@@ -1854,6 +1854,7 @@ struct Tapped {
     writer: Arc<Inner>,
     asked: std::sync::Mutex<Vec<Name>>,
     grants: AtomicBool,
+    lose_once: std::sync::Mutex<Vec<Name>>,
     instead: std::sync::Mutex<std::collections::HashMap<Name, Bytes>>,
     tx: futures::channel::mpsc::UnboundedSender<Bytes>,
     rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
@@ -1866,6 +1867,7 @@ impl Tapped {
             writer: Arc::clone(&writer.inner),
             asked: std::sync::Mutex::new(Vec::new()),
             grants: AtomicBool::new(true),
+            lose_once: std::sync::Mutex::new(Vec::new()),
             instead: std::sync::Mutex::new(std::collections::HashMap::new()),
             tx,
             rx: futures::lock::Mutex::new(rx),
@@ -1889,6 +1891,14 @@ impl Connection for Tapped {
             return Ok(());
         }
         self.asked.lock().unwrap().push(name.clone());
+        // An ask named in `lose_once` is lost, once (its re-expression is answered).
+        {
+            let mut lose = self.lose_once.lock().unwrap();
+            if let Some(at) = lose.iter().position(|n| n == name) {
+                lose.remove(at);
+                return Ok(());
+            }
+        }
         // A grant ask is answered by the writer's `grant` — which fetches the asker's seal
         // key over the writer's own link — unless `grants` is off: then it is lost.
         if let Some((granter, ask)) = parse_grant_name(name)
@@ -2161,6 +2171,16 @@ async fn a_new_version_a_notice_names_is_one_fetch_not_a_walk() {
         vec![second.clone()],
         "the entry named is the only one asked"
     );
+    assert_eq!(
+        asked
+            .iter()
+            .take(4)
+            .filter(|a| parse_summary_name(a).is_some())
+            .count(),
+        3,
+        "the root and the two nodes on the way to the collection are asked beside the \
+         entry, before any answer: {asked:?}"
+    );
     assert!(
         parse_log_name(&asked[0]).is_some(),
         "one fetch first: the entry named, before any root or node: {asked:?}"
@@ -2215,6 +2235,40 @@ async fn the_summary_listing_an_entry_taken_from_a_notice_is_read_at_once() {
         (d.peer_applied(), d.peer_walked()),
         (3, 3),
         "and the root that lists it is walked, not left to a pause"
+    );
+    d.shutdown();
+}
+
+/// The entry and the summary that lists it are fetched together and taken only when
+/// every packet is here: the root's ask is lost once, so nothing is told for as long as
+/// its re-expression takes (under the 250 ms a lost ask costs), and the entry is held,
+/// with the root that lists it walked, once the re-expression is answered. A device that
+/// missed the notice and asks this one for the writer's root while the writer is away
+/// is never told "not here" by a device that holds the entry (spec §13.5, h10).
+#[tokio::test(start_paused = true)]
+async fn an_entry_is_not_taken_from_a_notice_before_the_summary_that_lists_it_is_here() {
+    let d = direct().await;
+    let (second, update) = d.put(1).await;
+    d.wire
+        .lose_once
+        .lock()
+        .unwrap()
+        .push(root_name(&d.laptop, &d.ns, 3));
+    d.reader.inner.on_update(&d.ns, update);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !d.reader.inner.st.lock().held.contains_key(&second),
+        "the entry is not taken while the root that lists it is not here"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        holds(&d.reader, &second),
+        "taken once the lost ask is answered"
+    );
+    assert_eq!(
+        (d.peer_applied(), d.peer_walked()),
+        (3, 3),
+        "with the root that lists it walked"
     );
     d.shutdown();
 }

@@ -2198,6 +2198,12 @@ struct St {
     /// Members do so in every namespace they follow that it writes into,
     /// whatever group they heard the announcement in.
     root_asks: u64,
+    /// The summary root and nodes that list the entries a notice named, fetched
+    /// beside those entries and held until the walk made right after them asks
+    /// for them ([`Inner::fetch_listing`], [`Inner::fetch_once`]): by the exact
+    /// name a walk asks, the root's by its discovery prefix. Unverified bytes
+    /// that decide nothing; the walk verifies them as any packet it fetches.
+    prefetched: HashMap<Name, Data>,
     /// The own entries signed and not yet named to the groups they are
     /// published into ([`Inner::publish_about`]), at most [`FRESH_MAX`].
     fresh: Vec<Fresh>,
@@ -7635,6 +7641,7 @@ impl Device {
                 peers: HashMap::new(),
                 groups: BTreeMap::new(),
                 root_asks: 0,
+                prefetched: HashMap::new(),
                 fresh: Vec::new(),
                 follows: BTreeSet::new(),
                 watchers: Vec::new(),
@@ -10125,12 +10132,14 @@ impl Inner {
                         // completeness a `Change::Summary` stands for, and a
                         // root and nodes this device can answer a reader
                         // that missed the notice with while the writer is
-                        // away (spec §13.5) — is read next, off the path the
-                        // entries took (spec §12.1).
-                        !unlisted
+                        // away (spec §13.5) — is read next, from the packets
+                        // fetched beside the entries (spec §12.1).
+                        let walked = !unlisted
                             || inner
                                 .refresh_pass(&ns, &device, &wake, &mut unverified)
-                                .await
+                                .await;
+                        inner.st.lock().prefetched.clear();
+                        walked
                     }
                     None => {
                         inner
@@ -10738,6 +10747,11 @@ impl Inner {
     /// a closed connection is an answer. Re-expressed up to
     /// [`REEXPRESS_MAX`] times ([`Self::fetch_expressed`]).
     async fn fetch_once(&self, name: Name, discover: bool) -> Result<Data, bool> {
+        // Fetched beside the entries a notice named, for this very ask
+        // ([`Self::fetch_listing`]): used once, so an ask again goes out.
+        if let Some(data) = self.st.lock().prefetched.remove(&name) {
+            return Ok(data);
+        }
         self.fetch_expressed(name, discover, REEXPRESS_MAX).await
     }
 
@@ -11116,7 +11130,7 @@ impl Inner {
         };
         if let Err(why) = self.take_root(device, ns, &rooted) {
             if let RootRefusal::Rollback { head, seen } = why {
-                tracing::warn!(%device, %ns, head, seen, "refused: a summary root older than one verified before (rollback); the writer must serve its newest root");
+                tracing::warn!(%device, %ns, head, seen, "refused: a summary root older than one verified before or than an entry held (a rollback, or an old copy a cache or a device answering for the writer gave); asked again, the writer must serve its newest root");
             }
             return false;
         }
@@ -11402,7 +11416,7 @@ impl Inner {
             return false;
         };
         let key = (device.clone(), ns.clone());
-        let (names, since) = {
+        let (names, news, since) = {
             let st = self.st.lock();
             let Some(p) = st.peers.get(&key) else {
                 return false;
@@ -11417,7 +11431,7 @@ impl Inner {
                 return false;
             }
             let mut at = p.settled();
-            let mut names = Vec::new();
+            let (mut names, mut news) = (Vec::new(), Vec::new());
             for e in &mine {
                 // Named before, by the announcement of another group of the
                 // writer (it publishes an entry into each group its
@@ -11434,20 +11448,37 @@ impl Inner {
                     return false;
                 }
                 at = e.seq;
+                news.push((e.subject.clone(), e.seq));
                 let name = log_name(device, Some(&e.subject), e.seq);
                 if !st.held.contains_key(&name) && !st.refused.contains_key(&name) {
                     names.push(name);
                 }
             }
-            (names, p.resets)
+            (names, news, p.resets)
         };
-        let taken = stream::iter(names)
-            .map(|name| async move { self.take_named_entry(name).await })
-            .buffer_unordered(self.config.window)
-            .collect::<Vec<_>>()
-            .await;
-        if !taken.iter().all(|ok| *ok) {
+        // The entries, and beside them the root and nodes that list them, one
+        // round trip for all: nothing is taken until every packet is here, so
+        // an entry is never told before the summary that lists it can be read
+        // (a device that holds the entry answers a reader that missed the
+        // notice with that summary, spec §13.5, h10), and a packet lost costs
+        // the re-expression of its ask while the writer is still there, never
+        // a window after the entry is told.
+        let (fetched, listing) = futures::future::join(
+            futures::future::join_all(names.iter().map(|name| self.fetch_named(name))),
+            self.fetch_listing(device, ns, &news),
+        )
+        .await;
+        let (Some(listing), Some(fetched)) =
+            (listing, fetched.into_iter().collect::<Option<Vec<Data>>>())
+        else {
             return false;
+        };
+        self.st.lock().prefetched.extend(listing);
+        for (name, data) in names.into_iter().zip(fetched) {
+            if !self.take_named_data(&name, data).await {
+                self.st.lock().prefetched.clear();
+                return false;
+            }
         }
         let mut st = self.st.lock();
         let peer = st.peers.entry(key).or_default();
@@ -11459,36 +11490,79 @@ impl Inner {
         peer.settled() >= last
     }
 
-    /// Fetch, verify and take one log entry a notice named, by one ask of its
-    /// writer: whether it is now held or refused by a cut, as for an entry a
-    /// walk lists ([`Self::take_listed`]) but without asking again in rounds or
-    /// of the devices answering for the writer: what one ask did not bring is
-    /// left to the walk. An entry another walk asks for now is waited for, not
-    /// asked again ([`Self::asked_once`]).
-    async fn take_named_entry(self: &Arc<Self>, name: Name) -> bool {
-        let decided = |st: &St| st.held.contains_key(&name) || st.refused.contains_key(&name);
-        if decided(&self.st.lock()) {
-            return true;
+    /// The log entry `name` a notice named, by one ask of its writer (asked
+    /// again in place by the re-expressions of any fetch, not in rounds, nor of
+    /// the devices answering for the writer: what one ask did not bring is left
+    /// to the walk). One it kept bytes for is asked by its full name
+    /// ([`Self::kept_bytes`]); one of a device whose key is suspected here is
+    /// not asked for at all.
+    async fn fetch_named(&self, name: &Name) -> Option<Data> {
+        if parse_log_name(name).is_some_and(|l| self.suspects_device(&self.st.lock(), &l.device)) {
+            return None;
         }
-        self.asked_once((name.clone(), None), async {
-            if parse_log_name(&name)
-                .is_some_and(|l| self.suspects_device(&self.st.lock(), &l.device))
-            {
-                return false;
+        let digest = self.kept_bytes(name).await;
+        let asked = digest.map_or_else(|| name.clone(), |d| name.clone().append_implicit_digest(d));
+        self.fetch_once(asked, false).await.ok()
+    }
+
+    /// Verify and take a fetched entry a notice named, as an entry a walk lists
+    /// is taken ([`Self::take_fetched`]): whether it is now held or refused by a
+    /// cut.
+    async fn take_named_data(self: &Arc<Self>, name: &Name, data: Data) -> bool {
+        match self.take_data(name, data).await {
+            Ok(()) => true,
+            Err(Refusal::OutsideCut(_)) => self.st.lock().cut_out.contains_key(name),
+            Err(_) => false,
+        }
+    }
+
+    /// The writer's root at the head the entries `news` (collection, seq) reach,
+    /// and the nodes on the way to each collection — `<O>/32=data` down to the
+    /// collection, each at the last seq of an entry under it — each by its own
+    /// name, all asked at once: what the walk after the entries asks for first
+    /// ([`Self::fetch_once`] hands them to it, keyed by the name it asks: a
+    /// node's with the digest of the packet, the root's by its prefix). `None`
+    /// when one is not to be had (a root newer than the head named is the only
+    /// one the writer serves by head, so the walk asks it instead); nodes of a
+    /// collection in pages below its node are the walk's.
+    async fn fetch_listing(
+        &self,
+        device: &Name,
+        ns: &Name,
+        news: &[(Name, u64)],
+    ) -> Option<Vec<(Name, Data)>> {
+        let Some(head) = news.iter().map(|(_, seq)| *seq).max() else {
+            return Some(Vec::new());
+        };
+        let mut nodes: BTreeMap<Name, u64> = BTreeMap::new();
+        for (subject, seq) in news {
+            for n in ns.len() + 1..=subject.len() {
+                let at = Name::from_components(subject.components()[..n].iter().cloned());
+                let top = nodes.entry(at).or_insert(0);
+                *top = (*top).max(*seq);
             }
-            let digest = self.kept_bytes(&name).await;
-            let asked =
-                digest.map_or_else(|| name.clone(), |d| name.clone().append_implicit_digest(d));
-            let Ok(data) = self.fetch_once(asked, false).await else {
-                return false;
-            };
-            match self.take_data(&name, data).await {
-                Ok(()) => true,
-                Err(Refusal::OutsideCut(_)) => self.st.lock().cut_out.contains_key(&name),
-                Err(_) => false,
-            }
-        })
-        .await
+        }
+        let root = (root_prefix(device, ns), root_name(device, ns, head));
+        let asks: Vec<(Option<Name>, Name)> = std::iter::once((Some(root.0), root.1))
+            .chain(
+                nodes
+                    .into_iter()
+                    .map(|(at, seq)| (None, node_name(device, &at, seq))),
+            )
+            .collect();
+        let got = futures::future::join_all(
+            asks.iter()
+                .map(|(_, ask)| self.fetch_once(ask.clone(), false)),
+        )
+        .await;
+        let mut out = Vec::with_capacity(got.len());
+        for ((key, ask), data) in asks.into_iter().zip(got) {
+            let data = data.ok()?;
+            let key = key
+                .unwrap_or_else(|| ask.append_implicit_digest(wire::implicit_digest(data.raw())));
+            out.push((key, data));
+        }
+        Some(out)
     }
 
     /// Process a verified node (or page) of `writer`'s summary of `ns`,
