@@ -1917,12 +1917,6 @@ struct Peer {
     /// Interest carried holds nothing back for longer than those tries, and
     /// a real device that a faulty path kept from one walk still does.
     unreached: bool,
-    /// The seq of the last entry a sync notice named that this device took
-    /// directly, with nothing between it and the head walked in full
-    /// ([`Inner::take_notice`]), in this run: the head held, as a walk of a
-    /// root at it would leave it, though no root of it was fetched. Not kept
-    /// across a restart (the walk is made then, spec §12.1).
-    applied: u64,
 }
 
 /// Where another device's roots stand that no trust context held here
@@ -1939,14 +1933,6 @@ enum Unjudged {
 }
 
 impl Peer {
-    /// The head up to which this device holds what the writer's summary of
-    /// the namespace lists, for what it follows: that of the root walked in
-    /// full, or of the last entry a notice named that followed on it and was
-    /// taken directly ([`Peer::applied`]).
-    fn settled(&self) -> u64 {
-        self.walked.max(self.applied)
-    }
-
     /// Forget that walks took `subject` in full — what is followed or
     /// peeked at under it changed, or a version of it was let go: the root,
     /// and the nodes and pages on the way to it and under it, are walked
@@ -1999,88 +1985,6 @@ struct SyncGroup {
     /// Interest carrying none above them brings nothing newer than is held
     /// ([`Inner::heard`]).
     noticed: HashMap<Name, (u64, u64)>,
-    /// The own entries published into this group that no announcement of it
-    /// named yet, at most [`NAMED_MAX`] ([`Inner::publish_about`]): the next
-    /// announcement names those at or below the log head it announces.
-    named: Vec<Fresh>,
-    /// An entry was not kept in [`SyncGroup::named`] (more than the bound):
-    /// the next announcement names none, so no reader takes a part of what it
-    /// covers for all.
-    over: bool,
-    /// The names the group's newest announcement carried.
-    #[cfg(test)]
-    carried: Option<Bytes>,
-}
-
-impl SyncGroup {
-    /// The notice of the announcement going out, which covers the log up to
-    /// `head`: what names it carries (`None` when it names none: no entry
-    /// is waiting, more than [`wire::NOTICE_ENTRIES`], names that are too
-    /// long, or one was not kept), the seqs of the entries it names, and
-    /// whether one was not kept. A reader that holds all that the entries
-    /// before the first named stand for takes what follows without walking
-    /// ([`Inner::take_notice`]).
-    fn notice(&mut self, head: u64) -> (Option<Bytes>, Vec<u64>, bool) {
-        let over = std::mem::take(&mut self.over);
-        let mut entries: Vec<&Fresh> = self.named.iter().filter(|f| f.seq <= head).collect();
-        entries.sort_by_key(|f| f.seq);
-        let taken = entries.iter().map(|f| f.seq).collect();
-        let notice = (!over)
-            .then(|| {
-                let named: Vec<wire::NoticeEntry> = entries
-                    .iter()
-                    .map(|f| wire::NoticeEntry {
-                        subject: f.subject.clone(),
-                        seq: f.seq,
-                        prev: f.prev,
-                        record: f.record,
-                    })
-                    .collect();
-                wire::encode_notice(&named)
-            })
-            .flatten();
-        (notice, taken, over)
-    }
-}
-
-/// An own log entry waiting to be named in the notices of the groups it is
-/// published into (spec §12.1).
-#[derive(Clone, Debug)]
-struct Fresh {
-    /// The collection it is about.
-    subject: Name,
-    /// Its seq in the own log.
-    seq: u64,
-    /// The highest seq of the own log in the subject's namespace before it, as
-    /// the summary tree held it ([`Tree::head`]).
-    prev: u64,
-    /// A record, not a version.
-    record: bool,
-}
-
-/// The most own entries kept for the notices to name ([`St::fresh`]); past it
-/// every group's next announcement names none.
-const FRESH_MAX: usize = 64;
-
-/// The most entries one group keeps for its next announcement to name
-/// ([`SyncGroup::named`]).
-const NAMED_MAX: usize = 16;
-
-/// The most notices of one device a refresh loop keeps for its next pass
-/// ([`Busy::named`]): past it the oldest is dropped, and the next notice does
-/// not follow on what is held, so the pass walks.
-const NOTICES_QUEUED: usize = 8;
-
-/// An announcement going out in a commit round ([`Inner::commit_rounds`]).
-struct Announce {
-    ns: Name,
-    tx: mpsc::Sender<(Name, Option<Bytes>)>,
-    /// The entries it names, encoded.
-    notice: Option<Bytes>,
-    /// The seqs of the entries it names.
-    taken: Vec<u64>,
-    /// An entry the group did not keep for it to name ([`SyncGroup::over`]).
-    over: bool,
 }
 
 /// A device whose refresh loop runs ([`Inner::refresh_loop`]).
@@ -2100,11 +2004,6 @@ struct Busy {
     /// pass it asks for begins at once, not after the pause notices that
     /// bring nothing new earn ([`Inner::refresh_loop`]).
     asked: bool,
-    /// The notices of it heard since the loop's newest pass, oldest first, at
-    /// most [`NOTICES_QUEUED`], each with the entries it named (`None`: it
-    /// named none, or none that decoded): the pass takes them directly, in
-    /// order, or walks ([`Inner::take_named`]).
-    named: VecDeque<Option<Arc<Vec<wire::NoticeEntry>>>>,
     /// Wakes the loop's pass ([`Inner::refresh_pass`]) when a notice
     /// arrives.
     wake: Arc<Notify>,
@@ -2183,15 +2082,11 @@ struct St {
     /// re-announcements) goes out in the same order in every run (§18.1).
     groups: BTreeMap<Name, SyncGroup>,
     /// Asks this device answered for its own newest root of any namespace
-    /// (`<device>/32=summary/<O>/32=root`) or for one of its own log entries:
-    /// a member walking a root after an announcement, or taking the entries
-    /// it named, took a change this device announced ([`Inner::herald`]).
-    /// Members do so in every namespace they follow that it writes into,
+    /// (`<device>/32=summary/<O>/32=root`): a member walking one after an
+    /// announcement took a change this device announced ([`Inner::herald`]).
+    /// Members walk it in every namespace they follow that it writes into,
     /// whatever group they heard the announcement in.
     root_asks: u64,
-    /// The own entries signed and not yet named to the groups they are
-    /// published into ([`Inner::publish_about`]), at most [`FRESH_MAX`].
-    fresh: Vec<Fresh>,
     follows: BTreeSet<Name>,
     watchers: Vec<Watcher>,
     /// While the records in force are made again from those held
@@ -4085,40 +3980,10 @@ impl St {
             .collect()
     }
 
-    /// Record the own log entry `seq` about `c` in the summary tree of `ns`,
-    /// and keep it for the notices of the groups it is published into to name
-    /// ([`Inner::publish_about`], spec §12.1), with the tree's head before it.
-    /// Past [`FRESH_MAX`] kept, they are all dropped and no group's next
-    /// announcement names any.
-    fn add_own(&mut self, ns: &Name, c: &Name, seq: u64, kind: Kind, record: bool) {
-        let tree = self
-            .trees
-            .entry(ns.clone())
-            .or_insert_with(|| Tree::new(ns.clone()));
-        let prev = tree.head();
-        tree.add(c, seq, kind);
-        if self.restoring {
-            return;
-        }
-        if self.fresh.len() >= FRESH_MAX {
-            self.fresh.clear();
-            for g in self.groups.values_mut() {
-                g.over = true;
-            }
-        }
-        self.fresh.push(Fresh {
-            subject: c.clone(),
-            seq,
-            prev,
-            record,
-        });
-    }
-
     /// Whether a walk of `device`'s summary of `ns` is owed (spec §17.1):
     /// something is followed or peeked at in `ns`, and a root of `device`
     /// verified here is above the head walked in full ([`Peer::walked`],
-    /// kept across restarts) or taken directly from a notice that named
-    /// the entries ([`Peer::applied`], not kept), or a name followed in `ns` lies under
+    /// both kept across restarts), or a name followed in `ns` lies under
     /// none a walk of that device's root in full went toward with it
     /// followed ([`Peer::followed`]: a name peeked at had its records
     /// taken, not its versions). Every version such a root lists that the
@@ -4136,7 +4001,7 @@ impl St {
         let toward = self.toward_in(ns);
         !toward.is_empty()
             && (peer.unjudged == Some(Unjudged::Adopted)
-                || peer.head > peer.settled()
+                || peer.head > peer.walked
                 || (peer.head > 0
                     && toward.iter().any(|t| {
                         self.follows.contains(t) && !peer.followed.iter().any(|w| t.has_prefix(w))
@@ -7626,7 +7491,6 @@ impl Device {
                 peers: HashMap::new(),
                 groups: BTreeMap::new(),
                 root_asks: 0,
-                fresh: Vec::new(),
                 follows: BTreeSet::new(),
                 watchers: Vec::new(),
                 quiet_members: false,
@@ -9370,10 +9234,6 @@ impl Inner {
                     unheard: None,
                     observed: None,
                     noticed: HashMap::new(),
-                    named: Vec::new(),
-                    over: false,
-                    #[cfg(test)]
-                    carried: None,
                 },
             );
             local_seq
@@ -9640,19 +9500,8 @@ impl Inner {
             targets.insert(ns.clone());
             targets
         };
-        // The entries the notice names, if it names any and came alone: a gap
-        // in the group's counters says a notice was missed, and what a
-        // notice names covers the announcement it came with only. A name is
-        // a hint (the notice is unsigned); what it names is fetched and
-        // verified as any entry is, and a notice that names nothing, or
-        // that does not decode, is walked ([`Self::take_notice`]).
-        let named = update
-            .mapping
-            .filter(|_| update.low_seq == update.high_seq)
-            .and_then(|m| wire::decode_notice(m).ok())
-            .map(Arc::new);
         for t in targets {
-            self.noticed(t, device.clone(), named.clone());
+            self.noticed(t, device.clone());
         }
         // A device moved: what was re-admitted and not to be had may be now.
         self.retry_readmissions();
@@ -9820,28 +9669,8 @@ impl Inner {
                 groups.push(ns.clone());
             }
         }
-        // The own entries about `c` signed since it was last published about:
-        // the notice of each group names them (spec §12.1), so each is told
-        // before the group is asked to announce.
-        let fresh: Vec<Fresh> = {
-            let mut st = self.st.lock();
-            let (mine, rest) = std::mem::take(&mut st.fresh)
-                .into_iter()
-                .partition(|f| f.subject == *c);
-            st.fresh = rest;
-            mine
-        };
         for ns in groups {
             self.join(&ns).await?;
-            if let Some(g) = self.st.lock().groups.get_mut(&ns) {
-                for f in &fresh {
-                    if g.named.len() >= NAMED_MAX {
-                        g.over = true;
-                    } else {
-                        g.named.push(f.clone());
-                    }
-                }
-            }
             self.publish(&ns);
         }
         Ok(())
@@ -9959,20 +9788,14 @@ impl Inner {
     /// Refresh `device`'s summary of `ns` in the background, coalescing
     /// requests that arrive while one runs.
     fn schedule(self: &Arc<Self>, ns: Name, device: Name) {
-        self.refresh_loop(ns, device, 0, false, None);
+        self.refresh_loop(ns, device, 0, false);
     }
 
     /// [`Self::schedule`] for a sync notice of `device`: it moved, so its
     /// loop walks until a root `device` itself gives answers the notice
-    /// ([`Busy::heard`], spec §17.1) — or takes the entries the notice
-    /// `named` directly, when they follow on what is held (spec §12.1).
-    fn noticed(
-        self: &Arc<Self>,
-        ns: Name,
-        device: Name,
-        named: Option<Arc<Vec<wire::NoticeEntry>>>,
-    ) {
-        self.refresh_loop(ns, device, 0, true, named);
+    /// ([`Busy::heard`], spec §17.1).
+    fn noticed(self: &Arc<Self>, ns: Name, device: Name) {
+        self.refresh_loop(ns, device, 0, true);
     }
 
     /// Hand a walk of `device`'s summary of `ns` that `missed` passes in a
@@ -9982,7 +9805,7 @@ impl Inner {
     /// §17.1); a loop under way already asks again while the walk is owed,
     /// so it is left as it is.
     fn walk_again(self: &Arc<Self>, ns: Name, device: Name, missed: u32) {
-        self.refresh_loop(ns, device, missed.max(1), false, None);
+        self.refresh_loop(ns, device, missed.max(1), false);
     }
 
     /// The one refresh loop of (`device`, `ns`) ([`Self::schedule`]),
@@ -9991,8 +9814,7 @@ impl Inner {
     /// while it runs marks it to walk again and wakes its pass
     /// ([`Self::refresh_pass`]), a walk that missed does not (the loop asks
     /// again while owed). `notice`: a sync notice of `device` started it,
-    /// counted in [`Busy::heard`], with the entries it `named` (spec §12.1).
-    /// A pass a notice asks for begins at once
+    /// counted in [`Busy::heard`]. A pass a notice asks for begins at once
     /// after one that took a newer root of `device`, or that did not reach
     /// its state (a loss: its own rounds pace it); after one that reached
     /// it and took nothing newer, after the pause such passes in a row earn
@@ -10002,14 +9824,7 @@ impl Inner {
     /// once. A name dropped from the devices heard that nothing held
     /// vouches for and nothing verified owes begins no pass
     /// ([`Self::walks_on`]).
-    fn refresh_loop(
-        self: &Arc<Self>,
-        ns: Name,
-        device: Name,
-        missed: u32,
-        notice: bool,
-        named: Option<Arc<Vec<wire::NoticeEntry>>>,
-    ) {
+    fn refresh_loop(self: &Arc<Self>, ns: Name, device: Name, missed: u32, notice: bool) {
         let wake = {
             let mut st = self.st.lock();
             let Some(g) = st.groups.get_mut(&ns) else {
@@ -10020,12 +9835,6 @@ impl Inner {
                     busy.again = true;
                     busy.heard += u64::from(notice);
                     busy.asked |= !notice;
-                    if notice {
-                        if busy.named.len() >= NOTICES_QUEUED {
-                            busy.named.pop_front();
-                        }
-                        busy.named.push_back(named);
-                    }
                     busy.wake.notify_one();
                 }
                 return;
@@ -10038,11 +9847,6 @@ impl Inner {
                     heard: u64::from(notice),
                     answered: 0,
                     asked: false,
-                    named: if notice {
-                        VecDeque::from([named])
-                    } else {
-                        VecDeque::new()
-                    },
                     wake: Arc::clone(&wake),
                 },
             );
@@ -10075,50 +9879,9 @@ impl Inner {
                     }
                     st.peers.get(&key).map_or(0, |p| p.head)
                 };
-                // The notices heard since the last pass, with the names they
-                // brought: taken directly when they follow on what is held,
-                // else (or when something held here asked for a walk) the
-                // walk is made, which answers every one of them.
-                let named = {
-                    let mut st = inner.st.lock();
-                    st.groups
-                        .get_mut(&ns)
-                        .and_then(|g| g.busy.get_mut(&device))
-                        .filter(|b| !b.named.is_empty())
-                        .and_then(|b| {
-                            let batch: Vec<_> = b.named.drain(..).collect();
-                            (!b.asked).then(|| {
-                                b.again = false;
-                                (batch, b.heard)
-                            })
-                        })
-                };
-                let direct = match named {
-                    Some((batch, heard)) if inner.take_named(&ns, &device, &batch).await => {
-                        Some(heard)
-                    }
-                    _ => None,
-                };
-                let ok = match direct {
-                    Some(heard) => {
-                        tracing::debug!(me = %inner.device, %ns, %device, "its notice settled by the entries it named: no walk");
-                        if let Some(b) = inner
-                            .st
-                            .lock()
-                            .groups
-                            .get_mut(&ns)
-                            .and_then(|g| g.busy.get_mut(&device))
-                        {
-                            b.answered = b.answered.max(heard);
-                        }
-                        true
-                    }
-                    None => {
-                        inner
-                            .refresh_pass(&ns, &device, &wake, &mut unverified)
-                            .await
-                    }
-                };
+                let ok = inner
+                    .refresh_pass(&ns, &device, &wake, &mut unverified)
+                    .await;
                 let moved = {
                     let st = inner.st.lock();
                     st.peers.get(&key).is_some_and(|p| p.head > from)
@@ -10250,7 +10013,6 @@ impl Inner {
                 let mut announce = Vec::new();
                 // The counters of the announcements wanted, one batch.
                 let _batch = self.stage.batch();
-                let head = st.head;
                 for (ns, g) in st.groups.iter_mut() {
                     let Some(tx) = g.tx.clone().filter(|_| g.pending) else {
                         continue;
@@ -10261,14 +10023,7 @@ impl Inner {
                         announced_name(ns),
                         Bytes::copy_from_slice(&g.announced.to_be_bytes()),
                     );
-                    let (notice, taken, over) = g.notice(head);
-                    announce.push(Announce {
-                        ns: ns.clone(),
-                        tx,
-                        notice,
-                        taken,
-                        over,
-                    });
+                    announce.push((ns.clone(), tx));
                 }
                 if announce.is_empty() && st.durable >= st.head && !st.flush_wanted {
                     return;
@@ -10289,19 +10044,10 @@ impl Inner {
                     }
                     self.committed.notify_waiters();
                     self.progress.notify_waiters();
-                    for a in announce {
-                        tracing::trace!(target: TIMELINE, ns = %a.ns, "announce");
-                        #[cfg(test)]
-                        if let Some(g) = self.st.lock().groups.get_mut(&a.ns) {
-                            g.carried = a.notice.clone();
-                        }
-                        // What the notice named is carried by the announcement
-                        // now; what was named after the round began waits.
-                        if let Some(g) = self.st.lock().groups.get_mut(&a.ns) {
-                            g.named.retain(|f| !a.taken.contains(&f.seq));
-                        }
-                        let _ = a.tx.send((sync_group(&a.ns), a.notice)).await;
-                        self.herald(&a.ns);
+                    for (ns, tx) in announce {
+                        tracing::trace!(target: TIMELINE, %ns, "announce");
+                        let _ = tx.send((sync_group(&ns), None)).await;
+                        self.herald(&ns);
                     }
                     pause = COMMIT_RETRY;
                 }
@@ -10315,10 +10061,9 @@ impl Inner {
                     {
                         let mut st = self.st.lock();
                         st.flush_wanted = true;
-                        for a in &announce {
-                            if let Some(g) = st.groups.get_mut(&a.ns) {
+                        for (ns, _) in &announce {
+                            if let Some(g) = st.groups.get_mut(ns) {
                                 g.pending = true;
-                                g.over |= a.over;
                             }
                         }
                     }
@@ -11305,159 +11050,14 @@ impl Inner {
 
     /// Whether a notice of `device` in `ns`'s group arrived since its
     /// refresh loop's newest walk began ([`Busy::again`]), taken: the walk
-    /// about to begin answers it, and every name a notice brought before it
-    /// ([`Busy::named`]).
+    /// about to begin answers it.
     fn noticed_again(&self, ns: &Name, device: &Name) -> bool {
         self.st
             .lock()
             .groups
             .get_mut(ns)
             .and_then(|g| g.busy.get_mut(device))
-            .is_some_and(|b| {
-                let again = std::mem::take(&mut b.again);
-                if again {
-                    b.named.clear();
-                }
-                again
-            })
-    }
-
-    /// Settle the notices of `device` heard since the last pass of its refresh
-    /// loop of `ns`, `batch` in the order they came, by taking the entries
-    /// they name directly instead of walking its summary (spec §12.1). Whether
-    /// every one settled: a notice that named nothing (or was not heard with
-    /// its names) leaves the walk to the loop, so does one that named
-    /// something this device cannot judge a walk would not have taken the
-    /// same way, or that does not follow on what is held ([`Self::take_notice`]).
-    async fn take_named(
-        self: &Arc<Self>,
-        ns: &Name,
-        device: &Name,
-        batch: &[Option<Arc<Vec<wire::NoticeEntry>>>],
-    ) -> bool {
-        for notice in batch {
-            let Some(entries) = notice else {
-                return false;
-            };
-            if !self.take_notice(ns, device, entries).await {
-                return false;
-            }
-        }
-        !batch.is_empty()
-    }
-
-    /// Take the entries of `device`'s log in `ns` that one notice names, if
-    /// that is all the walk would have done for it: they are asked for by their
-    /// names, each by one ask, and verified and taken as the entries a walk
-    /// lists are ([`Self::take_named_entry`]). The names are a hint of the
-    /// notice's sender, unsigned, and decide nothing: only what verifies is
-    /// taken, and the walk is left to the loop (`false`) unless
-    ///
-    /// - a root of `device` was processed in full for what is followed now,
-    ///   nothing is owed ([`St::owes_walk`]) and nothing above it is held;
-    /// - the first entry named follows on exactly what is held: its `prev`,
-    ///   the writer's highest seq in `ns` before it, is the head held, and each
-    ///   next one follows on the one before;
-    /// - every entry named is of a collection followed here and not held for
-    ///   its owner, which this device is not left out of; and
-    /// - every entry named is held or refused by a cut once asked for.
-    ///
-    /// Held so, the head is as a walk of a root at the last seq would leave it
-    /// ([`Peer::applied`]).
-    async fn take_notice(
-        self: &Arc<Self>,
-        ns: &Name,
-        device: &Name,
-        entries: &[wire::NoticeEntry],
-    ) -> bool {
-        let mine: Vec<&wire::NoticeEntry> = entries
-            .iter()
-            .filter(|e| namespace_of(&e.subject).as_ref() == Some(ns))
-            .collect();
-        let Some(last) = mine.last().map(|e| e.seq) else {
-            return false;
-        };
-        let key = (device.clone(), ns.clone());
-        let (names, since) = {
-            let st = self.st.lock();
-            let Some(p) = st.peers.get(&key) else {
-                return false;
-            };
-            if p.root.is_none()
-                || p.walked == 0
-                || p.unjudged.is_some()
-                || p.head != p.settled()
-                || st.owes_walk(device, ns)
-                || self.ended(&st, device)
-            {
-                return false;
-            }
-            let mut at = p.settled();
-            let mut names = Vec::new();
-            for e in &mine {
-                if e.prev != at
-                    || !st.inside(&e.subject)
-                    || st.holding.contains_key(&e.subject)
-                    || self.left_out(&st, &e.subject)
-                {
-                    return false;
-                }
-                at = e.seq;
-                let name = log_name(device, Some(&e.subject), e.seq);
-                if !st.held.contains_key(&name) && !st.refused.contains_key(&name) {
-                    names.push(name);
-                }
-            }
-            (names, p.resets)
-        };
-        let taken = stream::iter(names)
-            .map(|name| async move { self.take_named_entry(name).await })
-            .buffer_unordered(self.config.window)
-            .collect::<Vec<_>>()
-            .await;
-        if !taken.iter().all(|ok| *ok) {
-            return false;
-        }
-        let mut st = self.st.lock();
-        let peer = st.peers.entry(key).or_default();
-        // Not when what is followed or peeked at changed meanwhile, nor under a
-        // head a root verified meanwhile: the walk owed settles those.
-        if peer.resets == since && peer.head <= last {
-            peer.applied = peer.applied.max(last);
-        }
-        peer.settled() >= last
-    }
-
-    /// Fetch, verify and take one log entry a notice named, by one ask of its
-    /// writer: whether it is now held or refused by a cut, as for an entry a
-    /// walk lists ([`Self::take_listed`]) but without asking again in rounds or
-    /// of the devices answering for the writer: what one ask did not bring is
-    /// left to the walk. An entry another walk asks for now is waited for, not
-    /// asked again ([`Self::asked_once`]).
-    async fn take_named_entry(self: &Arc<Self>, name: Name) -> bool {
-        let decided = |st: &St| st.held.contains_key(&name) || st.refused.contains_key(&name);
-        if decided(&self.st.lock()) {
-            return true;
-        }
-        self.asked_once((name.clone(), None), async {
-            if parse_log_name(&name)
-                .is_some_and(|l| self.suspects_device(&self.st.lock(), &l.device))
-            {
-                return false;
-            }
-            let digest = self.kept_bytes(&name).await;
-            let asked =
-                digest.map_or_else(|| name.clone(), |d| name.clone().append_implicit_digest(d));
-            let Ok(data) = self.fetch_once(asked, false).await else {
-                return false;
-            };
-            match self.take_data(&name, data).await {
-                Ok(()) => true,
-                Err(Refusal::OutsideCut(_)) => self.st.lock().cut_out.contains_key(&name),
-                Err(_) => false,
-            }
-        })
-        .await
+            .is_some_and(|b| std::mem::take(&mut b.again))
     }
 
     /// Process a verified node (or page) of `writer`'s summary of `ns`,
@@ -12289,12 +11889,14 @@ impl Inner {
         if let Some(c) = &parsed.subject {
             if mine {
                 let ns = namespace_of(c).expect("a log entry's collection has a namespace");
-                let is_record = !matches!(record, Record::Version(_));
                 let kind = match record {
                     Record::Version(_) => Kind::Version(retain.unwrap_or(Retain::ALWAYS)),
                     _ => Kind::Record,
                 };
-                st.add_own(&ns, c, parsed.seq, kind, is_record);
+                st.trees
+                    .entry(ns.clone())
+                    .or_insert_with(|| Tree::new(ns))
+                    .add(c, parsed.seq, kind);
             } else {
                 self.note_peer_head(st, &parsed.device, c, parsed.seq);
             }
@@ -15665,7 +15267,10 @@ impl Inner {
             true => Retain { keep, dated },
             false => Retain::ALWAYS,
         };
-        st.add_own(ns, &c, seq, Kind::Version(retain), false);
+        st.trees
+            .entry(ns.clone())
+            .or_insert_with(|| Tree::new(ns.clone()))
+            .add(&c, seq, Kind::Version(retain));
         if let Some(g) = version.group {
             st.note_member(&c, &id, g, version.keep);
         }
@@ -16159,14 +15764,12 @@ impl Inner {
             None => {}
         }
         let reply = self.packet_for(&name, interest.selectors().can_be_prefix);
-        // An ask for this device's own newest root of any namespace, or for
-        // one of its own log entries: a member walking the root, or taking
-        // the entry a notice named (spec §12), took what this device
-        // announced, in whichever group it heard it ([`Self::herald`]).
+        // An ask for this device's own newest root of any namespace: a
+        // member walking it took what this device announced, in whichever
+        // group it heard it ([`Self::herald`]).
         if reply.is_some()
-            && (parse_summary_name(&name)
+            && parse_summary_name(&name)
                 .is_some_and(|s| s.device == self.device && s.head.is_none())
-                || parse_log_name(&name).is_some_and(|l| l.device == self.device))
         {
             self.st.lock().root_asks += 1;
         }

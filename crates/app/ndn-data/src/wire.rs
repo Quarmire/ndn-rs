@@ -167,20 +167,6 @@ pub mod tlv {
     pub const EPHEMERAL_KEY: u64 = 0x057C;
     /// An epoch key's check: 32 octets, HKDF-SHA256 of the key (spec §9).
     pub const KEY_CHECK: u64 = 0x057E;
-    /// The entries a sync notice names, the application data of the notice's
-    /// `MappingData` (spec §12): `NoticeEntry+`, ascending by seq. Odd, so a
-    /// reader that does not know it refuses the notice's names and walks.
-    pub const NOTICE: u64 = 0x0571;
-    /// One entry a notice names: `Name` (its collection), `Seq`, `NoticePrev`,
-    /// and `NoticeRecord` if it is a record, not a version.
-    pub const NOTICE_ENTRY: u64 = 0x0573;
-    /// NonNegativeInteger: the highest seq of the writer's log in the
-    /// collection's namespace before this entry (0: none), as its summary tree
-    /// held it.
-    pub const NOTICE_PREV: u64 = 0x0575;
-    /// Empty: the entry named is a record (members, hold, lease, prune), not
-    /// a version.
-    pub const NOTICE_RECORD: u64 = 0x0577;
 
     // Slice 3: odd numbers, critical — a reader that does not know them
     // must refuse what carries them rather than pass over it.
@@ -2597,102 +2583,6 @@ pub fn decode_head(content: Bytes) -> Result<HeadBody, WireError> {
             "a head record names a collection, a seq, a node digest and a freshness",
         )),
     }
-}
-
-/// The most entries one sync notice names (spec §12): an announcement that
-/// covers more carries none, and its readers walk.
-pub const NOTICE_ENTRIES: usize = 4;
-
-/// The most octets the names of a sync notice take: one Sync Interest carries
-/// them beside the group's state vector, which can already be large.
-pub const NOTICE_BYTES: usize = 768;
-
-/// One log entry a sync notice names, of the log of the device that sent it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NoticeEntry {
-    /// The collection the entry is about.
-    pub subject: Name,
-    /// Its seq in the device's log.
-    pub seq: u64,
-    /// The highest seq of the device's log in the subject's namespace before
-    /// this entry, as its summary tree held it (0: none): what a reader that
-    /// holds everything up to there holds up to this entry once it holds it.
-    pub prev: u64,
-    /// A record (members, hold, lease, prune), not a version.
-    pub record: bool,
-}
-
-/// Encode the entries a sync notice names, ascending by seq. `None` when
-/// there are none, more than [`NOTICE_ENTRIES`], or the names would take more
-/// than [`NOTICE_BYTES`]: the notice then names nothing.
-pub fn encode_notice(entries: &[NoticeEntry]) -> Option<Bytes> {
-    if entries.is_empty() || entries.len() > NOTICE_ENTRIES {
-        return None;
-    }
-    let mut w = TlvWriter::new();
-    w.write_nested(tlv::NOTICE, |w| {
-        for e in entries {
-            w.write_nested(tlv::NOTICE_ENTRY, |w| {
-                write_name(w, &e.subject);
-                write_nni(w, tlv::SEQ, e.seq);
-                write_nni(w, tlv::NOTICE_PREV, e.prev);
-                if e.record {
-                    w.write_tlv(tlv::NOTICE_RECORD, &[]);
-                }
-            });
-        }
-    });
-    let out = w.finish();
-    (out.len() <= NOTICE_BYTES).then_some(out)
-}
-
-/// Decode the entries a sync notice names. What does not decode, or is not
-/// what an honest writer sends (more than [`NOTICE_ENTRIES`], a seq not above
-/// the one before it, a `prev` not below its seq, a subject that is no
-/// collection), is an error: the
-/// notice then names nothing. The names are a hint and decide nothing; a
-/// reader fetches and verifies what they name as it does anything else.
-pub fn decode_notice(content: Bytes) -> Result<Vec<NoticeEntry>, WireError> {
-    let mut r = TlvReader::new(content);
-    let (typ, value) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
-    if typ != tlv::NOTICE || !r.is_empty() {
-        return Err(bad("a notice's names are one Notice"));
-    }
-    let mut out: Vec<NoticeEntry> = Vec::new();
-    each(value, |t, v| {
-        if t != tlv::NOTICE_ENTRY {
-            return Ok(false);
-        }
-        let (mut subject, mut seq, mut prev, mut record) = (None, None, None, false);
-        each(v, |t, v| {
-            match t {
-                tlv_type::NAME => subject = Some(read_name(v)?),
-                tlv::SEQ => seq = Some(read_nni(&v)?),
-                tlv::NOTICE_PREV => prev = Some(read_nni(&v)?),
-                tlv::NOTICE_RECORD => record = true,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        })?;
-        let (Some(subject), Some(seq), Some(prev)) = (subject, seq, prev) else {
-            return Err(bad("a notice's entry names a collection, a seq and a prev"));
-        };
-        if !is_collection_name(&subject) || prev >= seq || out.last().is_some_and(|e| e.seq >= seq)
-        {
-            return Err(bad("a notice's entries ascend, each after its prev"));
-        }
-        out.push(NoticeEntry {
-            subject,
-            seq,
-            prev,
-            record,
-        });
-        Ok(true)
-    })?;
-    if out.is_empty() || out.len() > NOTICE_ENTRIES {
-        return Err(bad("a notice names one to NOTICE_ENTRIES entries"));
-    }
-    Ok(out)
 }
 
 /// Encode a members record.
