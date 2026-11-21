@@ -202,6 +202,38 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(4500);
 /// (as [`InterestBuilder::build_with_timeout`] adds).
 pub const REPLY_SLACK: Duration = Duration::from_millis(500);
 
+/// The ceiling of the first pause before an Interest a forwarder or link Nacked with reason
+/// `Congestion` is expressed again ([`Consumer::fetch_reexpressing`]): the Nack says the
+/// Interest was dropped for rate, so a token of the limiter's bucket comes back soon (a limit
+/// of 100 frames a second gives one every 10 ms). The pause is jittered between half of the
+/// ceiling and the ceiling, well under the 250 ms a lost Interest waits.
+pub const CONGESTION_PAUSE: Duration = Duration::from_millis(20);
+
+/// The most one pause before expressing a congestion-Nacked Interest again lasts: the
+/// ceiling doubles per Nack until it is this.
+pub const CONGESTION_PAUSE_MAX: Duration = Duration::from_millis(160);
+
+/// The most times one fetch expresses an Interest again after a `Congestion` Nack. The
+/// pauses add up to at most 940 ms (20, 40, 80, then 160 ms five times), so a Nack that never
+/// stops costs a fetch at most that, and the fetch then answers with the last Nack.
+pub const CONGESTION_RETRIES: u32 = 8;
+
+/// The pause before the `retry`-th (from 0) expression again of an Interest Nacked with
+/// `Congestion`: half to all of [`CONGESTION_PAUSE`]·2^`retry`, at most
+/// [`CONGESTION_PAUSE_MAX`]. The jitter is taken from the first Interest's nonce (a process
+/// and a counter, so it differs between askers and asks) and the retry, never from a clock
+/// or a random source: a virtual runtime runs the same.
+pub fn congestion_pause(nonce: u32, retry: u32) -> Duration {
+    let ceiling = CONGESTION_PAUSE
+        .saturating_mul(1 << retry.min(8))
+        .min(CONGESTION_PAUSE_MAX);
+    let mixed = nonce
+        .wrapping_add(retry.wrapping_mul(0x9E37_79B9))
+        .wrapping_mul(0x85EB_CA6B);
+    let fraction = mixed >> 16;
+    ceiling / 2 + (ceiling / 2) * fraction / 0x1_0000
+}
+
 /// Per-Interest attempts for whole-object (RDR) fetches. Each metadata-discovery
 /// and segment Interest is re-expressed up to this many times with back-off
 /// before the fetch fails. Lossy/high-latency faces (connectionless named-radio
@@ -448,9 +480,14 @@ impl Consumer {
     /// so a late reply to an earlier one answers as well as a reply to the
     /// latest; the fetch waits [`REPLY_SLACK`] past the budget, as
     /// [`Self::fetch_with`] waits past the lifetime. A Nack or a refusal
-    /// answers at once, as in [`Self::fetch_wire`]. Returns the Data and how
-    /// many Interests were expressed for it: a round-trip sample is
-    /// unambiguous only when that is 1.
+    /// answers at once, as in [`Self::fetch_wire`] — except a Nack with reason
+    /// [`Congestion`](ndn_packet::NackReason::Congestion), which says the Interest was
+    /// dropped for rate and nothing more: it is expressed again after a jittered pause
+    /// ([`congestion_pause`]: 10 to 20 ms, doubling to at most 160 ms) at most
+    /// [`CONGESTION_RETRIES`] times (at most 940 ms of pauses in all) and only while
+    /// `min_left` of the budget is left after the pause; when those end, the last
+    /// Nack is the answer. Returns the Data and how many Interests were expressed
+    /// for it: a round-trip sample is unambiguous only when that is 1.
     ///
     /// A lost Interest or Data then costs one gap, not the lifetime. A
     /// forwarder hands a fresh-nonce Interest from the same face on upstream
@@ -477,18 +514,34 @@ impl Consumer {
         let mut expressed = 1u32;
         let mut spent = Duration::ZERO;
         let mut gaps = gaps.into_iter();
+        let nonce = interest.nonce().unwrap_or_default();
+        let mut congested = 0u32;
+        let mut gap = gaps
+            .next()
+            .filter(|g| budget.saturating_sub(spent + *g) >= min_left);
         loop {
-            let gap = gaps
-                .next()
-                .filter(|g| budget.saturating_sub(spent + *g) >= min_left);
             let wait = gap.unwrap_or(budget.saturating_sub(spent) + REPLY_SLACK);
             let reply =
                 crate::rt::timeout(wait, replies.answer(&interest.name, can_be_prefix, false))
                     .await;
             match (reply, gap) {
-                (Ok(reply), _) => return reply.map(|(data, _)| (data, expressed)),
-                (Err(_), Some(gap)) => {
-                    spent += gap;
+                // The Interest was dropped for rate, not answered: ask again after a short
+                // pause, as long as the retries and the lifetime allow it. The gap in
+                // progress is not used up: the Interest it timed starts afresh.
+                (
+                    Ok(Err(AppError::Nacked {
+                        reason: Some(ndn_packet::NackReason::Congestion),
+                    })),
+                    _,
+                ) if congested < CONGESTION_RETRIES
+                    && budget.saturating_sub(spent + congestion_pause(nonce, congested))
+                        >= min_left =>
+                {
+                    let pause = congestion_pause(nonce, congested);
+                    crate::rt::sleep(pause).await;
+                    spent += pause;
+                    congested += 1;
+                    gap = gap.filter(|g| budget.saturating_sub(spent + *g) >= min_left);
                     let left = budget - spent;
                     if let Some(registry) = replies.registry() {
                         registry.expect_name(
@@ -500,6 +553,24 @@ impl Consumer {
                     }
                     self.conn.send(make().lifetime(left).build()).await?;
                     expressed += 1;
+                }
+                (Ok(reply), _) => return reply.map(|(data, _)| (data, expressed)),
+                (Err(_), Some(waited)) => {
+                    spent += waited;
+                    let left = budget - spent;
+                    if let Some(registry) = replies.registry() {
+                        registry.expect_name(
+                            (*interest.name).clone(),
+                            can_be_prefix,
+                            must_be_fresh,
+                            left,
+                        );
+                    }
+                    self.conn.send(make().lifetime(left).build()).await?;
+                    expressed += 1;
+                    gap = gaps
+                        .next()
+                        .filter(|g| budget.saturating_sub(spent + *g) >= min_left);
                 }
                 (Err(_), None) => return Err(AppError::Timeout),
             }
@@ -1824,6 +1895,196 @@ mod subscription_tests {
             .map(|i| i.1.unwrap().as_millis())
             .collect();
         assert_eq!(lifetimes, [2000, 1750, 1250, 250]);
+    }
+
+    /// A link that answers each of the first `nacks` Interests it is handed with a Nack of
+    /// `reason` and every later one with a Data under its name; it records when (on the
+    /// paused clock) and with what lifetime each Interest came.
+    struct NacksFirst {
+        nacks: usize,
+        reason: ndn_packet::NackReason,
+        sent: std::sync::Mutex<Vec<(tokio::time::Instant, Option<Duration>)>>,
+        tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+        rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Bytes>>,
+    }
+
+    impl NacksFirst {
+        fn new(nacks: usize, reason: ndn_packet::NackReason) -> Arc<Self> {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            Arc::new(Self {
+                nacks,
+                reason,
+                sent: std::sync::Mutex::new(Vec::new()),
+                tx,
+                rx: tokio::sync::Mutex::new(rx),
+            })
+        }
+
+        /// The gaps between the Interests it was handed.
+        fn gaps(&self) -> Vec<Duration> {
+            let sent = self.sent.lock().unwrap();
+            sent.windows(2).map(|w| w[1].0 - w[0].0).collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Connection for NacksFirst {
+        async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+            let interest =
+                Interest::decode(wire.clone()).map_err(|e| AppError::Protocol(e.to_string()))?;
+            let mut sent = self.sent.lock().unwrap();
+            sent.push((tokio::time::Instant::now(), interest.lifetime()));
+            let reply = if sent.len() <= self.nacks {
+                ndn_packet::lp::encode_lp_nack(self.reason, &wire)
+            } else {
+                ndn_packet::encode::DataBuilder::new((*interest.name).clone(), b"x").build()
+            };
+            let _ = self.tx.send(reply);
+            Ok(())
+        }
+        async fn recv(&self) -> Option<Bytes> {
+            self.rx.lock().await.recv().await
+        }
+        async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    async fn fetch_congested(
+        conn: &Arc<NacksFirst>,
+        budget: Duration,
+    ) -> (Result<(Data, u32), AppError>, Duration) {
+        let mut consumer = Consumer::new(crate::DemuxConnection::new(conn.clone()));
+        let name: Name = "/rate/limited".parse().unwrap();
+        let start = tokio::time::Instant::now();
+        let got = consumer
+            .fetch_reexpressing(
+                || InterestBuilder::new(name.clone()),
+                budget,
+                Duration::from_millis(250),
+                doubling(),
+            )
+            .await;
+        (got, start.elapsed())
+    }
+
+    /// An Interest dropped for rate and Nacked `Congestion` is asked again soon, not given up
+    /// on and not left to the 250 ms a lost one waits: the Data comes after the first K
+    /// Nacks, each retry after a pause of half to all of 20 ms doubling, with the lifetime
+    /// left as its lifetime.
+    #[tokio::test(start_paused = true)]
+    async fn a_congestion_nack_is_asked_again_soon() {
+        let conn = NacksFirst::new(3, ndn_packet::NackReason::Congestion);
+        let (got, took) = fetch_congested(&conn, Duration::from_secs(2)).await;
+        let (data, expressed) = got.expect("the fourth Interest is answered");
+        assert_eq!(&*data.name, &"/rate/limited".parse::<Name>().unwrap());
+        assert_eq!(expressed, 4);
+        let gaps = conn.gaps();
+        assert_eq!(gaps.len(), 3);
+        for (k, gap) in gaps.iter().enumerate() {
+            let ceiling = CONGESTION_PAUSE.saturating_mul(1 << k);
+            assert!(
+                *gap >= ceiling / 2 && *gap <= ceiling,
+                "pause {k} was {gap:?}, not within {:?}..={ceiling:?}",
+                ceiling / 2
+            );
+        }
+        assert_eq!(took, gaps.iter().sum::<Duration>());
+        assert!(took <= Duration::from_millis(140), "{took:?}");
+        let lifetimes: Vec<_> = conn
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.1.unwrap())
+            .collect();
+        assert_eq!(lifetimes[0], Duration::from_secs(2));
+        for (k, w) in lifetimes.windows(2).enumerate() {
+            // Lifetimes are carried in whole milliseconds.
+            assert!(
+                (w[0] - w[1]).abs_diff(gaps[k]) <= Duration::from_millis(1),
+                "the lifetime left shrinks by the pause: {w:?} {:?}",
+                gaps[k]
+            );
+        }
+    }
+
+    /// Every other reason is an answer, as before: one Interest, the Nack returned at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_nack_that_is_not_congestion_is_final() {
+        for reason in [
+            ndn_packet::NackReason::NoRoute,
+            ndn_packet::NackReason::NotYet,
+            ndn_packet::NackReason::Duplicate,
+            ndn_packet::NackReason::Other(999),
+        ] {
+            let conn = NacksFirst::new(usize::MAX, reason);
+            let (got, took) = fetch_congested(&conn, Duration::from_secs(2)).await;
+            assert!(
+                matches!(&got, Err(AppError::Nacked { reason: Some(r) }) if *r == reason),
+                "{reason:?}: {got:?}"
+            );
+            assert_eq!(conn.sent.lock().unwrap().len(), 1, "{reason:?}");
+            assert_eq!(took, Duration::ZERO, "{reason:?}");
+        }
+    }
+
+    /// A Nack that never stops costs a fetch [`CONGESTION_RETRIES`] more Interests and at
+    /// most the sum of the pauses' ceilings, 940 ms; then the Nack is the answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_congestion_nack_that_never_stops_is_asked_again_a_bounded_number_of_times() {
+        let conn = NacksFirst::new(usize::MAX, ndn_packet::NackReason::Congestion);
+        let (got, took) = fetch_congested(&conn, Duration::from_secs(2)).await;
+        assert!(
+            matches!(
+                got,
+                Err(AppError::Nacked {
+                    reason: Some(ndn_packet::NackReason::Congestion)
+                })
+            ),
+            "{got:?}"
+        );
+        assert_eq!(
+            conn.sent.lock().unwrap().len(),
+            1 + CONGESTION_RETRIES as usize
+        );
+        assert!(took <= Duration::from_millis(940), "{took:?}");
+        assert!(took >= Duration::from_millis(470), "{took:?}");
+    }
+
+    /// A pause that would leave less than `min_left` of the budget is not taken: the Nack is
+    /// the answer, the lifetime is never overrun.
+    #[tokio::test(start_paused = true)]
+    async fn a_congestion_retry_never_overruns_the_budget() {
+        let conn = NacksFirst::new(usize::MAX, ndn_packet::NackReason::Congestion);
+        let (got, took) = fetch_congested(&conn, Duration::from_millis(255)).await;
+        assert!(matches!(got, Err(AppError::Nacked { .. })), "{got:?}");
+        assert_eq!(conn.sent.lock().unwrap().len(), 1);
+        assert_eq!(took, Duration::ZERO);
+    }
+
+    /// The pause is half to all of its ceiling, the ceiling 20 ms doubling to 160 ms, and
+    /// differs between askers (their first nonces).
+    #[test]
+    fn the_congestion_pause_is_jittered_within_its_ceiling() {
+        let mut seen = std::collections::BTreeSet::new();
+        for nonce in (0..2000u32).map(|k| (4242 << 16) + k) {
+            for retry in 0..12 {
+                let ceiling = CONGESTION_PAUSE
+                    .saturating_mul(1 << retry.min(8))
+                    .min(CONGESTION_PAUSE_MAX);
+                let pause = congestion_pause(nonce, retry);
+                assert!(
+                    pause >= ceiling / 2 && pause <= ceiling,
+                    "{nonce} {retry}: {pause:?} not within {:?}..={ceiling:?}",
+                    ceiling / 2
+                );
+                if retry == 0 {
+                    seen.insert(pause);
+                }
+            }
+        }
+        assert!(seen.len() > 100, "the first pauses differ: {}", seen.len());
     }
 
     #[test]

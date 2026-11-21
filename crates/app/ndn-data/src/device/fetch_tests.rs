@@ -300,6 +300,142 @@ async fn a_reply_refused_as_forged_is_asked_again() {
     dev.shutdown();
 }
 
+/// A forwarder that answers each of the first `nacks` Interests for a name under `/rate` with
+/// a Nack of `reason` (a link dropping Interests over its rate, told as Congestion) and every
+/// later one with a Data under its name; it records when each Interest came.
+struct Nacks {
+    nacks: usize,
+    reason: NackReason,
+    sent: std::sync::Mutex<Vec<Instant>>,
+    tx: futures::channel::mpsc::UnboundedSender<Bytes>,
+    rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
+}
+
+impl Nacks {
+    fn new(nacks: usize, reason: NackReason) -> Arc<Self> {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        Arc::new(Nacks {
+            nacks,
+            reason,
+            sent: std::sync::Mutex::new(Vec::new()),
+            tx,
+            rx: futures::lock::Mutex::new(rx),
+        })
+    }
+
+    fn asked(&self) -> usize {
+        self.sent.lock().unwrap().len()
+    }
+}
+
+#[async_trait::async_trait]
+impl Connection for Nacks {
+    async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+        let Ok(interest) = Interest::decode(wire.clone()) else {
+            return Ok(());
+        };
+        if !interest.name.has_prefix(&n("/rate")) {
+            return Ok(());
+        }
+        let mut sent = self.sent.lock().unwrap();
+        sent.push(Instant::now());
+        let reply = if sent.len() <= self.nacks {
+            ndn_packet::lp::encode_lp_nack(self.reason, &wire)
+        } else {
+            DataBuilder::new((*interest.name).clone(), b"here").build()
+        };
+        let _ = self.tx.unbounded_send(reply);
+        Ok(())
+    }
+    async fn recv(&self) -> Option<Bytes> {
+        self.rx.lock().await.next().await
+    }
+    async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+/// An Interest the link dropped for rate and Nacked `Congestion` is not "not there" (spec
+/// §17.1): it is asked again soon, with a jittered pause that doubles — the first retry
+/// well under [`RTO_MIN`] — and the packet is taken once the link lets it through. The ask
+/// takes the time of the pauses and no sample of the round trip.
+#[tokio::test(start_paused = true)]
+async fn an_interest_nacked_for_rate_is_asked_again_soon() {
+    let conn = Nacks::new(3, NackReason::Congestion);
+    let dev = device_on(conn.clone()).await;
+    let name = n("/rate/limited/one");
+    let start = Instant::now();
+    let got = dev.inner.fetch_once(name.clone(), false).await;
+    let took = start.elapsed();
+    assert!(
+        got.as_ref().is_ok_and(|d| *d.name == name),
+        "the fourth Interest is answered: {:?}",
+        got.map(|d| d.name)
+    );
+    assert_eq!(conn.asked(), 4, "three Nacks, then the Data");
+    let sent = conn.sent.lock().unwrap().clone();
+    let first = sent[1] - sent[0];
+    assert!(
+        first >= ndn_app::consumer::CONGESTION_PAUSE / 2
+            && first <= ndn_app::consumer::CONGESTION_PAUSE
+            && first < RTO_MIN / 8,
+        "the first retry came after {first:?}"
+    );
+    assert!(
+        took <= Duration::from_millis(140),
+        "the retries took {took:?}"
+    );
+    assert!(took < RTO_MIN, "far less than a lost Interest costs");
+    dev.shutdown();
+}
+
+/// Every other reason keeps its meaning: a no-route Nack says the packet is not there, an
+/// answer: asked once, not asked again by the owed fetch either.
+#[tokio::test(start_paused = true)]
+async fn a_no_route_nack_is_still_an_answer() {
+    let conn = Nacks::new(usize::MAX, NackReason::NoRoute);
+    let dev = device_on(conn.clone()).await;
+    let name = n("/rate/nowhere");
+    let start = Instant::now();
+    assert_eq!(
+        dev.inner.fetch_once(name.clone(), false).await.err(),
+        Some(false),
+        "an answer, not a miss to ask again"
+    );
+    assert!(dev.inner.fetch_owed(name, false).await.is_none());
+    assert_eq!(conn.asked(), 2, "one Interest per fetch, none asked again");
+    assert_eq!(start.elapsed(), Duration::ZERO);
+    dev.shutdown();
+}
+
+/// A link that Nacks `Congestion` for ever costs an owed fetch a bounded number of
+/// Interests and time: each of its [`FETCH_TRIES`] asks is one Interest and
+/// [`ndn_app::consumer::CONGESTION_RETRIES`] more, over at most 940 ms of pauses, and
+/// the pauses between the asks; it is a miss to ask again, never an answer.
+#[tokio::test(start_paused = true)]
+async fn a_nack_for_rate_that_never_stops_costs_a_bounded_number_of_asks() {
+    let conn = Nacks::new(usize::MAX, NackReason::Congestion);
+    let dev = device_on(conn.clone()).await;
+    let name = n("/rate/never");
+    assert_eq!(
+        dev.inner.fetch_once(name.clone(), false).await.err(),
+        Some(true),
+        "a miss asking again may mend"
+    );
+    let one = conn.asked();
+    assert_eq!(one, 1 + ndn_app::consumer::CONGESTION_RETRIES as usize);
+    let start = Instant::now();
+    assert!(dev.inner.fetch_owed(name, false).await.is_none());
+    assert_eq!(conn.asked(), one + FETCH_TRIES as usize * one);
+    let pauses: Duration = (0..FETCH_TRIES - 1).map(retry_pause).sum();
+    assert!(
+        start.elapsed() <= Duration::from_millis(940) * FETCH_TRIES + pauses,
+        "{:?}",
+        start.elapsed()
+    );
+    dev.shutdown();
+}
+
 /// A large payload's pieces are fetched a window at once (spec §4.1,
 /// §17.1): pieces that do not come neither stop the walk nor hold back the
 /// pieces behind them. Every piece that does come is fetched and kept in

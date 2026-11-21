@@ -10458,9 +10458,10 @@ impl Inner {
     /// packet: nothing answered in time, the forwarder refused it for now
     /// (a certificate on its chain not to be had yet), or it refused a
     /// reply that does not verify (`bad-signature`: forged or altered on
-    /// the way, spec §17.1). A Nack, any other final refusal or a closed
-    /// connection is an answer. Re-expressed up to [`REEXPRESS_MAX`] times
-    /// ([`Self::fetch_expressed`]).
+    /// the way, spec §17.1), or a Nack with reason Congestion that asking
+    /// again soon did not mend. Any other Nack, any other final refusal or
+    /// a closed connection is an answer. Re-expressed up to
+    /// [`REEXPRESS_MAX`] times ([`Self::fetch_expressed`]).
     async fn fetch_once(&self, name: Name, discover: bool) -> Result<Data, bool> {
         self.fetch_expressed(name, discover, REEXPRESS_MAX).await
     }
@@ -10472,7 +10473,11 @@ impl Inner {
     /// left (spec §17.1). A lost packet then costs about one round-trip
     /// timeout, not the lifetime. An ask its caller asks again under a
     /// fresh name of its own (a custody ask, §13.3) is expressed once
-    /// (`most` 0). The miss is told as in [`Self::fetch_once`].
+    /// (`most` 0). A Nack with reason Congestion — the Interest was dropped
+    /// for rate — is asked again by the consumer after a short jittered
+    /// pause, a bounded number of times within the lifetime
+    /// ([`ndn_app::Consumer::fetch_reexpressing`]), which costs the ask no
+    /// sample of the round trip. The miss is told as in [`Self::fetch_once`].
     async fn fetch_expressed(&self, name: Name, discover: bool, most: u32) -> Result<Data, bool> {
         let Ok(_slot) = self.slots.acquire().await else {
             return Err(false);
@@ -10522,6 +10527,14 @@ impl Inner {
                     ndn_app::AppError::Refused { reason } => {
                         reason == ndn_packet::Refusal::BadSignature || !reason.is_final()
                     }
+                    // The Interest was dropped for rate, and asking again soon
+                    // already failed [`ndn_app::consumer::CONGESTION_RETRIES`]
+                    // times: not an answer, so the owed ask asks again after its
+                    // pause ([`Self::fetch_owed`]), never "not there". The other
+                    // reasons (no route, not yet, duplicate, none) are answers.
+                    ndn_app::AppError::Nacked {
+                        reason: Some(NackReason::Congestion),
+                    } => true,
                     _ => false,
                 })
             }
