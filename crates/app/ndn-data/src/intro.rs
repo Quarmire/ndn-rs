@@ -54,7 +54,7 @@ pub const SECRET_LEN: usize = ndn_trust_envelope::INTRO_SECRET_LEN;
 pub const DEPARTURE_FOR: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// The keyword of an ask's name: `<D>/32=intro/<IntroAsk>`.
-const INTRO: &[u8] = b"intro";
+pub(crate) const INTRO: &[u8] = b"intro";
 
 /// Domain labels of the exchange's derivations.
 const COMMIT: &[u8] = b"ndn-data/intro/commit/1";
@@ -1366,7 +1366,7 @@ pub fn introduction_prefixes(device: &Name) -> [Name; 3] {
 // ---- the hint record --------------------------------------------------------------------------
 
 /// The keyword of a hint record's name: `<D>/32=hint/<token>`.
-const HINT: &[u8] = b"hint";
+pub(crate) const HINT: &[u8] = b"hint";
 
 /// The label a hint token is derived under.
 const HINT_LABEL: &[u8] = b"ndn-data/intro/hint/1";

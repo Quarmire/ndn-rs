@@ -357,6 +357,7 @@ const SIGNAL: &[u8] = b"signal";
 const RUN: &[u8] = b"run";
 const ANSWER: &[u8] = b"answer";
 const QUESTION: &[u8] = b"question";
+pub(crate) const ASK_ANSWER: &[u8] = b"ask-answer";
 
 /// The most payload octets a version carries in its own packet; a larger
 /// payload travels in pieces, whatever the collection's rule (a block never).
@@ -1210,12 +1211,99 @@ pub fn parse_held_name(name: &Name) -> Option<(Name, Name)> {
 /// The octets of an answer id.
 pub const ANSWER_ID_LEN: usize = 32;
 
-/// Whether `name` has an answer or question keyword: `get` takes it as a name of answers
-/// (answers.md §7.1) and answers `BadName` saying how to form it if it is not one.
-pub(crate) fn names_an_answer(name: &Name) -> bool {
-    name.components()
-        .iter()
-        .any(|c| is_kw(c, ANSWER) || is_kw(c, QUESTION))
+/// The keywords of a name that `get` routes by, found in one pass over its components: each
+/// parser `get` would try needs its own keyword in the name, so a name without it skips the
+/// parser. A necessary condition only: the parsers still judge the name (a `32=range` anywhere
+/// is a range name, and an ill-formed one is a `BadName`; an answer or question keyword
+/// anywhere makes it a name of answers, answers.md §7.1, which answers `BadName` saying how to
+/// form one if it is not).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NameWords(u8);
+
+impl NameWords {
+    const LOG: u8 = 1;
+    const ENTRY: u8 = 2;
+    const STATE: u8 = 4;
+    const RANGE: u8 = 8;
+    const ANSWER: u8 = 16;
+
+    pub(crate) fn of(name: &Name) -> Self {
+        let mut bits = 0;
+        for c in name.components() {
+            if c.typ != tlv_type::KEYWORD {
+                continue;
+            }
+            bits |= match c.value.as_ref() {
+                LOG => Self::LOG,
+                ENTRY => Self::ENTRY,
+                STATE => Self::STATE,
+                RANGE => Self::RANGE,
+                ANSWER | QUESTION => Self::ANSWER,
+                _ => 0,
+            };
+        }
+        Self(bits)
+    }
+
+    /// Has an answer or question keyword.
+    pub(crate) fn answer(self) -> bool {
+        self.0 & Self::ANSWER != 0
+    }
+
+    pub(crate) fn log(self) -> bool {
+        self.0 & Self::LOG != 0
+    }
+
+    pub(crate) fn entry(self) -> bool {
+        self.0 & Self::ENTRY != 0
+    }
+
+    pub(crate) fn state(self) -> bool {
+        self.0 & Self::STATE != 0
+    }
+
+    pub(crate) fn range(self) -> bool {
+        self.0 & Self::RANGE != 0
+    }
+}
+
+/// The asks and fetches a device serves by a keyword right after its own name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Served {
+    /// `<granter>/32=grant/<ask>`.
+    Grant,
+    /// `<holder>/32=hold/<ask>`.
+    Hold,
+    /// `<device>/32=intro/<digest>`.
+    Intro,
+    /// `<signer>/32=ask-answer/<digest>`.
+    AnswerAsk,
+    /// `<device>/32=hint/<token>`.
+    Hint,
+    /// `<holder>/32=held/<name>`.
+    Held,
+    /// `<holder>/32=audit/<ask>`.
+    Audit,
+}
+
+/// Which [`Served`] name `name` can be, by one look: each of their parsers takes everything
+/// before its keyword as a device name, which holds no keyword and no digest, so only the
+/// first such component can be that keyword. The parser of the kind still judges the name.
+pub(crate) fn served_kind(name: &Name) -> Option<Served> {
+    let first = name.components().iter().find(|c| !is_plain(c))?;
+    if first.typ != tlv_type::KEYWORD {
+        return None;
+    }
+    match first.value.as_ref() {
+        GRANT => Some(Served::Grant),
+        HOLD => Some(Served::Hold),
+        crate::intro::INTRO => Some(Served::Intro),
+        ASK_ANSWER => Some(Served::AnswerAsk),
+        crate::intro::HINT => Some(Served::Hint),
+        HELD => Some(Served::Held),
+        AUDIT => Some(Served::Audit),
+        _ => None,
+    }
 }
 
 /// An answer's name: `<D>/32=answer/<id>`, `D` the signer's device name, `id` one component of
@@ -4521,5 +4609,153 @@ mod tests {
             decode_audit_answer(encode_audit_answer(&AuditAnswer::Expired)),
             Ok(AuditAnswer::Expired)
         );
+    }
+
+    /// Routing a name by its keyword (`served_kind`, `NameWords`) decides what the chains of
+    /// parsers it replaced decided by trying each: over every name the layer makes, and names
+    /// that mix or misplace keywords, the parser of the kind the keyword picks accepts exactly
+    /// when the first of the old chain that accepted, and a parser is skipped only for a name
+    /// it would refuse.
+    #[test]
+    fn routing_by_keyword_is_what_the_chain_of_parsers_decided() {
+        let device = n("/alice/laptop");
+        let c = n("/alice/32=data/docs/plan");
+        let epoch = Epoch {
+            creator: device.clone(),
+            seq: Seq(3),
+        };
+        let log = log_name(&device, Some(&c), 7);
+        let asker = Bytes::from_static(b"proof");
+        let mut names = vec![
+            Name::from_components([]),
+            n("/alice/laptop"),
+            c.clone(),
+            log.clone(),
+            log_name(&device, None, 2),
+            entry_name(&log, 1),
+            piece_name(&log, PieceKind::Chunk(2)),
+            piece_name(&log, PieceKind::Manifest(0)),
+            state_name(&c, &Frontier::default()),
+            range_name(&c, &Range::Seqs(1, 4)),
+            head_name(&device, &c, 5),
+            root_name(&device, &n("/alice"), 4),
+            node_name(&device, &c, 4),
+            seal_key_name(&device, &[9; 32]),
+            grant_name(
+                &device,
+                &GrantAsk {
+                    seal_key: seal_key_name(&device, &[9; 32]),
+                    collection: c.clone(),
+                    epoch,
+                },
+            ),
+            hold_ask_name(
+                &device,
+                &HoldAsk {
+                    record: log.clone(),
+                    nonce: [1; NONCE_LEN],
+                    asker: asker.clone(),
+                },
+            ),
+            audit_ask_name(
+                &device,
+                &AuditAsk {
+                    nonce: [2; NONCE_LEN],
+                    piece: log.clone(),
+                    whole: true,
+                    asker,
+                },
+            ),
+            held_name(&device, &log),
+            held_name(&device, &n("/bob/phone/32=log/seq=1")),
+            crate::intro::intro_name(&device, b"params"),
+            crate::intro::hint_name(&device, &[3; crate::intro::HINT_TOKEN_LEN]),
+            crate::answer::answer_ask_name(&device, b"params"),
+            answer_name(&device, &[4; ANSWER_ID_LEN]),
+            // Mixed and misplaced keywords: a keyword after another, after a digest, twice.
+            n("/alice/laptop/32=log/32=hold/x"),
+            n("/alice/laptop/32=hold/32=held/x"),
+            n("/alice/laptop/32=held/32=held/x"),
+            n("/alice/32=data/a/32=answer/x"),
+            n("/alice/32=data/a/32=question/x"),
+            n("/alice/laptop/32=log/32=answer/seq=1"),
+            n("/32=grant"),
+            n("/alice/32=grant"),
+            n("/alice/32=range/x"),
+            n("/alice/32=data/a/32=range/x/32=state/y"),
+            n("/alice/laptop/32=audit"),
+            n("/alice/laptop/32=intro"),
+            n("/alice/laptop/32=hint"),
+            n("/alice/laptop/32=ask-answer"),
+        ];
+        names.push(held_name(&device, &log).append_implicit_digest([5; 32]));
+        names.push(
+            device
+                .clone()
+                .append_implicit_digest([5; 32])
+                .append_component(kw(HELD))
+                .append(b"x"),
+        );
+
+        // What `Inner::answer` tried in order, as parsers alone.
+        let chain = |name: &Name| {
+            if parse_grant_name(name).is_some() {
+                Some(Served::Grant)
+            } else if parse_hold_ask_name(name).is_some() {
+                Some(Served::Hold)
+            } else if crate::intro::parse_intro_name(name).is_some() {
+                Some(Served::Intro)
+            } else if crate::answer::parse_answer_ask_name(name).is_some() {
+                Some(Served::AnswerAsk)
+            } else if crate::intro::parse_hint_name(name).is_some() {
+                Some(Served::Hint)
+            } else if parse_held_name(name).is_some() {
+                Some(Served::Held)
+            } else if parse_audit_ask_name(name).is_some() {
+                Some(Served::Audit)
+            } else {
+                None
+            }
+        };
+        let routed = |name: &Name| match served_kind(name)? {
+            Served::Grant => parse_grant_name(name).map(|_| Served::Grant),
+            Served::Hold => parse_hold_ask_name(name).map(|_| Served::Hold),
+            Served::Intro => crate::intro::parse_intro_name(name).map(|_| Served::Intro),
+            Served::AnswerAsk => {
+                crate::answer::parse_answer_ask_name(name).map(|_| Served::AnswerAsk)
+            }
+            Served::Hint => crate::intro::parse_hint_name(name).map(|_| Served::Hint),
+            Served::Held => parse_held_name(name).map(|_| Served::Held),
+            Served::Audit => parse_audit_ask_name(name).map(|_| Served::Audit),
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for name in &names {
+            assert_eq!(routed(name), chain(name), "{name}");
+            seen.extend(chain(name).map(|k| format!("{k:?}")));
+
+            let words = NameWords::of(name);
+            let answers = name
+                .components()
+                .iter()
+                .any(|c| is_kw(c, ANSWER) || is_kw(c, QUESTION));
+            assert_eq!(words.answer(), answers, "{name}");
+            assert!(
+                words.log() || parse_log_name(name).is_none(),
+                "{name}: a log name without 32=log"
+            );
+            assert!(
+                words.entry() || parse_entry_name(name).is_none(),
+                "{name}: an entry name without 32=entry"
+            );
+            assert!(
+                words.state() || parse_state_name(name).is_none(),
+                "{name}: a state name without 32=state"
+            );
+            assert!(
+                words.range() || parse_range_name(name).is_none(),
+                "{name}: a range name without 32=range"
+            );
+        }
+        assert_eq!(seen.len(), 7, "the table reaches every route: {seen:?}");
     }
 }

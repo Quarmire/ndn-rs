@@ -1934,7 +1934,7 @@ impl AnswerAskBody {
 /// `<signer>/32=ask-answer`: an ask for an answer's name before its parameters digest, and what
 /// its sealing binds as associated data.
 pub fn answer_ask_prefix(signer: &Name) -> Name {
-    signer.clone().append_component(wire::kw(b"ask-answer"))
+    signer.clone().append_component(wire::kw(wire::ASK_ANSWER))
 }
 
 /// An ask's name: `<signer>/32=ask-answer/<ParametersSha256Digest>`, the digest over the
@@ -1953,7 +1953,9 @@ pub fn answer_ask_name(signer: &Name, params: &[u8]) -> Name {
 /// The signer `<signer>/32=ask-answer/<ParametersSha256Digest>` asks.
 pub fn parse_answer_ask_name(name: &Name) -> Option<Name> {
     let comps = name.components();
-    let at = comps.iter().position(|c| wire::is_kw(c, b"ask-answer"))?;
+    let at = comps
+        .iter()
+        .position(|c| wire::is_kw(c, wire::ASK_ANSWER))?;
     (wire::is_device_comps(&comps[..at])
         && at + 2 == comps.len()
         && comps[at + 1].typ == tlv_type::PARAMETERS_SHA256

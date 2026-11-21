@@ -15655,80 +15655,100 @@ impl Inner {
 
     async fn answer(self: Arc<Self>, interest: Interest, responder: Responder) {
         let name = (*interest.name).clone();
-        if let Some((granter, ask)) = parse_grant_name(&name)
-            && granter == self.device
-        {
-            // A grant fetches the asker's seal key first: its own task, so
-            // the serving future stays free of fetches (wasm32 timers are
-            // not `Send`).
-            rt::spawn(async move {
-                let reply = self.grant(&name, ask).await;
-                self.reply(&name, responder, reply).await;
-            });
-            return;
-        }
-        if let Some((holder, ask)) = parse_hold_ask_name(&name)
-            && holder == self.device
-        {
-            // Taking a hold verifies the asker and fetches the owner's record
-            // and the collection: its own task.
-            rt::spawn(async move {
-                let reply = self.accept_hold(&name, ask).await;
-                self.reply(&name, responder, reply).await;
-            });
-            return;
-        }
-        if crate::intro::parse_intro_name(&name).is_some_and(|d| d == self.device) {
-            // Answering an ask verifies the asker, writes durably and has
-            // the host adopt the asker's anchor (spec §19.4): its own task.
-            let params = interest.app_parameters().cloned();
-            rt::spawn(async move {
-                let reply = self.answer_intro(&name, params).await;
-                self.reply(&name, responder, reply).await;
-            });
-            return;
-        }
-        if crate::answer::parse_answer_ask_name(&name).is_some_and(|d| d == self.device) {
-            // Answering an ask for an answer opens the ask, verifies the
-            // asker and may compute: its own task (answers.md §15). An ask
-            // that does not authenticate gets no reply at all, not even a
-            // Nack: the Interest is dropped.
-            let params = interest.app_parameters().cloned();
-            let lifetime = interest.lifetime();
-            rt::spawn(async move {
-                match self.answer_ask(&name, params, lifetime).await {
-                    Some(wire) => self.reply(&name, responder, Some(wire)).await,
-                    None => drop(responder),
+        // One look at the name's keyword picks the one ask it can be; the kind's parser
+        // still judges it, and a name that is none of them, or not this device's, is a
+        // packet it serves ([`Self::packet_for`]).
+        match wire::served_kind(&name) {
+            Some(wire::Served::Grant) => {
+                if let Some((granter, ask)) = parse_grant_name(&name)
+                    && granter == self.device
+                {
+                    // A grant fetches the asker's seal key first: its own task, so
+                    // the serving future stays free of fetches (wasm32 timers are
+                    // not `Send`).
+                    rt::spawn(async move {
+                        let reply = self.grant(&name, ask).await;
+                        self.reply(&name, responder, reply).await;
+                    });
+                    return;
                 }
-            });
-            return;
-        }
-        if crate::intro::parse_hint_name(&name).is_some_and(|(d, _)| d == self.device) {
-            // The hint record of a short code (SHAPES-R10 §2), or its gone mark:
-            // made and signed on request, for a token this device holds; a
-            // token it does not is not answered.
-            let reply = self.hint_packet(&name);
-            self.reply(&name, responder, reply).await;
-            return;
-        }
-        if let Some((holder, piece)) = parse_held_name(&name)
-            && holder == self.device
-        {
-            let reply = self
-                .held_packet(&piece)
-                .map(|w| DataBuilder::new(name.clone(), &w).sign_digest_sha256());
-            self.reply(&name, responder, reply).await;
-            return;
-        }
-        if let Some((holder, ask)) = parse_audit_ask_name(&name)
-            && holder == self.device
-        {
-            // Answering verifies the asker first: its own task.
-            rt::spawn(async move {
-                let reply = self.audit_answer(&name, &ask).await;
-                self.reply(&name, responder, reply).await;
-            });
-            return;
+            }
+            Some(wire::Served::Hold) => {
+                if let Some((holder, ask)) = parse_hold_ask_name(&name)
+                    && holder == self.device
+                {
+                    // Taking a hold verifies the asker and fetches the owner's record
+                    // and the collection: its own task.
+                    rt::spawn(async move {
+                        let reply = self.accept_hold(&name, ask).await;
+                        self.reply(&name, responder, reply).await;
+                    });
+                    return;
+                }
+            }
+            Some(wire::Served::Intro) => {
+                if crate::intro::parse_intro_name(&name).is_some_and(|d| d == self.device) {
+                    // Answering an ask verifies the asker, writes durably and has
+                    // the host adopt the asker's anchor (spec §19.4): its own task.
+                    let params = interest.app_parameters().cloned();
+                    rt::spawn(async move {
+                        let reply = self.answer_intro(&name, params).await;
+                        self.reply(&name, responder, reply).await;
+                    });
+                    return;
+                }
+            }
+            Some(wire::Served::AnswerAsk) => {
+                if crate::answer::parse_answer_ask_name(&name).is_some_and(|d| d == self.device) {
+                    // Answering an ask for an answer opens the ask, verifies the
+                    // asker and may compute: its own task (answers.md §15). An ask
+                    // that does not authenticate gets no reply at all, not even a
+                    // Nack: the Interest is dropped.
+                    let params = interest.app_parameters().cloned();
+                    let lifetime = interest.lifetime();
+                    rt::spawn(async move {
+                        match self.answer_ask(&name, params, lifetime).await {
+                            Some(wire) => self.reply(&name, responder, Some(wire)).await,
+                            None => drop(responder),
+                        }
+                    });
+                    return;
+                }
+            }
+            Some(wire::Served::Hint) => {
+                if crate::intro::parse_hint_name(&name).is_some_and(|(d, _)| d == self.device) {
+                    // The hint record of a short code (SHAPES-R10 §2), or its gone mark:
+                    // made and signed on request, for a token this device holds; a
+                    // token it does not is not answered.
+                    let reply = self.hint_packet(&name);
+                    self.reply(&name, responder, reply).await;
+                    return;
+                }
+            }
+            Some(wire::Served::Held) => {
+                if let Some((holder, piece)) = parse_held_name(&name)
+                    && holder == self.device
+                {
+                    let reply = self
+                        .held_packet(&piece)
+                        .map(|w| DataBuilder::new(name.clone(), &w).sign_digest_sha256());
+                    self.reply(&name, responder, reply).await;
+                    return;
+                }
+            }
+            Some(wire::Served::Audit) => {
+                if let Some((holder, ask)) = parse_audit_ask_name(&name)
+                    && holder == self.device
+                {
+                    // Answering verifies the asker first: its own task.
+                    rt::spawn(async move {
+                        let reply = self.audit_answer(&name, &ask).await;
+                        self.reply(&name, responder, reply).await;
+                    });
+                    return;
+                }
+            }
+            None => {}
         }
         let reply = self.packet_for(&name, interest.selectors().can_be_prefix);
         // An ask for this device's own newest root of any namespace: a
@@ -20465,20 +20485,27 @@ impl Device {
 impl DataLayer for Device {
     async fn get(&self, name: &Name) -> Result<Answer, DataError> {
         let inner = &self.inner;
+        // Each reading below needs its own keyword in the name: one pass finds them, so a
+        // plain collection name (the common read) is parsed by none of them.
+        let words = wire::NameWords::of(name);
         // An exact answer name, or a question (answers.md §7.1).
-        if wire::names_an_answer(name) {
+        if words.answer() {
             return inner.get_answer(name).await;
         }
         // A version or entry of a merge collection whose state is not built
         // yet is read from it: built now (spec §5.2). A collection or state
         // name is followed, which builds it ([`Inner::follow`]).
-        let of = parse_entry_name(name)
-            .and_then(|(v, _)| parse_log_name(&v)?.subject)
-            .or_else(|| parse_log_name(name)?.subject);
+        let entry = words.entry().then(|| parse_entry_name(name)).flatten();
+        let of = entry
+            .as_ref()
+            .and_then(|(v, _)| parse_log_name(v)?.subject)
+            .or_else(|| words.log().then(|| parse_log_name(name)?.subject).flatten());
         if let Some(c) = of {
             inner.st.lock().awaken(&c);
         }
-        if let Some((c, at)) = parse_state_name(name) {
+        if words.state()
+            && let Some((c, at)) = parse_state_name(name)
+        {
             inner.look(&c).await?;
             inner.known_under_folder(&c);
             let rules = inner.config.rules.clone();
@@ -20512,10 +20539,12 @@ impl DataLayer for Device {
                 age: Age::Exact,
             });
         }
-        if let Some((version, index)) = parse_entry_name(name) {
+        if let Some((version, index)) = entry {
             return inner.get_entry(name, &version, index).await;
         }
-        if let Some(range) = parse_range_name(name) {
+        if words.range()
+            && let Some(range) = parse_range_name(name)
+        {
             return match range {
                 Ok((c, range)) => {
                     let a = inner.get_range(name, &c, range).await;
@@ -20527,7 +20556,7 @@ impl DataLayer for Device {
                 }),
             };
         }
-        if parse_log_name(name).is_some() {
+        if words.log() && parse_log_name(name).is_some() {
             return inner.get_log_entry(name).await;
         }
         check_collection(name)?;
