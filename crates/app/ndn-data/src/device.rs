@@ -1746,6 +1746,19 @@ const COMMIT_RETRY: Duration = Duration::from_millis(100);
 /// The longest pause between two flushes asked of a store that failed.
 const COMMIT_RETRY_MAX: Duration = Duration::from_secs(30);
 
+/// The `tracing` target of the timeline events (level `trace`): the few seams
+/// a put crosses on its way to another device's watch, each one named by its
+/// message so a recorder can lay one put's journey out in time — `flush_begin`
+/// / `flush_end` (the store's durability barrier of a commit round),
+/// `announce` (the announcement handed to the sync group), `sync_update` (a
+/// notice of another device heard), `fetch_out` / `fetch_in` / `fetch_miss`
+/// (one ask of the network: its name, and how many Interests it expressed),
+/// `verify_begin` / `verify_end` (one signature chain judged) and `watch_send`
+/// (a change handed to a watcher). Disabled, each costs the callsite check
+/// and nothing else; none changes what the device does. The benchmark
+/// `ndn-link/examples/ladder.rs` records them.
+const TIMELINE: &str = "ndn_data::timeline";
+
 /// Why this device owes a collection (or folder) a new members record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Owed {
@@ -2029,6 +2042,7 @@ impl Watcher {
             }));
             return;
         }
+        tracing::trace!(target: TIMELINE, "watch_send");
         let _ = self.tx.try_send(Ok(change));
     }
 }
@@ -9452,6 +9466,7 @@ impl Inner {
     fn on_update(self: &Arc<Self>, ns: &Name, update: SyncUpdate) {
         let device = update.name;
         tracing::trace!(me = %self.device, %ns, %device, high = update.high_seq, "sync update");
+        tracing::trace!(target: TIMELINE, %device, high = update.high_seq, "sync_update");
         if device == self.device {
             return;
         }
@@ -10017,7 +10032,10 @@ impl Inner {
                 st.round += 1;
                 (st.head, st.round, announce)
             };
-            match self.flush().await {
+            tracing::trace!(target: TIMELINE, "flush_begin");
+            let flushed = self.flush().await;
+            tracing::trace!(target: TIMELINE, ok = flushed.is_ok(), "flush_end");
+            match flushed {
                 Ok(()) => {
                     {
                         let mut st = self.st.lock();
@@ -10027,6 +10045,7 @@ impl Inner {
                     self.committed.notify_waiters();
                     self.progress.notify_waiters();
                     for (ns, tx) in announce {
+                        tracing::trace!(target: TIMELINE, %ns, "announce");
                         let _ = tx.send((sync_group(&ns), None)).await;
                         self.herald(&ns);
                     }
@@ -10468,6 +10487,7 @@ impl Inner {
                 b
             }
         };
+        tracing::trace!(target: TIMELINE, %name, "fetch_out");
         let asked = Instant::now();
         let fetched = Consumer::new(self.node.connection())
             .fetch_reexpressing(
@@ -10479,6 +10499,7 @@ impl Inner {
             .await;
         match fetched {
             Ok((d, expressed)) => {
+                tracing::trace!(target: TIMELINE, %name, expressed, "fetch_in");
                 let mut rtt = self.rtt.lock();
                 if expressed == 1 {
                     rtt.sample(asked.elapsed());
@@ -10488,6 +10509,7 @@ impl Inner {
                 Ok(d)
             }
             Err(e) => {
+                tracing::trace!(target: TIMELINE, %name, "fetch_miss");
                 tracing::trace!(me = %self.device, %name, "fetch missed: {e}");
                 Err(match e {
                     ndn_app::AppError::Timeout => {
@@ -10568,7 +10590,14 @@ impl Inner {
             Some(d) => Arc::clone(&d.judge),
             None => self.judge(&data.name),
         };
-        match judge.validate_durable(data).await {
+        tracing::trace!(target: TIMELINE, "verify_begin");
+        let verdict = judge.validate_durable(data).await;
+        tracing::trace!(
+            target: TIMELINE,
+            valid = matches!(verdict, ValidationResult::Valid(_)),
+            "verify_end"
+        );
+        match verdict {
             ValidationResult::Valid(safe)
                 if !matches!(safe.trust_path(), TrustPath::DigestSha256) =>
             {
