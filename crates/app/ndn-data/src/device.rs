@@ -1919,11 +1919,9 @@ struct Peer {
     unreached: bool,
     /// The seq of the last entry a sync notice named that this device took
     /// directly, with nothing between it and the head walked in full
-    /// ([`Inner::take_notice`]), in this run: the head the entries held reach,
-    /// as a walk of a root at it would leave it. Until a walk takes that root
-    /// ([`Peer::walked`]) the summary that lists them is unread
-    /// ([`Peer::unlisted`]) and is read next. Not kept across a restart (the
-    /// walk is made then, spec §12.1).
+    /// ([`Inner::take_notice`]), in this run: the head held, as a walk of a
+    /// root at it would leave it, though no root of it was fetched. Not kept
+    /// across a restart (the walk is made then, spec §12.1).
     applied: u64,
 }
 
@@ -1947,13 +1945,6 @@ impl Peer {
     /// taken directly ([`Peer::applied`]).
     fn settled(&self) -> u64 {
         self.walked.max(self.applied)
-    }
-
-    /// Entries were taken directly from notices, past the head a walk took in
-    /// full: the writer's summary that lists them is not read yet, and is read
-    /// next ([`Inner::refresh_loop`], spec §12.1) until it is.
-    fn unlisted(&self) -> bool {
-        self.applied > self.walked
     }
 
     /// Forget that walks took `subject` in full — what is followed or
@@ -10110,27 +10101,17 @@ impl Inner {
                 };
                 let ok = match direct {
                     Some(heard) => {
-                        tracing::debug!(me = %inner.device, %ns, %device, "its notice settled by the entries it named");
-                        let unlisted = {
-                            let mut st = inner.st.lock();
-                            if let Some(b) =
-                                st.groups.get_mut(&ns).and_then(|g| g.busy.get_mut(&device))
-                            {
-                                b.answered = b.answered.max(heard);
-                            }
-                            st.peers.get(&key).is_some_and(Peer::unlisted)
-                        };
-                        // The entries are held and delivered. What only the
-                        // writer's summary gives — the listing, the
-                        // completeness a `Change::Summary` stands for, and a
-                        // root and nodes this device can answer a reader
-                        // that missed the notice with while the writer is
-                        // away (spec §13.5) — is read next, off the path the
-                        // entries took (spec §12.1).
-                        !unlisted
-                            || inner
-                                .refresh_pass(&ns, &device, &wake, &mut unverified)
-                                .await
+                        tracing::debug!(me = %inner.device, %ns, %device, "its notice settled by the entries it named: no walk");
+                        if let Some(b) = inner
+                            .st
+                            .lock()
+                            .groups
+                            .get_mut(&ns)
+                            .and_then(|g| g.busy.get_mut(&device))
+                        {
+                            b.answered = b.answered.max(heard);
+                        }
+                        true
                     }
                     None => {
                         inner
@@ -10165,8 +10146,7 @@ impl Inner {
                     // no trust context held here judges are not asked for
                     // and spend no try: the adoption that judges them owes
                     // the walk ([`Self::owe_unjudged_roots`]).
-                    let owed = st.owes_walk(&device, &ns)
-                        || st.peers.get(&key).is_some_and(Peer::unlisted);
+                    let owed = st.owes_walk(&device, &ns);
                     let waits =
                         owed || (!ok && misses < REFRESH_TRIES && !st.unheld_roots(&device, &ns));
                     match st.groups.get_mut(&ns) {
@@ -11374,20 +11354,16 @@ impl Inner {
     /// taken, and the walk is left to the loop (`false`) unless
     ///
     /// - a root of `device` was processed in full for what is followed now,
-    ///   nothing is owed ([`St::owes_walk`]), nothing above it is held, and the
-    ///   device is not ended here;
-    /// - the first entry named above the head held follows on exactly what is
-    ///   held: its `prev`, the writer's highest seq in `ns` before it, is the
-    ///   head held, and each next one follows on the one before (one at or
-    ///   below the head held is covered, named by the announcement of another
-    ///   group of the writer or by an earlier notice);
+    ///   nothing is owed ([`St::owes_walk`]) and nothing above it is held;
+    /// - the first entry named follows on exactly what is held: its `prev`,
+    ///   the writer's highest seq in `ns` before it, is the head held, and each
+    ///   next one follows on the one before;
     /// - every entry named is of a collection followed here and not held for
     ///   its owner, which this device is not left out of; and
     /// - every entry named is held or refused by a cut once asked for.
     ///
     /// Held so, the head is as a walk of a root at the last seq would leave it
-    /// ([`Peer::applied`]); the summary that lists the entries is read next
-    /// ([`Inner::refresh_loop`]).
+    /// ([`Peer::applied`]).
     async fn take_notice(
         self: &Arc<Self>,
         ns: &Name,
@@ -11419,13 +11395,6 @@ impl Inner {
             let mut at = p.settled();
             let mut names = Vec::new();
             for e in &mine {
-                // Named before, by the announcement of another group of the
-                // writer (it publishes an entry into each group its
-                // collection's record lists), or by an earlier notice: the
-                // head held covers it.
-                if e.seq <= p.settled() {
-                    continue;
-                }
                 if e.prev != at
                     || !st.inside(&e.subject)
                     || st.holding.contains_key(&e.subject)

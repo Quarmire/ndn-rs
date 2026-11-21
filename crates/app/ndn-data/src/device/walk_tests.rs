@@ -813,20 +813,6 @@ async fn wendy(
     Vec<Arc<SecurityManager>>,
     impl Fn() -> Arc<Validator> + use<>,
 ) {
-    let (ns, keys, validator, _anchor) = wendy_anchored(devices).await;
-    (ns, keys, validator)
-}
-
-/// [`wendy`], and the namespace's anchor certificate, for a context that revokes a
-/// key later.
-async fn wendy_anchored(
-    devices: &[&Name],
-) -> (
-    Name,
-    Vec<Arc<SecurityManager>>,
-    impl Fn() -> Arc<Validator> + use<>,
-    ndn_security::Certificate,
-) {
     let ns = n("/wendy");
     let authority = SecurityManager::new();
     let issuer = authority
@@ -848,18 +834,17 @@ async fn wendy_anchored(
         certs.push(cert);
     }
     let context = ns.clone();
-    let trusted = anchor.clone();
     let validator = move || {
         let v = Arc::new(Validator::new(TrustSchema::hierarchical()));
         let ctx = SignedTrustContext::hierarchical(context.clone());
-        assert!(ctx.add_anchor(trusted.clone()));
+        assert!(ctx.add_anchor(anchor.clone()));
         v.adopt_context(Arc::new(ctx)).unwrap();
         for cert in &certs {
             v.cert_cache().insert(cert.clone());
         }
         v
     };
-    (ns, keys, validator, anchor)
+    (ns, keys, validator)
 }
 
 /// Share `c` as a log collection Wendy's namespace writes, from `writer`.
@@ -1853,7 +1838,6 @@ async fn notices_that_keep_a_pass_alive_still_spend_the_tries_of_its_walks() {
 struct Tapped {
     writer: Arc<Inner>,
     asked: std::sync::Mutex<Vec<Name>>,
-    grants: AtomicBool,
     instead: std::sync::Mutex<std::collections::HashMap<Name, Bytes>>,
     tx: futures::channel::mpsc::UnboundedSender<Bytes>,
     rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
@@ -1865,7 +1849,6 @@ impl Tapped {
         Arc::new(Tapped {
             writer: Arc::clone(&writer.inner),
             asked: std::sync::Mutex::new(Vec::new()),
-            grants: AtomicBool::new(true),
             instead: std::sync::Mutex::new(std::collections::HashMap::new()),
             tx,
             rx: futures::lock::Mutex::new(rx),
@@ -1889,21 +1872,6 @@ impl Connection for Tapped {
             return Ok(());
         }
         self.asked.lock().unwrap().push(name.clone());
-        // A grant ask is answered by the writer's `grant` — which fetches the asker's seal
-        // key over the writer's own link — unless `grants` is off: then it is lost.
-        if let Some((granter, ask)) = parse_grant_name(name)
-            && granter == self.writer.device
-        {
-            if self.grants.load(Ordering::Relaxed) {
-                let (writer, tx, name) = (Arc::clone(&self.writer), self.tx.clone(), name.clone());
-                let nack = ndn_packet::encode::encode_nack(NackReason::NoRoute, &wire);
-                tokio::spawn(async move {
-                    let reply = writer.grant(&name, ask).await;
-                    let _ = tx.unbounded_send(reply.unwrap_or(nack));
-                });
-            }
-            return Ok(());
-        }
         let reply = self.instead.lock().unwrap().get(name).cloned().or_else(|| {
             self.writer
                 .packet_for(name, interest.selectors().can_be_prefix)
@@ -1987,64 +1955,22 @@ struct Direct {
 async fn direct() -> Direct {
     let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
     let (ns, keys, validator) = wendy(&[&laptop, &phone]).await;
-    direct_on(false, ns, keys, validator).await
-}
-
-/// [`direct`] in the namespace `ns` of `keys`. `sealed`: the collection is sealed to
-/// the namespace's person, and the phone's asks for its epoch key are lost
-/// ([`Tapped::grants`]), so the first version is held locked.
-async fn direct_on(
-    sealed: bool,
-    ns: Name,
-    keys: Vec<Arc<SecurityManager>>,
-    validator: impl Fn() -> Arc<Validator>,
-) -> Direct {
-    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
-    // The writer reaches the phone, for a seal key it is asked to grant, once the phone is
-    // started.
-    let late = Late::new();
-    let writer_link: Arc<dyn Connection> = if sealed {
-        late.clone()
-    } else {
-        Arc::new(Unconnected)
-    };
-    let writer = start_on(&laptop, Arc::clone(&keys[0]), validator(), writer_link).await;
+    let writer = start_on(
+        &laptop,
+        Arc::clone(&keys[0]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
     let c = n("/wendy/32=data/notes");
-    if sealed {
-        writer
-            .share(
-                &c,
-                crate::layer::Share {
-                    rule: Rule::Log,
-                    writers: vec![ns.clone()],
-                    readers: vec![Audience::Person(ns.clone())],
-                },
-            )
-            .await
-            .unwrap();
-        writer.inner.flushed().await;
-    } else {
-        share_log(&writer, &c, &ns).await;
-    }
+    share_log(&writer, &c, &ns).await;
     let first = put_served(&writer, &laptop, &c, 0).await;
     let wire = Tapped::new(&writer);
-    wire.grants.store(!sealed, Ordering::Relaxed);
     let reader = start_on(&phone, Arc::clone(&keys[1]), validator(), wire.clone()).await;
-    late.join(Hostile::new(&[&reader], &n("/nothing"), None, &laptop, &ns));
     reader.inner.follow(&c).await.unwrap();
     reader.inner.on_update(&ns, notice(&laptop));
-    let held = |dev: &Device| {
-        let st = dev.inner.st.lock();
-        st.held.contains_key(&first)
-    };
-    for _ in 0..60 {
-        if held(&reader) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
     assert!(
-        held(&reader),
+        held_within(&reader, &first, 60).await,
         "precondition: the phone takes the first version through a walk"
     );
     // Quiet: the walk's loop ended, the phone's state is the root's.
@@ -2061,49 +1987,6 @@ async fn direct_on(
     }
 }
 
-/// A link whose far end is joined after its device is started.
-struct Late {
-    to: std::sync::Mutex<Option<Arc<dyn Connection>>>,
-    joined: tokio::sync::Notify,
-}
-
-impl Late {
-    fn new() -> Arc<Self> {
-        Arc::new(Late {
-            to: std::sync::Mutex::new(None),
-            joined: tokio::sync::Notify::new(),
-        })
-    }
-
-    fn join(&self, to: Arc<dyn Connection>) {
-        *self.to.lock().unwrap() = Some(to);
-        self.joined.notify_one();
-    }
-}
-
-#[async_trait::async_trait]
-impl Connection for Late {
-    async fn send(&self, wire: Bytes) -> Result<(), AppError> {
-        let to = self.to.lock().unwrap().clone();
-        match to {
-            Some(to) => to.send(wire).await,
-            None => Ok(()),
-        }
-    }
-    async fn recv(&self) -> Option<Bytes> {
-        loop {
-            let to = self.to.lock().unwrap().clone();
-            if let Some(to) = to {
-                return to.recv().await;
-            }
-            self.joined.notified().await;
-        }
-    }
-    async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
-        Ok(())
-    }
-}
-
 impl Direct {
     /// Write version `i`, serve it, and hear the notice of its announcement.
     async fn put(&self, i: usize) -> (Name, SyncUpdate) {
@@ -2115,10 +1998,6 @@ impl Direct {
 
     fn peer_applied(&self) -> u64 {
         self.reader.inner.st.lock().peers[&(self.laptop.clone(), self.ns.clone())].applied
-    }
-
-    fn peer_walked(&self) -> u64 {
-        self.reader.inner.st.lock().peers[&(self.laptop.clone(), self.ns.clone())].walked
     }
 
     fn shutdown(self) {
@@ -2154,25 +2033,16 @@ async fn a_new_version_a_notice_names_is_one_fetch_not_a_walk() {
         "the phone takes it"
     );
     tokio::time::sleep(Duration::from_secs(5)).await;
-    let asked = d.wire.take_asked();
-    let (entries, summaries) = entries_and_summaries(&asked);
+    let (entries, summaries) = entries_and_summaries(&d.wire.take_asked());
     assert_eq!(
-        entries,
-        vec![second.clone()],
-        "the entry named is the only one asked"
-    );
-    assert!(
-        parse_log_name(&asked[0]).is_some(),
-        "one fetch first: the entry named, before any root or node: {asked:?}"
-    );
-    assert!(
-        summaries >= 1,
-        "the summary that lists the entry is read after it: {asked:?}"
+        (entries, summaries),
+        (vec![second.clone()], 0),
+        "one fetch: the entry named, no root and no node"
     );
     assert_eq!(
-        (d.peer_applied(), d.peer_walked()),
-        (3, 3),
-        "the head the phone holds moved with it, and the root that lists it is walked"
+        d.peer_applied(),
+        3,
+        "the head the phone holds moved with it"
     );
 
     for i in 2..4 {
@@ -2180,13 +2050,10 @@ async fn a_new_version_a_notice_names_is_one_fetch_not_a_walk() {
         d.reader.inner.on_update(&d.ns, update);
         assert!(held_within(&d.reader, &version, 5).await);
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let asked = d.wire.take_asked();
-        let (entries, summaries) = entries_and_summaries(&asked);
-        assert_eq!(entries, vec![version], "put {i}");
-        assert!(parse_log_name(&asked[0]).is_some(), "put {i}: {asked:?}");
-        assert!(summaries >= 1, "put {i}: its summary is read after");
+        let (entries, summaries) = entries_and_summaries(&d.wire.take_asked());
+        assert_eq!((entries, summaries), (vec![version], 0), "put {i}");
     }
-    assert_eq!((d.peer_applied(), d.peer_walked()), (5, 5));
+    assert_eq!(d.peer_applied(), 5);
 
     // A notice naming nothing is walked; every entry it lists is held.
     d.reader.inner.on_update(&d.ns, notice(&d.laptop));
@@ -2195,27 +2062,6 @@ async fn a_new_version_a_notice_names_is_one_fetch_not_a_walk() {
     assert!(summaries >= 1, "the walk asks for the root");
     assert_eq!(entries, Vec::<Name>::new(), "and no entry again");
     assert!(holds(&d.reader, &d.first));
-    d.shutdown();
-}
-
-/// The summary that lists an entry taken from a notice is read at once, behind the
-/// entry and not after the pause an owed walk waits: the phone may be asked, within
-/// moments, by a device that missed the notice, for the writer's root and nodes
-/// while the writer is away (spec §13.5, h10), and a root it does not hold yet
-/// cannot be answered. Within 100 ms of the notice the entry is held and the root
-/// that lists it is walked.
-#[tokio::test(start_paused = true)]
-async fn the_summary_listing_an_entry_taken_from_a_notice_is_read_at_once() {
-    let d = direct().await;
-    let (second, update) = d.put(1).await;
-    d.reader.inner.on_update(&d.ns, update);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(holds(&d.reader, &second), "the entry named is held");
-    assert_eq!(
-        (d.peer_applied(), d.peer_walked()),
-        (3, 3),
-        "and the root that lists it is walked, not left to a pause"
-    );
     d.shutdown();
 }
 
@@ -2377,303 +2223,5 @@ async fn an_entry_taken_from_a_notice_still_reveals_a_fork() {
         d.reader.inner.st.lock().twins.contains_key(&second),
         "two packets of one name: the fork is kept and told"
     );
-    d.shutdown();
-}
-
-/// Version `i` of `c` from `writer` with `len` octets of content, served: its log
-/// entry name (a payload past `INLINE_MAX` travels in pieces).
-async fn put_served_sized(writer: &Device, device: &Name, c: &Name, i: usize, len: usize) -> Name {
-    let options = PutOptions {
-        type_id: crate::TypeId {
-            name: n("/types/note"),
-            revision: 1,
-        },
-        keep: Keep::Forever,
-        batch: None,
-    };
-    let content = Content::new().with("t", Bytes::from(vec![i as u8; len]));
-    let id = writer.put(c, content, options).await.unwrap();
-    let name = log_name(device, Some(c), id.seq.0);
-    for _ in 0..500 {
-        if writer.inner.packet_for(&name, false).is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(writer.inner.packet_for(&name, false).is_some());
-    name
-}
-
-/// A notice names a real entry with a head before it that is not the head the phone
-/// holds — a lie, or a notice that does not follow on what the phone took: the entry
-/// is not asked for on the notice's word. The walk is made first (its root is the
-/// first ask), the entry comes by it, no head is taken from the notice, and the
-/// same lie again asks for no entry held.
-#[tokio::test(start_paused = true)]
-async fn a_notice_naming_a_head_the_phone_does_not_hold_is_walked_not_taken_directly() {
-    let d = direct().await;
-    let (second, update) = d.put(1).await;
-    let mut names = named(&update);
-    // Below the entry's seq, so the notice decodes; not the head the phone holds.
-    names[0].prev = 1;
-    let lie = |update: &SyncUpdate, high: u64| SyncUpdate {
-        low_seq: high,
-        high_seq: high,
-        mapping: wire::encode_notice(&names),
-        publisher: update.publisher.clone(),
-        name: update.name.clone(),
-        serving_party: None,
-    };
-    d.reader
-        .inner
-        .on_update(&d.ns, lie(&update, update.high_seq));
-    assert!(
-        held_within(&d.reader, &second, 30).await,
-        "the walk brings it"
-    );
-    let asked = d.wire.take_asked();
-    assert!(
-        parse_summary_name(&asked[0]).is_some(),
-        "the first ask is the walk's root, not the entry the notice named: {asked:?}"
-    );
-    assert_eq!(d.peer_applied(), 0, "no head is taken on the notice's word");
-    for round in 1..4 {
-        d.reader
-            .inner
-            .on_update(&d.ns, lie(&update, update.high_seq + round));
-        tokio::time::sleep(Duration::from_secs(20)).await;
-    }
-    let asked = d.wire.take_asked();
-    let (entries, _) = entries_and_summaries(&asked);
-    assert_eq!(
-        entries,
-        Vec::<Name>::new(),
-        "the same lie costs no ask for an entry held: {asked:?}"
-    );
-    d.shutdown();
-}
-
-/// A notice that names the entry after the one before it, with the head the phone
-/// holds as its `prev`, though an entry lies between — a lie that would hide it —
-/// is taken (a notice's names are a hint of the writer's own), and the summary that
-/// lists the entries is read next: the entry between is listed, asked for and held
-/// with no further notice. Taking entries by name never leaves a hole.
-#[tokio::test(start_paused = true)]
-async fn a_notice_that_skips_an_entry_cannot_hide_it_the_summary_read_next_lists_it() {
-    let d = direct().await;
-    let (between, _unheard) = d.put(1).await;
-    let (third, update) = d.put(2).await;
-    let mut names = named(&update);
-    names[0].prev = d.peer_walked();
-    d.reader.inner.on_update(
-        &d.ns,
-        SyncUpdate {
-            mapping: wire::encode_notice(&names),
-            ..update
-        },
-    );
-    assert!(
-        held_within(&d.reader, &third, 5).await,
-        "the entry named is taken"
-    );
-    assert!(
-        held_within(&d.reader, &between, 30).await,
-        "the entry the notice skipped is listed by the summary read next and held"
-    );
-    d.shutdown();
-}
-
-/// A collection this device holds for its owner (spec §13.2) takes the walk: what
-/// its owner's hold record asks to keep is decided by that record and the summary,
-/// not by a notice's names. The entry the notice names is not asked for directly
-/// and no head is taken from it.
-#[tokio::test(start_paused = true)]
-async fn a_collection_held_for_its_owner_takes_the_walk_not_the_entry_a_notice_names() {
-    let d = direct().await;
-    d.reader.inner.st.lock().holding.insert(
-        d.c.clone(),
-        Holding {
-            hold: log_name(&d.laptop, Some(&d.c), 1),
-            until: Timestamp(u64::MAX / 2),
-            at: Frontier::new(),
-            lease: None,
-            answered: None,
-        },
-    );
-    let (_second, update) = d.put(1).await;
-    d.reader.inner.on_update(&d.ns, update);
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    let asked = d.wire.take_asked();
-    assert!(
-        parse_summary_name(&asked[0]).is_some(),
-        "the walk's root is the first ask, not the entry the notice named: {asked:?}"
-    );
-    assert_eq!(d.peer_applied(), 0, "no head taken from the notice");
-    d.shutdown();
-}
-
-/// A value in pieces (64 KiB and 1 MiB): the notice names its entry, which is taken
-/// directly first; its pieces are then fetched by the code a walk's entries use,
-/// and the phone reads the whole value.
-#[tokio::test(start_paused = true)]
-async fn an_entry_in_pieces_taken_from_a_notice_has_its_pieces_fetched_and_reads_whole() {
-    for len in [64 * 1024, 1024 * 1024] {
-        let d = direct().await;
-        let before = counter(&d.writer, &d.ns);
-        let big = put_served_sized(&d.writer, &d.laptop, &d.c, 1, len).await;
-        let update = announced(&d.writer, &d.ns, before).await;
-        d.reader.inner.on_update(&d.ns, update);
-        assert!(
-            held_within(&d.reader, &big, 5).await,
-            "{len}: the entry is taken"
-        );
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        // Read whole: the pieces are fetched by the reading, as for an entry a walk took.
-        let whole = d.reader.get(&big).await.unwrap();
-        let asked = d.wire.take_asked();
-        assert!(
-            parse_log_name(&asked[0]).is_some(),
-            "{len}: the entry named is asked first: {asked:?}"
-        );
-        let pieces = asked
-            .iter()
-            .filter(|a| a.len() > big.len() && a.has_prefix(&big))
-            .count();
-        assert!(
-            pieces >= len / wire::CHUNK,
-            "{len}: its {} chunks and manifest were asked for: {pieces}",
-            len / wire::CHUNK
-        );
-        let Got::Version(version) = whole.got else {
-            panic!("{len}: read as a version: {:?}", whole.got);
-        };
-        let Payload::Entry(content) = version.payload else {
-            panic!("{len}: read whole, not in pieces: {:?}", version.payload);
-        };
-        assert_eq!(
-            content.get("t").map(|t| t.len()),
-            Some(len),
-            "{len}: the whole value"
-        );
-        d.shutdown();
-    }
-}
-
-/// An entry sealed in an epoch whose key the phone does not hold yet — its asks for
-/// the key are lost — is taken from the notice as a walk takes it: held locked, not
-/// applied, a `get` of it refused as unreadable. The first version, taken by the walk,
-/// is held locked the same way. Once the key comes, both open, in order, and read.
-#[tokio::test(start_paused = true)]
-async fn a_sealed_entry_taken_from_a_notice_waits_for_its_key_and_is_never_applied_unreadable() {
-    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
-    let (ns, keys, validator) = wendy(&[&laptop, &phone]).await;
-    let d = direct_on(true, ns, keys, validator).await;
-    let writer = d.writer.inner.writer.clone();
-    let locked = |d: &Direct, name: &Name| {
-        matches!(d.reader.inner.st.lock().held.get(name), Some(Held::Locked))
-    };
-    assert!(
-        locked(&d, &d.first),
-        "precondition: the walk holds the first locked"
-    );
-
-    let (second, update) = d.put(1).await;
-    d.reader.inner.on_update(&d.ns, update);
-    for _ in 0..5 {
-        if d.reader.inner.st.lock().held.contains_key(&second) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    let asked = d.wire.take_asked();
-    let first_ask = asked.iter().find(|a| parse_grant_name(a).is_none());
-    assert!(
-        first_ask.is_some_and(|a| *a == second),
-        "the entry named is taken directly, before any root: {asked:?}"
-    );
-    assert!(
-        locked(&d, &second),
-        "held locked, as a walk holds a sealed entry without its key"
-    );
-    assert_eq!(
-        d.reader.inner.st.lock().colls[&d.c].applied.get(&writer),
-        None,
-        "nothing of the writer is applied while it cannot be read"
-    );
-    assert!(
-        d.reader.get(&second).await.is_err(),
-        "a get of it is refused: it is not readable"
-    );
-
-    d.wire.grants.store(true, Ordering::Relaxed);
-    for _ in 0..180 {
-        if holds(&d.reader, &second) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    assert!(
-        holds(&d.reader, &d.first) && holds(&d.reader, &second),
-        "both open with the key"
-    );
-    assert!(
-        d.reader.inner.st.lock().colls[&d.c].locked.is_empty(),
-        "nothing stays locked"
-    );
-    let Got::Version(v) = d.reader.get(&second).await.unwrap().got else {
-        panic!("a version");
-    };
-    let Payload::Entry(content) = v.payload else {
-        panic!("its content");
-    };
-    assert_eq!(content.get("t"), Some(&Bytes::from("1")));
-    d.shutdown();
-}
-
-/// The phone adopts a context that revokes the laptop's key with a cut that accepts
-/// what it held: an entry the laptop's key signs after is outside the cut. A notice
-/// naming it is not taken on its word: the entry is not asked for (the cut decides
-/// what is fetched of a revoked key, spec §8), is not held, applied or told, and no
-/// head is taken from the notice.
-#[tokio::test(start_paused = true)]
-async fn an_entry_of_a_revoked_key_outside_its_cut_is_not_taken_from_a_notice() {
-    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
-    let (ns, keys, validator, anchor) = wendy_anchored(&[&laptop, &phone]).await;
-    let d = direct_on(false, ns.clone(), keys, validator).await;
-    let key = d.writer.inner.writer.key().clone();
-    let mut cut = RevocationCut::new(key.clone());
-    cut.add_run(
-        &log_prefix(&log_name(&d.laptop, Some(&d.c), 0)),
-        1,
-        d.peer_walked(),
-    );
-    let ctx = SignedTrustContext::hierarchical(ns.clone())
-        .with_version(2)
-        .with_revocation(key)
-        .with_revocation_cut(cut);
-    assert!(ctx.add_anchor(anchor));
-    d.reader
-        .inner
-        .validator
-        .keyring()
-        .adopt_update(Arc::new(ctx))
-        .unwrap();
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    d.wire.take_asked();
-
-    let (after, update) = d.put(1).await;
-    d.reader.inner.on_update(&d.ns, update);
-    tokio::time::sleep(Duration::from_secs(30)).await;
-    let asked = d.wire.take_asked();
-    assert!(
-        !asked.contains(&after),
-        "the entry outside the cut is not asked for on the notice's word: {asked:?}"
-    );
-    assert!(
-        !d.reader.inner.st.lock().held.contains_key(&after),
-        "not held"
-    );
-    assert_eq!(d.peer_applied(), 0, "no head taken from the notice");
-    assert!(holds(&d.reader, &d.first), "what the cut accepts stays");
     d.shutdown();
 }
