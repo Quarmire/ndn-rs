@@ -18,7 +18,9 @@ use ndn_transport::{ErasedTransport, Face, FaceId, LpLinkService};
 async fn a_nack_leaves_a_reliable_face_as_a_nack() {
     let (transport, handle) = InProcFace::new(FaceId(1), 128);
     let transport: Arc<dyn ErasedTransport> = Arc::new(transport);
-    let service = Arc::new(LpLinkService::with_reliability(ReliabilityConfig::ethernet()));
+    let service = Arc::new(LpLinkService::with_reliability(
+        ReliabilityConfig::ethernet(),
+    ));
     let (_engine, shutdown) = EngineBuilder::new(EngineConfig::default())
         .face_composed(Face::from_parts(transport, service))
         .build()

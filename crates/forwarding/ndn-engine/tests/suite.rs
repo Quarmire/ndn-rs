@@ -49,10 +49,10 @@ mod path_control;
 mod personal_namespace_not_held;
 #[path = "pit_fan_out_witness.rs"]
 mod pit_fan_out_witness;
-#[path = "reliable_face_nack.rs"]
-mod reliable_face_nack;
 #[path = "rejected_interest_pit.rs"]
 mod rejected_interest_pit;
+#[path = "reliable_face_nack.rs"]
+mod reliable_face_nack;
 #[path = "self_learning.rs"]
 mod self_learning;
 #[path = "simultaneous_interests.rs"]
