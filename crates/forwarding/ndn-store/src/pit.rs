@@ -237,6 +237,14 @@ pub struct PitEntry {
     pub upstream_lost: bool,
 }
 
+/// The instant, in nanoseconds, `ms` milliseconds after `now_ns`. Saturates:
+/// a lifetime or freshness is a sender's number, and one past the clock's
+/// range means "never" — not a panic in debug nor a deadline wrapped into the
+/// past in release.
+pub fn deadline_after_ms(now_ns: u64, ms: u64) -> u64 {
+    now_ns.saturating_add(ms.saturating_mul(1_000_000))
+}
+
 impl PitEntry {
     pub fn new(name: Arc<Name>, now: u64, lifetime_ms: u64) -> Self {
         Self {
@@ -247,7 +255,7 @@ impl PitEntry {
             nonces_seen: SmallVec::new(),
             is_satisfied: false,
             created_at: now,
-            expires_at: now + lifetime_ms * 1_000_000,
+            expires_at: deadline_after_ms(now, lifetime_ms),
             persistent: None,
             forward_cancelled: false,
             upstream_lost: false,
@@ -1416,5 +1424,18 @@ mod retx_suppression_tests {
         assert_eq!(e.out_records.len(), 2, "one record per upstream, renewed");
         let r3 = e.out_records.iter().find(|r| r.face_id == 3).unwrap();
         assert_eq!((r3.last_nonce, r3.sent_at), (11, 500), "renewed, not stale");
+    }
+
+    /// The lifetime is the sender's: an entry made for an enormous one has a
+    /// deadline that saturates (a panic in debug, a deadline wrapped into the
+    /// past in release, which expired the entry at once).
+    #[test]
+    fn an_enormous_lifetime_saturates_the_deadline() {
+        let e = PitEntry::new(
+            Arc::new(Name::from_components(Vec::<NameComponent>::new())),
+            5,
+            u64::MAX,
+        );
+        assert_eq!(e.expires_at, u64::MAX);
     }
 }

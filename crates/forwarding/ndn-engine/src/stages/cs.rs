@@ -7,7 +7,7 @@ use crate::pipeline::{Action, DecodedPacket, PacketContext};
 use crate::revocation_purge;
 use ndn_packet::CachePolicyType;
 use ndn_security::Validator;
-use ndn_store::{CsAdmissionPolicy, CsMeta, ErasedContentStore};
+use ndn_store::{CsAdmissionPolicy, CsMeta, ErasedContentStore, deadline_after_ms};
 
 use crate::stages::decode::LpCachePolicy;
 
@@ -119,7 +119,7 @@ impl CsInsertStage {
             // make fresh again until it caught up.
             let stale_at = match freshness_ms {
                 0 => 0,
-                ms => now_ns + ms * 1_000_000,
+                ms => deadline_after_ms(now_ns, ms),
             };
 
             // Stamped with the revocation epoch read before validation, so
@@ -548,6 +548,40 @@ mod tests {
         assert!(
             cs.get_erased(&Interest::new(name), NOW).await.is_none(),
             "unverified Data must NOT enter the CS (D.12 fail-secure)"
+        );
+    }
+
+    /// FreshnessPeriod is the sender's: an enormous one (here `u64::MAX` ms)
+    /// must not overflow the nanosecond deadline (a panic in debug, a wrapped
+    /// deadline in release that made the Data stale at once). It saturates:
+    /// the Data stays fresh as long as the clock can say.
+    #[tokio::test]
+    async fn an_enormous_freshness_period_saturates_instead_of_overflowing() {
+        const T: u64 = 5_000_000_000;
+        let name = ndn_packet::name!("/test/fresh/enormous");
+        let wire = DataBuilder::new(name.clone(), b"x")
+            .freshness(std::time::Duration::from_millis(u64::MAX))
+            .sign_sync(SignatureType::DigestSha256, None, |_| {
+                Bytes::from_static(&[0u8; 32])
+            });
+        let data = Data::decode(wire.clone()).unwrap();
+        let mut data_ctx = PacketContext::new(wire, FaceId(0), T);
+        data_ctx.name = Some(Arc::clone(&data.name));
+        data_ctx.packet = DecodedPacket::Data(Box::new(data));
+        data_ctx.verified = true;
+
+        let (insert, cs) = make_insert_stage();
+        insert.process(data_ctx).await;
+        let lookup = CsLookupStage {
+            cs: cs as Arc<dyn ndn_store::ErasedContentStore>,
+            validator: None,
+        };
+        let wire = InterestBuilder::new(name).must_be_fresh().build();
+        let mut ctx = interest_ctx(wire);
+        ctx.arrival = T + 1_000_000_000;
+        assert!(
+            matches!(lookup.process(ctx).await, Action::Satisfy(_)),
+            "a Data whose FreshnessPeriod exceeds the clock's range stays fresh"
         );
     }
 }

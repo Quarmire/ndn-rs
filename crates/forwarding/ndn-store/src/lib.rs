@@ -47,6 +47,7 @@ pub use lru_cs::LruCs;
 pub use observable_cs::{CsEvent, CsObserver, ObservableCs};
 pub use pit::{
     InRecord, NameHashes, OutRecord, PersistentState, Pit, PitEntry, PitKeyDiscriminator, PitToken,
+    deadline_after_ms,
 };
 pub use sharded_cs::ShardedCs;
 #[cfg(feature = "sqlite-cs")]

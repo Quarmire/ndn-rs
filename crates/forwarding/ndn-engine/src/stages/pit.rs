@@ -6,7 +6,7 @@ use crate::observability::targets as t;
 use crate::pipeline::{Action, DecodedPacket, DownstreamInterest, DropReason, PacketContext};
 use ndn_store::{
     DeadNonceList, InRecord, NameHashes, NonceFingerprint, PersistentState, Pit, PitEntry,
-    PitKeyDiscriminator, PitToken,
+    PitKeyDiscriminator, PitToken, deadline_after_ms,
 };
 use ndn_transport::FaceId;
 
@@ -124,7 +124,7 @@ impl PitCheckStage {
         // ([`Pit::note_full_name_interest`]).
         if !subscription_flavored && ends_in_implicit_digest(&key_name) {
             self.pit
-                .note_full_name_interest(now_ns.saturating_add(lifetime_ms * 1_000_000));
+                .note_full_name_interest(deadline_after_ms(now_ns, lifetime_ms));
         }
         // Persistent (SubscriptionRequest) Interests occupy a distinct PIT
         // entry from classical Interests at the same logical name.
@@ -216,7 +216,7 @@ impl PitCheckStage {
                 // Before its in-record is added: whether this face is a new
                 // downstream of the entry (see the no-out-record rule below).
                 let new_downstream = !entry.in_records.iter().any(|r| r.face_id == ctx.face_id.0);
-                let expires_at = now_ns + lifetime_ms * 1_000_000;
+                let expires_at = deadline_after_ms(now_ns, lifetime_ms);
                 // NS-11 (with the always-re-forward below): a persistent re-express
                 // from a face REPLACES that face's prior standing in-record rather
                 // than accumulating a second one — so the subscriber's credit pool
@@ -311,7 +311,7 @@ impl PitCheckStage {
                 entry.add_in_record_with_persistent(
                     ctx.face_id.0,
                     nonce,
-                    now_ns + lifetime_ms * 1_000_000,
+                    deadline_after_ms(now_ns, lifetime_ms),
                     ctx.lp_pit_token.clone(),
                     in_selector.clone(),
                     persistent.clone(),
@@ -378,7 +378,9 @@ impl PitCheckStage {
             match subscription_validation(v, interest).await {
                 InterestValidationOutcome::Valid => {
                     let now = ctx.arrival;
-                    let reap_at = now + (sub_req.max_lifetime_secs as u64) * 1_000_000_000;
+                    let reap_at = now.saturating_add(
+                        (sub_req.max_lifetime_secs as u64).saturating_mul(1_000_000_000),
+                    );
                     // Re-attach across face churn (F15): if this subscription
                     // carries a SubscriptionId and a budget was parked when its
                     // previous face was torn down, splice the *surviving* credit
@@ -1246,6 +1248,44 @@ mod n06_dead_nonce_engine_tests {
         assert!(
             !hashes(&pit, arrival + two_hours),
             "past the forwarder's maximum InterestLifetime"
+        );
+    }
+
+    /// InterestLifetime is the sender's: the forwarder caps it at
+    /// `MAX_INTEREST_LIFETIME`, and the deadline it makes (arrival plus that
+    /// lifetime, in nanoseconds) saturates instead of overflowing, however
+    /// late the clock reads (a panic in debug, a deadline wrapped into the
+    /// past in release).
+    #[tokio::test]
+    async fn an_interest_deadline_saturates_instead_of_overflowing() {
+        let pit = Arc::new(Pit::new());
+        let check = PitCheckStage {
+            pit: Arc::clone(&pit),
+            face_table: Arc::new(ndn_transport::FaceTable::new()),
+            dead_nonce_list: None,
+            validator: None,
+            replay_guard: None,
+        };
+        let arrival = u64::MAX - 1_000;
+        let wire = InterestBuilder::new(ndn_packet::name!("/audit/overflow/lifetime"))
+            .lifetime(std::time::Duration::from_millis(u64::MAX))
+            .build();
+        let interest = Interest::decode(wire.clone()).unwrap();
+        let mut ctx = PacketContext::new(wire, FaceId(1), arrival);
+        ctx.name = Some(Arc::clone(&interest.name));
+        ctx.packet = DecodedPacket::Interest(Box::new(interest));
+        let Action::Continue(ctx) = check.process(ctx).await else {
+            panic!("the Interest is admitted");
+        };
+        let token = ctx.pit_token.expect("the entry has a token");
+        let (entry_deadline, in_record_deadline) = pit
+            .with_entry(&token, |e| (e.expires_at, e.in_records[0].expires_at))
+            .expect("the entry exists");
+        assert_eq!(entry_deadline, u64::MAX, "the entry's deadline saturates");
+        assert_eq!(
+            in_record_deadline,
+            u64::MAX,
+            "the in-record's deadline saturates"
         );
     }
 
