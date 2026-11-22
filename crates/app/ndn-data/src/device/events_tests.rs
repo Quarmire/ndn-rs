@@ -11,7 +11,7 @@ use ndn_sync::{MemoryStore, StoreOp};
 
 use super::durability_tests::Engine;
 
-use super::group_tests::{
+use super::test_kit::{
     Made, Unconnected, budget, give, id, key, log_share, made, n, plan, version,
 };
 use super::*;
@@ -327,7 +327,7 @@ async fn another_signature_value_over_the_same_signed_region_is_not_an_equivocat
         dev.inner.st.lock().twins.is_empty(),
         "no second packet is kept as evidence of what the key never signed twice"
     );
-    let seen = super::group_tests::drain(&mut changes).await;
+    let seen = super::test_kit::drain(&mut changes).await;
     assert!(
         !seen
             .iter()
@@ -664,7 +664,7 @@ async fn a_flood_is_bounded_and_the_first_event_of_each_kind_and_subject_survive
     );
     // The evidence stays re-derivable from the entries held: a watch lists the equivocations.
     let mut changes = dev.watch(&plan(), &Frontier::new()).await.unwrap();
-    let seen = super::group_tests::drain(&mut changes).await;
+    let seen = super::test_kit::drain(&mut changes).await;
     assert!(
         seen.iter().any(|c| matches!(c, Change::Equivocation { first, .. } if first.id() == &id("/carol/dev19", 7))),
         "an equivocation whose event was not kept is still listed by a watch"

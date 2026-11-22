@@ -108,7 +108,7 @@ pub use layer::{
     NotCounted, PutOptions, Share, ShareChange, Sharing, State,
 };
 pub use merge::{
-    Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value, Yrs, owns,
+    Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value, Yrs,
 };
 pub use ndn_foundation_types::{Hash, Name};
 pub use signal::{SignalKey, SignalRefusal, SignalScope, SignalSender};

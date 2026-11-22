@@ -124,32 +124,8 @@ pub trait MergeRule: Send + Sync {
 
     /// An empty state of `collection`, in which `local` (this device's
     /// writer) may edit. The collection's name says whose it is: its owner
-    /// devices are those [`owns`] answers for.
+    /// devices are those [`crate::wire::owns`] answers for.
     fn start(&self, collection: &Name, local: &Writer) -> Box<dyn MergeState>;
-}
-
-/// Whether `writer` is an owner device of `collection`: its device — the
-/// key name `<D>/KEY/<key-id>` without `KEY/<key-id>` — lies under the
-/// collection's namespace, the components before its `32=data` marker
-/// (spec §3). Alice's laptop and phone both own `/alice/32=data/notes`;
-/// Bob's laptop does not. It depends on the two names alone, never on what
-/// a device holds, so every member judges a writer alike in any arrival
-/// order; the layer judges its owner rule by this same test.
-///
-/// The owner rule also asks which held trust context governs the device:
-/// a device of a longer namespace held beside the collection's (a
-/// `/home/bob` device, for `/home/32=data/x`) is that namespace's device,
-/// not an owner. Names alone cannot tell that, and a rule's answer may not
-/// depend on the contexts one member holds, so `owns` answers the name
-/// half: whether `D` lies under the namespace — what a reader holding the
-/// collection's namespace and no longer one under it concludes.
-///
-/// A revoked owner device, or one outside a cut, needs no handling here:
-/// its versions the layer refuses never reach [`MergeState::apply`].
-pub fn owns(collection: &Name, writer: &Writer) -> bool {
-    let key = writer.key();
-    crate::wire::device_len(key)
-        .is_some_and(|n| crate::wire::device_owns(collection, &key.components()[..n]))
 }
 
 /// One collection's state under a merge rule.
@@ -678,41 +654,5 @@ mod tests {
                 .is_some(),
             "held back is not dropped"
         );
-    }
-
-    #[test]
-    fn owns_is_a_device_of_the_collections_namespace() {
-        let notes = n("/alice/32=data/notes/p1");
-        // Every device of the namespace owns it, the namespace's own key too.
-        for key in [
-            "/alice/laptop/KEY/1",
-            "/alice/phone/KEY/7",
-            "/alice/member/tablet/KEY/2",
-            "/alice/KEY/1",
-        ] {
-            assert!(owns(&notes, &w(key)), "{key} owns {notes}");
-        }
-        // Another namespace's device, one whose name only starts alike, and
-        // a name that is no key name do not.
-        for key in [
-            "/bob/laptop/KEY/1",
-            "/alicia/laptop/KEY/1",
-            "/alice/laptop",
-            "/alice/laptop/KEY",
-        ] {
-            assert!(!owns(&notes, &w(key)), "{key} does not own {notes}");
-        }
-        // The namespace ends at the marker, however many components it has:
-        // the folder and every collection under it alike.
-        let home = n("/home/bob/32=data/x");
-        assert!(owns(&home, &w("/home/bob/member/laptop/KEY/1")));
-        assert!(!owns(&home, &w("/home/member/hub/KEY/1")));
-        assert!(owns(
-            &n("/home/32=data/x"),
-            &w("/home/bob/member/laptop/KEY/1")
-        ));
-        assert!(owns(&n("/alice/32=data"), &w("/alice/laptop/KEY/1")));
-        // A name that is no data name has no owner.
-        assert!(!owns(&n("/alice/notes"), &w("/alice/laptop/KEY/1")));
     }
 }

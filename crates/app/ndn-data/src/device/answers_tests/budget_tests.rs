@@ -103,7 +103,7 @@ fn state_read(i: usize) -> ReadRef {
     let mut at = Parents::new();
     at.insert(
         &VersionId {
-            writer: Writer::new(super::super::group_tests::key("/alice/laptop")),
+            writer: Writer::new(super::super::test_kit::key("/alice/laptop")),
             seq: Seq(1),
         },
         Some([i as u8; 32]),

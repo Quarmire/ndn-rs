@@ -26,7 +26,7 @@
 //! put back to its copy, and the second run puts a different version. No
 //! name may be served with two contents across both runs.
 
-use super::group_tests::{Unconnected, n, options};
+use super::test_kit::{Unconnected, n, options};
 use super::*;
 use crate::layer::Share;
 use ndn_app::AppError;

@@ -11,7 +11,7 @@ use ndn_security::{Certificate, RevocationCut, SignedTrustContext, TrustSchema, 
 use ndn_sync::MemoryStore;
 
 use super::answer_get::Opened;
-use super::group_tests::{Unconnected, budget, log_share, n, options, plan};
+use super::test_kit::{Unconnected, budget, log_share, n, options, plan};
 use super::*;
 use crate::answer::{
     AnswerAsk, AnswerBinding, AnswerConfig, AnswerKind, AnswerPolicy, AnswerStore, Answered,

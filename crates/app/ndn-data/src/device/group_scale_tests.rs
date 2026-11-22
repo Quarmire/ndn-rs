@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use super::group_tests::{Unconnected, n};
+use super::test_kit::{Unconnected, n};
 use super::*;
 use crate::layer::Share;
 use ndn_security::TrustSchema;

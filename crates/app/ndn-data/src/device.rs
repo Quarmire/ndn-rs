@@ -2460,14 +2460,14 @@ fn frontier_of(writer: &Writer, head: u64) -> Frontier {
 /// Whether the members record named `entry` (`<D>/32=log/<C>/seq=<n>`, its
 /// signature by `writer`, a key of `D`, verified) about collection `c` is
 /// signed by a device of `c`'s namespace, so its owner (spec §3): `D` lies
-/// under the namespace ([`crate::merge::owns`], the test a merge rule asks
+/// under the namespace ([`crate::wire::owns`], the test a merge rule asks
 /// too), and the trust context governing the record's name — the one the
 /// validator verified it under, the held context whose namespace is the
 /// longest prefix of it — is the namespace's own. A device under the
 /// namespace that a longer held namespace governs (a `/home/bob` device,
 /// for `/home`) is that namespace's device, not an owner.
 fn owner_signed(keyring: &Keyring, entry: &Name, c: &Name, writer: &Writer) -> bool {
-    crate::merge::owns(c, writer)
+    crate::wire::owns(c, writer)
         && namespace_of(c).is_some_and(|ns| *keyring.context_for(entry).namespace() == ns)
 }
 
@@ -21764,6 +21764,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_store_with_records_of_a_deleted_family_still_starts() {
+        let device = n("/alice/laptop");
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        validator.adopt_context(context("/alice")).unwrap();
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        for kind in [
+            "answers",
+            "answer-results",
+            "answer-evidence",
+            "events",
+            "host",
+            "expired",
+            "pruned",
+            "batched",
+        ] {
+            for rest in ["x", "x/y"] {
+                store.insert(
+                    n(&format!("/localhost/ndn-data/{kind}/{rest}")),
+                    Bytes::from_static(b"\xff\x00 not a record of anything"),
+                );
+            }
+        }
+        let dev = start(&device, &keys_of(&device), &validator, &store)
+            .await
+            .expect("records of a family this build no longer has are inert");
+        dev.shutdown();
+    }
+
+    #[tokio::test]
     async fn a_name_without_its_marker_is_refused_with_how_to_name_it() {
         let device = n("/home/bob/member/laptop");
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
@@ -27423,6 +27452,9 @@ mod tests {
         dev.shutdown();
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod test_kit;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod merge_tests;

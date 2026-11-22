@@ -5,7 +5,7 @@
 //! and in `handoff-ndf-rs/SHAPES-R5.md`.
 
 use super::durability_tests::{Engine, collection, laptop, percentiles};
-use super::group_tests::{Unconnected, n, options};
+use super::test_kit::{Unconnected, n, options};
 use super::*;
 use crate::layer::Share;
 use ndn_security::TrustSchema;

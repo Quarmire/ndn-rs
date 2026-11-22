@@ -6,7 +6,7 @@
 
 use super::durability_tests::device_over;
 use super::face_up::TOTAL_PER_SECOND;
-use super::group_tests::n;
+use super::test_kit::n;
 use super::*;
 use ndn_app::{AppError, FaceId, RouteEvents, RouteUp};
 use tokio::sync::broadcast;

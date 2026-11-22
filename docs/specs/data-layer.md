@@ -589,7 +589,7 @@ past (a version never loses to one made over it), never let it decide a
 check, and MUST treat it as any other field of the operation — the same
 on every reader.
 
-- **Owners** (ndn-data: `merge::owns(collection, writer)`). A writer `w`
+- **Owners** (ndn-data: `wire::owns(collection, writer)`). A writer `w`
   (key `<D>/KEY/<k>`) is an **owner device** of `C` exactly when `D` lies
   under `C`'s namespace, the components before its marker (§3). It depends
   on the two names alone, so every member answers alike in any order; the

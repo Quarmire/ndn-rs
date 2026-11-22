@@ -4,7 +4,7 @@
 
 use std::sync::atomic::AtomicUsize;
 
-use super::group_tests::{self, give};
+use super::test_kit::{self, give};
 use super::*;
 use crate::layer::Share;
 use ndn_app::AppError;
@@ -353,7 +353,7 @@ async fn a_version_a_checkpoint_covers_counts_as_that_checkpoint_counts() {
         Value::Rule(Bytes::new()),
         "what a checkpoint not counted covers is out of the value, as the state says"
     );
-    let told = group_tests::drain(&mut changes).await;
+    let told = test_kit::drain(&mut changes).await;
     assert!(
         !told
             .iter()
@@ -371,7 +371,7 @@ async fn a_version_a_checkpoint_covers_counts_as_that_checkpoint_counts() {
         "the state built lazily from the newest checkpoint is the state before the restart"
     );
     let mut changes = dev.watch(&a, &Frontier::new()).await.unwrap();
-    let _ = group_tests::drain(&mut changes).await;
+    let _ = test_kit::drain(&mut changes).await;
     // The rule now counts the checkpoint: what it covers counts with it.
     dev.put_op(&a, op(b'R', "go"), options()).await.unwrap();
     let s = state(&dev, &a).await;
@@ -381,7 +381,7 @@ async fn a_version_a_checkpoint_covers_counts_as_that_checkpoint_counts() {
         s.not_counted
     );
     assert_eq!(s.value, Value::Rule(Bytes::from_static(b"go\nkept")));
-    let told = group_tests::drain(&mut changes).await;
+    let told = test_kit::drain(&mut changes).await;
     for id in [&one, &held, &cp] {
         assert!(
             told.iter()
@@ -426,7 +426,7 @@ async fn a_folder_watch_builds_only_the_collections_holding_versions_past_its_fr
     let calls = Arc::new(Calls::default());
     let dev = start(&keys, &store, &calls).await;
     let mut changes = dev.watch(&f, &seen).await.unwrap();
-    let got = group_tests::drain(&mut changes).await;
+    let got = test_kit::drain(&mut changes).await;
     assert!(
         got.iter()
             .any(|ch| matches!(ch, Change::Version(v) if v.id == later)),
@@ -451,18 +451,18 @@ async fn a_folder_watch_builds_only_the_collections_holding_versions_past_its_fr
 }
 
 /// A version of Bob's in `c` at `seq`, of `group`.
-fn bobs(c: &Name, seq: u64, group: Group) -> group_tests::Made {
-    group_tests::version("/bob/phone", c, seq, &[], Some(group))
+fn bobs(c: &Name, seq: u64, group: Group) -> test_kit::Made {
+    test_kit::version("/bob/phone", c, seq, &[], Some(group))
 }
 
 #[tokio::test]
 async fn an_incomplete_groups_members_wait_in_the_store_not_in_memory() {
-    let dev = group_tests::device().await;
+    let dev = test_kit::device().await;
     let cs: Vec<Name> = (0..3)
         .map(|i| n(&format!("/alice/32=data/trip/day{i}")))
         .collect();
     for c in &cs {
-        dev.share(c, group_tests::log_share()).await.unwrap();
+        dev.share(c, test_kit::log_share()).await.unwrap();
     }
     let group = Group { id: 5, count: 3 };
     let members: Vec<_> = cs
@@ -477,7 +477,7 @@ async fn an_incomplete_groups_members_wait_in_the_store_not_in_memory() {
         let st = dev.inner.st.lock();
         for (c, m) in cs.iter().zip(&members[..2]) {
             let coll = &st.colls[c];
-            let id = group_tests::id("/bob/phone", parse_log_name(&m.name).unwrap().seq);
+            let id = test_kit::id("/bob/phone", parse_log_name(&m.name).unwrap().seq);
             assert!(
                 coll.parked.contains_key(&id) && !coll.versions.contains_key(&id),
                 "a member of an incomplete group is not in memory"
@@ -496,7 +496,7 @@ async fn an_incomplete_groups_members_wait_in_the_store_not_in_memory() {
     give(&dev, &members[2]);
     let st = dev.inner.st.lock();
     for (c, m) in cs.iter().zip(&members) {
-        let id = group_tests::id("/bob/phone", parse_log_name(&m.name).unwrap().seq);
+        let id = test_kit::id("/bob/phone", parse_log_name(&m.name).unwrap().seq);
         let coll = &st.colls[c];
         assert!(coll.parked.is_empty(), "complete, nothing stays parked");
         assert!(
@@ -522,15 +522,15 @@ async fn a_parked_member_and_its_equivocation_outlive_a_restart() {
     );
     let dev = start(&keys, &store, &calls).await;
     for c in [&plan, &budget, &list] {
-        dev.share(c, group_tests::log_share()).await.unwrap();
+        dev.share(c, test_kit::log_share()).await.unwrap();
     }
     let group = Group { id: 5, count: 2 };
     let (a, b) = (bobs(&plan, 5, group), bobs(&budget, 6, group));
     // Bob's second entry at seq 5, in another folder: equivocation.
-    let twin = group_tests::version("/bob/phone", &list, 5, &[], None);
+    let twin = test_kit::version("/bob/phone", &list, 5, &[], None);
     give(&dev, &a);
     give(&dev, &twin);
-    let five = group_tests::id("/bob/phone", 5);
+    let five = test_kit::id("/bob/phone", 5);
     assert!(dev.inner.st.lock().colls[&plan].parked.contains_key(&five));
     dev.shutdown();
     drop(dev);
@@ -539,13 +539,13 @@ async fn a_parked_member_and_its_equivocation_outlive_a_restart() {
     let dev = start(&keys, &store, &calls).await;
     give(&dev, &b);
     assert!(
-        group_tests::counts(&dev, &plan, &five)
-            && group_tests::counts(&dev, &budget, &group_tests::id("/bob/phone", 6)),
+        test_kit::counts(&dev, &plan, &five)
+            && test_kit::counts(&dev, &budget, &test_kit::id("/bob/phone", 6)),
         "the member parked before the restart is still held: its group completes without it \
          being fetched again"
     );
     let mut changes = dev.watch(&list, &Frontier::new()).await.unwrap();
-    let seen = group_tests::drain(&mut changes).await;
+    let seen = test_kit::drain(&mut changes).await;
     // Which of the two was seen first depends on the order they were read
     // back in; both are reported.
     let pair = BTreeSet::from([a.name.clone(), twin.name.clone()]);
@@ -569,10 +569,10 @@ async fn two_packets_at_one_name_stay_evidence_across_a_restart() {
     let calls = Arc::new(Calls::default());
     let plan = n("/alice/32=data/trip/plan");
     let dev = start(&keys, &store, &calls).await;
-    dev.share(&plan, group_tests::log_share()).await.unwrap();
+    dev.share(&plan, test_kit::log_share()).await.unwrap();
     // Bob signs two different packets under one name.
-    let one = group_tests::version("/bob/phone", &plan, 7, &[], None);
-    let other = group_tests::version("/bob/phone", &plan, 7, &[("/bob/phone", 3)], None);
+    let one = test_kit::version("/bob/phone", &plan, 7, &[], None);
+    let other = test_kit::version("/bob/phone", &plan, 7, &[("/bob/phone", 3)], None);
     assert_eq!(one.name, other.name);
     assert_ne!(one.packet, other.packet);
     let mut changes = dev.watch(&plan, &Frontier::new()).await.unwrap();
@@ -585,14 +585,14 @@ async fn two_packets_at_one_name_stay_evidence_across_a_restart() {
                 if *collection == plan && a.name == one.name && b.name == one.name && a != b
         ))
     };
-    let seen = group_tests::drain(&mut changes).await;
+    let seen = test_kit::drain(&mut changes).await;
     assert!(twins(&seen), "reported as it arrives: {seen:?}");
     dev.shutdown();
     drop(dev);
 
     let dev = start(&keys, &store, &calls).await;
     let mut changes = dev.watch(&plan, &Frontier::new()).await.unwrap();
-    let seen = group_tests::drain(&mut changes).await;
+    let seen = test_kit::drain(&mut changes).await;
     assert!(
         twins(&seen),
         "the second packet is kept: still reported after the restart: {seen:?}"

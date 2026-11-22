@@ -598,7 +598,7 @@ impl Connection for Unheard {
 async fn a_first_look_into_a_group_heard_from_no_one_asks_the_group_again() {
     let group = sync_group(&n("/bob"));
     let conn = Unheard::new(group.clone());
-    let dev = device_with(Arc::new(super::group_tests::Unconnected), conn.clone()).await;
+    let dev = device_with(Arc::new(super::test_kit::Unconnected), conn.clone()).await;
     dev.inner
         .look(&n("/bob/32=data/notes"))
         .await
@@ -676,7 +676,7 @@ async fn a_change_no_member_is_heard_to_have_taken_is_announced_again() {
     let ns = n("/alice");
     let group = sync_group(&ns);
     let conn = Unheard::new(group.clone());
-    let dev = device_with(Arc::new(super::group_tests::Unconnected), conn.clone()).await;
+    let dev = device_with(Arc::new(super::test_kit::Unconnected), conn.clone()).await;
     dev.inner.join(&ns).await.expect("the group is joined");
     // The laptop is heard, at the phone's counter before the change.
     conn.tx.unbounded_send(laptop_heard(&group, 0)).unwrap();
@@ -724,7 +724,7 @@ async fn a_group_no_member_walks_is_announced_again_for_one_run_only() {
     let ns = n("/alice");
     let group = sync_group(&ns);
     let conn = Unheard::new(group.clone());
-    let dev = device_with(Arc::new(super::group_tests::Unconnected), conn.clone()).await;
+    let dev = device_with(Arc::new(super::test_kit::Unconnected), conn.clone()).await;
     dev.inner.join(&ns).await.expect("the group is joined");
     conn.tx.unbounded_send(laptop_heard(&group, 0)).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -765,7 +765,7 @@ async fn a_sync_interest_naming_many_devices_leaves_the_state_vector_bounded() {
     let ns = n("/alice");
     let group = sync_group(&ns);
     let conn = Unheard::new(group.clone());
-    let dev = device_with(Arc::new(super::group_tests::Unconnected), conn.clone()).await;
+    let dev = device_with(Arc::new(super::test_kit::Unconnected), conn.clone()).await;
     dev.inner.join(&ns).await.expect("the group is joined");
     let laptop = n("/alice/laptop");
     conn.tx.unbounded_send(laptop_heard(&group, 0)).unwrap();
@@ -880,7 +880,7 @@ async fn signals_pushed_into_the_group_confirm_nothing() {
     let ns = n("/alice");
     let group = sync_group(&ns);
     let conn = Unheard::new(group.clone());
-    let dev = device_with(Arc::new(super::group_tests::Unconnected), conn.clone()).await;
+    let dev = device_with(Arc::new(super::test_kit::Unconnected), conn.clone()).await;
     dev.inner.join(&ns).await.expect("the group is joined");
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert!(
@@ -916,7 +916,7 @@ async fn only_a_sync_interest_bringing_nothing_newer_confirms() {
     let ns = n("/alice");
     let group = sync_group(&ns);
     let conn = Unheard::new(group.clone());
-    let dev = device_with(Arc::new(super::group_tests::Unconnected), conn.clone()).await;
+    let dev = device_with(Arc::new(super::test_kit::Unconnected), conn.clone()).await;
     dev.inner.join(&ns).await.expect("the group is joined");
 
     // Nothing of the namespace followed: the laptop's notice is taken at

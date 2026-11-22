@@ -2,7 +2,7 @@
 //! created after the watch began included, every kind of change, each tagged
 //! with its collection, and no version twice.
 
-use super::group_tests::{
+use super::test_kit::{
     PAIR, budget, device, device_tuned, drain, give, id, log_share, n, plan, version,
 };
 use super::*;
@@ -132,7 +132,7 @@ async fn a_version_waiting_when_the_watch_begins_is_delivered_once_when_it_appli
 }
 
 /// Version `seq` of `device` in `c` saying `text`.
-fn saying(device: &str, c: &Name, seq: u64, text: &str) -> super::group_tests::Made {
+fn saying(device: &str, c: &Name, seq: u64, text: &str) -> super::test_kit::Made {
     let body = VersionBody {
         collection: c.clone(),
         parents: Parents::default(),
@@ -151,7 +151,7 @@ fn saying(device: &str, c: &Name, seq: u64, text: &str) -> super::group_tests::M
         chunks: None,
         block: None,
     };
-    super::group_tests::made(device, c, seq, Record::Version(body))
+    super::test_kit::made(device, c, seq, Record::Version(body))
 }
 
 #[tokio::test]
@@ -253,7 +253,7 @@ async fn an_outside_writer_makes_a_follower_track_only_as_many_collections_as_it
         0,
         "past the policy, the writer's new collection is not followed: {seen:?}"
     );
-    let bob = Writer::new(super::group_tests::key("/bob/laptop"));
+    let bob = Writer::new(super::test_kit::key("/bob/laptop"));
     let why = seen
         .iter()
         .find_map(|c| match c {

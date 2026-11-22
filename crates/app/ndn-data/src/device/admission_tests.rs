@@ -4,7 +4,7 @@
 //! can tell alike — its own signed versions, the audiences of the epochs
 //! they are sealed in, and keeps that never expire.
 
-use super::group_tests::{
+use super::test_kit::{
     Made, PAIR, Unconnected, budget, counts, device, drain, give, id, key, log_share, made, n,
     options, plan, refusal, version,
 };
