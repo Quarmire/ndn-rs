@@ -1601,6 +1601,10 @@ struct Pass {
     past: AtomicUsize,
     /// The highest head of the roots its walks took.
     head: AtomicU64,
+    /// When the writer's own root came to each walk, by its place: what a pass that
+    /// reached the writer's state confirms is as of then, never later — what its walk
+    /// went on to fetch after the root says nothing of whether the writer still holds it.
+    rooted: Mutex<BTreeMap<usize, Instant>>,
     /// Wakes the pass.
     wake: Arc<Notify>,
 }
@@ -9880,7 +9884,7 @@ impl Inner {
                     }
                     st.peers.get(&key).map_or(0, |p| p.head)
                 };
-                let ok = inner
+                let (ok, reached) = inner
                     .refresh_pass(&ns, &device, &wake, &mut unverified)
                     .await;
                 let moved = {
@@ -9925,7 +9929,12 @@ impl Inner {
                             _ => {
                                 g.busy.remove(&device);
                                 if ok && g.busy.is_empty() {
-                                    g.confirmed = Some(Instant::now());
+                                    // As of when the writer's root came to the walk that
+                                    // reached its state, not of when that walk ended: its
+                                    // descent may fetch for long what the root lists,
+                                    // after the writer left.
+                                    let at = reached.unwrap_or_else(Instant::now);
+                                    g.confirmed = Some(g.confirmed.map_or(at, |c| c.max(at)));
                                 }
                                 // Its loop ended short of the writer's
                                 // state: what the notices brought is not
@@ -10840,6 +10849,9 @@ impl Inner {
         let Some((rooted, relayed)) = self.fetch_root(root, ns, device, above, floor).await else {
             return false;
         };
+        if let Some(r) = &reach {
+            r.pass.rooted.lock().insert(r.index, Instant::now());
+        }
         if let Err(why) = self.take_root(device, ns, &rooted) {
             if let RootRefusal::Rollback { head, seen } = why {
                 tracing::warn!(%device, %ns, head, seen, "refused: a summary root older than one verified before (rollback); the writer must serve its newest root");
@@ -10966,16 +10978,19 @@ impl Inner {
     /// when the pass does: notices arriving while a walk runs begin the
     /// next, so a pass may last as long as they keep coming — and at
     /// [`REFRESH_TRIES`] the device is unreached ([`Self::mark_unreached`]).
+    /// Returns that, and when the writer's own root came to that walk: what
+    /// the pass confirms is as of then.
     async fn refresh_pass(
         self: &Arc<Self>,
         ns: &Name,
         device: &Name,
         wake: &Arc<Notify>,
         unverified: &mut u32,
-    ) -> bool {
+    ) -> (bool, Option<Instant>) {
         let pass = Arc::new(Pass {
             past: AtomicUsize::new(0),
             head: AtomicU64::new(0),
+            rooted: Mutex::new(BTreeMap::new()),
             wake: Arc::clone(wake),
         });
         let walk = |index: usize| {
@@ -11046,7 +11061,12 @@ impl Inner {
                 break;
             }
         }
-        outcome.unwrap_or(false)
+        let whole = outcome.unwrap_or(false);
+        // As of the newest walk's root, never of the end of its descent.
+        let reached = whole
+            .then(|| pass.rooted.lock().get(&newest).copied())
+            .flatten();
+        (whole, reached)
     }
 
     /// Whether a notice of `device` in `ns`'s group arrived since its

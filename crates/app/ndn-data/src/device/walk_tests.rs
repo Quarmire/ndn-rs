@@ -428,6 +428,135 @@ async fn a_version_missed_inside_a_walk_is_asked_again_in_place_not_after_the_wa
     writer.shutdown();
 }
 
+/// A walk that reached the writer's state confirms what it found as of when the writer's
+/// root came to it, not of when its descent ended (spec §5.3, §15): the phone's walk takes
+/// eighty versions over a slow path, far longer than the root took, and the laptop may
+/// have gone away at any moment of it; the phone's answer is then aged from the root, not
+/// from the walk's end.
+#[tokio::test(start_paused = true)]
+async fn a_walk_confirms_as_of_the_root_not_of_the_end_of_its_descent() {
+    let ns = n("/wendy");
+    let authority = SecurityManager::new();
+    let issuer = authority
+        .generate_ed25519(ns.clone().append("KEY").append("ns"))
+        .unwrap();
+    let public = authority
+        .get_signer_sync(&issuer)
+        .unwrap()
+        .public_key()
+        .unwrap();
+    let anchor = authority
+        .issue_self_signed_async(&issuer, public, VALIDITY_MS)
+        .await
+        .unwrap();
+    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
+    let (laptop_keys, laptop_cert) = device_key(&authority, &issuer, &laptop).await;
+    let (phone_keys, phone_cert) = device_key(&authority, &issuer, &phone).await;
+    let validator = || {
+        let v = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        let ctx = SignedTrustContext::hierarchical(ns.clone());
+        assert!(ctx.add_anchor(anchor.clone()));
+        v.adopt_context(Arc::new(ctx)).unwrap();
+        v.cert_cache().insert(laptop_cert.clone());
+        v.cert_cache().insert(phone_cert.clone());
+        v
+    };
+    let writer = start_on(&laptop, laptop_keys, validator(), Arc::new(Unconnected)).await;
+    let c = n("/wendy/32=data/notes");
+    writer
+        .share(
+            &c,
+            crate::layer::Share {
+                rule: Rule::Log,
+                writers: vec![ns.clone()],
+                readers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    const VERSIONS: usize = 80;
+    let mut last = None;
+    for i in 0..VERSIONS {
+        let content = Content::new().with("t", Bytes::from(i.to_string()));
+        let options = PutOptions {
+            type_id: crate::TypeId {
+                name: n("/types/note"),
+                revision: 1,
+            },
+            keep: Keep::Forever,
+            batch: None,
+        };
+        last = Some(writer.put(&c, content, options).await.unwrap());
+    }
+    let last = log_name(&laptop, Some(&c), last.unwrap().seq.0);
+    for _ in 0..100 {
+        if writer.inner.packet_for(&last, false).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(writer.inner.packet_for(&last, false).is_some());
+
+    // Each ask is answered near the end of its Interest's lifetime, two at a time.
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    let link = Arc::new(SlowLink {
+        writer: Arc::clone(&writer.inner),
+        delay: Config::new().lifetime - RTO_MIN / 2,
+        lost: n("/nothing/is/lost"),
+        lose: std::sync::atomic::AtomicUsize::new(0),
+        tx,
+        rx: futures::lock::Mutex::new(rx),
+    });
+    let mut config = Config::new();
+    config.window = 2;
+    let reader = start_with(&phone, phone_keys, validator(), link.clone(), config).await;
+    reader.inner.join(&ns).await.expect("the group is joined");
+    // Following the collection is what makes the walk descend to its versions.
+    reader.inner.st.lock().follows.insert(c.clone());
+    let began = tokio::time::Instant::now();
+    reader.inner.on_update(
+        &ns,
+        SyncUpdate {
+            publisher: laptop.to_string(),
+            name: laptop.clone(),
+            low_seq: 1,
+            high_seq: VERSIONS as u64,
+            mapping: None,
+            serving_party: None,
+        },
+    );
+    // The walk's end: every version held and no refresh pending.
+    let mut ended = None;
+    for _ in 0..600 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if holds(&reader, &last) && reader.inner.st.lock().groups[&ns].busy.is_empty() {
+            ended = Some(began.elapsed());
+            break;
+        }
+    }
+    let ended = ended.expect("the walk takes every version and ends");
+    assert!(
+        ended > Duration::from_secs(60),
+        "the descent takes far longer than the root: {ended:?}"
+    );
+    assert!(
+        reader.inner.st.lock().groups[&ns].confirmed.is_some(),
+        "the walk that reached the laptop's state confirmed it"
+    );
+    let unconfirmed = match reader.inner.age(&reader.inner.st.lock(), &c) {
+        Age::Newest { unconfirmed_for } => unconfirmed_for,
+        other => panic!("a log collection's answer is aged as the newest: {other:?}"),
+    };
+    // The root came within the first seconds of the walk.
+    assert!(
+        unconfirmed + Duration::from_secs(10) >= began.elapsed(),
+        "the walk confirmed the laptop's state as of its root, near the walk's start, not of \
+         its end {ended:?} later: unconfirmed for {unconfirmed:?}"
+    );
+    reader.shutdown();
+    writer.shutdown();
+}
+
 /// The laptop's notes folder holds a long collection `a`, which the
 /// phone's refresh loop walks a few versions at a time over a slow path,
 /// and a short one `b`. Once that walk took its first version, the laptop

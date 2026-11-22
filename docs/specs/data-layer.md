@@ -2073,7 +2073,11 @@ name (`<D>/32=summary/<X>/seq=<head>`, a page
 and pages are DigestSha256 packets; a reader MUST check each against the
 digest its parent lists. The **root**, the node of `O` itself, is the only
 signed one: `<D>/32=summary/<O>/32=root/seq=<head>`, signed by the device key,
-FreshnessPeriod 0 so that discovery always reaches the writer. A writer
+FreshnessPeriod 0 so that discovery always reaches the writer: a forwarder's
+Content Store takes a Data with no FreshnessPeriod or a zero one as stale at
+once, never fresh for a MustBeFresh Interest, whatever its clock reads later
+(a clock stepped back does not make it fresh again; a writer's forwarder
+would otherwise answer for it with the root it had signed before). A writer
 SHOULD sign a new root only when one is asked for and the tree changed. A
 one-key collection's node is also named by the collection's signed head
 (§5.3), one hop from the reader.
@@ -3902,7 +3906,9 @@ decides anything, and a watch keeps telling every `Change` it tells.
   (§5) — with `Age::Newest`: the time since the device last knew nothing
   newer was outstanding in `C`'s sync group, measured on its monotonic
   clock: it finished a refresh that reached the writer's state with no
-  other pending, or heard one of the group's Sync Interests
+  other pending — as of when the writer's root came to that refresh, not
+  of when its descent ended: the descent may fetch for long what the root
+  lists, after the writer left —, or heard one of the group's Sync Interests
   (`<O>/32=sync/v=N`, admitted as the group's driver admits it) with none
   pending whose state vector carried no device's counter above what
   notices brought here and no refresh of that device ended short of (round
