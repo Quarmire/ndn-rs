@@ -331,6 +331,7 @@ impl PacketDispatcher {
         };
         if let Some(rev_face) = reverse_face {
             trace!(target: t::FWD_PIPELINE, face=%ctx.face_id, rev_face=%rev_face, "reflexive: reverse routing");
+            self.strategy.record_out_records(&ctx, &[rev_face]);
             self.dispatch_action(Action::Send(ctx, smallvec::smallvec![rev_face]))
                 .await;
             return;
@@ -376,11 +377,31 @@ impl PacketDispatcher {
         // PIT key is the bare Interest name; selectors live on each in-record.
         let token = PitToken::from_interest(&nack.interest.name);
 
-        let has_pit_entry = self.strategy.pit.contains(&token);
-        if !has_pit_entry {
-            debug!(target: t::FWD_PIT, face=?ctx.face_id, "nack for unknown PIT entry, dropping");
-            return;
-        }
+        // A Nack speaks for an upstream: it is accepted only from a face the
+        // Interest was forwarded to (an out-record of this entry) and only
+        // with the nonce that out-record last sent (NFD `onIncomingNack`).
+        // Any other face naming a pending Interest would otherwise end a
+        // fetch with a reason of its own choosing, or steer the failover.
+        let nack_nonce = nack.interest.nonce();
+        let origin = self.strategy.pit.with_entry(&token, |e| {
+            match e.out_records.iter().find(|r| r.face_id == ctx.face_id.0) {
+                None => Err("no out-record"),
+                Some(r) if Some(r.last_nonce) != nack_nonce => Err("nonce differs"),
+                Some(r) => Ok(r.last_nonce),
+            }
+        });
+        let nonce = match origin {
+            None => {
+                debug!(target: t::FWD_PIT, face=%ctx.face_id, name=%name, "nack for unknown PIT entry, dropping");
+                return;
+            }
+            Some(Err(why)) => {
+                debug!(target: t::FWD_PIT, face=%ctx.face_id, name=%name, reason=why,
+                       "nack dropped: only a face this Interest was forwarded to, echoing the nonce it was sent, may Nack it");
+                return;
+            }
+            Some(Ok(nonce)) => nonce,
+        };
 
         let fib_entry_arc = self.strategy.fib.lpm(&name);
         let fib_entry_ref = fib_entry_arc.as_deref();
@@ -475,21 +496,56 @@ impl PacketDispatcher {
         let action = strategy.on_nack_erased(&sctx, nack_reason);
         match action {
             ForwardingAction::Forward(faces) => {
-                let interest_wire = nack.interest.raw().clone();
+                // The failover Interest is the forwarder's own, rebuilt from
+                // its PIT entry as a downstream's Interest is for a Nack: the
+                // in-record of the Interest that went upstream (its nonce is
+                // the verified one), else the latest. Not a byte of what the
+                // Nack enclosed is sent on. The nonce stays: NFD resends the
+                // entry's Interest to the next upstream unchanged.
+                let now = ctx.arrival;
+                let pending = self
+                    .strategy
+                    .pit
+                    .with_entry(&token, |e| {
+                        let r = e
+                            .in_records
+                            .iter()
+                            .find(|r| r.nonce == nonce)
+                            .or(e.in_records.last())?;
+                        let left_ns = r.expires_at.saturating_sub(now);
+                        Some((
+                            e.name.clone(),
+                            r.selector.clone(),
+                            r.parameters.clone(),
+                            left_ns,
+                        ))
+                    })
+                    .flatten();
+                let Some((entry_name, selector, parameters, left_ns)) = pending else {
+                    debug!(target: t::FWD_STRATEGY, face=%ctx.face_id, name=%name, "nack failover skipped: no downstream still waits on this entry");
+                    return;
+                };
+                if left_ns == 0 {
+                    debug!(target: t::FWD_STRATEGY, face=%ctx.face_id, name=%name, "nack failover skipped: the Interest's lifetime is spent");
+                    return;
+                }
+                let interest_wire = ndn_packet::Nack::pending_interest_wire(
+                    &entry_name,
+                    &selector,
+                    nonce,
+                    left_ns.div_ceil(1_000_000),
+                    parameters.as_ref(),
+                );
                 // Record the failover send as an out-record so a subsequent
                 // Nack from this new upstream excludes it too (D.09).
-                let nonce = nack.interest.nonce();
                 // The failover out-record's sent_at must share the time base the retx
                 // suppressor compares against (`ctx.arrival`), so it's the Nack's arrival,
                 // not a fresh wall-clock read — deterministic under a virtual runtime.
                 // (ndn-lab slice 0c; fixes a 0b miss on the Nack path.)
-                let now = ctx.arrival;
                 for face_id in &faces {
-                    if let Some(nonce) = nonce {
-                        self.strategy
-                            .pit
-                            .with_entry_mut(&token, |e| e.add_out_record(face_id.0, nonce, now));
-                    }
+                    self.strategy
+                        .pit
+                        .with_entry_mut(&token, |e| e.add_out_record(face_id.0, nonce, now));
                     if let Some(state) = self.face_states.get(face_id) {
                         state.counters.out_interests.fetch_add(1, Ordering::Relaxed);
                     }

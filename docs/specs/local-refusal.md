@@ -262,10 +262,21 @@ learns nothing.
 A forwarder that receives a Nack carrying `170`–`176` from an upstream handles it as follows.
 
 1. The ordinary Nack checks apply first. A Nack received on a multi-access or ad-hoc face is
-   dropped. A Nack with no matching PIT entry is dropped.
+   dropped. A Nack with no matching PIT entry is dropped. A Nack is **accepted only from a face
+   holding an out-record of that PIT entry, with the same nonce**: the Nack's enclosed
+   Interest MUST carry the nonce that out-record last sent. A Nack from a face with no
+   out-record (any face that merely knows the name), or with another nonce, is dropped, and
+   the drop is logged with the name, the face and the reason ("no out-record" or "nonce
+   differs"; NFD `Forwarder::onIncomingNack`). Without this check any face could end a
+   pending fetch with a reason of its own choosing, or steer the failover. Every way the
+   forwarder sends an Interest upstream (the strategy's choice, a `NextHopFaceId` pin, a
+   scheduled forward, a reflexive reverse route) makes the face an upstream by recording an
+   out-record, so its Nack is accepted.
 2. The forwarding strategy sees the refusal as **NoRoute**: that upstream has nothing usable,
    and another upstream might. This also applies to any reason code the forwarder does not
-   know. If the strategy retries another upstream, no Nack goes downstream.
+   know. If the strategy retries another upstream, no Nack goes downstream. The Interest sent
+   to that upstream is the forwarder's own, rebuilt from its PIT in-record (name, selectors,
+   nonce, parameters, and the lifetime the entry has left), never the bytes the Nack enclosed.
 3. If the strategy decides to Nack, the forwarder removes the PIT entry and chooses the reason
    to relay:
    - **The refusal came from a program-face upstream** (a forwarder on this host, reached

@@ -277,6 +277,32 @@ impl Nack {
         nonce: u32,
         parameters: Option<&Bytes>,
     ) -> Bytes {
+        Self::rebuilt_interest(name, selector, nonce, None, parameters)
+    }
+
+    /// The Interest a forwarder sends upstream *again* — to another nexthop
+    /// after a Nack — rebuilt from what its PIT kept of the downstream's
+    /// Interest: [`interest_wire`](Self::interest_wire) plus the
+    /// `InterestLifetime` the entry has left (`lifetime_ms`, at least 1), so
+    /// the new upstream holds the Interest no longer than this forwarder does.
+    /// Nothing of what a Nack enclosed is used.
+    pub fn pending_interest_wire(
+        name: &Name,
+        selector: &Selector,
+        nonce: u32,
+        lifetime_ms: u64,
+        parameters: Option<&Bytes>,
+    ) -> Bytes {
+        Self::rebuilt_interest(name, selector, nonce, Some(lifetime_ms.max(1)), parameters)
+    }
+
+    fn rebuilt_interest(
+        name: &Name,
+        selector: &Selector,
+        nonce: u32,
+        lifetime_ms: Option<u64>,
+        parameters: Option<&Bytes>,
+    ) -> Bytes {
         let mut w = ndn_tlv::TlvWriter::new();
         w.write_nested(tlv_type::INTEREST, |w| {
             w.write_raw(&name.encode_to_tlv());
@@ -287,6 +313,10 @@ impl Nack {
                 w.write_tlv(tlv_type::MUST_BE_FRESH, &[]);
             }
             w.write_tlv(tlv_type::NONCE, &nonce.to_be_bytes());
+            if let Some(ms) = lifetime_ms {
+                let (buf, len) = crate::lp::nni(ms);
+                w.write_tlv(tlv_type::INTEREST_LIFETIME, &buf[..len]);
+            }
             if let Some(parameters) = parameters {
                 w.write_raw(parameters);
             }
@@ -399,6 +429,48 @@ mod tests {
         let name = Name::from_components([NameComponent::generic(Bytes::from_static(b"x"))]);
         let unparameterized = Interest::decode(encode_interest(&name, None)).unwrap();
         assert_eq!(unparameterized.parameters_portion(), None);
+    }
+
+    /// The Interest a forwarder resends upstream after a Nack: what its PIT
+    /// kept, plus the lifetime left, with the parameters portion intact.
+    #[test]
+    fn a_pending_interest_carries_its_lifetime_and_parameters() {
+        let mut w = TlvWriter::new();
+        w.write_nested(tlv_type::INTEREST, |w| {
+            w.write_nested(tlv_type::NAME, |w| {
+                w.write_tlv(tlv_type::NAME_COMPONENT, b"ca");
+                w.write_tlv(tlv_type::PARAMETERS_SHA256, &[7u8; 32]);
+            });
+            w.write_tlv(tlv_type::MUST_BE_FRESH, &[]);
+            w.write_tlv(tlv_type::NONCE, &[1, 2, 3, 4]);
+            w.write_tlv(tlv_type::APP_PARAMETERS, b"params");
+        });
+        let original = Interest::decode(w.finish()).unwrap();
+        let portion = original.parameters_portion().expect("parameterized");
+
+        let wire = Nack::pending_interest_wire(
+            &original.name,
+            original.selectors(),
+            0x0102_0304,
+            2_500,
+            Some(&portion),
+        );
+        let rebuilt = Interest::decode(wire).unwrap();
+        assert_eq!(rebuilt.name, original.name);
+        assert_eq!(rebuilt.selectors(), original.selectors());
+        assert_eq!(rebuilt.nonce(), Some(0x0102_0304));
+        assert_eq!(
+            rebuilt.lifetime(),
+            Some(core::time::Duration::from_millis(2_500))
+        );
+        assert_eq!(rebuilt.parameters_portion(), Some(portion));
+
+        let zero = Nack::pending_interest_wire(&original.name, original.selectors(), 1, 0, None);
+        assert_eq!(
+            Interest::decode(zero).unwrap().lifetime(),
+            Some(core::time::Duration::from_millis(1)),
+            "an InterestLifetime is never zero"
+        );
     }
 
     #[test]

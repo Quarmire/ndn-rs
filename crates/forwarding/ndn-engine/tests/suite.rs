@@ -37,6 +37,8 @@ mod local_data_validation;
 mod local_refusal;
 #[path = "nack_counters.rs"]
 mod nack_counters;
+#[path = "nack_origin.rs"]
+mod nack_origin;
 #[path = "next_hop_face_id_local_fields.rs"]
 mod next_hop_face_id_local_fields;
 #[path = "partition_throughput.rs"]

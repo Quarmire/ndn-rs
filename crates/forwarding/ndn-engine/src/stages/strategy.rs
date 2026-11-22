@@ -240,6 +240,25 @@ impl StrategyStage {
 }
 
 impl StrategyStage {
+    /// Record that this Interest is forwarded to `faces` by a path that does
+    /// not go through the strategy's `Forward` (a `NextHopFaceId` pin, a
+    /// reflexive reverse route): each face is an upstream of the PIT entry,
+    /// so a Nack from it is accepted (see `nack_pipeline`), as for any
+    /// forwarded Interest.
+    pub(crate) fn record_out_records(&self, ctx: &PacketContext, faces: &[ndn_transport::FaceId]) {
+        let (Some(token), DecodedPacket::Interest(i)) = (ctx.pit_token, &ctx.packet) else {
+            return;
+        };
+        let Some(nonce) = i.nonce() else { return };
+        self.pit.with_entry_mut(&token, |entry| {
+            for face in faces {
+                entry.add_out_record(face.0, nonce, ctx.arrival);
+            }
+        });
+    }
+}
+
+impl StrategyStage {
     pub async fn process(&self, mut ctx: PacketContext) -> Action {
         match &ctx.packet {
             DecodedPacket::Interest(_) => {}
@@ -255,6 +274,7 @@ impl StrategyStage {
             NextHopOverride::Forward(face_id) => {
                 trace!(target: t::FWD_STRATEGY, face=%ctx.face_id, name=%name, override_face=%face_id, action="forward", "strategy decision");
                 ctx.out_faces.push(face_id);
+                self.record_out_records(&ctx, &[face_id]);
                 let out = ctx.out_faces.clone();
                 return Action::Send(ctx, out);
             }
@@ -548,6 +568,11 @@ impl StrategyStage {
                     let face_table = Arc::clone(&self.face_table);
                     let raw_bytes = ctx.raw_bytes.clone();
                     let pit_token = ctx.pit_token;
+                    let sent_nonce = match &ctx.packet {
+                        DecodedPacket::Interest(i) => i.nonce(),
+                        _ => None,
+                    };
+                    let arrival = ctx.arrival;
                     let runtime = Arc::clone(&self.runtime);
                     let sleep = runtime.sleep(delay);
                     self.runtime.spawn(Box::pin(async move {
@@ -566,6 +591,13 @@ impl StrategyStage {
                         }
                         for face_id in &faces {
                             if let Some(face) = face_table.get(*face_id) {
+                                // The scheduled send makes the face an upstream
+                                // of the entry: its Nack is accepted.
+                                if let (Some(token), Some(nonce)) = (pit_token, sent_nonce) {
+                                    pit.with_entry_mut(&token, |e| {
+                                        e.add_out_record(face_id.0, nonce, arrival)
+                                    });
+                                }
                                 let _ = face.send_bytes(raw_bytes.clone()).await;
                             }
                         }
