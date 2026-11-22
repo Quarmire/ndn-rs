@@ -3067,6 +3067,10 @@ routed by hand and no route is learnt from traffic: the routes come from
 the links' admitted identities and the contexts held, the groups a device
 publishes into from the members records it holds.
 
+### 12.1 A notice names no entry (round 12)
+
+A group counter says only "moved": it names neither the collection nor the seq of the log entry that moved it, and one announcement can cover several entries of several collections. So a reader answers every notice with the walk of §12 (root, summary nodes, entry), and a new 1 KiB version costs a watcher six asks one after the other (the root, four nodes, the entry). Taking the named entry directly would need the announcement to carry the names (the application data of the Sync Interest's `MappingData`), unsigned and deciding nothing, and the summary that lists the entry would still have to be read: `Change::Summary`, the listing of entries not held, and the root and nodes a holder answers a reader that missed the notice with (§13.5) all come from the walk. Round 12 built that shape (kept on the ndn-rs branch `r12-direct-fetch`) and did not ship it: under packet loss it failed conformance case r7 on 6 of 160 fault seeds, for a cause not found in time. The direct fetch comes with the data layer's next crate, whose notice names the entry by construction.
+
 ## 13. Custody — slice 3 (merge pieces: slice 6)
 
 ### 13.1 Large payloads
@@ -4829,7 +4833,9 @@ octets), a piece of one `<A>/seg=<i>` or `<A>/32=manifest/seg=<k>`, a question
 
 A fetch **misses** when nothing answers within the Interest lifetime
 (`Config::lifetime`, 2 s by default), the forwarder refuses the packet for
-now (a certificate on its chain not to be had yet), a Nack comes, or what
+now (a certificate on its chain not to be had yet), a Nack with reason
+Congestion comes that asking again soon did not mend ("A Nack for rate", below;
+any other Nack is an answer, not a miss), or what
 comes is refused as a packet (§4: it does not verify, or is not its name's
 packet) — by the device, or by its forwarder, whose `bad-signature`
 refusal (forged or altered on the way) is final for that packet, never for
@@ -5135,6 +5141,31 @@ under a fresh nonce. A granter that sees two Interests of one grant ask
 answers both with the one packet it keeps for that name (§9). Re-expression
 is liveness only: it decides nothing (invariant 1), and what is held or
 counted never depends on its timing.
+
+**A Nack for rate (normative).** A Nack with reason Congestion says the
+Interest it carries was dropped for rate — a link's quota, ndn-link.md — and
+nothing about the packet: the packet may well be there. An ask that gets one
+MUST NOT take it as an answer ("not there"); it expresses the Interest again,
+a fresh nonce and the lifetime left as its InterestLifetime, after a pause of
+between half of and all of 20 ms (`CONGESTION_PAUSE`), the ceiling doubling
+per Nack to at most 160 ms (`CONGESTION_PAUSE_MAX`), so the first retry comes
+well under `RTO_MIN` and at about the time one token of a 100-frames-a-second
+bucket returns. The jitter is taken from the ask's first Interest's nonce and
+the retry count, never from a clock or a random source. **Bound:** at most
+`CONGESTION_RETRIES` (8) retries per ask — at most 940 ms of pauses (20, 40, 80
+and five of 160 ms) — and a retry only while at least `RTO_MIN` of the lifetime
+is left after its pause, so a Nack that never stops costs an ask 1 + 8
+Interests and under a second, never more than its lifetime. A pause is no
+lost-Interest wait: it does not use up a re-expression of `RTO` (the timer
+starts again for the new Interest) and the ask that needed a retry gives no
+sample of the round trip. When the retries end, the last Nack ends the ask
+as a miss asking again may mend, not as an answer: the owed fetch asks again
+after its pause, `FETCH_TRIES` asks in all, so a link that Nacks Congestion
+for ever costs one owed packet at most `FETCH_TRIES` · (1 + 8) = 27
+Interests per (lifetime + pause). Every other reason keeps its meaning: no
+route, not yet, duplicate or any other code is an answer — the packet is not
+to be had from that face now — and ends the ask at once. Like
+re-expression it is liveness only: it decides nothing (invariant 1).
 
 **Pause.** After `k` misses in a row of one such loop (`k` = 0, 1, …) the
 device waits min(250 ms · 2^`k`, 4 s) before asking again
@@ -5915,7 +5946,9 @@ hint record made on request, below): the device's
 **link key** — SHA-256 of its public key as a certificate carries it, 32
 octets, the fingerprint a link handshake proves (ndn-link.md §3.3) — and
 at most `LINK_HINT_CANDIDATES_MAX` = 8 **candidates**, the addresses of its
-listening link socket, most promising first, each a kind (ndn-link's: host,
+listening link socket, most promising first (an address another computer can
+reach, then one of a bridge or container interface, then loopback and
+link-local ones; ndn-link.md §14.2), each a kind (ndn-link's: host,
 reflexive, advertised, mapped, §14.2), an IPv4 or IPv6 address and a UDP
 port. It is the value of the envelope's `LinkHint` (0x0478): the TLVs
 `LinkKey` (0x05B0, the 32 octets) and `LinkCandidate` (0x05B2, once per
@@ -6163,8 +6196,9 @@ publishes the hint record, only when `IntroPolicy::short_code` is on (the
 default), the host gives a first contact and the line fits
 `IntroPolicy::short_width` characters (default 294: three lines of 98
 columns, counted in characters with the spaces). The first contacts are, in
-order, the dialable candidates of the host's link hint (loopback and
-link-local ones only under `local_candidates`), then the namespace's relays
+order, the dialable candidates of the host's link hint, which is in ndn-link's
+order (an address another computer can reach first; loopback and
+link-local ones last, and only under `local_candidates`), then the namespace's relays
 (up to 8), and the first whose line fits is taken: a longer address or name
 gives way to the next. With none, `Code::short` is `None` and
 `Code::short_why` says why, naming what to do (give the link, or the words

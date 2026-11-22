@@ -277,8 +277,8 @@ wake_command = ["/usr/local/bin/ndn-wake", "--push"]
 | `roots` | `[]` | With `serve = "listed"` (required, and only there): root key fingerprints (64 hex digits). |
 | `links_total` | `256` | Quota: links from devices of other namespaces, in total. |
 | `links_per_namespace` | `32` (at most `links_total`) | Quota: links per other namespace. |
-| `interests_per_key` | `100` | Quota: Interests per second from one device (burst twice that). |
-| `interests_per_namespace` | `400` | Quota: Interests per second from one other namespace (burst twice that). |
+| `interests_per_key` | `100` | Quota: Interests per second from one stranger's device (burst twice that). The links of people this device invited (grants) take far higher rates, set by the link layer, not here; own-namespace links are never limited. An Interest over the rate is answered with a Nack (Congestion). |
+| `interests_per_namespace` | `400` | Quota: Interests per second from one other namespace's strangers together (burst twice that). |
 | `hold` | `false` | Hold Interests for sleeping devices that ask, and deliver them when they are back. |
 | `hold_per_device` | `64` | Most Interests held for one device (at least 1). |
 | `hold_total` | `4096` | Most Interests held in total (at least `hold_per_device`). |
