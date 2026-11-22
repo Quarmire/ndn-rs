@@ -1322,7 +1322,7 @@ fn entry_of(device: &str, digest: Option<[u8; 32]>) -> crate::events::EntryRef {
 }
 
 #[test]
-fn a_flood_of_two_kinds_under_one_namespace_cannot_hide_a_cut_a_revocation_or_answer_evidence() {
+fn a_flood_of_two_kinds_under_one_namespace_cannot_hide_a_cut_or_a_revocation() {
     let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
     let clock: Clock = Arc::new(|| Timestamp(1));
     let mut book = book_over(store, clock);
@@ -1360,22 +1360,9 @@ fn a_flood_of_two_kinds_under_one_namespace_cannot_hide_a_cut_a_revocation_or_an
         revoked: key("/bob/lost"),
         version: 2,
     });
-    book.report(EventDetail::Answer {
-        answer: n("/dave/laptop/32=answer/x"),
-        signer: key("/dave/laptop"),
-        id: [1; 32],
-        readset: [2; 32],
-        fault: crate::events::AnswerFault::Equivocation {
-            other_result: [3; 32],
-        },
-    });
     let pending = book.pending();
     let named = |k: EventKind| pending.iter().filter(|e| e.kind() == k).count();
-    for k in [
-        EventKind::Cut,
-        EventKind::Revocation,
-        EventKind::AnswerEvidence,
-    ] {
+    for k in [EventKind::Cut, EventKind::Revocation] {
         assert_eq!(
             named(k),
             1,

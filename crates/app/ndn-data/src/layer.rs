@@ -162,9 +162,6 @@ pub enum Got {
     /// (`<C>/32=range/<R>`, [`crate::wire::range_name`]), or one entry by
     /// its name.
     Entries(Entries),
-    /// An answer, asked by its exact name `<D>/32=answer/<id>` or by a question
-    /// `<X>/32=question/<AnswerAsk>` (`docs/specs/answers.md` §7).
-    Answer(crate::answer::Answered),
 }
 
 /// How old an answer may be (model invariant 5, "stale, never wrong").
@@ -531,9 +528,8 @@ pub trait DataLayer: Send + Sync {
     ///
     /// An exact version, state or snapshot by its name; or, by a
     /// collection's name, the newest by its rule — for a merge collection,
-    /// the merged state at a frontier — with how stale it may be. A
-    /// function's answer is a `get` on its name (slice 6). Readers that know
-    /// a prune covering the name answer [`DataError::Pruned`]. When no path
+    /// the merged state at a frontier — with how stale it may be. Readers
+    /// that know a prune covering the name answer [`DataError::Pruned`]. When no path
     /// answers, older verified data is returned with its [`Age`] rather than
     /// an error. A merge collection whose rule this device does not know
     /// is held and answered [`DataError::RuleUnknown`], never read under

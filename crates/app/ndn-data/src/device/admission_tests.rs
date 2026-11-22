@@ -582,3 +582,47 @@ async fn a_member_its_writers_node_stops_listing_keeps_its_group_waiting_until_i
     );
     dev.shutdown();
 }
+
+/// Whether a device may hold an epoch's key is the standing of the records
+/// held here: its namespace is a listed reader, it is not, or the record
+/// that would tell is not held (spec §9). `may_hold` is true only for the
+/// first.
+#[tokio::test]
+async fn may_hold_judges_by_epoch_standing() {
+    let owner = device().await;
+    let sealed = n("/alice/32=data/trip/sealed");
+    owner
+        .share(
+            &sealed,
+            Share {
+                readers: vec![Audience::Person(n("/alice"))],
+                ..log_share()
+            },
+        )
+        .await
+        .unwrap();
+    let epoch = owner.inner.st.lock().colls[&sealed]
+        .members
+        .as_ref()
+        .unwrap()
+        .epoch
+        .clone()
+        .unwrap();
+    let st = owner.inner.st.lock();
+    let asked = |c: &Name, who: &str, ns: &str| {
+        let standing = owner.inner.epoch_standing(&st, c, &epoch, &n(who), &n(ns));
+        let may = owner.inner.may_hold(&st, c, &epoch, &n(who), &n(ns));
+        assert_eq!(may, standing == EpochStanding::In, "{who} of {ns}");
+        standing
+    };
+    // The records are held here, so it is judged, not unknown.
+    assert_eq!(asked(&sealed, "/alice/phone", "/alice"), EpochStanding::In);
+    assert_eq!(asked(&sealed, "/bob/laptop", "/bob"), EpochStanding::Out);
+    // A collection no record of is held says nothing.
+    assert_eq!(
+        asked(&n("/alice/32=data/other"), "/alice/phone", "/alice"),
+        EpochStanding::NotHeld
+    );
+    drop(st);
+    owner.shutdown();
+}

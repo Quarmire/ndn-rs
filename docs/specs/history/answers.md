@@ -1,3 +1,5 @@
+> Superseded by NAME.md at ndn-rs <commit>. Kept for history; nothing here is normative.
+
 # Answers: named, checkable readings over signed data
 
 - **Status:** Built (round 5, item F; ndn-rs `ndn-data`, ndn-sim cases `a1`–`a18`; round 8 adds the ask exchange of §15 and the cases `a19`–`a22`; round 11 adds the refusal reason `EvaluatorRefused` and the case `a23`). The two decisions that were open are settled by the owner (2026-11-19): asking another device for an answer is built as the sealed ask exchange of §15 (F-QUESTIONS #1, option (a)), and the policy of §9 stays a value the host passes (#2, option (a)), to be revisited when the first provider is deployed.

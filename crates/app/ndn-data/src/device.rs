@@ -164,9 +164,7 @@ pub struct Config {
     /// How many askers' proofs this device verifies at once, whoever claims
     /// to ask — hold and audit asks' proofs (spec §13) and introduction
     /// asks, opened and verified (spec §19.4): what a crowd of strangers'
-    /// asks costs it at once; the rest wait their turn. Asks for an answer
-    /// (spec answers.md §15) have a budget of their own of the same size, so a
-    /// crowd of them slows none of these. At least 1.
+    /// asks costs it at once; the rest wait their turn. At least 1.
     pub asks_verifying: usize,
     /// How far ahead of this device's clock another device's may run, as
     /// this device judges it: a holder's signed `Expired` audit answer for a
@@ -208,13 +206,6 @@ pub struct Config {
     /// evidence it derives again after a restart is not reported again
     /// once acknowledged ([`Device::acknowledge`], spec §21.4).
     pub events_acked: usize,
-    /// The evaluators this device knows, by exact name (spec `answers.md` §4.1): what it
-    /// recomputes a pure answer with. Default none.
-    pub evaluators: crate::answer::Evaluators,
-    /// What this device does with answers: its policy, whether `get` signs what it computed, its
-    /// budget, what it keeps of others' answers and how fast it signs (spec `answers.md` §9,
-    /// §10).
-    pub answers: crate::answer::AnswerConfig,
 }
 
 impl Config {
@@ -254,8 +245,6 @@ impl Config {
             writer_collections: 1024,
             events_unacked: 256,
             events_acked: 1024,
-            evaluators: crate::answer::Evaluators::none(),
-            answers: crate::answer::AnswerConfig::default(),
         }
     }
 }
@@ -285,8 +274,6 @@ impl std::fmt::Debug for Config {
             .field("writer_collections", &self.writer_collections)
             .field("events_unacked", &self.events_unacked)
             .field("events_acked", &self.events_acked)
-            .field("evaluators", &self.evaluators)
-            .field("answers", &self.answers)
             .finish_non_exhaustive()
     }
 }
@@ -2235,9 +2222,6 @@ struct St {
     quarantine: BTreeSet<Name>,
     /// Per asker device, its hold and audit asks this holder is working on.
     asks: HashMap<Name, usize>,
-    /// The asks for an answer this signer holds: queued, working, and the calls waiting for
-    /// its host ([`answer_ask::AnswerAsks`]).
-    answer_asks: answer_ask::AnswerAsks,
     /// Asker devices one of whose hold asks waits here for its other one
     /// to end ([`Inner::hold_slot`]).
     hold_waits: BTreeSet<Name>,
@@ -2292,8 +2276,6 @@ struct St {
     scopes: scoped::Scopes,
     /// The events no folder owns, kept for the host ([`events::Book`]).
     events: events::Book,
-    /// What this device holds of answers, serves, and keeps as evidence ([`answers::Book`]).
-    answer_book: answers::Book,
 }
 
 struct Inner {
@@ -2334,20 +2316,6 @@ struct Inner {
     asking: Mutex<HashMap<(Name, Option<u64>), WalkAsk>>,
     /// Asker proofs being verified ([`Config::asks_verifying`]).
     verifying: Semaphore,
-    /// Proofs of asks for an answer being verified: a budget of their own, the size of
-    /// [`Config::asks_verifying`], so a crowd of those asks costs the others nothing.
-    answer_verifying: Semaphore,
-    /// The one turn at verifying a proof of an ask for an answer whose asker's key has no
-    /// certificate held here: verifying it may wait on a certificate fetch, so those proofs
-    /// share this one permit and none of [`Self::answer_verifying`], which askers with a
-    /// certificate held take their turns from (answers.md §15.3).
-    answer_uncached_verifying: Semaphore,
-    /// Asks for an answer being worked on, all askers together
-    /// ([`AnswerConfig::asks_at_once`](crate::answer::AnswerConfig)).
-    asks_at_once: Arc<Semaphore>,
-    /// Where the provider asks of authenticated devices go: what
-    /// [`Device::provider_asks`] gave out. `None` until a host takes it.
-    provider_asks: Mutex<Option<mpsc::Sender<crate::answer::ProviderAsk>>>,
     signatures: AtomicU64,
     /// Epoch keys asked for ([`Device::grants_asked`]).
     grants_asked: AtomicU64,
@@ -7106,34 +7074,16 @@ impl St {
         rules: &MergeRules,
         me: &Writer,
     ) -> Option<(Value, Vec<(VersionId, NotCounted)>)> {
-        self.value_and_cover_at(c, at, rules, me)
-            .map(|(value, not_counted, _)| (value, not_counted))
-    }
-
-    /// [`Self::value_at`], and the per-writer highest seq inside the cover of a checkpoint
-    /// applied at `at` ([`Cover::join`]): what an answer's applied-set digest leaves out
-    /// (`docs/specs/answers.md` §3.1).
-    #[allow(clippy::type_complexity)]
-    fn value_and_cover_at(
-        &self,
-        c: &Name,
-        at: &Frontier,
-        rules: &MergeRules,
-        me: &Writer,
-    ) -> Option<(Value, Vec<(VersionId, NotCounted)>, BTreeMap<Writer, u64>)> {
         let coll = self.colls.get(c)?;
         let members = coll.members.as_ref()?;
         let Rule::Merge { function } = &members.rule else {
             return None;
         };
         if *at == coll.at() {
-            return coll.state.as_ref().map(|s| {
-                (
-                    s.value(&coll.held_back()),
-                    coll.not_counted_list(),
-                    coll.cover.join.clone(),
-                )
-            });
+            return coll
+                .state
+                .as_ref()
+                .map(|s| (s.value(&coll.held_back()), coll.not_counted_list()));
         }
         let mut state = rules.get(function)?.start(c, me);
         let mut versions = coll.versions.clone();
@@ -7232,11 +7182,7 @@ impl St {
                 not_counted.entry(id.clone()).or_insert_with(|| why.clone());
             }
         }
-        Some((
-            state.value(&excluded),
-            not_counted.into_iter().collect(),
-            cover.join,
-        ))
+        Some((state.value(&excluded), not_counted.into_iter().collect()))
     }
 
     /// The devices, besides its writer's, whose versions of `c` held here
@@ -7460,7 +7406,6 @@ impl Device {
         let svs = spawn_multi_svs(device.clone(), out_tx, in_rx);
         let in_flight = config.in_flight.max(config.window).max(1);
         let asks_verifying = config.asks_verifying.max(1);
-        let asks_at_once = config.answers.asks_at_once.max(1);
         let recipient = recipient_key(&keys, &device)?;
         let seal_keys = Keys::new(recipient);
         let clock = Arc::clone(&config.clock);
@@ -7559,7 +7504,6 @@ impl Device {
                 me: Writer::new(identity.key.clone()),
                 quarantine: BTreeSet::new(),
                 asks: HashMap::new(),
-                answer_asks: answer_ask::AnswerAsks::default(),
                 hold_waits: BTreeSet::new(),
                 taking: BTreeSet::new(),
                 answers: Kept::new(ANSWERS_KEPT),
@@ -7579,7 +7523,6 @@ impl Device {
                 sleeping: BTreeSet::new(),
                 scopes: scoped::Scopes::default(),
                 events,
-                answer_book: answers::Book::default(),
             }),
             progress: Notify::new(),
             sweep: Arc::new(Notify::new()),
@@ -7590,10 +7533,6 @@ impl Device {
             rtt: Mutex::new(Rtt::default()),
             asking: Mutex::new(HashMap::new()),
             verifying: Semaphore::new(asks_verifying),
-            answer_verifying: Semaphore::new(asks_verifying),
-            answer_uncached_verifying: Semaphore::new(1),
-            asks_at_once: Arc::new(Semaphore::new(asks_at_once)),
-            provider_asks: Mutex::new(None),
             signatures: AtomicU64::new(0),
             grants_asked: AtomicU64::new(0),
             grants_answered: AtomicU64::new(0),
@@ -7638,8 +7577,6 @@ impl Device {
             let mut st = inner.st.lock();
             st.durable = st.head;
         }
-        // Answers an earlier run kept, verified again, and the evidence kept against signers.
-        inner.load_answers().await;
         inner.spawn_committer();
         let weak = Arc::downgrade(&inner);
         rt::spawn(async move {
@@ -8753,6 +8690,18 @@ fn bare_interest(pkt: Bytes) -> Option<Interest> {
     Interest::decode(pkt).ok()
 }
 
+/// Whether a device may hold the key of an epoch, as far as what this device holds tells
+/// ([`Inner::epoch_standing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EpochStanding {
+    /// It may.
+    In,
+    /// It may not.
+    Out,
+    /// The records that tell are not all held here (yet): neither.
+    NotHeld,
+}
+
 impl Inner {
     fn me(&self) -> &Writer {
         &self.writer
@@ -8804,7 +8753,7 @@ impl Inner {
         let mut scoped_newest = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
             // The device's own events, loaded before ([`events::Book::load`]).
-            if events::is_stored(&name) || answers::is_stored(&name) || notes::is_stored(&name) {
+            if events::is_stored(&name) || notes::is_stored(&name) {
                 continue;
             }
             if let Some(entry) = over(&verified_prefix(), &name) {
@@ -10638,24 +10587,13 @@ impl Inner {
     /// by this clock is [`Refusal::Lapsed`]: kept by no decision, since only
     /// the clock refuses it.
     async fn verify(&self, data: &Data) -> Result<Writer, Refusal> {
-        self.verify_scoped(data).await.map(|(writer, _)| writer)
-    }
-
-    /// [`Self::verify`], saying of what it verified whether it is a packet of
-    /// one device of a writer's namespace taken on the strength of a members
-    /// record listing that writer, which this device does not hold
-    /// ([`Self::judge_device_packet`]): the namespace, for the caller to limit
-    /// what it uses the packet for (an answer's reads, spec §6.3). Such a
-    /// packet verifies only when its signing key is of the device its name is
-    /// under, and no other device of the namespace.
-    async fn verify_scoped(&self, data: &Data) -> Result<(Writer, Option<Name>), Refusal> {
         let key = data
             .sig_info()
             .and_then(|s| s.key_locator_name())
             .ok_or(Refusal::BadSignature)?;
         // A person's namespace adopted for a folder judges its packets
-        // about that folder alone (spec §6.3), and the seal key, the reply
-        // and the answers of a device of a writer the folder's record lists
+        // about that folder alone (spec §6.3), and the seal key and the
+        // asker's proof of a device of a writer the folder's record lists
         // no others; the device's own validator every other packet.
         let device_packet = self.judge_device_packet(&data.name);
         let judge = match &device_packet {
@@ -10679,10 +10617,7 @@ impl Inner {
                     tracing::debug!(name = %data.name, key = %key, "not verified: it is signed by a key of another device than the one its name is under");
                     return Err(Refusal::BadSignature);
                 }
-                Ok((
-                    Writer::new((*key).clone()),
-                    device_packet.map(|d| d.namespace),
-                ))
+                Ok(Writer::new((*key).clone()))
             }
             // The signing key itself (not an issuer above it) is revoked.
             ValidationResult::Invalid(TrustError::Revoked { name, .. })
@@ -12899,7 +12834,6 @@ impl Inner {
             false => Rejudge::Withdrawn(None),
         })
         .await;
-        self.rejudge_answers().await;
         self.fetch_cut_runs();
         self.settle().await;
         self.progress.notify_waiters();
@@ -15781,23 +15715,6 @@ impl Inner {
                     return;
                 }
             }
-            Some(wire::Served::AnswerAsk) => {
-                if crate::answer::parse_answer_ask_name(&name).is_some_and(|d| d == self.device) {
-                    // Answering an ask for an answer opens the ask, verifies the
-                    // asker and may compute: its own task (answers.md §15). An ask
-                    // that does not authenticate gets no reply at all, not even a
-                    // Nack: the Interest is dropped.
-                    let params = interest.app_parameters().cloned();
-                    let lifetime = interest.lifetime();
-                    rt::spawn(async move {
-                        match self.answer_ask(&name, params, lifetime).await {
-                            Some(wire) => self.reply(&name, responder, Some(wire)).await,
-                            None => drop(responder),
-                        }
-                    });
-                    return;
-                }
-            }
             Some(wire::Served::Hint) => {
                 if crate::intro::parse_hint_name(&name).is_some_and(|(d, _)| d == self.device) {
                     // The hint record of a short code (SHAPES-R10 §2), or its gone mark:
@@ -15873,10 +15790,6 @@ impl Inner {
     }
 
     fn packet_for(&self, name: &Name, can_be_prefix: bool) -> Option<Bytes> {
-        // An answer, or a piece of one (answers.md §6.2).
-        if let Some(reply) = self.answer_packet(name) {
-            return reply;
-        }
         // A name ending in an implicit digest asks for exactly that packet
         // (a re-admission fetches so, spec §8): the packet of the name
         // before it, if its digest is that one.
@@ -16000,7 +15913,7 @@ impl Inner {
             return (*kept.name == *name).then_some(w);
         }
         // This device's seal key by its device name alone, as one asked for
-        // by prefix: whoever seals an ask to this device (answers.md §15)
+        // by prefix: whoever seals an ask to this device (spec §19.4)
         // learns the key from the packet it signed, and verifies it so.
         if can_be_prefix && *name == wire::seal_key_prefix(&self.device) {
             return self.seal_key_packet(&mut self.st.lock());
@@ -16178,7 +16091,34 @@ impl Inner {
     /// that subject's record in force when it seals. Records not held
     /// admit no one.
     fn may_hold(&self, st: &St, c: &Name, e: &Epoch, device: &Name, dns: &Name) -> bool {
-        self.epoch_standing(st, c, e, device, dns) == answer_ask::Standing::In
+        self.epoch_standing(st, c, e, device, dns) == EpochStanding::In
+    }
+
+    /// Whether `device`, of namespace `dns`, may hold the key of epoch `e` of `c`, as far as the
+    /// records held here tell: a held owner-signed record of `c` — or of the folder whose
+    /// epoch it is ([`St::seal_subject`]) — names `e`, the readers those records list (or `e`'s
+    /// creator) admit it, and so does that subject's record in force when it seals. A record
+    /// that is not held says nothing: [`EpochStanding::NotHeld`].
+    fn epoch_standing(
+        &self,
+        st: &St,
+        c: &Name,
+        e: &Epoch,
+        device: &Name,
+        dns: &Name,
+    ) -> EpochStanding {
+        let Some((epochs, Some(record))) = st.line_of(&st.seal_subject(c, e)) else {
+            return EpochStanding::NotHeld;
+        };
+        let Some(named) = epochs.get(e) else {
+            return EpochStanding::NotHeld;
+        };
+        let admitted = self.admits(st, &named.readers, Some(&e.creator), device, dns)
+            && (record.epoch.is_none() || self.admits_record(st, record, device, dns));
+        match admitted {
+            true => EpochStanding::In,
+            false => EpochStanding::Out,
+        }
     }
 
     /// Whether this device reads `c`.
@@ -18707,23 +18647,10 @@ impl Inner {
     /// `asker` that verifies to a trust anchor. At most
     /// [`Config::asks_verifying`] proofs are verified at once.
     async fn proves(&self, proof: &Data, asker: &Name, binding: &[u8; 32]) -> bool {
-        self.proves_with(&self.verifying, proof, asker, binding)
-            .await
-    }
-
-    /// [`Self::proves`], taking its turn from `turns`: asks for an answer have a budget of
-    /// their own.
-    async fn proves_with(
-        &self,
-        turns: &Semaphore,
-        proof: &Data,
-        asker: &Name,
-        binding: &[u8; 32],
-    ) -> bool {
         if *proof.name != wire::ask_name(asker, binding) {
             return false;
         }
-        let Ok(_turn) = turns.acquire().await else {
+        let Ok(_turn) = self.verifying.acquire().await else {
             return false;
         };
         self.verify(proof)
@@ -18741,10 +18668,9 @@ impl Inner {
     }
 
     /// [`Self::ask_slot`] for a grant ask of `asker`, [`GRANTS_PER_ASKER`] at
-    /// once. Counted apart from the asker's other asks (an answer ask, a hold,
-    /// an audit), under the asker's name with the `32=grant` keyword added,
-    /// so a device's grant asks neither take the slot of its own answer ask
-    /// nor wait behind it.
+    /// once. Counted apart from the asker's other asks (a hold, an audit), under
+    /// the asker's name with the `32=grant` keyword added, so a device's grant
+    /// asks neither take the slot of its other asks nor wait behind them.
     fn grant_slot(&self, asker: &Name) -> Option<AskSlot<'_>> {
         let key = Name::from_components(
             asker
@@ -20640,10 +20566,6 @@ impl DataLayer for Device {
         // Each reading below needs its own keyword in the name: one pass finds them, so a
         // plain collection name (the common read) is parsed by none of them.
         let words = wire::NameWords::of(name);
-        // An exact answer name, or a question (answers.md §7.1).
-        if words.answer() {
-            return inner.get_answer(name).await;
-        }
         // A version or entry of a merge collection whose state is not built
         // yet is read from it: built now (spec §5.2). A collection or state
         // name is followed, which builds it ([`Inner::follow`]).
@@ -20907,15 +20829,6 @@ impl DataLayer for Device {
                         name: name.clone(),
                         why: "a range read's answer grows with its stream, so a snapshot cannot \
                               pin it; pin the blocks it read, by their names"
-                            .into(),
-                    });
-                }
-                Got::Answer(_) => {
-                    return Err(DataError::BadRequest {
-                        name: name.clone(),
-                        why: "a snapshot pins versions and states, not answers; pin the versions \
-                              the answer read (its read set lists them), and ask the question \
-                              again from the snapshot"
                             .into(),
                     });
                 }
@@ -27498,17 +27411,6 @@ mod groups;
 mod scoped;
 
 mod events;
-
-mod answer_get;
-
-mod answer_ask;
-
-mod answer_reads;
-
-mod answers;
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod answers_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod events_tests;

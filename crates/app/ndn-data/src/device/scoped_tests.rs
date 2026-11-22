@@ -4,13 +4,11 @@
 
 use super::super::*;
 use super::{Adopted, DevicePacket, SCOPE_PER_SUBJECT, Scopes, device_packet};
-use crate::answer::{ReadRef, ReadSet};
 use crate::collection::Accepted;
 use crate::intro::{Adopting, Introducer, Scoping};
 use crate::layer::Share;
 use crate::wire::CutBody;
 use ndn_app::AppError;
-use ndn_foundation_types::Hash;
 use ndn_packet::NameComponent;
 use ndn_security::self_certifying::{Genesis, personal_namespace_of, self_certifying_name};
 use ndn_security::{ScopedContext, TrustSchema};
@@ -792,7 +790,7 @@ async fn adopting(carol: &Carol, phones: &[&Phone]) -> Device {
 }
 
 /// What a device of a writer a record lists is taken for, and nothing of
-/// hers beyond: its seal key, the reply to an ask, an answer and an asker's
+/// hers beyond: its seal key and an asker's
 /// proof verify, each only as that very device's own packet and only for a
 /// role her context names; a seal key whose content is another key, one
 /// signed by another device of her namespace, a device a role deeper or
@@ -826,18 +824,13 @@ async fn a_listed_writers_own_device_packets_verify_and_nothing_else_of_hers_doe
         "and is the device's seal key"
     );
 
-    // The reply, an answer and the asker's proof, each by the same device.
-    for (what, name) in [
-        (
-            "a reply",
-            crate::answer::answer_ask_name(&phone.name, b"parameters"),
-        ),
-        ("an answer", wire::answer_name(&phone.name, &[1; 32])),
-        ("an asker's proof", wire::ask_name(&phone.name, &[2; 32])),
-    ] {
-        let verified = dev.inner.verify(&phone.signs(&name, b"x")).await;
-        assert!(verified.is_ok(), "{what} of her own device: {verified:?}");
-    }
+    // The asker's proof, by the same device.
+    let proof = wire::ask_name(&phone.name, &[2; 32]);
+    let verified = dev.inner.verify(&phone.signs(&proof, b"x")).await;
+    assert!(
+        verified.is_ok(),
+        "an asker's proof of her own device: {verified:?}"
+    );
 
     // Another key under the seal key's name: the content names another key.
     let other = phone.signs(&seal, &wire::encode_seal_key(&[8; 32]));
@@ -846,12 +839,7 @@ async fn a_listed_writers_own_device_packets_verify_and_nothing_else_of_hers_doe
         "a seal key packet whose content is not the key its name carries is not that key's"
     );
     // Signed by another device of her namespace.
-    for name in [
-        seal.clone(),
-        wire::answer_name(&phone.name, &[1; 32]),
-        crate::answer::answer_ask_name(&phone.name, b"parameters"),
-        wire::ask_name(&phone.name, &[2; 32]),
-    ] {
+    for name in [seal.clone(), wire::ask_name(&phone.name, &[2; 32])] {
         let forged = tablet.signs(&name, &wire::encode_seal_key(&pk));
         assert_eq!(
             dev.inner.verify(&forged).await.map(|w| w.key().clone()),
@@ -943,40 +931,6 @@ async fn a_person_no_record_lists_as_a_writer_has_no_device_packet_judged() {
             .await
             .map(|w| w.key().clone()),
         Err(Refusal::BadSignature),
-    );
-    dev.shutdown();
-}
-
-/// An answer of a listed writer's device is of what the records list her
-/// for: every read's collection lies under a subject whose record in force
-/// lists her as a writer.
-#[tokio::test(start_paused = true)]
-async fn an_answer_of_a_listed_writers_device_reads_only_what_its_record_lists() {
-    let carol = Carol::new();
-    let (k1, _) = &carol.k1;
-    let phone = Phone::new(&carol.mgr, &carol.ns, k1, "member", "phone").await;
-    let dev = adopting(&carol, &[&phone]).await;
-    let read = |collection: Name| ReadRef::Version {
-        name: log_name(&n("/alice/laptop"), Some(&collection), 1),
-        digest: Hash([1; 32]),
-    };
-    let set = |collections: &[Name]| {
-        ReadSet::new(collections.iter().cloned().map(read)).expect("a read set")
-    };
-    let inside = folder().append("plan");
-    assert_eq!(
-        dev.inner
-            .reads_listed_for(&carol.ns, &set(std::slice::from_ref(&inside))),
-        Ok(())
-    );
-    let refused = dev
-        .inner
-        .reads_listed_for(&carol.ns, &set(&[inside, f_other().append("plan")]));
-    assert!(
-        refused.as_ref().is_err_and(|why| why.contains("other/plan")
-            && why.contains("as a writer")
-            && why.contains("ask a signer of")),
-        "one read of a collection no record lists her for refuses the answer, saying why: {refused:?}"
     );
     dev.shutdown();
 }

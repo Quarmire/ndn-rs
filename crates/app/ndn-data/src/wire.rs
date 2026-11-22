@@ -355,9 +355,6 @@ const RANGE: &[u8] = b"range";
 const CUT: &[u8] = b"cut";
 const SIGNAL: &[u8] = b"signal";
 const RUN: &[u8] = b"run";
-const ANSWER: &[u8] = b"answer";
-const QUESTION: &[u8] = b"question";
-pub(crate) const ASK_ANSWER: &[u8] = b"ask-answer";
 
 /// The most payload octets a version carries in its own packet; a larger
 /// payload travels in pieces, whatever the collection's rule (a block never).
@@ -1078,18 +1075,15 @@ pub enum AskProtocol {
     IntroAsk,
     /// An introduction answer ([`crate::intro::AnswerBody`]).
     IntroAnswer,
-    /// An ask for an answer ([`crate::answer::AnswerAskBody`]).
-    AnswerAsk,
 }
 
 impl AskProtocol {
     /// Every protocol.
-    pub const ALL: [AskProtocol; 5] = [
+    pub const ALL: [AskProtocol; 4] = [
         AskProtocol::Hold,
         AskProtocol::Audit,
         AskProtocol::IntroAsk,
         AskProtocol::IntroAnswer,
-        AskProtocol::AnswerAsk,
     ];
 
     /// The octets opening its bindings: ASCII ending in a zero octet, so
@@ -1100,7 +1094,6 @@ impl AskProtocol {
             AskProtocol::Audit => b"ndn-data audit ask\0",
             AskProtocol::IntroAsk => b"ndn-data intro ask\0",
             AskProtocol::IntroAnswer => b"ndn-data intro answer\0",
-            AskProtocol::AnswerAsk => b"ndn-data answer ask\0",
         }
     }
 }
@@ -1229,17 +1222,10 @@ pub fn parse_held_name(name: &Name) -> Option<(Name, Name)> {
     Some((name_of(&comps[..at]), read_name(value).ok()?))
 }
 
-// ---- round 5: answers (answers.md §3.3, §7.1, §11.1) ---------------------------------------------
-
-/// The octets of an answer id.
-pub const ANSWER_ID_LEN: usize = 32;
-
 /// The keywords of a name that `get` routes by, found in one pass over its components: each
 /// parser `get` would try needs its own keyword in the name, so a name without it skips the
 /// parser. A necessary condition only: the parsers still judge the name (a `32=range` anywhere
-/// is a range name, and an ill-formed one is a `BadName`; an answer or question keyword
-/// anywhere makes it a name of answers, answers.md §7.1, which answers `BadName` saying how to
-/// form one if it is not).
+/// is a range name, and an ill-formed one is a `BadName`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct NameWords(u8);
 
@@ -1248,7 +1234,6 @@ impl NameWords {
     const ENTRY: u8 = 2;
     const STATE: u8 = 4;
     const RANGE: u8 = 8;
-    const ANSWER: u8 = 16;
 
     pub(crate) fn of(name: &Name) -> Self {
         let mut bits = 0;
@@ -1261,16 +1246,10 @@ impl NameWords {
                 ENTRY => Self::ENTRY,
                 STATE => Self::STATE,
                 RANGE => Self::RANGE,
-                ANSWER | QUESTION => Self::ANSWER,
                 _ => 0,
             };
         }
         Self(bits)
-    }
-
-    /// Has an answer or question keyword.
-    pub(crate) fn answer(self) -> bool {
-        self.0 & Self::ANSWER != 0
     }
 
     pub(crate) fn log(self) -> bool {
@@ -1299,8 +1278,6 @@ pub(crate) enum Served {
     Hold,
     /// `<device>/32=intro/<digest>`.
     Intro,
-    /// `<signer>/32=ask-answer/<digest>`.
-    AnswerAsk,
     /// `<device>/32=hint/<token>`.
     Hint,
     /// `<holder>/32=held/<name>`.
@@ -1321,94 +1298,11 @@ pub(crate) fn served_kind(name: &Name) -> Option<Served> {
         GRANT => Some(Served::Grant),
         HOLD => Some(Served::Hold),
         crate::intro::INTRO => Some(Served::Intro),
-        ASK_ANSWER => Some(Served::AnswerAsk),
         crate::intro::HINT => Some(Served::Hint),
         HELD => Some(Served::Held),
         AUDIT => Some(Served::Audit),
         _ => None,
     }
-}
-
-/// An answer's name: `<D>/32=answer/<id>`, `D` the signer's device name, `id` one component of
-/// the 32 octets of the answer id (answers.md §3.3).
-pub fn answer_name(device: &Name, id: &[u8; ANSWER_ID_LEN]) -> Name {
-    device
-        .clone()
-        .append_component(kw(ANSWER))
-        .append_component(NameComponent::generic(Bytes::copy_from_slice(id)))
-}
-
-/// Parse `<D>/32=answer/<id>`: `D` is everything before the first `32=answer` (a device name:
-/// no keyword, no digest), and exactly one generic component of 32 octets follows.
-pub fn parse_answer_name(name: &Name) -> Option<(Name, [u8; ANSWER_ID_LEN])> {
-    let comps = name.components();
-    let at = comps.iter().position(|c| is_kw(c, ANSWER))?;
-    if !is_device_comps(&comps[..at]) || at + 2 != comps.len() {
-        return None;
-    }
-    let id = &comps[at + 1];
-    if id.typ != tlv_type::GENERIC_NAME_COMPONENT {
-        return None;
-    }
-    Some((
-        name_of(&comps[..at]),
-        <[u8; ANSWER_ID_LEN]>::try_from(&id.value[..]).ok()?,
-    ))
-}
-
-/// Parse a piece of an answer in pieces: `<A>/seg=<i>` or `<A>/32=manifest/seg=<k>`, `A` an
-/// answer's name (answers.md §5.4, §11.1): the answer's name and which piece. No custody applies
-/// to answers.
-pub fn parse_answer_piece_name(name: &Name) -> Option<(Name, PieceKind)> {
-    let comps = name.components();
-    let (last, rest) = comps.split_last()?;
-    let n = last.as_segment()?;
-    let (rest, kind) = match rest.split_last() {
-        Some((m, before)) if is_kw(m, MANIFEST) => (before, PieceKind::Manifest(n)),
-        _ => (rest, PieceKind::Chunk(n)),
-    };
-    let answer = name_of(rest);
-    parse_answer_name(&answer)?;
-    Some((answer, kind))
-}
-
-/// A question's name: `<X>/32=question/<AnswerAsk TLV>`, one generic component whose value is
-/// exactly the `AnswerAsk` (answers.md §7.1). Local, never sent. `X` is the definition's
-/// collection (pure) or the provider device (provider); `AnswerAsk::name` checks that.
-pub fn question_name(x: &Name, ask: &crate::answer::AnswerAsk) -> Name {
-    x.clone()
-        .append_component(kw(QUESTION))
-        .append_component(NameComponent::generic(ask.encode()))
-}
-
-/// Parse `<X>/32=question/<AnswerAsk TLV>`: `None` when the name is not of that form (no
-/// `32=question` as the next-to-last component); `Some(Err(..))` when it is, and its last
-/// component is not exactly one decodable `AnswerAsk` of at most `QUESTION_MAX` octets.
-pub fn parse_question_name(
-    name: &Name,
-) -> Option<Result<(Name, crate::answer::AnswerAsk), WireError>> {
-    let comps = name.components();
-    let (last, rest) = comps.split_last()?;
-    let (marker, x) = rest.split_last()?;
-    if !is_kw(marker, QUESTION) {
-        return None;
-    }
-    if x.iter().any(|c| is_kw(c, QUESTION)) {
-        return Some(Err(bad("a question name has one 32=question component")));
-    }
-    if last.typ != tlv_type::GENERIC_NAME_COMPONENT {
-        return Some(Err(bad(
-            "the last component of a question is one generic component holding an AnswerAsk",
-        )));
-    }
-    if last.value.len() > crate::answer::QUESTION_MAX {
-        return Some(Err(bad(format!(
-            "a question is at most {} octets, this one is {}",
-            crate::answer::QUESTION_MAX,
-            last.value.len()
-        ))));
-    }
-    Some(crate::answer::AnswerAsk::decode(last.value.clone()).map(|ask| (name_of(x), ask)))
 }
 
 // ---- slice 4: heads, entries, range reads -------------------------------------------------------
@@ -4730,15 +4624,10 @@ mod tests {
             held_name(&device, &n("/bob/phone/32=log/seq=1")),
             crate::intro::intro_name(&device, b"params"),
             crate::intro::hint_name(&device, &[3; crate::intro::HINT_TOKEN_LEN]),
-            crate::answer::answer_ask_name(&device, b"params"),
-            answer_name(&device, &[4; ANSWER_ID_LEN]),
             // Mixed and misplaced keywords: a keyword after another, after a digest, twice.
             n("/alice/laptop/32=log/32=hold/x"),
             n("/alice/laptop/32=hold/32=held/x"),
             n("/alice/laptop/32=held/32=held/x"),
-            n("/alice/32=data/a/32=answer/x"),
-            n("/alice/32=data/a/32=question/x"),
-            n("/alice/laptop/32=log/32=answer/seq=1"),
             n("/32=grant"),
             n("/alice/32=grant"),
             n("/alice/32=range/x"),
@@ -4746,7 +4635,6 @@ mod tests {
             n("/alice/laptop/32=audit"),
             n("/alice/laptop/32=intro"),
             n("/alice/laptop/32=hint"),
-            n("/alice/laptop/32=ask-answer"),
         ];
         names.push(held_name(&device, &log).append_implicit_digest([5; 32]));
         names.push(
@@ -4765,8 +4653,6 @@ mod tests {
                 Some(Served::Hold)
             } else if crate::intro::parse_intro_name(name).is_some() {
                 Some(Served::Intro)
-            } else if crate::answer::parse_answer_ask_name(name).is_some() {
-                Some(Served::AnswerAsk)
             } else if crate::intro::parse_hint_name(name).is_some() {
                 Some(Served::Hint)
             } else if parse_held_name(name).is_some() {
@@ -4781,9 +4667,6 @@ mod tests {
             Served::Grant => parse_grant_name(name).map(|_| Served::Grant),
             Served::Hold => parse_hold_ask_name(name).map(|_| Served::Hold),
             Served::Intro => crate::intro::parse_intro_name(name).map(|_| Served::Intro),
-            Served::AnswerAsk => {
-                crate::answer::parse_answer_ask_name(name).map(|_| Served::AnswerAsk)
-            }
             Served::Hint => crate::intro::parse_hint_name(name).map(|_| Served::Hint),
             Served::Held => parse_held_name(name).map(|_| Served::Held),
             Served::Audit => parse_audit_ask_name(name).map(|_| Served::Audit),
@@ -4794,11 +4677,6 @@ mod tests {
             seen.extend(chain(name).map(|k| format!("{k:?}")));
 
             let words = NameWords::of(name);
-            let answers = name
-                .components()
-                .iter()
-                .any(|c| is_kw(c, ANSWER) || is_kw(c, QUESTION));
-            assert_eq!(words.answer(), answers, "{name}");
             assert!(
                 words.log() || parse_log_name(name).is_none(),
                 "{name}: a log name without 32=log"
@@ -4816,6 +4694,6 @@ mod tests {
                 "{name}: a range name without 32=range"
             );
         }
-        assert_eq!(seen.len(), 7, "the table reaches every route: {seen:?}");
+        assert_eq!(seen.len(), 6, "the table reaches every route: {seen:?}");
     }
 }

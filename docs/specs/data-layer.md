@@ -34,10 +34,6 @@
   their wire format (§16). Sections marked with a later slice are not yet
   normative beyond what they state; a section marked *open* has no
   normative content beyond its text.
-- **Answers (round 5, item F):** named, checkable, sealed readings over signed
-  data are specified in [answers.md](answers.md) (the interim of slice 8, a
-  service that `put`s its answer into a collection of its own, is replaced by
-  it); this document names where they touch it.
 - **Scope:** the data model shared by files, databases and network
   exchanges — versions, collections, members, summaries, cuts, snapshots,
   custody, prune, seals and types — and the seven verbs over it. The Rust
@@ -92,10 +88,6 @@ Every implementation MUST hold all of these.
 9. **Forward-only, said plainly.** Revocation and deletion stop future
    reads; an implementation MUST NOT claim to recall copies already made.
 
-10. **Answers say what they read.** An answer is immutable and named by the
-    exact versions it read; a mismatch with a recomputation is evidence
-    (answers.md).
-
 No validity decision may accept anything because of a wall clock, nor
 compare a certificate's validity period with one, with one exception that
 can only refuse: a key of a role the trust context lists in DataRequiresCut
@@ -134,8 +126,7 @@ which entries it puts in a cut it makes (§8.1); a reader never reads it.
   where a collection is asked for, or another keyword or digest component —
   answers `BadName`, saying which and how the name must be formed
   (`NextStep::FixName`). `get` also takes log entry and state names
-  (§11), entry and range names (§4.1, §5.4), and answer and question names
-  (answers.md §3.3, §7.1).
+  (§11), and entry and range names (§4.1, §5.4).
 - A **device** `D` is the identity of one key: the key is named
   `<D>/KEY/<key-id>` (NDN key naming). `D` is the device's name in seals
   and the prefix it serves; it has no KeywordNameComponent or digest
@@ -466,11 +457,6 @@ a put. Batching is there for atomicity, and for engines that pay per write.
   after a kill, or none is. A group of `GROUP_MAX` versions is a batch of
   that many entries with their pieces and markers, held in memory until it
   is handed over, as the signed group already is.
-
-An answer is served, announced and listed only behind the same barrier as a log
-entry (answers.md §6.2), and a provider keeps every answer it signed, so after a
-restart or a power loss it serves what it signed or nothing, never another
-result at the name.
 
 ## 5. Collection and rule — slices 1, 2, 4 (one key), 6 (rules by name, groups)
 
@@ -1938,14 +1924,12 @@ gesture beyond the owner's records.
   reader, so no members record `P` signs is taken.
 - **A listed writer's own devices (round 11).** One more kind of packet of
   `P` is judged by the adopted context, so that two writers who never met
-  can ask each other for answers (answers.md §15): the packets of **one
-  device** of `P` that the ask exchange is made of, and exactly these, by
-  name — `<P>/<role>/<dev>/32=seal/<pk>` (the device's seal key, `<pk>` its
-  32 octets), `<P>/<role>/<dev>/32=ask-answer/<ParametersSha256>` (the
-  reply to an ask), `<P>/<role>/<dev>/32=answer/<id>` (an answer) and
-  `<P>/<role>/<dev>/32=ask/<binding>` (the proof an asker sends with its
-  ask, §13.2) — with exactly two components, `<role>` and `<dev>`, between
-  `P` and the keyword, and `<role>` a role `P`'s context names: one of the
+  can exchange signed asks (§13.2): the packets of **one device** of `P` that
+  the ask exchange is made of, and exactly these, by name —
+  `<P>/<role>/<dev>/32=seal/<pk>` (the device's seal key, `<pk>` its 32
+  octets) and `<P>/<role>/<dev>/32=ask/<binding>` (the proof an asker sends
+  with its ask, §13.2) — with exactly two components, `<role>` and `<dev>`,
+  between `P` and the keyword, and `<role>` a role `P`'s context names: one of the
   layout's (`admin`, `member`, `node`, `guest`) or one the context lists in
   `DataRequiresCut` or its link policy. The device does this
   (`judge_device_packet`, apart from the scope above, whose names it does
@@ -1962,25 +1946,17 @@ gesture beyond the owner's records.
     record in force lists `P` as a writer: the record that drops `P` drops
     every seal key kept for its devices (at once, under the same lock as
     the record), and one that arrives after is not kept;
-  - **a reply** is taken only by the asker whose Interest it answers (its
-    name is the Interest's, answers.md §15.5), as before;
-  - **an answer** is taken only after it is opened, and only if every read's
-    collection lies under a subject whose record in force lists `P` as a
-    writer: otherwise it is refused `Untrusted`, saying which read and what
-    to do, and no evidence is raised against the device for it;
-  - **an asker's proof** authenticates the device for the signer that
-    serves its namespace (`OwnAndMembers`): the asker's namespace is `P`
-    when no context of it is held and it is adopted and a record lists it
-    as a writer; what it may then ask is decided as for any asker
-    (answers.md §15.4 steps 3 to 5), by the records.
+  - **an asker's proof** authenticates the device for the holder, granter
+    or offering device that receives it, as every asker's proof does
+    (§13.2); what it may then ask is decided by the records.
 
   Why it is safe. Nothing vouches for a key but a certificate chain to the
   genesis `P` hashes: only `P`'s owner can make a key that verifies here,
-  and a record's owner already named `P` a writer, so a signer of answers
-  for the subject. A copied seal key gives the copier nothing: the ask's
-  associated data binds the signer's name, and the proof's binding the
-  signer's device and the ephemeral key. A grant is made only to the
-  epoch's audience, as it was (§9: the seal key only tells where to wrap).
+  and a record's owner already named `P` a writer for the subject. A copied
+  seal key gives the copier nothing: the ask's associated data binds the
+  signer's name, and the proof's binding the signer's device and the
+  ephemeral key. A grant is made only to the epoch's audience, as it was
+  (§9: the seal key only tells where to wrap).
   What stays: `P`'s owner may make devices at will, as for any listed
   writer. Nothing else of `P` is judged by this: not a log entry about a
   subject no record lists it for, not a head, a summary or a snapshot
@@ -2415,11 +2391,6 @@ always did.
   and forwarders and validators keep them and the cut's manifest, for that
   use only (trust-context.md §5.1, §6.3).
 
-**Answers.** A revocation cut never lists an answer (an answer is not a log
-entry and has no seq): like summary roots, one-key heads, seal keys, grants,
-audit answers and an asker's proofs, answers by a revoked key are refused once
-the revocation is held (answers.md §13.9).
-
 ### 8.2 Re-admission — slice 5
 
 A cut can drop honest work: a stolen device's offline edits nobody had
@@ -2853,12 +2824,6 @@ forward ciphertext. Erasure is the destruction of the key.
   names the asker's seal key, the collection or folder and the epoch), and
   when.
 
-**Answers (answers.md §5).** An answer over sealed collections is sealed under
-an audience key derived (HKDF-SHA256) from the content keys of every epoch of
-its read set, so only a device in the audience of every one of them holds it;
-erasing an epoch's key erases the answers that read in it. What a relay sees of
-an answer: its name, kind, the size of its ciphertext and its epoch list.
-
 ## 10. Type — slice 1
 
 A type is a named, versioned content schema (`/types/note`, revision 2).
@@ -2891,10 +2856,6 @@ entry name or a state name. Publishing it makes a set of versions and
 merged states citable together: a link carries the snapshot's name. It
 does not hold the versions it pins back — a reader may count them before
 the snapshot arrives; versions counted all or none are a group (§5.5).
-
-A state read by an answer is bound by the digest of each of its tips and by the
-applied-set digest, the versions of the collection inside the frontier that no
-applied checkpoint covers (answers.md §3.1).
 
 ## 12. Sync notice — slices 1, 2
 
@@ -3166,10 +3127,6 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
 - A reader does not keep an applied operation in pieces in memory: it is
   opened again from the pieces when the state is computed anew. A version
   found not whole is not looked for again until its pieces arrive.
-
-An answer's body travels in pieces as a version's payload does, under the
-answer's name, `<A>/seg=<i>` and `<A>/32=manifest/seg=<k>`
-(answers.md §5.4); no custody applies to answers.
 
 ### 13.2 Hold records and leases
 
@@ -3646,10 +3603,6 @@ of that pass took; otherwise it asks the writer again in the next round.
   orphan pieces of a pruned version serves none of them (the prune
   records are restored, not only the versions held).
 
-A device also serves, under its own `32=held` name, the answers it holds
-verified, as signed: never one of a key it holds evidence against, one a
-revocation refuses, or one it cannot keep (answers.md §6.2, §8.2).
-
 ## 14. Prune and expiry — slices 2 (scope), 3, 4 (expiry), 6 (folder epochs)
 
 A prune is an entry of the pruner's log about collection `C` (Content
@@ -3738,9 +3691,6 @@ A prune is an entry of the pruner's log about collection `C` (Content
 - **What a pruner can and cannot do.** It drops only its own versions; it
   cannot end another writer's data or another holder's promise for it, and
   it cannot recall copies already made.
-
-An answer has no keep: devices drop the answers they hold of others by their
-quota, per signer and in all (answers.md §10).
 
 ### 14.1 Retention by expiry — slice 4
 
@@ -3894,8 +3844,7 @@ With blocks, heads and expiry:
 and `members` reads what they signed, as a `get` reads a version: the
 verbs stay seven. Code mostly uses `get`, `put` and `watch`.
 `hold`, `prune` and `share` run on host policy, or on the person's
-gesture. A function's answer is a `get` on its name (a later slice).
-Exposure over forwarder management and the mobile FFI is slice 7. A device
+gesture. Exposure over forwarder management and the mobile FFI is slice 7. A device
 answers a verb or option of a later slice with an error that names the
 slice. Beside the verbs, a `Device` makes and takes introductions (§19):
 `offer(folder, {role, until, tries}) → code` and `close_offer(offer)` on
@@ -4228,13 +4177,6 @@ decides anything, and a watch keeps telling every `Change` it tells.
   writer, makes the folder move to a new epoch (§14).
 - A verb given a name it cannot take answers `BadName` (§3).
 
-`get` of an answer name `<D>/32=answer/<id>` or a question name
-`<X>/32=question/<AnswerAsk>` answers `Got::Answer` (answers.md §7); the host
-surface adds `Device::answer_id`, `publish_answer`, `provide`, `current_read`,
-`read_ref`, `ask_answer` and `provider_asks` (the sealed ask exchange, answers.md
-§15); `DataError` gains `CannotCheck` and `Answer`, `NextStep` gains
-`SetPolicy`.
-
 ## 16. Wire format — slices 1–4, 6 (slice 5 adds none)
 
 ### 16.1 Names
@@ -4325,7 +4267,7 @@ Every name parses one way, and a reader MUST refuse one that does not:
 - **Seal key.** `D` is the components before the first `32=seal`; one
   GenericNameComponent of 32 octets follows, the X25519 public key, equal
   to the `SealKey` the packet carries. A device also answers an Interest for
-  its own `<D>/32=seal` with CanBePrefix by that packet (answers.md §15.8).
+  its own `<D>/32=seal` with CanBePrefix by that packet.
 - **Grant.** `G` is the components before the first `32=grant`; one
   GenericNameComponent follows whose value is one `GrantAsk` TLV: a seal key
   name, a collection Name (or, for a folder epoch, the folder's, §9) and a
@@ -4339,13 +4281,10 @@ Every name parses one way, and a reader MUST refuse one that does not:
   SHA-256 of the protocol's label, then the holder's Name TLV followed by
   the ask's TLV without its `Asker` (§13.2, §13.3); in an introduction,
   the offering device's Name TLV followed by the ask's fields before its
-  `Asker`, or the answer's fields before its `Asker` (§19.3); in an ask for
-  an answer, the signer's Name TLV, the `AnswerAsk` TLV and the ask's
-  ephemeral key (answers.md §15.3). The labels,
+  `Asker`, or the answer's fields before its `Asker` (§19.3). The labels,
   ASCII each ending in a zero octet so none is a prefix of another, are
-  `ndn-data hold ask\0`, `ndn-data audit ask\0`, `ndn-data intro ask\0`,
-  `ndn-data intro answer\0` and `ndn-data answer ask\0`. A receiver computes
-  the binding with the
+  `ndn-data hold ask\0`, `ndn-data audit ask\0`, `ndn-data intro ask\0`
+  and `ndn-data intro answer\0`. A receiver computes the binding with the
   label of the protocol it expects, so a proof made for one protocol
   never verifies as another's, whatever its fields.
 - **Introduction ask.** `D` is the components before the first
@@ -4559,12 +4498,6 @@ existing `32=held` wrapper; a members change (§6.1) signs an ordinary
 writer's namespace adopted for one folder (§6.3) is fetched by the trust
 context's own names; asking again (§17.1) and the faulty mode (§18.1) put
 nothing on the wire. The odd numbers 0x0571–0x057F stay free.
-
-**Answers (round 5).** Names: an answer `<D>/32=answer/<id>` (one component of 32
-octets), a piece of one `<A>/seg=<i>` or `<A>/32=manifest/seg=<k>`, a question
-`<X>/32=question/<AnswerAsk>` (never fetched), and a held answer
-`<H>/32=held/<Name TLV>` (answers.md §11.1). Round 5 adds the TLV numbers
-0x05C0–0x05DF for answers (answers.md §11.2); every number is odd.
 
 ### 16.3 Why these encodings
 
@@ -5394,10 +5327,6 @@ one that acknowledges what it never saw is refused whole (§21.4). A device that
 stops ends every stream; one that starts again delivers what was not
 acknowledged (§21.6).
 
-An answer asked for by id is an owed fetch: at most `FETCH_TRIES` per candidate
-and `RELAYS_ASKED` candidates (answers.md §7.2); each piece of an answer in
-pieces is asked in rounds.
-
 ## 18. Conformance
 
 `ndn-data-conformance` (ndn-sim) runs the study's use cases against an
@@ -5750,9 +5679,6 @@ extended or removed) fails its MAC and is not read, so no grant is
 resurrected; a writer demoted to a reader is granted as a reader at once and
 the host told again once; and the host is told of an end before it is
 durable (a frozen disk does not delay it).
-
-Answers: cases `a1`–`a23` (answers.md §14); case `c12` is rewritten over a
-provider answer.
 
 ### 18.1 Faulty mode
 
@@ -6647,8 +6573,7 @@ most `Config::intro.asks_queued` asks at once (32 by default), verifying or
 waiting for their turn — one more gets no answer at once (a Nack), says so
 in its log, and its asker retries — and opens and verifies at most
 `Config::asks_verifying` at once (8 by default, the bound hold and audit
-asks' proofs share, §13; asks for an answer have a budget of their own of
-the same size, answers.md §15), before any unwrapping. It
+asks' proofs share, §13), before any unwrapping. It
 checks, in this order:
 
 1. **It opens**: the name's digest is its parameters', the content key
@@ -7975,8 +7900,7 @@ verbs, as introductions (§19) are, and change none of them.
 
 The kind, subject, meaning, next step and the words for what happened and what
 to do follow from the detail, in one place per variant of the enum, so a later
-round adds a variant with one arm of each (round 5's answers add one for an
-answer whose result differs from a signed one):
+round adds a variant with one arm of each:
 
 | Kind | Subject (with the kind, the coalescing key) | Detail | Meaning (what this device already did) | Next step |
 |---|---|---|---|---|
@@ -8091,8 +8015,8 @@ MUST NOT be able to push out an event already kept.
   acknowledged; a flood of one subject is one event.
 - **The cap.** At most `events_unacked` (default 256, at least 1) events are
   kept unacknowledged, at most the cap divided by the number of kinds events
-  are kept for (five: equivocation, withdrawal, cut, revocation, answer
-  evidence; at least 1) of one kind, and at most a quarter of the cap (at least
+  are kept for (four: equivocation, withdrawal, cut, revocation; at least 1)
+  of one kind, and at most a quarter of the cap (at least
   1) about one namespace (the one that governs the key or name the event
   names, else its first component), so that a flood of one or two kinds, or
   of the keys of one namespace, cannot take the room of the others. A new
@@ -8159,8 +8083,8 @@ derives what the ledger does not cover.
   version of the context: a later context that keeps a revocation revokes
   nothing new); for a cut its subject, whether a folder, the key prefix cut,
   the signer and how many versions it keeps; for a withdrawal the name of the
-  entry. An equivocation and an answer's evidence have none: the entries that
-  are their evidence are held and are the record (§21.5).
+  entry. An equivocation has none: the entries that are its evidence are held
+  and are the record (§21.5).
 - A fact is **entered with its event, in the same batch** (§4.2), whatever
   becomes of the event: made, coalesced into one kept, counted in the
   overflow notice, or not made because its id was acknowledged. The members
@@ -8247,7 +8171,7 @@ evidence give it the same id.
   authority is hers to mint device keys in without end, each a subject of an
   equivocation or a withdrawal. That is why the limits are per kind and per
   namespace: such a flood fills at most its namespace's quarter and its two
-  kinds' shares, and a later cut, revocation or answer evidence, of another
+  kinds' shares, and a later cut or revocation, of another
   namespace or kind, is named, not only counted.
 - **Forged evidence.** An event is made from verified data only (§21.1). A
   forged entry, a forged copy of a certificate or a replayed root is refused
@@ -8281,11 +8205,6 @@ evidence give it the same id.
   key or a faulty device does; the layer's refusal of what a cut or a
   revocation excludes was already made without it. The next step a host takes
   (suspect, revoke, re-admit) is the owner's, signed as any other.
-
-The device event `AnswerEvidence` (kind `AnswerEvidence`, detail
-`EventDetail::Answer`, meaning `AnswerKept`) is the evidence of a signed answer
-that a recomputation, a second answer at its name, its binding or its read set
-contradicts (answers.md §8). It coalesces per signer key as every event does.
 
 ### 21.9 Conformance
 

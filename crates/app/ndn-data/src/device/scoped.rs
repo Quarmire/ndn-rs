@@ -27,13 +27,11 @@ use ndn_security::{ScopedContext, SignedTrustContext, Validator};
 use sha2::{Digest, Sha256};
 
 use super::{Inner, REFRESH_PAUSE_MAX, Rejudge, St, Subject, refuses_more, under};
-use crate::answer::{ReadSet, parse_answer_ask_name};
 use crate::collection::Members;
 use crate::rt::{self, Instant};
 use crate::wire::{
-    LAYOUT_ROLES, namespace_of, parse_answer_name, parse_ask_name, parse_entry_name,
-    parse_head_name, parse_log_name, parse_piece_name, parse_seal_key_name, parse_signal_run_name,
-    parse_summary_name,
+    LAYOUT_ROLES, namespace_of, parse_ask_name, parse_entry_name, parse_head_name, parse_log_name,
+    parse_piece_name, parse_seal_key_name, parse_signal_run_name, parse_summary_name,
 };
 
 /// The first pause before a namespace the host could not adopt is asked
@@ -247,8 +245,8 @@ pub(super) struct Scopes {
     listed: BTreeMap<Name, BTreeSet<Subject>>,
     /// Of [`Self::listed`], per person's namespace, the subjects whose record
     /// in force names it as a **writer** (a writer prefix of it, not a prefix
-    /// only a cut keeps): the subjects its own devices' seal keys, replies
-    /// and answers are judged for ([`Inner::judge_device_packet`]).
+    /// only a cut keeps): the subjects its own devices' seal keys and
+    /// asker proofs are judged for ([`Inner::judge_device_packet`]).
     writing: BTreeMap<Name, BTreeSet<Subject>>,
     /// Per subject, what its record lists past the caps, as last told.
     over: BTreeMap<Subject, Vec<Name>>,
@@ -391,15 +389,6 @@ impl Scopes {
             Some(Adopted::Held { ctx, judge }) => Some((ctx, judge)),
             _ => None,
         }
-    }
-
-    /// Whether a record in force lists `ns` as a writer of a subject that
-    /// `collection` lies under (or is): an answer of `ns`'s devices may read
-    /// there.
-    pub(super) fn writes_under(&self, ns: &Name, collection: &Name) -> bool {
-        self.writing
-            .get(ns)
-            .is_some_and(|ss| ss.iter().any(|s| collection.has_prefix(&s.name)))
     }
 
     /// Whether the device `device` is of a namespace adopted here that no
@@ -643,10 +632,6 @@ fn role_named(ctx: &SignedTrustContext, role: &NameComponent) -> bool {
 pub(super) enum DevicePacket {
     /// `<device>/32=seal/<pk>`.
     SealKey,
-    /// `<device>/32=ask-answer/<ParametersSha256>`: the reply to an ask.
-    Reply,
-    /// `<device>/32=answer/<id>`.
-    Answer,
     /// `<device>/32=ask/<binding>`: the proof of an asker, sent with its ask
     /// to a signer that does not hold its namespace.
     AskProof,
@@ -657,18 +642,15 @@ pub(super) enum DevicePacket {
 pub(super) struct DeviceJudge {
     /// The view adopted for the namespace.
     pub(super) judge: Arc<Validator>,
-    /// The person's namespace.
-    pub(super) namespace: Name,
     /// The device the packet's name is under: its signing key is of this
     /// device and no other.
     pub(super) device: Name,
 }
 
 /// The person's namespace, the device and the kind of the packet named
-/// `name`, when it is exactly `<W>/<role>/<dev>/32=seal/<pk>`,
-/// `<W>/<role>/<dev>/32=ask-answer/<ParametersSha256>`,
-/// `<W>/<role>/<dev>/32=answer/<id>` or `<W>/<role>/<dev>/32=ask/<binding>`
-/// (the proof an asker sends with its ask), `W` a person's namespace
+/// `name`, when it is exactly `<W>/<role>/<dev>/32=seal/<pk>` or
+/// `<W>/<role>/<dev>/32=ask/<binding>` (the proof an asker sends with its
+/// ask), `W` a person's namespace
 /// (`/user/<0xA1: …>`), `<role>` and `<dev>` plain components and nothing
 /// more or less between `W` and the keyword. No role is checked here
 /// ([`role_named`]).
@@ -676,13 +658,9 @@ pub(super) fn device_packet(name: &Name) -> Option<(Name, Name, DevicePacket)> {
     let namespace = personal_namespace_of(name)?;
     let (device, kind) = if let Some((device, _)) = parse_seal_key_name(name) {
         (device, DevicePacket::SealKey)
-    } else if let Some(device) = parse_answer_ask_name(name) {
-        (device, DevicePacket::Reply)
-    } else if let Some((device, _)) = parse_ask_name(name) {
-        (device, DevicePacket::AskProof)
     } else {
-        let (device, _) = parse_answer_name(name)?;
-        (device, DevicePacket::Answer)
+        let (device, _) = parse_ask_name(name)?;
+        (device, DevicePacket::AskProof)
     };
     (device.len() == namespace.len() + 2 && device.has_prefix(&namespace))
         .then_some((namespace, device, kind))
@@ -709,16 +687,6 @@ impl Inner {
         scoped.unwrap_or_else(|| Arc::clone(&self.validator))
     }
 
-    /// [`Self::judge`] for a packet that may be one of a listed writer's own
-    /// devices ([`Self::judge_device_packet`]): the view adopted for the
-    /// writer's namespace when it is, else what [`Self::judge`] picks.
-    pub(super) fn judge_any(&self, name: &Name) -> Arc<Validator> {
-        match self.judge_device_packet(name) {
-            Some(d) => d.judge,
-            None => self.judge(name),
-        }
-    }
-
     /// Whether `name` lies in a person's namespace this node holds no context
     /// of ([`Keyring::unheld_personal_namespace`](ndn_security::Keyring::unheld_personal_namespace)):
     /// what is known of it here is known on a record's listing.
@@ -727,24 +695,6 @@ impl Inner {
             .keyring()
             .unheld_personal_namespace(name)
             .is_some()
-    }
-
-    /// The namespace of an asker's device `name` for the serving of asks
-    /// (answers.md §15.7): that of the trust context this device holds for
-    /// it, else — a person's self-certifying name no held context covers —
-    /// the person's namespace when it is adopted here and a record in force
-    /// lists it as a writer, whose devices' proofs are judged by that
-    /// adoption ([`Self::judge_device_packet`]); empty otherwise, a namespace
-    /// this device does not serve.
-    pub(super) fn asker_namespace(&self, name: &Name) -> Name {
-        let held = self.namespace_of_name(name);
-        if !held.is_empty() {
-            return held;
-        }
-        match personal_namespace_of(name) {
-            Some(person) if self.st.lock().scopes.writer_view(&person).is_some() => person,
-            _ => held,
-        }
     }
 
     /// The validator that judges key `key`'s packets about `scope`, read
@@ -763,10 +713,8 @@ impl Inner {
     /// The validator that judges the packet named `name` when it is a packet
     /// of one device of an adopted writer's namespace `W` that this device
     /// does not hold, and **only** then (spec §6.3, "A listed writer's own
-    /// devices"): its seal key `<W>/<role>/<dev>/32=seal/<pk>`, the reply to
-    /// an ask `<W>/<role>/<dev>/32=ask-answer/<ParametersSha256>`, an answer
-    /// `<W>/<role>/<dev>/32=answer/<id>` and an asker's proof
-    /// `<W>/<role>/<dev>/32=ask/<binding>` ([`device_packet`]), where
+    /// devices"): its seal key `<W>/<role>/<dev>/32=seal/<pk>` and an asker's
+    /// proof `<W>/<role>/<dev>/32=ask/<binding>` ([`device_packet`]), where
     /// `<role>` is a role `W`'s context names ([`role_named`]) and a members
     /// record in force here lists `W` as a **writer** (a prefix only a removal
     /// cut keeps is not one) and `W` is adopted. It is the view adopted for
@@ -776,9 +724,7 @@ impl Inner {
     /// vouches for nothing else of `W`: not a log entry, a head or a summary
     /// outside the subjects its records list (that is [`about`]'s, unchanged),
     /// not any other name. The caller takes the packet only if it is signed
-    /// by that very device's key ([`DeviceJudge::device`]), and an answer only
-    /// after it is opened and its reads are of collections under subjects whose
-    /// record lists `W` as a writer ([`Scopes::writes_under`]).
+    /// by that very device's key ([`DeviceJudge::device`]).
     pub(super) fn judge_device_packet(&self, name: &Name) -> Option<DeviceJudge> {
         let namespace = self.validator.keyring().unheld_personal_namespace(name)?;
         let (_, device, _) = device_packet(name)?;
@@ -786,28 +732,8 @@ impl Inner {
         let (ctx, judge) = st.scopes.writer_view(&namespace)?;
         role_named(ctx.context(), &device.components()[namespace.len()]).then(|| DeviceJudge {
             judge: Arc::clone(judge),
-            namespace,
             device,
         })
-    }
-
-    /// Whether every read of an answer of one of `ns`'s devices lies under a
-    /// subject whose record in force lists `ns` as a writer ([`Scopes::writes_under`]):
-    /// what such a device's answer is taken for ([`Self::judge_device_packet`]),
-    /// and nothing else. `Err` says which read is not, and what to do.
-    pub(super) fn reads_listed_for(&self, ns: &Name, reads: &ReadSet) -> Result<(), String> {
-        let st = self.st.lock();
-        for read in reads.reads() {
-            let collection = read.collection().map_err(|e| e.to_string())?;
-            if !st.scopes.writes_under(ns, &collection) {
-                return Err(format!(
-                    "the answer reads {collection}, which no members record in force here lists \
-                     {ns} as a writer of: a device of {ns} is taken as a signer only for what a \
-                     record that lists it covers; ask a signer of {collection}"
-                ));
-            }
-        }
-        Ok(())
     }
 
     /// At start, after the records are read back: each namespace a record

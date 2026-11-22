@@ -739,9 +739,7 @@ its role were listed, so a key outside the roles cannot escape the lapsed
 rule. Where the context lists no role (a flat namespace, or one that
 predates the rule), there is no layout to hold a name to, and no entry applies
 to the key (ndn-rs: `SignedTrustContext::is_role_less_device`,
-`requires_cut_for`). A device with no role is likewise not served as one of
-the person's own by an ask for an answer in a namespace that declares the
-role layout (answers.md §15.7).
+`requires_cut_for`).
 
 For a key whose role the context lists, or that is a device with no role in a
 namespace that lists any, Data the key signs is accepted under the durable rule

@@ -227,7 +227,7 @@ pub(super) fn cut_event(
 /// what it holds ([`St::derived_events`]): a revocation by namespace and name (not by the context's
 /// version: a later context that keeps the revocation is not another one), a cut by its subject,
 /// key prefix, signer and how many versions it keeps, a withdrawal by the entry's name. Equivocation
-/// and answer evidence are not derived: their entries are the evidence, and the book keeps theirs.
+/// is not derived: its entries are the evidence, and the book keeps theirs.
 pub(super) fn fact_of(detail: &EventDetail) -> Option<Fact> {
     match detail {
         EventDetail::Revocation {
@@ -242,9 +242,7 @@ pub(super) fn fact_of(detail: &EventDetail) -> Option<Fact> {
             ..
         } => Some(cut_fact(subject, *folder, of, signer, *kept)),
         EventDetail::Withdrawal { entry, .. } => Some(withdrawal_fact(&entry.name)),
-        EventDetail::Equivocation { .. }
-        | EventDetail::Overflow { .. }
-        | EventDetail::Answer { .. } => None,
+        EventDetail::Equivocation { .. } | EventDetail::Overflow { .. } => None,
     }
 }
 

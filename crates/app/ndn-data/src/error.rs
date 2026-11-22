@@ -50,9 +50,6 @@ pub enum NextStep {
     /// Run a program that knows the named merge rule: this one holds the
     /// collection's versions and reads them under no other rule.
     UpdateProgram,
-    /// Change the host's answer policy, or ask whoever sets it: a signer to
-    /// name as a provider of a function, or to trust for pure answers.
-    SetPolicy,
 }
 
 /// Why a version was refused. A refused version is never served as data.
@@ -434,28 +431,6 @@ pub enum DataError {
         /// Why.
         why: crate::intro::IntroRefusal,
     },
-    /// The evaluator is not known here and no trusted signer's answer is
-    /// available: "can't check here" (answers.md §7.3).
-    #[error(
-        "{name}: the evaluator {evaluator} is not known here and no signer the policy trusts has \
-         answered: {why}"
-    )]
-    CannotCheck {
-        /// The question or answer asked for.
-        name: Name,
-        /// The evaluator the answer names.
-        evaluator: Name,
-        /// Why, and what to do.
-        why: String,
-    },
-    /// An answer is refused, or a question cannot be made (answers.md §12).
-    #[error("answer {name} is refused: {why}")]
-    Answer {
-        /// The answer or question.
-        name: Name,
-        /// Why.
-        why: AnswerRefusal,
-    },
 }
 
 impl DataError {
@@ -474,11 +449,6 @@ impl DataError {
                         | crate::intro::IntroRefusal::GoneUnproven { .. }
                 )
             }
-            DataError::Answer { why, .. } => match why {
-                AnswerRefusal::ReadsChanged(_) => true,
-                AnswerRefusal::AskRefused { why, .. } => why.retry_after().is_some(),
-                _ => false,
-            },
             _ => false,
         }
     }
@@ -526,173 +496,6 @@ impl DataError {
                 | crate::intro::IntroRefusal::HintMismatch { .. }
                 | crate::intro::IntroRefusal::InviterConflict { .. } => NextStep::AskOwner,
             },
-            DataError::CannotCheck { .. } => NextStep::UpdateProgram,
-            DataError::Answer { why, .. } => why.next(),
-        }
-    }
-}
-
-/// Why an answer is refused, or a question cannot be made (answers.md §12). Each says why and
-/// what to do ([`AnswerRefusal::next`]).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum AnswerRefusal {
-    /// It does not decode exactly, or breaks a grammar rule (answers.md §3.4, §11).
-    Malformed(String),
-    /// Its content does not give the id in its name: the signer put a binding in a name that
-    /// is not its. Evidence.
-    Binding,
-    /// Its read set is not canonical, its digest not the binding's, its epochs not its reads',
-    /// its definition missing, it conflicts with a version held, or it is not the reads of the
-    /// evaluator. Evidence.
-    ReadSet(String),
-    /// A read no longer holds here (a state whose rule or applied set changed, a version
-    /// refused since): the answer is correct for what it read; ask the question again.
-    ReadsChanged(String),
-    /// A provider answer by a signer the policy does not name for the function.
-    NotProvider {
-        /// The key that signed it.
-        signer: Writer,
-        /// The function it names.
-        function: Name,
-    },
-    /// Its signer's key or issuer is revoked, or its chain no longer verifies.
-    Untrusted {
-        /// Why.
-        why: String,
-    },
-    /// Two answers at this name by this key have different results: evidence.
-    Equivocal,
-    /// More reads, epochs or octets than answers.md §10 allows.
-    TooLarge {
-        /// What is too large.
-        what: String,
-        /// How much there is.
-        size: u64,
-        /// The most allowed.
-        limit: u64,
-    },
-    /// A signed answer lists more reads of merge states than this device checks against what
-    /// it holds, so it is not used (answers.md §10).
-    TooManyStates {
-        /// How many reads of merge states it lists.
-        states: u64,
-        /// The most this device checks.
-        limit: u64,
-    },
-    /// An evaluation would exceed the host's budget; never a different result.
-    OverBudget {
-        /// Which budget.
-        what: String,
-    },
-    /// A provider answer that must be kept cannot be: this device refuses to make it rather
-    /// than drop one it signed.
-    Busy,
-    /// This device already signed a different result at this name: it serves that one and
-    /// signs no other.
-    AlreadySigned,
-    /// A device it asked for the answer (answers.md §15) refused the ask, and said why.
-    AskRefused {
-        /// The device asked.
-        signer: Name,
-        /// The reason code it gave.
-        why: crate::answer::AskRefusal,
-        /// What it said: why, and what to do.
-        said: String,
-    },
-}
-
-impl AnswerRefusal {
-    /// What to do about it, by class.
-    pub fn next(&self) -> NextStep {
-        match self {
-            AnswerRefusal::Malformed(_)
-            | AnswerRefusal::Binding
-            | AnswerRefusal::ReadSet(_)
-            | AnswerRefusal::AlreadySigned => NextStep::None,
-            AnswerRefusal::ReadsChanged(_) => NextStep::RetryLater,
-            AnswerRefusal::NotProvider { .. } => NextStep::SetPolicy,
-            AnswerRefusal::Untrusted { .. } | AnswerRefusal::Equivocal => NextStep::AskOwner,
-            AnswerRefusal::TooLarge { .. } | AnswerRefusal::TooManyStates { .. } => {
-                NextStep::FixRequest
-            }
-            AnswerRefusal::OverBudget { .. } | AnswerRefusal::Busy => NextStep::FixLocal,
-            AnswerRefusal::AskRefused { why, .. } => why.next(),
-        }
-    }
-}
-
-impl std::fmt::Display for AnswerRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AnswerRefusal::Malformed(why) => write!(
-                f,
-                "it is not an answer this program can decode ({why}); it is dropped and the next \
-                 source asked, nothing more is needed"
-            ),
-            AnswerRefusal::Binding => f.write_str(
-                "its content does not give the id in its name, so its signer put a binding in a \
-                 name that is not its: it is kept as evidence, never served, and the owner \
-                 should look at the signer's key",
-            ),
-            AnswerRefusal::ReadSet(why) => write!(
-                f,
-                "its read set is wrong ({why}): it is kept as evidence and never used; the \
-                 owner should look at the signer's key"
-            ),
-            AnswerRefusal::ReadsChanged(why) => write!(
-                f,
-                "what it read no longer holds here ({why}); it is correct for what it read, so \
-                 ask the question again to read what this device holds now"
-            ),
-            AnswerRefusal::NotProvider { signer, function } => write!(
-                f,
-                "{} signed an answer of the function {function}, and this device's policy does \
-                 not name it as a provider of that function; change the policy \
-                 (AnswerPolicy::providers) or ask the provider",
-                signer.key()
-            ),
-            AnswerRefusal::Untrusted { why } => write!(
-                f,
-                "its signer is not trusted ({why}); ask the owner of the signer's namespace to \
-                 certify a key again, and ask the question again: a pure answer is recomputed \
-                 by anyone"
-            ),
-            AnswerRefusal::Equivocal => f.write_str(
-                "evidence is kept against the answer at this name: its result differs from \
-                 another answer's at this name by this key, or from this device's recomputation; \
-                 it is kept whole, never served and never taken again until the owner decides \
-                 about the key (a pure question is answered by recomputing it)",
-            ),
-            AnswerRefusal::TooLarge { what, size, limit } => write!(
-                f,
-                "{what} is {size}, more than the {limit} an answer carries; ask a smaller \
-                 question, or split the reading into several"
-            ),
-            AnswerRefusal::TooManyStates { states, limit } => write!(
-                f,
-                "it lists {states} reads of merge states, and this device checks at most {limit} \
-                 against what it holds (each is a replay of the collection's merge), so it does \
-                 not use the answer; ask its signer for an answer over fewer states, or ask the \
-                 question so that this device recomputes it"
-            ),
-            AnswerRefusal::OverBudget { what } => write!(
-                f,
-                "this device's budget for {what} would be exceeded, so there is no result \
-                 (never a different one); raise Config::answers.budget on this device, or ask \
-                 for less"
-            ),
-            AnswerRefusal::Busy => f.write_str(
-                "this device cannot keep one more provider answer, and a provider keeps every \
-                 answer it signed, so it makes none; raise Config::answers.store on this device",
-            ),
-            AnswerRefusal::AlreadySigned => f.write_str(
-                "this device already signed a different result at this name; it serves that \
-                 one and signs no other, and a function whose result is not reproducible puts \
-                 into its inputs a signed version that tells two calls apart",
-            ),
-            AnswerRefusal::AskRefused { signer, said, .. } => {
-                write!(f, "{signer} refused the ask for the answer: {said}")
-            }
         }
     }
 }

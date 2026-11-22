@@ -66,8 +66,7 @@ const HELD_DEPTH: u8 = 2;
 ///
 /// Not carried: the sync group, certificates and the trust context (the
 /// host's link layer adds those: they are the namespaces', not the folder's),
-/// introductions (the introduction surface's), answers and questions
-/// (answers.md), anything that is not a name of this layer.
+/// introductions (the introduction surface's), anything that is not a name of this layer.
 pub fn folder_carries(folder: &Name, name: &Name) -> bool {
     is_data_name(folder) && carries(folder, name, HELD_DEPTH)
 }

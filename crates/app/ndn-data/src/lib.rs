@@ -53,7 +53,6 @@
 //! | 3 | large payloads, custody leases with audits, `prune`, keep caps hold |
 //! | 4 | signed blocks of small entries under a producer's delay, the one-key rule (a signed head with a freshness bound, rollback refused), retention by expiry (summaries listed by keep), range reads by seq and by time |
 //! | 5 | revocation as a cut, owner re-admission of honest work |
-//! | 6 | named functions whose answers are sealed to their inputs' audience: [`answer`] (round 5, `docs/specs/answers.md`) |
 //! | 7 | the verbs over forwarder management and the mobile FFI |
 //!
 //! [`Device`] answers a verb or option of a later slice with
@@ -62,9 +61,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 
-pub mod answer;
-#[cfg(test)]
-mod answer_tests;
 pub mod collection;
 pub mod device;
 pub mod error;
@@ -82,21 +78,14 @@ mod tree;
 pub mod version;
 pub mod wire;
 
-pub use answer::{
-    AnswerAsk, AnswerAskBody, AnswerAskEnvelope, AnswerAskRefusal, AnswerBinding, AnswerConfig,
-    AnswerKind, AnswerPolicy, AnswerStore, Answered, AskRefusal, AskServing, Budget, Definition,
-    EVALUATOR_REASON_MAX, EvalError, Evaluator, Evaluators, PlanError, Provenance, ProviderAsk,
-    Publish, QUESTION_MAX, READS_MAX, ReadRef, ReadSet, ReadView, Reads, SEAL_EPOCHS_MAX, Signers,
-    answer_ask_name, answer_ask_prefix, applied_digest, parse_answer_ask_name,
-};
 pub use collection::{Child, Cut, Epoch, Members, Parent, Resolve, Rule, Summary};
 pub use device::{
     Clock, Config, CutBound, CutProposal, Device, Entropy, IntroductionSurface, Released, Transport,
 };
-pub use error::{AnswerRefusal, DataError, NextStep, Refusal};
+pub use error::{DataError, NextStep, Refusal};
 pub use events::{
-    AnswerFault, Cursor, DeviceEvent, DeviceEvents, EntryKind, EntryRef, EventDetail, EventId,
-    EventKind, EventSubject, Meaning, ReadSetFault, WithdrawnBy,
+    Cursor, DeviceEvent, DeviceEvents, EntryKind, EntryRef, EventDetail, EventId, EventKind,
+    EventSubject, Meaning, WithdrawnBy,
 };
 pub use folder_scope::{departure_carries, folder_carries, writer_carries, writer_sync};
 pub use intro::{

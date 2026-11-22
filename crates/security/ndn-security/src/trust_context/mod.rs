@@ -1432,9 +1432,7 @@ impl SignedTrustContext {
     /// `ndn-fwd init` makes does. There such a name is no device the CA issued
     /// (its role policy issues `/<ns>/<role>/<device>` and nothing else): it
     /// is a key the root signed by hand, and is judged as the strictest role
-    /// is — it is not served as one of the namespace's own devices
-    /// (ndn-data's `AnswerConfig::ask_roles` has no role to match) and the lapsed rule
-    /// applies to it ([`requires_cut_for`](Self::requires_cut_for)). A flat
+    /// is: the lapsed rule applies to it ([`requires_cut_for`](Self::requires_cut_for)). A flat
     /// namespace (nothing listed) has no role layout to hold names to, so
     /// `false`. The namespace's own keys (`/<ns>/KEY/..`) and the CA's
     /// (`/<ns>/CA/KEY/..`: `CA` is reserved, no device is so named) are no
