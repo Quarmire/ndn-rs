@@ -472,7 +472,27 @@ impl LpReliability {
         }
 
         let now = self.clock.now();
-        for ack_seq in acks {
+        for ack_seq in acks.into_iter().take(self.acks_per_frame()) {
+            // An ack counts only when it names a frame this side still holds
+            // (NFD's `LpReliability::processIncomingPacket` looks the acked
+            // TxSequence up first and ignores an ack that finds nothing). One
+            // for a TxSequence never sent, or sent and acked, evicted or given
+            // up already, is not evidence of anything and costs one lookup:
+            // it used to walk the table below it and condemn the frames there
+            // (round 12, L1: three acks of `1 << 40` made every frame in
+            // flight "lost" and resent).
+            if ack_seq >= self.next_tx_seq {
+                continue;
+            }
+            let Some(entry) = self.unacked.remove(&ack_seq) else {
+                continue;
+            };
+            // Karn: only measure RTT on non-retransmitted packets.
+            if !entry.is_retx {
+                let rtt_us = now.duration_since(entry.first_sent).as_micros() as f64;
+                self.update_rto(rtt_us);
+            }
+
             // Fast retransmit, mirroring NFD's findLostLpPackets(): every frame
             // still unacked BELOW the acked TxSequence has had a later frame
             // arrive ahead of it. Once SEQ_NUM_LOSS_THRESHOLD such acks have
@@ -492,6 +512,10 @@ impl LpReliability {
             // of earlier frames against a retransmission turned one loss into
             // `max_retries` back-to-back resends, all but the first spurious,
             // and then a give-up for a frame the peer had received.
+            //
+            // The walk is bounded by the table (`max_unacked`) and each walk
+            // costs the peer one frame this side holds and sent: an ack that
+            // names none never gets here.
             for (&seq, entry) in self.unacked.range_mut(..ack_seq) {
                 if ack_seq < entry.evidence_floor {
                     continue;
@@ -501,16 +525,17 @@ impl LpReliability {
                     self.fast_retx_candidates.push(seq);
                 }
             }
-
-            if let Some(entry) = self.unacked.remove(&ack_seq) {
-                // Karn: only measure RTT on non-retransmitted packets.
-                if !entry.is_retx {
-                    let rtt_us = now.duration_since(entry.first_sent).as_micros() as f64;
-                    self.update_rto(rtt_us);
-                }
-            }
         }
         is_duplicate
+    }
+
+    /// The most acks one inbound frame is read for: twice the frames this side
+    /// may hold in flight. An honest peer's frame names each frame in flight
+    /// once, and a few a second time (the ack of a retransmitted copy), so
+    /// none of its acks lies past this; a frame stuffed with acks costs a
+    /// bounded number of lookups, however large it is.
+    fn acks_per_frame(&self) -> usize {
+        self.max_unacked.saturating_mul(2)
     }
 
     /// Wires for frames that ack ordering has declared lost, ready to send now.
@@ -1014,6 +1039,65 @@ mod tests {
 
         let retx = rel.check_retransmit();
         assert!(retx.is_empty());
+        assert_eq!(rel.unacked_count(), 0);
+    }
+
+    /// R12 L1: an ack names a frame this side holds, or it is nothing.
+    ///
+    /// Every ack used to walk the frames below its TxSequence and count itself as evidence
+    /// that they were lost, before it was found to name any frame at all: three acks of
+    /// `1 << 40` made every frame in flight "lost" and resent, and each such ack cost a
+    /// walk of the table. An ack of a TxSequence never sent (>= `next_tx_seq`), or of one
+    /// no longer held (acked already, evicted, given up), is dropped at once.
+    #[test]
+    fn an_ack_that_names_no_frame_in_flight_is_evidence_of_nothing() {
+        let mut rel = LpReliability::from_config(1400, ReliabilityConfig::default());
+        for _ in 0..5 {
+            rel.on_send(&small_packet());
+        }
+
+        // Never sent: three of them used to declare frames 0..=4 lost.
+        rel.on_receive(&encode_lp_acks(&[1 << 40, 1 << 40, 1 << 40, 5, 6, 1000]));
+        assert_eq!(rel.unacked_count(), 5, "no frame was acked");
+        assert!(
+            rel.take_fast_retransmits().is_empty(),
+            "acks of TxSequences never sent declared frames lost"
+        );
+
+        // Held once, acked, then acked again and again: the repeats name nothing.
+        rel.on_receive(&encode_lp_acks(&[4]));
+        assert_eq!(rel.unacked_count(), 4);
+        rel.on_receive(&encode_lp_acks(&[4, 4, 4, 4]));
+        assert!(
+            rel.take_fast_retransmits().is_empty(),
+            "repeats of an ack declared the frames below it lost"
+        );
+        assert_eq!(rel.unacked_count(), 4);
+    }
+
+    /// R12 L1: one frame is read for no more acks than frames could be in flight twice over.
+    #[test]
+    fn a_frame_is_read_for_a_bounded_number_of_acks() {
+        let mut rel = LpReliability::from_config(
+            1400,
+            ReliabilityConfig {
+                max_unacked: 2,
+                ..ReliabilityConfig::default()
+            },
+        );
+        rel.on_send(&small_packet());
+        rel.on_send(&small_packet());
+
+        // The cap is 2 x max_unacked = 4 acks: the two that name the frames lie past it.
+        rel.on_receive(&encode_lp_acks(&[90, 91, 92, 93, 0, 1]));
+        assert_eq!(
+            rel.unacked_count(),
+            2,
+            "acks past the per-frame cap were read"
+        );
+
+        // Within the cap, an honest frame's acks all count.
+        rel.on_receive(&encode_lp_acks(&[1, 0]));
         assert_eq!(rel.unacked_count(), 0);
     }
 
