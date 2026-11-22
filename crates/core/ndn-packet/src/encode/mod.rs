@@ -61,20 +61,50 @@ pub(super) fn write_name(w: &mut TlvWriter, name: &Name) {
     });
 }
 
-/// Per-process-unique 4-byte nonce. Sufficient for loop detection; not
-/// cryptographically random.
-pub(super) fn next_nonce() -> u32 {
+/// Per-process-unique 4-byte nonce: a per-process base plus a counter.
+/// Sufficient for loop detection; not cryptographically random. The base is
+/// `pid << 16` on native targets (deterministic per process, which the
+/// simulator relies on); on wasm32, which has no process id, it is drawn from
+/// the host's RNG once per instance, so two instances do not run the same
+/// sequence (nonces that a stranger could predict would let it forge a
+/// duplicate-nonce Nack, and the jitter of Congestion retries derives from
+/// the nonce).
+pub(crate) fn next_nonce() -> u32 {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        (std::process::id() << 16).wrapping_add(seq)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        // No process id on wasm32-unknown-unknown; per-instance counter is
-        // sufficient for the duplicate-nonce loop-detection window.
-        seq
+    nonce_at(nonce_base(), COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+fn nonce_at(base: u32, seq: u32) -> u32 {
+    base.wrapping_add(seq)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn nonce_base() -> u32 {
+    std::process::id() << 16
+}
+
+#[cfg(target_arch = "wasm32")]
+fn nonce_base() -> u32 {
+    static BASE: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        let mut bytes = [0u8; 4];
+        let entropy = getrandom::getrandom(&mut bytes).ok().map(|()| bytes);
+        let clock_ns = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        wasm_nonce_base(entropy, clock_ns)
+    });
+    *BASE
+}
+
+/// Where a wasm instance starts its nonce sequence: from the host's RNG
+/// (`entropy`) when it has one, else from its clock (a host with neither
+/// still gets instances that differ, though predictably).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn wasm_nonce_base(entropy: Option<[u8; 4]>, clock_ns: u128) -> u32 {
+    match entropy {
+        Some(bytes) => u32::from_le_bytes(bytes),
+        None => (clock_ns ^ (clock_ns >> 32) ^ (clock_ns >> 64)) as u32,
     }
 }
 
@@ -249,5 +279,52 @@ mod tests {
         let data = Data::decode(Bytes::copy_from_slice(&ndnd_wire)).unwrap();
         assert_eq!(data.name.to_string(), "/test");
         assert!(data.meta_info().is_none());
+    }
+
+    /// Two sequences from different bases never meet (the wasm instances
+    /// that used to run the identical sequence from 0).
+    #[test]
+    fn nonce_sequences_from_different_bases_differ() {
+        let (a, b) = (0x1111_0000u32, 0x2222_0000u32);
+        for seq in 0..64 {
+            assert_ne!(nonce_at(a, seq), nonce_at(b, seq));
+        }
+        assert_eq!(nonce_at(a, 3), a + 3, "a base plus the counter");
+        assert_eq!(nonce_at(u32::MAX, 1), 0, "wraps, never panics");
+    }
+
+    /// A wasm instance's base is the host RNG's draw: different draws, different
+    /// bases (the base is a pure function of its inputs, so this runs natively).
+    #[test]
+    fn wasm_base_is_the_hosts_random_draw() {
+        let a = wasm_nonce_base(Some([1, 2, 3, 4]), 7);
+        let b = wasm_nonce_base(Some([5, 6, 7, 8]), 7);
+        assert_eq!(a, u32::from_le_bytes([1, 2, 3, 4]));
+        assert_ne!(a, b);
+        assert_eq!(
+            wasm_nonce_base(Some([1, 2, 3, 4]), 7),
+            wasm_nonce_base(Some([1, 2, 3, 4]), 9),
+            "with an RNG, the clock does not enter"
+        );
+    }
+
+    /// A host with no RNG still starts instances apart, by their clocks.
+    #[test]
+    fn wasm_base_without_an_rng_follows_the_clock() {
+        let a = wasm_nonce_base(None, 1_700_000_000_000_000_000);
+        let b = wasm_nonce_base(None, 1_700_000_000_123_456_789);
+        assert_ne!(a, b);
+        assert_ne!(
+            wasm_nonce_base(None, 1_700_000_000_000_000_000),
+            wasm_nonce_base(None, 1_700_000_000_000_000_001)
+        );
+    }
+
+    /// Native nonces are unchanged: `pid << 16` plus the counter, so the
+    /// simulator and every native process keep the sequence they had.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_base_is_the_process_id_shifted() {
+        assert_eq!(nonce_base(), std::process::id() << 16);
     }
 }

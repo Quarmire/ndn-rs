@@ -2,11 +2,10 @@
 //! [`encode`](crate::encode) so they compile on `wasm32-unknown-unknown`
 //! without pulling in `ring`; signing paths remain gated on `std`.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use bytes::Bytes;
 use ndn_tlv::{TlvReader, TlvWriter};
 
+use crate::encode::next_nonce;
 use crate::{NackReason, lp::encode_lp_nack, tlv_type};
 
 /// Wrap an Interest in an NDNLPv2 Nack with the given reason.
@@ -50,19 +49,4 @@ pub fn ensure_nonce(interest_wire: &Bytes) -> Bytes {
         }
     });
     w.finish()
-}
-
-fn next_nonce() -> u32 {
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        (std::process::id() << 16).wrapping_add(seq)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        // No process id on wasm32-unknown-unknown; a per-instance counter is
-        // sufficient for the duplicate-nonce loop-detection window.
-        seq
-    }
 }
