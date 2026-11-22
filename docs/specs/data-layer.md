@@ -5,11 +5,11 @@
   and C: merge rules by exact versioned name and the rule interface,
   operations the application builds, versions held but not counted,
   checkpoints covering by frontier, pieces in merge collections and the
-  release of merge pieces only on an audited covering checkpoint, groups
-  of versions counted all or none, folder members records narrowing every
+  release of merge pieces only on an audited covering checkpoint, folder
+  members records narrowing every
   collection under a folder with one seal epoch per folder epoch, and
   joining a folder by a code (introductions, §19), §5.1,
-  §5.2, §5.5, §6.1, §6.2, §9, §13, §15, §16, §19); slice 5: a revoked key's versions kept
+  §5.2, §6.1, §6.2, §9, §13, §15, §16, §19); slice 5: a revoked key's versions kept
   exactly where the root's revocation cut in the trust context accepts
   them, the cut bounded by when the owner says the key was lost and bound
   to the key and to each version's bytes, Data judged without clocks or
@@ -168,8 +168,7 @@ which entries it puts in a cut it makes (§8.1); a reader never reads it.
 ## 4. Version and log — slices 1, 2, 4 (blocks)
 
 A version is an immutable record signed by one key. It carries
-`(writer, seq)`, parents, type, seal, keep, a date and a payload, and, when
-it is one of a group of versions counted all or none, its group (§5.5).
+`(writer, seq)`, parents, type, seal, keep, a date and a payload.
 
 - A writer is one key, never a person. Each key keeps **one log**: every
   entry it signs about any collection — versions, members records (§6),
@@ -188,8 +187,7 @@ it is one of a group of versions counted all or none, its group (§5.5).
   while both are held, across restarts too: two packets at one name keep
   the second in the store beside the first (ndn-data: under
   `/localhost/ndn-data/equivocal/<log entry name>`, one per name), stored
-  before it is reported; a group of the key
-  over that seq is malformed (§5.5). A cut accepts a seq only in the
+  before it is reported. A cut accepts a seq only in the
   collection it lists it under (§6.1, §8, §8.1), so a removed or revoked
   key gains nothing by signing an accepted seq again elsewhere. An entry
   the trust context refuses (§8.1) is no evidence against its key: a copy
@@ -344,7 +342,7 @@ restarts, and an honest writer has equivocated (invariant 2).
   - ask a holder to hold under a hold record that is not durable, answer a
     hold ask with a lease before the lease is durable, or answer an audit
     ask before what it answers from is durable (§13.2, §13.3).
-- **Local application is immediate.** `put`, `put_op` and `put_group` return
+- **Local application is immediate.** `put` and `put_op` return
   once the entry is signed, stored and applied; the device reads its own
   writes at once and refuses nothing for the disk. Only publication waits.
 - **Group commit, bounded delay.** A device flushes its store once per
@@ -372,15 +370,14 @@ it was at some moment at or after its last returned barrier, and a device
 restarted on it is that device stopped at that moment — which restore
 already handles (§8.3). Everything it published was at or below the
 durable head, so behind the barrier, so held. A batch is applied whole on an
-atomic store, so the same holds of every put and group; on one that is not,
+atomic store, so the same holds of every put; on one that is not,
 the order of the batch leaves only prefixes restore accepts.
 
 **One batch per put (store write batching).** The writes of one put go to
 the store as one `DataStore::apply`, not one call each: the markers (the
 written marker, saying this device signed the entry, and the verified
 marker), the pieces of an entry larger than a packet, then the entry
-itself; for `put_group`, every record the group's fresh collections need
-and every member with its markers, as one batch; a commit round's
+itself; a commit round's
 announcement counters likewise. A device MUST hand a batch to the store
 before the `put` that made it returns, and MUST NOT defer it to a
 background writer: the guarantees above (a write that returned survives
@@ -411,12 +408,11 @@ barrier returned, as before. No further coalescing of barriers is
 specified: a burst of puts already shares a flush per round.
 
 Measured, not guaranteed (ext4 on NVMe, release build, medians; one put at
-a time, before and after batching): redb `put` 1.74 ms and 0.71 ms,
-`put_group` of 10 21.3 ms and 3.2–4.2 ms, of 100 210 ms and 14.2–14.5 ms;
-fjall `put` 146 µs and 155–168 µs (59.7 and 55–60 µs back to back),
-`put_group` of 100 8.9 ms and 8.5–8.9 ms, unchanged within noise, a put on a
-store that costs nothing being 49 µs: on fjall the writes were never most of
-a put. Batching is there for atomicity, and for engines that pay per write.
+a time, before and after batching): redb `put` 1.74 ms and 0.71 ms; fjall
+`put` 146 µs and 155–168 µs (59.7 and 55–60 µs back to back), unchanged
+within noise, a put on a store that costs nothing being 49 µs: on fjall the
+writes were never most of a put. Batching is there for atomicity, and for
+engines that pay per write.
 
 **Threat notes.**
 
@@ -452,16 +448,12 @@ a put. Batching is there for atomicity, and for engines that pay per write.
   again. The reverse state, a record this device made without the key it
   made for its epoch, which left the creator unable to write into the
   collection (`NotReady`, no other device having the key), is never left.
-- A group is one batch: every member and every record it makes are there
-  after a kill, or none is. A group of `GROUP_MAX` versions is a batch of
-  that many entries with their pieces and markers, held in memory until it
-  is handed over, as the signed group already is.
 
-## 5. Collection and rule — slices 1, 2, 4 (one key), 6 (rules by name, groups)
+## 5. Collection and rule — slices 1, 2, 4 (one key), 6 (rules by name)
 
 A collection is a named, growing set of versions with a rule and a members
 record. It exists when its first members record is signed (§6): `share`, or
-a writer's first `put` (`put_op`, `put_group`) into a collection of its own
+a writer's first `put` (or `put_op`) into a collection of its own
 namespace (§3), which signs the host's default record (merge with
 `/merge/yrs`, the namespace writing and reading, sealed to it). A collection
 under a folder whose members record is in force exists with that record
@@ -549,7 +541,7 @@ state for it and says so.
 - A device that does not know the rule holds every version of the
   collection as it holds any version — verifies, stores and serves it, and
   lists it to `watch` with nothing applied — and answers `get(C)`, `get` of
-  a state name of `C` (§11), and `put`, `put_op` and `put_group` into `C`,
+  a state name of `C` (§11), and `put` and `put_op` into `C`,
   with `RuleUnknown`, naming the collection and the rule (next step
   `UpdateProgram`: run a program that knows the rule). It MUST NOT compute a
   state of `C` under any other rule, `/merge/yrs` included.
@@ -609,7 +601,7 @@ on every reader.
   Every reason in the operation itself is the check's; apply meets the
   state, which other writers' versions make, so an exclusion that depends
   on it is not counted — never a refusal, which would let one writer
-  withdraw another's version and its group. An apply that fails MUST leave
+  withdraw another's version. An apply that fails MUST leave
   the state as it was before it; the layer keeps the version applied and
   not counted, with the reason (an own operation that fails is not
   written).
@@ -638,8 +630,8 @@ on every reader.
 - **Value** is the merged value, typed by the rule: named fields (what
   `/merge/yrs` merges into), or the rule's own encoding, which the program
   defining the rule decodes. The layer passes the applied versions it holds
-  back (members of a group waiting on another member, §5.5, and versions
-  covered only by checkpoints the rule does not count, §5.2); the value
+  back (versions covered only by checkpoints the rule does not count,
+  §5.2); the value
   leaves them out, while the rule's counting of every version still sees
   them (the layer's holding back never feeds back into the rule).
 - **Determinism.** The layer applies parents first (§5.2), and versions
@@ -905,7 +897,7 @@ state it builds is the one it had before the restart.
 
 - **What start restores.** What the device needs to publish and judge:
   its log and summaries, heads, records (members, holds, leases, prunes,
-  cuts, introductions), groups, refusals, equivocation evidence, and per
+  cuts, introductions), refusals, equivocation evidence, and per
   merge collection the index of the versions its store holds (ndn-data:
   `Coll::dormant`, each writer's seqs and the writers their parents name).
   No merge state is built then.
@@ -913,9 +905,9 @@ state it builds is the one it had before the restart.
   version or entry of it; a `watch` of it; a `watch` of a folder over it,
   only when the collection holds a version past the watch's `since` (one
   to list — a collection wholly inside `since` stays unbuilt, and what
-  arrives later builds it); `put`, `put_op` or `put_group` into it; `hold`
-  or `release` of it; a version arriving for it; a group with a member in
-  it being judged; a new members record over it; a revocation of a key
+  arrives later builds it); `put` or `put_op` into it; `hold`
+  or `release` of it; a version arriving for it; a new members record
+  over it; a revocation of a key
   that wrote in it.
 - **The build.** It loads the collection's versions from the store and
   applies them by the rules above — its newest checkpoint first, then the
@@ -1127,169 +1119,6 @@ plus the duration the writer stated. What it promises, and no more:
   own order: the search may miss entries it dated out of order, and never
   returns an entry the writer did not sign or one dated outside the range.
   No date decides validity.
-
-### 5.5 Groups of versions — slice 6
-
-A **group** is a set of versions one writer signs to be counted all or
-none: one transaction of one device across collections of one folder. A
-reader counts a group's versions only once all of them are held and
-readable, and none of them when any is refused, on every member alike and
-in any arrival order.
-
-- **Format.** A version of a group carries `Group` (§16.2): the group's
-  `id`, the seq in its writer's log of the group's first version, and its
-  `count`, `1 ≤ count ≤ 65,536` (`GROUP_MAX`, as many seqs as a summary
-  node lists, §7; a chosen bound, not a limit of the design). The group `(w, id)` is
-  exactly `w`'s versions at seqs `id` to `id + count − 1`, consecutive, one
-  per collection and one per seq, all in collections of one folder — the
-  same parent name, every component but the last — all declaring one
-  `Seal`, and all kept `Forever` (until pruned): a member that expired
-  would leave a reader that never held it unable to tell the group
-  complete (§14.1).
-- **A reader's memory.** While a group waits — incomplete, or for a key, an
-  audience or a keep — a reader keeps each member it holds whole and
-  opened in its store, not in memory (ndn-data: under
-  `/localhost/ndn-data/parked/<log entry name>`), and in memory only what
-  judging the group reads of it: its id, name, keep, declared seal and
-  epoch. The member is listed not counted with why as before. Once the
-  group is complete or refused its members are loaded and applied, or
-  refused, together. A stalled group so costs a reader that index per
-  member, not the members. A parked member is not applied, yet it was
-  verified as it was parked, so it is kept across a restart: read back from
-  its parked copy at start as any held entry, it parks again while its
-  group waits, and a stalled group is never fetched again for it. Its seq
-  is noted again as it is read back, so an equivocation it is part of is
-  kept and reported after the restart too (§4). A
-  member in pieces not held whole stays in memory while its pieces are
-  fetched, so does a member held sealed that this device cannot open (no
-  key of its epoch held, §9), and so does a member of a collection held
-  for its owner (§13.2): a holder keeps, audits and leases exactly what it
-  holds.
-- **Writing.** `put_group` (§15) signs its items under one lock at
-  consecutive seqs of the device's log, each carrying the group; no other
-  entry of that log comes between them. It refuses, and writes nothing — no
-  version signed, no seq taken, nothing published — when there are no
-  items or more than `GROUP_MAX`, a collection appears twice, the
-  collections are not all of one folder, the records in force of the
-  collections list different readers (one was narrowed, say: a reader of
-  one could then never complete the group), `batch` is set, `keep` is not
-  `Forever`, or the rule of an item's collection refuses its operation:
-  `BadRequest`, saying which item and why (next step `FixRequest`). When a
-  collection's rule is unknown here it answers `RuleUnknown` (§5.1), and
-  when a collection is not writable by this device, that collection's own
-  error, unchanged; again nothing is written.
-- **Verdict.** A reader judges each group `(w, id)` from what every reader
-  of the group's folder holds alike: the group's own signed versions and
-  their admission, the entries and listings `w` signed in the folder's
-  collections, and the audiences of the epochs its members are sealed in:
-  - **Malformed** — refused for good: a member's seq outside `id` to
-    `id + count − 1`, members disagreeing on `count`, members in
-    collections of different parents, two members in one collection,
-    members whose declared `Seal`s differ as sets, sealed and unsealed
-    members together, or two entries of `w` at one seq of the group in
-    collections of its folder (equivocation, §4). An entry of `w` at a seq
-    counts here when it is held kept `Forever`, or known (held, or listed
-    by a node of `w` the reader verified, ever) and covered by `w`'s prune
-    record, or known in a merge collection (whose nodes list every entry):
-    what every reader following the folder learns from `w`'s signed nodes
-    and fetches. Evidence once taken is kept: a node that later stops
-    listing an entry — its writer's store lost it, say — takes nothing
-    back. An entry outside the folder, or kept for its last `n` or until a
-    date — which leaves `w`'s listing, so a reader starting later never
-    learns of it — is not evidence against the group; cuts accept a seq
-    only in its collection (§6.1, §8), so such an entry gains its writer
-    nothing. An absent listing is never evidence: what an honest writer's
-    node stops listing may be listed, and fetched, again (§7).
-  - **Refused** — a member is refused for good: by the record in force of
-    its collection (`NotMember`, `OutsideCut`, §6, §8), by a revocation cut
-    or an untrusted chain (§8.1, §8.3), `Unsealed` (§9), by its rule's
-    check (§5.2; an apply that fails only leaves its member not counted),
-    or because the group is malformed. Then no member ever
-    applies: each is a version refused for what it carries (§5.2), so later
-    versions do not wait for it, and each is reported not counted
-    (`Change::NotCounted`, the group refused). A member applied before is
-    withdrawn, in every collection of the group: watchers are told
-    `Withdrawn` with the reason `Refusal::Group` — the refused member and
-    why — and `get` of each other member answers `Refused` with that
-    reason, while `get` of the member refused for its own sake answers its
-    own refusal (`OutsideCut`, `NotMember`, …). Versions by
-    other writers made over a withdrawn member stay counted: a parent that
-    never applies holds nothing back (§5.2).
-  - **Not covered** — the members' epochs do not all admit the same
-    readers: some epoch's audience, as the records held here name it
-    (every reader a record naming the epoch lists, and the device that
-    started it, §9), does not admit a reader listed by another member's
-    epoch (epoch creators aside). A reader could then open some members
-    and never others. No member counts, at any reader: each is reported
-    not counted ("group waits: … sealed in the epoch …, whose readers do
-    not include …; it counts once the owner adds them to that epoch"), and
-    versions that depend on a member wait. A record that only adds
-    readers keeps its epoch (§6), so audiences only grow: the group
-    counts, at every reader alike, once records admitting them are held
-    and the keys granted. The requirement comes from the epochs used,
-    never from the seal the writer declares.
-  - **Never counted** — a member is kept otherwise than `Forever`: no
-    member counts and none is refused, at any reader; each is reported not
-    counted, as an exclusion that waiting does not end ("group never
-    counts: … kept …"; `NotCounted::Excluded`, not `Waits`: no later
-    version brings a `Counted`, only the writer putting the items again as
-    a group kept `Forever`), and versions that depend on a member — its
-    writer's later versions in those collections among them — wait. A
-    reader that never learns of that member (it left its writer's listing)
-    finds the group incomplete and waits alike, so no reader applies what
-    follows it and no honest writer builds on it: only the misbehaving
-    writer's own later versions are held back.
-  - **Unreadable here** — a member is held sealed and this device cannot
-    open it: no member is shown — none delivered as a version, none in a
-    value — each is reported not counted ("group not readable here"), and
-    versions that depend on a member wait (stale).
-  - **Incomplete** — fewer than `count` members are present: held,
-    admitted and whole (one in pieces: every piece held, below), or known
-    pruned (below). Each
-    held member waits, reported not counted ("group incomplete: k of n"),
-    and versions that depend on one wait.
-  - **Complete** — all `count` members are present, and each held one is
-    ready (§5.2), a dependency on another member of the group counting as
-    met: all held members are applied together, across their collections,
-    in seq order.
-- **Pruned members.** A member this reader knows pruned (§14) — held
-  before or not — counts as present for its group's verdict: prune is its
-  writer's own retention, never a refusal, and every reader knows it alike
-  from the signed prune record and the writer's summary, which keeps
-  listing what it pruned. The group counts once every other member is
-  present, and nothing counted is uncounted by a prune. Expiry has no such
-  evidence for a reader that never held the member — the writer's node
-  stops listing it — which is why a group with a member that may expire
-  never counts.
-- **Members in pieces.** A member whose payload travels in pieces (§13.1)
-  is present once its record is admitted and every piece is held here —
-  whether or not it is opened yet. It is opened (and, sealed, unsealed) as
-  it applies, which only the group's verdict lets it do: a reader that
-  required it opened before counting it present would wait for its group
-  while the group waits for it, and the group would never count (ndf's
-  report: a 37,847-octet operation in a group of three). A member whose
-  pieces turn out not to open is refused (`BadSignature`, its writer
-  signed what does not decode), and its group with it. The same holds for
-  the writer's own device: what it applied in pieces is let go from memory
-  (§13.1), so when it reads a collection again — a new members record, a
-  re-admission, a revocation — its own members are pending and unopened,
-  present by their pieces held, and its group counts again whole.
-- A device holding a member of an incomplete group follows the member's
-  folder (its parent name, §12), so that the others arrive.
-- **A group counts only while every member counts.** While a member
-  applied here is not counted — its rule's answer, or an apply that failed
-  — every other applied member is not counted either: applied (later
-  versions do not wait for it), held, shown, left out of its collection's
-  value and newest, and reported not counted with the reason "group
-  waiting on `<member>`: `<that member's reason>`", naming the first such
-  member by seq. A member its rule does not count keeps its own reason.
-  When every member counts, every member is reported counted. The rule
-  computes counting over the whole applied set, waiting groups included,
-  and the layer's holding back never feeds back into it, so the judgement
-  is one pass and the same at every reader in any order. Refusal for good
-  still withdraws the group (above).
-- Groups work in merge, log and one-key collections alike: counted means
-  applied, delivered, and a candidate for the newest.
 
 ## 6. Members — slices 1, 2, 6 (folder records)
 
@@ -1602,9 +1431,9 @@ one name (§5.1). A version it does not count is held, applied to the
 frontier, served, shown with the reason to every watcher and listed in the
 state: never dropped, never hidden. Only its check refuses, from the
 operation and its past alone; what its apply answers, meeting the state
-other writers made, never refuses a version nor withdraws its group (it is
+other writers made, never refuses a version (it is
 not counted, with the reason), so no writer can arrange a state that gets
-another writer's group withdrawn. A version it refuses is kept against its
+another writer's version withdrawn. A version it refuses is kept against its
 name with the reason, and nothing waits for it. A program whose rule
 behaves otherwise than another's under the same name breaks determinism;
 the defence is the versioned name — a change of meaning is a new name.
@@ -1662,62 +1491,14 @@ audit fails and its lease is a breach the owner repairs, as with a holder
 losing pieces (§13.3, §13.4). A device wanting the stronger guarantee keeps
 its own copy, or holds with more copies.
 
-**Group griefing.** Only a group's own writer can make it incomplete, and
-only its own versions: a member never sent keeps the others held and shown
-as not counted, and what depends on them waits — stale, never wrong.
-Another writer's version can depend on a member only if that writer held
-the group complete, so the member then exists to be fetched from it. A
-malformed group is refused by every reader alike, from its own signed
-versions, and a group none of whose members are refused is counted whole
-or not at all, never in part.
-
 **Seq reuse across collections.** A writer's log is one sequence, and a
 collection holds a subset of it, so a writer can sign a second entry at a
 seq it used, in another collection: a new name, unseen by a reader that
 follows only the first collection. Nothing that matters trusts such a
 seq: a cut, removal or revocation, accepts a seq only in the collection it
 lists it under (§6.1, §8, §8.1), so a removed writer cannot inject an entry
-at a seq its cut kept elsewhere; and a group whose writer signed two
-entries at one of its seqs, in collections of its folder, is malformed
-(§5.5). The verdict reads only what every reader of the folder holds
-alike — the writer's entries kept `Forever` and its signed listings there,
-pruned entries included — never an entry outside the folder, which only
-some readers fetch, nor one kept to expire, which a reader starting later
-never learns of. A reader that has fetched one of two entries counts the
-group until it holds the other, which the writer's node under the folder
-lists, as a reader that has not yet heard of a removal cut keeps a version
-until the cut arrives. Readers report any equivocation they hold
+at a seq its cut kept elsewhere. Readers report any equivocation they hold
 (`Change::Equivocation`), inside the folder or not.
-
-**Narrowing races and seals declared falsely.** An owner narrowing one
-collection's readers while a writer signs a group across it does not split
-the verdict: a reader judges a group by the epochs its members are sealed
-in and their audiences, never by the record in force it happens to hold,
-so every reader with the same access judges it alike. A reader the
-narrowing leaves out finds the group unreadable here, and counts none of
-it. A writer that seals one member in an epoch leaving out a reader
-another member's epoch admits — whatever seal it declares, larger,
-smaller or none, and whether or not it leaves a member unsealed (then the
-group is malformed) — so that one reader could count the group and
-another never could, gains nothing: no reader counts a group while its
-members' epochs do not all admit the same readers (§5.5), and it counts
-everywhere once the owner admits them to every epoch.
-
-**Expiring members.** A member kept for the last `n` versions or until a
-date would vanish from its writer's listing once expired, and a reader
-starting later could never learn it had existed, while readers that held
-it counted the group and built on it. Group members are therefore kept
-until pruned: `put_group` refuses another keep. A writer that signs one
-anyway gains no split: a reader holding it never counts the group and
-refuses none of it, and a reader that never learns of it finds the group
-incomplete — both wait, so no reader applies the writer's later versions
-there and no honest writer builds on them; only the misbehaving writer
-is held back. Nothing is refused for a listing that is absent: an honest
-writer's node may stop listing an entry its store lost and list it again
-once found, and the group then counts everywhere. A prune leaves signed
-evidence every reader fetches — the prune record, and the writer's
-summary still listing the entry — so a pruned member counts as present
-alike everywhere.
 
 **Folder-level widening attempts.** `share` refuses to widen a
 collection under a folder; a record that widens anyway — signed by older
@@ -2818,7 +2599,7 @@ forward ciphertext. Erasure is the destruction of the key.
   versions they keep, revision and `Since`, and whether a record is a
   folder's; each epoch and its key check; each version's record but its
   payload — collection, writer, seq, parents, type, the seal it declares,
-  keep, the writer's date, its group (§5.5) — and the ciphertext's size;
+  keep, the writer's date — and the ciphertext's size;
   seal keys; and who asks whom for which epoch's key (the grant's name
   names the asker's seal key, the collection or folder and the epoch), and
   when.
@@ -2854,7 +2635,7 @@ collection), Content `SnapshotRecord`: the names it pins, each an exact log
 entry name or a state name. Publishing it makes a set of versions and
 merged states citable together: a link carries the snapshot's name. It
 does not hold the versions it pins back — a reader may count them before
-the snapshot arrives; versions counted all or none are a group (§5.5).
+the snapshot arrives.
 
 ## 12. Sync notice — slices 1, 2
 
@@ -3437,7 +3218,7 @@ was online (ndf's REPLY-12 §1; case h10).
 - every log entry of another device it holds verified: a version, opened
   or held sealed — a sealed one as the ciphertext its writer signed —, and
   every record (members, folder, hold, lease, prune, snapshot); stored, or
-  waiting in memory (pending, parked while its group waits, locked);
+  waiting in memory (pending, locked);
 - every piece (chunk and manifest node) of such a version that it holds;
 - every node and page of another device's summary it verified in its
   newest descent of that device: the reader keeps, per writer, node and
@@ -3461,7 +3242,7 @@ and a holder answering for pruned bytes would undo them. Erasure destroys
 an epoch's key only once every version sealed in it is pruned (§14), so a
 version of an erased epoch is never served either. Nothing refused or
 withdrawn here: by the record in force (`NotMember`, `OutsideCut`), a
-revocation cut or an untrusted chain (§8), its group (§5.5) or its rule's
+revocation cut or an untrusted chain (§8) or its rule's
 check (§5.2) — another reader would refuse it too, and serving it would
 only cost that reader a verification. This holds for a collection the
 device holds for its owner (§13.2) as for any other: a holder keeps
@@ -3592,7 +3373,7 @@ of that pass took; otherwise it asks the writer again in the next round.
   writer that signed two packets at one name (a copy of its key, §4)
   may have one held at one device and the other elsewhere; a reader
   takes the first that verifies, and the second, met later from any
-  source, is the equivocation §4 reports and §5.5 refuses a group for. A
+  source, is the equivocation §4 reports. A
   holder cannot make one: it cannot sign for the writer, and the same
   signed region under another signature value, which an ECDSA signature
   leaves malleable, is no second thing the writer signed (§4). A removal
@@ -3830,7 +3611,6 @@ With blocks, heads and expiry:
 | `get` | `get(name) → version, state or entries + age` | 1 (entries, ranges: 4) |
 | `put` | `put(collection, content, {type, keep, batch}) → (writer, seq)` | 1 (`batch`: 4) |
 | `put_op` | `put_op(collection, operation, {type, keep}) → (writer, seq)` | 6 |
-| `put_group` | `put_group([(collection, fields \| operation)…], {type, keep}) → [(writer, seq)…]` | 6 |
 | `watch` | `watch(collection, since F) → summary, new versions…` | 1 |
 | `snapshot` | `snapshot(names \| collections) → snapshot` | 1 |
 | `hold` | `hold(prefix, {copies, until, holders}) → custody` | 3 |
@@ -3839,7 +3619,7 @@ With blocks, heads and expiry:
 | `share_folder` | `share_folder(folder, {rule, readers, writers} \| change)` | 6 |
 | `members` | `members(folder \| collection) → {rule, writers, readers}` | 6 |
 
-`put_op` and `put_group` are forms of `put`, `share_folder` of `share`,
+`put_op` is a form of `put`, `share_folder` of `share`,
 and `members` reads what they signed, as a `get` reads a version: the
 verbs stay seven. Code mostly uses `get`, `put` and `watch`.
 `hold`, `prune` and `share` run on host policy, or on the person's
@@ -3854,7 +3634,7 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   state name, `at`, the value (typed by the rule, §5.1) and `not_counted`:
   the versions held that are not in the value, sorted by id, each with why
   as a `NotCounted` (`Excluded`: the rule's not counted inside `at`;
-  `Waits`: members of groups incomplete or unreadable here, §5.2, §5.5; see
+  `Waits`: a basis or pieces still arriving, §5.2; see
   the `NotCounted` bullet below); of a log collection, its newest version
   (§5) — with `Age::Newest`: the time since the device last knew nothing
   newer was outstanding in `C`'s sync group, measured on its monotonic
@@ -3965,14 +3745,8 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   `BadRequest` (next step `FixRequest`: `put_op` is for merge collections);
   under a rule the device does not know, `RuleUnknown`; with `batch`, as
   `put` in a merge collection. It answers as `put` does otherwise.
-- **`put_group(items, {type, keep})`** signs one version per item — fields
-  (made into an operation by the rule's edit in a merge collection) or an
-  operation — as one group (§5.5), and answers their ids in item order, or
-  refuses as §5.5 says, writing nothing: the default records of new
-  collections among them are signed only once every item passed, and as
-  `put` signs them (§5).
-- **A put never waits on other devices** (round 4). `put`, `put_op`,
-  `put_group` and the batch forms return once the version is applied
+- **A put never waits on other devices** (round 4). `put`, `put_op`
+  and the batch forms return once the version is applied
   locally and queued behind the durability barrier; publishing after the
   barrier is the only wait. (1) A collection under a folder whose members
   record this device holds, its own folder or another's, and that has no
@@ -4013,14 +3787,11 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   the value (`State::not_counted`, `Change::NotCounted::why`), two kinds
   that differ in whether they end by waiting, so a program shows a spinner
   for one and a mark for the other: **`Waits(why)`** is the layer's own
-  wait — the group of the version is incomplete (`group incomplete: 1 of
-  2`), not readable here, waits for the epoch its readers are in, or a
-  basis or pieces of it are still arriving; it ends when what it waits for
-  arrives, and the version then counts (`Change::Counted`). **`Excluded(why)`**
-  is a rule's own exclusion (the rule's `Counting::NotCounted`, an apply
-  that failed, a group refused, a group member held back by a member its
-  rule excludes, a group with a member kept otherwise than `Forever`
-  (§5.5)): it does not end by waiting for what the layer waits for
+  wait — a basis or pieces of the version are still arriving; it ends
+  when what it waits for arrives, and the version then counts
+  (`Change::Counted`). **`Excluded(why)`** is a rule's own exclusion (the
+  rule's `Counting::NotCounted`, an apply that failed): it does not end by
+  waiting for what the layer waits for
   (a later version the rule counts differently may still end it, as §5.2
   says, and `Change::Counted` follows then too). `Display` is the bare
   reason. A version whose reason moves from `Waits` to `Excluded`, or
@@ -4032,7 +3803,7 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   then every version applied later, the summaries of §7, each outside `F`,
   every equivocation (§4), and every version withdrawn (§8), pruned (§14)
   or expired (§14.1); from slice 6 also every version held but not
-  counted, with why (`Change::NotCounted`, §5.2, §5.5), and every such
+  counted, with why (`Change::NotCounted`, §5.2), and every such
   version once it counts (`Change::Counted`); it starts a refresh of every
   device known to write into the namespace. The stream ends when the
   device stops. A folder's watch is one stream for every collection under
@@ -4050,15 +3821,14 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   also reports the equivocation evidence held about what is watched,
   whatever `F`. The listing
   reports what is applied, and, right after a version, `NotCounted` with
-  why when the rule does not count it, and a group member waiting for its
-  group as `NotCounted` alone (its version comes once the group counts); a
-  version held but not applied yet (it waits for an earlier one, its
-  group, its key or its pieces) is not listed and comes once it applies,
+  why when the rule does not count it; a version held but not applied yet
+  (it waits for an earlier one, its key or its pieces) is not listed and
+  comes once it applies,
   so the stream delivers no version twice (a version withdrawn and taken
   back comes again, after its `Withdrawn`). `F` filters every collection
   alike, by writer and seq, as a watch of that collection with `F` would;
-  within one collection a writer's versions come in seq order (a group's
-  members once their group counts), across collections in no common
+  within one collection a writer's versions come in seq order, across
+  collections in no common
   order — one may wait for its key while another applies — so a frontier
   joined from a folder's deliveries may cover a version of another
   collection still to come: a host resuming a whole folder passes the
@@ -4301,14 +4071,16 @@ The data layer uses 0x0520–0x057F, and 0x05B0–0x05BF for an introduction
 code's link hint and a short code's hint record (below), registered in
 [README.md](README.md#tlv-type-numbers). The block 0x05E0–0x05FE is freed and
 quarantined, not reused (the old spec is kept in
-[history/data-layer-events.md](history/data-layer-events.md)). A number is even unless the notes
+[history/data-layer-events.md](history/data-layer-events.md)). The numbers
+0x0557 and 0x0559 are freed and quarantined too, not reused (the old spec
+is kept in [history/data-layer-groups.md](history/data-layer-groups.md)). A number is even unless the notes
 below say it is odd: a decoder MUST skip an unknown even TLV inside these records
 and MUST refuse an unknown odd one, so a later revision can add fields old
 readers pass over (and fields they must not).
 
 | Type | Name | Value |
 |---|---|---|
-| 0x0520 | VersionRecord | Name (collection), Frontier (parents, each entry with its tip's Digest), TypeId, Seal, Keep, Dated, [Group] (§5.5), [Rule] (merge: the rule the operation was made for, §5.1), then Fields, MergeOp — or Block (§4.1), or Chunks (§13.1; in a collection of any rule from slice 6) — or, sealed, Sealed |
+| 0x0520 | VersionRecord | Name (collection), Frontier (parents, each entry with its tip's Digest), TypeId, Seal, Keep, Dated, [Rule] (merge: the rule the operation was made for, §5.1), then Fields, MergeOp — or Block (§4.1), or Chunks (§13.1; in a collection of any rule from slice 6) — or, sealed, Sealed |
 | 0x0522 | Frontier | FrontierEntry*, by writer (in a version's parents, one per writer) |
 | 0x0524 | FrontierEntry | Name (writer key), Seq; in a version's parents, then Digest (the implicit digest of that writer's packet at that seq) |
 | 0x0526 | Seq | NonNegativeInteger |
@@ -4383,8 +4155,6 @@ readers pass over (and fields they must not).
 | 0x0551 | Expired | empty, an AuditAnswer: the piece's version expired by the holder's clock and it dropped it (§14.1) |
 | 0x0553 | Expiry | SeqRange+ (seqs the node lists in Entries), KeepUntil (a date at or after each one's keep); in a SummaryNode, at most 64, their seqs ascending and disjoint across all of them (§7) |
 | 0x0555 | Folder | empty; in a MembersRecord right after its Name: the record governs the folder Name and every collection strictly under it (§6.1) |
-| 0x0557 | Group | Seq (the group's id: the seq of its first version), GroupCount; in a VersionRecord right after Dated (§5.5) |
-| 0x0559 | GroupCount | NonNegativeInteger 1–65,536 (`GROUP_MAX`): the number of versions in the group |
 | 0x055B | CutBytes | Name: the full name, ending in its ImplicitSha256DigestComponent, of the root of a cut manifest (`<R>/32=cut/seg=0`, §16.1; trust-context.md §3.3.12) listing, under `<D>/32=log/<C>`, the seq and implicit digest of every version the cut keeps; in a Cut right after its Name, ascending, once each; never in a cut that keeps nothing (§8) |
 | 0x055F | CutIn | Name (a collection strictly under the folder), then per key it keeps versions of in that collection, by key: Writer, Entries (exactly those seqs); in a folder record's Cut only, once per collection (§6.1, §8) |
 | 0x0561 | IntroOffer | Name (the folder), Role, KeepUntil (its expiry), Tries, Digest (the commitment to its secret), SealKey (the offering device's); a log record (§19.1) |
@@ -4438,10 +4208,7 @@ than the reader.
 Slice 6's numbers are odd for the same reasons. A reader passing over
 `Folder` would take a folder's record as the record of a collection named
 like the folder, and judge every collection under it without it: a writer
-the folder removed would be admitted there — wrong, not stale. One passing
-over `Group` would count the members of an incomplete or refused group in
-part, which is the one thing a group forbids; one passing over
-`GroupCount` could not tell a complete group from an incomplete one. One
+the folder removed would be admitted there — wrong, not stale. One
 passing over `CutIn` would read a folder cut as accepting nothing, and
 withdraw every version it kept — wrong, not stale; one reading its seqs
 as valid in every collection would admit a removed writer's re-signed
@@ -4623,14 +4390,6 @@ nothing on the wire. The odd numbers 0x0571–0x057F stay free.
   compute different states under one name and no reader falls back to
   another rule. `/merge/yrs` keeps its name, so slice-2 records still mean
   what they meant.
-- **A group's id is its first seq**, and its versions are its writer's
-  consecutive seqs (§5.5): a key's seqs are unique across its log, so
-  `(writer, id)` names the group with no new identifier; a reader knows
-  exactly which seqs make it up, so it can tell what is missing and fetch
-  it by name from the summaries, and no other version can claim to belong
-  (a seq outside the range is malformed). `put_group` signs under one lock,
-  so nothing else of the device's log comes between. `GroupCount` makes
-  completeness a fact of each member's own signed record.
 - **A folder record is the existing members record with a flag** (§6.1),
   not a new record: the owner rule, revisions, parents, the merge of
   concurrent records, cuts, epochs, key checks and `Since` all carry over
@@ -4691,16 +4450,15 @@ nothing on the wire. The odd numbers 0x0571–0x057F stay free.
 | Holder withholds a range's blocks | A time search probes a window at once and stops a round none of whose probes answers; the read answers within its bound, listing what it did not reach `missing`. | invariant 4, §5.4 |
 | Holder rolls back | A summary older than one already seen is refused, also by a reader that restarted since. | invariant 3, §7 |
 | Writer never pauses | Each descent finishes against the root it started from, whose nodes the writer keeps serving; the reader then continues from there and keeps up. | §7 |
-| Writer equivocates | Both entries are kept and reported (`Change::Equivocation`), at one name or at one seq in two collections or of two kinds; a group over that seq is refused. | invariant 2, §4, §5.5 |
+| Writer equivocates | Both entries are kept and reported (`Change::Equivocation`), at one name or at one seq in two collections or of two kinds. | invariant 2, §4 |
 | A writer names a parent seq that does not exist yet (a checkpoint over another's future) | Its parent's digest matches no packet at that seq: refused `Refusal::Parent` once the genuine one is held; it covers nothing, and the other writer's versions apply. A checkpoint over a parent that never applies is refused too. | §4, §5.2 |
 | A stale writer's operation made for an earlier rule | Refused `Refusal::OtherRule`; never read under the rule in force. | §5.1 |
-| A rule's apply fails on the state others made | Applied, not counted, with the reason; no version or group is refused for it. | §5.1 |
+| A rule's apply fails on the state others made | Applied, not counted, with the reason; no version is refused for it. | §5.1 |
 | A basis refused by its key | In no past on any reader, held or not: judged alike everywhere. | §5.2 |
 | A Yjs update deleting or placing against content outside its past | Refused by `/merge/yrs`'s check. | §5.1 |
 | Pieces served to one device only | Readers ask the devices whose versions are made over the version. | §13.1 |
 | Writer offline, another device holds its work | Readers ask the other devices they hear for the namespace, under their own names, for the writer's newest root, summary nodes, entries and pieces; each answers with the writer's own packets (sealed as ciphertext), verified as from the writer. Nothing pruned, expired, refused or unverified is served. | §13.5 |
 | Holder behind, or withholding | Its older root is not taken below the head verified; the reader gets less, never wrong data, and asks the writer first again once reachable. | §7, §13.5 |
-| Group member in pieces, not opened yet | Present once every piece is held; opened as it applies; the group counts whole, on readers and on the writer after it reads a collection again. | §5.5 |
 | Old software writes | Unknown fields survive its edit. | invariant 8, §10 |
 | Poisoned cache | Verification fails, or the packet is signed by another device's key or does not decode: that packet is dropped, nothing is kept against its name, and it is fetched elsewhere; the genuine copy is taken. | invariant 1, §4 |
 | Stranger in a sync group | Costs a root fetch per name it carries, at most `HEARD_MAX` names per group kept heard; never asked to answer for another device or to grant; its entries are refused `NotMember`. | §6, §12, §13.5 |
@@ -4736,19 +4494,8 @@ nothing on the wire. The odd numbers 0x0571–0x057F stay free.
 | Merge version's pieces missing | It waits as a missing parent, with what depends on it, while its pieces are fetched from the writer and the holders; covered by a checkpoint held whole and checked, its pieces are never fetched. | §5.2, §13.1 |
 | Member writes a bogus checkpoint | Applied alike everywhere as its writer's claim; the owner's removal cut withdraws it, and the versions it covered then apply. | §5.2, §6.2, §8 |
 | Checkpoint the rule does not count | What only such checkpoints cover is not counted, saying which checkpoint and why, and is out of the value, alike whether it was applied before the checkpoint or never and after a restart; a member's write the rule never counts stays not counted under her own checkpoint. It counts, and watchers are told, once a checkpoint covering it counts. | §5.2 |
-| Group member never arrives | The group stays incomplete: its members held and shown not counted, what depends on them waiting — stale, never wrong. | §5.5 |
-| Group member refused, or group malformed | No member counts, on every reader alike; members applied before are withdrawn in every collection (`Refusal::Group`); others' versions made over them stay counted. | §5.5 |
-| Two members, or a member and another entry, at one seq of a group, in collections of its folder | The group is malformed at every reader of the folder once it holds both (an entry kept `Forever`, or listed and pruned, or listed in a merge collection), whatever their order; one outside the folder, or kept to expire, changes nothing; the equivocation is reported. | §4, §5.5 |
-| Narrowing concurrent with a group | Judged by the epochs its members are sealed in and their audiences, alike everywhere; a reader left out finds it unreadable here and counts none of it. | §5.5, §6.2 |
-| Group whose members' epochs admit different readers, whatever seal it declares | No reader counts it until every member's epoch admits every reader another member's epoch lists; sealed and unsealed members together make it malformed. | §5.5, §6.2 |
-| `put_group` that cannot complete | Refused before anything is signed, saying which item and why — also for a keep other than `Forever`. | §5.5 |
-| Group member pruned | It counts as present for its group's verdict, alike at every reader (the prune record and the writer's summary say so): the group counts once every other member is present, and nothing counted is uncounted by the prune. | §5.5, §14 |
-| Group member that may expire | The group never counts and nothing of it is refused, at every reader: one holding the member and one that never learns of it both wait, so no reader applies the writer's later versions there and no honest writer builds on them. | §5.5, §6.2, §14.1 |
-| Group member its writer's node stops listing (store loss) | Nothing is refused: the group waits, and counts everywhere — with versions made over the member — once the node lists it again and it is fetched. | §5.5, §7 |
 | A stored version gone or no longer decoding when a merge state is first built after a restart | It is no longer held: the state is built from the versions that read, and the lost one is fetched again where a summary lists it; versions after it wait for it — stale, never wrong: every verdict is the one the signed versions held give, as before the restart. | §5.2, §7 |
 | Device stops or loses power while a merge state is being built | Nothing is lost or changed: the build computes from the versions its store holds, each verdict a function of them; the next start indexes the collection again and its next need builds the same state. | §4.2, §5.2 |
-| A large group stalls (a member never arrives, or never opens here) | Its members held whole and opened wait in the store, each costing memory only its index (id, name, keep, seal, epoch); members in pieces, members sealed in an epoch whose key is not held here, and members of a collection held for its owner stay in memory. Each is listed not counted with why; what depends on them waits — stale, never wrong. | §5.5 |
-| Device restarts with group members parked | They are read back from their parked copies at start, verified when parked, and parked again while the group waits: nothing of a stalled group is fetched again, a member whose writer is gone still completes its group, and an equivocation a parked member is part of is noted again and still reported. A parked copy whose member applied, was refused or was let go is dropped. | §4, §5.5, §7 |
 | Reader removed at folder level | One new folder epoch for every inheriting collection; collections in their own epoch listing the reader move to new epochs of their own, and until such a record is held no writer seals in the outgrown epoch (`NotReady`, `RetryLater`). | §6.1, §9 |
 | Collection takes its first own record under a folder | Starts from the effective record: a rule change or a first seal sets `Since`, a writer the folder admitted gets a cut, the folder's cuts carry over; its history stays readable and its writers' past admitted. | §6, §6.1 |
 | Owner device puts into a new collection before it synced the folder above | No default record is signed while a known device of its namespace was never walked toward the collection's folder, or is known at a newer root than the one walked (the head and the names walked toward are kept across restarts): `NotReady` (`RetryLater`), naming the devices; the folder's record, once held, governs the collection. A device merely offline since a walk toward that folder holds nothing back, nor does one nothing signed held vouches for once its walks spent their `REFRESH_TRIES` tries unreached; one a faulty path kept from a few walks is still waited for. | §5, §6.1, §13.5 |
@@ -4760,14 +4507,14 @@ nothing on the wire. The odd numbers 0x0571–0x057F stay free.
 | Collection record wider than its folder | `share` refuses it; one signed anyway widens nothing: every reader intersects the levels. | §6.1 |
 | Release of merge pieces without a covering checkpoint proved held | Refused: the pieces are kept, saying why, and `NotHeld` when nothing is released. | §13.3 |
 | Collection created under a watched folder, by this device or another writer | Reported on the folder's one watch with no further call, every change tagged with its collection; finding it costs the new branch only (the root, the nodes on the way, the folder node or its changed page, the new collection's node and entries), never a walk of the folder. | §7, §15 |
-| Version listed by a watch while it waits (for an earlier version, its group, its key, its pieces) | Not listed: it comes once it applies, so no watch is handed a version twice; a group member waiting is listed `NotCounted` with why. | §15 |
+| Version listed by a watch while it waits (for an earlier version, its key, its pieces) | Not listed: it comes once it applies, so no watch is handed a version twice. | §15 |
 | Folder watch resumed from a frontier joined across its collections | May skip a version of another collection still to come: a writer's versions come in seq order within a collection only. A host resumes a whole folder from the empty frontier (the listing is local) or each collection from its own frontier. | §15 |
 | Watcher reads slower than changes come | Its queue holds what its listing queued and `Config::watch_queue` changes more; then `Change::Lagged`, and every change after it is dropped until the watcher read the queue empty — memory bounded, the gap told in order, never silent. The watcher reads again from its frontier. | §15 |
 | Folder writer creates collection after collection | It makes a follower follow at most `Config::writer_collections` collections of a namespace outside its own; past it, its new collection is neither fetched nor taken, and the folder's watchers are told `Change::Untracked` naming the writer and what to do (follow the collection by name, or have the writer removed). Counted from what is held, so a restart grants no new allowance. | §15 |
 | Owner lists thousands of persons' namespaces | A reader adopts, refreshes, carries in transit and joins the groups of at most `SCOPE_PER_SUBJECT` (64) for one subject and `SCOPE_NAMESPACES` (256) in all; no group of a namespace not adopted is joined; the rest are logged and told `Change::NotAdopted` with what to do, their versions waiting. | §6.3, §12 |
 | After a restart, a path serves only an older version of a member's context, or a thief's branch numbered past the one held | The newest version adopted is kept in the store, signed, held again at start and refreshed from by continuity: an older version, that number with other content, or a branch not descending from it is refused and asked again later, so a key a newer version revoked never writes again. | §6.3 |
 | Equivocation across two folders | Each collection's watchers are told with their own version whole and the other by name and id only: no watcher learns content of a collection it does not watch. | §4, §15 |
-| Reader that predates slice 6 | Refuses folder records and group members (odd TLVs) and waits for them — stale; it applies a collection's own record alone, without a folder's narrowing, until updated. | §16.2 |
+| Reader that predates slice 6 | Refuses folder records (odd TLVs) and waits for them — stale; it applies a collection's own record alone, without a folder's narrowing, until updated. | §16.2 |
 | Code stolen or forwarded | Admits whoever presents it first within its expiry, with its role; then one key only: every other is refused `Used` and gains nothing; the owner sees and removes the joiner as any member. | §19.4, §19.7 |
 | Ask replayed | Answered from the answer kept for it, bound to the asker's key: admits nobody new. | §19.4, §19.7 |
 | Ask without the secret, or guessing | Refused `WrongProof`, counted durably; at the offer's tries it closes for good, even to the right secret, across restarts. | §19.4 |
@@ -5465,20 +5212,7 @@ apart from the checkpoint alike, for the same reason, and show the same
 value, also after an owner writes over it), b9 (a checkpoint written while
 another member works offline: back before any release, the member's edit
 merges exactly on every device, the device that applied the checkpoint
-first fetching the covered version it was made over, with no conflict), g1 (a
-group counted all or none on arrival, and withdrawn whole when one member
-is refused), g6 (a group with one member under a lock waits whole, each
-other member not counted with a reason naming that member and its
-reason, then counts whole once unlocked), g7 (a group of three whose
-37,847-octet member travels in pieces counts whole at a reader once every
-piece is held, and at the writer after a new members record makes it read
-the folder again), g2 (`put_group` refuses a group that could not complete,
-writing nothing), g3 (a group judged the same at every reader despite a
-concurrent narrowing of one of its collections), g4 (a copy of a
-writer's device signs seqs it already used in other collections: entries
-at seqs a folder cut kept are refused `OutsideCut` in the collection the
-cut did not list them under, at every reader, and a group one of whose
-seqs carries a second entry is refused for its group at every reader),
+first fetching the covered version it was made over, with no conflict),
 h10 (a device serves the versions it holds that another device wrote:
 Alice's phone locks a paragraph of a sealed folder and goes away for good,
 no cache keeping what it served; her laptop answers for the phone's root,
@@ -5495,14 +5229,9 @@ keeps what was written unsealed before readable, at every reader) and f4
 watch show both with no gesture of hers; she lets Carol go with a change
 naming Carol alone, and Bob stays a member, writing and reading, his
 device holding the same record, while Carol no longer reads what follows).
-Their features are `RuleByName`, `AppOps`, `MergePieces`, `Groups`,
+Their features are `RuleByName`, `AppOps`, `MergePieces`,
 `FolderMembers` and, for f4, `Introduction`.
 
-The large-group case is g5 (one folder of 2,000 element collections; a
-writer puts one edit into each as a single group, above the former bound
-of 1,024; another member holds no member counted until all 2,000 are
-held, then counts all of them, and a reader holding only some keeps them
-in its store, not in memory, listed not counted with "group incomplete").
 The lazy-state case is l1 (a note collection with edits, a checkpoint and
 edits after it, beside collections nobody touches after a restart; the
 device stops and starts again from its store: no merge state is built at
@@ -5512,10 +5241,7 @@ frontier, value and `not_counted` equal those before the restart; the
 untouched collections stay unbuilt, costing index entries only). ndn-data
 carries l1 as a unit test, its rule counting starts and applies
 (`device/lazy_tests.rs`), with a folder watch that builds only the
-collections holding versions past its `since`, the parking of an
-incomplete group's members, and parked members read back after a restart
-(the group completes with nothing fetched, and an equivocation a parked
-member is part of is still listed).
+collections holding versions past its `since`.
 
 The folder-watch case is w1 (a note of 1,000 paragraphs, one element
 collection each, under one folder shared by `share_folder` with a second
@@ -5529,11 +5255,10 @@ handed one version twice. The Interests the watching device sent from
 each add to its delivery, and the time, are measured, not asserted). Its
 feature is `FolderWatch`. Focused tests in `ndn-data`'s
 `device/watch_tests.rs` hand a device crafted entries: a collection
-created under a watched folder delivers its version, a group member's
-`NotCounted` and `Counted`, and a cross-collection equivocation once per
-collection, each tagged; an equivocation across two folders shows a
-watcher nothing of the other folder's content; a watch lists a group
-member waiting as `NotCounted`, and a version waiting for an earlier one
+created under a watched folder delivers its version, and a
+cross-collection equivocation once per collection, each tagged; an
+equivocation across two folders shows a watcher nothing of the other
+folder's content; a version waiting for an earlier one
 when the watch begins is delivered once, when it applies; a watcher that
 falls behind is told `Lagged`, its queue bounded, and delivery goes on
 once it read the queue empty; and an outside writer past
@@ -5555,18 +5280,18 @@ each store instance has its own barrier. The batching cases (§4.2, one batch
 per put) are d4 to d8: d4 (a batch, `DataStore::apply` or
 `SyncBackend::write_batch`, that returned survives `kill -9`, with nothing
 written after it) and d5 (a child killed at a random moment inside a large
-batch, then inside a `put_group`: after reopening each batch, each group, is
-whole or absent, in order) run on both engines in `ndn-sync`'s
-`tests/durability.rs` and `ndn-data`'s `device/batching_tests.rs`; the
-power-loss case d2 also commits `apply` batches. d6 (a put, a `put_group`
-reach the store as one batch, markers before pieces before the entry; for
+batch: after reopening each batch is whole or absent, in order) run on both
+engines in `ndn-sync`'s `tests/durability.rs` and `ndn-data`'s
+`device/batching_tests.rs`; the power-loss case d2 also commits `apply`
+batches. d6 (a put reaches the store as one batch, markers before pieces
+before the entry; for
 every prefix of a batch on a store that does not apply it atomically a
 restarted device is sound) and d7 (a burst of puts reaches the store in seq
 order and is served identically after a restart) are in `ndn-data`'s
 `device/batching_tests.rs`; d3's in-process check also covers a burst, whose
 batches are all stored before any `put` returns and none published before
 its flush. d8 runs in the conformance runner, clean and `--faulty`: a burst
-of puts and groups, each one batch, converges among devices and survives a
+of puts, each one batch, converges among devices and survives a
 restart. d9 (a members record's batch holds the key of the epoch it starts
 before the record, and the erasure of the old epoch's key in the same
 batch, as one `apply`; a child killed at a random moment inside rotations
@@ -5788,7 +5513,7 @@ Bob's phone signed. And for the trust-context versions an adoption by
 name fetches (§6.3): a copy whose signature fails is refused as forged
 (`bad-signature`) and asked for again, never taken as a version that does
 not follow (trust-context.md §8.1); n1 failed so before.
-A duplicated packet is idempotent: a version, group member, grant,
+A duplicated packet is idempotent: a version, grant,
 members record, summary, head, ask or answer delivered twice is taken
 once, reported to watchers once, and counted once — a duplicated ask with
 a wrong proof spends one try, a duplicated join spends the code once. A

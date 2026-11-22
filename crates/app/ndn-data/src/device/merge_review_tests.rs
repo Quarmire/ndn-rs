@@ -31,63 +31,6 @@ fn share_under(rule: &str, writers: &[&str]) -> Share {
     }
 }
 
-/// The notes of collection `c` in `dev`'s state.
-async fn notes_of(dev: &Device, c: &Name) -> Vec<String> {
-    match dev.get(c).await.unwrap().got {
-        Got::State(s) => notes(&s),
-        other => panic!("not a state: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn a_state_another_writer_made_never_refuses_a_version_nor_withdraws_its_group() {
-    let trip = |x: &str| n(&format!("/alice/32=data/trip/{x}"));
-    let (plan, budget) = (trip("plan"), trip("budget"));
-    let dev = super::merge_tests::device_under(rules(), &plan, RULE).await;
-    dev.share(&budget, share_under(RULE, &["/alice", "/bob", "/carol"]))
-        .await
-        .unwrap();
-    let grouped = |c: &Name, seq: u64, op: Bytes| {
-        let mut body = body_in(c, RULE, &[], op);
-        body.group = Some(Group { id: 10, count: 2 });
-        made_in(c, "/bob/laptop", seq, Record::Version(body))
-    };
-    // Carol notes "a" first; Bob's group claims "a" in the plan and adds
-    // "b" to the budget. His claim meets a state Carol made: it does not
-    // count, and refuses nothing of his; his group waits on it whole,
-    // withdrawn nowhere.
-    let carol = made_in(
-        &plan,
-        "/carol/laptop",
-        5,
-        Record::Version(body_in(&plan, RULE, &[], edit(None, "a"))),
-    );
-    let claim = grouped(&plan, 10, Bytes::from_static(b"Xa"));
-    let other = grouped(&budget, 11, edit(None, "b"));
-    for m in [&carol, &claim, &other] {
-        give(&dev, m);
-    }
-    assert!(
-        !notes_of(&dev, &budget).await.contains(&"b".to_owned()),
-        "the group's other member waits with it"
-    );
-    let st = dev.inner.st.lock();
-    assert!(
-        !st.refused.contains_key(&claim.name) && !st.refused.contains_key(&other.name),
-        "{:?}",
-        st.refused.get(&claim.name)
-    );
-    assert!(st.colls[&plan].not_counted.contains_key(&claim.id()));
-    let waits = &st.colls[&budget].group_held[&other.id()].1;
-    assert!(
-        st.colls[&budget].at().contains(&other.id())
-            && waits.reason().contains(&claim.name.to_string()),
-        "applied, held back by its group, naming the member it waits on: {waits:?}"
-    );
-    drop(st);
-    dev.shutdown();
-}
-
 /// Carol's edits `from..=to`, each made over the one before `prev`.
 fn carols(prev: &Made, from: u64, to: u64) -> Vec<Made> {
     let mut out: Vec<Made> = Vec::new();
@@ -472,7 +415,7 @@ async fn a_holder_serves_nothing_of_a_held_collection_it_refused_or_withdrew() {
         let why = Refusal::Untrusted {
             why: "its chain no longer verifies".into(),
         };
-        st.cut_out.edit().insert(
+        st.cut_out.insert(
             withdrawn.name.clone(),
             OutOfCut {
                 writer: Writer::new(withdrawn.key.clone()),

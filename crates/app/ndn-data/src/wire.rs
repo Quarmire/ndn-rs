@@ -52,8 +52,7 @@ use ndn_tlv::{TlvReader, TlvWriter};
 
 use crate::collection::{Accepted, Cut, Epoch, Members, Parent, Rule};
 use crate::version::{
-    Audience, Content, Frontier, GROUP_MAX, Group, Keep, Parents, Seal, Seq, Timestamp, TypeId,
-    Writer,
+    Audience, Content, Frontier, Keep, Parents, Seal, Seq, Timestamp, TypeId, Writer,
 };
 
 /// TLV-TYPE numbers (0x0520–0x057F).
@@ -253,12 +252,6 @@ pub mod tlv {
     /// folder's — it governs the folder that `Name` names and every
     /// collection under it (spec §6).
     pub const FOLDER: u64 = 0x0555;
-    /// In a version record right after its `Dated`: the group the version
-    /// belongs to, `Seq` (the group's id: the seq of its first version) and
-    /// `GroupCount` (spec §5.5).
-    pub const GROUP: u64 = 0x0557;
-    /// NonNegativeInteger `1 ..= GROUP_MAX`: the versions in a group.
-    pub const GROUP_COUNT: u64 = 0x0559;
     /// In a folder record's `Cut`, once per collection under the folder in
     /// which versions of the cut's keys stay accepted, collections
     /// ascending: `Name` (the collection), then per key `Writer` and
@@ -1987,8 +1980,6 @@ pub struct VersionBody {
     pub keep: Keep,
     /// The writer's clock.
     pub dated: Timestamp,
-    /// The group the version belongs to (spec §5.5).
-    pub group: Option<Group>,
     /// The merge rule the operation was made for (spec §5.1); `None` under
     /// the log and one-key rules.
     pub rule: Option<Name>,
@@ -2199,12 +2190,6 @@ pub fn encode_version(b: &VersionBody) -> Bytes {
         write_audiences(w, tlv::SEAL, &b.seal.any_of);
         write_keep(w, b.keep);
         write_nni(w, tlv::DATED, b.dated.0);
-        if let Some(g) = &b.group {
-            w.write_nested(tlv::GROUP, |w| {
-                write_nni(w, tlv::SEQ, g.id);
-                write_nni(w, tlv::GROUP_COUNT, u64::from(g.count));
-            });
-        }
         if let Some(function) = &b.rule {
             w.write_nested(tlv::RULE, |w| {
                 write_nni(w, tlv::RULE_KIND, 2);
@@ -2781,12 +2766,8 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
     let mut sealed = None;
     let mut chunks = None;
     let mut block = None;
-    let mut group = None;
     let mut rule = None;
-    // The TLV-TYPE before this one: `Group` comes right after `Dated`.
-    let mut last = 0;
     each(value, |typ, v| {
-        let before = std::mem::replace(&mut last, typ);
         match typ {
             tlv_type::NAME => collection = Some(read_name(v)?),
             tlv::FRONTIER => parents = Some(read_parents(v)?),
@@ -2812,12 +2793,6 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
             }
             tlv::KEEP => keep = read_keep(v)?,
             tlv::DATED => dated = Some(Timestamp(read_nni(&v)?)),
-            tlv::GROUP => {
-                if before != tlv::DATED || group.is_some() {
-                    return Err(bad("a version's Group comes once, right after its Dated"));
-                }
-                group = Some(read_group(v)?);
-            }
             tlv::RULE => {
                 if rule.is_some() {
                     return Err(bad("a version names one rule"));
@@ -2910,7 +2885,6 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
         seal: seal.ok_or_else(|| missing("a seal"))?,
         keep: keep.ok_or_else(|| missing("a keep"))?,
         dated: dated.ok_or_else(|| missing("a date"))?,
-        group,
         rule,
         fields,
         op,
@@ -2918,30 +2892,6 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
         chunks,
         block,
     })
-}
-
-fn read_group(v: Bytes) -> Result<Group, WireError> {
-    let (mut id, mut count) = (None, None);
-    each(v, |t, v| {
-        match t {
-            tlv::SEQ if id.is_none() => id = Some(read_nni(&v)?),
-            tlv::GROUP_COUNT if count.is_none() => count = Some(read_nni(&v)?),
-            tlv::SEQ | tlv::GROUP_COUNT => {
-                return Err(bad("a Group has one Seq and one GroupCount"));
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
-    let (Some(id), Some(count)) = (id, count) else {
-        return Err(bad("a Group has a Seq and a GroupCount"));
-    };
-    match u32::try_from(count) {
-        Ok(count) if (1..=GROUP_MAX).contains(&count) => Ok(Group { id, count }),
-        _ => Err(bad(format!(
-            "a group holds 1 to {GROUP_MAX} versions, not {count}"
-        ))),
-    }
 }
 
 fn read_fields(v: Bytes) -> Result<Content, WireError> {
@@ -4269,7 +4219,6 @@ mod tests {
             },
             keep: Keep::Forever,
             dated: Timestamp(5),
-            group: None,
             rule: None,
             fields: Content::new(),
             op: Bytes::new(),
@@ -4310,79 +4259,6 @@ mod tests {
     }
 
     #[test]
-    fn a_versions_group_parses_back_and_only_right_after_its_date() {
-        let body = VersionBody {
-            collection: n("/alice/32=data/trip/plan"),
-            parents: Parents::new(),
-            type_id: TypeId {
-                name: n("/types/note"),
-                revision: 1,
-            },
-            seal: Seal { any_of: Vec::new() },
-            keep: Keep::Forever,
-            dated: Timestamp(5),
-            group: Some(Group { id: 7, count: 3 }),
-            rule: None,
-            fields: Content::new(),
-            op: Bytes::from_static(b"op"),
-            sealed: None,
-            chunks: None,
-            block: None,
-        };
-        assert_eq!(
-            decode_record(encode_version(&body)),
-            Ok(Record::Version(body.clone()))
-        );
-        // The record's TLVs, to place a Group elsewhere.
-        let mut r = TlvReader::new(encode_version(&body));
-        let (_, inner) = r.read_tlv().unwrap();
-        let mut parts = Vec::new();
-        let mut r = TlvReader::new(inner);
-        while !r.is_empty() {
-            parts.push(r.read_tlv().unwrap());
-        }
-        let rebuilt = |parts: &[(u64, Bytes)]| {
-            let mut w = TlvWriter::new();
-            w.write_nested(tlv::VERSION_RECORD, |w| {
-                for (t, v) in parts {
-                    w.write_tlv(*t, v);
-                }
-            });
-            w.finish()
-        };
-        assert!(decode_record(rebuilt(&parts)).is_ok());
-        let at = parts.iter().position(|(t, _)| *t == tlv::GROUP).unwrap();
-        // Moved before Dated, or after the payload, or twice: refused.
-        let mut moved = parts.clone();
-        let g = moved.remove(at);
-        moved.insert(at - 1, g.clone());
-        assert!(decode_record(rebuilt(&moved)).is_err());
-        let mut late = parts.clone();
-        late.remove(at);
-        late.push(g.clone());
-        assert!(decode_record(rebuilt(&late)).is_err());
-        let mut twice = parts.clone();
-        twice.insert(at + 1, g);
-        assert!(decode_record(rebuilt(&twice)).is_err());
-        // A count outside 1 ..= GROUP_MAX is refused.
-        for count in [0, u64::from(GROUP_MAX) + 1] {
-            let mut w = TlvWriter::new();
-            w.write_nested(tlv::GROUP, |w| {
-                write_nni(w, tlv::SEQ, 7);
-                write_nni(w, tlv::GROUP_COUNT, count);
-            });
-            let mut r = TlvReader::new(w.finish());
-            let mut bad = parts.clone();
-            bad[at] = r.read_tlv().unwrap();
-            assert!(decode_record(rebuilt(&bad)).is_err(), "count {count}");
-        }
-        // Both types are critical: a reader that does not know them refuses
-        // the record rather than pass over them.
-        assert_eq!(tlv::GROUP % 2, 1);
-        assert_eq!(tlv::GROUP_COUNT % 2, 1);
-    }
-
-    #[test]
     fn a_versions_parents_carry_their_tips_digests_and_its_rule_parses_back() {
         let tip = |key: &str, seq: u64| crate::VersionId {
             writer: Writer::new(n(key)),
@@ -4404,7 +4280,6 @@ mod tests {
             seal: Seal { any_of: Vec::new() },
             keep: Keep::Forever,
             dated: Timestamp(5),
-            group: None,
             rule: Some(n("/ndf/merge/element/v=1")),
             fields: Content::new(),
             op: Bytes::from_static(b"op"),
@@ -4449,7 +4324,6 @@ mod tests {
             seal: Seal { any_of: Vec::new() },
             keep: Keep::Forever,
             dated: Timestamp(5),
-            group: None,
             rule: None,
             fields: Content::new(),
             op: Bytes::new(),
@@ -4531,7 +4405,6 @@ mod tests {
             seal: Seal { any_of: Vec::new() },
             keep: Keep::Until(Timestamp(1_000_000)),
             dated: Timestamp(5),
-            group: None,
             rule: None,
             fields: Content::new(),
             op: Bytes::new(),

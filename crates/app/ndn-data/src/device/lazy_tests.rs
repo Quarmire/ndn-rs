@@ -1,6 +1,5 @@
 //! A merge collection's state built lazily from its newest checkpoint after
-//! a restart (spec §5.2, case l1), and an incomplete group's members held in
-//! the store rather than in memory (spec §5.5).
+//! a restart (spec §5.2, case l1).
 
 use std::sync::atomic::AtomicUsize;
 
@@ -450,117 +449,6 @@ async fn a_folder_watch_builds_only_the_collections_holding_versions_past_its_fr
     dev.shutdown();
 }
 
-/// A version of Bob's in `c` at `seq`, of `group`.
-fn bobs(c: &Name, seq: u64, group: Group) -> test_kit::Made {
-    test_kit::version("/bob/phone", c, seq, &[], Some(group))
-}
-
-#[tokio::test]
-async fn an_incomplete_groups_members_wait_in_the_store_not_in_memory() {
-    let dev = test_kit::device().await;
-    let cs: Vec<Name> = (0..3)
-        .map(|i| n(&format!("/alice/32=data/trip/day{i}")))
-        .collect();
-    for c in &cs {
-        dev.share(c, test_kit::log_share()).await.unwrap();
-    }
-    let group = Group { id: 5, count: 3 };
-    let members: Vec<_> = cs
-        .iter()
-        .enumerate()
-        .map(|(i, c)| bobs(c, 5 + i as u64, group))
-        .collect();
-    for m in &members[..2] {
-        give(&dev, m);
-    }
-    {
-        let st = dev.inner.st.lock();
-        for (c, m) in cs.iter().zip(&members[..2]) {
-            let coll = &st.colls[c];
-            let id = test_kit::id("/bob/phone", parse_log_name(&m.name).unwrap().seq);
-            assert!(
-                coll.parked.contains_key(&id) && !coll.versions.contains_key(&id),
-                "a member of an incomplete group is not in memory"
-            );
-            assert!(
-                st.store.get(&parked_name(&m.name)).is_some(),
-                "it is in the store"
-            );
-            assert!(
-                coll.not_counted_list().iter().any(|(x, why)| *x == id
-                    && matches!(why, NotCounted::Waits(w) if w.contains("group incomplete"))),
-                "and listed not counted, with why"
-            );
-        }
-    }
-    give(&dev, &members[2]);
-    let st = dev.inner.st.lock();
-    for (c, m) in cs.iter().zip(&members) {
-        let id = test_kit::id("/bob/phone", parse_log_name(&m.name).unwrap().seq);
-        let coll = &st.colls[c];
-        assert!(coll.parked.is_empty(), "complete, nothing stays parked");
-        assert!(
-            coll.at().contains(&id),
-            "every member counts once the group is complete"
-        );
-        assert!(st.store.get(&parked_name(&m.name)).is_none());
-    }
-    drop(st);
-    dev.shutdown();
-}
-
-#[tokio::test]
-async fn a_parked_member_and_its_equivocation_outlive_a_restart() {
-    let keys = Arc::new(SecurityManager::new());
-    keys.generate_ed25519(n("/alice/laptop/KEY/1")).unwrap();
-    let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-    let calls = Arc::new(Calls::default());
-    let (plan, budget, list) = (
-        n("/alice/32=data/trip/plan"),
-        n("/alice/32=data/trip/budget"),
-        n("/alice/32=data/home/list"),
-    );
-    let dev = start(&keys, &store, &calls).await;
-    for c in [&plan, &budget, &list] {
-        dev.share(c, test_kit::log_share()).await.unwrap();
-    }
-    let group = Group { id: 5, count: 2 };
-    let (a, b) = (bobs(&plan, 5, group), bobs(&budget, 6, group));
-    // Bob's second entry at seq 5, in another folder: equivocation.
-    let twin = test_kit::version("/bob/phone", &list, 5, &[], None);
-    give(&dev, &a);
-    give(&dev, &twin);
-    let five = test_kit::id("/bob/phone", 5);
-    assert!(dev.inner.st.lock().colls[&plan].parked.contains_key(&five));
-    dev.shutdown();
-    drop(dev);
-
-    // Nothing reaches the restarted device but the group's other member.
-    let dev = start(&keys, &store, &calls).await;
-    give(&dev, &b);
-    assert!(
-        test_kit::counts(&dev, &plan, &five)
-            && test_kit::counts(&dev, &budget, &test_kit::id("/bob/phone", 6)),
-        "the member parked before the restart is still held: its group completes without it \
-         being fetched again"
-    );
-    let mut changes = dev.watch(&list, &Frontier::new()).await.unwrap();
-    let seen = test_kit::drain(&mut changes).await;
-    // Which of the two was seen first depends on the order they were read
-    // back in; both are reported.
-    let pair = BTreeSet::from([a.name.clone(), twin.name.clone()]);
-    assert!(
-        seen.iter().any(|c| matches!(
-            c,
-            Change::Equivocation { collection, first, second }
-                if *collection == list
-                    && BTreeSet::from([first.name().clone(), second.name().clone()]) == pair
-        )),
-        "the equivocation is still reported after the restart: {seen:?}"
-    );
-    dev.shutdown();
-}
-
 #[tokio::test]
 async fn two_packets_at_one_name_stay_evidence_across_a_restart() {
     let keys = Arc::new(SecurityManager::new());
@@ -571,8 +459,8 @@ async fn two_packets_at_one_name_stay_evidence_across_a_restart() {
     let dev = start(&keys, &store, &calls).await;
     dev.share(&plan, test_kit::log_share()).await.unwrap();
     // Bob signs two different packets under one name.
-    let one = test_kit::version("/bob/phone", &plan, 7, &[], None);
-    let other = test_kit::version("/bob/phone", &plan, 7, &[("/bob/phone", 3)], None);
+    let one = test_kit::version("/bob/phone", &plan, 7, &[]);
+    let other = test_kit::version("/bob/phone", &plan, 7, &[("/bob/phone", 3)]);
     assert_eq!(one.name, other.name);
     assert_ne!(one.packet, other.packet);
     let mut changes = dev.watch(&plan, &Frontier::new()).await.unwrap();

@@ -195,7 +195,6 @@ fn version(device: &Name, c: &Name, seq: u64, sealed: Option<(&Epoch, &ContentKe
         seal: Seal { any_of: Vec::new() },
         keep: Keep::Forever,
         dated: Timestamp(1),
-        group: None,
         rule: None,
         fields,
         op: Bytes::new(),
@@ -693,12 +692,6 @@ async fn an_owner_device_not_synced_signs_no_default_record() {
     knows(&dev, "/alice/phone", 3, 0);
     let head = dev.inner.st.lock().head;
     not_ready(dev.put(&plan(), reading(1), options()).await.unwrap_err());
-    assert_eq!(dev.inner.st.lock().head, head, "no record signed");
-    not_ready(
-        dev.put_group(vec![(plan(), Edit::Fields(reading(1)))], options())
-            .await
-            .unwrap_err(),
-    );
     assert_eq!(dev.inner.st.lock().head, head, "no record signed");
     // Synced, the collection is created.
     synced(&dev, "/alice/phone");
@@ -1369,11 +1362,11 @@ const LOCAL: Duration = Duration::from_millis(5);
 /// namespace whose summary nothing it reaches ever answers. While the phone
 /// is not walked toward the folder, a put into a collection new to the
 /// laptop answers `NotReady` at once, since the phone may hold a narrower
-/// record of the collection's own (spec §15, 2). Once it was walked, a put,
-/// a `put_op` and a group of twelve into collections new to it, all under a
-/// held folder record, inherit that record and return at once (spec §15, 1):
-/// none looks at the phone first, so none costs the first-look time, and
-/// none signs a members record of its own.
+/// record of the collection's own (spec §15, 2). Once it was walked, a put
+/// and a `put_op` into collections new to it, both under a held folder
+/// record, inherit that record and return at once (spec §15, 1): neither
+/// looks at the phone first, so neither costs the first-look time, and
+/// neither signs a members record of its own.
 #[tokio::test(start_paused = true)]
 async fn a_new_collection_under_a_held_folder_record_is_put_without_waiting_for_a_device_that_cannot_be_reached()
  {
@@ -1390,25 +1383,11 @@ async fn a_new_collection_under_a_held_folder_record_is_put_without_waiting_for_
         .unwrap();
     hears(&dev, "/alice/phone").await;
 
-    let items: Vec<(Name, Edit)> = (0..12)
-        .map(|i| {
-            (
-                folder().append(format!("paste{i}")),
-                Edit::Fields(reading(i)),
-            )
-        })
-        .collect();
     let (refused, spent) = took(dev.put(&plan(), reading(1), options())).await;
     assert!(
         matches!(refused, Err(DataError::NotReady { .. })) && spent < LOCAL,
         "a put inheriting the folder's record, the phone not walked, answered {refused:?} after \
          {spent:?}, not NotReady at once"
-    );
-    let (refused, spent) = took(dev.put_group(items.clone(), options())).await;
-    assert!(
-        matches!(refused, Err(DataError::NotReady { .. })) && spent < LOCAL,
-        "a group inheriting the folder's record, the phone not walked, answered {refused:?} \
-         after {spent:?}, not NotReady at once"
     );
     walked(&dev, "/alice/phone", &[folder(), ops.clone()]);
 
@@ -1431,17 +1410,9 @@ async fn a_new_collection_under_a_held_folder_record_is_put_without_waiting_for_
         "a put_op into a new collection took {spent:?}"
     );
 
-    let (group, spent) = took(dev.put_group(items.clone(), options())).await;
-    assert_eq!(group.unwrap().len(), 12);
-    assert!(
-        spent < LOCAL,
-        "a group of twelve new collections took {spent:?}"
-    );
-
     // Each is written under the record of its folder: none signed its own.
     let st = dev.inner.st.lock();
-    let mut all = vec![plan(), a];
-    all.extend(items.into_iter().map(|(c, _)| c));
+    let all = vec![plan(), a];
     for c in &all {
         assert!(
             st.colls[c].line.own.is_none(),

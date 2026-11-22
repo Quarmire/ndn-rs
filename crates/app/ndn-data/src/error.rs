@@ -120,14 +120,6 @@ pub enum Refusal {
         /// The rule's reason.
         why: String,
     },
-    /// A version of its group is refused for good, or the group is
-    /// malformed, so no version of the group counts (spec §5.5).
-    Group {
-        /// The member refused (or that makes the group malformed).
-        member: Name,
-        /// Why.
-        why: String,
-    },
     /// One of its parents names a packet this reader cannot take as what
     /// it was made over (spec §5.2): the packet held at that writer and seq
     /// has another digest (its writer named a packet that does not exist,
@@ -221,12 +213,6 @@ impl std::fmt::Display for Refusal {
                 f,
                 "the collection's merge rule refuses its operation ({why}); its writer writes \
                  an operation the rule takes"
-            ),
-            Refusal::Group { member, why } => write!(
-                f,
-                "it was signed in one group with {member}, which is refused ({why}), so no \
-                 version of the group counts; its writer writes the group again without what is \
-                 refused"
             ),
             Refusal::Suspected { key, since } => write!(
                 f,
@@ -472,7 +458,6 @@ impl DataError {
                 Refusal::Unsealed
                 | Refusal::NotInline
                 | Refusal::Rule { .. }
-                | Refusal::Group { .. }
                 | Refusal::Parent { .. }
                 | Refusal::OtherRule { .. } => NextStep::None,
             },

@@ -11,7 +11,7 @@ use crate::layer::Share;
 use ndn_security::TrustSchema;
 use ndn_sync::store::BackendStore;
 use ndn_sync::{MemoryStore, StoreOp};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicUsize;
 
 /// A store that counts how it is written: single writes, and batches.
@@ -93,15 +93,12 @@ impl DataStore for Counting {
 enum Load {
     /// One `put`.
     Put,
-    /// One `put_group` of this many items.
-    Group(usize),
 }
 
 impl Load {
     fn label(self) -> String {
         match self {
             Load::Put => "put".into(),
-            Load::Group(k) => format!("put_group({k})"),
         }
     }
 
@@ -111,23 +108,11 @@ impl Load {
         let content = |i: usize| Content::new().with("k", format!("{i:08}"));
         match self {
             Load::Put => dev.put(&c, content(i), options()).await.unwrap().seq.0,
-            Load::Group(k) => {
-                let items = (0..k)
-                    .map(|j| {
-                        (
-                            n(&format!("/alice/32=data/grp/c{j}")),
-                            Edit::Fields(content(i)),
-                        )
-                    })
-                    .collect();
-                let ids = dev.put_group(items, options()).await.unwrap();
-                ids.iter().map(|id| id.seq.0).max().unwrap()
-            }
         }
     }
 }
 
-/// How long `put` and `put_group` take on each engine, how many store calls
+/// How long `put` takes on each engine, how many store calls
 /// they make, and how long until what they wrote is published — measured,
 /// never asserted. Two loads: one operation at a time, each waiting until
 /// published (a flush per operation), and operations back to back (the
@@ -139,11 +124,7 @@ impl Load {
 async fn batching_latency() {
     let c = collection();
     for engine in [Some(Engine::Fjall), Some(Engine::Redb), None] {
-        for (load, ops) in [
-            (Load::Put, 2000),
-            (Load::Group(10), 400),
-            (Load::Group(100), 40),
-        ] {
+        for (load, ops) in [(Load::Put, 2000)] {
             let dir = tempfile::tempdir().unwrap();
             // `None`: the store's cost is nothing, what a put costs besides it.
             let label = engine.map_or("memory", Engine::label);
@@ -168,7 +149,7 @@ async fn batching_latency() {
             )
             .await
             .unwrap();
-            // The first group makes each collection's record.
+            // The first put makes the collection's record.
             let warm = load.run(&dev, 0).await;
             assert!(dev.inner.published(warm).await);
 
@@ -246,236 +227,13 @@ async fn batching_latency() {
     }
 }
 
-// ---- a kill in the middle of a put_group, on a real engine -------------------------------------
-
-/// The environment variable that makes [`batch_kill_child`] run:
-/// `<engine>|<directory>`.
-const KILL_ROLE: &str = "NDN_DATA_BATCH_KILL";
-
-/// Items of a group of the kill case; each entry is several pieces, so that
-/// writing a group takes a good part of the time putting it does.
-const GROUP: usize = 20;
-
-fn big_group(i: usize) -> Vec<(Name, Edit)> {
-    (0..GROUP)
-        .map(|j| {
-            (
-                n(&format!("/alice/32=data/big/c{j}")),
-                Edit::Fields(Content::new().with("blob", format!("{i:06}{}", "x".repeat(60_000)))),
-            )
-        })
-        .collect()
-}
-
+/// The store of `engine`, opened in `dir`.
 fn open_engine(engine: Engine, dir: &std::path::Path) -> Arc<dyn DataStore> {
     let live = engine.live(dir);
     match engine {
         Engine::Fjall => Arc::new(BackendStore::open_fjall(&live).unwrap()),
         Engine::Redb => Arc::new(BackendStore::open_redb(&live).unwrap()),
     }
-}
-
-/// One run of a device in a process of its own, putting large groups one
-/// after the other, each announced before and reported after it returned.
-/// Nothing when no case started it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "a child process of the kill case; it runs only when it starts it"]
-async fn batch_kill_child() {
-    use std::io::Write;
-    let Ok(role) = std::env::var(KILL_ROLE) else {
-        return;
-    };
-    let (engine, dir) = role.split_once('|').expect("<engine>|<directory>");
-    let engine = match engine {
-        "fjall" => Engine::Fjall,
-        "redb" => Engine::Redb,
-        other => panic!("{KILL_ROLE} names engine {other:?}; it is fjall or redb"),
-    };
-    let dev = laptop(open_engine(engine, std::path::Path::new(dir))).await;
-    let say = |line: String| {
-        println!("{line}");
-        std::io::stdout().flush().unwrap();
-    };
-    for i in 0.. {
-        say(format!("start {i}"));
-        dev.put_group(big_group(i), options()).await.unwrap();
-        say(format!("done {i}"));
-    }
-}
-
-/// The groups of `store`'s own log: for each group id, how many of its members
-/// the store holds and how many it has.
-fn groups_held(store: &dyn DataStore) -> BTreeMap<u64, (usize, u32)> {
-    let mut groups: BTreeMap<u64, (usize, u32)> = BTreeMap::new();
-    for (name, wire) in store.scan_under(&n("/alice/laptop"), 0) {
-        let Some(l) = parse_log_name(&name) else {
-            continue;
-        };
-        if l.subject
-            .is_none_or(|c| !c.has_prefix(&n("/alice/32=data/big")))
-        {
-            continue;
-        }
-        let Some(Record::Version(body)) = Data::decode(wire).ok().and_then(|d| {
-            d.content()
-                .and_then(|c| wire::decode_record(c.clone()).ok())
-        }) else {
-            continue;
-        };
-        if let Some(g) = body.group {
-            let held = groups.entry(g.id).or_insert((0, g.count));
-            held.0 += 1;
-        }
-    }
-    groups
-}
-
-fn a_kill_in_the_middle_of_a_put_group_leaves_all_of_it_or_none(engine: Engine) {
-    use std::io::{BufRead, BufReader};
-    let mut rng = std::hash::BuildHasher::hash_one(
-        &std::collections::hash_map::RandomState::new(),
-        engine.label(),
-    );
-    // A fixed seed would repeat the same cuts: the moment of the kill is the
-    // point, so it varies; the case's checks hold at every moment.
-    let mut next = move || {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        (rng % 1000) as f64 / 1000.0
-    };
-    let mut mid_batch = 0;
-    for round in 0..8 {
-        let dir = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "device::batching_tests::batch_kill_child",
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(
-                KILL_ROLE,
-                format!("{}|{}", engine.label(), dir.path().display()),
-            )
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        // How long a group takes, from the second.
-        let (mut lines, mut began) = (Vec::new(), None);
-        let took = loop {
-            let line = rx
-                .recv_timeout(Duration::from_secs(120))
-                .unwrap_or_else(|e| {
-                    let _ = child.kill();
-                    panic!("the {} child said nothing for 120 s ({e})", engine.label())
-                });
-            if line == "start 1" {
-                began = Some(std::time::Instant::now());
-            }
-            if line == "done 1" {
-                lines.push(line);
-                break began.expect("start 1 came first").elapsed();
-            }
-            if line.starts_with("start ") || line.starts_with("done ") {
-                lines.push(line);
-            }
-        };
-        // A group after them is under way; cut it somewhere inside.
-        std::thread::sleep(took.mul_f64(next() * 2.0));
-        child.kill().unwrap();
-        child.wait().unwrap();
-        lines.extend(rx.iter());
-        let number = |what: &str| {
-            lines
-                .iter()
-                .filter_map(|l| l.strip_prefix(what)?.parse::<usize>().ok())
-                .max()
-                .unwrap()
-        };
-        let (started, done) = (number("start "), number("done "));
-        if started > done {
-            mid_batch += 1;
-        }
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let store = open_engine(engine, dir.path());
-            let groups = groups_held(store.as_ref());
-            for (id, (held, count)) in &groups {
-                assert_eq!(
-                    *held,
-                    *count as usize,
-                    "{} round {round}: of the group at seq {id} ({started} groups started, {done} \
-                     reported done) the store holds {held} of {count} versions after kill -9: a \
-                     version is there without the rest of its group",
-                    engine.label()
-                );
-            }
-            assert!(
-                groups.len() > done,
-                "{} round {round}: {} groups reported done before kill -9, the store holds {}",
-                engine.label(),
-                done + 1,
-                groups.len()
-            );
-            // And the device starts on it and goes on, above what the store holds.
-            let top = store
-                .scan_under(&n("/alice/laptop"), 0)
-                .iter()
-                .filter_map(|(name, _)| parse_log_name(name).map(|l| l.seq))
-                .max()
-                .unwrap();
-            let dev = laptop(Arc::clone(&store)).await;
-            let next = dev
-                .put(
-                    // (A new run has a recipient key of its own here, so a key the
-                    // killed run made for a sealed collection is not one it can open.)
-                    &n("/alice/32=data/after"),
-                    Content::new().with("k", "after"),
-                    options(),
-                )
-                .await
-                .unwrap();
-            assert!(
-                next.seq.0 > top,
-                "the restarted device signed at seq {}, not above the {top} its store holds",
-                next.seq.0
-            );
-            dev.shutdown();
-        });
-    }
-    assert!(
-        mid_batch >= 1,
-        "{}: none of eight kills landed while a group was being put, so the case shows nothing",
-        engine.label()
-    );
-}
-
-#[test]
-fn a_kill_in_the_middle_of_a_put_group_leaves_all_of_it_or_none_on_fjall() {
-    a_kill_in_the_middle_of_a_put_group_leaves_all_of_it_or_none(Engine::Fjall);
-}
-
-#[test]
-fn a_kill_in_the_middle_of_a_put_group_leaves_all_of_it_or_none_on_redb() {
-    a_kill_in_the_middle_of_a_put_group_leaves_all_of_it_or_none(Engine::Redb);
 }
 
 // ---- what the store is asked ------------------------------------------------------------------
@@ -657,88 +415,6 @@ async fn a_put_reaches_the_store_as_one_batch_markers_first_the_entry_last() {
                 .iter()
                 .all(|p| *p > at(ops, &written_name(&entry)).max(at(ops, &verified_name(&entry)))),
         "markers, then pieces, then the entry: {ops:?}"
-    );
-    dev.shutdown();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_put_group_reaches_the_store_as_one_batch() {
-    let store = Recording::over(Arc::new(MemoryStore::new()));
-    let dev = laptop(Arc::clone(&store) as Arc<dyn DataStore>).await;
-    let items = |tag: &str| -> Vec<(Name, Edit)> {
-        (0..6)
-            .map(|j| {
-                (
-                    n(&format!("/alice/32=data/grp/c{j}")),
-                    Edit::Fields(Content::new().with("t", format!("{tag} {j}"))),
-                )
-            })
-            .collect()
-    };
-    // The first group makes each collection's record too: the records and the
-    // versions are one batch.
-    let mark = store.mark();
-    let ids = dev.put_group(items("first"), options()).await.unwrap();
-    let calls = store.since(mark);
-    let entries: Vec<Name> = ids
-        .iter()
-        .enumerate()
-        .map(|(j, id)| {
-            let c = n(&format!("/alice/32=data/grp/c{j}"));
-            log_name(dev.name(), Some(&c), id.seq.0)
-        })
-        .collect();
-    let first = the_batch(&calls, &entries[0]);
-    for e in &entries {
-        at(first, e);
-        at(first, &written_name(e));
-        let single = calls
-            .iter()
-            .any(|c| matches!(c, Call::Insert(n) | Call::Remove(n) if about(e, n)));
-        assert!(
-            !single,
-            "{e} was written on its own, not in the group's batch"
-        );
-    }
-    // A record's entry is in the batch twice (the same name and bytes), so the
-    // names are counted once.
-    let log_entries: BTreeSet<String> = first
-        .iter()
-        .filter_map(|op| match op {
-            StoreOp::Insert(n, _) if n.has_prefix(dev.name()) => Some(n.to_string()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        log_entries.len(),
-        2 * entries.len(),
-        "the group's versions and the records the first group makes are one batch: {log_entries:#?}"
-    );
-
-    // A second group: the six versions, with their markers, one batch.
-    let mark = store.mark();
-    let ids = dev.put_group(items("second"), options()).await.unwrap();
-    let calls = store.since(mark);
-    let entries: Vec<Name> = ids
-        .iter()
-        .enumerate()
-        .map(|(j, id)| {
-            log_name(
-                dev.name(),
-                Some(&n(&format!("/alice/32=data/grp/c{j}"))),
-                id.seq.0,
-            )
-        })
-        .collect();
-    let batch = the_batch(&calls, &entries[0]);
-    for e in &entries {
-        assert!(at(batch, &written_name(e)) < at(batch, e));
-        assert!(at(batch, &verified_name(e)) < at(batch, e));
-    }
-    let ordered: Vec<usize> = entries.iter().map(|e| at(batch, e)).collect();
-    assert!(
-        ordered.windows(2).all(|w| w[0] < w[1]),
-        "the group's members are in seq order in its batch: {ordered:?}"
     );
     dev.shutdown();
 }

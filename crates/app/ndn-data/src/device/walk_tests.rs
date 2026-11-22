@@ -2219,12 +2219,6 @@ async fn a_put_inheriting_a_folder_record_is_not_ready_until_the_phone_was_walke
         head,
         "nothing is signed under the folder's record meanwhile"
     );
-    // The group put too.
-    let grouped = me.put_group(vec![(c.clone(), Edit::Fields(note(1)))], options.clone());
-    assert!(
-        matches!(grouped.await, Err(DataError::NotReady { .. })),
-        "a put_group inheriting the folder's record is NotReady alike"
-    );
 
     // The phone is reached again; the look, in the background, ends.
     net.losing.store(false, Ordering::Relaxed);

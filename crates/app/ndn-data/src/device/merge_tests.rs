@@ -359,7 +359,6 @@ pub(super) fn body_in(
         seal: Seal { any_of: Vec::new() },
         keep: Keep::Forever,
         dated: Timestamp(1),
-        group: None,
         rule: Some(n(rule)),
         fields: Content::new(),
         op,

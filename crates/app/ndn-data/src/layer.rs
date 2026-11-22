@@ -27,16 +27,6 @@ use crate::version::{
 /// (spec §5.3). A day.
 pub const BATCH_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// One version of a [`put_group`](DataLayer::put_group).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Edit {
-    /// Fields, as [`put`](DataLayer::put) takes them.
-    Fields(Content),
-    /// The operation the app built, as [`put_op`](DataLayer::put_op) takes
-    /// it (merge collections only).
-    Op(bytes::Bytes),
-}
-
 /// The options of a [`put`](DataLayer::put).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PutOptions {
@@ -60,15 +50,12 @@ pub struct PutOptions {
 /// `Display` is the bare reason.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NotCounted {
-    /// The layer's own wait: its group is incomplete ("group incomplete: 1
-    /// of 2"), not readable here, or waits for its readers' epoch, or a
-    /// basis or pieces are still arriving. It ends: the version then counts
-    /// and [`Change::Counted`] follows.
+    /// The layer's own wait: a basis or the pieces of the version are still
+    /// arriving. It ends: the version then counts and [`Change::Counted`]
+    /// follows.
     Waits(String),
-    /// A rule's own exclusion (its [`Counting::NotCounted`]), an apply that
-    /// failed, a group refused or held back by a member its rule excludes,
-    /// or a group with a member kept otherwise than until pruned: it does
-    /// not end by waiting.
+    /// A rule's own exclusion (its [`Counting::NotCounted`]), or an apply
+    /// that failed: it does not end by waiting.
     ///
     /// [`Counting::NotCounted`]: crate::merge::Counting::NotCounted
     Excluded(String),
@@ -104,8 +91,7 @@ pub struct State {
     pub value: Value,
     /// Versions of the collection held here that are not in `value`, with
     /// why (sorted by id): the rule's `NotCounted` (inside `at`), as
-    /// [`NotCounted::Excluded`], and members of incomplete or unreadable
-    /// groups, as [`NotCounted::Waits`].
+    /// [`NotCounted::Excluded`].
     pub not_counted: Vec<(VersionId, NotCounted)>,
 }
 
@@ -261,10 +247,9 @@ pub enum Change {
         second: Equivocal,
     },
     /// A held, verified version that is not in the state: the rule's
-    /// [`NotCounted`](crate::merge::Counting::NotCounted), or its group is
-    /// incomplete or not readable here. Shown, never dropped. A version
-    /// whose reason moves from a [`NotCounted::Waits`] to an
-    /// [`NotCounted::Excluded`] (or back) is told again.
+    /// [`NotCounted`](crate::merge::Counting::NotCounted). Shown, never
+    /// dropped. A version whose reason moves from a [`NotCounted::Waits`] to
+    /// an [`NotCounted::Excluded`] (or back) is told again.
     NotCounted {
         /// The version's collection.
         collection: Name,
@@ -566,24 +551,6 @@ pub trait DataLayer: Send + Sync {
         op: bytes::Bytes,
         options: PutOptions,
     ) -> Result<VersionId, DataError>;
-
-    /// `put` several versions as one group, counted all or none (spec
-    /// §5.5): one version per item, each in its own collection, all
-    /// collections of one folder (the same parent name), signed under one
-    /// lock at consecutive seqs of this device's log. A reader counts them
-    /// only once it holds and reads all of them, and none of them when any
-    /// is refused. Refused — with nothing written — when there are no items
-    /// or more than [`GROUP_MAX`](crate::GROUP_MAX), a collection comes
-    /// twice, the collections are not of one folder, their records in force
-    /// list different readers, `options.batch` is set, or an item's rule
-    /// refuses its operation ([`DataError::BadRequest`]); an item's rule
-    /// unknown here ([`DataError::RuleUnknown`]); a collection not writable
-    /// here (that collection's own error). The ids, in item order.
-    async fn put_group(
-        &self,
-        items: Vec<(Name, Edit)>,
-        options: PutOptions,
-    ) -> Result<Vec<VersionId>, DataError>;
 
     /// `watch(collection | folder, since F) → summary, new versions…`.
     ///

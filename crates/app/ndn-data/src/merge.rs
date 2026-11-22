@@ -161,8 +161,7 @@ pub trait MergeState: Send {
     /// the state met here; the state MUST be left unchanged, and the layer
     /// keeps the version applied and not counted with this reason (never
     /// refused: the state is others' doing, so nothing apply answers
-    /// withdraws a version or its group). An own operation that errs is not
-    /// written.
+    /// withdraws a version). An own operation that errs is not written.
     ///
     /// A checkpoint's application yields the state of its past and itself,
     /// plus whatever concurrent versions were applied, whichever subset of
@@ -212,8 +211,8 @@ pub trait MergeState: Send {
     }
 
     /// The merged value, leaving out `excluded`: applied versions the
-    /// layer holds back (members of a group waiting on another member,
-    /// spec §5.5). They stay applied — the rule's counting of every other
+    /// layer holds back (versions only checkpoints not counted cover, spec
+    /// §5.1). They stay applied — the rule's counting of every other
     /// version still sees them — and are only kept out of what is shown.
     fn value(&self, excluded: &BTreeSet<VersionId>) -> Value;
 }

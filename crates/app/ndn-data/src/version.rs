@@ -333,9 +333,6 @@ pub struct Version {
     pub keep: Keep,
     /// The date its writer's clock showed; display only.
     pub dated: Timestamp,
-    /// The group it belongs to, if its writer signed it as one of several
-    /// versions counted all or none (spec §5.5).
-    pub group: Option<Group>,
     /// The merge rule its writer made its operation for, by exact name
     /// (spec §5.1); `None` under the log and one-key rules. A merge
     /// collection applies it only under that rule.
@@ -353,20 +350,4 @@ pub struct Version {
     /// carried in pieces and not read whole ([`Payload::Large`]; a `get` of
     /// the version's name reads it whole and fills it).
     pub op: Option<bytes::Bytes>,
-}
-
-/// The most versions one group holds (spec §5.5): as many seqs as a summary
-/// node lists. A reader keeps an incomplete group's members in its store,
-/// not in memory, so a stalled group costs it no memory per member.
-pub const GROUP_MAX: u32 = 65_536;
-
-/// A group of versions one writer signs to be counted all or none (spec
-/// §5.5): its writer's versions at the consecutive seqs `id .. id + count`,
-/// one per collection, all in collections of one folder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Group {
-    /// The seq of the group's first version in its writer's log.
-    pub id: u64,
-    /// How many versions the group holds, `1 ..= GROUP_MAX`.
-    pub count: u32,
 }

@@ -130,14 +130,8 @@ pub(super) fn made(device: &str, c: &Name, seq: u64, record: Record) -> Made {
     }
 }
 
-/// Version `seq` of `device` in `c`, naming `parents`, of `group`.
-pub(super) fn version(
-    device: &str,
-    c: &Name,
-    seq: u64,
-    parents: &[(&str, u64)],
-    group: Option<Group>,
-) -> Made {
+/// Version `seq` of `device` in `c`, naming `parents`.
+pub(super) fn version(device: &str, c: &Name, seq: u64, parents: &[(&str, u64)]) -> Made {
     let body = VersionBody {
         collection: c.clone(),
         parents: parents.iter().map(|(d, s)| (id(d, *s), None)).collect(),
@@ -148,7 +142,6 @@ pub(super) fn version(
         seal: Seal { any_of: Vec::new() },
         keep: Keep::Forever,
         dated: Timestamp(1),
-        group,
         rule: None,
         fields: Content::new().with("t", format!("{device} {seq}")),
         op: Bytes::new(),
@@ -203,5 +196,3 @@ pub(super) async fn drain(changes: &mut Changes) -> Vec<Change> {
     }
     out
 }
-
-pub(super) const PAIR: Group = Group { id: 10, count: 2 };

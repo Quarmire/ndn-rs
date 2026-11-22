@@ -2,9 +2,7 @@
 //! created after the watch began included, every kind of change, each tagged
 //! with its collection, and no version twice.
 
-use super::test_kit::{
-    PAIR, budget, device, device_tuned, drain, give, id, log_share, n, plan, version,
-};
+use super::test_kit::{budget, device, device_tuned, drain, give, id, log_share, n, plan, version};
 use super::*;
 use crate::layer::{Share, ShareChange, Sharing};
 
@@ -38,7 +36,7 @@ async fn a_folder_watch_reports_every_kind_for_a_collection_created_after_it_beg
 
     // A collection nobody wrote before the watch began: its first version
     // comes on the same stream, tagged with it.
-    let first = version("/bob/laptop", &later(), 20, &[], None);
+    let first = version("/bob/laptop", &later(), 20, &[]);
     give(&dev, &first);
     let seen = drain(&mut changes).await;
     let v = seen
@@ -47,32 +45,9 @@ async fn a_folder_watch_reports_every_kind_for_a_collection_created_after_it_beg
         .expect("the new collection's version is delivered");
     assert_eq!(v.collection(), &later());
 
-    // A group member of the new collection waits for its other member:
-    // reported not counted, then counted, each tagged with its collection.
-    let a = version("/carol/laptop", &later(), 10, &[], Some(PAIR));
-    let b = version("/carol/laptop", &plan(), 11, &[], Some(PAIR));
-    give(&dev, &a);
-    let seen = drain(&mut changes).await;
-    assert!(
-        seen.iter()
-            .any(|c| matches!(c, Change::NotCounted { collection, id: i, .. }
-            if *collection == later() && *i == id("/carol/laptop", 10))),
-        "{seen:?}"
-    );
-    give(&dev, &b);
-    let seen = drain(&mut changes).await;
-    assert!(
-        seen.iter()
-            .any(|c| matches!(c, Change::Counted { collection, id: i }
-            if *collection == later() && *i == id("/carol/laptop", 10))),
-        "{seen:?}"
-    );
-    assert_eq!(delivered(&seen, &id("/carol/laptop", 10)), 1);
-    assert_eq!(delivered(&seen, &id("/carol/laptop", 11)), 1);
-
     // Bob signs a second entry at seq 20, in another collection under the
     // folder: told once for each collection, tagged with each.
-    let second = version("/bob/laptop", &budget(), 20, &[], None);
+    let second = version("/bob/laptop", &budget(), 20, &[]);
     give(&dev, &second);
     let seen = drain(&mut changes).await;
     let mut told: Vec<Name> = seen
@@ -91,31 +66,9 @@ async fn a_folder_watch_reports_every_kind_for_a_collection_created_after_it_beg
 }
 
 #[tokio::test]
-async fn a_watch_lists_a_member_waiting_for_its_group_as_not_counted() {
-    let dev = device().await;
-    let a = version("/bob/laptop", &plan(), 10, &[], Some(PAIR));
-    give(&dev, &a);
-    let mut changes = dev.watch(&trip(), &Frontier::new()).await.unwrap();
-    let seen = drain(&mut changes).await;
-    assert!(
-        seen.iter().any(
-            |c| matches!(c, Change::NotCounted { collection, id: i, why: NotCounted::Waits(why) }
-            if *collection == plan() && *i == id("/bob/laptop", 10) && why.starts_with("group incomplete"))
-        ),
-        "the listing shows a held version not counted, with why: {seen:?}"
-    );
-    assert_eq!(
-        delivered(&seen, &id("/bob/laptop", 10)),
-        0,
-        "nor is it shown"
-    );
-    dev.shutdown();
-}
-
-#[tokio::test]
 async fn a_version_waiting_when_the_watch_begins_is_delivered_once_when_it_applies() {
     let dev = device().await;
-    let three = version("/bob/laptop", &plan(), 3, &[("/bob/laptop", 2)], None);
+    let three = version("/bob/laptop", &plan(), 3, &[("/bob/laptop", 2)]);
     give(&dev, &three);
     let mut changes = dev.watch(&trip(), &Frontier::new()).await.unwrap();
     let mut seen = drain(&mut changes).await;
@@ -124,7 +77,7 @@ async fn a_version_waiting_when_the_watch_begins_is_delivered_once_when_it_appli
         0,
         "not applied, so not listed: {seen:?}"
     );
-    give(&dev, &version("/bob/laptop", &plan(), 2, &[], None));
+    give(&dev, &version("/bob/laptop", &plan(), 2, &[]));
     seen.extend(drain(&mut changes).await);
     assert_eq!(delivered(&seen, &id("/bob/laptop", 2)), 1, "{seen:?}");
     assert_eq!(delivered(&seen, &id("/bob/laptop", 3)), 1, "{seen:?}");
@@ -143,7 +96,6 @@ fn saying(device: &str, c: &Name, seq: u64, text: &str) -> super::test_kit::Made
         seal: Seal { any_of: Vec::new() },
         keep: Keep::Forever,
         dated: Timestamp(1),
-        group: None,
         rule: None,
         fields: Content::new().with("t", text.to_owned()),
         op: Bytes::new(),
@@ -206,7 +158,7 @@ async fn a_watcher_that_falls_behind_is_told_it_lagged_never_queued_without_boun
     let listed = drain(&mut changes).await.len();
     // Many more changes than the queue holds, none read meanwhile.
     for seq in 1..=20 {
-        give(&dev, &version("/bob/laptop", &plan(), seq, &[], None));
+        give(&dev, &version("/bob/laptop", &plan(), seq, &[]));
     }
     let seen = drain(&mut changes).await;
     assert!(
@@ -218,7 +170,7 @@ async fn a_watcher_that_falls_behind_is_told_it_lagged_never_queued_without_boun
         "the gap is told, after everything delivered before it: {seen:?}"
     );
     // Read empty, the watcher is told what comes next again.
-    give(&dev, &version("/bob/laptop", &plan(), 21, &[], None));
+    give(&dev, &version("/bob/laptop", &plan(), 21, &[]));
     let seen = drain(&mut changes).await;
     assert_eq!(delivered(&seen, &id("/bob/laptop", 21)), 1, "{seen:?}");
     // Watching anew from what it holds lists what it missed.
@@ -242,7 +194,7 @@ async fn an_outside_writer_makes_a_follower_track_only_as_many_collections_as_it
     drain(&mut changes).await;
     let new = |i: u64| n(&format!("/alice/32=data/trip/new{i}"));
     for i in 0..3 {
-        give(&dev, &version("/bob/laptop", &new(i), 30 + i, &[], None));
+        give(&dev, &version("/bob/laptop", &new(i), 30 + i, &[]));
     }
     let seen = drain(&mut changes).await;
     for i in 0..2 {
@@ -271,14 +223,14 @@ async fn an_outside_writer_makes_a_follower_track_only_as_many_collections_as_it
     );
     // The namespace's own devices and collections shared with a record of
     // their own are not counted.
-    give(&dev, &version("/alice/phone", &new(3), 1, &[], None));
-    give(&dev, &version("/bob/laptop", &budget(), 40, &[], None));
+    give(&dev, &version("/alice/phone", &new(3), 1, &[]));
+    give(&dev, &version("/bob/laptop", &budget(), 40, &[]));
     let seen = drain(&mut changes).await;
     assert_eq!(delivered(&seen, &id("/alice/phone", 1)), 1, "{seen:?}");
     assert_eq!(delivered(&seen, &id("/bob/laptop", 40)), 1, "{seen:?}");
     // Followed by its own name, the refused collection is read.
     let mut by_name = dev.watch(&new(2), &Frontier::new()).await.unwrap();
-    give(&dev, &version("/bob/laptop", &new(2), 32, &[], None));
+    give(&dev, &version("/bob/laptop", &new(2), 32, &[]));
     let seen = drain(&mut by_name).await;
     assert_eq!(delivered(&seen, &id("/bob/laptop", 32)), 1, "{seen:?}");
     dev.shutdown();

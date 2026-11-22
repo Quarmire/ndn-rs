@@ -88,7 +88,7 @@ pub use intro::{
     JoinedFolder, Offer, Role,
 };
 pub use layer::{
-    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
+    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Entries, Entry, Equivocal, Got, Hold,
     NotCounted, PutOptions, Share, ShareChange, Sharing, State,
 };
 pub use merge::{
@@ -98,6 +98,6 @@ pub use ndn_foundation_types::{Hash, Name};
 pub use signal::{SignalKey, SignalRefusal, SignalScope, SignalSender};
 pub use statement::{Audit, Breach, Custody, Lease, Prune, Snapshot};
 pub use version::{
-    Audience, BlockEntry, Content, Frontier, GROUP_MAX, Group, Keep, Parents, Payload, Seal, Seq,
-    Timestamp, TypeId, Version, VersionId, Writer,
+    Audience, BlockEntry, Content, Frontier, Keep, Parents, Payload, Seal, Seq, Timestamp, TypeId,
+    Version, VersionId, Writer,
 };
