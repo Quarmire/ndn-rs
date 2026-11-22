@@ -114,7 +114,13 @@ impl CsInsertStage {
                 .and_then(|m| m.freshness_period)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let stale_at = now_ns + freshness_ms * 1_000_000;
+            // No FreshnessPeriod, or a zero one, is stale at once (NFD): never fresh, which
+            // is `stale_at` 0, not the instant of arrival, that a clock stepped back would
+            // make fresh again until it caught up.
+            let stale_at = match freshness_ms {
+                0 => 0,
+                ms => now_ns + ms * 1_000_000,
+            };
 
             // Stamped with the revocation epoch read before validation, so
             // `CsLookupStage` re-checks it once a revoking update has moved
@@ -287,6 +293,49 @@ mod tests {
             ),
             "stale once FreshnessPeriod has elapsed on the runtime clock"
         );
+    }
+
+    /// A Data with no FreshnessPeriod, or a zero one (NFD: stale at once), satisfies no
+    /// MustBeFresh Interest, whatever the clock reads when it asks: a clock stepped back
+    /// after the Data arrived (a day, here) must not make it fresh again, which would
+    /// have a forwarder answer for its application with a packet the application has
+    /// since replaced (a summary root the data layer signs with a zero freshness so
+    /// that discovery always reaches its writer).
+    #[tokio::test]
+    async fn data_with_no_freshness_is_never_fresh_even_if_the_clock_steps_back() {
+        const T: u64 = 200_000_000_000_000;
+        const DAY: u64 = 86_400_000_000_000;
+        for (label, zero) in [("no FreshnessPeriod", None), ("zero", Some(0))] {
+            let name = ndn_packet::name!("/test/fresh/never");
+            let builder = DataBuilder::new(name.clone(), b"x");
+            let builder = match zero {
+                Some(ms) => builder.freshness(std::time::Duration::from_millis(ms)),
+                None => builder,
+            };
+            let wire = builder.sign_sync(SignatureType::DigestSha256, None, |_| {
+                Bytes::from_static(&[0u8; 32])
+            });
+            let data = Data::decode(wire.clone()).unwrap();
+            let mut data_ctx = PacketContext::new(wire, FaceId(0), T);
+            data_ctx.name = Some(Arc::clone(&data.name));
+            data_ctx.packet = DecodedPacket::Data(Box::new(data));
+            data_ctx.verified = true;
+            let (insert, cs) = make_insert_stage();
+            insert.process(data_ctx).await;
+            let lookup = CsLookupStage {
+                cs: cs as Arc<dyn ndn_store::ErasedContentStore>,
+                validator: None,
+            };
+            for (when, arrival) in [("later", T + 1), ("after a day's step back", T - DAY)] {
+                let wire = InterestBuilder::new(name.clone()).must_be_fresh().build();
+                let mut ctx = interest_ctx(wire);
+                ctx.arrival = arrival;
+                assert!(
+                    matches!(lookup.process(ctx).await, Action::Continue(_)),
+                    "Data with {label} satisfies no MustBeFresh Interest, asked {when}"
+                );
+            }
+        }
     }
 
     /// A validator RAN and rejected this Data, so it must not be cached.
