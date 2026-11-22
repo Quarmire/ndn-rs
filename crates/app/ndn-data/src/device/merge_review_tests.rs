@@ -380,13 +380,13 @@ async fn a_device_serves_every_entry_it_holds_of_others_and_nothing_it_refused()
     dev.shutdown();
 }
 
-/// Round-3 review L3 (spec §13.5): a collection this device holds for its
-/// owner serves nothing refused or withdrawn here either — not an outsider's
-/// version, not one its rule refused, not one its trust context withdrew —
-/// while every entry held verified still is; and an ask for a seq it never
-/// held is answered with nothing.
+/// Round-3 review L3 (spec §13.5): a device serves nothing refused or
+/// withdrawn here either — not an outsider's version, not one its rule
+/// refused, not one its trust context withdrew — while every entry held
+/// verified still is; and an ask for a seq it never held is answered with
+/// nothing.
 #[tokio::test]
-async fn a_holder_serves_nothing_of_a_held_collection_it_refused_or_withdrew() {
+async fn a_device_serves_nothing_it_refused_or_withdrew() {
     let dev = device(rules()).await;
     let applied = version("/bob/laptop", 10, &[], edit(None, "applied"));
     let outsider = version("/dave/phone", 2, &[], edit(None, "not a writer"));
@@ -402,16 +402,6 @@ async fn a_holder_serves_nothing_of_a_held_collection_it_refused_or_withdrew() {
     }
     {
         let mut st = dev.inner.st.lock();
-        st.holding.insert(
-            c(),
-            Holding {
-                hold: log_name(&n("/alice/phone"), Some(&c()), 1),
-                until: Timestamp(u64::MAX),
-                at: Frontier::new(),
-                lease: None,
-                answered: None,
-            },
-        );
         let why = Refusal::Untrusted {
             why: "its chain no longer verifies".into(),
         };

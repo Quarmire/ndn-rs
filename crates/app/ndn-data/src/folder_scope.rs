@@ -31,10 +31,9 @@ use ndn_packet::Name;
 use ndn_packet::tlv_type::IMPLICIT_SHA256;
 
 use crate::wire::{
-    LAYOUT_ROLES, is_data_name, is_kw, is_namespace, log_name, namespace_of, parse_audit_ask_name,
-    parse_cut_bytes_name, parse_grant_name, parse_head_name, parse_head_prefix, parse_held_name,
-    parse_hold_ask_name, parse_log_name, parse_piece_name, parse_seal_key_name,
-    parse_signal_run_name, parse_summary_name,
+    LAYOUT_ROLES, is_data_name, is_kw, is_namespace, log_name, namespace_of, parse_cut_bytes_name,
+    parse_grant_name, parse_head_name, parse_head_prefix, parse_held_name, parse_log_name,
+    parse_piece_name, parse_seal_key_name, parse_signal_run_name, parse_summary_name,
 };
 
 /// How deep a held packet's name may nest another: a `<H>/32=held/<Name>`
@@ -61,8 +60,7 @@ const HELD_DEPTH: u8 = 2;
 ///   ask of a collection under `folder` **to a device of the folder's own
 ///   namespace** (the epoch's creator, or another device of the owner's that
 ///   holds the key; one to a listed writer's device is [`writer_carries`]'s);
-/// - a custody ask (hold, audit) and a held packet (`<H>/32=held/<name>`)
-///   about a name carried by these rules.
+/// - a held packet (`<H>/32=held/<name>`) about a name carried by these rules.
 ///
 /// Not carried: the sync group, certificates and the trust context (the
 /// host's link layer adds those: they are the namespaces', not the folder's),
@@ -260,14 +258,6 @@ fn carries(folder: &Name, name: &Name, held_depth: u8) -> bool {
         return within(folder, &ask.collection)
             && namespace_of(folder).is_some_and(|own| device_of_namespace(&granter, &own));
     }
-    if let Some((_, ask)) = parse_hold_ask_name(name) {
-        return parse_log_name(&ask.record)
-            .and_then(|l| l.subject)
-            .is_some_and(|c| within(folder, &c));
-    }
-    if let Some((_, ask)) = parse_audit_ask_name(name) {
-        return held_depth > 0 && carries(folder, &ask.piece, held_depth - 1);
-    }
     if let Some((_, inner)) = parse_held_name(name) {
         return held_depth > 0 && carries(folder, &inner, held_depth - 1);
     }
@@ -383,13 +373,10 @@ mod tests {
     }
 
     #[test]
-    fn custody_and_epoch_grants_are_judged_by_the_name_they_are_about() {
+    fn held_packets_and_epoch_grants_are_judged_by_the_name_they_are_about() {
         use crate::collection::Epoch;
         use crate::version::Seq;
-        use crate::wire::{
-            AuditAsk, GrantAsk, HoldAsk, NONCE_LEN, audit_ask_name, grant_name, held_name,
-            hold_ask_name,
-        };
+        use crate::wire::{GrantAsk, grant_name, held_name};
         let folder = folder();
         let holder = n("/alice/member/laptop");
         let writer = n("/bob/member/phone");
@@ -406,33 +393,6 @@ mod tests {
         // One that names another held packet does not hide it.
         let nested = held_name(&holder, &held_name(&holder, &outside));
         assert!(!folder_carries(&folder, &nested));
-
-        // A hold ask and an audit ask, by the record or piece they concern.
-        let hold = |record: &Name| {
-            hold_ask_name(
-                &holder,
-                &HoldAsk {
-                    record: record.clone(),
-                    nonce: [1; NONCE_LEN],
-                    asker: bytes::Bytes::from_static(b"proof"),
-                },
-            )
-        };
-        assert!(folder_carries(&folder, &hold(&inside)));
-        assert!(!folder_carries(&folder, &hold(&outside)));
-        let audit = |piece: &Name| {
-            audit_ask_name(
-                &holder,
-                &AuditAsk {
-                    nonce: [1; NONCE_LEN],
-                    piece: piece.clone(),
-                    whole: false,
-                    asker: bytes::Bytes::from_static(b"proof"),
-                },
-            )
-        };
-        assert!(folder_carries(&folder, &audit(&inside)));
-        assert!(!folder_carries(&folder, &audit(&outside)));
 
         // An epoch's grant, by the collection or folder whose key it is.
         let grant = |collection: &Name| {

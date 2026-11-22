@@ -478,58 +478,6 @@ async fn a_piece_walk_fetches_past_pieces_that_do_not_come_a_window_at_once() {
     dev.shutdown();
 }
 
-/// A holder's take asks for an entry inside the hold record's `at` by its
-/// name when a summary listed it but no walk took it (spec §13.2, §17.1):
-/// asking the devices for their summaries again cannot bring it when the
-/// walk counts it listed, so the take does not wait on them for it.
-#[tokio::test(start_paused = true)]
-async fn a_holders_take_asks_for_an_entry_it_heard_of_by_its_name() {
-    let c = n("/alice/32=data/photos");
-    let laptop = n("/alice/laptop");
-    let writer = Writer::new(n("/alice/laptop/KEY/1"));
-    let entry = log_name(&laptop, Some(&c), 2);
-    // It never comes: what counts is that it is asked for.
-    let conn = Serves::new(
-        [(entry.clone(), DataBuilder::new(entry.clone(), b"").build())],
-        HashSet::from([entry.clone()]),
-        HashSet::new(),
-    );
-    let dev = device_on(conn.clone()).await;
-    {
-        let mut st = dev.inner.st.lock();
-        st.holding.insert(
-            c.clone(),
-            Holding {
-                hold: log_name(&laptop, Some(&c), 3),
-                until: Timestamp(u64::MAX),
-                at: [VersionId {
-                    writer: writer.clone(),
-                    seq: Seq(2),
-                }]
-                .into_iter()
-                .collect(),
-                lease: None,
-                answered: None,
-            },
-        );
-        // A summary of the laptop's listed it.
-        st.colls
-            .entry(c.clone())
-            .or_default()
-            .entries
-            .insert(writer, BTreeSet::from([2]));
-    }
-    dev.inner.take_held(&c, &n("/alice"));
-    while dev.inner.st.lock().taking.contains(&c) {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    assert!(
-        conn.asked(&entry) > 0,
-        "the entry the summary listed is asked for by its name"
-    );
-    dev.shutdown();
-}
-
 /// A network on which the device's Sync Interests into `group` reach no
 /// one: it counts them, keeps the parameters of the newest, and carries
 /// only what the case gives the device.

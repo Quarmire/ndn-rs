@@ -3,8 +3,8 @@
 //! Interests are unsigned: anyone who can send one names any devices it
 //! likes. So the list of devices heard is bounded per group, the devices
 //! signed data held here does not vouch for dropped first, and only a
-//! device that signed data held here vouches for — a member or a holder,
-//! not a name a Sync Interest carried — is asked to answer for another
+//! device that signed data held here vouches for — a member, not a name a
+//! Sync Interest carried — is asked to answer for another
 //! (a relay, a granter), at most [`RELAYS_ASKED`] of them per ask. A name
 //! heard and not vouched for is still walked toward itself, as any device
 //! a notice names: that costs one device's asks, never more.
@@ -115,11 +115,10 @@ impl Inner {
         dropped != *device
     }
 
-    /// Whether signed data held here vouches for `device` as a member or a
-    /// holder of namespace `ns` (spec §13.5): a summary root of it for `ns`
+    /// Whether signed data held here vouches for `device` as a member of
+    /// namespace `ns` (spec §13.5): a summary root of it for `ns`
     /// verified here (in this run, or kept from an earlier one); a version
-    /// of it applied in a collection of `ns`; a lease or hold record of a
-    /// collection of `ns` naming it as a holder; or a members record in
+    /// of it applied in a collection of `ns`; or a members record in
     /// force of a collection or folder of `ns` listing it — its device
     /// name or one of its keys as a writer, the device as a reader. A
     /// writer prefix naming a whole namespace or person vouches for no
@@ -141,10 +140,7 @@ impl Inner {
         };
         let of_ns = |c: &Name| namespace_of(c).as_ref() == Some(ns);
         st.colls.iter().filter(|(c, _)| of_ns(c)).any(|(_, x)| {
-            x.applied.keys().any(|w| names(w.key()))
-                || x.leases.contains_key(device)
-                || x.holds.values().any(|(_, _, h)| h.holders.contains(device))
-                || x.members.as_ref().is_some_and(listed)
+            x.applied.keys().any(|w| names(w.key())) || x.members.as_ref().is_some_and(listed)
         }) || st
             .folders
             .iter()
@@ -176,23 +172,14 @@ impl Inner {
     }
 
     /// Note that the walks of `device`'s summary of `ns` spent their tries
-    /// with no root of it verified ([`Peer::unreached`]). The first time,
-    /// with nothing held vouching for it, the erasures of `ns`'s folders it
-    /// may have held back are judged again ([`Self::not_walked`]).
+    /// with no root of it verified ([`Peer::unreached`]): with nothing held
+    /// vouching for it, it holds back no more of what waits for the devices
+    /// not walked ([`Self::not_walked`]).
     pub(super) fn mark_unreached(&self, st: &mut St, device: &Name, ns: &Name) {
-        let peer = st.peers.entry((device.clone(), ns.clone())).or_default();
-        if std::mem::replace(&mut peer.unreached, true) || self.vouched(st, device, ns) {
-            return;
-        }
-        let folders: Vec<Name> = st
-            .folders
-            .keys()
-            .filter(|f| namespace_of(f).as_ref() == Some(ns))
-            .cloned()
-            .collect();
-        for f in folders {
-            self.erase_folder(st, &f);
-        }
+        st.peers
+            .entry((device.clone(), ns.clone()))
+            .or_default()
+            .unreached = true;
     }
 
     /// Whether `device` lies in a person's namespace that a members record

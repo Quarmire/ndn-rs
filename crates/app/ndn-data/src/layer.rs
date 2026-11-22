@@ -1,4 +1,4 @@
-//! The seven verbs, as one device's [`DataLayer`].
+//! The five verbs, as one device's [`DataLayer`].
 //!
 //! Each verb maps one-to-one onto the model; nothing is added for
 //! convenience. Deliberately absent: open/close/seek (versions are whole
@@ -16,7 +16,7 @@ use ndn_foundation_types::Name;
 use crate::collection::{Rule, Summary};
 use crate::error::{DataError, Refusal};
 use crate::merge::Value;
-use crate::statement::{Custody, Prune, Snapshot};
+use crate::statement::Snapshot;
 use crate::version::{
     Audience, Content, Frontier, Keep, Timestamp, TypeId, Version, VersionId, Writer,
 };
@@ -209,17 +209,6 @@ pub enum Change {
         /// chain verifies again).
         why: Refusal,
     },
-    /// A version delivered earlier was pruned by its writer: the reader
-    /// dropped it, and a `get` of it answers [`DataError::Pruned`]. Filled
-    /// by slice 3.
-    Pruned {
-        /// The version's collection.
-        collection: Name,
-        /// The version.
-        id: VersionId,
-        /// The prune record that covers it.
-        by: Prune,
-    },
     /// A version delivered earlier expired by this device's clock (spec
     /// §14.1): the device dropped it, and a `get` of it answers
     /// [`DataError::Expired`].
@@ -397,7 +386,6 @@ impl Change {
             Change::Summary(s) => &s.collection,
             Change::Version(v) => &v.collection,
             Change::Withdrawn { collection, .. }
-            | Change::Pruned { collection, .. }
             | Change::Expired { collection, .. }
             | Change::Equivocation { collection, .. }
             | Change::NotCounted { collection, .. }
@@ -414,19 +402,6 @@ impl Change {
 /// The stream a [`watch`](DataLayer::watch) returns. It ends only when the
 /// layer shuts down.
 pub type Changes = Pin<Box<dyn Stream<Item = Result<Change, DataError>> + Send>>;
-
-/// What a [`hold`](DataLayer::hold) asks for.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Hold {
-    /// How many holders, each a distinct device, must keep it.
-    pub copies: u32,
-    /// Until when; each lease is capped by the data's keep.
-    pub until: Timestamp,
-    /// The holder devices the owner chooses, by name: at least `copies` of
-    /// them, none of them this device. Only they are asked, and only their
-    /// leases count (spec §13.2).
-    pub holders: Vec<Name>,
-}
 
 /// The new content of a collection's members record, for
 /// [`share`](DataLayer::share).
@@ -496,7 +471,7 @@ pub struct ShareChange {
     pub remove_readers: Vec<Audience>,
 }
 
-/// One device's data layer: the seven verbs, signing with this device's
+/// One device's data layer: the five verbs, signing with this device's
 /// key.
 ///
 /// Code mostly uses `get`, `put` and `watch`, plus `snapshot` when several
@@ -513,8 +488,7 @@ pub trait DataLayer: Send + Sync {
     ///
     /// An exact version, state or snapshot by its name; or, by a
     /// collection's name, the newest by its rule — for a merge collection,
-    /// the merged state at a frontier — with how stale it may be. Readers
-    /// that know a prune covering the name answer [`DataError::Pruned`]. When no path
+    /// the merged state at a frontier — with how stale it may be. When no path
     /// answers, older verified data is returned with its [`Age`] rather than
     /// an error. A merge collection whose rule this device does not know
     /// is held and answered [`DataError::RuleUnknown`], never read under
@@ -574,31 +548,6 @@ pub trait DataLayer: Send + Sync {
     /// multi-object change; it also makes a merged state citable. Filled by
     /// slice 2.
     async fn snapshot(&self, of: &[Name]) -> Result<Snapshot, DataError>;
-
-    /// `hold(prefix, {copies, until, holders}) → custody`.
-    ///
-    /// Ask the holder devices the owner names to keep the collection
-    /// `prefix` and get their signed leases back, never beyond the data's
-    /// keep. Each call audits every live lease (random pieces, fresh nonces)
-    /// and repairs: a named holder whose lease is broken, unanswered or
-    /// missing is asked, until `copies` distinct holder devices hold it
-    /// kept. Only a device of the collection's namespace asks
-    /// ([`DataError::NotOwner`] otherwise); fewer holders than copies, or a
-    /// holder that is no device or this device itself, is
-    /// [`DataError::BadRequest`]. Filled by slice 3.
-    async fn hold(&self, prefix: &Name, want: Hold) -> Result<Custody, DataError>;
-
-    /// `prune(prefix, upto)`.
-    ///
-    /// Drop this writer's own versions of the collection `prefix` (or the
-    /// one version `prefix` names) up to `upto`; the record spreads like
-    /// data and ends the leases it covers. Versions by other keys are
-    /// refused with [`DataError::NotOwnWrites`]; a merge collection's
-    /// versions with [`DataError::NotPrunable`]; up to past this device's
-    /// newest entry with [`DataError::BadRequest`]. Sealed data is erased by
-    /// destroying its epoch's key once every writer's versions of the epoch
-    /// are pruned or cut. Filled by slice 3.
-    async fn prune(&self, prefix: &Name, upto: &Frontier) -> Result<(), DataError>;
 
     /// `share(collection, {readers, writers})`.
     ///

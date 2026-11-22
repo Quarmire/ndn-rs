@@ -1,8 +1,8 @@
-//! Folder records and the write paths under them (spec §5, §6.1, §9, §14):
+//! Folder records and the write paths under them (spec §5, §6.1, §9):
 //! a collection's first own record starts from the record in force over it,
 //! a refused write leaves nothing behind, a folder dropping a reader stops
-//! sealing for it, folder epochs are erased, and a device not synced with
-//! the folder's summaries neither signs a default record nor cuts.
+//! sealing for it, and a device not synced with the folder's summaries
+//! neither signs a default record nor cuts.
 
 use super::*;
 use crate::layer::Share;
@@ -201,13 +201,6 @@ fn version(device: &Name, c: &Name, seq: u64, sealed: Option<(&Epoch, &ContentKe
         sealed,
         chunks: None,
         block: None,
-    })
-}
-
-fn prune(c: &Name, device: &Name, seq: u64) -> Record {
-    Record::Prune(PruneBody {
-        prefix: c.clone(),
-        upto: [id(device, seq)].into_iter().collect(),
     })
 }
 
@@ -440,221 +433,6 @@ async fn a_writer_does_not_seal_for_a_reader_the_folder_dropped() {
     writer.shutdown();
 }
 
-// ---- M6: folder epochs are erased --------------------------------------------------------------
-
-#[tokio::test]
-async fn a_folder_epoch_key_is_destroyed_only_once_every_writer_left_it_everywhere_under_it() {
-    let parts = Parts::new("/alice/laptop", &["/alice", "/bob"]);
-    let dev = parts.start().await;
-    let f = folder();
-    dev.share_folder(
-        &f,
-        share(
-            Rule::Log,
-            &["/alice"],
-            vec![person("/alice"), person("/bob")],
-        )
-        .into(),
-    )
-    .await
-    .unwrap();
-    let (first, first_key) = folder_epoch(&dev, &f);
-    let (phone, tablet) = (n("/alice/phone"), n("/alice/tablet"));
-    let sealed = |e, k| Some((e, k));
-    assert_eq!(
-        hand(
-            &dev,
-            &phone,
-            &plan(),
-            1,
-            version(&phone, &plan(), 1, sealed(&first, &first_key))
-        ),
-        None
-    );
-    assert_eq!(
-        hand(
-            &dev,
-            &tablet,
-            &notes(),
-            1,
-            version(&tablet, &notes(), 1, sealed(&first, &first_key))
-        ),
-        None
-    );
-    // Bob removed: a new folder epoch.
-    dev.share_folder(
-        &f,
-        share(Rule::Log, &["/alice"], vec![person("/alice")]).into(),
-    )
-    .await
-    .unwrap();
-    let (second, second_key) = folder_epoch(&dev, &f);
-    assert_ne!(first, second);
-    // The phone moves on and prunes its version of the first epoch; the
-    // tablet, which has not heard of the second, prunes its own.
-    assert_eq!(
-        hand(
-            &dev,
-            &phone,
-            &plan(),
-            2,
-            version(&phone, &plan(), 2, sealed(&second, &second_key))
-        ),
-        None
-    );
-    hand(&dev, &phone, &plan(), 3, prune(&plan(), &phone, 1));
-    hand(&dev, &tablet, &notes(), 2, prune(&notes(), &tablet, 1));
-    assert!(
-        dev.inner.st.lock().keys.key(&f, &first).is_some(),
-        "the tablet may still write in the first epoch: its erasure waits"
-    );
-    // It did, offline, in another collection under the folder: it opens.
-    assert_eq!(
-        hand(
-            &dev,
-            &tablet,
-            &plan(),
-            3,
-            version(&tablet, &plan(), 3, sealed(&first, &first_key))
-        ),
-        None
-    );
-    assert!(matches!(
-        dev.inner
-            .st
-            .lock()
-            .held
-            .get(&log_name(&tablet, Some(&plan()), 3)),
-        Some(Held::Version(_))
-    ));
-    // It moves on and prunes that one too: now the epoch goes.
-    assert_eq!(
-        hand(
-            &dev,
-            &tablet,
-            &notes(),
-            4,
-            version(&tablet, &notes(), 4, sealed(&second, &second_key))
-        ),
-        None
-    );
-    hand(&dev, &tablet, &plan(), 5, prune(&plan(), &tablet, 3));
-    assert!(
-        dev.inner.st.lock().keys.key(&f, &first).is_none(),
-        "every writer left the first epoch and pruned all of it"
-    );
-    assert!(dev.inner.st.lock().keys.key(&f, &second).is_some());
-    // The erasure outlives a restart: the key, granted again, is refused.
-    dev.shutdown();
-    drop(dev);
-    let again = parts.start().await;
-    {
-        let mut st = again.inner.st.lock();
-        assert!(st.folders[&f].erased.contains(&first));
-        assert!(!st.take_key(&f, &first, first_key.clone()));
-    }
-    again.shutdown();
-}
-
-#[tokio::test]
-async fn a_folder_epoch_is_kept_while_a_collection_under_it_is_not_known() {
-    let dev = device("/bob/phone", &["/alice", "/bob"]).await;
-    let owner = device("/alice/laptop", &["/alice", "/bob"]).await;
-    let f = folder();
-    owner
-        .share_folder(
-            &f,
-            share(
-                Rule::Log,
-                &["/alice", "/bob"],
-                vec![person("/alice"), person("/bob")],
-            )
-            .into(),
-        )
-        .await
-        .unwrap();
-    let (first, first_key) = folder_epoch(&owner, &f);
-    // Bob's phone reads only `plan`, not the whole folder.
-    assert_eq!(relay(&owner, &dev, &f, 1), None);
-    assert!(dev.inner.st.lock().take_key(&f, &first, first_key.clone()));
-    owner
-        .share_folder(
-            &f,
-            share(Rule::Log, &["/alice", "/bob"], vec![person("/bob")]).into(),
-        )
-        .await
-        .unwrap();
-    let (second, second_key) = folder_epoch(&owner, &f);
-    assert_eq!(relay(&owner, &dev, &f, owner.inner.st.lock().head), None);
-    assert!(
-        dev.inner
-            .st
-            .lock()
-            .take_key(&f, &second, second_key.clone())
-    );
-    let tablet = n("/alice/tablet");
-    let sealed = |e, k| Some((e, k));
-    assert_eq!(
-        hand(
-            &dev,
-            &tablet,
-            &plan(),
-            1,
-            version(&tablet, &plan(), 1, sealed(&first, &first_key))
-        ),
-        None
-    );
-    assert_eq!(
-        hand(
-            &dev,
-            &tablet,
-            &plan(),
-            2,
-            version(&tablet, &plan(), 2, sealed(&second, &second_key))
-        ),
-        None
-    );
-    hand(&dev, &tablet, &plan(), 3, prune(&plan(), &tablet, 1));
-    assert!(
-        dev.inner.st.lock().keys.key(&f, &first).is_some(),
-        "another collection under the folder may hold versions of the epoch"
-    );
-    dev.shutdown();
-    owner.shutdown();
-}
-
-#[tokio::test]
-async fn pruning_in_the_folder_epoch_in_force_rotates_it_and_erases_its_key() {
-    let dev = device("/alice/laptop", &["/alice", "/bob"]).await;
-    let f = folder();
-    dev.share_folder(
-        &f,
-        share(
-            Rule::Log,
-            &["/alice"],
-            vec![person("/alice"), person("/bob")],
-        )
-        .into(),
-    )
-    .await
-    .unwrap();
-    let (first, _) = folder_epoch(&dev, &f);
-    let written = dev.put(&plan(), reading(1), options()).await.unwrap();
-    dev.prune(&plan(), &[written].into_iter().collect())
-        .await
-        .unwrap();
-    let (second, _) = folder_epoch(&dev, &f);
-    assert_ne!(first, second, "the folder moved to a new epoch");
-    let st = dev.inner.st.lock();
-    assert!(
-        st.keys.key(&f, &first).is_none(),
-        "the pruned epoch's key is gone"
-    );
-    assert!(st.folders[&f].erased.contains(&first));
-    drop(st);
-    dev.shutdown();
-}
-
 // ---- M8, L1: a device not synced with the folder above ----------------------------------------
 
 /// Make `dev` know `other`, a device of its namespace whose summary root
@@ -788,7 +566,7 @@ async fn a_cut_is_signed_over_what_is_held_whoever_stays_away() {
     dev.shutdown();
 }
 
-// ---- what is owed survives a restart; any prune in a folder's epoch rotates it ---------------
+// ---- what is owed survives a restart ----------------------------------------------------------
 
 #[tokio::test]
 async fn an_epoch_owed_when_the_device_stopped_is_owed_again_after_a_restart() {
@@ -832,40 +610,6 @@ async fn an_epoch_owed_when_the_device_stopped_is_owed_again_after_a_restart() {
     let now = own(&dev, &c).epoch.unwrap();
     assert_ne!(now, before, "the epoch Bob holds the key of is left");
     dev.put(&c, reading(1), options()).await.unwrap();
-    dev.shutdown();
-}
-
-#[tokio::test]
-async fn another_writers_prune_in_the_folder_epoch_in_force_rotates_it() {
-    let dev = device("/alice/laptop", &["/alice", "/bob"]).await;
-    let f = folder();
-    dev.share_folder(
-        &f,
-        share(
-            Rule::Log,
-            &["/alice"],
-            vec![person("/alice"), person("/bob")],
-        )
-        .into(),
-    )
-    .await
-    .unwrap();
-    let (first, key) = folder_epoch(&dev, &f);
-    let tablet = n("/alice/tablet");
-    assert_eq!(
-        hand(
-            &dev,
-            &tablet,
-            &plan(),
-            1,
-            version(&tablet, &plan(), 1, Some((&first, &key)))
-        ),
-        None
-    );
-    hand(&dev, &tablet, &plan(), 2, prune(&plan(), &tablet, 1));
-    dev.inner.settle().await;
-    let (second, _) = folder_epoch(&dev, &f);
-    assert_ne!(first, second, "the folder moved to a new epoch");
     dev.shutdown();
 }
 

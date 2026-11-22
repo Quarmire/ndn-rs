@@ -189,7 +189,7 @@ pub trait MergeState: Send {
     /// with its past) and of the bases held for them: handing a basis after
     /// the versions made over it gives the state handing it before gives,
     /// and what changed counting is told by `counting_changed`. Without a
-    /// basis (gone everywhere after a release, spec §13.3) the rule merges
+    /// basis (gone everywhere: every device that held it whole is away) the rule merges
     /// `W` against the checkpoint's state alone: its conflict handling.
     /// Err: the rule cannot take it; the state MUST be left unchanged, and
     /// the versions made over it merge as without it. A rule that keeps no

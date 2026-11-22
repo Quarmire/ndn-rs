@@ -1,7 +1,7 @@
 //! The data layer: named, signed, versioned data that merges the
 //! filesystem, the database and the network into one model.
 //!
-//! This crate holds the **contract** — the model's types and the seven verbs
+//! This crate holds the **contract** — the model's types and the five verbs
 //! as the [`DataLayer`] trait — and its **reference implementation**,
 //! [`Device`]: one device's layer over NDN, built on `ndn-app` (fetching and
 //! serving), `ndn-sync` (State Vector Sync as the change notice, and the
@@ -20,9 +20,8 @@
 //! merge) and an owner-signed [`Members`] record saying who writes and who
 //! reads. Everything else is a version that says something about other
 //! versions: a [`Summary`] (what a collection holds, signed, nested by
-//! digest), a [`Cut`] (removal or revocation: "up to here"), a [`Snapshot`]
-//! (exact versions or a state), [`Custody`] (leases to keep data, never beyond
-//! its [`Keep`]) and a [`Prune`] (drop one's own writes). A [`Seal`] says who
+//! digest), a [`Cut`] (removal or revocation: "up to here") and a [`Snapshot`]
+//! (exact versions or a state). A [`Seal`] says who
 //! may read, over people, devices and groups — never apps. Content is typed
 //! ([`TypeId`]) and writers keep fields they do not understand.
 //!
@@ -39,7 +38,7 @@
 //! | caller | verbs |
 //! |---|---|
 //! | lens or service code | [`get`](DataLayer::get), [`put`](DataLayer::put), [`watch`](DataLayer::watch), and [`snapshot`](DataLayer::snapshot) when several things change together |
-//! | host, by policy defaults | [`hold`](DataLayer::hold), [`prune`](DataLayer::prune), [`share`](DataLayer::share); a lens calls `prune` or `share` only when the person makes that gesture |
+//! | host, by policy defaults | [`share`](DataLayer::share); a lens calls it only when the person makes that gesture |
 //!
 //! # Slices
 //!
@@ -49,8 +48,8 @@
 //! | slice | fills |
 //! |---|---|
 //! | 1 | versions, members records (owner-signed, writers of any prefix), the merge rule ([`merge`]), signed nested summaries, `get`, `put`, `watch`, `snapshot` of states and versions, `share` that adds |
-//! | 2 | members of other namespaces reached through their own groups, `share` that removes (cuts) and changes the rule, re-check on cut arrival (`Withdrawn`), seals (epoch keys granted to the audience), the log rule, `prune` refusing others' writes |
-//! | 3 | large payloads, custody leases with audits, `prune`, keep caps hold |
+//! | 2 | members of other namespaces reached through their own groups, `share` that removes (cuts) and changes the rule, re-check on cut arrival (`Withdrawn`), seals (epoch keys granted to the audience), the log rule |
+//! | 3 | large payloads |
 //! | 4 | signed blocks of small entries under a producer's delay, the one-key rule (a signed head with a freshness bound, rollback refused), retention by expiry (summaries listed by keep), range reads by seq and by time |
 //! | 5 | revocation as a cut, owner re-admission of honest work |
 //! | 7 | the verbs over forwarder management and the mobile FFI |
@@ -79,7 +78,7 @@ pub mod wire;
 
 pub use collection::{Child, Cut, Epoch, Members, Parent, Resolve, Rule, Summary};
 pub use device::{
-    Clock, Config, CutBound, CutProposal, Device, Entropy, IntroductionSurface, Released, Transport,
+    Clock, Config, CutBound, CutProposal, Device, Entropy, IntroductionSurface, Transport,
 };
 pub use error::{DataError, NextStep, Refusal};
 pub use folder_scope::{departure_carries, folder_carries, writer_carries, writer_sync};
@@ -88,15 +87,15 @@ pub use intro::{
     JoinedFolder, Offer, Role,
 };
 pub use layer::{
-    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Entries, Entry, Equivocal, Got, Hold,
-    NotCounted, PutOptions, Share, ShareChange, Sharing, State,
+    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Entries, Entry, Equivocal, Got, NotCounted,
+    PutOptions, Share, ShareChange, Sharing, State,
 };
 pub use merge::{
     Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value, Yrs,
 };
 pub use ndn_foundation_types::{Hash, Name};
 pub use signal::{SignalKey, SignalRefusal, SignalScope, SignalSender};
-pub use statement::{Audit, Breach, Custody, Lease, Prune, Snapshot};
+pub use statement::Snapshot;
 pub use version::{
     Audience, BlockEntry, Content, Frontier, Keep, Parents, Payload, Seal, Seq, Timestamp, TypeId,
     Version, VersionId, Writer,

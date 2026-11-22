@@ -206,15 +206,14 @@ pub struct TypeId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(pub u64);
 
-/// Retention chosen at write (model invariant 7). Custody never extends it;
-/// prune only narrows it.
+/// Retention chosen at write (model invariant 7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Keep {
     /// Keep until this date, by the holder's clock.
     Until(Timestamp),
     /// Keep this writer's last `n` versions in the collection.
     LastN(u32),
-    /// Keep until pruned.
+    /// Keep forever.
     Forever,
 }
 

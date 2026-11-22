@@ -1,6 +1,6 @@
 [package]
 name = "ndn-data"
-description = "Data layer: named, signed, versioned data — the contract (model types, the seven verbs get, put, watch, snapshot, hold, prune, share) and its reference implementation over NDN"
+description = "Data layer: named, signed, versioned data — the contract (model types, the five verbs get, put, watch, snapshot, share) and its reference implementation over NDN"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

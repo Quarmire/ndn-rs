@@ -69,7 +69,7 @@ impl Retain {
 pub(crate) enum Kind {
     /// A version, listed by its keep.
     Version(Retain),
-    /// A record that is not a version: members, hold, lease or prune.
+    /// A record that is not a version: a members record.
     Record,
 }
 

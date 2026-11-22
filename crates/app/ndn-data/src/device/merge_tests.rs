@@ -875,59 +875,6 @@ async fn a_version_whose_past_is_held_but_not_applied_is_checked_only_once_it_is
     dev.shutdown();
 }
 
-#[tokio::test]
-async fn merge_pieces_are_not_released_without_a_covering_checkpoint_proved_kept() {
-    let dev = device(rules()).await;
-    let hold_record = made(
-        "/alice/laptop",
-        1000,
-        Record::Hold(HoldBody {
-            collection: c(),
-            copies: 1,
-            until: Timestamp(u64::MAX / 2),
-            at: Frontier::new(),
-            holders: vec![n("/alice/holder")],
-        }),
-    );
-    give(&dev, &hold_record);
-    let big = "p".repeat(3 * wire::INLINE_MAX);
-    let (large, pieces) = in_pieces("/bob/laptop", 10, &[], edit(None, &big));
-    let chunk = pieces
-        .iter()
-        .map(|p| p.name.clone())
-        .find(|p| {
-            matches!(
-                parse_piece_name(p).map(|x| x.kind),
-                Some(PieceKind::Chunk(_))
-            )
-        })
-        .unwrap();
-    give(&dev, &large);
-    for p in pieces {
-        dev.inner.store.insert(p.name, p.wire);
-    }
-    dev.inner.st.lock().pieces_arrived(&c(), &large.name);
-    assert!(at(&dev).contains(&large.id()));
-    let none = dev.release(&c()).await;
-    assert!(matches!(none, Err(DataError::NotHeld { .. })), "{none:?}");
-    // A checkpoint covering it, held whole here, that no holder proved.
-    let cp = version(
-        "/carol/laptop",
-        5,
-        &[tip(&large)],
-        checkpoint(&[big.as_str()]),
-    );
-    give(&dev, &cp);
-    assert!(at(&dev).contains(&cp.id()));
-    let unproved = dev.release(&c()).await;
-    assert!(
-        matches!(unproved, Err(DataError::NotHeld { .. })),
-        "{unproved:?}"
-    );
-    assert!(dev.inner.store.contains(&chunk), "its pieces stay");
-    dev.shutdown();
-}
-
 /// The version told for `id` among `seen`, which must be there.
 fn told<'c>(seen: &'c [Change], id: &VersionId) -> &'c Version {
     seen.iter()

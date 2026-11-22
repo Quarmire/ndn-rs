@@ -176,46 +176,13 @@ pub mod tlv {
     pub const CHUNKS: u64 = 0x0521;
     /// NonNegativeInteger: the payload's octets.
     pub const SIZE: u64 = 0x0523;
-    /// The Content of a hold log entry: `Name` (collection), `Copies`,
-    /// `KeepUntil` (until), `Frontier` (what the asker had applied).
-    pub const HOLD_RECORD: u64 = 0x0525;
-    /// NonNegativeInteger: how many holders.
-    pub const COPIES: u64 = 0x0527;
-    /// The Content of a lease log entry: `Name` (collection), `Name` (the
-    /// hold record answered), `KeepUntil` (until), `Frontier` (what it
-    /// holds).
-    pub const LEASE_RECORD: u64 = 0x0529;
-    /// The Content of a prune log entry: `Name` (collection or version),
-    /// `Frontier` (up to).
-    pub const PRUNE_RECORD: u64 = 0x052B;
-    /// What a hold ask names: `Name` (the hold record), `Nonce`, `Asker`.
-    pub const HOLD_ASK: u64 = 0x052D;
-    /// What an audit asks: `Nonce`, `Name` (the piece), `Whole`?, `Asker`.
-    pub const AUDIT_ASK: u64 = 0x052F;
     /// Octets: an ask's fresh random nonce (16).
     pub const NONCE: u64 = 0x0531;
-    /// An audit's answer: `Piece`, `Missing`, `Proof`, `PrunedBy` or `RefusedBy`.
-    pub const AUDIT_ANSWER: u64 = 0x0533;
-    /// Octets: the piece's whole Data packet.
-    pub const PIECE: u64 = 0x0535;
-    /// Empty: the holder does not hold the piece, and knows no record that
-    /// ends it (it lost it, or never held it).
-    pub const MISSING: u64 = 0x0537;
-    /// In a hold record, the holder devices the owner chose: `Name*`.
-    pub const HOLDERS: u64 = 0x0539;
     /// Octets: the asker's proof that it asks, a Data packet `<asker>/32=ask/
-    /// <binding>` signed by the asker device's key (spec §13.2).
+    /// <binding>` signed by the asker device's key.
     pub const ASKER: u64 = 0x053B;
-    /// Empty: the audit asks for one proof over every piece of the version
-    /// named (spec §13.3, release).
-    pub const WHOLE: u64 = 0x053D;
-    /// 32 octets: SHA-256 over the nonce and every piece of the version, in
-    /// order (its log entry, its manifest nodes, its chunks).
+    /// 32 octets: an introduction's proof (spec §19).
     pub const PROOF: u64 = 0x053F;
-    /// Octets: the prune record's packet that ends the piece's version.
-    pub const PRUNED_BY: u64 = 0x0541;
-    /// Octets: the members record's packet that refuses the piece's version.
-    pub const REFUSED_BY: u64 = 0x0543;
 
     // Slice 4: odd numbers, critical.
 
@@ -237,9 +204,6 @@ pub mod tlv {
     pub const FRESHNESS: u64 = 0x054D;
     /// In a range name: `Dated` (from), `Dated` (to), from < to.
     pub const TIME_RANGE: u64 = 0x054F;
-    /// Empty, an audit answer: the piece's version's keep passed by the
-    /// holder's clock, and the holder dropped it.
-    pub const EXPIRED: u64 = 0x0551;
     /// In a summary node of a log or one-key collection, a run of the
     /// versions it lists kept until a date: `SeqRange+` (listed seqs),
     /// `KeepUntil` (a date at or after each one's keep). A node's runs are
@@ -337,8 +301,6 @@ const STATE: &[u8] = b"state";
 const SEAL: &[u8] = b"seal";
 const GRANT: &[u8] = b"grant";
 const MANIFEST: &[u8] = b"manifest";
-const HOLD: &[u8] = b"hold";
-const AUDIT: &[u8] = b"audit";
 const HELD: &[u8] = b"held";
 const ROOT: &[u8] = b"root";
 const ASK: &[u8] = b"ask";
@@ -364,7 +326,7 @@ pub const CHUNK: usize = 4096;
 /// The digests one manifest node lists.
 pub const FANOUT: usize = 128;
 
-/// The octets of an audit's nonce.
+/// The octets of an ask's nonce.
 pub const NONCE_LEN: usize = 16;
 
 /// The most seqs one summary node lists in its `Entries` and
@@ -556,7 +518,7 @@ pub(crate) fn device_len(key: &Name) -> Option<usize> {
 /// Whether the device named by `device` lies under the namespace of
 /// `collection` (the components before its `32=data` marker): the name
 /// half of the owner rule (spec §3), shared by the layer's judgement of
-/// members and hold records and by [`owns`].
+/// members records and by [`owns`].
 pub(crate) fn device_owns(collection: &Name, device: &[NameComponent]) -> bool {
     data_marker(collection)
         .is_ok_and(|at| device.len() >= at && device[..at] == collection.components()[..at])
@@ -934,7 +896,7 @@ pub fn parse_grant_name(name: &Name) -> Option<(Name, GrantAsk)> {
     ))
 }
 
-// ---- slice 3: pieces, hold asks, audits ---------------------------------------------------------
+// ---- slice 3: pieces ----------------------------------------------------------------------------
 
 /// A piece of a large version (spec §4.1): a chunk of its payload, or a node
 /// of its manifest tree.
@@ -971,8 +933,7 @@ pub fn piece_name(version: &Name, kind: PieceKind) -> Name {
 
 /// The names of every piece of the large version named `version` whose
 /// record carries `chunks`: its manifest nodes in heap order, then its
-/// chunks in order (spec §13.1) — the order a `whole` audit ask's proof
-/// covers them in, after the version's log entry.
+/// chunks in order (spec §13.1).
 pub fn piece_names<'a>(version: &'a Name, chunks: &ChunksBody) -> impl Iterator<Item = Name> + 'a {
     let shape = crate::pieces::Shape::of(chunks.size);
     let manifests: Vec<u64> = shape.manifests().collect();
@@ -1021,49 +982,11 @@ pub fn parse_cut_bytes_name(name: &Name) -> Option<LogName> {
     Some(log)
 }
 
-/// What a hold ask asks a holder: to hold what an owner device's hold record
-/// asks (spec §13.2), under a fresh nonce, proved to come from the device
-/// that signed the record.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct HoldAsk {
-    /// The hold record's name: a log entry of the asker, with a collection.
-    pub record: Name,
-    /// Random octets the asker chose for this ask alone.
-    pub nonce: [u8; NONCE_LEN],
-    /// The asker's proof ([`ask_name`]): a Data packet signed by its key,
-    /// naming this ask's [`binding`](Self::binding).
-    pub asker: Bytes,
-}
-
-impl HoldAsk {
-    /// What the asker's proof names: the hold label, the holder's name and
-    /// the ask without the proof ([`ask_binding`]).
-    pub fn binding(&self, holder: &Name) -> [u8; 32] {
-        ask_binding(
-            AskProtocol::Hold,
-            &[&holder.encode_to_tlv(), &self.fields()],
-        )
-    }
-
-    fn fields(&self) -> Bytes {
-        let mut w = TlvWriter::new();
-        w.write_nested(tlv::HOLD_ASK, |w| {
-            write_name(w, &self.record);
-            w.write_tlv(tlv::NONCE, &self.nonce);
-        });
-        w.finish()
-    }
-}
-
 /// A protocol whose asks or answers carry a proof `<device>/32=ask/
 /// <binding>` ([`ask_name`]): its label opens every binding it makes (spec
 /// §16.3), so a proof made for one protocol never verifies as another's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AskProtocol {
-    /// A hold ask ([`HoldAsk`]).
-    Hold,
-    /// An audit ask ([`AuditAsk`]).
-    Audit,
     /// An introduction ask ([`crate::intro::AskBody`]).
     IntroAsk,
     /// An introduction answer ([`crate::intro::AnswerBody`]).
@@ -1072,19 +995,12 @@ pub enum AskProtocol {
 
 impl AskProtocol {
     /// Every protocol.
-    pub const ALL: [AskProtocol; 4] = [
-        AskProtocol::Hold,
-        AskProtocol::Audit,
-        AskProtocol::IntroAsk,
-        AskProtocol::IntroAnswer,
-    ];
+    pub const ALL: [AskProtocol; 2] = [AskProtocol::IntroAsk, AskProtocol::IntroAnswer];
 
     /// The octets opening its bindings: ASCII ending in a zero octet, so
     /// none is a prefix of another.
     pub const fn label(self) -> &'static [u8] {
         match self {
-            AskProtocol::Hold => b"ndn-data hold ask\0",
-            AskProtocol::Audit => b"ndn-data audit ask\0",
             AskProtocol::IntroAsk => b"ndn-data intro ask\0",
             AskProtocol::IntroAnswer => b"ndn-data intro answer\0",
         }
@@ -1105,9 +1021,8 @@ pub fn ask_binding(protocol: AskProtocol, parts: &[&[u8]]) -> [u8; 32] {
 }
 
 /// The name of an asker's proof: `<asker>/32=ask/<binding>`. Its Data
-/// packet, signed by the asker device's key, rides in the ask it proves; a
-/// holder answers an ask only from the owner devices the hold records it
-/// holds name, so a stranger's ask costs it no work and no signature.
+/// packet, signed by the asker device's key, rides in the ask it proves, so
+/// a stranger's ask costs the answerer no work and no signature.
 pub fn ask_name(asker: &Name, binding: &[u8; 32]) -> Name {
     asker
         .clone()
@@ -1124,61 +1039,6 @@ pub fn parse_ask_name(name: &Name) -> Option<(Name, [u8; 32])> {
     }
     let binding = <[u8; 32]>::try_from(comps[at + 1].value.as_ref()).ok()?;
     Some((name_of(&comps[..at]), binding))
-}
-
-/// The ask's elements after its fields: the asker's proof.
-fn write_asker(w: &mut TlvWriter, asker: &[u8]) {
-    w.write_tlv(tlv::ASKER, asker);
-}
-
-/// A hold ask's name: `<holder>/32=hold/<HoldAsk TLV>`.
-pub fn hold_ask_name(holder: &Name, ask: &HoldAsk) -> Name {
-    let mut w = TlvWriter::new();
-    w.write_nested(tlv::HOLD_ASK, |w| {
-        write_name(w, &ask.record);
-        w.write_tlv(tlv::NONCE, &ask.nonce);
-        write_asker(w, &ask.asker);
-    });
-    holder
-        .clone()
-        .append_component(kw(HOLD))
-        .append_component(NameComponent::generic(w.finish()))
-}
-
-/// Parse `<holder>/32=hold/<HoldAsk TLV>`: the holder and the ask, whose
-/// record is a log entry with a collection.
-pub fn parse_hold_ask_name(name: &Name) -> Option<(Name, HoldAsk)> {
-    let comps = name.components();
-    let at = comps.iter().position(|c| is_kw(c, HOLD))?;
-    if !is_device_comps(&comps[..at]) || at + 2 != comps.len() {
-        return None;
-    }
-    let mut r = TlvReader::new(comps[at + 1].value.clone());
-    let (typ, value) = r.read_tlv().ok()?;
-    if typ != tlv::HOLD_ASK || !r.is_empty() {
-        return None;
-    }
-    let (mut record, mut nonce, mut asker) = (None, None, None);
-    each(value, |t, v| {
-        match t {
-            tlv_type::NAME => record = Some(read_name(v)?),
-            tlv::NONCE => nonce = Some(read_nonce(&v)?),
-            tlv::ASKER => asker = Some(v),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })
-    .ok()?;
-    let record = record?;
-    parse_log_name(&record)?.subject?;
-    Some((
-        name_of(&comps[..at]),
-        HoldAsk {
-            record,
-            nonce: nonce?,
-            asker: asker?,
-        },
-    ))
 }
 
 pub(crate) fn read_nonce(v: &[u8]) -> Result<[u8; NONCE_LEN], WireError> {
@@ -1267,16 +1127,12 @@ impl NameWords {
 pub(crate) enum Served {
     /// `<granter>/32=grant/<ask>`.
     Grant,
-    /// `<holder>/32=hold/<ask>`.
-    Hold,
     /// `<device>/32=intro/<digest>`.
     Intro,
     /// `<device>/32=hint/<token>`.
     Hint,
     /// `<holder>/32=held/<name>`.
     Held,
-    /// `<holder>/32=audit/<ask>`.
-    Audit,
 }
 
 /// Which [`Served`] name `name` can be, by one look: each of their parsers takes everything
@@ -1289,11 +1145,9 @@ pub(crate) fn served_kind(name: &Name) -> Option<Served> {
     }
     match first.value.as_ref() {
         GRANT => Some(Served::Grant),
-        HOLD => Some(Served::Hold),
         crate::intro::INTRO => Some(Served::Intro),
         crate::intro::HINT => Some(Served::Hint),
         HELD => Some(Served::Held),
-        AUDIT => Some(Served::Audit),
         _ => None,
     }
 }
@@ -1440,171 +1294,6 @@ pub fn parse_range_name(name: &Name) -> Option<Result<(Name, Range), WireError>>
         Ok((collection, range))
     })();
     Some(parsed)
-}
-
-/// What an audit asks a holder for: one piece, or a proof over every piece
-/// of a version (`whole`), under a fresh nonce, proved to come from an owner
-/// device.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct AuditAsk {
-    /// Random octets the auditor chose for this ask alone.
-    pub nonce: [u8; NONCE_LEN],
-    /// The piece: a version's log entry, or a chunk or manifest node of it;
-    /// with `whole`, the version's log entry.
-    pub piece: Name,
-    /// Whether the ask is for [`AuditAnswer::Proof`] over every piece of the
-    /// version (spec §13.3, release).
-    pub whole: bool,
-    /// The auditor's proof ([`ask_name`]) naming this ask's
-    /// [`binding`](Self::binding).
-    pub asker: Bytes,
-}
-
-impl AuditAsk {
-    /// What the auditor's proof names: the audit label, the holder's name
-    /// and the ask without the proof ([`ask_binding`]).
-    pub fn binding(&self, holder: &Name) -> [u8; 32] {
-        let mut w = TlvWriter::new();
-        w.write_nested(tlv::AUDIT_ASK, |w| self.write_fields(w));
-        ask_binding(AskProtocol::Audit, &[&holder.encode_to_tlv(), &w.finish()])
-    }
-
-    fn write_fields(&self, w: &mut TlvWriter) {
-        w.write_tlv(tlv::NONCE, &self.nonce);
-        write_name(w, &self.piece);
-        if self.whole {
-            w.write_tlv(tlv::WHOLE, &[]);
-        }
-    }
-}
-
-/// An audit ask's name: `<holder>/32=audit/<AuditAsk TLV>`.
-pub fn audit_ask_name(holder: &Name, ask: &AuditAsk) -> Name {
-    let mut w = TlvWriter::new();
-    w.write_nested(tlv::AUDIT_ASK, |w| {
-        ask.write_fields(w);
-        write_asker(w, &ask.asker);
-    });
-    holder
-        .clone()
-        .append_component(kw(AUDIT))
-        .append_component(NameComponent::generic(w.finish()))
-}
-
-/// Parse `<holder>/32=audit/<AuditAsk TLV>`.
-pub fn parse_audit_ask_name(name: &Name) -> Option<(Name, AuditAsk)> {
-    let comps = name.components();
-    let at = comps.iter().position(|c| is_kw(c, AUDIT))?;
-    if !is_device_comps(&comps[..at]) || at + 2 != comps.len() {
-        return None;
-    }
-    let mut r = TlvReader::new(comps[at + 1].value.clone());
-    let (typ, value) = r.read_tlv().ok()?;
-    if typ != tlv::AUDIT_ASK || !r.is_empty() {
-        return None;
-    }
-    let (mut nonce, mut piece, mut whole, mut asker) = (None, None, false, None);
-    each(value, |t, v| {
-        match t {
-            tlv::NONCE => nonce = Some(read_nonce(&v)?),
-            tlv_type::NAME => piece = Some(read_name(v)?),
-            tlv::WHOLE => whole = true,
-            tlv::ASKER => asker = Some(v),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })
-    .ok()?;
-    Some((
-        name_of(&comps[..at]),
-        AuditAsk {
-            nonce: nonce?,
-            piece: piece?,
-            whole,
-            asker: asker?,
-        },
-    ))
-}
-
-/// A holder's answer to an audit ask (spec §13.3).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AuditAnswer {
-    /// The piece's whole Data packet.
-    Piece(Bytes),
-    /// The holder does not hold it and knows no record that ends it: it lost
-    /// it, or never held it.
-    Missing,
-    /// To a `whole` ask: SHA-256 over the nonce and every piece of the
-    /// version in order ([`version_proof`]).
-    Proof([u8; 32]),
-    /// The holder dropped it as its writer pruned it: the prune record's
-    /// packet, which the auditor verifies and takes.
-    PrunedBy(Bytes),
-    /// The holder never kept it as a members record refuses its version: the
-    /// record's packet, which the auditor verifies and takes.
-    RefusedBy(Bytes),
-    /// The holder dropped the piece as its version's keep passed by the
-    /// holder's own clock (spec §14.1): no answer, unless the writer's signed
-    /// keep proves it false beyond the auditor's clock skew (§13.3).
-    Expired,
-}
-
-/// Encode an audit answer (the Content of the holder's signed reply).
-pub fn encode_audit_answer(a: &AuditAnswer) -> Bytes {
-    let mut w = TlvWriter::new();
-    w.write_nested(tlv::AUDIT_ANSWER, |w| match a {
-        AuditAnswer::Piece(wire) => w.write_tlv(tlv::PIECE, wire),
-        AuditAnswer::Missing => w.write_tlv(tlv::MISSING, &[]),
-        AuditAnswer::Proof(d) => w.write_tlv(tlv::PROOF, d),
-        AuditAnswer::PrunedBy(wire) => w.write_tlv(tlv::PRUNED_BY, wire),
-        AuditAnswer::RefusedBy(wire) => w.write_tlv(tlv::REFUSED_BY, wire),
-        AuditAnswer::Expired => w.write_tlv(tlv::EXPIRED, &[]),
-    });
-    w.finish()
-}
-
-/// Decode an audit answer.
-pub fn decode_audit_answer(content: Bytes) -> Result<AuditAnswer, WireError> {
-    let mut r = TlvReader::new(content);
-    let (typ, value) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
-    if typ != tlv::AUDIT_ANSWER || !r.is_empty() {
-        return Err(bad("an audit answer is one AuditAnswer"));
-    }
-    let mut answer = None;
-    each(value, |t, v| {
-        match t {
-            tlv::PIECE => answer = Some(AuditAnswer::Piece(v)),
-            tlv::MISSING => answer = Some(AuditAnswer::Missing),
-            tlv::PROOF => answer = Some(AuditAnswer::Proof(read_digest(&v)?)),
-            tlv::PRUNED_BY => answer = Some(AuditAnswer::PrunedBy(v)),
-            tlv::REFUSED_BY => answer = Some(AuditAnswer::RefusedBy(v)),
-            tlv::EXPIRED => answer = Some(AuditAnswer::Expired),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
-    answer.ok_or_else(|| {
-        bad("an audit answer carries a piece or a proof, or says why the piece is not held")
-    })
-}
-
-/// The proof a `whole` audit ask is answered with: SHA-256 over `nonce`
-/// then, for each of `pieces` (the version's log entry, its manifest nodes
-/// in heap order, its chunks in order), its length (8 octets, big-endian)
-/// and its whole packet. Only a device holding every piece when asked
-/// computes it.
-pub fn version_proof<'a>(
-    nonce: &[u8; NONCE_LEN],
-    pieces: impl IntoIterator<Item = &'a [u8]>,
-) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(nonce);
-    for p in pieces {
-        h.update((p.len() as u64).to_be_bytes());
-        h.update(p);
-    }
-    h.finalize().into()
 }
 
 /// A manifest node's Content: the digests it lists, in order.
@@ -2035,45 +1724,6 @@ pub struct ChunksBody {
     pub root: [u8; 32],
 }
 
-/// The body of a hold log entry: an owner device's custody policy for a
-/// collection (spec §13).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HoldBody {
-    /// The collection to hold.
-    pub collection: Name,
-    /// How many holders.
-    pub copies: u32,
-    /// Until when.
-    pub until: Timestamp,
-    /// What the asker had applied of the collection when it asked.
-    pub at: Frontier,
-    /// The holder devices the owner chose (by name, ascending): only their
-    /// leases answering this record count, and only they are asked.
-    pub holders: Vec<Name>,
-}
-
-/// The body of a lease log entry: a holder's promise (spec §13).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LeaseBody {
-    /// The collection held.
-    pub collection: Name,
-    /// The owner's hold record the lease answers.
-    pub hold: Name,
-    /// Until when.
-    pub until: Timestamp,
-    /// What the holder held, verified, when it signed.
-    pub holds: Frontier,
-}
-
-/// The body of a prune log entry (spec §14).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PruneBody {
-    /// A collection, or one of the pruner's version names in it.
-    pub prefix: Name,
-    /// Up to where, for the pruner's own key only.
-    pub upto: Frontier,
-}
-
 /// One removal in a members record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CutBody {
@@ -2148,12 +1798,6 @@ pub enum Record {
     Members(MembersBody),
     /// A snapshot's pins.
     Snapshot(Vec<Name>),
-    /// A hold record.
-    Hold(HoldBody),
-    /// A lease.
-    Lease(LeaseBody),
-    /// A prune record.
-    Prune(PruneBody),
     /// An introduction's offer or use mark (spec §19).
     Intro(crate::intro::IntroRecord),
 }
@@ -2166,12 +1810,6 @@ impl Record {
             Record::Version(b) => Some(b.collection.clone()),
             Record::Members(b) => Some(b.collection.clone()),
             Record::Snapshot(_) => None,
-            Record::Hold(b) => Some(b.collection.clone()),
-            Record::Lease(b) => Some(b.collection.clone()),
-            Record::Prune(b) => match parse_log_name(&b.prefix) {
-                Some(l) => l.subject,
-                None => Some(b.prefix.clone()),
-            },
             Record::Intro(r) => r.subject(),
         }
     }
@@ -2376,7 +2014,7 @@ fn read_keep(v: Bytes) -> Result<Option<Keep>, WireError> {
     Ok(keep)
 }
 
-/// What a device keeps of a version it dropped (pruned, or expired by its
+/// What a device keeps of a version it dropped (expired by its
 /// clock): its writer, its keep and the dates of its first and last entry,
 /// so its own summary goes on listing it as the log does, a `get` answers
 /// why, and a range read places it. A local value, never published.
@@ -2567,54 +2205,12 @@ pub fn encode_snapshot(pins: &[Name]) -> Bytes {
     w.finish()
 }
 
-/// Encode a hold record.
-pub fn encode_hold(b: &HoldBody) -> Bytes {
-    let mut w = TlvWriter::new();
-    w.write_nested(tlv::HOLD_RECORD, |w| {
-        write_name(w, &b.collection);
-        write_nni(w, tlv::COPIES, u64::from(b.copies));
-        write_nni(w, tlv::KEEP_UNTIL, b.until.0);
-        write_frontier(w, &b.at);
-        w.write_nested(tlv::HOLDERS, |w| {
-            for h in &b.holders {
-                write_name(w, h);
-            }
-        });
-    });
-    w.finish()
-}
-
-/// Encode a lease.
-pub fn encode_lease(b: &LeaseBody) -> Bytes {
-    let mut w = TlvWriter::new();
-    w.write_nested(tlv::LEASE_RECORD, |w| {
-        write_name(w, &b.collection);
-        write_name(w, &b.hold);
-        write_nni(w, tlv::KEEP_UNTIL, b.until.0);
-        write_frontier(w, &b.holds);
-    });
-    w.finish()
-}
-
-/// Encode a prune record.
-pub fn encode_prune(b: &PruneBody) -> Bytes {
-    let mut w = TlvWriter::new();
-    w.write_nested(tlv::PRUNE_RECORD, |w| {
-        write_name(w, &b.prefix);
-        write_frontier(w, &b.upto);
-    });
-    w.finish()
-}
-
 /// Encode any log record.
 pub fn encode_record(r: &Record) -> Bytes {
     match r {
         Record::Version(b) => encode_version(b),
         Record::Members(b) => encode_members(b),
         Record::Snapshot(p) => encode_snapshot(p),
-        Record::Hold(b) => encode_hold(b),
-        Record::Lease(b) => encode_lease(b),
-        Record::Prune(b) => encode_prune(b),
         Record::Intro(r) => r.encode(),
     }
 }
@@ -2640,117 +2236,10 @@ pub fn decode_record(content: Bytes) -> Result<Record, WireError> {
             })?;
             Ok(Record::Snapshot(pins))
         }
-        tlv::HOLD_RECORD => decode_hold(value).map(Record::Hold),
-        tlv::LEASE_RECORD => decode_lease(value).map(Record::Lease),
-        tlv::PRUNE_RECORD => decode_prune(value).map(Record::Prune),
         tlv::INTRO_OFFER | tlv::INTRO_USED => {
             crate::intro::IntroRecord::decode(typ, value).map(Record::Intro)
         }
         other => Err(bad(format!("{other:#x} is not a log record"))),
-    }
-}
-
-fn decode_hold(value: Bytes) -> Result<HoldBody, WireError> {
-    let (mut collection, mut copies, mut until, mut at) = (None, None, None, None);
-    let mut holders: Option<Vec<Name>> = None;
-    each(value, |t, v| {
-        match t {
-            tlv_type::NAME => collection = Some(read_name(v)?),
-            tlv::COPIES => {
-                copies = Some(u32::try_from(read_nni(&v)?).map_err(|_| bad("copies fit 32 bits"))?)
-            }
-            tlv::KEEP_UNTIL => until = Some(Timestamp(read_nni(&v)?)),
-            tlv::FRONTIER => at = Some(read_frontier(v)?),
-            tlv::HOLDERS => {
-                let mut list = Vec::new();
-                each(v, |t, v| {
-                    if t != tlv_type::NAME {
-                        return Ok(false);
-                    }
-                    let h = read_name(v)?;
-                    if !is_device_name(&h) {
-                        return Err(bad(format!("holder {h} is not a device name")));
-                    }
-                    list.push(h);
-                    Ok(true)
-                })?;
-                holders = Some(list);
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
-    match (collection, copies, until, at, holders) {
-        (Some(collection), Some(copies), Some(until), Some(at), Some(holders))
-            if is_collection_name(&collection) =>
-        {
-            Ok(HoldBody {
-                collection,
-                copies,
-                until,
-                at,
-                holders,
-            })
-        }
-        _ => Err(bad(
-            "a hold record names a collection, how many copies, until when, a frontier, and \
-             the holders",
-        )),
-    }
-}
-
-fn decode_lease(value: Bytes) -> Result<LeaseBody, WireError> {
-    let mut names = Vec::new();
-    let (mut until, mut holds) = (None, None);
-    each(value, |t, v| {
-        match t {
-            tlv_type::NAME => names.push(read_name(v)?),
-            tlv::KEEP_UNTIL => until = Some(Timestamp(read_nni(&v)?)),
-            tlv::FRONTIER => holds = Some(read_frontier(v)?),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
-    let bad_lease = || {
-        bad("a lease names a collection, the hold record it answers, until when, and a frontier")
-    };
-    let [collection, hold]: [Name; 2] = names.try_into().map_err(|_| bad_lease())?;
-    let held_about = parse_log_name(&hold).and_then(|l| l.subject);
-    match (until, holds) {
-        (Some(until), Some(holds))
-            if is_collection_name(&collection) && held_about.as_ref() == Some(&collection) =>
-        {
-            Ok(LeaseBody {
-                collection,
-                hold,
-                until,
-                holds,
-            })
-        }
-        _ => Err(bad_lease()),
-    }
-}
-
-fn decode_prune(value: Bytes) -> Result<PruneBody, WireError> {
-    let (mut prefix, mut upto) = (None, None);
-    each(value, |t, v| {
-        match t {
-            tlv_type::NAME => prefix = Some(read_name(v)?),
-            tlv::FRONTIER => upto = Some(read_frontier(v)?),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
-    match (prefix, upto) {
-        (Some(prefix), Some(upto))
-            if is_collection_name(&prefix)
-                || parse_log_name(&prefix).is_some_and(|l| l.subject.is_some()) =>
-        {
-            Ok(PruneBody { prefix, upto })
-        }
-        _ => Err(bad(
-            "a prune record names a collection or a version, and the frontier it prunes up to",
-        )),
     }
 }
 
@@ -4432,10 +3921,6 @@ mod tests {
             freshness: 60_000,
         };
         assert_eq!(decode_head(encode_head(&h)), Ok(h));
-        assert_eq!(
-            decode_audit_answer(encode_audit_answer(&AuditAnswer::Expired)),
-            Ok(AuditAnswer::Expired)
-        );
     }
 
     /// Routing a name by its keyword (`served_kind`, `NameWords`) decides what the chains of
@@ -4452,7 +3937,6 @@ mod tests {
             seq: Seq(3),
         };
         let log = log_name(&device, Some(&c), 7);
-        let asker = Bytes::from_static(b"proof");
         let mut names = vec![
             Name::from_components([]),
             n("/alice/laptop"),
@@ -4476,36 +3960,16 @@ mod tests {
                     epoch,
                 },
             ),
-            hold_ask_name(
-                &device,
-                &HoldAsk {
-                    record: log.clone(),
-                    nonce: [1; NONCE_LEN],
-                    asker: asker.clone(),
-                },
-            ),
-            audit_ask_name(
-                &device,
-                &AuditAsk {
-                    nonce: [2; NONCE_LEN],
-                    piece: log.clone(),
-                    whole: true,
-                    asker,
-                },
-            ),
             held_name(&device, &log),
             held_name(&device, &n("/bob/phone/32=log/seq=1")),
             crate::intro::intro_name(&device, b"params"),
             crate::intro::hint_name(&device, &[3; crate::intro::HINT_TOKEN_LEN]),
             // Mixed and misplaced keywords: a keyword after another, after a digest, twice.
-            n("/alice/laptop/32=log/32=hold/x"),
-            n("/alice/laptop/32=hold/32=held/x"),
             n("/alice/laptop/32=held/32=held/x"),
             n("/32=grant"),
             n("/alice/32=grant"),
             n("/alice/32=range/x"),
             n("/alice/32=data/a/32=range/x/32=state/y"),
-            n("/alice/laptop/32=audit"),
             n("/alice/laptop/32=intro"),
             n("/alice/laptop/32=hint"),
         ];
@@ -4522,27 +3986,21 @@ mod tests {
         let chain = |name: &Name| {
             if parse_grant_name(name).is_some() {
                 Some(Served::Grant)
-            } else if parse_hold_ask_name(name).is_some() {
-                Some(Served::Hold)
             } else if crate::intro::parse_intro_name(name).is_some() {
                 Some(Served::Intro)
             } else if crate::intro::parse_hint_name(name).is_some() {
                 Some(Served::Hint)
             } else if parse_held_name(name).is_some() {
                 Some(Served::Held)
-            } else if parse_audit_ask_name(name).is_some() {
-                Some(Served::Audit)
             } else {
                 None
             }
         };
         let routed = |name: &Name| match served_kind(name)? {
             Served::Grant => parse_grant_name(name).map(|_| Served::Grant),
-            Served::Hold => parse_hold_ask_name(name).map(|_| Served::Hold),
             Served::Intro => crate::intro::parse_intro_name(name).map(|_| Served::Intro),
             Served::Hint => crate::intro::parse_hint_name(name).map(|_| Served::Hint),
             Served::Held => parse_held_name(name).map(|_| Served::Held),
-            Served::Audit => parse_audit_ask_name(name).map(|_| Served::Audit),
         };
         let mut seen = std::collections::BTreeSet::new();
         for name in &names {
@@ -4567,6 +4025,6 @@ mod tests {
                 "{name}: a range name without 32=range"
             );
         }
-        assert_eq!(seen.len(), 6, "the table reaches every route: {seen:?}");
+        assert_eq!(seen.len(), 4, "the table reaches every route: {seen:?}");
     }
 }

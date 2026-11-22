@@ -87,21 +87,6 @@ impl Keys {
             None => held.push((c, key)),
         }
     }
-
-    /// Destroy the content key of `epoch` of `c`: the held copy is dropped
-    /// (and zeroed, [`ContentKey`] is `ZeroizeOnDrop`). Whether one was held.
-    pub(crate) fn forget(&mut self, c: &Name, epoch: &Epoch) -> bool {
-        let Some(held) = self.held.get_mut(epoch) else {
-            return false;
-        };
-        let before = held.len();
-        held.retain(|(at, _)| at != c);
-        let forgot = held.len() < before;
-        if held.is_empty() {
-            self.held.remove(epoch);
-        }
-        forgot
-    }
 }
 
 /// Seal a version's fields and operation under `key`, bound to its name.

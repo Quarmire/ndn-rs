@@ -9,7 +9,6 @@
 use ndn_foundation_types::Name;
 
 use crate::collection::Cut;
-use crate::statement::Prune;
 use crate::version::{Keep, Timestamp, VersionId, Writer};
 
 /// What the caller can do about an error, by class. A host words the step
@@ -41,11 +40,8 @@ pub enum NextStep {
     /// Ask again with a name the layer can use: the error says how such a
     /// name is formed.
     FixName,
-    /// Ask holders to keep it first (`hold`), and audit them: nothing
-    /// confirms it is kept anywhere else.
-    HoldFirst,
     /// Ask again as the error says: the request, as given, asks for
-    /// something no device does (a prune past the log, too few holders).
+    /// something no device does.
     FixRequest,
     /// Run a program that knows the named merge rule: this one holds the
     /// collection's versions and reads them under no other rule.
@@ -292,14 +288,6 @@ pub enum DataError {
         /// Why not, and how to name it.
         why: String,
     },
-    /// The data was pruned by its writer; this reader knows the prune.
-    #[error("{name} was pruned by {by:?}")]
-    Pruned {
-        /// The name asked for.
-        name: Name,
-        /// The prune record that covers it.
-        by: Prune,
-    },
     /// The data's keep passed by this device's clock (spec §14.1): it
     /// dropped it and keeps none of it, whoever else may still hold it.
     #[error("{name} expired: its keep {keep:?} passed by this device's clock")]
@@ -334,12 +322,6 @@ pub enum DataError {
         /// The collection.
         collection: Name,
     },
-    /// Prune reaches only the pruner's own writes (model change M9).
-    #[error("{prefix} holds versions this key did not write; prune covers only its own writes")]
-    NotOwnWrites {
-        /// The prefix asked for.
-        prefix: Name,
-    },
     /// This device is not in the data's seal audience.
     #[error("{name} is sealed to an audience this device is not in")]
     Sealed {
@@ -360,26 +342,6 @@ pub enum DataError {
         size: u64,
         /// The most a version of the collection carries.
         limit: u64,
-    },
-    /// Prune does not apply to this collection's rule (spec §14).
-    #[error("{name} cannot be pruned: {why}")]
-    NotPrunable {
-        /// The name given.
-        name: Name,
-        /// Why, and what to do instead.
-        why: String,
-    },
-    /// Nothing confirms the data is kept anywhere but here, so this device
-    /// keeps its copy.
-    #[error(
-        "{name} is not released: {why}; ask holders that keep it to hold it (hold), then release \
-         it again"
-    )]
-    NotHeld {
-        /// The name given.
-        name: Name,
-        /// Why the evidence did not suffice: which holders proved what.
-        why: String,
     },
     /// The request asks for something no device does as given.
     #[error("{name}: {why}")]
@@ -443,9 +405,7 @@ impl DataError {
     pub fn next(&self) -> NextStep {
         match self {
             DataError::Unavailable { .. } | DataError::NotReady { .. } => NextStep::RetryLater,
-            DataError::NotFound { .. } | DataError::Pruned { .. } | DataError::Expired { .. } => {
-                NextStep::None
-            }
+            DataError::NotFound { .. } | DataError::Expired { .. } => NextStep::None,
             DataError::BadName { .. } | DataError::TooLarge { .. } => NextStep::FixName,
             DataError::Refused { why, .. } => match why {
                 Refusal::OutsideCut(_)
@@ -463,8 +423,6 @@ impl DataError {
             },
             DataError::NotAllowed { .. } | DataError::Sealed { .. } => NextStep::AskOwner,
             DataError::NotOwner { .. } => NextStep::UseOwnerDevice,
-            DataError::NotOwnWrites { .. } | DataError::NotPrunable { .. } => NextStep::EditInstead,
-            DataError::NotHeld { .. } => NextStep::HoldFirst,
             DataError::BadRequest { .. } => NextStep::FixRequest,
             DataError::Local { .. } => NextStep::FixLocal,
             DataError::RuleUnknown { .. } => NextStep::UpdateProgram,
