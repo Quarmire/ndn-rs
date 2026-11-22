@@ -1152,7 +1152,7 @@ mod tests {
         // A rule one record changed wins over one that kept the parent's;
         // two changes, the highest signer's.
         let merged = Rule::Merge {
-            function: n("/merge/yrs"),
+            function: n(crate::merge::NEWEST),
         };
         let changed = from(Members {
             rule: merged.clone(),

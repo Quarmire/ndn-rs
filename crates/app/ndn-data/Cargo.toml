@@ -1,6 +1,6 @@
 [package]
 name = "ndn-data"
-description = "Data layer: named, signed, versioned data — the contract (model types, the five verbs get, put, watch, snapshot, share) and its reference implementation over NDN"
+description = "Data layer: named, signed, versioned data — the contract (model types, the verbs get, put, watch, share) and its reference implementation over NDN"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -34,7 +34,6 @@ subtle       = "2"
 getrandom    = { workspace = true }
 tracing      = { workspace = true }
 web-time     = { workspace = true }
-yrs          = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ndn-packet = { workspace = true, features = ["std"] }

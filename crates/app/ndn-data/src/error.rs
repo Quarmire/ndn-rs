@@ -107,18 +107,17 @@ pub enum Refusal {
         /// The last seq this device wrote.
         head: u64,
     },
-    /// The collection's merge rule refuses its operation: its check, which
-    /// sees the operation and its past alone, failed, for good.
+    /// The collection's merge rule refuses the version: a register version
+    /// whose bytes travel in pieces, not in its own record.
     Rule {
         /// The rule's reason.
         why: String,
     },
     /// One of its parents names a packet this reader cannot take as what
-    /// it was made over (spec §5.2): the packet held at that writer and seq
+    /// it was made over (spec §5): the packet held at that writer and seq
     /// has another digest (its writer named a packet that does not exist,
-    /// or that parent's key signed two at one seq — an equivocation), the
-    /// parent carries no digest, or — of a checkpoint — that parent never
-    /// applies here, so the checkpoint cannot stand for what lies below it.
+    /// or that parent's key signed two at one seq — an equivocation), or
+    /// the parent carries no digest.
     Parent {
         /// The parent named.
         parent: VersionId,
@@ -126,7 +125,7 @@ pub enum Refusal {
         why: String,
     },
     /// It was made for another merge rule than the one the collection's
-    /// members record names now (spec §5.1): its writer had not heard of
+    /// members record names now (spec §5): its writer had not heard of
     /// the change. Its operation is read only under the rule it was made
     /// for.
     OtherRule {

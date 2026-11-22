@@ -3,7 +3,7 @@
 //! Each verb maps one-to-one onto the model; nothing is added for
 //! convenience. Deliberately absent: open/close/seek (versions are whole
 //! values), mkdir (a collection exists when its first version is put),
-//! locks and transactions (per-writer logs, merge rules, snapshots), ACLs
+//! locks and transactions (per-writer logs, merge rules), ACLs
 //! (members record and seal, edited by `share`), sync settings (`watch` is
 //! sync), accounts (keys belong to devices), routes and cache control.
 
@@ -15,9 +15,8 @@ use ndn_foundation_types::Name;
 
 use crate::collection::{Rule, Summary};
 use crate::error::{DataError, Refusal};
-use crate::merge::Value;
-use crate::statement::Snapshot;
 use crate::version::{Audience, Content, Frontier, Keep, TypeId, Version, VersionId, Writer};
+use bytes::Bytes;
 
 /// The options of a [`put`](DataLayer::put).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -28,57 +27,44 @@ pub struct PutOptions {
     pub keep: Keep,
 }
 
-/// Why a held, verified version is not in a state's value (spec §15).
-///
-/// The two kinds differ in how they end: the layer's own wait ends when
-/// what it waits for arrives, and the version then counts
-/// ([`Change::Counted`]); a rule's exclusion does not end by waiting.
-/// `Display` is the bare reason.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum NotCounted {
-    /// The layer's own wait: a basis or the pieces of the version are still
-    /// arriving. It ends: the version then counts and [`Change::Counted`]
-    /// follows.
-    Waits(String),
-    /// A rule's own exclusion (its [`Counting::NotCounted`]), or an apply
-    /// that failed: it does not end by waiting.
-    ///
-    /// [`Counting::NotCounted`]: crate::merge::Counting::NotCounted
-    Excluded(String),
-}
-
-impl NotCounted {
-    /// The reason, as a bare string, whichever kind it is.
-    pub fn reason(&self) -> &str {
-        match self {
-            NotCounted::Waits(why) | NotCounted::Excluded(why) => why,
-        }
-    }
-}
-
-impl std::fmt::Display for NotCounted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.reason())
-    }
-}
-
 /// A merged value at a frontier, for a collection with a merge rule (model
 /// change M10). Filled by slice 1.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
-    /// A name for exactly this state; a [`Snapshot`] pins it so it can be
-    /// cited.
-    pub name: Name,
     /// The collection.
     pub collection: Name,
     /// The versions the state is computed from.
     pub at: Frontier,
     /// The merged value, as the collection's rule defines it.
     pub value: Value,
-    /// Versions of the collection held here that are not in `value`, with
-    /// why (sorted by id): the rule's `NotCounted` (inside `at`), as
-    /// [`NotCounted::Excluded`].
-    pub not_counted: Vec<(VersionId, NotCounted)>,
+}
+
+/// The merged value: the rule defines it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Value {
+    /// Named fields.
+    Fields(Content),
+    /// The rule's own encoding; the crate that defines the rule decodes it.
+    /// The register's is `by ‖ bytes`.
+    Rule(Bytes),
+}
+
+impl Value {
+    /// The fields, when the rule merges into named fields.
+    pub fn fields(&self) -> Option<&Content> {
+        match self {
+            Value::Fields(c) => Some(c),
+            Value::Rule(_) => None,
+        }
+    }
+
+    /// The rule's own encoding, when it has one.
+    pub fn bytes(&self) -> Option<&Bytes> {
+        match self {
+            Value::Rule(b) => Some(b),
+            Value::Fields(_) => None,
+        }
+    }
 }
 
 /// What a [`get`](DataLayer::get) found.
@@ -87,10 +73,8 @@ pub enum Got {
     /// One exact version: asked by its name, or the newest of a log
     /// collection.
     Version(Version),
-    /// The merged state of a merge collection, or a state named exactly.
+    /// The merged state of a merge collection.
     State(State),
-    /// A snapshot, asked by its name.
-    Snapshot(Snapshot),
 }
 
 /// How old an answer may be (model invariant 5, "stale, never wrong").
@@ -166,38 +150,6 @@ pub enum Change {
         first: Equivocal,
         /// The conflicting version.
         second: Equivocal,
-    },
-    /// A held, verified version that is not in the state: the rule's
-    /// [`NotCounted`](crate::merge::Counting::NotCounted). Shown, never
-    /// dropped. A version whose reason moves from a [`NotCounted::Waits`] to
-    /// an [`NotCounted::Excluded`] (or back) is told again.
-    NotCounted {
-        /// The version's collection.
-        collection: Name,
-        /// The version.
-        id: VersionId,
-        /// Why it is not in the state.
-        why: NotCounted,
-    },
-    /// A version reported [`NotCounted`](Change::NotCounted) now counts.
-    Counted {
-        /// The version's collection.
-        collection: Name,
-        /// The version.
-        id: VersionId,
-    },
-    /// The value of a merge collection changed with no version delivered:
-    /// `bases`, covered versions that versions applied here were made over
-    /// (spec §5.2, covered versions as a basis), arrived after those
-    /// versions applied without them, and the rule merged them again
-    /// against them. Told to every watcher of the collection, whatever its
-    /// frontier, only when the value changed; `get` the collection for its
-    /// value now.
-    Remerged {
-        /// The collection.
-        collection: Name,
-        /// The bases handed, as the rule took them.
-        bases: Vec<VersionId>,
     },
     /// The watcher fell behind: it left [`Config::watch_queue`] changes
     /// unread, so the changes after it were dropped until it read what was
@@ -319,9 +271,6 @@ impl Change {
             Change::Version(v) => &v.collection,
             Change::Withdrawn { collection, .. }
             | Change::Equivocation { collection, .. }
-            | Change::NotCounted { collection, .. }
-            | Change::Counted { collection, .. }
-            | Change::Remerged { collection, .. }
             | Change::Lagged { collection }
             | Change::Untracked { collection, .. }
             | Change::NotAdopted { collection, .. }
@@ -405,9 +354,9 @@ pub struct ShareChange {
 /// One device's data layer: the five verbs, signing with this device's
 /// key.
 ///
-/// Code mostly uses `get`, `put` and `watch`, plus `snapshot` when several
-/// things change together. `hold`, `prune` and `share` run on host policy,
-/// or when the person makes that gesture. No implementation exists yet; the
+/// Code mostly uses `get`, `put` and `watch`. `hold`, `prune` and `share` run
+/// on host policy, or when the person makes that gesture. No implementation
+/// exists yet; the
 /// conformance cases in `ndn-sim` (`ndn-data-conformance`) are written
 /// against this trait.
 /// The futures are `Send` natively; on wasm32 (one thread, non-`Send`
@@ -417,7 +366,7 @@ pub struct ShareChange {
 pub trait DataLayer: Send + Sync {
     /// `get(name) → version or state + age`.
     ///
-    /// An exact version, state or snapshot by its name; or, by a
+    /// An exact version or state by its name; or, by a
     /// collection's name, the newest by its rule — for a merge collection,
     /// the merged state at a frontier — with how stale it may be. When no path
     /// answers, older verified data is returned with its [`Age`] rather than
@@ -432,9 +381,8 @@ pub trait DataLayer: Send + Sync {
     /// frontier this device has seen. The collection's members and the trust
     /// schema decide whether this key may write; the collection's seal
     /// applies. Fields of the current state that `options.type_id` does not
-    /// know are kept. In a merge
-    /// collection the rule makes the operation of the fields and checks and
-    /// applies it, as [`put_op`](Self::put_op) does. Filled by slice 1.
+    /// know are kept. A merge collection takes no fields:
+    /// [`DataError::BadRequest`], use [`put_op`](Self::put_op).
     async fn put(
         &self,
         collection: &Name,
@@ -442,13 +390,13 @@ pub trait DataLayer: Send + Sync {
         options: PutOptions,
     ) -> Result<VersionId, DataError>;
 
-    /// `put`, with the operation the app built: a new version of the merge
+    /// `put`, with the register's write: a new version of the merge
     /// collection `collection` carrying `op` as its `MergeOp`, its parents
-    /// the state's frontier. The collection's rule checks and applies it
-    /// first; one it refuses is [`DataError::BadRequest`] with the rule's
-    /// reason, and nothing is signed into the log. Merge collections whose
-    /// rule this device knows only ([`DataError::RuleUnknown`] otherwise; a
-    /// log collection is [`DataError::BadRequest`]).
+    /// the state's frontier. The register
+    /// ([`NEWEST`](crate::merge::NEWEST)) takes any bytes, and empty
+    /// bytes are a removal. Merge collections whose rule this device knows
+    /// only ([`DataError::RuleUnknown`] otherwise; a log collection is
+    /// [`DataError::BadRequest`]).
     async fn put_op(
         &self,
         collection: &Name,
@@ -463,21 +411,12 @@ pub trait DataLayer: Send + Sync {
     /// every collection under it, those created after the watch began
     /// included, by any writer, every change tagged with its collection
     /// ([`Change::collection`]); `since` filters each collection alike. The
-    /// listing shows what is applied (with [`Change::NotCounted`] for what
-    /// is held but not counted) and the equivocation evidence held; a
+    /// listing shows what is applied and the equivocation evidence held; a
     /// version not applied yet comes once it applies, so no version comes
     /// twice. Nested summaries let it descend only into children that
     /// changed. A watcher that leaves too many changes unread is told
     /// [`Change::Lagged`] rather than queued for without bound.
     async fn watch(&self, collection: &Name, since: &Frontier) -> Result<Changes, DataError>;
-
-    /// `snapshot(names | collections) → snapshot`.
-    ///
-    /// One signed record pinning, for each name, the exact version it names
-    /// or the collection's current state. Publishing it is the atomic
-    /// multi-object change; it also makes a merged state citable. Filled by
-    /// slice 2.
-    async fn snapshot(&self, of: &[Name]) -> Result<Snapshot, DataError>;
 
     /// `share(collection, {readers, writers})`.
     ///

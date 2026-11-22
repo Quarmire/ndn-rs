@@ -18,10 +18,9 @@
 //! its parents as [`Parents`]: a [`Frontier`] bound to its tips' digests. A
 //! collection has a [`Rule`] (log or
 //! merge) and an owner-signed [`Members`] record saying who writes and who
-//! reads. Everything else is a version that says something about other
-//! versions: a [`Summary`] (what a collection holds, signed, nested by
-//! digest), a [`Cut`] (removal or revocation: "up to here") and a [`Snapshot`]
-//! (exact versions or a state). A [`Seal`] says who
+//! reads. A [`Cut`] (removal or revocation: "up to here") and a [`Summary`]
+//! (what a collection holds, signed, nested by digest) say something about
+//! other versions. A [`Seal`] says who
 //! may read, over people, devices and groups — never apps. Content is typed
 //! ([`TypeId`]) and writers keep fields they do not understand.
 //!
@@ -37,7 +36,7 @@
 //!
 //! | caller | verbs |
 //! |---|---|
-//! | lens or service code | [`get`](DataLayer::get), [`put`](DataLayer::put), [`watch`](DataLayer::watch), and [`snapshot`](DataLayer::snapshot) when several things change together |
+//! | lens or service code | [`get`](DataLayer::get), [`put`](DataLayer::put), [`watch`](DataLayer::watch) |
 //! | host, by policy defaults | [`share`](DataLayer::share); a lens calls it only when the person makes that gesture |
 //!
 //! # Slices
@@ -47,7 +46,7 @@
 //!
 //! | slice | fills |
 //! |---|---|
-//! | 1 | versions, members records (owner-signed, writers of any prefix), the merge rule ([`merge`]), signed nested summaries, `get`, `put`, `watch`, `snapshot` of states and versions, `share` that adds |
+//! | 1 | versions, members records (owner-signed, writers of any prefix), the merge rule ([`merge`]), signed nested summaries, `get`, `put`, `watch`, `share` that adds |
 //! | 2 | members of other namespaces reached through their own groups, `share` that removes (cuts) and changes the rule, re-check on cut arrival (`Withdrawn`), seals (epoch keys granted to the audience), the log rule |
 //! | 3 | large payloads |
 //! | 5 | revocation as a cut, owner re-admission of honest work |
@@ -70,7 +69,6 @@ mod pieces;
 mod rt;
 mod seal;
 pub mod signal;
-pub mod statement;
 mod tree;
 pub mod version;
 pub mod wire;
@@ -86,15 +84,11 @@ pub use intro::{
     JoinedFolder, Offer, Role,
 };
 pub use layer::{
-    Age, Answer, Change, Changes, DataLayer, Equivocal, Got, NotCounted, PutOptions, Share,
-    ShareChange, Sharing, State,
-};
-pub use merge::{
-    Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value, Yrs,
+    Age, Answer, Change, Changes, DataLayer, Equivocal, Got, PutOptions, Share, ShareChange,
+    Sharing, State, Value,
 };
 pub use ndn_foundation_types::{Hash, Name};
 pub use signal::{SignalKey, SignalRefusal, SignalScope, SignalSender};
-pub use statement::Snapshot;
 pub use version::{
     Audience, Content, Frontier, Keep, Parents, Payload, Seal, Seq, Timestamp, TypeId, Version,
     VersionId, Writer,

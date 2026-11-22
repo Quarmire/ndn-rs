@@ -5,8 +5,7 @@
 //! neither signs a default record nor cuts.
 
 use super::*;
-use crate::layer::Share;
-use crate::merge::Value;
+use crate::layer::{Share, Value};
 use ndn_app::AppError;
 use ndn_security::TrustSchema;
 use ndn_sync::MemoryStore;
@@ -55,9 +54,9 @@ fn share(rule: Rule, writers: &[&str], readers: Vec<Audience>) -> Share {
     }
 }
 
-fn yrs() -> Rule {
+fn register() -> Rule {
     Rule::Merge {
-        function: crate::merge::Yrs::new().function().clone(),
+        function: n(crate::merge::NEWEST),
     }
 }
 
@@ -85,6 +84,11 @@ fn options() -> PutOptions {
 
 fn reading(t: u64) -> Content {
     Content::new().with("t", Bytes::from(t.to_string()))
+}
+
+/// A register's write.
+fn op(t: u64) -> Bytes {
+    Bytes::from(t.to_string())
 }
 
 /// The parts a device is started from, so a test can start it again.
@@ -253,7 +257,7 @@ async fn inheriting(readers: Vec<Audience>) -> (Device, Name) {
 #[tokio::test]
 async fn a_first_own_record_changing_the_rule_starts_after_what_was_applied() {
     let (dev, bob) = inheriting(Vec::new()).await;
-    dev.share(&plan(), share(yrs(), &[], Vec::new()))
+    dev.share(&plan(), share(register(), &[], Vec::new()))
         .await
         .unwrap();
     let m = own(&dev, &plan());
@@ -309,18 +313,18 @@ async fn a_first_own_record_narrowing_the_writers_cuts_and_keeps_their_past() {
 async fn a_refused_edit_leaves_the_merge_state_as_it_was() {
     let dev = device("/alice/laptop", &["/alice"]).await;
     let c = n("/alice/32=data/notebook");
-    dev.put(&c, reading(1), options()).await.unwrap();
+    dev.put_op(&c, op(1), options()).await.unwrap();
     let value = |dev: &Device| -> Value {
         dev.inner.st.lock().colls[&c]
             .state
             .as_ref()
             .unwrap()
-            .value(&BTreeSet::new())
+            .value()
     };
     let (before, head) = (value(&dev), dev.inner.st.lock().head);
-    // Fields and operation together pass the most a version carries.
-    let huge = Content::new().with("t", Bytes::from(vec![7u8; 33 << 20]));
-    let refused = dev.put(&c, huge, options()).await.unwrap_err();
+    // More than a register's version carries.
+    let huge = Bytes::from(vec![7u8; wire::INLINE_MAX + 1]);
+    let refused = dev.put_op(&c, huge, options()).await.unwrap_err();
     assert!(matches!(refused, DataError::TooLarge { .. }), "{refused}");
     assert_eq!(value(&dev), before, "the refused edit is not in the state");
     assert_eq!(dev.inner.st.lock().head, head, "nothing signed");
@@ -332,18 +336,17 @@ async fn a_refused_operation_into_a_new_collection_signs_no_members_record() {
     let dev = device("/alice/laptop", &["/alice"]).await;
     let c = n("/alice/32=data/notebook");
     let head = dev.inner.st.lock().head;
-    let refused = dev
-        .put_op(&c, Bytes::from_static(b"not an update"), options())
-        .await
-        .unwrap_err();
-    assert!(matches!(refused, DataError::BadRequest { .. }), "{refused}");
+    // A register's bytes ride in its version: more than fits is refused.
+    let big = Bytes::from(vec![7u8; wire::INLINE_MAX + 1]);
+    let refused = dev.put_op(&c, big, options()).await.unwrap_err();
+    assert!(matches!(refused, DataError::TooLarge { .. }), "{refused}");
     {
         let st = dev.inner.st.lock();
         assert_eq!(st.head, head, "nothing signed");
         assert!(st.colls.get(&c).is_none_or(|x| x.line.own.is_none()));
     }
     // The collection is still the app's to create.
-    dev.put(&c, reading(1), options()).await.unwrap();
+    dev.put_op(&c, op(1), options()).await.unwrap();
     assert_eq!(own(&dev, &c).revision, Seq(1));
     dev.shutdown();
 }
@@ -467,11 +470,11 @@ async fn an_owner_device_not_synced_signs_no_default_record() {
     // The phone, never walked here, may hold the folder's record.
     knows(&dev, "/alice/phone", 3, 0);
     let head = dev.inner.st.lock().head;
-    not_ready(dev.put(&plan(), reading(1), options()).await.unwrap_err());
+    not_ready(dev.put_op(&plan(), op(1), options()).await.unwrap_err());
     assert_eq!(dev.inner.st.lock().head, head, "no record signed");
     // Synced, the collection is created.
     synced(&dev, "/alice/phone");
-    dev.put(&plan(), reading(1), options()).await.unwrap();
+    dev.put_op(&plan(), op(1), options()).await.unwrap();
     assert_eq!(own(&dev, &plan()).revision, Seq(1));
     dev.shutdown();
 }
@@ -503,12 +506,12 @@ async fn a_device_walked_in_an_earlier_run_holds_nothing_back_until_it_moves() {
     let dev = walked_earlier(&parts, &[plan()]).await;
     // Offline since, at the head walked: nothing held back.
     knows(&dev, "/alice/phone", 3, 3);
-    dev.put(&notes(), reading(1), options()).await.unwrap();
+    dev.put_op(&notes(), op(1), options()).await.unwrap();
     // Heard at a newer head not walked yet: it may hold a folder record.
     knows(&dev, "/alice/phone", 5, 3);
     let head = dev.inner.st.lock().head;
     let later = n("/alice/32=data/docs/later");
-    not_ready(dev.put(&later, reading(1), options()).await.unwrap_err());
+    not_ready(dev.put_op(&later, op(1), options()).await.unwrap_err());
     assert_eq!(dev.inner.st.lock().head, head, "no record signed");
     dev.shutdown();
 }
@@ -521,10 +524,10 @@ async fn a_walk_that_never_went_toward_the_folder_does_not_count_for_it() {
     let dev = walked_earlier(&parts, &[n("/alice/32=data/photos")]).await;
     knows(&dev, "/alice/phone", 3, 3);
     let head = dev.inner.st.lock().head;
-    not_ready(dev.put(&notes(), reading(1), options()).await.unwrap_err());
+    not_ready(dev.put_op(&notes(), op(1), options()).await.unwrap_err());
     assert_eq!(dev.inner.st.lock().head, head, "no record signed");
     // A collection with no folder above it is not held back by it.
-    dev.put(&n("/alice/32=data/diary"), reading(1), options())
+    dev.put_op(&n("/alice/32=data/diary"), op(1), options())
         .await
         .unwrap();
     dev.shutdown();
@@ -616,7 +619,7 @@ async fn a_lost_device_marked_suspected_is_not_waited_for() {
     let dev = device("/alice/laptop", &["/alice"]).await;
     // The phone, lost before this device ever walked it.
     knows(&dev, "/alice/phone", 3, 0);
-    let refused = dev.put(&plan(), reading(1), options()).await.unwrap_err();
+    let refused = dev.put_op(&plan(), op(1), options()).await.unwrap_err();
     match &refused {
         DataError::NotReady { why, .. } => {
             assert!(why.contains("/alice/phone"), "names the device: {why}")
@@ -629,7 +632,7 @@ async fn a_lost_device_marked_suspected_is_not_waited_for() {
         .lock()
         .suspected
         .insert(n("/alice/phone/KEY/1"), Timestamp(1));
-    dev.put(&plan(), reading(1), options()).await.unwrap();
+    dev.put_op(&plan(), op(1), options()).await.unwrap();
     assert_eq!(own(&dev, &plan()).revision, Seq(1));
     dev.shutdown();
 }
@@ -1034,7 +1037,10 @@ async fn a_collection_a_walk_listed_under_a_followed_folder_is_read_under_the_fo
     let owner = device("/alice/laptop", &["/alice", "/bob"]).await;
     let f = folder();
     owner
-        .share_folder(&f, share(yrs(), &["/alice", "/bob"], Vec::new()).into())
+        .share_folder(
+            &f,
+            share(register(), &["/alice", "/bob"], Vec::new()).into(),
+        )
         .await
         .unwrap();
     assert_eq!(relay(&owner, &dev, &f, 1), None);
@@ -1120,9 +1126,12 @@ async fn a_new_collection_under_a_held_folder_record_is_put_without_waiting_for_
     )
     .await
     .unwrap();
-    dev.share_folder(&ops, share(yrs(), &["/alice", "/bob"], Vec::new()).into())
-        .await
-        .unwrap();
+    dev.share_folder(
+        &ops,
+        share(register(), &["/alice", "/bob"], Vec::new()).into(),
+    )
+    .await
+    .unwrap();
     hears(&dev, "/alice/phone").await;
 
     let (refused, spent) = took(dev.put(&plan(), reading(1), options())).await;
@@ -1141,11 +1150,7 @@ async fn a_new_collection_under_a_held_folder_record_is_put_without_waiting_for_
     );
 
     let a = ops.clone().append("a");
-    let op = crate::merge::Yrs::new()
-        .start(&a, &Writer::new(key(dev.name())))
-        .edit(&reading(1))
-        .unwrap();
-    let (second, spent) = took(dev.put_op(&a, op, options())).await;
+    let (second, spent) = took(dev.put_op(&a, op(1), options())).await;
     second.unwrap();
     assert!(
         spent < LOCAL,

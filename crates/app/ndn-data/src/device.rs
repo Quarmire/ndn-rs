@@ -2,8 +2,8 @@
 //! [`DataLayer`] over NDN (`docs/specs/data-layer.md`).
 //!
 //! A device signs with its own key and publishes only under its own name. It
-//! keeps one log (its key's sequence of entries: versions, members records,
-//! snapshots) and, per namespace it writes into, a nested summary of that log
+//! keeps one log (its key's sequence of entries: versions and members
+//! records) and, per namespace it writes into, a nested summary of that log
 //! (`docs/specs/data-layer.md` §7). It learns what others wrote from their summaries: State
 //! Vector Sync in the namespace's group (`<namespace>/32=sync`) only says
 //! that a writer moved; the reader then fetches the writer's signed root,
@@ -78,16 +78,11 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::collection::{self, Accepted, Child, Cut, Epoch, Members, Resolve, Rule, Summary};
 use crate::error::{DataError, Refusal};
-use crate::layer::{
-    Age, Answer, Change, Changes, DataLayer, Equivocal, Got, NotCounted, PutOptions, State,
-};
-use crate::merge::{
-    Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value,
-};
+use crate::layer::{Age, Answer, Change, Changes, DataLayer, Equivocal, Got, PutOptions, State};
+use crate::merge::{self, MergeState, Op, Past};
 use crate::pieces::{self, Shape};
 use crate::rt::{self, Instant};
 use crate::seal::{self, Keys};
-use crate::statement::Snapshot;
 use crate::tree::{Kind, Tree};
 use crate::version::{
     Audience, Content, Frontier, Keep, Parents, Payload, Seal, Seq, Timestamp, TypeId, Version,
@@ -97,8 +92,8 @@ use crate::wire::{
     self, Branches, ChunksBody, CutBody, GrantAsk, MembersBody, NodeBody, PieceKind, Record,
     SealedBody, VersionBody, cut_bytes_prefix, device_of, grant_name, log_name, namespace_of,
     node_name, page_name, parse_cut_bytes_name, parse_grant_name, parse_held_name, parse_log_name,
-    parse_piece_name, parse_seal_key_name, parse_state_name, parse_summary_name, piece_name,
-    piece_names, root_name, root_prefix, seal_key_name, seqs_of, state_name, subject_namespace,
+    parse_piece_name, parse_seal_key_name, parse_summary_name, piece_name, root_name, root_prefix,
+    seal_key_name, seqs_of, subject_namespace,
 };
 use ndn_security::confidentiality::{ContentKey, RecipientKey, Sealed, wrap_ck_to};
 
@@ -121,8 +116,6 @@ const ROOT_FRESHNESS: Duration = Duration::ZERO;
 pub struct Config {
     /// State Vector Sync settings for every group the device joins.
     pub svs: SvsConfig,
-    /// The merge functions the device can run.
-    pub rules: MergeRules,
     /// The device's wall clock, for the dates it writes.
     pub clock: Clock,
     /// Interest lifetime of every fetch: one ask lasts it, and an Interest
@@ -173,8 +166,8 @@ pub struct Config {
 }
 
 impl Config {
-    /// Defaults: SVS's reference timing, the standard merge rules, the
-    /// system clock, 2 s Interests, a 4 s first look, 32 asks in flight per
+    /// Defaults: SVS's reference timing, the system clock, 2 s Interests, a
+    /// 4 s first look, 32 asks in flight per
     /// walk and 256 per device, 8 asker proofs verified at once, the
     /// operating system's randomness, no introducer, the default
     /// introductions ([`crate::intro::IntroPolicy::new`]), 4096 changes a
@@ -183,7 +176,6 @@ impl Config {
     pub fn new() -> Self {
         Self {
             svs: SvsConfig::default(),
-            rules: MergeRules::standard(),
             clock: Arc::new(|| {
                 let since = web_time::SystemTime::now()
                     .duration_since(web_time::UNIX_EPOCH)
@@ -216,7 +208,6 @@ impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
             .field("svs", &self.svs)
-            .field("rules", &self.rules)
             .field("lifetime", &self.lifetime)
             .field("first_look", &self.first_look)
             .field("window", &self.window)
@@ -240,7 +231,7 @@ pub struct CutBound {
     /// its key was marked suspected, [`Device::suspected`]).
     pub held_before: Option<Timestamp>,
     /// Keep, per collection, only entries at or below this seq; when given,
-    /// a collection it does not name, and snapshots, keep nothing.
+    /// a collection it does not name, and entries of no collection, keep nothing.
     pub upto: BTreeMap<Name, u64>,
 }
 
@@ -278,8 +269,8 @@ pub struct Device {
 
 struct HeldVersion {
     version: Version,
-    /// Its operation, once its payload is opened (empty under the log
-    /// rule).
+    /// Its operation (empty under the log rule, and when the payload is in
+    /// pieces).
     op: Bytes,
     wire: Bytes,
     /// The implicit digest of `wire`: the version's content address.
@@ -290,15 +281,10 @@ struct HeldVersion {
     epoch: Option<Epoch>,
     /// Its payload in pieces, when it travels so (spec §13.1).
     chunks: Option<ChunksBody>,
-    /// Whether `op` is its operation: inline, or in pieces held whole and
-    /// opened ([`open_held`]). A merge version applies only opened; once
-    /// applied, an operation in pieces is let go ([`Self::unloaded`]) and
-    /// read again from the pieces when needed.
-    opened: bool,
 }
 
 impl HeldVersion {
-    /// A version as held: opened unless its payload is in pieces. Its
+    /// A version as held. Its
     /// digest is the version's ([`Version::digest`], of `wire`).
     fn new(
         version: Version,
@@ -315,26 +301,8 @@ impl HeldVersion {
             wire,
             sealed,
             epoch,
-            opened: chunks.is_none(),
             chunks,
         }
-    }
-
-    /// This version without its operation in memory, when that travels in
-    /// pieces (up to 64 MiB) and is in memory: what is applied needs no
-    /// operation until the state is computed anew, which opens it again
-    /// from the pieces. `None` when there is nothing to let go.
-    fn unloaded(&self) -> Option<Self> {
-        (self.chunks.is_some() && self.opened).then(|| HeldVersion {
-            version: self.version.clone(),
-            op: Bytes::new(),
-            wire: self.wire.clone(),
-            digest: self.digest,
-            sealed: self.sealed,
-            epoch: self.epoch.clone(),
-            chunks: self.chunks,
-            opened: false,
-        })
     }
 }
 
@@ -608,24 +576,6 @@ struct Coll {
     line: Line,
     /// The merge state, once the rule is known and this device runs it.
     state: Option<Box<dyn MergeState>>,
-    /// Versions of the collection held here that are not in the state's
-    /// value, with why, by id: the rule's `NotCounted` answers, as its
-    /// `counting_changed` moves them, and applies that failed (each inside
-    /// the state's frontier). Rebuilt with the state.
-    not_counted: BTreeMap<VersionId, String>,
-    /// What the rule's check made of each version it checked
-    /// ([`OpKind`]); a checked checkpoint covers its past (spec §5.2).
-    /// Cleared with the state.
-    kinds: HashMap<VersionId, OpKind>,
-    /// Admitted versions (and sealed ones held locked) by the implicit
-    /// digest of their packet, for [`Past::by_digest`]. An entry whose
-    /// version is no longer held, or is refused, is checked away on lookup.
-    by_digest: HashMap<[u8; 32], VersionId>,
-    /// Pending versions in pieces found not whole: not looked for again
-    /// until their pieces arrive ([`St::pieces_arrived`]) or the state is
-    /// rebuilt, so an arrival costs no scan of every waiting version's
-    /// pieces.
-    unwhole: BTreeSet<VersionId>,
     /// Every admitted version held, applied or waiting for its parents (or,
     /// under a merge rule this device does not know, held and never
     /// applied).
@@ -644,8 +594,8 @@ struct Coll {
     waiting: Vec<Arc<HeldVersion>>,
     /// Held but refused: by the newest members record — their keys are not
     /// writers, they lie outside a cut, or they are not sealed in a sealed
-    /// collection — or by the collection's merge rule. A later revision
-    /// that admits them admits them (and the rule judges them again).
+    /// collection — or because their operation travels in pieces. A later
+    /// revision that admits them admits them.
     outsiders: Vec<Arc<HeldVersion>>,
     /// Verified, sealed in an epoch whose key this device does not hold
     /// (yet, or ever: it is not of the audience).
@@ -656,27 +606,6 @@ struct Coll {
     /// that its cut does not accept, and that no exact re-admission brought
     /// in, never applies: nothing waits for it.
     revoked: HashMap<Writer, Cut>,
-    /// A merge collection whose state is not built yet (spec §5.2, lazy
-    /// state): what the store holds of it as applied when this device last
-    /// stopped, as an index only. Its versions are loaded from the store,
-    /// and its state built from them, on the first need ([`St::wake`]).
-    dormant: Option<Dormant>,
-    /// The checkpoints applied here and what they cover ([`Cover`], spec
-    /// §5.2): a version inside a cover counts as the checkpoints covering
-    /// it count, and the rule's word on it is not told. Cleared with the
-    /// state.
-    cover: Cover,
-}
-
-/// A merge collection's versions the store holds as applied, not loaded
-/// ([`Coll::dormant`]).
-#[derive(Default)]
-struct Dormant {
-    /// Per writer, the seqs of its versions held.
-    held: BTreeMap<Writer, BTreeSet<u64>>,
-    /// The writers those versions name among their parents, whose
-    /// revocation cuts the collection notes ([`Inner::note_revoked`]).
-    parents: BTreeSet<Writer>,
 }
 
 /// What an own version carries, before it is signed.
@@ -721,26 +650,6 @@ impl Coll {
         }
     }
 
-    /// Its versions held that are not in the state's value, with why,
-    /// by id: the rule's `NotCounted`, and applies that failed.
-    fn not_counted_list(&self) -> Vec<(VersionId, NotCounted)> {
-        self.not_counted
-            .iter()
-            .map(|(id, why)| (id.clone(), NotCounted::Excluded(why.clone())))
-            .collect()
-    }
-
-    /// The applied versions the value leaves out besides those its rule
-    /// does not count: versions only checkpoints not counted cover
-    /// ([`Cover`]).
-    fn held_back(&self) -> BTreeSet<VersionId> {
-        self.not_counted
-            .keys()
-            .filter(|id| self.cover.inside(id))
-            .cloned()
-            .collect()
-    }
-
     fn at(&self) -> Frontier {
         self.applied
             .iter()
@@ -753,9 +662,8 @@ impl Coll {
 
     /// Its state's frontier as an own version's parents (spec §4): each
     /// tip with the implicit digest of its packet held here. In a merge
-    /// collection every tip is held (applied, or covered by a checkpoint
-    /// that applied only once each of its parents was held as the packet it
-    /// names).
+    /// collection every tip is held (applied once each of its parents was
+    /// held as the packet it names).
     fn parents(&self) -> Parents {
         self.applied
             .iter()
@@ -875,8 +783,7 @@ const CUT_KEPT_MAX: usize = 262_144;
 /// The first pause before something a fetch missed is asked for again
 /// (spec §17.1): a device's summary not reached or not processed in full
 /// ([`Inner::schedule`]), an epoch key no device granted
-/// ([`Inner::obtain`]), a merge version's pieces not all found
-/// ([`Inner::spawn_pieces`]), a removal cut's manifest packet a version
+/// ([`Inner::obtain`]), a removal cut's manifest packet a version
 /// waits for ([`Inner::fetch_wanted_bytes`]). Doubled after each further
 /// miss in a row up to [`REFRESH_PAUSE_MAX`] ([`retry_pause`]). Liveness
 /// only: what counts is decided by the versions held.
@@ -1131,7 +1038,6 @@ enum Held {
         digest: [u8; 32],
         signed: [u8; 32],
     },
-    Snapshot(Snapshot),
 }
 
 /// A log entry refused by the trust context governing its name, kept
@@ -1465,22 +1371,6 @@ struct St {
     /// Per group, the collections and folders whose own record in force
     /// names it a reader.
     sealed_to: HashMap<Name, BTreeSet<Subject>>,
-    /// Large versions whose pieces are being fetched.
-    fetching: BTreeSet<Name>,
-    /// Merge versions in pieces a fetch found whole: not fetched again
-    /// while they wait to open (for their epoch's key, or to apply).
-    walked: BTreeSet<Name>,
-    /// Merge versions in pieces a fetch did not find whole (yet): not
-    /// fetched again until [`Inner::retry_pieces`] asks.
-    unfound: BTreeSet<Name>,
-    /// Of those, how many fetches of each missed in a row: it is asked again
-    /// after [`retry_pause`] of that, while it is still wanted (spec §17.1).
-    /// From [`REFRESH_TRIES`] on, it no longer holds back the pieces of the
-    /// versions in its past ([`St::wanted_pieces`]).
-    piece_misses: HashMap<Name, u32>,
-    /// Descents of summaries under way ([`Descending`]): the pieces of the
-    /// merge versions they bring are fetched once none is.
-    descents: usize,
     /// The first log entry taken here at each seq of each key, of any
     /// collection and any kind: a key's log is one sequence (spec §4).
     seqs: HashMap<(Writer, u64), Name>,
@@ -1500,10 +1390,6 @@ struct St {
     /// different packets under (spec §4): kept in the store
     /// ([`equivocal_name`]) and read back at start, so the evidence lasts.
     twins: HashMap<Name, Bytes>,
-    /// The merge rules this device runs ([`Config::rules`]).
-    rules: MergeRules,
-    /// This device's writer.
-    me: Writer,
     /// Per asker device, its introduction and grant asks this device is
     /// working on.
     asks: HashMap<Name, usize>,
@@ -1520,16 +1406,8 @@ struct St {
     contexts: HashMap<Name, Arc<SignedTrustContext>>,
     /// Introductions: offers, use marks and answers (spec §19).
     intro: intro::Intros,
-    /// Whether the store is being read back at start ([`Inner::restore`]):
-    /// a merge collection's versions are then only indexed, its state not
-    /// built ([`Coll::dormant`]).
+    /// Whether the store is being read back at start ([`Inner::restore`]).
     restoring: bool,
-    /// The versions of each collection loaded from the store since it last
-    /// ran ([`St::wake`]): delivered before the device stopped, so not
-    /// delivered again as they apply.
-    woken: HashMap<Name, BTreeSet<VersionId>>,
-    /// The collections whose state is not built yet ([`Coll::dormant`]).
-    sleeping: BTreeSet<Name>,
     /// The persons' namespaces the records in force list as writers, and
     /// what is adopted of them for those records' subjects (spec §6.3).
     scopes: scoped::Scopes,
@@ -1617,7 +1495,6 @@ enum Verdict {
 fn held_signer<'a>(st: &'a St, name: &Name, held: &'a Held) -> Option<&'a Writer> {
     match held {
         Held::Version(id) => Some(&id.writer),
-        Held::Snapshot(s) => Some(&s.id.writer),
         Held::Record { writer, .. } => Some(writer),
         Held::Locked => parse_log_name(name)
             .and_then(|l| st.colls.get(&l.subject?))
@@ -1693,7 +1570,7 @@ fn skipped_by(
             .is_some_and(|s| s.contains(&id.seq.0))
 }
 
-/// What a collection's versions wait for (spec §5.2): the entries known
+/// What a collection's versions wait for (spec §5): the entries known
 /// here, and which of them never apply.
 #[derive(Clone, Copy)]
 struct Waits<'a> {
@@ -1796,58 +1673,8 @@ fn ready(w: &Waits, applied: &BTreeMap<Writer, u64>, v: &Version) -> bool {
         })
 }
 
-/// The versions `id`, naming `parents`, waits for (spec §5.2): its writer's
-/// previous entry here that applies at all, and each parent as far as it
-/// applies ([`needed`]).
-fn tips(w: &Waits, id: &VersionId, parents: &Frontier) -> Vec<VersionId> {
-    let at = |writer: &Writer, s: u64| VersionId {
-        writer: writer.clone(),
-        seq: Seq(s),
-    };
-    let prev = w.entries.get(&id.writer).and_then(|e| {
-        e.range(..id.seq.0)
-            .rev()
-            .find(|s| !w.never(&at(&id.writer, **s)))
-            .copied()
-    });
-    prev.map(|s| at(&id.writer, s))
-        .into_iter()
-        .chain(parents.iter().filter_map(|(y, t)| {
-            let need = needed(w, y, t.0);
-            (need > 0).then(|| at(y, need))
-        }))
-        .collect()
-}
-
-/// Whether every version of `v`'s past that applies at all is held here as
-/// a signed record, whole or not, opened or not (spec §5.2, a checkpoint's
-/// readiness): inside `applied`, admitted, or held sealed and locked —
-/// each with its own past held, down to what `applied` holds.
-fn past_held(w: &Waits, applied: &BTreeMap<Writer, u64>, v: &Version) -> bool {
-    let mut seen = BTreeSet::new();
-    let mut todo = tips(w, &v.id, v.parents.frontier());
-    while let Some(t) = todo.pop() {
-        if applied.get(&t.writer).is_some_and(|a| *a >= t.seq.0) || !seen.insert(t.clone()) {
-            continue;
-        }
-        if let Some(hv) = w.admitted.get(&t) {
-            todo.extend(tips(w, &t, hv.version.parents.frontier()));
-        } else if let Some(l) = w
-            .locked
-            .iter()
-            .find(|l| l.writer == t.writer && l.seq == t.seq.0)
-        {
-            todo.extend(tips(w, &t, l.body.parents.frontier()));
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
-/// P of version `v` (spec §5.2): its parents joined with (its writer,
-/// seq − 1). down(P) is what it was made over — for a checkpoint, what it
-/// covers.
+/// P of version `v` (spec §5): its parents joined with (its writer,
+/// seq − 1). down(P) is what it was made over.
 fn past_frontier(v: &Version) -> Frontier {
     let mut within = v.parents.frontier().clone();
     if let Some(before) = v.id.seq.0.checked_sub(1).filter(|s| *s > 0) {
@@ -1859,241 +1686,22 @@ fn past_frontier(v: &Version) -> Frontier {
     within
 }
 
-/// The covered versions of one merge collection fetched at once as the
-/// basis of versions written apart from a checkpoint (spec §5.2, bound):
-/// the writer of such a version chooses which covered versions it names,
-/// so their fetches are paced, the next as one ends.
-const BASIS_FETCHES: usize = 16;
-
-/// The checkpoints applied in a merge collection and what they cover
-/// (spec §5.2): a version inside the cover of one counts exactly when a
-/// checkpoint covering it counts — the rule's word on that checkpoint, or,
-/// for one itself covered, the same test — and the rule's word on the
-/// covered version itself is not told. A checkpoint covered by another is
-/// never applied by a state built from the newest checkpoint, so only the
-/// checkpoints no other covers decide: the same after a restart. Cleared
-/// with the state, with what the rule holds of the versions covered as a
-/// basis.
-#[derive(Clone, Default)]
-struct Cover {
-    /// Per writer, the highest seq inside the cover of any (the join of
-    /// their `P(CP)`).
-    join: BTreeMap<Writer, u64>,
-    /// Each checkpoint applied: its cover `P(CP)`, and why the rule does
-    /// not count it, if it does not.
-    checkpoints: BTreeMap<VersionId, (Frontier, Option<String>)>,
-    /// The checkpoints that count, as above.
-    counted: BTreeSet<VersionId>,
-    /// The versions inside the cover the rule holds as a basis (spec §5.2,
-    /// covered versions as a basis): applied before a checkpoint covered
-    /// them, or handed ([`MergeState::basis`]) — or found unfit to hand
-    /// (refused by the check, or not taken by the rule), alike on every
-    /// reader. Never handed again.
-    basis: BTreeSet<VersionId>,
-    /// The versions inside the cover that a version not covered, applied
-    /// or about to apply, is made over, not handed yet: not whole here (in
-    /// pieces not held, or sealed without the key). Their pieces are
-    /// fetched ([`St::wanted_pieces`]); each is handed once whole.
-    wanted: BTreeSet<VersionId>,
-    /// Each version waiting for bases in pieces still to be fetched
-    /// ([`Run::bases`]): those bases, and how many asks for any of them
-    /// missed while it waited. Once [`REFRESH_TRIES`] did, counted over
-    /// its whole basis set, it applies without the ones still missing,
-    /// which are handed when they arrive (spec §5.2): what it names delays
-    /// its exact merge, never its applying, however wide its past.
-    waiting: BTreeMap<VersionId, (BTreeSet<VersionId>, u32)>,
-}
-
-impl Cover {
-    /// Whether `id` lies inside the cover of a checkpoint applied.
-    fn inside(&self, id: &VersionId) -> bool {
-        self.join.get(&id.writer).is_some_and(|s| *s >= id.seq.0)
-    }
-
-    /// Checkpoint `id` applied, covering `cover`, counted as `counting`.
-    fn add(&mut self, id: &VersionId, cover: Frontier, counting: &Counting) {
-        for (w, s) in cover.iter() {
-            let j = self.join.entry(w.clone()).or_insert(0);
-            *j = (*j).max(s.0);
-        }
-        self.checkpoints
-            .insert(id.clone(), (cover, not_counted_why(counting)));
-        self.recompute();
-    }
-
-    /// The rule's counting of applied version `id` changed: whether it is
-    /// a checkpoint, so what it covers may count otherwise now.
-    fn recount(&mut self, id: &VersionId, counting: &Counting) -> bool {
-        let Some((_, why)) = self.checkpoints.get_mut(id) else {
-            return false;
-        };
-        *why = not_counted_why(counting);
-        self.recompute();
-        true
-    }
-
-    /// How version `id` counts by the checkpoints covering it: `None`
-    /// when none does; `Some(None)` counted; else why not.
-    fn counting(&self, id: &VersionId) -> Option<Option<String>> {
-        if !self.inside(id) {
-            return None;
-        }
-        let covering: Vec<&VersionId> = self
-            .checkpoints
-            .iter()
-            .filter(|(_, (cover, _))| cover.contains(id))
-            .map(|(k, _)| k)
-            .collect();
-        if covering.iter().any(|k| self.counted.contains(*k)) {
-            return Some(None);
-        }
-        // The newest of those no checkpoint covers names the reason: they
-        // are the ones a state built from the newest checkpoint applies.
-        let root = covering
-            .iter()
-            .rev()
-            .find(|k| !self.covered_by_other(k))
-            .or(covering.last());
-        let Some(k) = root else {
-            return Some(None);
-        };
-        Some(Some(match &self.checkpoints[*k].1 {
-            Some(why) if !self.covered_by_other(k) => format!(
-                "covered by the checkpoint {} seq {}, which its rule does not count: {why}",
-                k.writer.key(),
-                k.seq.0
-            ),
-            _ => format!(
-                "covered by the checkpoint {} seq {}, itself covered only by checkpoints its \
-                 rule does not count",
-                k.writer.key(),
-                k.seq.0
-            ),
-        }))
-    }
-
-    /// Whether another checkpoint applied covers checkpoint `k`.
-    fn covered_by_other(&self, k: &VersionId) -> bool {
-        self.checkpoints
-            .iter()
-            .any(|(o, (cover, _))| o != k && cover.contains(k))
-    }
-
-    /// The checkpoints that count: one no other covers, as its rule
-    /// counts it; one covered, when a checkpoint covering it counts.
-    fn recompute(&mut self) {
-        let mut counted: BTreeSet<VersionId> = BTreeSet::new();
-        loop {
-            let mut grew = false;
-            for (k, (_, why)) in &self.checkpoints {
-                if counted.contains(k) {
-                    continue;
-                }
-                let mut covering = self
-                    .checkpoints
-                    .iter()
-                    .filter(|(o, (cover, _))| *o != k && cover.contains(k))
-                    .peekable();
-                let counts = match covering.peek() {
-                    None => why.is_none(),
-                    Some(_) => covering.any(|(o, _)| counted.contains(o)),
-                };
-                if counts {
-                    counted.insert(k.clone());
-                    grew = true;
-                }
-            }
-            if !grew {
-                break;
-            }
-        }
-        self.counted = counted;
-    }
-}
-
-/// Why `counting` does not count, if it does not.
-fn not_counted_why(counting: &Counting) -> Option<String> {
-    match counting {
-        Counting::Counted => None,
-        Counting::NotCounted(why) => Some(why.clone()),
-    }
-}
-
-/// Count again by `cover` ([`Cover::counting`]) the applied versions
-/// among `ids` inside it — every applied version inside it when `None` —
-/// keeping `not_counted` as it says: each whose counting moved, with how
-/// it counts now (`None`: counted; else why not).
-fn recount_covered(
-    cover: &Cover,
-    not_counted: &mut BTreeMap<VersionId, String>,
-    versions: &BTreeMap<VersionId, Arc<HeldVersion>>,
-    pending: &BTreeSet<VersionId>,
-    ids: Option<Vec<VersionId>>,
-) -> Vec<(VersionId, Option<String>)> {
-    let ids: Vec<VersionId> = match ids {
-        Some(ids) => ids,
-        None => versions
-            .keys()
-            .filter(|id| cover.inside(id))
-            .cloned()
-            .collect(),
-    };
-    let mut moved = Vec::new();
-    for id in ids {
-        if pending.contains(&id) || !versions.contains_key(&id) {
-            continue;
-        }
-        let Some(now) = cover.counting(&id) else {
-            continue;
-        };
-        if not_counted.get(&id) == now.as_ref() {
-            continue;
-        }
-        match &now {
-            None => not_counted.remove(&id),
-            Some(why) => not_counted.insert(id.clone(), why.clone()),
-        };
-        moved.push((id, now));
-    }
-    moved
-}
-
-/// The past of a version as its rule sees it (spec §5.2): down
-/// ([`past_frontier`]) — the versions inside it not refused by their key —
-/// and, of those, the ones held here by the implicit digest of their packet:
-/// admitted, held sealed, or held and refused for what they carry or for
-/// their group (a version withdrawn after another was made over it is still
-/// what that one was made over). Every reader holds those before it judges
-/// a version over them: a parent that applies is applied first, and one
-/// refused for what it carries is held to be refused. A version refused by
-/// its key — a cut that does not list it, a key no writer, a revocation,
-/// an issuer no longer trusted — is in no past, whether this device holds
-/// it or not (a late reader never fetches it), so every reader answers
-/// alike.
+/// The past of a version as its rule sees it (spec §5): down
+/// ([`past_frontier`]) — the versions inside it not refused by their key.
+/// A version refused by its key — a cut that does not list it, a key no
+/// writer, a revocation, an issuer no longer trusted — is in no past,
+/// whether this device holds it or not (a late reader never fetches it), so
+/// every reader answers alike.
 struct PastOf<'a> {
     within: Frontier,
     waits: Waits<'a>,
-    by_digest: &'a HashMap<[u8; 32], VersionId>,
-    /// The versions held and refused.
-    outsiders: &'a [Arc<HeldVersion>],
-    /// The entries a trust context refuses ([`St::cut_out`]).
-    cut_out: &'a HashMap<Name, OutOfCut>,
 }
 
 impl<'a> PastOf<'a> {
-    fn new(
-        v: &Version,
-        waits: Waits<'a>,
-        by_digest: &'a HashMap<[u8; 32], VersionId>,
-        outsiders: &'a [Arc<HeldVersion>],
-        cut_out: &'a HashMap<Name, OutOfCut>,
-    ) -> Self {
+    fn new(v: &Version, waits: Waits<'a>) -> Self {
         PastOf {
             within: past_frontier(v),
             waits,
-            by_digest,
-            outsiders,
-            cut_out,
         }
     }
 
@@ -2107,23 +1715,6 @@ impl<'a> PastOf<'a> {
 impl Past for PastOf<'_> {
     fn contains(&self, id: &VersionId) -> bool {
         self.within.contains(id) && !self.key_refused(id)
-    }
-
-    fn by_digest(&self, digest: &[u8; 32]) -> Option<VersionId> {
-        if let Some(id) = self.by_digest.get(digest)
-            && self.waits.digest_of(id) == Some(*digest)
-            && self.contains(id)
-        {
-            return Some(id.clone());
-        }
-        self.outsiders
-            .iter()
-            .find(|hv| {
-                hv.digest == *digest
-                    && self.contains(&hv.version.id)
-                    && !self.cut_out.contains_key(&hv.version.name)
-            })
-            .map(|hv| hv.version.id.clone())
     }
 }
 
@@ -2161,92 +1752,15 @@ struct Signed {
     function: Option<Name>,
 }
 
-/// What a merge rule made of an own version.
-struct Ruled {
-    kind: OpKind,
-    counting: Counting,
-    /// Other versions whose counting changed, each with how it counts now.
-    changed: Vec<(VersionId, Counting)>,
-}
-
-/// `state`'s ruling on `held`, opened, against `past`: checked, and with
-/// `apply`, applied (else `Counted` is assumed).
-fn rule_on(
-    state: &mut (dyn MergeState + 'static),
-    held: &HeldVersion,
-    past: &PastOf<'_>,
-    apply: bool,
-) -> Result<Ruled, MergeError> {
-    let op = Op {
+/// Apply `held`, an own version, to `state` over `past`: the register's
+/// write.
+fn apply_own(state: &mut (dyn MergeState + 'static), held: &HeldVersion, past: &PastOf<'_>) {
+    state.apply(&Op {
         id: &held.version.id,
         digest: &held.digest,
-        parents: held.version.parents.frontier(),
         past,
         bytes: &held.op,
-        dated: held.version.dated,
-    };
-    let kind = state.check(&op)?;
-    if !apply {
-        return Ok(Ruled {
-            kind,
-            counting: Counting::Counted,
-            changed: Vec::new(),
-        });
-    }
-    let counting = state.apply(&op)?;
-    Ok(Ruled {
-        kind,
-        counting,
-        changed: state.counting_changed(),
-    })
-}
-
-/// What opening a version in pieces found.
-enum Opening {
-    /// Whole and opened: its operation.
-    Opened(Bytes),
-    /// The key of its epoch is not held (yet).
-    NoKey,
-    /// A piece is not held yet.
-    Missing,
-    /// Whole, and its payload does not open: its writer signed what does
-    /// not decode.
-    Bad,
-}
-
-/// Open `hv`, a version whose payload travels in pieces, from the pieces
-/// `store` holds (spec §13.1): assembled, each piece checked against its
-/// manifest, and unsealed under its epoch's key from `keys` (looked for
-/// first: it costs no read of the pieces).
-fn open_held(store: &dyn DataStore, keys: &Keys, hv: &HeldVersion) -> Opening {
-    let Some(chunks) = hv.chunks else {
-        return Opening::Missing;
-    };
-    let key = match &hv.epoch {
-        Some(e) => match keys.key(&hv.version.collection, e) {
-            Some(key) => Some(key),
-            None => return Opening::NoKey,
-        },
-        None => None,
-    };
-    let name = &hv.version.name;
-    if !piece_names(name, &chunks).all(|p| store.contains(&p)) {
-        return Opening::Missing;
-    }
-    let Some(payload) = pieces::assemble(name, &chunks, |p| store.get(p)) else {
-        return Opening::Missing;
-    };
-    let op = match key {
-        Some(key) => match seal::open_payload(&key, name, &payload) {
-            Some((_, op)) => op,
-            None => return Opening::Bad,
-        },
-        None => match wire::decode_payload(Bytes::from(payload)) {
-            Ok((_, op)) => op,
-            Err(_) => return Opening::Bad,
-        },
-    };
-    Opening::Opened(op)
+    });
 }
 
 /// The folder a collection is in: its name but the last component.
@@ -2256,86 +1770,32 @@ fn folder_of(c: &Name) -> Name {
 
 /// What a [`Run`] did with one version, in order.
 enum Ran {
-    /// Applied: by the rule, with what it made of it; or, under the log
-    /// rule or inside the record's `since`, taken without one (`Counted`).
-    Applied(VersionId, Counting),
-    /// Inside a checkpoint's past: in the frontier now, never applied to
-    /// the rule (spec §5.2).
-    Covered(VersionId),
-    /// Refused for good — by the rule, or its payload in pieces does not
-    /// open — and taken out of the admitted versions.
+    /// Applied: by the rule; or, under the log rule or inside the record's
+    /// `since`, taken without one.
+    Applied(VersionId),
+    /// Refused for good — by the rule — and taken out of the admitted
+    /// versions.
     Refused(Arc<HeldVersion>, Refusal),
-    /// Applied earlier, and its counting changed: it counts now, or no
-    /// longer (or for another reason), as the rule reports.
-    Counting(VersionId, Counting),
-    /// Bases handed after versions made over them applied without them,
-    /// which changed the value: what the rule took, in order.
-    Remerged(Vec<VersionId>),
 }
 
-/// What [`Run::take`] did with one version.
-enum Took {
-    Applied(OpKind),
-    Refused,
-    Waits,
-}
-
-/// What [`Run::hand`] did with one covered version wanted as a basis.
-enum Hand {
-    /// The rule holds it (or it is no basis on any reader).
-    Taken,
-    /// Its pieces are still to be fetched: what is made over it waits.
-    Fetching,
-    /// Not to be had now (found nowhere, or sealed without the key): what
-    /// is made over it applies without it, and it is handed on arrival.
-    Later,
-}
-
-/// The bases [`Run::run`] hands that arrived after what is made over them
-/// may have applied without them: the value before the first the rule
-/// took, and those it took.
-#[derive(Default)]
-struct Late {
-    before: Option<Value>,
-    taken: Vec<VersionId>,
-}
-
-/// One collection's pending versions run through its rule (spec §5.2):
+/// One collection's pending versions run through its rule (spec §5):
 /// each applied once its writer's earlier versions and its parents are; a
-/// merge version only once whole and opened, only if it was made for the
-/// rule in force, only over the very packets its parents name, and only if
-/// its rule's check passes against its past; a checkpoint as soon as its
-/// past is held, moving the frontier past what it covers. Under the log
-/// rule (`state` `None`) versions apply without a rule. The live state and
-/// [`St::value_at`] run the same procedure.
+/// merge version only if it carries its operation in its record, only if it
+/// was made for the rule in force, and only over the very packets its
+/// parents name. Under the log rule (`state` `None`) versions apply without
+/// a rule. The live state and [`St::value_at`] run the same procedure.
 struct Run<'a> {
     members: &'a Members,
     entries: &'a HashMap<Writer, BTreeSet<u64>>,
     locked: &'a [Locked],
     revoked: &'a HashMap<Writer, Cut>,
-    by_digest: &'a HashMap<[u8; 32], VersionId>,
-    /// The entries a trust context refuses ([`St::cut_out`]).
-    cut_out: &'a HashMap<Name, OutOfCut>,
-    store: &'a dyn DataStore,
-    keys: &'a Keys,
     state: Option<&'a mut (dyn MergeState + 'static)>,
     versions: &'a mut BTreeMap<VersionId, Arc<HeldVersion>>,
     skipped: &'a mut HashMap<Writer, BTreeSet<u64>>,
     applied: &'a mut BTreeMap<Writer, u64>,
     pending: &'a mut BTreeSet<VersionId>,
-    kinds: &'a mut HashMap<VersionId, OpKind>,
     /// The versions held and refused: those refused in this run join them.
     outsiders: &'a mut Vec<Arc<HeldVersion>>,
-    /// Pending versions found not whole ([`Coll::unwhole`]): not looked
-    /// for again until their pieces arrive.
-    unwhole: &'a mut BTreeSet<VersionId>,
-    /// The checkpoints applied and what they cover ([`Coll::cover`]).
-    cover: &'a mut Cover,
-    /// How many asks for each large version's pieces missed in a row
-    /// ([`St::piece_misses`]): a version made over one of them as a basis
-    /// applies without it once [`REFRESH_TRIES`] did (spec §5.2, when a
-    /// basis is gone).
-    misses: &'a HashMap<Name, u32>,
     out: Vec<Ran>,
 }
 
@@ -2358,48 +1818,18 @@ impl Run<'_> {
 
     fn is_ready(&self, id: &VersionId) -> bool {
         self.pending.contains(id)
-            && !self.unwhole.contains(id)
             && self
                 .versions
                 .get(id)
                 .is_some_and(|hv| ready(&self.waits(), self.applied, &hv.version))
     }
 
-    /// Apply everything that is ready; what was done, in order. Each round
-    /// first applies the newest checkpoint whose past is held, if there is
-    /// one ([`Self::checkpoint`]): it stands for everything it covers, which
-    /// is then never applied to the rule (spec §5.2) — so a collection read
-    /// from its versions anew applies its newest checkpoint and what came
-    /// after, whatever the order the versions were held in. A covered
-    /// version reaches the rule only as the basis of a version written
-    /// apart from the checkpoint ([`Self::bases`]): first, those that became
-    /// whole since they were wanted.
+    /// Apply everything that is ready; what was done, in order.
     fn run(mut self) -> Vec<Ran> {
-        let merge = self.state.is_some();
-        if merge {
+        if self.state.is_some() {
             self.other_rule();
-            self.cover();
-            // Bases wanted earlier, whole now: what is made over them may
-            // have applied without them, so the value may move; told when
-            // it did (spec §5.2).
-            let wanted: Vec<VersionId> = self.cover.wanted.iter().cloned().collect();
-            let mut late = Late::default();
-            for v in wanted {
-                self.hand(&v, Some(&mut late));
-            }
-            if let Some(before) = late.before
-                && !late.taken.is_empty()
-            {
-                let state = self.state.as_deref().expect("a merge run");
-                if state.value(&BTreeSet::new()) != before {
-                    self.out.push(Ran::Remerged(late.taken));
-                }
-            }
         }
         loop {
-            if merge && self.checkpoint() {
-                continue;
-            }
             let ready_now: Vec<VersionId> = self
                 .pending
                 .iter()
@@ -2411,14 +1841,7 @@ impl Run<'_> {
                 if !self.is_ready(&id) {
                     continue;
                 }
-                match self.take(&id) {
-                    Took::Applied(OpKind::Checkpoint) => {
-                        moved = true;
-                        break;
-                    }
-                    Took::Applied(OpKind::Edit) | Took::Refused => moved = true,
-                    Took::Waits => {}
-                }
+                moved |= self.take(&id);
             }
             if !moved {
                 break;
@@ -2428,7 +1851,7 @@ impl Run<'_> {
     }
 
     /// Every pending version made for another rule than the one in force
-    /// is refused (spec §5.1): what it carries is read only under its own.
+    /// is refused (spec §5): what it carries is read only under its own.
     /// Versions inside the record's `since` are its history, taken without
     /// a rule.
     fn other_rule(&mut self) {
@@ -2456,15 +1879,14 @@ impl Run<'_> {
         }
     }
 
-    /// Whether each parent of `id`, of `kind`, is held here as the very
-    /// packet it names (spec §5.2): `Ok(false)` while a parent that applies
-    /// is not held yet. A parent that never applies is no tip of an edit's
-    /// (it waits for what applies below it); a checkpoint cannot stand for
-    /// one. Refused for good when a parent carries no digest, names another
-    /// packet than the one held at its writer and seq, or — of a checkpoint
-    /// — never applies: every reader holding the same packets decides alike,
-    /// whatever order they arrived in.
-    fn parents_hold(&self, id: &VersionId, kind: OpKind) -> Result<bool, Refusal> {
+    /// Whether each parent of `id` is held here as the very packet it names
+    /// (spec §5): `Ok(false)` while a parent that applies is not held yet.
+    /// A parent that never applies is no tip (it waits for what applies
+    /// below it). Refused for good when a parent carries no digest, or names
+    /// another packet than the one held at its writer and seq: every reader
+    /// holding the same packets decides alike, whatever order they arrived
+    /// in.
+    fn parents_hold(&self, id: &VersionId) -> Result<bool, Refusal> {
         let Some(hv) = self.versions.get(id) else {
             return Ok(false);
         };
@@ -2483,14 +1905,6 @@ impl Run<'_> {
                 });
             };
             if needed(&w, y, t.0) != t.0 {
-                if kind == OpKind::Checkpoint {
-                    return Err(Refusal::Parent {
-                        parent,
-                        why: "that version never applies here, and a checkpoint stands only \
-                              for versions that apply"
-                            .into(),
-                    });
-                }
                 continue;
             }
             match w.digest_of(&parent) {
@@ -2510,25 +1924,8 @@ impl Run<'_> {
         Ok(true)
     }
 
-    /// Every pending version inside the frontier is covered by a
-    /// checkpoint: it never applies to the rule.
-    fn cover(&mut self) {
-        let covered: Vec<VersionId> = self
-            .pending
-            .iter()
-            .filter(|id| self.applied.get(&id.writer).is_some_and(|a| *a >= id.seq.0))
-            .cloned()
-            .collect();
-        for id in covered {
-            self.pending.remove(&id);
-            self.cover.waiting.remove(&id);
-            self.out.push(Ran::Covered(id));
-        }
-    }
-
     fn refuse(&mut self, id: &VersionId, why: Refusal) {
         self.pending.remove(id);
-        self.cover.waiting.remove(id);
         self.skipped
             .entry(id.writer.clone())
             .or_default()
@@ -2539,104 +1936,33 @@ impl Run<'_> {
         }
     }
 
-    /// Open `id` if its payload is in pieces held whole. Whether it is
-    /// opened; refused when it does not open.
-    fn whole(&mut self, id: &VersionId) -> Option<bool> {
-        let hv = self.versions.get(id)?;
-        if hv.opened {
-            return Some(true);
-        }
-        match open_held(self.store, self.keys, hv) {
-            Opening::Opened(op) => {
-                let opened = HeldVersion {
-                    version: hv.version.clone(),
-                    op,
-                    wire: hv.wire.clone(),
-                    digest: hv.digest,
-                    sealed: hv.sealed,
-                    epoch: hv.epoch.clone(),
-                    chunks: hv.chunks,
-                    opened: true,
-                };
-                self.versions.insert(id.clone(), Arc::new(opened));
-                Some(true)
-            }
-            Opening::Missing => {
-                self.unwhole.insert(id.clone());
-                None
-            }
-            Opening::NoKey => None,
-            Opening::Bad => {
-                tracing::debug!(?id, "refused: its payload in pieces does not open");
-                self.refuse(id, Refusal::BadSignature);
-                Some(false)
-            }
-        }
-    }
-
-    /// The rule's check of `id`, opened, against its past.
-    fn check(&self, id: &VersionId) -> Result<OpKind, MergeError> {
-        let hv = &self.versions[id];
-        let past = PastOf::new(
-            &hv.version,
-            self.waits(),
-            self.by_digest,
-            self.outsiders,
-            self.cut_out,
-        );
-        let op = Op {
-            id,
-            digest: &hv.digest,
-            parents: hv.version.parents.frontier(),
-            past: &past,
-            bytes: &hv.op,
-            dated: hv.version.dated,
-        };
-        self.state.as_deref().expect("a merge run").check(&op)
-    }
-
-    /// Apply `id`: ready, or a checkpoint whose past is held.
-    fn take(&mut self, id: &VersionId) -> Took {
+    /// Apply `id`, which is ready. Whether anything moved: not while a
+    /// parent that applies is not held here yet.
+    fn take(&mut self, id: &VersionId) -> bool {
         if self.state.is_none() || self.history(id) {
             self.pending.remove(id);
             self.applied.insert(id.writer.clone(), id.seq.0);
-            self.out.push(Ran::Applied(id.clone(), Counting::Counted));
-            return Took::Applied(OpKind::Edit);
+            self.out.push(Ran::Applied(id.clone()));
+            return true;
         }
-        match self.whole(id) {
-            None => return Took::Waits,
-            Some(false) => return Took::Refused,
-            Some(true) => {}
+        let hv = Arc::clone(&self.versions[id]);
+        if hv.chunks.is_some() {
+            tracing::debug!(?id, "refused: its operation travels in pieces");
+            let why = "a register version carries its bytes in its own record, and this one's \
+                       travel in pieces";
+            self.refuse(id, Refusal::Rule { why: why.into() });
+            return true;
         }
-        let kind = match self.kinds.get(id) {
-            Some(k) => Ok(*k),
-            None => self.check(id),
-        };
-        let kind = match kind {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::debug!(?id, "refused by its rule's check: {e}");
-                self.refuse(id, Refusal::Rule { why: e.0 });
-                return Took::Refused;
-            }
-        };
-        self.kinds.insert(id.clone(), kind);
-        match self.parents_hold(id, kind) {
+        match self.parents_hold(id) {
             Ok(true) => {}
-            Ok(false) => return Took::Waits,
+            Ok(false) => return false,
             Err(why) => {
                 tracing::debug!(?id, %why, "refused");
                 self.refuse(id, why);
-                return Took::Refused;
+                return true;
             }
         }
-        // An edit written apart from a checkpoint is merged against what it
-        // was made over: the covered versions of its past, handed first.
-        if kind == OpKind::Edit && !self.bases(id) {
-            return Took::Waits;
-        }
-        let hv = Arc::clone(&self.versions[id]);
-        let done = {
+        {
             // Its past, from the fields, while the state is borrowed.
             let waits = Waits {
                 collection: &self.members.collection,
@@ -2647,358 +1973,19 @@ impl Run<'_> {
                 revoked: self.revoked,
                 admitted: self.versions,
             };
-            let past = PastOf::new(
-                &hv.version,
-                waits,
-                self.by_digest,
-                self.outsiders,
-                self.cut_out,
-            );
-            let op = Op {
+            let past = PastOf::new(&hv.version, waits);
+            self.state.as_deref_mut().expect("a merge run").apply(&Op {
                 id,
                 digest: &hv.digest,
-                parents: hv.version.parents.frontier(),
                 past: &past,
                 bytes: &hv.op,
-                dated: hv.version.dated,
-            };
-            self.state.as_deref_mut().expect("a merge run").apply(&op)
-        };
-        // What the operation itself makes unacceptable its check refused,
-        // from the operation and its past alone; apply meets the state,
-        // which other writers' versions make, so what it answers never
-        // refuses a version (spec §5.1): the version is applied, not
-        // counted, with the reason.
-        let counting = done.unwrap_or_else(|e| {
-            tracing::debug!(?id, "not counted: its rule does not apply it here: {e}");
-            Counting::NotCounted(format!(
-                "its rule does not apply it to the state here: {}",
-                e.0
-            ))
-        });
+            });
+        }
         self.pending.remove(id);
-        // Applied, an operation in pieces is not kept in memory.
-        if let Some(unloaded) = hv.unloaded() {
-            self.versions.insert(id.clone(), Arc::new(unloaded));
-        }
-        if kind == OpKind::Checkpoint {
-            // What the rule applied of what the checkpoint covers stays in
-            // it, as a basis only ([`MergeState::apply`]): never handed.
-            let covers = past_frontier(&hv.version);
-            for (w, s) in covers.iter() {
-                let from = self.cover.join.get(w).map_or(1, |j| j + 1);
-                if from > s.0 {
-                    continue;
-                }
-                let lo = VersionId {
-                    writer: w.clone(),
-                    seq: Seq(from),
-                };
-                let hi = VersionId {
-                    writer: w.clone(),
-                    seq: s,
-                };
-                let ruled = self.versions.range(lo..=hi).filter(|(v, _)| {
-                    !self.pending.contains(*v)
-                        && self.applied.get(&v.writer).is_some_and(|a| *a >= v.seq.0)
-                });
-                let ruled: Vec<VersionId> = ruled.map(|(v, _)| v.clone()).collect();
-                self.cover.basis.extend(ruled);
-            }
-            // The frontier moves past everything the checkpoint covers:
-            // each of its parents, held as the packet it names.
-            for t in tips(&self.waits(), id, hv.version.parents.frontier()) {
-                let a = self.applied.entry(t.writer).or_insert(0);
-                *a = (*a).max(t.seq.0);
-            }
-            // What it covers counts as it counts, whether or not some of it
-            // was applied before.
-            self.cover.add(id, past_frontier(&hv.version), &counting);
-        }
         let a = self.applied.entry(id.writer.clone()).or_insert(0);
         *a = (*a).max(id.seq.0);
-        self.out.push(Ran::Applied(id.clone(), counting));
-        let changed = self
-            .state
-            .as_deref_mut()
-            .expect("a merge run")
-            .counting_changed();
-        for (other, counting) in &changed {
-            self.cover.recount(other, counting);
-        }
-        self.out.extend(
-            changed
-                .into_iter()
-                .map(|(id, counting)| Ran::Counting(id, counting)),
-        );
-        if kind == OpKind::Checkpoint {
-            self.cover();
-        }
-        Took::Applied(kind)
-    }
-
-    /// Hand the rule the basis of `id`, an edit about to apply (spec §5.2,
-    /// covered versions as a basis): each version inside the cover that it
-    /// was made over, apart from the checkpoints inside its past, which the
-    /// rule does not hold yet ([`Self::basis_of`]). Whether `id` applies
-    /// now: not while a basis in pieces is still to be fetched, until
-    /// [`REFRESH_TRIES`] asks for its bases missed in all ([`Cover::waiting`]).
-    /// One found nowhere, or sealed in an epoch whose key is not held, is
-    /// handed when it arrives; `id` applies without it meanwhile.
-    fn bases(&mut self, id: &VersionId) -> bool {
-        if self.cover.checkpoints.is_empty() {
-            return true;
-        }
-        let mut fetching = BTreeSet::new();
-        for v in self.basis_of(id) {
-            if let Hand::Fetching = self.hand(&v, None) {
-                fetching.insert(v);
-            }
-        }
-        let spent = self
-            .cover
-            .waiting
-            .get(id)
-            .is_some_and(|(_, missed)| *missed >= REFRESH_TRIES);
-        if fetching.is_empty() || spent {
-            if !fetching.is_empty() {
-                tracing::debug!(
-                    ?id,
-                    missing = fetching.len(),
-                    "applies without the bases still missing: {REFRESH_TRIES} asks for them missed"
-                );
-            }
-            self.cover.waiting.remove(id);
-            return true;
-        }
-        self.cover.waiting.entry(id.clone()).or_default().0 = fetching;
-        false
-    }
-
-    /// The versions `id` is merged against that a checkpoint applied here
-    /// covers and the rule does not hold: those inside `down(P(id))` and
-    /// in no `down(P(K))` of a checkpoint `K` applied here inside it, and
-    /// the same of each of them, by id. Each is a version of `C` that
-    /// exists here — an entry known, held as a signed record — and is
-    /// visited once, so what `id`'s writer names costs at most the history
-    /// the checkpoints cover (spec §5.2, bound).
-    fn basis_of(&self, id: &VersionId) -> Vec<VersionId> {
-        let w = self.waits();
-        let within = |u: &VersionId| -> Option<Frontier> {
-            let parents = match self.versions.get(u) {
-                Some(hv) => hv.version.parents.frontier(),
-                None => self
-                    .locked
-                    .iter()
-                    .find(|l| l.writer == u.writer && l.seq == u.seq.0)
-                    .map(|l| l.body.parents.frontier())?,
-            };
-            let mut p = parents.clone();
-            if let Some(before) = u.seq.0.checked_sub(1).filter(|s| *s > 0) {
-                p.include(&VersionId {
-                    writer: u.writer.clone(),
-                    seq: Seq(before),
-                });
-            }
-            Some(p)
-        };
-        let mut out: BTreeSet<VersionId> = BTreeSet::new();
-        let mut seen: BTreeSet<VersionId> = BTreeSet::new();
-        let mut todo = vec![id.clone()];
-        while let Some(u) = todo.pop() {
-            if !seen.insert(u.clone()) {
-                continue;
-            }
-            // A checkpoint applied here, now covered, stands for its past.
-            if u != *id && self.cover.checkpoints.contains_key(&u) {
-                continue;
-            }
-            let Some(p) = within(&u) else { continue };
-            // Below a checkpoint applied here inside it, that checkpoint
-            // stands for its past.
-            let mut floor: BTreeMap<&Writer, u64> = BTreeMap::new();
-            for (k, (covers, _)) in &self.cover.checkpoints {
-                if p.contains(k) {
-                    for (y, s) in covers.iter() {
-                        let f = floor.entry(y).or_insert(0);
-                        *f = (*f).max(s.0);
-                    }
-                }
-            }
-            for (y, t) in p.iter() {
-                let top = t.0.min(self.cover.join.get(y).copied().unwrap_or(0));
-                let lo = floor.get(y).copied().unwrap_or(0);
-                if lo >= top {
-                    continue;
-                }
-                let Some(seqs) = self.entries.get(y) else {
-                    continue;
-                };
-                for s in seqs.range(lo + 1..=top) {
-                    let v = VersionId {
-                        writer: y.clone(),
-                        seq: Seq(*s),
-                    };
-                    if self.cover.basis.contains(&v) || w.never(&v) || self.history(&v) {
-                        continue;
-                    }
-                    if out.insert(v.clone()) {
-                        todo.push(v);
-                    }
-                }
-            }
-        }
-        out.into_iter().collect()
-    }
-
-    /// Hand covered version `v` to the rule as a basis if it is whole here
-    /// ([`MergeState::basis`]): opened, checked against its own past (one
-    /// the check refuses, or whose pieces do not open, is no basis on any
-    /// reader, and never handed), and taken. Not whole, it is wanted: its
-    /// pieces fetched ([`St::wanted_pieces`]) and handed when they arrive.
-    /// `late`: one wanted before, which may change the value (what it was
-    /// before the first, and what the rule took, are kept there).
-    fn hand(&mut self, v: &VersionId, mut late: Option<&mut Late>) -> Hand {
-        if self.cover.basis.contains(v) {
-            self.cover.wanted.remove(v);
-            return Hand::Taken;
-        }
-        let Some(hv) = self.versions.get(v).cloned() else {
-            // Held sealed, its epoch's key not here: handed once it opens.
-            self.cover.wanted.insert(v.clone());
-            return Hand::Later;
-        };
-        let opened = if hv.opened {
-            None
-        } else {
-            match open_held(self.store, self.keys, &hv) {
-                Opening::Opened(op) => Some(op),
-                Opening::Missing => {
-                    self.cover.wanted.insert(v.clone());
-                    let gone = self
-                        .misses
-                        .get(&hv.version.name)
-                        .is_some_and(|m| *m >= REFRESH_TRIES);
-                    return if gone { Hand::Later } else { Hand::Fetching };
-                }
-                Opening::NoKey => {
-                    self.cover.wanted.insert(v.clone());
-                    return Hand::Later;
-                }
-                Opening::Bad => {
-                    tracing::debug!(?v, "no basis: its payload in pieces does not open");
-                    self.cover.wanted.remove(v);
-                    self.cover.basis.insert(v.clone());
-                    return Hand::Taken;
-                }
-            }
-        };
-        let taken = {
-            let waits = Waits {
-                collection: &self.members.collection,
-                members: Some(self.members),
-                entries: self.entries,
-                skipped: self.skipped,
-                locked: self.locked,
-                revoked: self.revoked,
-                admitted: self.versions,
-            };
-            let past = PastOf::new(
-                &hv.version,
-                waits,
-                self.by_digest,
-                self.outsiders,
-                self.cut_out,
-            );
-            let op = Op {
-                id: v,
-                digest: &hv.digest,
-                parents: hv.version.parents.frontier(),
-                past: &past,
-                bytes: opened.as_deref().unwrap_or(&hv.op),
-                dated: hv.version.dated,
-            };
-            let state = self.state.as_deref_mut().expect("a merge run");
-            if let Some(late) = late.as_deref_mut()
-                && late.before.is_none()
-            {
-                late.before = Some(state.value(&BTreeSet::new()));
-            }
-            state.check(&op).and_then(|_| state.basis(&op))
-        };
-        match taken {
-            Err(e) => tracing::debug!(?v, "no basis: its rule does not take it: {e}"),
-            Ok(()) => late.into_iter().for_each(|l| l.taken.push(v.clone())),
-        }
-        self.cover.wanted.remove(v);
-        self.cover.basis.insert(v.clone());
-        let changed = self
-            .state
-            .as_deref_mut()
-            .expect("a merge run")
-            .counting_changed();
-        for (other, counting) in &changed {
-            self.cover.recount(other, counting);
-        }
-        self.out.extend(
-            changed
-                .into_iter()
-                .map(|(id, counting)| Ran::Counting(id, counting)),
-        );
-        Hand::Taken
-    }
-
-    /// Apply the newest checkpoint whose past is held, if one is pending:
-    /// the pending versions are looked at newest first (by each writer's
-    /// seq), and each whose past is held is checked (once) to learn what
-    /// it is. A check that fails before the version is ready refuses
-    /// nothing: its rule judges it against its past applied, when it is
-    /// ready (spec §5.2). Whether anything changed.
-    fn checkpoint(&mut self) -> bool {
-        let candidates: Vec<VersionId> = self
-            .pending
-            .iter()
-            .filter(|id| {
-                !self.unwhole.contains(id)
-                    && self.kinds.get(id) != Some(&OpKind::Edit)
-                    && !self.history(id)
-            })
-            .cloned()
-            .collect();
-        for id in candidates.into_iter().rev() {
-            let held = self
-                .versions
-                .get(&id)
-                .is_some_and(|hv| past_held(&self.waits(), self.applied, &hv.version));
-            if !held {
-                continue;
-            }
-            match self.whole(&id) {
-                None => continue,
-                Some(false) => return true,
-                Some(true) => {}
-            }
-            if !self.kinds.contains_key(&id) {
-                match self.check(&id) {
-                    Ok(k) => {
-                        self.kinds.insert(id.clone(), k);
-                    }
-                    Err(e) if self.is_ready(&id) => {
-                        tracing::debug!(?id, "refused by its rule's check: {e}");
-                        self.refuse(&id, Refusal::Rule { why: e.0 });
-                        return true;
-                    }
-                    // Not ready: not a checkpoint now; its own turn decides.
-                    Err(_) => {}
-                }
-            }
-            if self.kinds.get(&id) == Some(&OpKind::Checkpoint)
-                && !matches!(self.take(&id), Took::Waits)
-            {
-                return true;
-            }
-        }
-        false
+        self.out.push(Ran::Applied(id.clone()));
+        true
     }
 }
 
@@ -3202,14 +2189,7 @@ impl St {
     /// folder. Owes a new record of this namespace's collections and
     /// folders where the merge leaves a reader to add or a removal undone,
     /// or where a group they are sealed to dropped a reader.
-    fn accept_members(
-        &mut self,
-        seq: u64,
-        body: MembersBody,
-        signer: &Writer,
-        rules: &MergeRules,
-        me: &Writer,
-    ) {
+    fn accept_members(&mut self, seq: u64, body: MembersBody, signer: &Writer) {
         let c = body.collection.clone();
         if body.folder && wire::check_collection_name(&c).is_err() {
             // A folder has a component after `32=data` (spec §6).
@@ -3296,8 +2276,8 @@ impl St {
             self.owed.entry(subject.clone()).or_insert(Owed::Merge);
         }
         match subject.folder {
-            true => self.refold_under(&c, rules, me),
-            false => self.refold(&c, rules, me),
+            true => self.refold_under(&c),
+            false => self.refold(&c),
         }
     }
 
@@ -3536,17 +2516,11 @@ impl St {
     /// with no record of its own that a folder governs takes the folder's
     /// (spec §6), so that what arrives for it is read, and what is put in
     /// it written, under that. Known from now on, a folder record taken
-    /// later sets it too ([`Self::refold_under`]). Once the device runs, a
-    /// merge collection's state is built here if it was not yet
-    /// ([`Self::awaken`]): what arrives for it, or is put in it, is judged
-    /// against it.
-    fn ensure(&mut self, c: &Name, rules: &MergeRules, me: &Writer) {
-        if !self.restoring {
-            self.awaken(c);
-        }
+    /// later sets it too ([`Self::refold_under`]).
+    fn ensure(&mut self, c: &Name) {
         let coll = self.colls.entry(c.clone()).or_default();
         if coll.members.is_none() && !self.folders_above(c).is_empty() {
-            self.refold(c, rules, me);
+            self.refold(c);
         }
     }
 
@@ -3556,13 +2530,11 @@ impl St {
     /// namespace's collections sealed to `c` as a group when `c` dropped a
     /// reader, and of `c` itself when a folder above dropped a reader its
     /// own record lists (spec §6).
-    fn refold(&mut self, c: &Name, rules: &MergeRules, me: &Writer) {
+    fn refold(&mut self, c: &Name) {
         let new = self.effective(c);
         if self.colls.get(c).is_some_and(|x| x.members == new) {
             return;
         }
-        // Its versions are read again under the new record: loaded first.
-        self.wake(c);
         let coll = self.colls.entry(c.clone()).or_default();
         if coll.members == new {
             return;
@@ -3613,7 +2585,7 @@ impl St {
             Self::tell_members(&mut self.watchers, c, own, old.as_ref(), new.as_ref());
         }
         if new.is_some() {
-            self.reread(c, rules, me);
+            self.reread(c);
         }
     }
 
@@ -3621,7 +2593,7 @@ impl St {
     /// every folder at or under `f`, and of every collection under it known
     /// here or looked at ([`Self::refold`]). Owes a new record of a folder
     /// under `f` of this namespace whose own readers lost one to `f`.
-    fn refold_under(&mut self, f: &Name, rules: &MergeRules, me: &Writer) {
+    fn refold_under(&mut self, f: &Name) {
         let folders: Vec<Name> = self
             .folders
             .keys()
@@ -3660,7 +2632,7 @@ impl St {
         let under = |n: &Name| n.has_prefix(f) && n != f;
         let colls: BTreeSet<Name> = self.colls.keys().filter(|n| under(n)).cloned().collect();
         for c in colls {
-            self.refold(&c, rules, me);
+            self.refold(&c);
         }
     }
 
@@ -3671,7 +2643,7 @@ impl St {
     /// ([`St::cut_out`]) — for its chain ([`Refusal::Untrusted`]) is
     /// withdrawn and reported to the watchers; one applied before and still
     /// admitted is not delivered again.
-    fn reread(&mut self, c: &Name, rules: &MergeRules, me: &Writer) {
+    fn reread(&mut self, c: &Name) {
         // Entries refused by a revocation as they arrived, never taken:
         // later versions do not wait for them.
         let cut_out: Vec<(Writer, u64)> = self
@@ -3683,19 +2655,6 @@ impl St {
                 (l.subject.as_ref() == Some(c)).then(|| (o.writer.clone(), l.seq))
             })
             .collect();
-        // At start a merge collection is only indexed: its state is built
-        // on the first need (spec §5.2, [`Self::wake`]).
-        if self.restoring && self.may_sleep(c) {
-            let coll = self.colls.get_mut(c).expect("may_sleep: held");
-            coll.state = None;
-            coll.dormant.get_or_insert_with(Dormant::default);
-            self.sleeping.insert(c.clone());
-            return;
-        }
-        // Its versions not loaded yet are read again with the rest; the
-        // loaded ones were delivered before.
-        self.wake(c);
-        let woken = self.woken.remove(c).unwrap_or_default();
         let Some(coll) = self.colls.get_mut(c) else {
             return;
         };
@@ -3704,7 +2663,7 @@ impl St {
         };
         // What was delivered: applied or covered (under a rule this device
         // does not know, held), and not refused since.
-        let mut delivered: BTreeSet<VersionId> = coll
+        let delivered: BTreeSet<VersionId> = coll
             .versions
             .iter()
             .filter(|(id, hv)| {
@@ -3712,7 +2671,6 @@ impl St {
             })
             .map(|(id, _)| id.clone())
             .collect();
-        delivered.extend(woken);
         let mut all: Vec<Arc<HeldVersion>> = std::mem::take(&mut coll.versions)
             .into_values()
             .chain(std::mem::take(&mut coll.waiting))
@@ -3726,13 +2684,9 @@ impl St {
             coll.skipped.entry(w).or_default().insert(seq);
         }
         coll.state = match &members.rule {
-            Rule::Merge { function } => rules.get(function).map(|r| r.start(c, me)),
+            Rule::Merge { function } => merge::rule(function).map(|r| r.start()),
             _ => None,
         };
-        coll.kinds.clear();
-        coll.cover = Cover::default();
-        coll.unwhole.clear();
-        let not_counted = std::mem::take(&mut coll.not_counted);
         let names: Vec<(VersionId, Name)> = all
             .iter()
             .filter(|hv| delivered.contains(&hv.version.id))
@@ -3758,33 +2712,6 @@ impl St {
                 _ => None,
             })
             .collect();
-        // What the rule counts changed only as the rebuilt state says:
-        // `apply_ready` told what was not delivered before; the rest is
-        // told here as it differs.
-        let mut told = Vec::new();
-        if let Some(coll) = self.colls.get(c) {
-            let at = coll.at();
-            for (id, why) in &coll.not_counted {
-                if delivered.contains(id) && not_counted.get(id) != Some(why) {
-                    told.push(Change::NotCounted {
-                        collection: c.clone(),
-                        id: id.clone(),
-                        why: NotCounted::Excluded(why.clone()),
-                    });
-                }
-            }
-            for id in not_counted.keys() {
-                if !coll.not_counted.contains_key(id) && at.contains(id) {
-                    told.push(Change::Counted {
-                        collection: c.clone(),
-                        id: id.clone(),
-                    });
-                }
-            }
-        }
-        for change in told {
-            self.tell(c, &change);
-        }
         for (id, why) in withdrawn {
             tracing::info!(?id, collection = %c, %why, "withdrawn");
             self.tell(
@@ -3805,9 +2732,6 @@ impl St {
     /// whether it was queued to apply.
     fn admit_one(&mut self, hv: Arc<HeldVersion>) -> bool {
         let c = hv.version.collection.clone();
-        // A version arriving in a collection whose state is not built yet
-        // is judged against it: built now.
-        self.wake(&c);
         let coll = self.colls.entry(c.clone()).or_default();
         if let Some(out) = self.cut_out.get(&hv.version.name) {
             tracing::debug!(id = ?hv.version.id, why = %out.why, "refused in {c} by the trust context");
@@ -3901,7 +2825,6 @@ impl St {
         }
         // Other bytes refused at its name before: these are the ones kept.
         self.other_bytes.remove(&hv.version.name);
-        coll.by_digest.insert(hv.digest, hv.version.id.clone());
         coll.entries
             .entry(hv.version.id.writer.clone())
             .or_default()
@@ -3916,86 +2839,6 @@ impl St {
         let c = hv.version.collection.clone();
         if self.admit_one(hv) {
             self.apply_ready(&c, &BTreeSet::new());
-        }
-    }
-
-    /// Whether merge collection `c`, being read back at start, may stay
-    /// unbuilt ([`Coll::dormant`]): its rule known here, nothing of it in
-    /// memory.
-    fn may_sleep(&self, c: &Name) -> bool {
-        let Some(coll) = self.colls.get(c) else {
-            return false;
-        };
-        let known = matches!(
-            coll.members.as_ref().map(|m| &m.rule),
-            Some(Rule::Merge { function }) if self.rules.get(function).is_some()
-        );
-        known
-            && coll.versions.is_empty()
-            && coll.waiting.is_empty()
-            && coll.outsiders.is_empty()
-            && coll.locked.is_empty()
-    }
-
-    /// Load dormant collection `c`'s versions from the store and admit
-    /// them, its state started empty (spec §5.2): applied as any held
-    /// versions are ([`Run`]) — its newest checkpoint first, then what came
-    /// after — by whoever applies `c` next. Each was delivered before the
-    /// device stopped, so is not delivered again ([`St::woken`]). Whether
-    /// `c` was dormant.
-    fn wake(&mut self, c: &Name) -> bool {
-        let Some(dormant) = self.colls.get_mut(c).and_then(|x| x.dormant.take()) else {
-            return false;
-        };
-        self.sleeping.remove(c);
-        let coll = self.colls.get_mut(c).expect("held above");
-        if let Some(Rule::Merge { function }) = coll.members.as_ref().map(|m| &m.rule) {
-            coll.state = self.rules.get(function).map(|r| r.start(c, &self.me));
-        }
-        tracing::debug!(collection = %c, "its merge state is built from the versions stored");
-        let mut woken = BTreeSet::new();
-        for (w, seqs) in dormant.held {
-            let Some(device) = device_of(w.key()) else {
-                continue;
-            };
-            for s in seqs {
-                let name = log_name(&device, Some(c), s);
-                let id = VersionId {
-                    writer: w.clone(),
-                    seq: Seq(s),
-                };
-                let still = match self.held.get(&name) {
-                    Some(Held::Version(h)) => *h == id,
-                    Some(Held::Locked) => true,
-                    _ => false,
-                };
-                if !still {
-                    continue;
-                }
-                let wire = self.store.get(&name);
-                match wire.and_then(|wire| self.reload(&name, wire)) {
-                    Some(Ok(hv)) => {
-                        self.held.insert(name, Held::Version(id.clone()));
-                        woken.insert(id);
-                        self.admit_one(Arc::new(hv));
-                    }
-                    Some(Err(locked)) => self.hold_locked(c, locked),
-                    None => {
-                        tracing::warn!(%name, "a version the store held is gone or no longer reads; fetched again when listed");
-                        self.held.remove(&name);
-                    }
-                }
-            }
-        }
-        self.woken.entry(c.clone()).or_default().extend(woken);
-        true
-    }
-
-    /// Build dormant collection `c`'s state now ([`Self::wake`]) and apply
-    /// its versions.
-    fn awaken(&mut self, c: &Name) {
-        if self.wake(c) {
-            self.apply_ready(c, &BTreeSet::new());
         }
     }
 
@@ -4033,49 +2876,17 @@ impl St {
         )))
     }
 
-    /// Hold `locked`, a version of `c` sealed in an epoch whose key is not
-    /// held here.
-    fn hold_locked(&mut self, c: &Name, locked: Locked) {
-        self.held.insert(locked.name.clone(), Held::Locked);
-        let coll = self.colls.entry(c.clone()).or_default();
-        coll.by_digest.insert(
-            wire::implicit_digest(&locked.wire),
-            VersionId {
-                writer: locked.writer.clone(),
-                seq: Seq(locked.seq),
-            },
-        );
-        coll.locked.push(locked);
-    }
-
     /// Apply every pending version of `c` that is ready ([`Run`]), store it,
     /// and deliver it to the watchers unless `quiet` lists it (delivered
-    /// before), with what the rule counts. Under a merge rule this device
-    /// does not know, every pending version is stored and delivered and
-    /// none applied: no state is read under another rule.
+    /// before). Under a merge rule this device does not know, every pending
+    /// version is stored and delivered and none applied: no state is read
+    /// under another rule.
     fn apply_ready(&mut self, c: &Name, quiet: &BTreeSet<VersionId>) {
-        // Not built yet: nothing of it waits (what arrives builds it,
-        // [`Self::admit_one`]).
-        if self.colls.get(c).is_none_or(|x| x.dormant.is_some()) {
-            return;
-        }
-        // What was loaded from the store was delivered before.
-        let merged: BTreeSet<VersionId>;
-        let quiet = match self.woken.remove(c) {
-            Some(r) if !r.is_empty() => {
-                merged = quiet.union(&r).cloned().collect();
-                &merged
-            }
-            _ => quiet,
-        };
         let St {
             colls,
             watchers,
             refused,
             store,
-            keys,
-            cut_out,
-            piece_misses,
             ..
         } = self;
         let Some(coll) = colls.get_mut(c) else {
@@ -4084,9 +2895,6 @@ impl St {
         let Coll {
             members,
             state,
-            not_counted,
-            kinds,
-            by_digest,
             versions,
             applied,
             entries,
@@ -4095,26 +2903,20 @@ impl St {
             pending,
             revoked,
             outsiders,
-            unwhole,
-            cover,
             ..
         } = coll;
         let Some(members) = members.as_ref() else {
             return;
         };
-        // Each change, and the version whose delivery it follows (`None`:
-        // every watcher of the collection is told).
-        let mut changes: Vec<(Change, Option<VersionId>)> = Vec::new();
-        let deliver = |hv: &HeldVersion, changes: &mut Vec<(Change, Option<VersionId>)>| {
+        // Each change, and the version whose delivery it follows.
+        let mut changes: Vec<(Change, VersionId)> = Vec::new();
+        let deliver = |hv: &HeldVersion, changes: &mut Vec<(Change, VersionId)>| {
             // What was delivered before is stored already.
             if !quiet.contains(&hv.version.id) {
                 store.insert(hv.version.name.clone(), hv.wire.clone());
             }
             if !quiet.contains(&hv.version.id) {
-                changes.push((
-                    Change::Version(hv.version.clone()),
-                    Some(hv.version.id.clone()),
-                ));
+                changes.push((Change::Version(hv.version.clone()), hv.version.id.clone()));
             }
         };
         if matches!(members.rule, Rule::Merge { .. }) && state.is_none() {
@@ -4129,142 +2931,29 @@ impl St {
                 entries,
                 locked,
                 revoked,
-                by_digest,
-                cut_out,
-                store: &**store,
-                keys,
                 state: state.as_deref_mut(),
                 versions,
                 skipped,
                 applied,
                 pending,
-                kinds,
                 outsiders,
-                unwhole,
-                cover,
-                misses: piece_misses,
                 out: Vec::new(),
             }
             .run();
-            // Only what still waits is remembered not whole.
-            unwhole.retain(|id| pending.contains(id));
-            // A version a checkpoint applied covers counts as the
-            // checkpoints covering it count ([`Cover`]): what the rule says
-            // of it is not told (spec §5.2) — so the state is the same
-            // whether it was applied before the checkpoint or never.
-            // Covers moved (a checkpoint applied, or its counting changed):
-            // everything inside them is counted again; else only what ran.
-            let moved = ran.iter().any(|r| match r {
-                Ran::Applied(id, _) | Ran::Counting(id, _) => cover.checkpoints.contains_key(id),
-                _ => false,
-            });
-            let ran_ids: Option<Vec<VersionId>> = (!moved).then(|| {
-                ran.iter()
-                    .filter_map(|r| match r {
-                        Ran::Applied(id, _) | Ran::Covered(id) | Ran::Counting(id, _) => {
-                            Some(id.clone())
-                        }
-                        Ran::Refused(..) | Ran::Remerged(_) => None,
-                    })
-                    .collect()
-            });
-            let inside = |id: &VersionId| cover.inside(id);
             for r in ran {
                 match r {
-                    Ran::Applied(id, counting) => {
-                        deliver(&versions[&id], &mut changes);
-                        if let Counting::NotCounted(why) = counting
-                            && !inside(&id)
-                        {
-                            not_counted.insert(id.clone(), why.clone());
-                            if !quiet.contains(&id) {
-                                changes.push((
-                                    Change::NotCounted {
-                                        collection: c.clone(),
-                                        id: id.clone(),
-                                        why: NotCounted::Excluded(why),
-                                    },
-                                    Some(id),
-                                ));
-                            }
-                        }
-                    }
-                    Ran::Covered(id) => deliver(&versions[&id], &mut changes),
+                    Ran::Applied(id) => deliver(&versions[&id], &mut changes),
                     Ran::Refused(hv, why) => {
                         tracing::debug!(id = ?hv.version.id, collection = %c, %why, "refused");
                         refused.insert(hv.version.name.clone(), why);
                     }
-                    Ran::Counting(id, _) if inside(&id) => {}
-                    Ran::Counting(id, counting) => {
-                        let tell = !quiet.contains(&id);
-                        match counting {
-                            Counting::Counted => {
-                                if not_counted.remove(&id).is_some() && tell {
-                                    changes.push((
-                                        Change::Counted {
-                                            collection: c.clone(),
-                                            id,
-                                        },
-                                        None,
-                                    ));
-                                }
-                            }
-                            Counting::NotCounted(why) => {
-                                if not_counted.get(&id) != Some(&why) {
-                                    not_counted.insert(id.clone(), why.clone());
-                                    if tell {
-                                        changes.push((
-                                            Change::NotCounted {
-                                                collection: c.clone(),
-                                                id: id.clone(),
-                                                why: NotCounted::Excluded(why),
-                                            },
-                                            Some(id),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Told to every watcher of the collection: no version
-                    // comes with it (spec §5.2, §15).
-                    Ran::Remerged(bases) => changes.push((
-                        Change::Remerged {
-                            collection: c.clone(),
-                            bases,
-                        },
-                        None,
-                    )),
                 }
-            }
-            for (id, now) in recount_covered(cover, not_counted, versions, pending, ran_ids) {
-                if quiet.contains(&id) {
-                    continue;
-                }
-                changes.push(match now {
-                    None => (
-                        Change::Counted {
-                            collection: c.clone(),
-                            id,
-                        },
-                        None,
-                    ),
-                    Some(why) => (
-                        Change::NotCounted {
-                            collection: c.clone(),
-                            id: id.clone(),
-                            why: NotCounted::Excluded(why),
-                        },
-                        Some(id),
-                    ),
-                });
             }
         }
         watchers.retain(|w| !w.tx.is_closed());
         for (change, of) in changes {
             for w in watchers.iter_mut() {
-                let to =
-                    c.has_prefix(&w.target) && of.as_ref().is_none_or(|id| !w.since.contains(id));
+                let to = c.has_prefix(&w.target) && !w.since.contains(&of);
                 if to {
                     w.send(change.clone());
                 }
@@ -4452,13 +3141,11 @@ impl St {
             Held::Version(_) | Held::Locked => {
                 held_wire(self, name).and_then(|w| wire::signed_digest(&w))
             }
-            Held::Snapshot(_) => self.store.get(name).and_then(|w| wire::signed_digest(&w)),
             Held::Record { signed, .. } => Some(*signed),
         }
     }
 
-    /// The version held here under `name`, opened or sealed (or, of a
-    /// collection not built yet, read from the store).
+    /// The version held here under `name`, opened or sealed.
     fn held_version(&self, name: &Name) -> Option<Version> {
         let l = parse_log_name(name)?;
         let coll = self.colls.get(l.subject.as_ref()?)?;
@@ -4473,14 +3160,6 @@ impl St {
                     .iter()
                     .find(|lk| lk.name == *name)
                     .map(|lk| lk.version())
-            })
-            .or_else(|| {
-                // Of a collection not built yet: read from the store.
-                coll.dormant.as_ref()?;
-                match self.reload(name, self.store.get(name)?)? {
-                    Ok(hv) => Some(hv.version),
-                    Err(lk) => Some(lk.version()),
-                }
             })
     }
 
@@ -4583,276 +3262,6 @@ impl St {
             )));
         }
     }
-
-    /// Why `c`'s state cannot be read here: its members record names a
-    /// merge rule this program does not know (rules are matched by name).
-    fn rule_unknown(&self, c: &Name, rules: &MergeRules) -> Option<DataError> {
-        let members = self.colls.get(c)?.members.as_ref()?;
-        match &members.rule {
-            Rule::Merge { function } if rules.get(function).is_none() => {
-                Some(DataError::RuleUnknown {
-                    collection: c.clone(),
-                    rule: function.clone(),
-                })
-            }
-            _ => None,
-        }
-    }
-
-    /// The merged value of `c` at exactly `at`, and the versions inside it
-    /// not counted, from held versions by the same procedure as the live
-    /// state ([`Run`]); `None` while some version inside `at` is not held
-    /// (or not whole), or `c` has no merge rule this device knows.
-    fn value_at(
-        &self,
-        c: &Name,
-        at: &Frontier,
-        rules: &MergeRules,
-        me: &Writer,
-    ) -> Option<(Value, Vec<(VersionId, NotCounted)>)> {
-        let coll = self.colls.get(c)?;
-        let members = coll.members.as_ref()?;
-        let Rule::Merge { function } = &members.rule else {
-            return None;
-        };
-        if *at == coll.at() {
-            return coll
-                .state
-                .as_ref()
-                .map(|s| (s.value(&coll.held_back()), coll.not_counted_list()));
-        }
-        let mut state = rules.get(function)?.start(c, me);
-        let mut versions = coll.versions.clone();
-        let mut pending: BTreeSet<VersionId> = versions
-            .keys()
-            .filter(|id| at.contains(id))
-            .cloned()
-            .collect();
-        let mut skipped = coll.skipped.clone();
-        let mut applied = BTreeMap::new();
-        let mut kinds = HashMap::new();
-        let mut cover = Cover::default();
-        let mut outsiders = coll.outsiders.clone();
-        let ran = Run {
-            members,
-            entries: &coll.entries,
-            locked: &coll.locked,
-            revoked: &coll.revoked,
-            by_digest: &coll.by_digest,
-            cut_out: &self.cut_out,
-            store: &*self.store,
-            keys: &self.keys,
-            state: Some(&mut *state),
-            versions: &mut versions,
-            skipped: &mut skipped,
-            applied: &mut applied,
-            pending: &mut pending,
-            kinds: &mut kinds,
-            outsiders: &mut outsiders,
-            unwhole: &mut BTreeSet::new(),
-            cover: &mut cover,
-            misses: &self.piece_misses,
-            out: Vec::new(),
-        }
-        .run();
-        let reached: Frontier = applied
-            .iter()
-            .map(|(w, s)| VersionId {
-                writer: w.clone(),
-                seq: Seq(*s),
-            })
-            .collect();
-        if reached != *at {
-            return None;
-        }
-        let mut not_counted = BTreeMap::new();
-        for r in ran {
-            match r {
-                Ran::Applied(id, Counting::NotCounted(why))
-                | Ran::Counting(id, Counting::NotCounted(why)) => {
-                    not_counted.insert(id, NotCounted::Excluded(why));
-                }
-                Ran::Counting(id, Counting::Counted) => {
-                    not_counted.remove(&id);
-                }
-                _ => {}
-            }
-        }
-        // What a checkpoint covers counts as the checkpoints covering it
-        // count (spec §5.2), and leaves the value when they do not.
-        not_counted.retain(|id, _| !cover.inside(id));
-        let mut excluded = BTreeSet::new();
-        for id in versions.keys().filter(|id| at.contains(id)) {
-            if let Some(Some(why)) = cover.counting(id) {
-                not_counted.insert(id.clone(), NotCounted::Excluded(why));
-                excluded.insert(id.clone());
-            }
-        }
-        Some((state.value(&excluded), not_counted.into_iter().collect()))
-    }
-
-    /// The devices, besides its writer's, whose versions of `c` held here
-    /// are made over the version named `v` (their parents include it): each
-    /// applied it, so holds its pieces and serves them under its own name
-    /// ([`Inner::packet_for`]). A reader asks them when the writer does not
-    /// answer, so a writer serving its pieces to one device only does not
-    /// stall what others build over it (spec §13.1). By name.
-    fn appliers(&self, c: &Name, v: &Name) -> Vec<Name> {
-        let Some(coll) = self.colls.get(c) else {
-            return Vec::new();
-        };
-        let Some(Held::Version(target)) = self.held.get(v) else {
-            return Vec::new();
-        };
-        let writer = parse_log_name(v).map(|l| l.device);
-        let devices: BTreeSet<Name> = coll
-            .versions
-            .values()
-            .filter(|hv| {
-                hv.version.id.writer != target.writer && hv.version.parents.contains(target)
-            })
-            .filter_map(|hv| parse_log_name(&hv.version.name).map(|l| l.device))
-            .filter(|d| Some(d) != writer.as_ref())
-            .collect();
-        devices.into_iter().collect()
-    }
-
-    /// The versions of merge collection `c` in pieces this device is to
-    /// fetch (spec §13.1): pending — admitted and neither applied nor
-    /// covered by a checkpoint — not opened, and neither being fetched nor
-    /// found whole already. A version in the past of another such version
-    /// whose pieces are yet to be found waits for that one's: it may be a
-    /// checkpoint covering it (spec §5.2), which opens and applies as soon
-    /// as it is whole, and what a checkpoint covers is fetched only as the
-    /// basis of a version written apart from it ([`Cover::wanted`]), at
-    /// most [`BASIS_FETCHES`] at once. Under a rule this device does not
-    /// know, none: it applies nothing.
-    fn wanted_pieces(&self, c: &Name) -> Vec<(Name, ChunksBody)> {
-        let Some(coll) = self.colls.get(c) else {
-            return Vec::new();
-        };
-        if coll.state.is_none() {
-            return Vec::new();
-        }
-        let unopened: Vec<&HeldVersion> = coll
-            .pending
-            .iter()
-            .filter_map(|id| coll.versions.get(id))
-            .filter(|hv| !hv.opened && hv.chunks.is_some())
-            .map(|hv| hv.as_ref())
-            .collect();
-        // In the past of a later unopened version (spec §5.2: its parents
-        // and its writer's earlier entries) whose pieces are neither found
-        // whole nor missed by every one of [`REFRESH_TRIES`] fetches: one
-        // lost packet is no evidence that the later version, maybe a
-        // checkpoint covering it, is not to be had (spec §17.1).
-        let later_unopened = |v: &VersionId| {
-            unopened.iter().any(|w| {
-                w.version.id != *v
-                    && !self.walked.contains(&w.version.name)
-                    && self
-                        .piece_misses
-                        .get(&w.version.name)
-                        .is_none_or(|m| *m < REFRESH_TRIES)
-                    && (w.version.parents.contains(v)
-                        || (w.version.id.writer == v.writer && v.seq < w.version.id.seq))
-            })
-        };
-        let mut out: Vec<(Name, ChunksBody)> = unopened
-            .iter()
-            .filter(|hv| {
-                !self.fetching.contains(&hv.version.name)
-                    && !self.walked.contains(&hv.version.name)
-                    && !self.unfound.contains(&hv.version.name)
-                    && !later_unopened(&hv.version.id)
-            })
-            .filter_map(|hv| Some((hv.version.name.clone(), hv.chunks?)))
-            .collect();
-        let bases = || {
-            coll.cover
-                .wanted
-                .iter()
-                .filter_map(|id| coll.versions.get(id))
-                .filter(|hv| !hv.opened)
-        };
-        let busy = bases()
-            .filter(|hv| self.fetching.contains(&hv.version.name))
-            .count();
-        out.extend(
-            bases()
-                .filter(|hv| {
-                    !self.fetching.contains(&hv.version.name)
-                        && !self.walked.contains(&hv.version.name)
-                        && !self.unfound.contains(&hv.version.name)
-                })
-                .filter_map(|hv| Some((hv.version.name.clone(), hv.chunks?)))
-                .take(BASIS_FETCHES.saturating_sub(busy)),
-        );
-        out
-    }
-
-    /// Every piece of version `v` of `c` was found: a merge version waiting
-    /// for them opens and applies once ready.
-    fn pieces_arrived(&mut self, c: &Name, v: &Name) {
-        let merge = self.colls.get(c).is_some_and(|x| x.state.is_some());
-        if !merge {
-            return;
-        }
-        self.walked.insert(v.clone());
-        if let Some(coll) = self.colls.get_mut(c) {
-            coll.unwhole
-                .retain(|id| coll.versions.get(id).is_none_or(|hv| hv.version.name != *v));
-        }
-        self.apply_ready(c, &BTreeSet::new());
-        // Remembered only while it waits unopened.
-        let waits = self.colls.get(c).is_some_and(|x| {
-            x.versions
-                .values()
-                .any(|hv| hv.version.name == *v && !hv.opened && x.pending.contains(&hv.version.id))
-        });
-        if !waits {
-            self.walked.remove(v);
-        }
-    }
-
-    /// A fetch found the pieces of version `v` of `c` nowhere: when it is
-    /// the basis of a version written apart from a checkpoint (spec §5.2,
-    /// [`Cover::wanted`]), each version waiting for it spends one ask of
-    /// its budget ([`Cover::waiting`]). One whose [`REFRESH_TRIES`] asks
-    /// for its whole basis set missed, or a basis every one of
-    /// [`REFRESH_TRIES`] asks in a row missed (one lost packet is no
-    /// evidence it is gone), stops what waits for it: that applies without
-    /// the bases still missing — the rule's conflict handling — and each
-    /// is handed when it is found later.
-    fn basis_unfound(&mut self, c: &Name, v: &Name) {
-        let gone = self
-            .piece_misses
-            .get(v)
-            .is_some_and(|m| *m >= REFRESH_TRIES);
-        let Some(coll) = self.colls.get_mut(c).filter(|x| x.state.is_some()) else {
-            return;
-        };
-        let versions = &coll.versions;
-        let Some(id) = coll
-            .cover
-            .wanted
-            .iter()
-            .find(|id| versions.get(id).is_some_and(|hv| hv.version.name == *v))
-            .cloned()
-        else {
-            return;
-        };
-        let mut spent = false;
-        for (bases, missed) in coll.cover.waiting.values_mut() {
-            if bases.contains(&id) {
-                *missed = missed.saturating_add(1);
-                spent |= *missed == REFRESH_TRIES;
-            }
-        }
-        if gone || spent {
-            self.apply_ready(c, &BTreeSet::new());
-        }
-    }
 }
 
 impl Device {
@@ -4914,7 +3323,6 @@ impl Device {
         let asks_verifying = config.asks_verifying.max(1);
         let recipient = recipient_key(&keys, &device)?;
         let seal_keys = Keys::new(recipient);
-        let rules = config.rules.clone();
         let contexts = contexts_by_namespace(validator.keyring());
         let own_key = identity
             .signer
@@ -4978,18 +3386,11 @@ impl Device {
                 owed: BTreeMap::new(),
                 to_follow: BTreeSet::new(),
                 sealed_to: HashMap::new(),
-                fetching: BTreeSet::new(),
-                walked: BTreeSet::new(),
-                unfound: BTreeSet::new(),
-                piece_misses: HashMap::new(),
-                descents: 0,
                 seqs: HashMap::new(),
                 equivocal: HashMap::new(),
                 brought: HashMap::new(),
                 bringing: HashMap::new(),
                 twins: HashMap::new(),
-                rules,
-                me: Writer::new(identity.key.clone()),
                 asks: HashMap::new(),
                 answers: Kept::new(ANSWERS_KEPT),
                 verified: HashMap::new(),
@@ -4997,8 +3398,6 @@ impl Device {
                 contexts,
                 intro: intro::Intros::new(),
                 restoring: false,
-                woken: HashMap::new(),
-                sleeping: BTreeSet::new(),
                 scopes: scoped::Scopes::default(),
             }),
             progress: Notify::new(),
@@ -5122,8 +3521,7 @@ impl Device {
             inner.join(&g).await?;
             inner.publish(&g);
         }
-        // Merge versions in pieces held from before wait for them.
-        inner.fetch_wanted(true);
+        inner.fetch_wanted_bytes();
         Ok(Device { inner })
     }
 
@@ -5175,11 +3573,11 @@ impl Device {
     /// the key signed: every log entry `key` signed that this device holds
     /// verified and has neither refused nor withdrawn — versions (opened or
     /// still sealed) and members records, as runs of
-    /// seqs per collection log `<D>/32=log/<C>`, and snapshots, under
+    /// seqs per collection log `<D>/32=log/<C>`, and of no collection, under
     /// `<D>/32=log` — that it first verified strictly before
     /// `bound.held_before` (when set) and whose seq is at most
     /// `bound.upto` of its collection (when `upto` is given; a collection
-    /// it does not name, and snapshots, are then left out). An entry whose
+    /// it does not name, and entries of no collection, are then left out). An entry whose
     /// first verification time or verifying public key is not known here
     /// (held before this was recorded) is left out. Every entry left out is
     /// listed in [`CutProposal::left_out`] by its full name, for the owner
@@ -5418,37 +3816,6 @@ impl Device {
         // The committer stops, and whatever waits for the barrier is let go.
         self.inner.commit_wake.notify_one();
         self.inner.committed.notify_waiters();
-    }
-}
-
-/// A descent under way ([`Inner::refresh`]): counted in [`St::descents`]
-/// while it lasts, whether it ends or is dropped, so the pieces it defers
-/// are fetched once no descent is under way.
-struct Descending<'a> {
-    st: &'a Mutex<St>,
-    ended: bool,
-}
-
-impl<'a> Descending<'a> {
-    fn new(st: &'a Mutex<St>) -> Self {
-        st.lock().descents += 1;
-        Self { st, ended: false }
-    }
-
-    /// End it; whether it was the last descent under way.
-    fn end(mut self) -> bool {
-        self.ended = true;
-        let mut st = self.st.lock();
-        st.descents -= 1;
-        st.descents == 0
-    }
-}
-
-impl Drop for Descending<'_> {
-    fn drop(&mut self) {
-        if !self.ended {
-            self.st.lock().descents -= 1;
-        }
     }
 }
 
@@ -5756,14 +4123,10 @@ enum EpochStanding {
 }
 
 impl Inner {
-    fn me(&self) -> &Writer {
-        &self.writer
-    }
-
     // ---- boot ---------------------------------------------------------------------------------
 
     /// Rebuild what the store holds: the own log, others' members records,
-    /// snapshots and applied versions (each verified when it was stored),
+    /// and applied versions (each verified when it was stored),
     /// the epoch keys made or granted here (each checked again against the
     /// record naming its epoch), and the highest summary root verified of
     /// each other device per namespace, so a rolled-back root is still
@@ -5897,18 +4260,18 @@ impl Inner {
         }
         // Members records first, by revision; then the other records, so
         // that what they say is known as the versions come back; then
-        // versions and snapshots.
+        // versions.
         entries.sort_by_key(|(_, _, record, _, seq, _)| match record {
             Record::Members(b) => (0, b.revision, *seq),
             Record::Intro(_) => (1, 0, *seq),
-            Record::Version(_) | Record::Snapshot(_) => (2, 0, *seq),
+            Record::Version(_) => (2, 0, *seq),
         });
         let rest = entries.split_off(
             entries.partition_point(|(_, _, record, ..)| matches!(record, Record::Members(_))),
         );
         let mut st = self.st.lock();
-        // A merge collection read back is indexed, its state built on the
-        // first need (spec §5.2): from here until everything is read.
+        // The store is read back from here until everything is read: what is
+        // taken is stored already.
         st.restoring = true;
         // What the trust context refused for its chain stays withdrawn
         // until judged again ([`Self::rejudge`]); what a held trust context
@@ -6975,15 +5338,12 @@ impl Inner {
     /// a name followed already is not: the walks toward that name took it
     /// (spec §15). One a writer outside its namespace was refused making
     /// this device follow ([`St::track`]) is not held, so following it by
-    /// its name walks again. A merge collection followed — read, written,
-    /// held or watched — has its state built now if it was not yet (spec
-    /// §5.2).
+    /// its name walks again.
     async fn follow(self: &Arc<Self>, target: &Name) -> Result<bool, DataError> {
         wire::data_marker(target).map_err(|why| bad_name(target, why))?;
         let ns = namespace_of(target).expect("a data name has a namespace");
         let new = {
             let mut st = self.st.lock();
-            st.awaken(target);
             let taken = st.inside(target) && st.colls.contains_key(target);
             let new = st.follows.insert(target.clone()) && !taken;
             if new {
@@ -7711,10 +6071,6 @@ impl Inner {
                 return !unreached;
             }
         }
-        // The pieces of merge versions it brings are fetched once it took
-        // everything it lists: a checkpoint among them may cover the others
-        // (spec §5.2), and what it covers is never fetched.
-        let descending = Descending::new(&self.st);
         let head = body.head;
         // What the descent goes toward: what is followed in
         // `ns` as it starts, and of that what is followed (its versions
@@ -7733,9 +6089,6 @@ impl Inner {
         };
         let walk = Walk { since, reach };
         let whole = self.descend(device, ns, &writer, body, &walk).await;
-        if descending.end() {
-            self.fetch_wanted(true);
-        }
         if !whole {
             return false;
         }
@@ -8419,7 +6772,7 @@ impl Inner {
                 tracing::debug!(record = %name, "a removal cut's manifest not held whole before its record is taken; asked again");
             }
         }
-        let (chase, wanted, withdrawn) = {
+        let (chase, withdrawn) = {
             let mut st = self.st.lock();
             let members = matches!(record, Record::Members(_));
             let key = key_name_of(writer.key());
@@ -8438,13 +6791,6 @@ impl Inner {
                 .cut_out
                 .values()
                 .any(|o| !o.by_cut() && key_name_of(o.writer.key()) == key);
-            // A merge version in pieces waits for them: fetched now, unless
-            // a descent is under way — it fetches them once it took all it
-            // lists, a checkpoint among them covering what it covers.
-            let wanted = match (&parsed.subject, st.descents) {
-                (Some(c), 0) => st.wanted_pieces(c),
-                _ => Vec::new(),
-            };
             // A group's record decides who reads the collections sealed to
             // it: their keys may be asked for now.
             let mut chase = Vec::new();
@@ -8474,13 +6820,10 @@ impl Inner {
             }
             chase.sort();
             chase.dedup();
-            (chase, wanted, (wake && withdrawn).then_some(key))
+            (chase, (wake && withdrawn).then_some(key))
         };
         for c in chase {
             self.chase_keys(&c);
-        }
-        for (v, chunks) in wanted {
-            self.spawn_pieces(v, chunks);
         }
         // Its key verifies again: what was withdrawn of it for its chain
         // may verify too (a new certificate of the key).
@@ -8549,7 +6892,7 @@ impl Inner {
     }
 
     /// Hold a verified log entry and let its collection take it. Own entries
-    /// and snapshots are stored now; members records once accepted
+    /// are stored now; members records once accepted
     /// (owner-signed); others' versions once applied.
     fn take(
         &self,
@@ -8607,15 +6950,12 @@ impl Inner {
         {
             return;
         }
-        let id = VersionId {
-            writer: writer.clone(),
-            seq: Seq(parsed.seq),
-        };
         // A key's log is one sequence across its collections and entry
         // kinds (spec §4): another entry at a seq it used is equivocation.
         // An entry the trust context refuses is a thief's (spec §8.1).
-        let second = !st.cut_out.contains_key(&name)
-            && st.note_seq(&name, &writer, parsed.seq, &record, &wire);
+        if !st.cut_out.contains_key(&name) {
+            st.note_seq(&name, &writer, parsed.seq, &record, &wire);
+        }
         if let Some(c) = &parsed.subject {
             if mine {
                 let ns = namespace_of(c).expect("a log entry's collection has a namespace");
@@ -8632,7 +6972,7 @@ impl Inner {
             }
         }
         // Read back from the store at start, it is stored already.
-        if !st.restoring && (mine || matches!(record, Record::Snapshot(_))) {
+        if !st.restoring && mine {
             self.store.insert(name.clone(), wire.clone());
         }
         // A record a revocation refuses is held as refused and not taken
@@ -8667,7 +7007,7 @@ impl Inner {
                     // The record and what accepting it writes reach the store as one batch.
                     let _batch = self.stage.batch();
                     self.store.insert(name.clone(), wire);
-                    st.accept_members(parsed.seq, body, &writer, &self.config.rules, self.me());
+                    st.accept_members(parsed.seq, body, &writer);
                 } else {
                     tracing::debug!(collection = %c, signer = ?writer, "members record not signed by a device of the collection's namespace; ignored");
                 }
@@ -8676,39 +7016,12 @@ impl Inner {
                 let c = body.collection.clone();
                 // Under a folder in force with no record of its own, it is
                 // read under the folder's (spec §6).
-                st.ensure(&c, &self.config.rules, self.me());
+                st.ensure(&c);
                 let seq = parsed.seq;
                 let sealed = body.sealed.is_some();
                 let epoch = body.sealed.as_ref().map(|s| s.epoch.clone());
-                // Read back at start into a merge collection not built yet:
-                // indexed only, its state built from the store on the first
-                // need (spec §5.2, [`St::wake`]). The store holds what was
-                // applied here, so the index is what applies.
-                let dormant = st.restoring
-                    && !second
-                    && st.colls.get(&c).is_some_and(|x| x.dormant.is_some());
-                if dormant {
-                    let locked = body
-                        .sealed
-                        .as_ref()
-                        .is_some_and(|s| st.keys.key(&c, &s.epoch).is_none());
-                    let coll = st.colls.get_mut(&c).expect("dormant above");
-                    coll.entries.entry(writer.clone()).or_default().insert(seq);
-                    let d = coll.dormant.as_mut().expect("dormant above");
-                    d.held.entry(writer).or_default().insert(seq);
-                    // Their revocation cuts are noted once all is read
-                    // ([`Self::note_revoked`]).
-                    d.parents
-                        .extend(body.parents.iter().map(|(y, _)| y.clone()));
-                    let held = match locked {
-                        true => Held::Locked,
-                        false => Held::Version(id),
-                    };
-                    st.held.insert(name, held);
-                    return;
-                }
                 // Of a revoked key, its entries outside its cut never apply:
-                // this version's and its parents' (spec §5.2, §8).
+                // this version's and its parents' (spec §5, §8).
                 let writers: Vec<Writer> = std::iter::once(writer.clone())
                     .chain(body.parents.iter().map(|(y, _)| y.clone()))
                     .collect();
@@ -8717,7 +7030,6 @@ impl Inner {
                     let Some(key) = st.keys.key(&c, &s.epoch) else {
                         st.held.insert(name.clone(), Held::Locked);
                         let coll = st.colls.entry(c.clone()).or_default();
-                        coll.by_digest.insert(digest, id.clone());
                         coll.locked.push(Locked {
                             name,
                             wire,
@@ -8755,14 +7067,6 @@ impl Inner {
                 st.admit(Arc::new(HeldVersion::new(
                     version, op, wire, sealed, epoch, chunks,
                 )));
-            }
-            Record::Snapshot(pins) => {
-                let snapshot = Snapshot {
-                    id,
-                    name: name.clone(),
-                    pins,
-                };
-                st.held.insert(name, Held::Snapshot(snapshot));
             }
             Record::Intro(body) => {
                 self.take_intro(st, name, &parsed, wire, writer, body, (digest, signed));
@@ -8992,8 +7296,8 @@ impl Inner {
     /// wait for ([`St::bytes_wanted`]), then read their collections again,
     /// so the waiting versions are judged by them. Called wherever a version
     /// may have come to wait for one — an entry taken, and every path that
-    /// admits versions anew ([`Self::fetch_wanted`]: a key obtained, a
-    /// descent ended, pieces arrived, a start). A packet not to be had stays
+    /// admits versions anew (a key obtained, a descent ended, a start). A
+    /// packet not to be had stays
     /// wanted, asked for again then and after [`retry_pause`] of the misses
     /// in a row for it (spec §17.1).
     fn fetch_wanted_bytes(self: &Arc<Self>) {
@@ -9011,7 +7315,7 @@ impl Inner {
             let inner = Arc::clone(self);
             rt::spawn(async move {
                 let held = inner.fetch_cut_bytes(&full).await;
-                let fetch: Vec<(Name, ChunksBody)> = {
+                {
                     let mut st = inner.st.lock();
                     st.bytes_fetching.remove(&full);
                     if !held {
@@ -9030,15 +7334,9 @@ impl Inner {
                         return;
                     }
                     st.bytes_misses.remove(&full);
-                    let mut fetch = Vec::new();
                     for c in &colls {
-                        st.reread(c, &inner.config.rules, inner.me());
-                        fetch.extend(st.wanted_pieces(c));
+                        st.reread(c);
                     }
-                    fetch
-                };
-                for (v, chunks) in fetch {
-                    inner.spawn_pieces(v, chunks);
                 }
                 inner.fetch_wanted_bytes();
                 inner.fetch_kept(false);
@@ -9211,9 +7509,6 @@ impl Inner {
                     ws.extend(hv.version.parents.iter().map(|(y, _)| y.clone()));
                 }
                 ws.extend(coll.locked.iter().map(|l| l.writer.clone()));
-                if let Some(d) = &coll.dormant {
-                    ws.extend(d.parents.iter().cloned());
-                }
                 (c.clone(), ws)
             })
             .collect();
@@ -9277,21 +7572,6 @@ impl Inner {
     /// Withdraw every held log entry whose key the trust context governing
     /// it revokes and whose cut does not accept it ([`Self::withdraw`]).
     fn withdraw_revoked(&self, st: &mut St) {
-        // A collection not built yet holding a revoked key's versions is
-        // built first: its versions are judged here as held ones are.
-        let revoked: Vec<Name> = st
-            .colls
-            .iter()
-            .filter(|(_, x)| {
-                x.dormant
-                    .as_ref()
-                    .is_some_and(|d| d.held.keys().any(|w| x.revoked.contains_key(w)))
-            })
-            .map(|(c, _)| c.clone())
-            .collect();
-        for c in revoked {
-            st.awaken(&c);
-        }
         let mut found: Vec<(Name, Writer, [u8; 32], Refusal)> = Vec::new();
         for coll in st.colls.values() {
             let versions = coll
@@ -9322,11 +7602,6 @@ impl Inner {
                 Held::Record { writer, digest, .. } => self
                     .refusing(name, writer, || Some(*digest))
                     .map(|r| (writer, r)),
-                Held::Snapshot(s) => self
-                    .refusing(name, &s.id.writer, || {
-                        self.store.get(name).map(|w| wire::implicit_digest(&w))
-                    })
-                    .map(|r| (&s.id.writer, r)),
                 _ => None,
             };
             if let Some((writer, (digest, cut))) = refused {
@@ -9401,7 +7676,7 @@ impl Inner {
             self.rebuild_members(st, &c, &why);
         }
         for c in reread {
-            st.reread(&c, &self.config.rules, self.me());
+            st.reread(&c);
         }
         // A version of a collection no record is known of yet: refused too.
         let waiting: Vec<(Name, Refusal)> = st
@@ -9493,7 +7768,7 @@ impl Inner {
                     .filter_map(|n| parse_log_name(n)?.subject)
                     .collect();
                 for c in &colls {
-                    st.reread(c, &self.config.rules, self.me());
+                    st.reread(c);
                 }
                 for name in &taken {
                     let again = parse_log_name(name).and_then(|l| l.subject).and_then(|c| {
@@ -9745,17 +8020,16 @@ impl Inner {
         if let Some(f) = st.folders.get_mut(c) {
             f.line = Line::default();
         }
-        let (rules, me) = (&self.config.rules, self.me());
         for (_, seq, body, writer) in records {
-            st.accept_members(seq, body, &writer, rules, me);
+            st.accept_members(seq, body, &writer);
         }
         // A line left with no record moved nothing when taking: set what is
         // in force anew either way.
         if folder {
-            st.refold_under(c, rules, me);
+            st.refold_under(c);
         }
         if st.colls.contains_key(c) {
-            st.refold(c, rules, me);
+            st.refold(c);
         }
         st.quiet_members = false;
         for (name, folder, before) in in_force {
@@ -10729,15 +9003,11 @@ impl Inner {
 
     /// Sign `draft` into `c` as a new own version (the record in force
     /// checked by [`Self::writable`]), sealed with `key`, and hold it; a
-    /// payload larger than [`wire::INLINE_MAX`] travels in pieces. A merge
-    /// collection's entry is the operation its rule makes of the fields
-    /// (or the one the app built), checked and applied by the rule against
-    /// the state before anything is kept: one the rule refuses is
-    /// [`DataError::BadRequest`], with nothing stored, published or
-    /// counted in the log's head. Refused for any reason once the edit
-    /// may have touched the state, the collection is read again
-    /// ([`St::reread`]): its state is the one its versions make, without
-    /// the refused edit.
+    /// log entry larger than [`wire::INLINE_MAX`] travels in pieces. A merge
+    /// collection's entry is the bytes the app built, applied by the rule to
+    /// the state before anything is kept: more than [`wire::INLINE_MAX`] is
+    /// [`DataError::TooLarge`], fields are [`DataError::BadRequest`], with
+    /// nothing stored, published or counted in the log's head.
     #[allow(clippy::too_many_arguments)]
     fn write(
         &self,
@@ -10749,18 +9019,11 @@ impl Inner {
         keep: Keep,
         draft: Draft,
     ) -> Result<VersionId, DataError> {
-        // Refused before the edit touches the state.
+        // Refused before anything touches the state.
         let seq = self.next_seq(st)?;
-        let judged = self
-            .sign_in(st, c, seq, key, type_id, keep, draft)
-            .and_then(|signed| Ok((self.judge_own(st, &signed, true)?, signed)));
-        match judged {
-            Ok((judged, signed)) => Ok(self.commit(st, ns, signed, judged)),
-            Err(e) => {
-                st.reread(c, &self.config.rules, self.me());
-                Err(e)
-            }
-        }
+        let signed = self.sign_in(st, c, seq, key, type_id, keep, draft)?;
+        self.apply_own_version(st, &signed)?;
+        Ok(self.commit(st, ns, signed))
     }
 
     /// [`Self::not_walked`] for a verb that must not wait on other devices:
@@ -11118,10 +9381,9 @@ impl Inner {
     /// Sign `draft` as the own version at `seq` of `c`, a fresh collection,
     /// under `body`, the host's default record about to be signed for it
     /// ([`Self::default_members`]), sealed with the key `made` of the epoch
-    /// it starts; and judge it, checked and applied, on a state of its own
-    /// that its rule starts empty — the state the record starts. The
-    /// version, its ruling and that state; nothing is kept. One the rule
-    /// refuses is [`DataError::BadRequest`].
+    /// it starts; and apply it on a state of its own that the register
+    /// starts empty — the state the record starts. The version and that
+    /// state; nothing is kept.
     fn sign_fresh(
         &self,
         c: &Name,
@@ -11130,48 +9392,32 @@ impl Inner {
         made: Option<&ContentKey>,
         draft: Draft,
         (type_id, keep): (TypeId, Keep),
-    ) -> Result<(Signed, Ruled, Box<dyn MergeState>), DataError> {
-        // The host default merges with `/merge/yrs` ([`Self::default_members`]).
-        let function = crate::merge::Yrs::new().function().clone();
-        let Some(rule) = self.config.rules.get(&function) else {
-            return Err(DataError::RuleUnknown {
-                collection: c.clone(),
-                rule: function,
-            });
-        };
-        let mut temp = rule.start(c, self.me());
+    ) -> Result<(Signed, Box<dyn MergeState>), DataError> {
+        // The host default is the register ([`Self::default_members`]).
+        let function: Name = merge::NEWEST
+            .parse()
+            .expect("the register's name is an NDN name");
+        let rule = merge::rule(&function).expect("the register is built in");
+        let mut temp = rule.start();
         let key = body.epoch.clone().zip(made.cloned());
         let under = Under {
             readers: body.readers.clone(),
-            function: Some(function.clone()),
+            function: Some(function),
             parents: Parents::new(),
         };
         let signed = self.sign_version(
             c,
             seq,
             under,
-            Some(&mut *temp),
+            Some(&*temp),
             key.as_ref(),
             (type_id, keep, (self.config.clock)()),
             draft,
         )?;
-        let (empty, none) = (Coll::default(), HashMap::new());
-        let past = PastOf::new(
-            &signed.held.version,
-            empty.waits(c),
-            &empty.by_digest,
-            &[],
-            &none,
-        );
-        let ruled =
-            rule_on(&mut *temp, &signed.held, &past, true).map_err(|e| DataError::BadRequest {
-                name: c.clone(),
-                why: format!(
-                    "{c} merges with {function}, whose rule refuses this operation ({e}); \
-                     nothing was written: put an operation the rule takes"
-                ),
-            })?;
-        Ok((signed, ruled, temp))
+        let empty = Coll::default();
+        let past = PastOf::new(&signed.held.version, empty.waits(c));
+        apply_own(&mut *temp, &signed.held, &past);
+        Ok((signed, temp))
     }
 
     /// After the record [`Self::sign_fresh`] signed a version under is
@@ -11209,12 +9455,11 @@ impl Inner {
             )));
         };
         let (body, made) = self.default_members(c, base);
-        let (signed, ruled, temp) =
-            self.sign_fresh(c, seq, &body, made.as_ref(), draft, options)?;
+        let (signed, temp) = self.sign_fresh(c, seq, &body, made.as_ref(), draft, options)?;
         let record = self.sign_members(st, c, base, (body, made))?;
         self.keep_members(st, c, record);
         self.start_fresh(st, c, temp);
-        Ok(self.commit(st, ns, signed, Some(ruled)))
+        Ok(self.commit(st, ns, signed))
     }
 
     /// Sign `draft` as the own version at `seq` of `c`, under its record in
@@ -11245,7 +9490,7 @@ impl Inner {
             c,
             seq,
             under,
-            coll.state.as_deref_mut(),
+            coll.state.as_deref(),
             key,
             (type_id, keep, dated),
             draft,
@@ -11263,7 +9508,7 @@ impl Inner {
         c: &Name,
         seq: u64,
         under: Under,
-        state: Option<&mut (dyn MergeState + 'static)>,
+        state: Option<&(dyn MergeState + 'static)>,
         key: Option<&(Epoch, ContentKey)>,
         (type_id, keep, dated): (TypeId, Keep, Timestamp),
         draft: Draft,
@@ -11274,21 +9519,23 @@ impl Inner {
         };
         let op = match &under.function {
             Some(function) => {
-                let Some(state) = state else {
+                if state.is_none() {
                     return Err(DataError::RuleUnknown {
                         collection: c.clone(),
                         rule: function.clone(),
                     });
-                };
+                }
                 match built {
                     Some(op) => op,
-                    None => state.edit(&content).map_err(|e| DataError::BadRequest {
-                        name: c.clone(),
-                        why: format!(
-                            "{c} merges with {function}, which makes no operation of these \
-                             fields ({e}); put the operation its rule takes (put_op)"
-                        ),
-                    })?,
+                    None => {
+                        return Err(DataError::BadRequest {
+                            name: c.clone(),
+                            why: format!(
+                                "{c} merges with {function}, which takes bytes, not fields: \
+                                 use put_op"
+                            ),
+                        });
+                    }
                 }
             }
             None => Bytes::new(),
@@ -11305,13 +9552,20 @@ impl Inner {
                 limit: wire::PAYLOAD_MAX,
             });
         }
-        // A large entry travels in pieces, whatever the rule (spec §13.1);
-        // the record carries its size and manifest root.
-        let (chunks, pieces) = if payload.len() > wire::INLINE_MAX {
+        // A large entry of a log travels in pieces (spec §13.1); the record
+        // carries its size and manifest root. A register's bytes ride in its
+        // record: more than fits is too large.
+        let (chunks, pieces) = if payload.len() <= wire::INLINE_MAX {
+            (None, Vec::new())
+        } else if under.function.is_some() {
+            return Err(DataError::TooLarge {
+                collection: c.clone(),
+                size: payload.len() as u64,
+                limit: wire::INLINE_MAX as u64,
+            });
+        } else {
             let (pieces, chunks) = pieces::split(&name, &payload);
             (Some(chunks), pieces)
-        } else {
-            (None, Vec::new())
         };
         let sealed = key.map(|(epoch, _)| SealedBody {
             epoch: epoch.clone(),
@@ -11350,10 +9604,7 @@ impl Inner {
             wire::implicit_digest(&wire),
             true,
         );
-        let held = HeldVersion {
-            opened: true,
-            ..HeldVersion::new(version, op, wire, key.is_some(), epoch, chunks)
-        };
+        let held = HeldVersion::new(version, op, wire, key.is_some(), epoch, chunks);
         Ok(Signed {
             c: c.clone(),
             seq,
@@ -11363,22 +9614,16 @@ impl Inner {
         })
     }
 
-    /// The rule's judgement of `signed`, an own version of a merge
-    /// collection, against its past — here the state's frontier and this
-    /// writer's earlier log, as every reader will judge it — by the
-    /// collection's state: checked, and with `apply`, applied. One the rule
-    /// refuses is [`DataError::BadRequest`]. `None` under the log rule.
-    fn judge_own(
-        &self,
-        st: &mut St,
-        signed: &Signed,
-        apply: bool,
-    ) -> Result<Option<Ruled>, DataError> {
+    /// Apply `signed`, an own version of a merge collection, to the
+    /// collection's state over its past — here the state's frontier and this
+    /// writer's earlier log, as every reader will judge it. Nothing under the
+    /// log rule; [`DataError::RuleUnknown`] when this device runs no rule for
+    /// the collection.
+    fn apply_own_version(&self, st: &mut St, signed: &Signed) -> Result<(), DataError> {
         let Some(function) = &signed.function else {
-            return Ok(None);
+            return Ok(());
         };
         let c = &signed.c;
-        let St { colls, cut_out, .. } = st;
         let Coll {
             members,
             state,
@@ -11387,17 +9632,15 @@ impl Inner {
             locked,
             revoked,
             versions,
-            by_digest,
-            outsiders,
             ..
-        } = colls.get_mut(c).expect("members known");
+        } = st.colls.get_mut(c).expect("members known");
         let Some(state) = state.as_deref_mut() else {
             return Err(DataError::RuleUnknown {
                 collection: c.clone(),
                 rule: function.clone(),
             });
         };
-        // Its past, as every reader will see it (spec §5.2).
+        // Its past, as every reader will see it (spec §5).
         let waits = Waits {
             collection: c,
             members: members.as_ref(),
@@ -11407,25 +9650,18 @@ impl Inner {
             revoked,
             admitted: versions,
         };
-        let judged = rule_on(
+        apply_own(
             state,
             &signed.held,
-            &PastOf::new(&signed.held.version, waits, by_digest, outsiders, cut_out),
-            apply,
+            &PastOf::new(&signed.held.version, waits),
         );
-        judged.map(Some).map_err(|e| DataError::BadRequest {
-            name: c.clone(),
-            why: format!(
-                "{c} merges with {function}, whose rule refuses this operation ({e}); nothing \
-                 was written: put an operation the rule takes"
-            ),
-        })
+        Ok(())
     }
 
-    /// Keep `signed`, an own version judged (`judged`, under a merge rule):
-    /// its seq is the log's head, it and its pieces are stored, listed in
-    /// the summary, applied, and delivered. Its id.
-    fn commit(&self, st: &mut St, ns: &Name, signed: Signed, judged: Option<Ruled>) -> VersionId {
+    /// Keep `signed`, an own version applied to its collection's state: its
+    /// seq is the log's head, it and its pieces are stored, listed in the
+    /// summary, applied, and delivered. Its id.
+    fn commit(&self, st: &mut St, ns: &Name, signed: Signed) -> VersionId {
         let _batch = self.stage.batch();
         let Signed {
             c,
@@ -11437,86 +9673,6 @@ impl Inner {
         let version = held.version.clone();
         let id = version.id.clone();
         let name = version.name.clone();
-        // Each change of counting, with the version it is about.
-        let mut told: Vec<(Change, VersionId)> = Vec::new();
-        if let Some(Ruled {
-            kind,
-            counting,
-            changed,
-        }) = judged
-        {
-            let coll = st.colls.get_mut(&c).expect("members known");
-            coll.kinds.insert(id.clone(), kind);
-            // An own checkpoint covers its past as any does (spec §5.2):
-            // what it covers counts as the checkpoints covering it count.
-            let mut moved = kind == OpKind::Checkpoint;
-            if moved {
-                coll.cover.add(&id, past_frontier(&version), &counting);
-            }
-            if let Counting::NotCounted(why) = counting {
-                coll.not_counted.insert(id.clone(), why.clone());
-                let change = Change::NotCounted {
-                    collection: c.clone(),
-                    id: id.clone(),
-                    why: NotCounted::Excluded(why),
-                };
-                told.push((change, id.clone()));
-            }
-            for (other, counting) in changed {
-                moved |= coll.cover.recount(&other, &counting);
-                // The rule's word on a covered version is not told.
-                if coll.cover.inside(&other) {
-                    continue;
-                }
-                let change = match counting {
-                    Counting::Counted => {
-                        coll.not_counted
-                            .remove(&other)
-                            .is_some()
-                            .then(|| Change::Counted {
-                                collection: c.clone(),
-                                id: other.clone(),
-                            })
-                    }
-                    Counting::NotCounted(why) => {
-                        (coll.not_counted.get(&other) != Some(&why)).then(|| {
-                            coll.not_counted.insert(other.clone(), why.clone());
-                            Change::NotCounted {
-                                collection: c.clone(),
-                                id: other.clone(),
-                                why: NotCounted::Excluded(why),
-                            }
-                        })
-                    }
-                };
-                if let Some(change) = change {
-                    told.push((change, other));
-                }
-            }
-            if moved {
-                let recounted = recount_covered(
-                    &coll.cover,
-                    &mut coll.not_counted,
-                    &coll.versions,
-                    &coll.pending,
-                    None,
-                );
-                for (other, now) in recounted {
-                    let change = match now {
-                        None => Change::Counted {
-                            collection: c.clone(),
-                            id: other.clone(),
-                        },
-                        Some(why) => Change::NotCounted {
-                            collection: c.clone(),
-                            id: other.clone(),
-                            why: NotCounted::Excluded(why),
-                        },
-                    };
-                    told.push((change, other));
-                }
-            }
-        }
         st.head = st.head.max(seq);
         // Written together (one batch): the markers first, then the pieces,
         // the entry that makes the version visible last. On a store that
@@ -11539,20 +9695,8 @@ impl Inner {
             .or_default()
             .insert(seq);
         coll.applied.insert(id.writer.clone(), seq);
-        coll.by_digest.insert(held.digest, id.clone());
-        // An own operation in pieces is not kept in memory once applied.
-        let held = match held.unloaded() {
-            Some(unloaded) => unloaded,
-            None => held,
-        };
         coll.versions.insert(id.clone(), Arc::new(held));
         st.emit(&c, &Change::Version(version), &id.writer, seq);
-        for (change, about) in told {
-            match &change {
-                Change::NotCounted { .. } => st.emit(&c, &change, &about.writer, about.seq.0),
-                _ => st.tell(&c, &change),
-            }
-        }
         id
     }
 
@@ -11588,7 +9732,7 @@ impl Inner {
     }
 
     /// The host default for a collection of this device's own namespace that
-    /// nobody shared: merge with `/merge/yrs`, written and read by the
+    /// nobody shared: the register ([`merge::NEWEST`]), written and read by the
     /// owner's namespace, sealed in an epoch this record (the own log's entry
     /// `seq`) starts; with the epoch's key.
     fn default_members(&self, c: &Name, seq: u64) -> (MembersBody, Option<ContentKey>) {
@@ -11598,7 +9742,9 @@ impl Inner {
             folder: false,
             revision: 1,
             rule: Rule::Merge {
-                function: crate::merge::Yrs::new().function().clone(),
+                function: merge::NEWEST
+                    .parse()
+                    .expect("the register's name is an NDN name"),
             },
             writers: vec![self.ns.clone()],
             readers: vec![Audience::Person(self.ns.clone())],
@@ -11905,7 +10051,7 @@ impl Inner {
             let refused = st.refused.contains_key(&version) || st.cut_out.contains_key(&version);
             let verified = matches!(
                 st.held.get(&version),
-                Some(Held::Version(_) | Held::Locked | Held::Record { .. } | Held::Snapshot(_))
+                Some(Held::Version(_) | Held::Locked | Held::Record { .. })
             );
             if refused || !verified {
                 return None;
@@ -12411,9 +10557,8 @@ impl Inner {
             .asking
             .remove(&(ask.collection.clone(), ask.epoch.clone()));
         if got {
-            // Merge versions in pieces it unlocked wait for them; a group
-            // member it opened may make its folder followed.
-            self.fetch_wanted(true);
+            // A group member it opened may make its folder followed.
+            self.fetch_wanted_bytes();
             self.settle().await;
         } else {
             tracing::debug!(collection = %ask.collection, epoch = ?ask.epoch, "the epoch's key is not owed here (no version held waits for it, or this device may not hold it): not asked again until one arrives");
@@ -12492,7 +10637,7 @@ impl Inner {
     fn known_under_folder(&self, c: &Name) {
         let mut st = self.st.lock();
         if st.inside(c) && st.colls.get(c).is_some_and(|x| x.members.is_none()) {
-            st.ensure(c, &self.config.rules, self.me());
+            st.ensure(c);
         }
     }
 
@@ -12521,11 +10666,9 @@ impl Inner {
                     });
                 };
                 Ok(Got::State(State {
-                    name: state_name(c, &at),
                     collection: c.clone(),
                     at,
-                    value: state.value(&coll.held_back()),
-                    not_counted: coll.not_counted_list(),
+                    value: state.value(),
                 }))
             }
             Rule::Log => {
@@ -12582,10 +10725,6 @@ impl Inner {
             }
             let held = st.held.get(name)?;
             Some(match held {
-                Held::Snapshot(s) => Ok(Answer {
-                    got: Got::Snapshot(s.clone()),
-                    age: Age::Exact,
-                }),
                 Held::Version(id) => {
                     let parsed = parse_log_name(name)?;
                     let c = parsed.subject?;
@@ -12749,15 +10888,13 @@ impl Inner {
 
     /// [`Self::get_piece`], trying `first` before the others, and saying
     /// which source answered (`None`: its writer by name; `Some(d)`: device
-    /// `d` under its own name — in a merge collection a device whose
-    /// versions are made over the piece's version and so applied it,
-    /// [`St::appliers`], then any other device heard for `c`'s namespace,
-    /// [`Self::relays`]). The store answers first whatever `first` says. In
-    /// rounds, as a walk asks (spec §13.5, §17.1): the writer first; once
-    /// its first ask missed (a lifetime), beside its later asks, the
-    /// appliers in turn, then the relays all at once — so a source that is
-    /// silent costs the writer's answer nothing, and the writer's later asks
-    /// wait for none of them.
+    /// `d` under its own name — any other device heard for `c`'s
+    /// namespace, [`Self::relays`]). The store answers first whatever
+    /// `first` says. In rounds, as a walk asks (spec §13.5, §17.1): the
+    /// writer first; once its first ask missed (a lifetime), beside its
+    /// later asks, the relays all at once — so a source that is silent
+    /// costs the writer's answer nothing, and the writer's later asks wait
+    /// for none of them.
     async fn get_piece_from(
         self: &Arc<Self>,
         c: &Name,
@@ -12771,27 +10908,17 @@ impl Inner {
             return Some((w, None));
         }
         let writer = parse_piece_name(name).map(|p| p.log.device);
-        let (appliers, relays) = {
+        let relays = {
             let st = self.st.lock();
-            let relays = match (namespace_of(c), &writer) {
+            match (namespace_of(c), &writer) {
                 (Some(ns), Some(w)) => self.relays(&st, &ns, w, &[]),
                 _ => Vec::new(),
-            };
-            (st.appliers(c, &strip_piece(name)), relays)
+            }
         };
         // An Interest for this device's own name goes nowhere useful: its
         // own pieces it dropped are asked of the others only.
         let own = writer.as_ref() == Some(&self.device);
-        let mut others: Vec<Name> = Vec::new();
-        for d in appliers {
-            if d != self.device && !others.contains(&d) {
-                others.push(d);
-            }
-        }
-        let mut relays: Vec<Name> = relays
-            .into_iter()
-            .filter(|d| *d != self.device && !others.contains(d))
-            .collect();
+        let mut relays: Vec<Name> = relays.into_iter().filter(|d| *d != self.device).collect();
         let checks = |data: Data| {
             let fits = *data.name == *name && wire::implicit_digest(data.raw()) == *digest;
             if !fits {
@@ -12801,19 +10928,13 @@ impl Inner {
         };
         // The source that answered the piece before this one, asked first.
         let preferred = match first {
-            Some(Some(d)) if others.contains(d) || relays.contains(d) => {
-                others.retain(|o| o != d);
+            Some(Some(d)) if relays.contains(d) => {
                 relays.retain(|r| r != d);
                 Some(d.clone())
             }
             _ => None,
         };
-        let from_others = async {
-            for h in &others {
-                if let Some(data) = self.fetch_held(name, h).await.and_then(checks) {
-                    return Some((data, Some(h.clone())));
-                }
-            }
+        let from_relays = async {
             self.first_held_from(name, &relays, Some(*digest))
                 .await
                 .map(|(data, r)| (data, Some(r)))
@@ -12825,7 +10946,7 @@ impl Inner {
                 return Some((data, Some(p.clone())));
             }
             if own {
-                return from_others.await;
+                return from_relays.await;
             }
             let by_name = async {
                 self.fetch_owed(name.clone(), false)
@@ -12835,7 +10956,7 @@ impl Inner {
             };
             let beside = async {
                 rt::sleep(self.config.lifetime).await;
-                from_others.await
+                from_relays.await
             };
             first_some(by_name, beside).await
         }
@@ -12996,111 +11117,6 @@ impl Inner {
         })
     }
 
-    /// Fetch, in the background, what versions held here wait for: the
-    /// removal cut manifest packets ([`Self::fetch_wanted_bytes`]) — which a
-    /// version may come to wait for as it is admitted on any path, a key
-    /// opening it as much as an entry taken (spec §8, §17.1) — and the
-    /// pieces every merge version waits for ([`St::wanted_pieces`]), these
-    /// not while a descent is under way: it fetches them when it ends, once
-    /// what it brought is taken. `retry`: also those whose pieces a fetch
-    /// did not find (asked again on what may have changed since: a descent,
-    /// a key, a start).
-    fn fetch_wanted(self: &Arc<Self>, retry: bool) {
-        self.fetch_wanted_bytes();
-        let wanted: Vec<(Name, ChunksBody)> = {
-            let mut st = self.st.lock();
-            if st.descents > 0 {
-                return;
-            }
-            if retry {
-                st.unfound.clear();
-            }
-            st.colls.keys().flat_map(|c| st.wanted_pieces(c)).collect()
-        };
-        for (v, chunks) in wanted {
-            self.spawn_pieces(v, chunks);
-        }
-    }
-
-    /// Fetch every piece of the large version `v` in the background — as a
-    /// reader of a merge collection whose version waits for them — then
-    /// open and apply what waited.
-    fn spawn_pieces(self: &Arc<Self>, v: Name, chunks: ChunksBody) {
-        if !self.st.lock().fetching.insert(v.clone()) {
-            return;
-        }
-        tracing::trace!(me = %self.device, name = %v, "fetching the pieces of a version");
-        let inner = Arc::clone(self);
-        rt::spawn(async move {
-            let c = parse_log_name(&v).and_then(|l| l.subject);
-            let whole = match &c {
-                Some(c) => inner.walk_pieces(&v, c, chunks, false).await.is_some(),
-                None => false,
-            };
-            let retry = {
-                let mut st = inner.st.lock();
-                st.fetching.remove(&v);
-                match (&c, whole) {
-                    (Some(c), true) => {
-                        st.unfound.remove(&v);
-                        st.piece_misses.remove(&v);
-                        st.pieces_arrived(c, &v);
-                        None
-                    }
-                    _ => {
-                        tracing::debug!(me = %inner.device, name = %v, "not every piece of a held version is to be had yet; asked again while it waits for them");
-                        st.unfound.insert(v.clone());
-                        let misses = st.piece_misses.entry(v.clone()).or_insert(0);
-                        let pause = retry_pause(*misses);
-                        *misses = misses.saturating_add(1);
-                        if let Some(c) = &c {
-                            st.basis_unfound(c, &v);
-                        }
-                        Some(pause)
-                    }
-                }
-            };
-            if let Some(pause) = retry {
-                inner.retry_pieces(v, pause);
-            }
-            inner.progress.notify_waiters();
-            // What it opened (a checkpoint, maybe, covering older versions)
-            // or did not find decides which pieces are fetched next.
-            inner.fetch_wanted(false);
-        });
-    }
-
-    /// Ask again, after `pause`, for the pieces of the merge version `v` a
-    /// fetch did not find whole (spec §17.1): if it still waits for them
-    /// ([`St::wanted_pieces`]: not covered by a checkpoint held whole, not
-    /// cut or let go) and nothing asked for them meanwhile. A descent
-    /// under way fetches them when it ends.
-    fn retry_pieces(self: &Arc<Self>, v: Name, pause: Duration) {
-        let weak = Arc::downgrade(self);
-        rt::spawn(async move {
-            rt::sleep(pause).await;
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            let wanted = {
-                let mut st = inner.st.lock();
-                if !st.unfound.remove(&v) || st.descents > 0 {
-                    return;
-                }
-                let wanted = parse_log_name(&v)
-                    .and_then(|l| l.subject)
-                    .and_then(|c| st.wanted_pieces(&c).into_iter().find(|(n, _)| *n == v));
-                if wanted.is_none() {
-                    st.piece_misses.remove(&v);
-                }
-                wanted
-            };
-            if let Some((v, chunks)) = wanted {
-                inner.spawn_pieces(v, chunks);
-            }
-        });
-    }
-
     /// The device an ask's proof claims asks, by its key locator, and the
     /// proof's packet: unverified, for the checks that cost nothing.
     fn claimed_asker(proof: &Bytes) -> Option<(Data, Name)> {
@@ -13188,7 +11204,7 @@ fn strip_piece(name: &Name) -> Name {
 }
 
 /// The prefix a revocation cut's range names for the log entry `entry`:
-/// its collection's log `<D>/32=log/<C>` (or `<D>/32=log`, a snapshot),
+/// its collection's log `<D>/32=log/<C>` (or `<D>/32=log`, of no collection),
 /// the name without its seq.
 fn log_prefix(entry: &Name) -> Name {
     let comps = entry.components();
@@ -13211,8 +11227,8 @@ fn anchor_key(ctx: &SignedTrustContext) -> Writer {
 
 /// The data-layer cut by which `ctx` ends `writer`'s key in the log
 /// `prefix` (`<D>/32=log/<C>`): of the key, accepting exactly the key's
-/// runs for that log, in collection `C` (of the snapshot log `<D>/32=log`,
-/// under that prefix), signed by the context's anchor key (spec §8). Empty
+/// runs for that log, in collection `C` (or of the log `<D>/32=log` of no
+/// collection, under that prefix), signed by the context's anchor key (spec §8). Empty
 /// when the revocation has no cut, or the cut no runs there.
 fn revocation_cut_for(ctx: &SignedTrustContext, writer: &Writer, prefix: &Name) -> Cut {
     let key = key_name_of(writer.key());
@@ -13338,9 +11354,8 @@ fn bound_bytes(
     }
 }
 
-/// The packet of the log entry `name` held here, opened or sealed — or, in a
-/// collection not built yet, read from the store. Every entry a collection
-/// holds is in [`St::held`]
+/// The packet of the log entry `name` held here, opened or sealed. Every
+/// entry a collection holds is in [`St::held`]
 /// by name, so an entry never held costs one lookup, and an admitted
 /// version one more by its id: no scan of the collection (spec §13.5).
 fn held_wire(st: &St, name: &Name) -> Option<Bytes> {
@@ -13362,12 +11377,6 @@ fn held_wire(st: &St, name: &Name) -> Option<Bytes> {
                 .iter()
                 .find(|l| l.name == *name)
                 .map(|l| l.wire.clone())
-        })
-        .or_else(|| {
-            coll.dormant.as_ref()?;
-            matches!(held, Held::Version(_) | Held::Locked)
-                .then(|| st.store.get(name))
-                .flatten()
         })
 }
 
@@ -13475,10 +11484,7 @@ impl Device {
         // Under a folder in force the collection writes under the record in
         // force over it, and no default record of its own is signed (spec
         // §6).
-        inner
-            .st
-            .lock()
-            .ensure(collection, &inner.config.rules, inner.me());
+        inner.st.lock().ensure(collection);
         // A collection inheriting a folder's record waits for the walk toward
         // it: the device that has not been walked may hold a narrower record
         // of the collection's own (spec §15).
@@ -13492,7 +11498,7 @@ impl Device {
         // Another person's collection is held under its record by now.
         let fresh = {
             let mut st = inner.st.lock();
-            st.ensure(collection, &inner.config.rules, inner.me());
+            st.ensure(collection);
             ns == inner.ns && st.colls.get(collection).is_none_or(|c| c.members.is_none())
         };
         // A collection of this namespace that no record governs gets the
@@ -13505,7 +11511,7 @@ impl Device {
                 inner.default_allowed(collection)?;
                 let written = {
                     let mut st = inner.st.lock();
-                    st.ensure(collection, &inner.config.rules, inner.me());
+                    st.ensure(collection);
                     match st.colls.get(collection).is_none_or(|c| c.members.is_none()) {
                         // A record arrived meanwhile: written under it.
                         false => Err(draft),
@@ -13562,49 +11568,6 @@ impl DataLayer for Device {
         // Each reading below needs its own keyword in the name: one pass finds them, so a
         // plain collection name (the common read) is parsed by none of them.
         let words = wire::NameWords::of(name);
-        // A version of a merge collection whose state is not built yet is
-        // read from it: built now (spec §5.2). A collection or state name
-        // is followed, which builds it ([`Inner::follow`]).
-        let of = words.log().then(|| parse_log_name(name)?.subject).flatten();
-        if let Some(c) = of {
-            inner.st.lock().awaken(&c);
-        }
-        if words.state()
-            && let Some((c, at)) = parse_state_name(name)
-        {
-            inner.look(&c).await?;
-            inner.known_under_folder(&c);
-            let rules = inner.config.rules.clone();
-            let me = inner.writer.clone();
-            let value = |st: &St| st.value_at(&c, &at, &rules, &me);
-            if inner.sealed_off(&inner.st.lock(), &c) {
-                let sealed = Err(DataError::Sealed { name: name.clone() });
-                return inner.sealed_judged(name, &c, sealed).await;
-            }
-            let unknown = |st: &St| st.rule_unknown(&c, &rules);
-            if !inner
-                .wait_for(|st| value(st).is_some() || unknown(st).is_some())
-                .await
-            {
-                return Err(DataError::Unavailable { name: name.clone() });
-            }
-            let st = inner.st.lock();
-            if let Some(e) = unknown(&st) {
-                return Err(e);
-            }
-            let (value, not_counted) =
-                value(&st).ok_or_else(|| DataError::Unavailable { name: name.clone() })?;
-            return Ok(Answer {
-                got: Got::State(State {
-                    name: name.clone(),
-                    collection: c,
-                    at,
-                    value,
-                    not_counted,
-                }),
-                age: Age::Exact,
-            });
-        }
         if words.log() && parse_log_name(name).is_some() {
             return inner.get_log_entry(name).await;
         }
@@ -13674,30 +11637,8 @@ impl DataLayer for Device {
         inner.follow(collection).await?;
         let mut rx = {
             let mut st = inner.st.lock();
-            // A collection under the target not built yet is built only if
-            // it holds a version past `since` — one to list; the rest stay
-            // unbuilt until something else needs them (spec §5.2, §15):
-            // what arrives later builds its collection as it applies.
-            let past_since: Vec<Name> = st
-                .colls
-                .iter()
-                .filter(|(c, x)| {
-                    c.has_prefix(collection)
-                        && x.dormant.as_ref().is_some_and(|d| {
-                            d.held.iter().any(|(w, seqs)| {
-                                seqs.last()
-                                    .is_some_and(|top| since.get(w).is_none_or(|s| s.0 < *top))
-                            })
-                        })
-                })
-                .map(|(c, _)| c.clone())
-                .collect();
-            for c in past_since {
-                st.awaken(&c);
-            }
             // Each collection under the target, in order: what it holds
-            // applied, each with why when it does not count (its rule's
-            // reason). A version not applied yet is delivered once it
+            // applied. A version not applied yet is delivered once it
             // applies, as it would have been had the watch begun earlier, so
             // none is delivered twice.
             let mut listed: Vec<(&Name, &VersionId, Change)> = Vec::new();
@@ -13708,24 +11649,8 @@ impl DataLayer for Device {
                         continue;
                     }
                     listed.push((c, &v.id, Change::Version(v.clone())));
-                    let why = coll
-                        .not_counted
-                        .get(&v.id)
-                        .map(|why| NotCounted::Excluded(why.clone()));
-                    if let Some(why) = why {
-                        listed.push((
-                            c,
-                            &v.id,
-                            Change::NotCounted {
-                                collection: c.clone(),
-                                id: v.id.clone(),
-                                why,
-                            },
-                        ));
-                    }
                 }
             }
-            // Stable: a version comes before why it is not counted.
             listed.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
             // First the records in force (spec §15): over the target, and
             // over each folder and each collection with a record of its own
@@ -13754,29 +11679,6 @@ impl DataLayer for Device {
         let ns = namespace_of(collection).expect("followed, so a data name");
         inner.refresh_group(&ns);
         Ok(Box::pin(stream::poll_fn(move |cx| rx.poll_recv(cx))))
-    }
-
-    async fn snapshot(&self, of: &[Name]) -> Result<Snapshot, DataError> {
-        let mut pins = Vec::with_capacity(of.len());
-        for name in of {
-            let pin = match self.get(name).await?.got {
-                Got::State(s) => s.name,
-                Got::Version(v) => v.name,
-                Got::Snapshot(s) => s.name,
-            };
-            pins.push(pin);
-        }
-        let inner = &self.inner;
-        let mut st = inner.st.lock();
-        let (name, seq) = inner.append(&mut st, None, wire::encode_snapshot(&pins))?;
-        Ok(Snapshot {
-            id: VersionId {
-                writer: inner.writer.clone(),
-                seq: Seq(seq),
-            },
-            name,
-            pins,
-        })
     }
 
     async fn share(
@@ -14367,7 +12269,7 @@ mod tests {
         };
         let share = crate::layer::Share {
             rule: Rule::Merge {
-                function: n("/merge/yrs"),
+                function: n(crate::merge::NEWEST),
             },
             writers: vec![n("/home/bob")],
             readers: Vec::new(),
@@ -14377,7 +12279,6 @@ mod tests {
             dev.get(&unmarked).await.err(),
             dev.watch(&unmarked, &Frontier::new()).await.err(),
             dev.share(&unmarked, share.clone()).await.err(),
-            dev.snapshot(std::slice::from_ref(&unmarked)).await.err(),
         ];
         for refusal in refusals {
             let Some(e @ DataError::BadName { .. }) = refusal else {
@@ -14445,7 +12346,7 @@ mod tests {
                 folder: false,
                 revision: 1,
                 rule: Rule::Merge {
-                    function: n("/merge/yrs"),
+                    function: n(crate::merge::NEWEST),
                 },
                 writers: vec![wire::namespace_of(&c).unwrap()],
                 readers: Vec::new(),
@@ -17062,10 +14963,7 @@ mod tests {
 mod test_kit;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod merge_tests;
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod merge_review_tests;
+mod register_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod folder_tests;
@@ -17078,9 +14976,6 @@ mod durability_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod watch_tests;
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod lazy_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod intro_tests;
@@ -17113,9 +15008,6 @@ mod fetch_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod walk_tests;
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod basis_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod batching_tests;

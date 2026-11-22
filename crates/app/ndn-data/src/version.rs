@@ -114,7 +114,7 @@ impl FromIterator<VersionId> for Frontier {
 /// A frontier names versions by seq alone, so a writer could name a seq of
 /// another key that does not exist yet and claim, once it does, to have
 /// seen everything below it; a digest it can only know of a packet it held.
-/// In a merge collection every parent carries one (spec §5.2).
+/// In a merge collection every parent carries one (spec §5).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Parents {
     at: Frontier,
@@ -310,18 +310,18 @@ pub struct Version {
     /// The date its writer's clock showed; display only.
     pub dated: Timestamp,
     /// The merge rule its writer made its operation for, by exact name
-    /// (spec §5.1); `None` under the log rule. A merge
+    /// (spec §5); `None` under the log rule. A merge
     /// collection applies it only under that rule.
     pub rule: Option<Name>,
     /// The content.
     pub payload: Payload,
     /// The implicit digest of the version's packet: SHA-256 of its whole
-    /// Data wire, its content address — what a merge operation's basis and
-    /// a parent's digest name (spec §4, §5.1).
+    /// Data wire, its content address — what a parent's digest names, and
+    /// what the register breaks a tie by (spec §4, §5).
     pub digest: [u8; 32],
     /// The `MergeOp` octets of a merge version (`rule` is `Some`), as the
-    /// rule's [`Op::bytes`](crate::Op::bytes) received them. `None` under
-    /// the log rule, and while the operation is not open
+    /// register applies them. `None` under the log rule, and while the
+    /// operation is not open
     /// here: sealed in an epoch whose key this device does not hold, or
     /// carried in pieces and not read whole ([`Payload::Large`]; a `get` of
     /// the version's name reads it whole and fills it).

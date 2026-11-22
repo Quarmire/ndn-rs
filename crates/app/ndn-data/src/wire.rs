@@ -12,7 +12,6 @@
 //! | packet | name | signed by |
 //! |---|---|---|
 //! | log entry (version, members record) | `<D>/32=log/<C>/seq=<n>` | the device key |
-//! | log entry (snapshot) | `<D>/32=log/seq=<n>` | the device key |
 //! | summary root of namespace `O` | `<D>/32=summary/<O>/seq=<head>` | the device key |
 //! | summary node of `X` | `<D>/32=summary/<X>/seq=<head>` | DigestSha256; its parent lists its digest |
 //! | summary page of `X` | `<D>/32=summary/<X>/32=page/<buckets>/seq=<head>` | DigestSha256; its parent lists its digest |
@@ -21,17 +20,15 @@
 //!
 //! `X` is a name of the tree from `O` to a collection: `O/32=data` (the
 //! root's one child) or `O/32=data/<path>`, a folder or collection. Some
-//! names are never fetched: the state name
-//! `<C>/32=state/<F>` (the merged value at frontier `F`, computed by every
-//! reader), and the sync
+//! names are never fetched: the sync
 //! group `<O>/32=sync` (State Vector Sync Interests,
 //! notifications only), [`ndn_security::sync_group`]: the one definition the
 //! forwarder's trust and link libraries route and multicast it by.
 //!
 //! Every name parses one way: `D` and `O` have no keyword component, so
 //! the first `32=log`, `32=summary`, `32=seal` or `32=grant` ends `D`,
-//! `32=data` ends `O`, and the layer's other keywords (`32=page`,
-//! `32=state`) follow a subject whose only keyword is its marker; a seal
+//! `32=data` ends `O`, and the layer's other keyword (`32=page`)
+//! follows a subject whose only keyword is its marker; a seal
 //! key's and a grant's last component is one opaque value (a key, a TLV).
 //! A node or page name always ends in its head:
 //! only a root is discovered without one (`<D>/32=summary/<O>`), and a
@@ -105,8 +102,6 @@ pub mod tlv {
     pub const WRITERS: u64 = 0x054C;
     /// Readers: `Audience*`.
     pub const READERS: u64 = 0x054E;
-    /// A snapshot record: the Content of a snapshot log entry, `Name*` (pins).
-    pub const SNAPSHOT_RECORD: u64 = 0x0550;
     /// A summary node or page: the Content of a summary packet.
     pub const SUMMARY_NODE: u64 = 0x0552;
     /// The writer's own entries directly in the node's collection: `SeqRange*`.
@@ -267,7 +262,6 @@ const DATA: &[u8] = b"data";
 const LOG: &[u8] = b"log";
 const SUMMARY: &[u8] = b"summary";
 const PAGE: &[u8] = b"page";
-const STATE: &[u8] = b"state";
 const SEAL: &[u8] = b"seal";
 const GRANT: &[u8] = b"grant";
 const MANIFEST: &[u8] = b"manifest";
@@ -524,7 +518,7 @@ pub fn log_name(device: &Name, subject: Option<&Name>, seq: u64) -> Name {
 pub struct LogName {
     /// The device whose log it is.
     pub device: Name,
-    /// The collection it is about; `None` for a snapshot.
+    /// The collection it is about; `None` for an entry about none.
     pub subject: Option<Name>,
     /// Its sequence number in the device's log.
     pub seq: u64,
@@ -705,36 +699,6 @@ pub fn parse_summary_name(name: &Name) -> Option<SummaryName> {
         page,
         head,
     })
-}
-
-/// The name of a collection's merged state at `at`:
-/// `<collection>/32=state/<Frontier TLV>`.
-pub fn state_name(collection: &Name, at: &Frontier) -> Name {
-    let mut w = TlvWriter::new();
-    write_frontier(&mut w, at);
-    collection
-        .clone()
-        .append_component(kw(STATE))
-        .append_component(NameComponent::generic(w.finish()))
-}
-
-/// Parse `<collection>/32=state/<Frontier TLV>`.
-pub fn parse_state_name(name: &Name) -> Option<(Name, Frontier)> {
-    let comps = name.components();
-    let n = comps.len();
-    if n < 3 || !is_kw(&comps[n - 2], STATE) {
-        return None;
-    }
-    let collection = name_of(&comps[..n - 2]);
-    if !is_collection_name(&collection) {
-        return None;
-    }
-    let mut r = TlvReader::new(comps[n - 1].value.clone());
-    let (typ, value) = r.read_tlv().ok()?;
-    (typ == tlv::FRONTIER && r.is_empty())
-        .then(|| read_frontier(value).ok())
-        .flatten()
-        .map(|f| (collection, f))
 }
 
 /// `<device>/32=seal`: what a device's seal key packet is asked for by when its public key is not
@@ -1044,7 +1008,6 @@ pub(crate) struct NameWords(u8);
 
 impl NameWords {
     const LOG: u8 = 1;
-    const STATE: u8 = 2;
 
     pub(crate) fn of(name: &Name) -> Self {
         let mut bits = 0;
@@ -1054,7 +1017,6 @@ impl NameWords {
             }
             bits |= match c.value.as_ref() {
                 LOG => Self::LOG,
-                STATE => Self::STATE,
                 _ => 0,
             };
         }
@@ -1063,10 +1025,6 @@ impl NameWords {
 
     pub(crate) fn log(self) -> bool {
         self.0 & Self::LOG != 0
-    }
-
-    pub(crate) fn state(self) -> bool {
-        self.0 & Self::STATE != 0
     }
 }
 
@@ -1473,7 +1431,7 @@ pub struct VersionBody {
     pub keep: Keep,
     /// The writer's clock.
     pub dated: Timestamp,
-    /// The merge rule the operation was made for (spec §5.1); `None` under
+    /// The merge rule the operation was made for (spec §5); `None` under
     /// the log rule.
     pub rule: Option<Name>,
     /// The fields the writer set (an empty value removes the field); empty
@@ -1585,20 +1543,17 @@ pub enum Record {
     Version(VersionBody),
     /// A members record.
     Members(MembersBody),
-    /// A snapshot's pins.
-    Snapshot(Vec<Name>),
     /// An introduction's offer or use mark (spec §19).
     Intro(crate::intro::IntroRecord),
 }
 
 impl Record {
     /// The collection a log entry with this record is about (its name's
-    /// subject): `None` for a snapshot.
+    /// subject): `None` for a record about no collection.
     pub fn subject(&self) -> Option<Name> {
         match self {
             Record::Version(b) => Some(b.collection.clone()),
             Record::Members(b) => Some(b.collection.clone()),
-            Record::Snapshot(_) => None,
             Record::Intro(r) => r.subject(),
         }
     }
@@ -1776,23 +1731,11 @@ pub fn encode_members(b: &MembersBody) -> Bytes {
     w.finish()
 }
 
-/// Encode a snapshot record.
-pub fn encode_snapshot(pins: &[Name]) -> Bytes {
-    let mut w = TlvWriter::new();
-    w.write_nested(tlv::SNAPSHOT_RECORD, |w| {
-        for p in pins {
-            write_name(w, p);
-        }
-    });
-    w.finish()
-}
-
 /// Encode any log record.
 pub fn encode_record(r: &Record) -> Bytes {
     match r {
         Record::Version(b) => encode_version(b),
         Record::Members(b) => encode_members(b),
-        Record::Snapshot(p) => encode_snapshot(p),
         Record::Intro(r) => r.encode(),
     }
 }
@@ -1807,17 +1750,6 @@ pub fn decode_record(content: Bytes) -> Result<Record, WireError> {
     match typ {
         tlv::VERSION_RECORD => decode_version(value).map(Record::Version),
         tlv::MEMBERS_RECORD => decode_members(value).map(Record::Members),
-        tlv::SNAPSHOT_RECORD => {
-            let mut pins = Vec::new();
-            each(value, |t, v| {
-                if t != tlv_type::NAME {
-                    return Ok(false);
-                }
-                pins.push(read_name(v)?);
-                Ok(true)
-            })?;
-            Ok(Record::Snapshot(pins))
-        }
         tlv::INTRO_OFFER | tlv::INTRO_USED => {
             crate::intro::IntroRecord::decode(typ, value).map(Record::Intro)
         }
@@ -2663,13 +2595,6 @@ mod tests {
             assert_eq!(subject_namespace(&ns), Some(ns.clone()));
             assert_eq!(subject_namespace(&c), Some(ns.clone()));
             assert!(is_data_name(&folder) && !is_collection_name(&folder));
-            let at: Frontier = [crate::VersionId {
-                writer: Writer::new(d.clone().append("KEY").append("1")),
-                seq: Seq(4),
-            }]
-            .into_iter()
-            .collect();
-            assert_eq!(parse_state_name(&state_name(&c, &at)), Some((c, at)));
         }
         assert_eq!(
             device_of(&n("/home/bob/member/phone/KEY/1")),
@@ -2730,7 +2655,7 @@ mod tests {
             folder: false,
             revision: 1,
             rule: Rule::Merge {
-                function: n("/merge/yrs"),
+                function: n(crate::merge::NEWEST),
             },
             writers: vec![n("/alice")],
             readers: vec![Audience::Person(n("/alice"))],
@@ -3260,7 +3185,6 @@ mod tests {
             log_name(&device, None, 2),
             piece_name(&log, PieceKind::Chunk(2)),
             piece_name(&log, PieceKind::Manifest(0)),
-            state_name(&c, &Frontier::default()),
             root_name(&device, &n("/alice"), 4),
             node_name(&device, &c, 4),
             seal_key_name(&device, &[9; 32]),
@@ -3281,7 +3205,6 @@ mod tests {
             n("/32=grant"),
             n("/alice/32=grant"),
             n("/alice/32=range/x"),
-            n("/alice/32=data/a/32=range/x/32=state/y"),
             n("/alice/laptop/32=intro"),
             n("/alice/laptop/32=hint"),
         ];
@@ -3323,10 +3246,6 @@ mod tests {
             assert!(
                 words.log() || parse_log_name(name).is_none(),
                 "{name}: a log name without 32=log"
-            );
-            assert!(
-                words.state() || parse_state_name(name).is_none(),
-                "{name}: a state name without 32=state"
             );
         }
         assert_eq!(seen.len(), 4, "the table reaches every route: {seen:?}");

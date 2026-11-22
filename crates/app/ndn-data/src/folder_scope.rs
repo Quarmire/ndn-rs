@@ -9,7 +9,7 @@
 //! themselves). So the link must carry only the names of the folder: the
 //! entries, pieces, summaries and keys of **collections under the
 //! folder**, and the few names of the layer's own that reach them. Everything
-//! else this device holds by name — another folder's collections, a snapshot,
+//! else this device holds by name — another folder's collections, an entry of no collection,
 //! the log of its other namespaces' data, answers — is not carried.
 //!
 //! The decision is a pure function of the two names, by the grammar of spec
@@ -48,7 +48,7 @@ const HELD_DEPTH: u8 = 2;
 /// Carried:
 /// - a log entry, a piece of a large version (chunk, manifest node), a cut
 ///   manifest node, of a collection **under** `folder`;
-///   never a snapshot (`<D>/32=log/seq=<n>`, no collection);
+///   never an entry of no collection (`<D>/32=log/seq=<n>`);
 /// - a summary root of `folder`'s namespace and a summary node or page of
 ///   `folder`, of a collection under it, or **on the way** to it (an
 ///   ancestor: the walk from the root passes through them);
@@ -323,7 +323,7 @@ mod tests {
                 ));
                 assert!(!folder_carries(&folder, &node_name(&device, &outside, 5)));
             }
-            // A snapshot names no collection.
+            // An entry of no collection names no collection.
             assert!(!folder_carries(&folder, &log_name(&device, None, 3)));
         }
     }
@@ -511,7 +511,7 @@ mod tests {
             node_name(&device, &n("/bob/32=data/diary"), 4),
             page_name(&device, &n("/bob/32=data/diary"), &[1], 4),
             node_name(&device, &data_folder(&n("/bob")), 4),
-            // A snapshot, the sync group, and names of no layer.
+            // An entry of no collection, the sync group, and names of no layer.
             log_name(&bob, None, 3),
             n("/bob/32=sync"),
             n("/bob/member/phone"),

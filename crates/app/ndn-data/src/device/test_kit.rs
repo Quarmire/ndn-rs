@@ -58,13 +58,7 @@ pub(super) fn log_share() -> Share {
 /// `/alice/laptop` on a forwarder that delivers nothing, owning `plan()`
 /// and `budget()` as log collections Alice, Bob and Carol write.
 pub(super) async fn device() -> Device {
-    device_with(MergeRules::standard(), log_share()).await
-}
-
-/// `/alice/laptop`, knowing `rules`, owning `plan()` and `budget()` shared
-/// as `share` says.
-pub(super) async fn device_with(rules: MergeRules, share: Share) -> Device {
-    device_tuned(share, |c| Config { rules, ..c }).await
+    device_tuned(log_share(), |c| c).await
 }
 
 /// `/alice/laptop`, its configuration as `tune` makes it, owning `plan()`

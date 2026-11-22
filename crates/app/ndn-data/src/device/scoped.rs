@@ -159,7 +159,7 @@ pub(super) struct About {
 /// What the packet named `name` is about, if it is a packet a scope may
 /// judge: a log entry of a collection (its pieces), a summary root, node or
 /// page, or a signal run header of a
-/// folder or collection (spec §20). Nothing else — a snapshot, a seal key,
+/// folder or collection (spec §20). Nothing else — a seal key,
 /// a grant — is about a folder.
 pub(super) fn about(name: &Name) -> Option<About> {
     let of_entry = |entry: &Name| {
