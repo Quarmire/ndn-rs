@@ -64,7 +64,6 @@
 pub mod collection;
 pub mod device;
 pub mod error;
-pub mod events;
 pub mod folder_scope;
 pub mod intro;
 pub mod layer;
@@ -83,10 +82,6 @@ pub use device::{
     Clock, Config, CutBound, CutProposal, Device, Entropy, IntroductionSurface, Released, Transport,
 };
 pub use error::{DataError, NextStep, Refusal};
-pub use events::{
-    Cursor, DeviceEvent, DeviceEvents, EntryKind, EntryRef, EventDetail, EventId, EventKind,
-    EventSubject, Meaning, WithdrawnBy,
-};
 pub use folder_scope::{departure_carries, folder_carries, writer_carries, writer_sync};
 pub use intro::{
     Code, Departure, Grant, IntroPolicy, IntroRefusal, Introducer, JOINED_WRITERS_MAX, Joined,

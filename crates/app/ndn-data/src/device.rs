@@ -78,7 +78,6 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::collection::{self, Accepted, Child, Cut, Epoch, Members, Resolve, Rule, Summary};
 use crate::error::{DataError, Refusal};
-use crate::events::{EntryKind, EntryRef, EventDetail, WithdrawnBy};
 use crate::layer::{
     Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Edit, Entries, Entry, Equivocal, Got, Hold,
     NotCounted, PutOptions, State,
@@ -196,16 +195,6 @@ pub struct Config {
     /// collections followed by their own name or with a members record of
     /// their own, are not counted.
     pub writer_collections: usize,
-    /// The most distinct `(kind, subject)` events this device keeps
-    /// unacknowledged for its host ([`Device::events`], spec §21.5): a new
-    /// one past it, past a fifth of it of one kind, or past a quarter of it about
-    /// one namespace, is counted in the single overflow event, never kept and
-    /// never silent; what is kept is never evicted. At least 1.
-    pub events_unacked: usize,
-    /// How many acknowledged events' ids this device remembers, so that
-    /// evidence it derives again after a restart is not reported again
-    /// once acknowledged ([`Device::acknowledge`], spec §21.4).
-    pub events_acked: usize,
 }
 
 impl Config {
@@ -243,8 +232,6 @@ impl Config {
             intro: crate::intro::IntroPolicy::new(),
             watch_queue: 4096,
             writer_collections: 1024,
-            events_unacked: 256,
-            events_acked: 1024,
         }
     }
 }
@@ -272,8 +259,6 @@ impl std::fmt::Debug for Config {
             .field("intro", &self.intro)
             .field("watch_queue", &self.watch_queue)
             .field("writer_collections", &self.writer_collections)
-            .field("events_unacked", &self.events_unacked)
-            .field("events_acked", &self.events_acked)
             .finish_non_exhaustive()
     }
 }
@@ -550,19 +535,6 @@ impl Line {
             return None;
         }
         Some(self.own.replace(top.clone()))
-    }
-
-    /// The seq and revision of the first held record of `cut`'s signer — the lowest revision —
-    /// that carries `cut`: the record that took the removal, as the event of a cut names it (spec
-    /// §21.3).
-    fn cut_record(&self, cut: &Cut) -> Option<(u64, u64)> {
-        self.records.iter().find_map(|(revision, signers)| {
-            let held = signers.get(&cut.signer)?;
-            held.record
-                .cuts
-                .contains(cut)
-                .then_some((held.seq, revision.0))
-        })
     }
 
     /// What the records of revision `n` held stand for, and what that
@@ -2274,8 +2246,6 @@ struct St {
     /// The persons' namespaces the records in force list as writers, and
     /// what is adopted of them for those records' subjects (spec §6.3).
     scopes: scoped::Scopes,
-    /// The events no folder owns, kept for the host ([`events::Book`]).
-    events: events::Book,
 }
 
 struct Inner {
@@ -4040,7 +4010,6 @@ impl St {
     /// Forget everything held of the log entry `name` and its refusal, so
     /// that it is taken anew (a re-admission, spec §8).
     fn forget(&mut self, name: &Name) {
-        self.events.forget(&events::withdrawal_fact(name));
         let writer = self.cut_out.edit().remove(name).map(|o| o.writer);
         self.refused.remove(name);
         self.held.remove(name);
@@ -4154,7 +4123,6 @@ impl St {
         me: &Writer,
     ) {
         let c = body.collection.clone();
-        let revision = body.revision;
         if body.folder && wire::check_collection_name(&c).is_err() {
             // A folder has a component after `32=data` (spec §6).
             tracing::debug!(folder = %c, "a folder record of a name with no path; ignored");
@@ -4194,31 +4162,6 @@ impl St {
             return;
         };
         let resolve = line.resolve;
-        // The cuts the record in force took that it did not hold before.
-        let new_cuts: Vec<Cut> = line
-            .own
-            .as_ref()
-            .map(|m| {
-                m.cuts
-                    .iter()
-                    .filter(|k| !before.as_ref().is_some_and(|b| b.cuts.contains(k)))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        let cut_events: Vec<EventDetail> = new_cuts
-            .iter()
-            .filter_map(|k| {
-                events::cut_event(line, &c, subject.folder, k, me, Some((seq, revision)))
-            })
-            .collect();
-        // The cuts it lifted: what the ledger records of them is no longer so.
-        let lifted: Vec<events::Fact> = before
-            .iter()
-            .flat_map(|b| &b.cuts)
-            .filter(|k| k.signer != *me && !line.own.as_ref().is_some_and(|m| m.cuts.contains(k)))
-            .map(|k| events::cut_fact(&c, subject.folder, &k.of, k.signer.key(), k.accept.count()))
-            .collect();
         // The persons' namespaces it lists are adopted for it (spec §6.3),
         // within the caps; what is left out is told.
         let excess = self.scopes.note(&subject, line.own.as_ref());
@@ -4237,17 +4180,6 @@ impl St {
                 .collect()
         };
         let after = line.own.as_ref().map(groups).unwrap_or_default();
-        // Told on the device, whoever watches (spec §21): a writer removed. Not one this device
-        // signed, which its host asked for; nothing while records are made again from those held
-        // (the ledger, which a cut a record no longer carries leaves, is not changed either).
-        if !self.quiet_members && !self.restoring {
-            for fact in lifted {
-                self.events.forget(&fact);
-            }
-            for detail in cut_events {
-                self.report_event(detail);
-            }
-        }
         for x in excess {
             tracing::warn!(subject = %x.subject.name, folder = x.subject.folder, left_out = x.namespaces.len(), "{}", x.why);
             self.tell(
@@ -4847,7 +4779,6 @@ impl St {
         }
         for (id, why) in withdrawn {
             tracing::info!(?id, collection = %c, %why, "withdrawn");
-            self.report_withdrawn(c, &id, &why);
             self.tell(
                 c,
                 &Change::Withdrawn {
@@ -5922,19 +5853,6 @@ impl St {
         }
         names.push(name.clone());
         tracing::warn!(%first, second = %name, "two log entries of one key at one seq: equivocation");
-        // Told on the device whatever the kinds of the two entries (spec §21): a members record
-        // against a version is equivocation too, which no folder's watch can carry.
-        let detail = EventDetail::Equivocation {
-            writer: writer.key().clone(),
-            seq,
-            first: self.entry_ref(&first),
-            second: EntryRef {
-                name: name.clone(),
-                kind: Some(EntryKind::of(record)),
-                digest: Some(wire::implicit_digest(wire)),
-            },
-        };
-        self.report_event(detail);
         if let Record::Version(body) = record
             && let Some(first) = self.held_version(&first)
         {
@@ -6106,6 +6024,19 @@ impl St {
             .unwrap_or_default();
         for gid in groups {
             self.rejudge(&(writer.clone(), gid));
+        }
+    }
+
+    /// The digest of what the key signed in the entry held at `name` ([`wire::signed_digest`]),
+    /// as far as this device holds it: of a members, hold, lease, prune or introduction record
+    /// that it does not store too, which it noted when it took it.
+    fn held_signed(&self, name: &Name) -> Option<[u8; 32]> {
+        match self.held.get(name)? {
+            Held::Version(_) | Held::Locked | Held::Pruned(_) | Held::Expired(_) => {
+                held_wire(self, name).and_then(|w| wire::signed_digest(&w))
+            }
+            Held::Snapshot(_) => self.store.get(name).and_then(|w| wire::signed_digest(&w)),
+            Held::Record { signed, .. } => Some(*signed),
         }
     }
 
@@ -7421,19 +7352,6 @@ impl Device {
         let store: Arc<dyn DataStore> = stage.clone();
         // The signal sequence counter and time hint, as the last run left them.
         let signal_clock = signal::SignalClock::load(store.as_ref());
-        // The events the last run left unacknowledged, before the store is read back.
-        let events = events::Book::load(
-            Arc::clone(&store),
-            Arc::clone(&clock),
-            config.events_unacked,
-            config.events_acked,
-            {
-                let validator = Arc::clone(&validator);
-                Arc::new(move |name: &Name| {
-                    validator.keyring().context_for(name).namespace().clone()
-                })
-            },
-        );
         let inner = Arc::new(Inner {
             writer: Writer::new(identity.key.clone()),
             signer: identity.signer,
@@ -7522,7 +7440,6 @@ impl Device {
                 to_apply: Vec::new(),
                 sleeping: BTreeSet::new(),
                 scopes: scoped::Scopes::default(),
-                events,
             }),
             progress: Notify::new(),
             sweep: Arc::new(Notify::new()),
@@ -7557,8 +7474,6 @@ impl Device {
         // trust contexts held now (spec §8): a key above its signer may
         // have been revoked while the device was off.
         inner.rejudge(Rejudge::All).await;
-        // What an earlier run held the cause of and did not report (spec §21.6).
-        inner.derive_events();
         // Versions kept by a removal cut whose manifest the store lacks wait
         // for it: asked for now.
         inner.fetch_wanted_bytes();
@@ -7964,7 +7879,6 @@ impl Device {
         // The committer stops, and whatever waits for the barrier is let go.
         self.inner.commit_wake.notify_one();
         self.inner.committed.notify_waiters();
-        self.inner.st.lock().events.wake().notify_waiters();
     }
 
     /// Drop this device's own copies of the chunks of the large versions
@@ -8752,8 +8666,7 @@ impl Inner {
         let mut twins = Vec::new();
         let mut scoped_newest = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
-            // The device's own events, loaded before ([`events::Book::load`]).
-            if events::is_stored(&name) || notes::is_stored(&name) {
+            if notes::is_stored(&name) {
                 continue;
             }
             if let Some(entry) = over(&verified_prefix(), &name) {
@@ -11811,7 +11724,6 @@ impl Inner {
                     self.store.insert(equivocal_name(&name), wire.clone());
                     st.twins.insert(name.clone(), wire.clone());
                 }
-                st.report_twin(&name, &writer, &record, &wire);
                 let change = Change::Equivocation {
                     collection: body.collection.clone(),
                     first: Equivocal::Here(Box::new(first)),
@@ -11825,15 +11737,10 @@ impl Inner {
                     ))),
                 };
                 st.emit(&body.collection, &change, &writer, seq.saturating_sub(1));
-            } else {
-                // Another kind under the name of a version held, or another packet: told on the
-                // device (spec §21), though no watch can carry it.
-                st.report_twin(&name, &writer, &record, &wire);
             }
             return None;
         }
         if st.held.contains_key(&name) {
-            st.report_twin(&name, &writer, &record, &wire);
             return None;
         }
         let parsed = parse_log_name(&name)?;
@@ -11989,8 +11896,7 @@ impl Inner {
                 );
                 let c = body.collection.clone();
                 if owner_signed(self.validator.keyring(), &name, &c, &writer) {
-                    // The record, the events of the cuts it takes and their ledger entries reach
-                    // the store as one batch (spec §21.6).
+                    // The record and what accepting it writes reach the store as one batch.
                     let _batch = self.stage.batch();
                     self.store.insert(name.clone(), wire);
                     st.accept_members(parsed.seq, body, &writer, &self.config.rules, self.me());
@@ -12767,45 +12673,10 @@ impl Inner {
         let ns = ctx.namespace().clone();
         let (readmit, more) = {
             let mut st = self.st.lock();
-            // The revocation events, the markers and withdrawal events of what it refuses, and
-            // the ledger entries of both, reach the store as one batch (spec §21.6).
+            // The markers of what it refuses reach the store as one batch.
             let _batch = self.stage.batch();
             let more = refuses_more(st.contexts.get(&ns).map(|c| &**c), ctx);
-            st.events.note(events::namespace_fact(&ns));
-            // Names this context revokes that the one before it for the namespace did not, and
-            // those it lifts. A first context of a namespace reports none of its own (what it
-            // refuses is told as withdrawals): what it revokes is entered in the ledger.
-            let (newly, lifted): (Vec<Name>, Vec<Name>) = match st.contexts.get(&ns) {
-                Some(old) => (
-                    ctx.revocations()
-                        .iter()
-                        .filter(|r| !old.revocations().contains(r))
-                        .cloned()
-                        .collect(),
-                    old.revocations()
-                        .iter()
-                        .filter(|r| !ctx.revocations().contains(r))
-                        .cloned()
-                        .collect(),
-                ),
-                None => {
-                    for r in ctx.revocations() {
-                        st.events.note(events::revocation_fact(&ns, r));
-                    }
-                    (Vec::new(), Vec::new())
-                }
-            };
             st.contexts.insert(ns.clone(), Arc::clone(ctx));
-            for r in &lifted {
-                st.events.forget(&events::revocation_fact(&ns, r));
-            }
-            for revoked in newly {
-                st.report_event(EventDetail::Revocation {
-                    namespace: ns.clone(),
-                    revoked,
-                    version: ctx.version(),
-                });
-            }
             let keyring = self.validator.keyring();
             let revoked: Vec<Name> = st
                 .suspected
@@ -12920,8 +12791,7 @@ impl Inner {
     /// packet stays in the store; one refused for its chain is marked so
     /// there ([`untrusted_name`]), for a restart.
     fn withdraw(&self, st: &mut St, found: Vec<(Name, Writer, [u8; 32], Refusal)>) {
-        // The markers, the events of the refusals and the ledger entries reach the store as one
-        // batch: a marker is never there without its event (spec §21.6).
+        // The markers reach the store as one batch.
         let _batch = self.stage.batch();
         let mut reread = BTreeSet::new();
         let mut rebuild = BTreeMap::new();
@@ -12935,21 +12805,6 @@ impl Inner {
             // ([`St::admit_one`]), which reports it if it was delivered.
             if !matches!(st.held.get(&name), Some(Held::Version(_))) {
                 st.refused.insert(name.clone(), why.clone());
-            }
-            // A held record or snapshot is no version a watcher is told of: told on the device
-            // alone (spec §21).
-            if matches!(
-                st.held.get(&name),
-                Some(Held::Record { .. } | Held::Snapshot(_))
-            ) && let Some(by) = WithdrawnBy::of(&why)
-            {
-                let entry = st.entry_ref(&name);
-                st.report_event(EventDetail::Withdrawal {
-                    writer: writer.key().clone(),
-                    collection: parse_log_name(&name).and_then(|l| l.subject),
-                    entry,
-                    by,
-                });
             }
             if let Refusal::Untrusted { why } = &why {
                 self.store.insert(
@@ -13437,7 +13292,6 @@ impl Inner {
                 .is_some_and(|coll| coll.versions.contains_key(&id));
             if !told && !admitted {
                 tracing::info!(?id, collection = %x, "withdrawn: the members record that admitted it is refused");
-                st.report_withdrawn(&x, &id, why);
                 st.tell(
                     &x,
                     &Change::Withdrawn {
@@ -23864,11 +23718,6 @@ mod tests {
             .await
             .expect("the copy verifies: S is malleable and the verifier accepts both");
         assert!(
-            dev.pending_events().is_empty(),
-            "a high-S copy is the same signed object, not equivocation: {:?}",
-            dev.pending_events()
-        );
-        assert!(
             dev.inner.st.lock().twins.is_empty() && store.get(&equivocal_name(&a)).is_none(),
             "no second packet is kept as evidence"
         );
@@ -23880,17 +23729,12 @@ mod tests {
         });
         let (second, _) = signed(&sensor_keys, &key, &a, &other);
         dev.inner
-            .take_data(&a, Data::decode(second.clone()).unwrap())
+            .take_data(&a, Data::decode(second).unwrap())
             .await
             .expect("verified");
-        let events = dev.pending_events();
         assert!(
-            matches!(
-                &events[..],
-                [e] if matches!(&e.detail, EventDetail::Equivocation { second: s, .. }
-                    if s.digest == Some(wire::implicit_digest(&second)))
-            ),
-            "two contents signed at one name are equivocation: {events:?}"
+            dev.inner.st.lock().twins.contains_key(&a) && store.get(&equivocal_name(&a)).is_some(),
+            "two contents signed at one name are equivocation: the second is kept as evidence"
         );
         dev.shutdown();
     }
@@ -25450,546 +25294,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_revocation_adopted_is_an_event_and_so_is_the_withdrawal_it_makes_once_across_restarts()
-     {
-        use crate::events::{EventDetail, EventKind, WithdrawnBy};
-        let r = Revoking::new(VALIDITY_MS).await;
-        for seq in 1..=3 {
-            let (name, data) = r.version(seq, seq);
-            r.dev
-                .inner
-                .take_data(&name, data)
-                .await
-                .expect("before the revocation");
-        }
-        assert!(r.dev.pending_events().is_empty());
-        // No one watches: the revocation and what it refuses are told on the device.
-        r.revoke(2, r.cut(1, 2, &[]));
-        let three = log_name(&r.phone, Some(&r.c), 3);
-        until(&r.dev, |st| st.refused.contains_key(&three)).await;
-        let events = r.dev.pending_events();
-        let revocations: Vec<_> = events
-            .iter()
-            .filter(|e| e.kind() == EventKind::Revocation)
-            .collect();
-        assert_eq!(
-            revocations.len(),
-            1,
-            "a trust context revoking the phone's key is an event; pending: {events:?}"
-        );
-        assert_eq!(
-            revocations[0].detail,
-            EventDetail::Revocation {
-                namespace: n("/sam"),
-                revoked: r.key.clone(),
-                version: 2,
-            }
-        );
-        assert_eq!(revocations[0].meaning(), crate::events::Meaning::KeyRefused);
-        let withdrawals: Vec<_> = events
-            .iter()
-            .filter(|e| e.kind() == EventKind::Withdrawal)
-            .collect();
-        assert_eq!(withdrawals.len(), 1, "{events:?}");
-        assert!(
-            matches!(&withdrawals[0].detail, EventDetail::Withdrawal { writer, collection, entry, by: WithdrawnBy::Cut { of, .. } }
-                if *writer == r.key && collection.as_ref() == Some(&r.c) && entry.name == three && *of == r.key),
-            "{:?}",
-            withdrawals[0]
-        );
-        assert!(revocations[0].cursor < withdrawals[0].cursor);
-
-        // A restart judges what is held again: the same events, once, not new ones.
-        r.dev.shutdown();
-        let again = start(&n("/rita/tab"), &r.tab_keys, &r.validator, &r.store)
-            .await
-            .unwrap();
-        assert_eq!(
-            again.pending_events(),
-            events,
-            "the events outlive the restart, each once"
-        );
-        let ids: Vec<_> = events.iter().map(|e| e.id).collect();
-        again.acknowledge(&ids).await.unwrap();
-        again.shutdown();
-        let last = start(&n("/rita/tab"), &r.tab_keys, &r.validator, &r.store)
-            .await
-            .unwrap();
-        assert!(
-            last.pending_events().is_empty(),
-            "acknowledged, and judged again at start: not reported again: {:?}",
-            last.pending_events()
-        );
-        last.shutdown();
-    }
-
-    // ---- a stop between a revocation, or a refusal, and its event (spec §21.6) ----------------
-
-    use super::durability_tests::Engine;
-    use super::events_tests::{EventGate, Gate, open_engine, role, run_child};
-
-    /// What a trust context of `/sam` revokes ([`Issuer::context`]).
-    #[derive(Clone, Copy)]
-    enum Revoke {
-        Nothing,
-        /// The phone's key, its cut accepting seqs 1 and 2 of the notes.
-        PhoneWithCut,
-        /// The key of `/sam/admin`, which certified the phone's: no cut, and what the phone
-        /// wrote is refused for its chain.
-        Admin,
-    }
-
-    /// `/sam`'s namespace key certifies `/sam/admin`, whose key certifies the phone
-    /// `/sam/admin/phone`; a reader `/rita/tab` holds the notes the phone writes. Every key
-    /// comes from a fixed seed, so a process started again makes the same (the certificates,
-    /// dated by the run, differ).
-    struct Issuer {
-        validator: Arc<Validator>,
-        anchor: ndn_security::Certificate,
-        admin_key: Name,
-        phone: Name,
-        phone_keys: Arc<SecurityManager>,
-        phone_key: Name,
-        tab: Name,
-        tab_keys: Arc<SecurityManager>,
-        c: Name,
-    }
-
-    impl Issuer {
-        /// The reader's keyring holds `/sam`'s context of `version`, revoking `what`.
-        async fn new(version: u64, what: Revoke) -> Self {
-            let authority = SecurityManager::new();
-            let issuer = authority
-                .generate_ed25519_from_seed(n("/sam").append("KEY").append("ns"), &[5; 32])
-                .unwrap();
-            let public = authority
-                .get_signer_sync(&issuer)
-                .unwrap()
-                .public_key()
-                .unwrap();
-            let anchor = authority
-                .issue_self_signed_async(&issuer, public, VALIDITY_MS)
-                .await
-                .unwrap();
-            let admin_keys = SecurityManager::new();
-            let admin_key = admin_keys
-                .generate_ed25519_from_seed(n("/sam/admin/KEY/1"), &[6; 32])
-                .unwrap();
-            let public = admin_keys
-                .get_signer_sync(&admin_key)
-                .unwrap()
-                .public_key()
-                .unwrap();
-            let admin_cert = authority
-                .certify(&admin_key, public, &issuer, VALIDITY_MS)
-                .await
-                .unwrap();
-            let phone = n("/sam/admin/phone");
-            let phone_keys = Arc::new(SecurityManager::new());
-            let phone_key = phone_keys
-                .generate_ed25519_from_seed(n("/sam/admin/phone/KEY/1"), &[3; 32])
-                .unwrap();
-            let public = phone_keys
-                .get_signer_sync(&phone_key)
-                .unwrap()
-                .public_key()
-                .unwrap();
-            let phone_cert = admin_keys
-                .certify(&phone_key, public, &admin_key, VALIDITY_MS)
-                .await
-                .unwrap();
-            let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-            validator.adopt_context(context("/rita")).unwrap();
-            validator.cert_cache().insert(admin_cert);
-            validator.cert_cache().insert(phone_cert);
-            let tab = n("/rita/tab");
-            let tab_keys = Arc::new(SecurityManager::new());
-            tab_keys
-                .generate_ed25519_from_seed(n("/rita/tab/KEY/1"), &[7; 32])
-                .unwrap();
-            let issuer = Self {
-                validator,
-                anchor,
-                admin_key,
-                phone,
-                phone_keys,
-                phone_key,
-                tab,
-                tab_keys,
-                c: n("/rita/32=data/notes"),
-            };
-            issuer
-                .validator
-                .adopt_context(issuer.context(version, what))
-                .unwrap();
-            issuer
-        }
-
-        fn context(&self, version: u64, what: Revoke) -> Arc<SignedTrustContext> {
-            let mut ctx = SignedTrustContext::hierarchical(n("/sam")).with_version(version);
-            match what {
-                Revoke::Nothing => {}
-                Revoke::Admin => ctx = ctx.with_revocation(self.admin_key.clone()),
-                Revoke::PhoneWithCut => {
-                    let mut cut = RevocationCut::new(self.phone_key.clone());
-                    cut.add_run(&log_prefix(&log_name(&self.phone, Some(&self.c), 0)), 1, 2);
-                    ctx = ctx
-                        .with_revocation(cut.key().clone())
-                        .with_revocation_cut(cut);
-                }
-            }
-            assert!(ctx.add_anchor(self.anchor.clone()));
-            Arc::new(ctx)
-        }
-
-        /// The keyring adopts `/sam`'s context of `version` while the device runs.
-        fn adopt(&self, version: u64, what: Revoke) {
-            self.validator
-                .keyring()
-                .adopt_update(self.context(version, what))
-                .unwrap();
-        }
-
-        fn name(&self, seq: u64) -> Name {
-            log_name(&self.phone, Some(&self.c), seq)
-        }
-
-        /// The phone's note `seq`, signed.
-        fn packet(&self, seq: u64) -> (Name, Data) {
-            let name = self.name(seq);
-            let (wire, _) = signed(
-                &self.phone_keys,
-                &self.phone_key,
-                &name,
-                &wire::encode_record(&Record::Version(version_body(&self.c, None))),
-            );
-            (name, Data::decode(wire).unwrap())
-        }
-
-        /// The reader, started on `store`.
-        async fn start(
-            &self,
-            store: &Arc<dyn DataStore>,
-            tune: impl FnOnce(Config) -> Config,
-        ) -> Device {
-            let conn: Arc<dyn Connection> = Arc::new(Unconnected);
-            Device::start(
-                Transport {
-                    node: Node::from_connection(Arc::clone(&conn)),
-                    sync: conn,
-                },
-                self.tab.clone(),
-                Arc::clone(&self.tab_keys),
-                Arc::clone(&self.validator),
-                Arc::clone(store),
-                tune(Config::new()),
-            )
-            .await
-            .unwrap()
-        }
-
-        /// The reader, started, owning the notes and holding the phone's first three.
-        async fn reading(&self, store: &Arc<dyn DataStore>) -> Device {
-            let dev = self.start(store, |c| c).await;
-            dev.share(&self.c, share_of(Rule::Log, &["/rita", "/sam"], Vec::new()))
-                .await
-                .unwrap();
-            for seq in 1..=3 {
-                let (name, data) = self.packet(seq);
-                dev.inner.take_data(&name, data).await.unwrap();
-            }
-            dev
-        }
-    }
-
-    /// The pending events of `dev` as `(kind, count)`.
-    fn kinds_pending(dev: &Device) -> Vec<(crate::events::EventKind, u64)> {
-        dev.pending_events()
-            .iter()
-            .map(|e| (e.kind(), e.count))
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn a_revocation_and_a_cut_withdrawal_whose_events_were_never_written_are_reported_after_a_restart()
-     {
-        use crate::events::EventKind;
-        let backing: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let gate = EventGate::over(Arc::clone(&backing), Gate::Open);
-        let store: Arc<dyn DataStore> = gate.clone();
-        let f = Issuer::new(1, Revoke::Nothing).await;
-        let dev = f.reading(&store).await;
-        assert!(dev.pending_events().is_empty());
-        // The context is adopted and the held entries are refused, and the stop comes before
-        // the events are written.
-        gate.set(Gate::Drop);
-        f.adopt(2, Revoke::PhoneWithCut);
-        until(&dev, |st| st.refused.contains_key(&f.name(3))).await;
-        let told = dev.pending_events();
-        assert_eq!(
-            told.iter().map(|e| e.kind()).collect::<Vec<_>>(),
-            vec![EventKind::Revocation, EventKind::Withdrawal],
-            "told while it ran: {told:?}"
-        );
-        dev.shutdown();
-        drop(dev);
-        gate.set(Gate::Open);
-
-        let again = f.start(&store, |c| c).await;
-        let key = |events: &[crate::events::DeviceEvent]| {
-            events
-                .iter()
-                .map(|e| (e.id, e.detail.clone(), e.count))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            key(&again.pending_events()),
-            key(&told),
-            "the context was adopted and the entries refused, and no event was written: the \
-             restart reports both, with the evidence the live run reported"
-        );
-        again.shutdown();
-    }
-
-    #[tokio::test]
-    async fn a_withdrawal_for_the_chain_whose_marker_is_stored_and_whose_event_was_not_is_reported_after_a_restart()
-     {
-        use crate::events::EventKind;
-        let backing: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let gate = EventGate::over(Arc::clone(&backing), Gate::Open);
-        let store: Arc<dyn DataStore> = gate.clone();
-        let f = Issuer::new(1, Revoke::Nothing).await;
-        let dev = f.reading(&store).await;
-        gate.set(Gate::Drop);
-        f.adopt(2, Revoke::Admin);
-        until(&dev, |st| {
-            (1..=3).all(|s| st.refused.contains_key(&f.name(s)))
-        })
-        .await;
-        assert_eq!(
-            kinds_pending(&dev),
-            vec![(EventKind::Revocation, 1), (EventKind::Withdrawal, 3)]
-        );
-        let markers = backing.scan_under(&untrusted_prefix(), 0).len();
-        assert_eq!(
-            markers, 3,
-            "the markers are stored: the state a kill leaves"
-        );
-        dev.shutdown();
-        drop(dev);
-        gate.set(Gate::Open);
-
-        let again = f.start(&store, |c| c).await;
-        assert_eq!(
-            kinds_pending(&again),
-            vec![(EventKind::Revocation, 1), (EventKind::Withdrawal, 3)],
-            "the entries are withdrawn for their chain by markers held, and no event was \
-             written: the restart reports them"
-        );
-        again.shutdown();
-    }
-
-    #[tokio::test]
-    async fn a_revocation_and_its_withdrawals_are_reported_once_whether_or_not_their_tombstones_are_kept()
-     {
-        use crate::events::EventKind;
-        for (what, withdrawn) in [(Revoke::PhoneWithCut, 1), (Revoke::Admin, 3)] {
-            for tombstones in [1024, 0] {
-                let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-                let f = Issuer::new(1, Revoke::Nothing).await;
-                let tune = |c: Config| Config {
-                    events_acked: tombstones,
-                    ..c
-                };
-                let dev = f.start(&store, tune).await;
-                dev.share(&f.c, share_of(Rule::Log, &["/rita", "/sam"], Vec::new()))
-                    .await
-                    .unwrap();
-                for seq in 1..=3 {
-                    let (name, data) = f.packet(seq);
-                    dev.inner.take_data(&name, data).await.unwrap();
-                }
-                f.adopt(2, what);
-                until(&dev, |st| st.refused.contains_key(&f.name(3))).await;
-                let told = dev.pending_events();
-                assert_eq!(
-                    kinds_pending(&dev),
-                    vec![
-                        (EventKind::Revocation, 1),
-                        (EventKind::Withdrawal, withdrawn)
-                    ]
-                );
-                dev.shutdown();
-                drop(dev);
-                // Reported before the stop: once after the restart.
-                let dev = f.start(&store, tune).await;
-                assert_eq!(dev.pending_events(), told, "tombstones {tombstones}");
-                let ids: Vec<_> = told.iter().map(|e| e.id).collect();
-                dev.acknowledge(&ids).await.unwrap();
-                dev.shutdown();
-                drop(dev);
-                let dev = f.start(&store, tune).await;
-                assert!(
-                    dev.pending_events().is_empty(),
-                    "tombstones {tombstones}: acknowledged and judged again at every start: not \
-                     reported again: {:?}",
-                    dev.pending_events()
-                );
-                dev.shutdown();
-            }
-        }
-    }
-
-    /// One run of the reader in a process of its own, which an event's write or the process's
-    /// own abort ends. Nothing when no case started it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "a child process of the kill cases; it runs only when they start it"]
-    async fn events_revocation_kill_child() {
-        use crate::events::EventKind;
-        let Some((engine, dir, scenario)) = role() else {
-            return;
-        };
-        let (what, stop) = match scenario.as_str() {
-            // Adopted, the held entries refused, and the process dies as the first event is
-            // written.
-            "revocation" => (Revoke::PhoneWithCut, Some(EventKind::Revocation)),
-            // A marker of an entry withdrawn for its chain is stored and the process dies as the
-            // event of its withdrawal is written.
-            "chain" => (Revoke::Admin, Some(EventKind::Withdrawal)),
-            // The events are written, and the process dies after them.
-            "reported" => (Revoke::PhoneWithCut, None),
-            other => panic!("kill case scenario {other:?}"),
-        };
-        let gate = EventGate::over(open_engine(engine, &dir), Gate::Open);
-        let store: Arc<dyn DataStore> = gate.clone();
-        let f = Issuer::new(1, Revoke::Nothing).await;
-        let dev = f.reading(&store).await;
-        if let Some(kind) = stop {
-            gate.set(Gate::AbortAt(kind));
-        }
-        f.adopt(2, what);
-        until(&dev, |st| st.refused.contains_key(&f.name(3))).await;
-        if stop.is_none() {
-            std::process::abort();
-        }
-        // Not reached: the event's write stops the process.
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        std::process::exit(0);
-    }
-
-    fn a_kill_around_the_events_of_a_revocation_loses_none_and_repeats_none(engine: Engine) {
-        use crate::events::{EventDetail, EventKind};
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        // (scenario, what the restarted host's keyring holds, withdrawals told)
-        for (scenario, what, withdrawn) in [
-            ("revocation", Revoke::PhoneWithCut, 1),
-            ("chain", Revoke::Admin, 3),
-            ("reported", Revoke::PhoneWithCut, 1),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let status = run_child(
-                "device::tests::events_revocation_kill_child",
-                engine,
-                dir.path(),
-                scenario,
-            );
-            assert!(
-                !status.success(),
-                "{} {scenario}: the child was to be killed: {status:?}",
-                engine.label()
-            );
-            rt.block_on(async {
-                let store = open_engine(engine, dir.path());
-                // Where the kill landed: what the store holds of the window.
-                let events = store.scan_under(&n("/localhost/ndn-data/events/e"), 0);
-                let markers = store.scan_under(&untrusted_prefix(), 0).len();
-                match scenario {
-                    "revocation" => assert!(
-                        events.is_empty(),
-                        "{} {scenario}: killed before the first event was written",
-                        engine.label()
-                    ),
-                    "chain" => assert_eq!(
-                        (events.len(), markers),
-                        (1, 3),
-                        "{} {scenario}: killed with the revocation's event and the three \
-                         markers stored, and not the withdrawal's event",
-                        engine.label()
-                    ),
-                    _ => assert_eq!(events.len(), 2, "{} {scenario}", engine.label()),
-                }
-                let f = Issuer::new(2, what).await;
-                let tune = |c: Config| Config {
-                    events_acked: 0,
-                    ..c
-                };
-                let dev = f.start(&store, tune).await;
-                assert_eq!(
-                    kinds_pending(&dev),
-                    vec![
-                        (EventKind::Revocation, 1),
-                        (EventKind::Withdrawal, withdrawn)
-                    ],
-                    "{} {scenario}: killed around the events of a revocation: after the restart \
-                     each is there once; pending: {:?}",
-                    engine.label(),
-                    dev.pending_events()
-                );
-                let events = dev.pending_events();
-                let revoked = match what {
-                    Revoke::Admin => f.admin_key.clone(),
-                    _ => f.phone_key.clone(),
-                };
-                assert_eq!(
-                    events[0].detail,
-                    EventDetail::Revocation {
-                        namespace: n("/sam"),
-                        revoked,
-                        version: 2,
-                    }
-                );
-                assert!(
-                    matches!(&events[1].detail, EventDetail::Withdrawal { writer, collection, .. }
-                        if *writer == f.phone_key && collection.as_ref() == Some(&f.c)),
-                    "{:?}",
-                    events[1]
-                );
-                // Acknowledged, with no tombstone kept: not told again.
-                let ids: Vec<_> = events.iter().map(|e| e.id).collect();
-                dev.acknowledge(&ids).await.unwrap();
-                dev.shutdown();
-                drop(dev);
-                let dev = f.start(&store, tune).await;
-                assert!(
-                    dev.pending_events().is_empty(),
-                    "{} {scenario}: acknowledged: not told again at the next start: {:?}",
-                    engine.label(),
-                    dev.pending_events()
-                );
-                dev.shutdown();
-            });
-        }
-    }
-
-    #[test]
-    fn a_kill_around_the_events_of_a_revocation_loses_none_and_repeats_none_on_fjall() {
-        a_kill_around_the_events_of_a_revocation_loses_none_and_repeats_none(
-            super::durability_tests::Engine::Fjall,
-        );
-    }
-
-    #[test]
-    fn a_kill_around_the_events_of_a_revocation_loses_none_and_repeats_none_on_redb() {
-        a_kill_around_the_events_of_a_revocation_loses_none_and_repeats_none(
-            super::durability_tests::Engine::Redb,
-        );
-    }
-
-    #[tokio::test]
     async fn an_exact_re_admission_admits_exactly_that_version() {
         let r = Revoking::new(VALIDITY_MS).await;
         r.revoke(2, r.cut(1, 2, &[]));
@@ -27409,11 +26713,6 @@ mod grants;
 mod groups;
 
 mod scoped;
-
-mod events;
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod events_tests;
 
 mod signal;
 
