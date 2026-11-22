@@ -1112,7 +1112,7 @@ impl Inner {
         hints: &[Name],
         params: Option<&Bytes>,
     ) -> Option<Data> {
-        let _slot = self.slots.acquire().await.ok()?;
+        let _slot = self.slot(self.config.lifetime).await.ok()?;
         let mut b = InterestBuilder::new(name).lifetime(self.config.lifetime);
         if !hints.is_empty() {
             b = b.forwarding_hint(hints.to_vec());

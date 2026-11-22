@@ -1898,11 +1898,13 @@ mod subscription_tests {
     }
 
     /// A link that answers each of the first `nacks` Interests it is handed with a Nack of
-    /// `reason` and every later one with a Data under its name; it records when (on the
-    /// paused clock) and with what lifetime each Interest came.
+    /// `reason` and every later one with a Data under its name (with nothing, when
+    /// `silent`); it records when (on the paused clock) and with what lifetime each
+    /// Interest came.
     struct NacksFirst {
         nacks: usize,
         reason: ndn_packet::NackReason,
+        silent: bool,
         sent: std::sync::Mutex<Vec<(tokio::time::Instant, Option<Duration>)>>,
         tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
         rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Bytes>>,
@@ -1910,10 +1912,20 @@ mod subscription_tests {
 
     impl NacksFirst {
         fn new(nacks: usize, reason: ndn_packet::NackReason) -> Arc<Self> {
+            Self::answering(nacks, reason, false)
+        }
+
+        /// Nacks the first `nacks` Interests, and answers no later one.
+        fn then_silent(nacks: usize, reason: ndn_packet::NackReason) -> Arc<Self> {
+            Self::answering(nacks, reason, true)
+        }
+
+        fn answering(nacks: usize, reason: ndn_packet::NackReason, silent: bool) -> Arc<Self> {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             Arc::new(Self {
                 nacks,
                 reason,
+                silent,
                 sent: std::sync::Mutex::new(Vec::new()),
                 tx,
                 rx: tokio::sync::Mutex::new(rx),
@@ -1935,11 +1947,15 @@ mod subscription_tests {
             let mut sent = self.sent.lock().unwrap();
             sent.push((tokio::time::Instant::now(), interest.lifetime()));
             let reply = if sent.len() <= self.nacks {
-                ndn_packet::lp::encode_lp_nack(self.reason, &wire)
+                Some(ndn_packet::lp::encode_lp_nack(self.reason, &wire))
+            } else if self.silent {
+                None
             } else {
-                ndn_packet::encode::DataBuilder::new((*interest.name).clone(), b"x").build()
+                Some(ndn_packet::encode::DataBuilder::new((*interest.name).clone(), b"x").build())
             };
-            let _ = self.tx.send(reply);
+            if let Some(reply) = reply {
+                let _ = self.tx.send(reply);
+            }
             Ok(())
         }
         async fn recv(&self) -> Option<Bytes> {
@@ -2061,6 +2077,34 @@ mod subscription_tests {
         assert!(matches!(got, Err(AppError::Nacked { .. })), "{got:?}");
         assert_eq!(conn.sent.lock().unwrap().len(), 1);
         assert_eq!(took, Duration::ZERO);
+    }
+
+    /// The most Interests one ask costs (spec §17.1, "A Nack for rate"): the Interests
+    /// lost and the Interests Nacked for rate add, and share the lifetime. With the data
+    /// layer's 3 re-expressions (gaps 250, 500, 1000 ms of its default 250 ms round-trip
+    /// timeout), 8 Congestion retries and a 2 s lifetime of which 250 ms must be left for
+    /// each, that is 1 + 8 + 2 = 11, not 1 + 3 + 8 = 12: the retries' pauses (at least
+    /// 470 ms) and the first two gaps leave no room for the third. Eight Nacks, then
+    /// silence, whatever the jitter of the pauses; the figure the data layer's owed fetch
+    /// multiplies by its 3 asks (33, not 27).
+    #[tokio::test(start_paused = true)]
+    async fn the_most_an_ask_costs_in_two_seconds_is_eleven_interests() {
+        let conn = NacksFirst::then_silent(
+            CONGESTION_RETRIES as usize,
+            ndn_packet::NackReason::Congestion,
+        );
+        let mut consumer = Consumer::new(crate::DemuxConnection::new(conn.clone()));
+        let name: Name = "/rate/limited".parse().unwrap();
+        let got = consumer
+            .fetch_reexpressing(
+                || InterestBuilder::new(name.clone()),
+                Duration::from_secs(2),
+                Duration::from_millis(250),
+                doubling().take(3),
+            )
+            .await;
+        assert!(matches!(got, Err(AppError::Timeout)), "{got:?}");
+        assert_eq!(conn.sent.lock().unwrap().len(), 11);
     }
 
     /// The pause is half to all of its ceiling, the ceiling 20 ms doubling to 160 ms, and

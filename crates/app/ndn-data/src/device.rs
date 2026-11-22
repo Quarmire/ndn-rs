@@ -1435,6 +1435,25 @@ const ANSWERS_KEPT: usize = 1024;
 const HOLDS_PER_ASKER: usize = 1;
 /// Audit asks of one owner device a holder answers at once.
 const AUDITS_PER_ASKER: usize = 64;
+/// Grant asks of one asker device a granter works on at once — each fetches
+/// the asker's seal key back, holding one of the device's
+/// [`Config::in_flight`] fetch slots while it waits (spec §9, §17.1). An
+/// honest asker has an ask in progress for each epoch it lacks, and each is
+/// expressed up to `1 + REEXPRESS_MAX` = 4 times at the granter while the
+/// seal key is slow to come: 32 is eight such asks at once, and the first
+/// one answered keeps the seal key, so the rest of a burst is answered
+/// from it by the asker's next round. An eighth of the default 256 slots,
+/// so no one asker's flood holds more.
+const GRANTS_PER_ASKER: usize = 32;
+/// Background runs that ask again for an asker's seal key at once
+/// ([`Inner::learn_seal_key`]): each holds one fetch slot at a time, so no
+/// more than a quarter of the default 256 slots is ever spent on keys no
+/// answer waits for. An asker beyond it is refused the run and asks its
+/// grant again, which starts the run when one ends.
+const SEAL_LEARNING_MAX: usize = 64;
+/// Of them, the runs one asker device may have: it has one seal key, and a
+/// second covers the key it had before a restart that an ask still names.
+const SEAL_LEARNING_PER_ASKER: usize = 2;
 /// The most hold asks one `hold` call sends one holder its record names
 /// (spec §13.3, repair; §17.1): asked again after [`retry_pause`], each
 /// time under a fresh nonce and proof, while no lease came back (lost, or
@@ -2142,7 +2161,9 @@ struct St {
     /// Askers' seal keys verified, by name.
     seal_keys: Kept<[u8; 32]>,
     /// Askers' seal keys a grant's ask in place did not get, asked again in
-    /// the background ([`Inner::learn_seal_key`]): one run per key.
+    /// the background ([`Inner::learn_seal_key`]): one run per key, at most
+    /// [`SEAL_LEARNING_MAX`] (and [`SEAL_LEARNING_PER_ASKER`] of one asker);
+    /// each run removes its key when it ends.
     seal_learning: BTreeSet<Name>,
     /// The walks started in the background of a put or a join that are
     /// under way, by (namespace, device): one at a time for each
@@ -10469,11 +10490,34 @@ impl Inner {
     /// (a certificate on its chain not to be had yet), or it refused a
     /// reply that does not verify (`bad-signature`: forged or altered on
     /// the way, spec §17.1), or a Nack with reason Congestion that asking
-    /// again soon did not mend. Any other Nack, any other final refusal or
-    /// a closed connection is an answer. Re-expressed up to
+    /// again soon did not mend, or no fetch slot to be had within an
+    /// Interest lifetime ([`Self::slot`]). Any other Nack, any other final
+    /// refusal or a closed connection is an answer. Re-expressed up to
     /// [`REEXPRESS_MAX`] times ([`Self::fetch_expressed`]).
     async fn fetch_once(&self, name: Name, discover: bool) -> Result<Data, bool> {
         self.fetch_expressed(name, discover, REEXPRESS_MAX).await
+    }
+
+    /// One of the device's [`Config::in_flight`] fetch slots, waiting for one
+    /// at most `within` — the lifetime of the Interest it is for (spec
+    /// §17.1), so a queue of fetches that others made never holds one
+    /// longer than the Interest it waits to send would have lived. `Err(true)`:
+    /// every slot stayed taken that long, so the device is busy, not the packet
+    /// absent — asking again after the pause may get a slot; `Err(false)`: the
+    /// device stopped.
+    async fn slot(&self, within: Duration) -> Result<tokio::sync::SemaphorePermit<'_>, bool> {
+        match rt::timeout(within, self.slots.acquire()).await {
+            Ok(Ok(slot)) => Ok(slot),
+            Ok(Err(_)) => Err(false),
+            Err(_) => {
+                tracing::debug!(
+                    me = %self.device,
+                    slots = self.config.in_flight,
+                    "fetch not sent: every one of the device's fetch slots stayed taken for an Interest lifetime ({within:?}); it is asked again after its pause, or raise Config::in_flight"
+                );
+                Err(true)
+            }
+        }
     }
 
     /// One ask, within one Interest lifetime: an Interest nothing answered
@@ -10487,12 +10531,17 @@ impl Inner {
     /// for rate — is asked again by the consumer after a short jittered
     /// pause, a bounded number of times within the lifetime
     /// ([`ndn_app::Consumer::fetch_reexpressing`]), which costs the ask no
-    /// sample of the round trip. The miss is told as in [`Self::fetch_once`].
+    /// sample of the round trip. The wait for a slot is at most one lifetime
+    /// ([`Self::slot`]). The miss is told as in [`Self::fetch_once`].
     async fn fetch_expressed(&self, name: Name, discover: bool, most: u32) -> Result<Data, bool> {
-        let Ok(_slot) = self.slots.acquire().await else {
-            return Err(false);
-        };
         let lifetime = self.config.lifetime;
+        let _slot = match self.slot(lifetime).await {
+            Ok(slot) => slot,
+            Err(busy) => {
+                tracing::trace!(me = %self.device, %name, "fetch not sent: no slot");
+                return Err(busy);
+            }
+        };
         let rto = self.rtt.lock().rto(lifetime);
         let interest = || {
             let b = InterestBuilder::new(name.clone());
@@ -16176,7 +16225,10 @@ impl Inner {
     /// otherwise. The seal key is asked once in place, within the asker's
     /// wait; when that ask misses, it is asked again in the background
     /// ([`Self::learn_seal_key`]), so the asker's next round is answered
-    /// from the key then verified.
+    /// from the key then verified. At most [`GRANTS_PER_ASKER`] asks of one
+    /// asker device are worked on at once, taken before anything is fetched
+    /// ([`Self::grant_slot`]): one more is refused, and an honest asker's
+    /// next round asks again.
     async fn grant(self: &Arc<Self>, name: &Name, ask: GrantAsk) -> Option<Bytes> {
         let (asker, public) = parse_seal_key_name(&ask.seal_key)?;
         let asker_ns = self.namespace_of_name(&asker);
@@ -16191,6 +16243,10 @@ impl Inner {
                 return Some(p.clone());
             }
             st.seal_keys.get(&ask.seal_key).copied()
+        };
+        let Some(_slot) = self.grant_slot(&asker) else {
+            tracing::debug!(%asker, "grant not answered: the asker has as many grant asks in progress here as it may ({GRANTS_PER_ASKER}); its next round asks again once they end");
+            return None;
         };
         if verified.is_none() {
             let fetched = self.fetch(ask.seal_key.clone(), false).await;
@@ -16253,10 +16309,33 @@ impl Inner {
     /// [`FETCH_TRIES`] asks, one run per key at a time, and, verified, it is
     /// kept, so the asker's next round of grant asks is answered at once.
     /// Only an asker the records held admit gets here ([`Self::grant_key`]):
-    /// a stranger costs no asks.
+    /// a stranger costs no asks. At most [`SEAL_LEARNING_MAX`] runs at once,
+    /// [`SEAL_LEARNING_PER_ASKER`] of one asker's: an admitted reader can
+    /// name any number of seal keys of its own device, and none of them
+    /// is to take the device's fetch slots from its own fetches. A run
+    /// beyond the cap is not started, and says why; the asker's next grant
+    /// ask starts it once one ends.
     fn learn_seal_key(self: &Arc<Self>, seal_key: &Name, asker: &Name, public: &[u8; 32]) {
-        if !self.st.lock().seal_learning.insert(seal_key.clone()) {
-            return;
+        {
+            let mut st = self.st.lock();
+            if st.seal_learning.contains(seal_key) {
+                return;
+            }
+            let of_asker = st
+                .seal_learning
+                .iter()
+                .filter(|k| k.has_prefix(asker))
+                .count();
+            if st.seal_learning.len() >= SEAL_LEARNING_MAX || of_asker >= SEAL_LEARNING_PER_ASKER {
+                tracing::debug!(
+                    %asker,
+                    all = st.seal_learning.len(),
+                    of_asker,
+                    "seal key not asked again in the background: as many runs are under way as this device allows ({SEAL_LEARNING_MAX} in all, {SEAL_LEARNING_PER_ASKER} per asker device); the asker's next grant ask starts it once one ends"
+                );
+                return;
+            }
+            st.seal_learning.insert(seal_key.clone());
         }
         let (inner, seal_key, asker, public) =
             (Arc::clone(self), seal_key.clone(), asker.clone(), *public);
@@ -18661,6 +18740,22 @@ impl Inner {
         })
     }
 
+    /// [`Self::ask_slot`] for a grant ask of `asker`, [`GRANTS_PER_ASKER`] at
+    /// once. Counted apart from the asker's other asks (an answer ask, a hold,
+    /// an audit), under the asker's name with the `32=grant` keyword added,
+    /// so a device's grant asks neither take the slot of its own answer ask
+    /// nor wait behind it.
+    fn grant_slot(&self, asker: &Name) -> Option<AskSlot<'_>> {
+        let key = Name::from_components(
+            asker
+                .components()
+                .iter()
+                .cloned()
+                .chain([wire::kw(b"grant")]),
+        );
+        self.ask_slot(&key, GRANTS_PER_ASKER)
+    }
+
     /// Count one more ask of `asker` in progress, if it has fewer than
     /// `limit`: whether it was counted. [`Self::release_ask`] gives it back.
     fn take_ask(&self, asker: &Name, limit: usize) -> bool {
@@ -19444,7 +19539,7 @@ impl Inner {
         let name = hold_ask_name(holder, &ask);
         let b = InterestBuilder::new(name.clone()).lifetime(self.hold_ask_lifetime());
         let reply = {
-            let _slot = self.slots.acquire().await.ok()?;
+            let _slot = self.slot(self.hold_ask_lifetime()).await.ok()?;
             Consumer::new(self.node.connection()).fetch_with(b).await
         };
         let Ok(reply) = reply else {

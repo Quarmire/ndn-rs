@@ -2780,9 +2780,19 @@ forward ciphertext. Erasure is the destruction of the key.
   held records naming `E` list, or `E`'s creator, admit the asker, (3) the
   record in force, when it seals `C`, admits the asker, and (4) `G` holds
   `E`'s key; anything else gets no answer, and `G` fetches nothing for it.
+  Of the asks that pass, `G` works on at most `GRANTS_PER_ASKER` (32) of one
+  asker device at once, counted before anything is fetched; one more is
+  refused at once (a Nack, and a trace saying why), and an honest asker's
+  next round asks again (round 12 review H1: a granted reader could send
+  distinct asks, each naming a seal key of its device that never comes, and
+  have a task and a fetch slot wait on each). A grant already kept is
+  answered before the count.
   It then fetches and verifies the asker's seal key (signed by the asker's
   device key) — one ask in place, within the asker's wait; when it misses,
-  up to `FETCH_TRIES` asks more in the background, one run per seal key, the
+  up to `FETCH_TRIES` asks more in the background, one run per seal key, at
+  most `SEAL_LEARNING_PER_ASKER` (2) runs of one asker device and
+  `SEAL_LEARNING_MAX` (64) in all, a run beyond them not started and traced
+  (the asker's next ask starts it once one ends), the
   key kept once verified, so the asker's next round is answered at once
   (round 3, faulty cases f2 and r7: a lossy path to the asker made every
   round's one ask miss) — and answers, signed by its own key, with the key wrapped to
@@ -5176,10 +5186,21 @@ starts again for the new Interest) and the ask that needed a retry gives no
 sample of the round trip. When the retries end, the last Nack ends the ask
 as a miss asking again may mend, not as an answer: the owed fetch asks again
 after its pause, `FETCH_TRIES` asks in all, so a link that Nacks Congestion
-for ever costs one owed packet at most `FETCH_TRIES` · (1 + 8) = 27
-Interests per (lifetime + pause). Every other reason keeps its meaning: no
+for ever costs one owed packet `FETCH_TRIES` · (1 + 8) = 27 Interests per
+(lifetime + pause) — and, where Interests are also lost, at most
+`FETCH_TRIES` · 11 = 33 at the defaults: an ask's re-expressions after `RTO`
+and its retries after a pause add, so one ask is at most
+1 + `REEXPRESS_MAX` + `CONGESTION_RETRIES` = 12 Interests, and within the
+default 2 s lifetime and 250 ms `RTO` (gaps of 250, 500 and 1000 ms, pauses of
+at least 470 ms in all for the 8 retries, each needing `RTO_MIN` of the
+lifetime left) at most 11: the eight retries and the first two re-expressions,
+never the third. Every other reason keeps its meaning: no
 route, not yet, duplicate or any other code is an answer — the packet is not
-to be had from that face now — and ends the ask at once. Like
+to be had from that face now — and ends the ask at once. A Nack reaches an
+ask only from a forwarder that accepted it: a Nack is accepted only from a
+face holding an out-record of the Interest with the same nonce, any other is
+dropped (local-refusal.md §5), so it speaks for an upstream the Interest went
+to, not for any face that knows the name. Like
 re-expression it is liveness only: it decides nothing (invariant 1).
 
 **Pause.** After `k` misses in a row of one such loop (`k` = 0, 1, …) the
@@ -5215,10 +5236,15 @@ pieces, one per name for a manifest packet. Each pass of a loop makes at
 most `FETCH_TRIES` asks per packet it misses (one per granter for a key),
 or, for a root or a packet a walk lists, at most `FETCH_TRIES` rounds of
 at most `FETCH_TRIES` asks per source (one ask of each for a root); each
-ask is of at most 1 + `REEXPRESS_MAX` Interests within one lifetime, and
+ask is of at most 1 + `REEXPRESS_MAX` Interests within one lifetime — at
+most 1 + `REEXPRESS_MAX` + `CONGESTION_RETRIES` (12) when Nacked for rate as
+well, 11 at the defaults ("A Nack for rate") — and
 every fetch holds one of the device's `Config::in_flight` slots (256 by
-default). So one owed packet costs at most `FETCH_TRIES` asks —
-`FETCH_TRIES` · (1 + `REEXPRESS_MAX`) = 12 Interests — per source per
+default), waiting for it at most one Interest lifetime: a fetch that gets
+none is a miss asking again may mend, not "not there". So one owed packet
+costs at most `FETCH_TRIES` asks — `FETCH_TRIES` · 12 = 36 Interests, 33 at
+the defaults, and `FETCH_TRIES` · (1 + `REEXPRESS_MAX`) = 12 where no Nack for
+rate comes — per source per
 (lifetime + pause), and a walk at most `FETCH_TRIES` such rounds per packet
 it lists, the walks of one pass sharing them: after the first misses,
 about one ask per source every 6 s; after 16 misses in a row, one a
@@ -5259,7 +5285,14 @@ its wait, so it costs a call two asks; a release asks each candidate at
 most `AUDIT_TRIES` `Whole` asks. A holder runs one take per collection at
 a time, of at most `REPAIR_ROUNDS` rounds, each asking every missing
 piece once per source; hold asks arriving meanwhile start nothing beside
-it.
+it. Grant asks are bounded per asker (§9): a granter works on at most
+`GRANTS_PER_ASKER` (32) of one asker device at once, each holding one fetch
+slot for at most the wait for its seal key, and keeps at most
+`SEAL_LEARNING_MAX` (64) background runs for seal keys, so however many
+distinct asks one granted reader sends, its tasks, its slots and the runs it
+starts stay bounded — one asker's flood leaves the granter's own fetches the
+rest of the slots — and a fetch that waits for a slot waits at most one
+lifetime (above).
 
 **Threat note: retry cost.** Who can make a device ask again? (1) A sync
 notice is unsigned (§12): a stranger naming a device that never answers
@@ -7412,6 +7445,17 @@ pub struct JoinedFolder {
     not of every device's (round 11 review I1: the clause carried the
     seal key of any namespace's device, so a stranger's crossed a link whose
     record did not list her).
+    A **grant ask** (`<G>/32=grant/<GrantAsk>`, §9) is carried the same way,
+    for a collection under the folder and only to a granter `G` that can hold
+    a key of the folder: `folder_carries` carries it to a device of the
+    folder's own namespace (the epoch's creator, or another device of the
+    owner's), `writer_carries` to a device of a namespace the record lists as a
+    writer (a co-writer reads in the epoch too, so the asker's granter list
+    names it, §9), in the same exact device form, and no other (round 12
+    review H1: the clause carried an ask to any device, so a member could make
+    the owner's forwarder relay grant asks of its choosing to devices that
+    never held the key, over the owner's own links). The folder's owner is not
+    the only granter, so the rule is the namespace, not the one device.
     A walk asks a device that answers for a writer for that writer's root
     wrapped as a held packet (`<H>/32=held/<D>/32=summary/<W>/32=root`): such a
     name is carried when the root it wraps is, nested to the depth

@@ -1735,6 +1735,332 @@ async fn a_seal_key_a_grants_ask_missed_is_learned_for_the_next_round() {
     asker.shutdown();
 }
 
+/// The phone's link to the laptop: an Interest for a seal key of the phone is
+/// answered after `delay` — with the phone's own seal key, and, when `signs_any`,
+/// with a validly signed seal key packet for any other key too (a granted reader
+/// that answers each ask's seal key with a key of its choosing); nothing else is
+/// answered, so a seal key of a stranger or of no one never comes.
+struct SealNet {
+    asker: Arc<Inner>,
+    signs_any: bool,
+    delay: Duration,
+    tx: futures::channel::mpsc::UnboundedSender<Bytes>,
+    rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
+}
+
+#[async_trait::async_trait]
+impl Connection for SealNet {
+    async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+        let Ok(interest) = Interest::decode(wire) else {
+            return Ok(());
+        };
+        let name: &Name = &interest.name;
+        let Some((device, public)) = parse_seal_key_name(name) else {
+            return Ok(());
+        };
+        if device != self.asker.device {
+            return Ok(());
+        }
+        let own = self.asker.st.lock().keys.recipient.public() == public;
+        let reply = match (own, self.signs_any) {
+            (true, _) => self.asker.packet_for(name, false),
+            (false, true) => self
+                .asker
+                .sign(DataBuilder::new(
+                    name.clone(),
+                    &wire::encode_seal_key(&public),
+                ))
+                .ok(),
+            (false, false) => None,
+        };
+        let Some(reply) = reply else {
+            return Ok(());
+        };
+        let (tx, delay) = (self.tx.clone(), self.delay);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.unbounded_send(reply);
+        });
+        Ok(())
+    }
+    async fn recv(&self) -> Option<Bytes> {
+        self.rx.lock().await.next().await
+    }
+    async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+/// The laptop (the granter, the owner here) shares a sealed collection with the
+/// person Wendy, whose phone (the asker) is a reader, and reaches the phone by
+/// [`SealNet`] only.
+struct GrantFlood {
+    granter: Device,
+    asker: Device,
+    phone: Name,
+    ask: GrantAsk,
+    /// The phone's own seal key: what the laptop fetches of the phone itself.
+    real_seal: Name,
+}
+
+impl GrantFlood {
+    async fn start(signs_any: bool) -> Self {
+        let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
+        let (ns, keys, validator) = wendy(&[&laptop, &phone]).await;
+        let asker = start_on(
+            &phone,
+            Arc::clone(&keys[1]),
+            validator(),
+            Arc::new(Unconnected),
+        )
+        .await;
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let net = Arc::new(SealNet {
+            asker: Arc::clone(&asker.inner),
+            signs_any,
+            delay: Duration::from_millis(50),
+            tx,
+            rx: futures::lock::Mutex::new(rx),
+        });
+        let granter = start_on(&laptop, Arc::clone(&keys[0]), validator(), net).await;
+        let c = n("/wendy/32=data/diary");
+        granter
+            .share(
+                &c,
+                crate::layer::Share {
+                    rule: Rule::Log,
+                    writers: vec![ns.clone()],
+                    readers: vec![Audience::Person(ns.clone())],
+                },
+            )
+            .await
+            .unwrap();
+        granter.inner.flushed().await;
+        let epoch = granter.inner.st.lock().colls[&c]
+            .members
+            .as_ref()
+            .and_then(|m| m.epoch.clone())
+            .expect("a sealed collection");
+        let public = asker.inner.st.lock().keys.recipient.public();
+        let real_seal = wire::seal_key_name(&phone, &public);
+        GrantFlood {
+            granter,
+            asker,
+            phone: phone.clone(),
+            ask: GrantAsk {
+                seal_key: real_seal.clone(),
+                collection: c,
+                epoch,
+            },
+            real_seal,
+        }
+    }
+
+    /// An ask of the phone naming the seal key `i`, which the phone made up.
+    fn ask(&self, i: usize) -> (Name, GrantAsk) {
+        let mut public = [0u8; 32];
+        public[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+        let ask = GrantAsk {
+            seal_key: wire::seal_key_name(&self.phone, &public),
+            ..self.ask.clone()
+        };
+        (grant_name(&self.granter.inner.device, &ask), ask)
+    }
+
+    /// What the laptop's forwarder does with one such Interest: a task of its
+    /// own ([`Inner::answer`]).
+    fn spawn_ask(&self, i: usize) -> tokio::task::JoinHandle<Option<Bytes>> {
+        let (name, ask) = self.ask(i);
+        let inner = Arc::clone(&self.granter.inner);
+        tokio::spawn(async move { inner.grant(&name, ask).await })
+    }
+
+    /// How many of the device's fetch slots are taken.
+    fn slots_taken(&self) -> usize {
+        let inner = &self.granter.inner;
+        inner.config.in_flight - inner.slots.available_permits()
+    }
+
+    fn shutdown(self) {
+        self.granter.shutdown();
+        self.asker.shutdown();
+    }
+}
+
+/// A granted reader sends grant asks without end, each naming a seal key of its
+/// own device that nothing answers (round 12, H1). The laptop's tasks, the fetch
+/// slots they hold and the background runs for the seal keys stay bounded, and
+/// the laptop's own fetch of the phone is answered within its lifetime meanwhile,
+/// not after the queue the flood would otherwise make for the 256 slots; once the
+/// flood ends nothing is left held.
+#[tokio::test(start_paused = true)]
+async fn a_flood_of_grant_asks_whose_seal_keys_never_come_cannot_stall_the_owner() {
+    let f = GrantFlood::start(false).await;
+    let lifetime = f.granter.inner.config.lifetime;
+    let mut tasks = Vec::new();
+    for wave in 0..5 {
+        for i in 0..400 {
+            tasks.push(f.spawn_ask(wave * 400 + i));
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    let began = Instant::now();
+    let got = f.granter.inner.fetch(f.real_seal.clone(), false).await;
+    let took = began.elapsed();
+    assert!(
+        got.is_some() && took < lifetime,
+        "the owner's own fetch of the phone was {} after {took:?}, the lifetime being \
+         {lifetime:?}: it waited behind the flood's fetches",
+        if got.is_some() {
+            "answered"
+        } else {
+            "not answered"
+        }
+    );
+    let alive = tasks.iter().filter(|t| !t.is_finished()).count();
+    assert!(
+        alive <= GRANTS_PER_ASKER,
+        "{alive} grant tasks are alive; one asker may have {GRANTS_PER_ASKER}"
+    );
+    let (taken, learning) = (
+        f.slots_taken(),
+        f.granter.inner.st.lock().seal_learning.len(),
+    );
+    assert!(
+        taken <= GRANTS_PER_ASKER + SEAL_LEARNING_PER_ASKER,
+        "{taken} fetch slots are taken by one asker's asks"
+    );
+    assert!(
+        learning <= SEAL_LEARNING_PER_ASKER,
+        "{learning} background runs for one asker's seal keys; at most \
+         {SEAL_LEARNING_PER_ASKER}"
+    );
+    // The flood over, nothing stays held.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert!(tasks.iter().all(|t| t.is_finished()));
+    let st = f.granter.inner.st.lock();
+    assert!(st.asks.is_empty(), "asks still counted: {:?}", st.asks);
+    assert!(st.seal_learning.is_empty(), "{:?}", st.seal_learning);
+    drop(st);
+    assert_eq!(f.slots_taken(), 0);
+    f.shutdown();
+}
+
+/// The same flood, but the phone answers every ask's seal key with a validly
+/// signed seal key packet for a key it made up: each ask then costs the laptop a
+/// verification, a key agreement and a signature. Of a burst, only the asks the
+/// asker may have at once are worked on; the rest are refused (and asked again
+/// by an honest asker's next round), so the work of a burst is bounded; the
+/// laptop's own fetch meanwhile is answered.
+#[tokio::test(start_paused = true)]
+async fn a_burst_of_grant_asks_answered_with_signed_seal_keys_is_worked_on_a_bounded_number_at_once()
+ {
+    let f = GrantFlood::start(true).await;
+    let lifetime = f.granter.inner.config.lifetime;
+    let tasks: Vec<_> = (0..1000).map(|i| f.spawn_ask(i)).collect();
+    let began = Instant::now();
+    let got = f.granter.inner.fetch(f.real_seal.clone(), false).await;
+    assert!(
+        got.is_some() && began.elapsed() < lifetime,
+        "the owner's own fetch was not answered within its lifetime"
+    );
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let mut answered = 0;
+    for t in tasks {
+        answered += usize::from(t.await.unwrap().is_some());
+    }
+    assert!(
+        answered <= GRANTS_PER_ASKER,
+        "{answered} of 1000 asks at once were answered, signed for: one asker may have \
+         {GRANTS_PER_ASKER} at once"
+    );
+    assert_eq!(
+        f.granter.grants_answered() as usize,
+        answered,
+        "every grant signed was one answered"
+    );
+    assert!(f.granter.inner.st.lock().asks.is_empty());
+    f.shutdown();
+}
+
+/// The background runs that ask again for an asker's seal key ([`Inner::learn_seal_key`])
+/// are capped: one asker's, and all of them. A key beyond the cap is not run (its
+/// asker's next grant ask starts it when one ends), so the set never outgrows
+/// them, however many distinct keys or askers an admitted reader names.
+#[tokio::test(start_paused = true)]
+async fn the_runs_asking_again_for_seal_keys_are_capped_one_askers_and_all() {
+    let f = GrantFlood::start(false).await;
+    let inner = Arc::clone(&f.granter.inner);
+    let key = |i: usize| {
+        let mut public = [0u8; 32];
+        public[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+        public
+    };
+    for i in 0..100 {
+        inner.learn_seal_key(&wire::seal_key_name(&f.phone, &key(i)), &f.phone, &key(i));
+    }
+    assert_eq!(
+        inner.st.lock().seal_learning.len(),
+        SEAL_LEARNING_PER_ASKER,
+        "one asker's seal keys of 100 asked again"
+    );
+    for a in 0..500 {
+        let asker = n(&format!("/wendy/ghost{a}"));
+        inner.learn_seal_key(&wire::seal_key_name(&asker, &key(a)), &asker, &key(a));
+    }
+    assert_eq!(
+        inner.st.lock().seal_learning.len(),
+        SEAL_LEARNING_MAX,
+        "the seal keys of 500 askers asked again"
+    );
+    // Each run ends, and what ended is given back.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert!(inner.st.lock().seal_learning.is_empty());
+    f.shutdown();
+}
+
+/// A fetch that cannot get one of the device's slots within its Interest lifetime
+/// fails as a miss asking again may mend (`Err(true)`: the device was busy, not
+/// "not there"), never waiting for ever; so do the other asks that take a slot
+/// (spec §17.1).
+#[tokio::test(start_paused = true)]
+async fn a_fetch_waits_for_a_slot_no_longer_than_its_lifetime() {
+    let f = GrantFlood::start(false).await;
+    let inner = &f.granter.inner;
+    let lifetime = inner.config.lifetime;
+    let all = inner
+        .slots
+        .acquire_many(inner.config.in_flight as u32)
+        .await
+        .unwrap();
+    let began = Instant::now();
+    let got =
+        tokio::time::timeout(lifetime * 5, inner.fetch_once(f.real_seal.clone(), false)).await;
+    assert!(
+        matches!(got, Ok(Err(true))) && began.elapsed() <= lifetime,
+        "a fetch with every slot taken: {got:?} after {:?}, the lifetime being {lifetime:?}",
+        began.elapsed()
+    );
+    let began = Instant::now();
+    let got = tokio::time::timeout(
+        lifetime * 5,
+        inner.fetch_hinted(f.real_seal.clone(), &[], None),
+    )
+    .await;
+    assert!(
+        matches!(got, Ok(None)) && began.elapsed() <= lifetime,
+        "an introduction fetch with every slot taken: {:?} after {:?}",
+        got.map(|d| d.map(|d| d.name)),
+        began.elapsed()
+    );
+    drop(all);
+    assert!(
+        inner.fetch(f.real_seal.clone(), false).await.is_some(),
+        "once a slot is free the fetch is answered"
+    );
+    f.shutdown();
+}
+
 /// The laptop hears the phone, a device of Wendy's namespace whose every
 /// answer is lost for now, and the phone holds the record of a folder over
 /// a collection new to the laptop. A put into that collection is `NotReady`

@@ -984,7 +984,7 @@ impl Inner {
 
     /// Send `params` to `prefix` and wait for the reply: one lifetime.
     async fn send_ask(&self, prefix: Name, params: &Bytes) -> Option<Data> {
-        let _slot = self.slots.acquire().await.ok()?;
+        let _slot = self.slot(self.config.lifetime).await.ok()?;
         let b = InterestBuilder::new(prefix)
             .lifetime(self.config.lifetime)
             .app_parameters(params.to_vec());

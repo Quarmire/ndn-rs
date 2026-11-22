@@ -58,7 +58,9 @@ const HELD_DEPTH: u8 = 2;
 ///   (`<W>/<role>/<device>/32=seal/<public key>`: a public key, named by the
 ///   device that holds it; a device of another namespace is a listed writer's,
 ///   [`writer_carries`]'s while the record lists her) and a folder epoch's grant
-///   of a collection under `folder`;
+///   ask of a collection under `folder` **to a device of the folder's own
+///   namespace** (the epoch's creator, or another device of the owner's that
+///   holds the key; one to a listed writer's device is [`writer_carries`]'s);
 /// - a custody ask (hold, audit) and a held packet (`<H>/32=held/<name>`)
 ///   about a name carried by these rules.
 ///
@@ -78,7 +80,10 @@ pub fn folder_carries(folder: &Name, name: &Name) -> bool {
 /// lists — so that a writer who never met another walks to the other's devices
 /// through this device's copy; and the **seal keys**
 /// (`<W>/<role>/<device>/32=seal/<key>`) of the devices of each listed `W`, so
-/// that a writer can ask the other's device (ndn-link §8.7 rule 20). Nothing
+/// that a writer can ask the other's device (ndn-link §8.7 rule 20), and the
+/// **grant asks** (`<G>/32=grant/<GrantAsk>`) of a collection under the folder to
+/// a device `G` of each listed `W`, which holds the key of an epoch it reads in
+/// too (spec §9). Nothing
 /// else: a root's nodes and pages of the folder, and every entry, piece, head
 /// and cut manifest of a collection under the folder, whatever device wrote
 /// it, are [`folder_carries`]'s already;
@@ -109,6 +114,15 @@ fn writer_root(folder: &Name, namespaces: &[Name], name: &Name, held_depth: u8) 
     let name = &undigested(name);
     if let Some((_, inner)) = parse_held_name(name) {
         return held_depth > 0 && writer_root(folder, namespaces, &inner, held_depth - 1);
+    }
+    if let Some((granter, ask)) = parse_grant_name(name) {
+        // A grant ask to a device of a listed writer's namespace, for a collection
+        // under the folder: the owner's forwarder relays it only to a device the
+        // folder's record lists, never to any device a member names.
+        return within(folder, &ask.collection)
+            && namespaces.iter().any(|ns| {
+                namespace_of(folder).as_ref() != Some(ns) && device_of_namespace(&granter, ns)
+            });
     }
     let Some(summary) = parse_summary_name(name) else {
         // The seal key `<W>/<role>/<device>/32=seal/<key>` of a device of a listed
@@ -239,8 +253,13 @@ fn carries(folder: &Name, name: &Name, held_depth: u8) -> bool {
     if let Some((device, _)) = parse_seal_key_name(name) {
         return namespace_of(folder).is_some_and(|own| device_of_namespace(&device, &own));
     }
-    if let Some((_, ask)) = parse_grant_name(name) {
-        return within(folder, &ask.collection);
+    if let Some((granter, ask)) = parse_grant_name(name) {
+        // Only to a device of the folder's own namespace: the epoch's creator or
+        // another device of the owner's. A listed writer's device is
+        // [`writer_carries`]'s; no other device holds a key of this folder, and
+        // the owner's forwarder would relay a member's ask to it for nothing.
+        return within(folder, &ask.collection)
+            && namespace_of(folder).is_some_and(|own| device_of_namespace(&granter, &own));
     }
     if let Some((_, ask)) = parse_hold_ask_name(name) {
         return parse_log_name(&ask.record)
@@ -565,6 +584,76 @@ mod tests {
             &namespaces,
             &root_name(&device, &n("/bob"), 4)
         ));
+    }
+
+    /// A grant ask crosses a grant link only to a granter the folder's records can
+    /// have: a device of the folder's own namespace (its epoch's creator), or of a
+    /// namespace its record in force lists as a writer (a co-writer holds the key
+    /// too, spec §9). A grant ask to any other device would make the owner's
+    /// forwarder relay a member's asks to devices that never held the key (round 12,
+    /// H1).
+    #[test]
+    fn a_grant_ask_crosses_only_to_a_granter_the_folder_can_have() {
+        use crate::collection::Epoch;
+        use crate::version::Seq;
+        use crate::wire::{GrantAsk, grant_name, held_name, seal_key_name};
+        let folder = folder();
+        let namespaces = namespaces();
+        let reader = n("/alice/member/phone");
+        let ask = |creator: &Name| GrantAsk {
+            seal_key: seal_key_name(&reader, &[3; 32]),
+            collection: n("/alice/32=data/notebook/ch"),
+            epoch: Epoch {
+                creator: creator.clone(),
+                seq: Seq(2),
+            },
+        };
+        let to = |granter: &str| grant_name(&n(granter), &ask(&n("/alice/member/laptop")));
+        // The folder's own namespace: `folder_carries`'s, with no writer listed.
+        for own in ["/alice/member/laptop", "/alice/admin/tablet"] {
+            let name = to(own);
+            assert!(folder_carries(&folder, &name), "{name}");
+            assert!(!writer_carries(&folder, &namespaces, &name), "{name}");
+        }
+        // A listed writer's device: added by `writer_carries`, only while listed.
+        for listed in ["/bob/member/phone", "/carol/admin/tablet"] {
+            let name = to(listed);
+            assert!(
+                !folder_carries(&folder, &name),
+                "a grant ask to {listed}, a device of another namespace, crossed on its own"
+            );
+            assert!(writer_carries(&folder, &namespaces, &name), "{name}");
+            assert!(
+                !writer_carries(&folder, &[], &name),
+                "{name} crossed with no writer listed"
+            );
+            let held = held_name(&n("/alice/member/laptop"), &name);
+            assert!(writer_carries(&folder, &namespaces, &held), "{held}");
+        }
+        // A device of no namespace the record lists, however it is named.
+        for other in [
+            "/dave/member/phone",
+            "/bobby/member/phone",
+            "/bob/member",
+            "/bob/member/phone/nested",
+            "/bob/stranger/phone",
+            "/alicia/member/laptop",
+        ] {
+            let name = to(other);
+            assert!(
+                !folder_carries(&folder, &name) && !writer_carries(&folder, &namespaces, &name),
+                "a grant ask to {other} crossed the folder's link"
+            );
+        }
+        // A listed writer's device is asked only for a collection under the folder.
+        let outside = grant_name(
+            &n("/bob/member/phone"),
+            &GrantAsk {
+                collection: n("/alice/32=data/diary"),
+                ..ask(&n("/alice/member/laptop"))
+            },
+        );
+        assert!(!writer_carries(&folder, &namespaces, &outside));
     }
 
     #[test]
