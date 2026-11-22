@@ -1075,7 +1075,11 @@ plus the duration the writer stated. What it promises, and no more:
   alike, then twice as many each time none of them answers, up to the
   reader's fetch window, and goes on from the nearest that answers; when a
   window of them answers none, the rest of the interval is not probed: it
-  is taken into the range and its versions are reported `missing`. A
+  is taken into the range and its versions are reported `missing`. When
+  the search's bound ended the round instead, that is no evidence that
+  they are withheld: a window of versions or fewer left in the interval are
+  not judged by the search and are fetched with the versions between, in
+  the fetch's own bound; more than a window are reported `missing`. A
   search's cost is counted in distinct versions probed, not Interests:
   asking a version again adds Interests and time, never a version. A
   version it knows expired is placed by the dates its tombstone keeps
@@ -1094,10 +1098,15 @@ plus the duration the writer stated. What it promises, and no more:
   rounds on a path whose round trips near the lifetime as on a fast one.
   As `RTO` never exceeds the lifetime, the bound is at most
   `RANGE_LOOKS` · max(first look, `RANGE_RTOS` · lifetime) — 64 s with the
-  defaults — however slow or hostile the path:
-  versions it has not reached by then
+  defaults — however slow or hostile the path. The search and the fetch of
+  the versions between each have the bound, the second counted from when
+  the search is done: a search whose probes were lost spends its own
+  bound, and the versions in range, none of which it asked for, are not
+  answered `missing` for that (a path that loses a probe costs it a
+  lifetime per ask, however short `RTO` measured the round trips that
+  answered). Versions a bound has not reached
   are reported `missing`, so withheld or unreachable blocks cost it time,
-  never more than the bound. The cost is the head, the node, `O(log n)`
+  never more than the bound of each phase. The cost is the head, the node, `O(log n)`
   probes (two or three for a steady stream, where interpolation lands near
   the answer) when probes answer — a lost probe is asked again at no cost
   in versions; a guess no ask reaches adds probes in steps of two, four, …
@@ -5227,8 +5236,9 @@ A verb's own asks are bounded per call: a one-key read makes at most
 `FETCH_TRIES` asks for the head and as many for the node it names; a verb
 waiting for an epoch key waits for at most `FETCH_TRIES` rounds of its
 ask, one ask per granter each; a range read probes for at most
-`RANGE_LOOKS` · max(first look, `RANGE_RTOS` · `RTO`) (§5.4), never more
-than `RANGE_LOOKS` · max(first look, `RANGE_RTOS` · lifetime), each probe
+`RANGE_LOOKS` · max(first look, `RANGE_RTOS` · `RTO`) (§5.4) in its search
+and again in the fetch of the versions in range, never more
+than `RANGE_LOOKS` · max(first look, `RANGE_RTOS` · lifetime) in each, each probe
 an owed fetch as above, probed again in place up to `SEARCH_TRIES` times
 in a search and until that bound in the range; a search probes at most a
 window more versions for a guess no probe reached, never more for loss.

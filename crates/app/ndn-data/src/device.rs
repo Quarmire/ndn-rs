@@ -1467,9 +1467,10 @@ const REPAIR_ROUNDS: u32 = 16;
 /// for the rest, until the next hold ask ([`Inner::repair_held`]).
 const REPAIR_IDLE: u32 = 3;
 /// How long a range read probes its blocks at most, in looks, from when
-/// the head's node lists them ([`range_bound`]): what withheld or
-/// unreachable blocks can cost a reader before the blocks it did not reach
-/// are answered `missing` (spec §5.4).
+/// the head's node lists them ([`range_bound`]), and again for the blocks
+/// in range once its search is done: what withheld or unreachable blocks
+/// can cost a reader before the blocks it did not reach are answered
+/// `missing` (spec §5.4).
 const RANGE_LOOKS: u32 = 8;
 /// The round trips one look of a range read lasts at least, in the
 /// device's retransmission timeout ([`Rtt::rto`]): a search probes one
@@ -17080,8 +17081,11 @@ impl Inner {
     /// within [`range_bound`] from when the head's node lists them (the
     /// records and the head have bounds of their own, spec §17.1), a probe
     /// lost on the way probed again in place: a search's up to
-    /// [`SEARCH_TRIES`] times, a block in range until then. What was not
-    /// probed by then is missing.
+    /// [`SEARCH_TRIES`] times, a block in range until then. The search and
+    /// the fetch of the blocks in range each have that bound, the second
+    /// counted from when the search is done: a search whose probes were
+    /// lost does not take the time of blocks it never asked for. What was
+    /// not probed by then is missing.
     async fn get_range(
         self: &Arc<Self>,
         name: &Name,
@@ -17214,14 +17218,22 @@ impl Inner {
                 seqs[lo..hi].to_vec()
             }
         };
-        // A block a probe lost is asked again in place; what the deadline
-        // leaves unprobed is missing.
+        // The blocks in range are fetched within a bound of their own, counted from when
+        // they are known: the search's lost probes spend the search's bound, and a bound
+        // they had already spent would leave blocks that were never asked for `missing`
+        // while every one of them is to be had (spec §5.4). A block a probe lost is asked
+        // again in place; what this deadline leaves unprobed is missing.
+        let rto = self.rtt.lock().measured(self.config.lifetime);
+        let fetch_by = Instant::now().checked_add(range_bound(
+            self.config.first_look,
+            rto.unwrap_or(Duration::ZERO),
+        ));
         let todo: Vec<u64> = picked
             .iter()
             .copied()
             .filter(|s| !settled(&probes, *s))
             .collect();
-        self.probe_all(c, &device, todo, &mut probes, deadline, u32::MAX)
+        self.probe_all(c, &device, todo, &mut probes, fetch_by, u32::MAX)
             .await;
         let id = |s: u64| VersionId {
             writer: key.clone(),
@@ -17320,8 +17332,11 @@ impl Inner {
     /// When none answers, the rest of `lo..hi` is not probed: it is counted
     /// missing, and the caller takes it in whole — so a round costs one
     /// block while probes answer, withheld blocks cost at most one window
-    /// more, not a probe each, and `deadline` bounds the whole. Returns
-    /// `(lo, hi)` narrowed: equal when found.
+    /// more, not a probe each, and `deadline` bounds the whole. Except when
+    /// `deadline` itself ended the round and no more than a window of
+    /// blocks is left in `lo..hi`: the bound running out is no evidence that
+    /// they are withheld, so they are left unjudged for the caller to fetch
+    /// within its own bound. Returns `(lo, hi)` narrowed: equal when found.
     #[allow(clippy::too_many_arguments)]
     async fn search(
         self: &Arc<Self>,
@@ -17381,10 +17396,19 @@ impl Inner {
                 step *= 2;
             }
             let Some((i, d)) = order().find_map(|i| known(i, probes).map(|d| (i, d))) else {
-                for s in &seqs[lo..hi] {
-                    let p = probes.entry(*s).or_insert(Probe::Missing);
-                    if matches!(p, Probe::Lost) {
-                        *p = Probe::Missing;
+                // No probe answered. When the bound ran out inside this round that is no
+                // evidence of withholding, and a window of blocks or fewer left unjudged is
+                // what the caller fetches whole, within the bound of its own: asking them
+                // costs no more versions than a widened round does. Otherwise (a window of
+                // probes answered none, or more blocks than a window are unjudged) the
+                // rest of the interval is not probed and is missing.
+                let cut = deadline.is_some_and(|d| Instant::now() >= d);
+                if !(cut && hi - lo <= window) {
+                    for s in &seqs[lo..hi] {
+                        let p = probes.entry(*s).or_insert(Probe::Missing);
+                        if matches!(p, Probe::Lost) {
+                            *p = Probe::Missing;
+                        }
                     }
                 }
                 return (lo, hi);
@@ -24477,6 +24501,61 @@ mod tests {
         dev.shutdown();
     }
 
+    /// A search whose bound ran out inside a round says nothing of the blocks it did not
+    /// reach: a window of blocks or fewer left in its interval are left unjudged for the
+    /// range read to fetch, never counted missing unasked; more than a window, or a window
+    /// of probes that answered none within the bound, are missing as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_search_cut_by_its_bound_leaves_a_window_of_blocks_unjudged() {
+        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        validator.adopt_context(context("/rita")).unwrap();
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let dev = start(&reader, &keys_of(&reader), &validator, &store)
+            .await
+            .unwrap();
+        let c = n("/sam/32=data/temps");
+        let key = sensor.clone().append("KEY").append("1");
+        one_key_record(&dev, &c, &key);
+        let window = dev.inner.config.window;
+        let seqs: Vec<u64> = (1..=(window as u64 + 8)).collect();
+        for (blocks, missing) in [(window, false), (window + 8, true)] {
+            let mut probes = HashMap::new();
+            let spent = Some(Instant::now());
+            let found = dev
+                .inner
+                .search(
+                    &c,
+                    &sensor,
+                    &seqs,
+                    &mut probes,
+                    (0, blocks),
+                    Timestamp(0),
+                    spent,
+                    |_| true,
+                )
+                .await;
+            assert_eq!(
+                found,
+                (0, blocks),
+                "a search that found nothing narrows nothing"
+            );
+            for s in &seqs[..blocks] {
+                assert_eq!(
+                    matches!(probes.get(s), Some(Probe::Missing)),
+                    missing,
+                    "{blocks} blocks left by a cut search, block {s}: missing only when more than \
+                     a window"
+                );
+                assert!(
+                    missing || !settled(&probes, *s),
+                    "left unjudged for the fetch"
+                );
+            }
+        }
+        dev.shutdown();
+    }
+
     /// A reader's link to one writer device: every Interest under the
     /// writer's name is answered with what the writer serves, except that
     /// for each name in `lossy` every Interest within `window` of the first
@@ -24595,7 +24674,7 @@ mod tests {
         validator.adopt_context(context("/rita")).unwrap();
         validator.cert_cache().insert(cert);
         let range = Range::Times(Timestamp(2_000), Timestamp(2_350));
-        let read = |link: Arc<Lossy>| {
+        let read = |link: Arc<Lossy>, first_look: Option<Duration>| {
             let (reader, validator, c, key) = (
                 reader.clone(),
                 Arc::clone(&validator),
@@ -24613,7 +24692,10 @@ mod tests {
                     keys_of(&reader),
                     validator,
                     Arc::new(MemoryStore::new()),
-                    Config::new(),
+                    Config {
+                        first_look: first_look.unwrap_or(Config::new().first_look),
+                        ..Config::new()
+                    },
                 )
                 .await
                 .unwrap();
@@ -24638,7 +24720,7 @@ mod tests {
         };
 
         let clean = Lossy::new(&writer, BTreeSet::new(), Duration::ZERO);
-        let (e, _, _) = read(Arc::clone(&clean)).await;
+        let (e, _, _) = read(Arc::clone(&clean), None).await;
         assert_eq!(values(&e), ["2000", "2100", "2200", "2300"]);
         let probed = clean.asked(&blocks);
         // The search's first guess bisects the listed seqs.
@@ -24653,8 +24735,8 @@ mod tests {
         let lifetime = writer.inner.config.lifetime + ndn_app::consumer::REPLY_SLACK;
         let probe =
             lifetime * FETCH_TRIES + (0..FETCH_TRIES - 1).map(retry_pause).sum::<Duration>();
-        let lossy = Lossy::new(&writer, [guess, within].into(), probe);
-        let (e, took, bound) = read(Arc::clone(&lossy)).await;
+        let lossy = Lossy::new(&writer, [guess.clone(), within].into(), probe);
+        let (e, took, bound) = read(Arc::clone(&lossy), None).await;
         assert_eq!(
             lossy.asked(&blocks),
             probed,
@@ -24668,6 +24750,30 @@ mod tests {
         );
         assert_eq!(values(&e), ["2000", "2100", "2200", "2300"]);
         assert!(took <= bound, "within its bound's cap {bound:?}: {took:?}");
+
+        // A search whose probes were lost has spent most of its bound: the blocks in range
+        // are still asked for, each lost once, within a bound of their own, counted from
+        // when the search is done — never answered `missing` unasked while every one of
+        // them is to be had.
+        let first_look = Duration::from_millis(1500);
+        let middle = [blocks[20].clone(), blocks[21].clone()];
+        let spent = Lossy::new(
+            &writer,
+            [guess, middle[0].clone(), middle[1].clone()].into(),
+            probe,
+        );
+        let (e, took, bound) = read(Arc::clone(&spent), Some(first_look)).await;
+        assert!(
+            e.missing.is_empty(),
+            "blocks in range lost once are asked again after the search spent its bound: {:?}",
+            e.missing
+        );
+        assert_eq!(values(&e), ["2000", "2100", "2200", "2300"]);
+        let one = range_bound(first_look, Duration::ZERO);
+        assert!(
+            took > one && took <= bound * 2,
+            "the search and the fetch have a bound each: {took:?} of {one:?} (cap {bound:?})"
+        );
         writer.shutdown();
     }
 
