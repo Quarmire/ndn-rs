@@ -101,7 +101,6 @@ fn saying(device: &str, c: &Name, seq: u64, text: &str) -> super::test_kit::Made
         op: Bytes::new(),
         sealed: None,
         chunks: None,
-        block: None,
     };
     super::test_kit::made(device, c, seq, Record::Version(body))
 }

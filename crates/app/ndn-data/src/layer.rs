@@ -17,15 +17,7 @@ use crate::collection::{Rule, Summary};
 use crate::error::{DataError, Refusal};
 use crate::merge::Value;
 use crate::statement::Snapshot;
-use crate::version::{
-    Audience, Content, Frontier, Keep, Timestamp, TypeId, Version, VersionId, Writer,
-};
-
-/// The longest batch delay a [`put`](DataLayer::put) accepts (spec §4.1):
-/// an entry waits unsigned at most this long, and a one-key head states its
-/// writer's delay as the freshness readers add to every answer's age
-/// (spec §5.3). A day.
-pub const BATCH_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+use crate::version::{Audience, Content, Frontier, Keep, TypeId, Version, VersionId, Writer};
 
 /// The options of a [`put`](DataLayer::put).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -34,12 +26,6 @@ pub struct PutOptions {
     pub type_id: TypeId,
     /// The retention chosen now, at write.
     pub keep: Keep,
-    /// The delay this producer accepts so that several entries share one
-    /// signature in a block (model change M6, spec §4.1); `None` signs the
-    /// version alone. A block closes at the earliest of its entries'
-    /// arrival plus this delay, so no entry waits longer. Log and one-key
-    /// collections only; at most [`BATCH_MAX`].
-    pub batch: Option<Duration>,
 }
 
 /// Why a held, verified version is not in a state's value (spec §15).
@@ -95,59 +81,16 @@ pub struct State {
     pub not_counted: Vec<(VersionId, NotCounted)>,
 }
 
-/// One entry of a block (or the one entry of a version that is no block),
-/// verified through its block's signature (spec §4.1).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Entry {
-    /// Its name, `<V>/32=entry/seg=<index>` ([`crate::wire::entry_name`]).
-    pub name: Name,
-    /// The block (version) carrying it.
-    pub id: VersionId,
-    /// Its 0-based index in the block.
-    pub index: u32,
-    /// Its date: the block's plus its offset. Display and indexing only.
-    pub dated: Timestamp,
-    /// The content.
-    pub content: Content,
-}
-
-/// The entries a range read (or an entry's name) found, from one key's
-/// stream (spec §5.4).
-///
-/// Complete exactly when `missing` is empty: relative to the summary node
-/// the one key's head named, every block it lists within the bounds is
-/// accounted for — read, expired here, or in pieces.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Entries {
-    /// The collection.
-    pub collection: Name,
-    /// The one key that writes it.
-    pub writer: Writer,
-    /// The entries in the bounds, in (seq, index) order, each from a block
-    /// of `writer` verified here.
-    pub entries: Vec<Entry>,
-    /// Listed blocks within the bounds that no path answered.
-    pub missing: Vec<VersionId>,
-    /// Blocks within the bounds this device knows expired.
-    pub expired: Vec<VersionId>,
-    /// Versions within the bounds that travel in pieces: read them by name.
-    pub large: Vec<VersionId>,
-}
-
 /// What a [`get`](DataLayer::get) found.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Got {
-    /// One exact version: asked by its name, or the newest of a one-key or
-    /// log collection.
+    /// One exact version: asked by its name, or the newest of a log
+    /// collection.
     Version(Version),
     /// The merged state of a merge collection, or a state named exactly.
     State(State),
     /// A snapshot, asked by its name.
     Snapshot(Snapshot),
-    /// Entries of a one-key collection's blocks: a range read
-    /// (`<C>/32=range/<R>`, [`crate::wire::range_name`]), or one entry by
-    /// its name.
-    Entries(Entries),
 }
 
 /// How old an answer may be (model invariant 5, "stale, never wrong").
@@ -208,17 +151,6 @@ pub enum Change {
         /// name and digest applies; it comes back as a version if its key's
         /// chain verifies again).
         why: Refusal,
-    },
-    /// A version delivered earlier expired by this device's clock (spec
-    /// §14.1): the device dropped it, and a `get` of it answers
-    /// [`DataError::Expired`].
-    Expired {
-        /// The version's collection.
-        collection: Name,
-        /// The version.
-        id: VersionId,
-        /// Its keep.
-        keep: Keep,
     },
     /// Two different versions with one `(writer, seq)`: evidence against that
     /// key (model invariant 2). Readers keep both and report. Told once for
@@ -386,7 +318,6 @@ impl Change {
             Change::Summary(s) => &s.collection,
             Change::Version(v) => &v.collection,
             Change::Withdrawn { collection, .. }
-            | Change::Expired { collection, .. }
             | Change::Equivocation { collection, .. }
             | Change::NotCounted { collection, .. }
             | Change::Counted { collection, .. }
@@ -501,8 +432,7 @@ pub trait DataLayer: Send + Sync {
     /// frontier this device has seen. The collection's members and the trust
     /// schema decide whether this key may write; the collection's seal
     /// applies. Fields of the current state that `options.type_id` does not
-    /// know are kept. With `options.batch`, the call returns once the block
-    /// carrying the entry is signed, with that block's id. In a merge
+    /// know are kept. In a merge
     /// collection the rule makes the operation of the fields and checks and
     /// applies it, as [`put_op`](Self::put_op) does. Filled by slice 1.
     async fn put(
@@ -518,7 +448,7 @@ pub trait DataLayer: Send + Sync {
     /// first; one it refuses is [`DataError::BadRequest`] with the rule's
     /// reason, and nothing is signed into the log. Merge collections whose
     /// rule this device knows only ([`DataError::RuleUnknown`] otherwise; a
-    /// log or one-key collection is [`DataError::BadRequest`]).
+    /// log collection is [`DataError::BadRequest`]).
     async fn put_op(
         &self,
         collection: &Name,

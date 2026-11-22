@@ -16,10 +16,6 @@ use crate::wire;
 /// A writer is always one key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Rule {
-    /// A single key writes — the one key its members record names — and
-    /// the newest is that key's signed head, with a freshness bound
-    /// (spec §5.3). Sensors, a service's answers.
-    OneKey,
     /// Each member key appends; the collection is the union of exactly its
     /// members' logs. Chat, a photo library. Filled by slice 2.
     Log,
@@ -1167,7 +1163,9 @@ mod tests {
         let (m, _) = Members::merge(&[phone.clone(), changed.clone()], held).unwrap();
         assert_eq!(m.rule, merged, "whatever order the records come in");
         let other = from(Members {
-            rule: Rule::OneKey,
+            rule: Rule::Merge {
+                function: n("/merge/notes"),
+            },
             ..phone.clone()
         });
         let (m, _) = Members::merge(&[changed.clone(), other.clone()], held).unwrap();

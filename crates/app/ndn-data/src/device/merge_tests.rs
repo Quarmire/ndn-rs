@@ -364,7 +364,6 @@ pub(super) fn body_in(
         op,
         sealed: None,
         chunks: None,
-        block: None,
     }
 }
 
@@ -435,7 +434,6 @@ pub(super) fn options() -> PutOptions {
             revision: 1,
         },
         keep: Keep::Forever,
-        batch: None,
     }
 }
 

@@ -79,8 +79,7 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use crate::collection::{self, Accepted, Child, Cut, Epoch, Members, Resolve, Rule, Summary};
 use crate::error::{DataError, Refusal};
 use crate::layer::{
-    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Entries, Entry, Equivocal, Got, NotCounted,
-    PutOptions, State,
+    Age, Answer, Change, Changes, DataLayer, Equivocal, Got, NotCounted, PutOptions, State,
 };
 use crate::merge::{
     Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value,
@@ -89,20 +88,17 @@ use crate::pieces::{self, Shape};
 use crate::rt::{self, Instant};
 use crate::seal::{self, Keys};
 use crate::statement::Snapshot;
-use crate::tree::{Kind, Retain, Tree};
+use crate::tree::{Kind, Tree};
 use crate::version::{
-    Audience, BlockEntry, Content, Frontier, Keep, Parents, Payload, Seal, Seq, Timestamp, TypeId,
-    Version, VersionId, Writer,
+    Audience, Content, Frontier, Keep, Parents, Payload, Seal, Seq, Timestamp, TypeId, Version,
+    VersionId, Writer,
 };
 use crate::wire::{
-    self, BlockEntryBody, Branches, ChunksBody, CutBody, ExpiryRun, GrantAsk, HeadBody, Inline,
-    MembersBody, NodeBody, PieceKind, Range, Record, SealedBody, Tomb, VersionBody,
-    cut_bytes_prefix, device_of, entry_name, grant_name, head_name, head_prefix, in_ranges,
-    log_name, namespace_of, node_name, page_name, parse_cut_bytes_name, parse_entry_name,
-    parse_grant_name, parse_head_name, parse_head_prefix, parse_held_name, parse_log_name,
-    parse_piece_name, parse_range_name, parse_seal_key_name, parse_state_name, parse_summary_name,
-    piece_name, piece_names, root_name, root_prefix, seal_key_name, seqs_of, state_name,
-    subject_namespace,
+    self, Branches, ChunksBody, CutBody, GrantAsk, MembersBody, NodeBody, PieceKind, Record,
+    SealedBody, VersionBody, cut_bytes_prefix, device_of, grant_name, log_name, namespace_of,
+    node_name, page_name, parse_cut_bytes_name, parse_grant_name, parse_held_name, parse_log_name,
+    parse_piece_name, parse_seal_key_name, parse_state_name, parse_summary_name, piece_name,
+    piece_names, root_name, root_prefix, seal_key_name, seqs_of, state_name, subject_namespace,
 };
 use ndn_security::confidentiality::{ContentKey, RecipientKey, Sealed, wrap_ck_to};
 
@@ -138,8 +134,7 @@ pub struct Config {
     /// one: spec §15; `share_folder` creating a first record does).
     pub first_look: Duration,
     /// How many asks one walk has in flight at once: the nodes or entries
-    /// of one summary node, the pieces of one large version, one round of
-    /// a range read's probes (spec §5.4, §13.1).
+    /// of one summary node, the pieces of one large version (spec §13.1).
     pub window: usize,
     /// How many asks the whole device has in flight at once, every walk
     /// and fetch together (its slots, spec §17.1): what bounds the memory
@@ -293,7 +288,7 @@ struct HeldVersion {
     sealed: bool,
     /// The epoch its payload is sealed in.
     epoch: Option<Epoch>,
-    /// Its payload in pieces, when it travels so (spec §4.1).
+    /// Its payload in pieces, when it travels so (spec §13.1).
     chunks: Option<ChunksBody>,
     /// Whether `op` is its operation: inline, or in pieces held whole and
     /// opened ([`open_held`]). A merge version applies only opened; once
@@ -643,10 +638,6 @@ struct Coll {
     /// sealed, or an operation the rule refuses): later versions do not wait
     /// for them.
     skipped: HashMap<Writer, BTreeSet<u64>>,
-    /// Per writer, its newest node of the collection verified here: what
-    /// it lists and the keep bounds it states decide which of the writer's
-    /// versions never apply here (spec §5.2, §7).
-    listings: HashMap<Writer, Listing>,
     /// Admitted, not yet applied.
     pending: BTreeSet<VersionId>,
     /// Held while no members record is known.
@@ -659,15 +650,6 @@ struct Coll {
     /// Verified, sealed in an epoch whose key this device does not hold
     /// (yet, or ever: it is not of the audience).
     locked: Vec<Locked>,
-    /// The date of this device's newest entry here: its next is dated no
-    /// earlier (spec §4.1), so a time range finds its entries in order.
-    last_dated: Option<Timestamp>,
-    /// The batch delay of each of this device's versions here (zero
-    /// unbatched) by seq, from the newest its head may state on: the
-    /// freshness a head states is its newest version's (spec §5.3), and a
-    /// head lists only the durable log (spec §4.2), so the versions after
-    /// the durable head and the newest before it are kept.
-    batches: BTreeMap<u64, Duration>,
     /// The revocation cuts of the revoked keys that write here, or that a
     /// version held here names as a parent, by key (spec §8): each accepts
     /// that key's runs for this collection's log. An entry of such a key
@@ -697,210 +679,12 @@ struct Dormant {
     parents: BTreeSet<Writer>,
 }
 
-/// Whether a rule makes a collection log-like: every member key appends,
-/// and nothing merges (spec §5). The one-key rule is the log rule with a
-/// single member and a signed head.
-fn log_like(rule: &Rule) -> bool {
-    matches!(rule, Rule::Log | Rule::OneKey)
-}
-
-/// The one key of one-key collection `coll` by its record in force, and
-/// the device it belongs to; `None` when the rule is another, or the record
-/// names no single key.
-fn one_key(coll: &Coll) -> Option<(Writer, Name)> {
-    let m = coll.members.as_ref()?;
-    if m.rule != Rule::OneKey {
-        return None;
-    }
-    let [key] = m.writers.as_slice() else {
-        return None;
-    };
-    Some((Writer::new(key.clone()), device_of(key)?))
-}
-
-/// Whether version `id`, kept `keep`, expired at this device by `now`, its
-/// own clock (spec §14.1): `Until(t)` with `t ≤ now`, or `LastN(n)` with
-/// `n` newer versions of its writer known here (`cutoff(n)`: the seq of the
-/// `n`-th newest, [`lastn_cutoff`]). Only a log-like collection's versions
-/// expire; the caller checks the rule.
-fn expires(keep: Keep, id: &VersionId, now: Timestamp, cutoff: impl FnOnce(u32) -> u64) -> bool {
-    match keep {
-        Keep::Until(t) => t <= now,
-        Keep::LastN(n) => id.seq.0 < cutoff(n),
-        Keep::Forever => false,
-    }
-}
-
-/// The seq below which a writer's versions in `coll` are outside its last
-/// `n` (every seq when `n` is 0, none while fewer than `n` are known).
-fn lastn_cutoff(coll: &Coll, writer: &Writer, n: u32) -> u64 {
-    if n == 0 {
-        return u64::MAX;
-    }
-    coll.entries
-        .get(writer)
-        .and_then(|s| s.iter().rev().nth(n as usize - 1))
-        .copied()
-        .unwrap_or(0)
-}
-
-/// The date of the last entry of `v`: its block's last, else its own.
-fn last_dated(v: &Version) -> Timestamp {
-    match &v.payload {
-        Payload::Block(entries) => entries.last().map_or(v.dated, |e| e.dated),
-        _ => v.dated,
-    }
-}
-
-/// What a dropped version leaves: its writer, keep and entry dates.
-fn tomb_of(v: &Version) -> Tomb {
-    Tomb {
-        writer: v.id.writer.key().clone(),
-        keep: v.keep,
-        first: v.dated,
-        last: Some(last_dated(v)),
-    }
-}
-
-/// Every entry of `v` as [`Entry`]s: a block's entries in order, a single
-/// entry as entry 0; none for a large version not read whole.
-fn entries_of(v: &Version) -> Vec<Entry> {
-    let entry = |index: u32, dated: Timestamp, content: &Content| Entry {
-        name: entry_name(&v.name, index),
-        id: v.id.clone(),
-        index,
-        dated,
-        content: content.clone(),
-    };
-    match &v.payload {
-        Payload::Entry(c) => vec![entry(0, v.dated, c)],
-        Payload::Block(list) => list
-            .iter()
-            .enumerate()
-            .map(|(i, e)| entry(i as u32, e.dated, &e.content))
-            .collect(),
-        Payload::Large { .. } => Vec::new(),
-    }
-}
-
-/// An own block being filled (spec §4.1): entries of one type, keep class
-/// and seal epoch, waiting at most the delay each accepted.
-struct OpenBlock {
-    type_id: TypeId,
-    /// `Until` merged to the latest of its entries'; `Forever` or `LastN`
-    /// equal across them.
-    keep: Keep,
-    /// The epoch its entries are sealed in.
-    epoch: Option<Epoch>,
-    /// The date of its first entry: the version's `Dated`.
-    first: Timestamp,
-    entries: Vec<BlockEntryBody>,
-    /// The earliest arrival plus batch of its entries: when it closes.
-    deadline: Instant,
-    /// The longest delay its entries accepted.
-    batch: Duration,
-    /// The puts waiting for it to be signed.
-    waiters: Vec<oneshot::Sender<Result<VersionId, DataError>>>,
-}
-
 /// What an own version carries, before it is signed.
 enum Draft {
     /// One entry.
     Entry(Content),
     /// The operation the app built, for a merge collection's rule.
     Op(Bytes),
-    /// A block: the date of its first entry, and its entries.
-    Block {
-        first: Timestamp,
-        entries: Vec<BlockEntryBody>,
-    },
-}
-
-/// Whether an entry kept `b` may share a block kept `a`: both until some
-/// date, or the same keep.
-fn same_keep_class(a: Keep, b: Keep) -> bool {
-    matches!((a, b), (Keep::Until(_), Keep::Until(_))) || a == b
-}
-
-/// This device's signed head of a one-key collection it writes (spec §5.3).
-struct SignedHead {
-    seq: u64,
-    digest: [u8; 32],
-    wire: Bytes,
-}
-
-/// What this device verified of the heads of one key of another device's
-/// one-key collection (spec §5.3).
-struct SeenHead {
-    /// The highest seq of the key verified: a lower one is a rollback.
-    seq: u64,
-    /// Whether `seq` was verified in this run, not restored from the store.
-    this_run: bool,
-    /// The last head of this run whose node checked out: its receipt, and
-    /// the seqs that node lists.
-    checked: Option<(Receipt, Vec<u64>)>,
-    /// The last head of this run whose newest listed version was
-    /// delivered: that version's seq and the head's receipt, from which
-    /// that version was last known the newest.
-    delivered: Option<(u64, Receipt)>,
-}
-
-/// A writer's newest node of a collection verified here (spec §5.2, §7):
-/// its head, the seqs it lists, and the keep bounds it states.
-struct Listing {
-    head: u64,
-    entries: Vec<(u64, u64)>,
-    expiry: Vec<ExpiryRun>,
-}
-
-impl Listing {
-    /// Whether the writer's version `seq`, when not held here, never
-    /// applies here by `now`, this device's clock: it is at or below the
-    /// node's head and the node does not list it, or lists it in a run
-    /// whose keep bound passed.
-    fn gone(&self, seq: u64, now: Timestamp) -> bool {
-        seq <= self.head
-            && (!in_ranges(&self.entries, seq) || self.bound(seq).is_some_and(|t| t <= now))
-    }
-
-    /// The keep bound the node states for `seq`, if a run of it lists it.
-    fn bound(&self, seq: u64) -> Option<Timestamp> {
-        let i = self
-            .expiry
-            .partition_point(|r| r.seqs.last().is_some_and(|(_, hi)| *hi < seq));
-        self.expiry
-            .get(i)
-            .filter(|r| in_ranges(&r.seqs, seq))
-            .map(|r| r.until)
-    }
-
-    /// The earliest keep bound it states after `now`: when more of what it
-    /// lists may stop being waited for.
-    fn next_bound(&self, now: Timestamp) -> Option<Timestamp> {
-        self.expiry
-            .iter()
-            .map(|r| r.until)
-            .filter(|t| *t > now)
-            .min()
-    }
-}
-
-/// When a head arrived, on this device's monotonic clock (a receipt does
-/// not survive a restart), and the freshness it states.
-#[derive(Clone, Copy)]
-struct Receipt {
-    at: Instant,
-    freshness: Duration,
-}
-
-impl Receipt {
-    /// The age of an answer this head confirmed the newest (spec §5.3):
-    /// the time since it arrived plus the freshness it states.
-    fn age(&self) -> Age {
-        Age::Newest {
-            unconfirmed_for: Instant::now().saturating_duration_since(self.at) + self.freshness,
-        }
-    }
 }
 
 /// A verified version whose payload is sealed and not opened.
@@ -931,7 +715,6 @@ impl Coll {
             members: self.members.as_ref(),
             entries: &self.entries,
             skipped: &self.skipped,
-            listings: &self.listings,
             locked: &self.locked,
             revoked: &self.revoked,
             admitted: &self.versions,
@@ -972,7 +755,7 @@ impl Coll {
     /// tip with the implicit digest of its packet held here. In a merge
     /// collection every tip is held (applied, or covered by a checkpoint
     /// that applied only once each of its parents was held as the packet it
-    /// names); under the log rule a tip whose version expired goes without.
+    /// names).
     fn parents(&self) -> Parents {
         self.applied
             .iter()
@@ -990,45 +773,6 @@ impl Coll {
                 (id, digest)
             })
             .collect()
-    }
-
-    /// Mark every entry known here that its writer's newest node verified
-    /// here shows never applies by `now` ([`Listing::gone`]), and that is
-    /// not held, as one later versions need not wait for (spec §5.2).
-    /// Log-like collections only. Whether it marked any.
-    fn mark_gone(&mut self, now: Timestamp) -> bool {
-        if self.members.as_ref().is_none_or(|m| !log_like(&m.rule)) {
-            return false;
-        }
-        let mut gone: Vec<(Writer, Vec<u64>)> = Vec::new();
-        for (w, l) in &self.listings {
-            let Some(known) = self.entries.get(w) else {
-                continue;
-            };
-            let skipped = self.skipped.get(w);
-            let seqs: Vec<u64> = known
-                .range(..=l.head)
-                .copied()
-                .filter(|s| skipped.is_none_or(|k| !k.contains(s)) && l.gone(*s, now))
-                .filter(|s| {
-                    !holds_entry(
-                        self,
-                        &VersionId {
-                            writer: w.clone(),
-                            seq: Seq(*s),
-                        },
-                    )
-                })
-                .collect();
-            if !seqs.is_empty() {
-                gone.push((w.clone(), seqs));
-            }
-        }
-        let marked = !gone.is_empty();
-        for (w, seqs) in gone {
-            self.skipped.entry(w).or_default().extend(seqs);
-        }
-        marked
     }
 }
 
@@ -1097,37 +841,6 @@ const SEAL_LEARNING_MAX: usize = 64;
 /// Of them, the runs one asker device may have: it has one seal key, and a
 /// second covers the key it had before a restart that an ask still names.
 const SEAL_LEARNING_PER_ASKER: usize = 2;
-/// How long a range read probes its blocks at most, in looks, from when
-/// the head's node lists them ([`range_bound`]), and again for the blocks
-/// in range once its search is done: what withheld or unreachable blocks
-/// can cost a reader before the blocks it did not reach are answered
-/// `missing` (spec §5.4).
-const RANGE_LOOKS: u32 = 8;
-/// The round trips one look of a range read lasts at least, in the
-/// device's retransmission timeout ([`Rtt::rto`]): a search probes one
-/// block a round, so on a path whose round trips near the lifetime a look
-/// of a fixed first-look time would cover two or three rounds.
-const RANGE_RTOS: u32 = 4;
-/// The probes of its guess a range read's search makes before it looks
-/// anywhere else (spec §5.4, §17.1), each [`FETCH_TRIES`] asks: a probe
-/// lost on the way is probed again in place, so loss costs the search
-/// time, never other blocks.
-const SEARCH_TRIES: u32 = 2;
-/// The blocks a search probes at once beside a guess no probe reached
-/// (spec §5.4): twice as many each step none answers, at most the fetch
-/// window in all for one guess.
-const SEARCH_WIDEN: usize = 2;
-
-/// The bound of a range read's probing (spec §5.4, §17.1): [`RANGE_LOOKS`]
-/// looks, each the first-look time or [`RANGE_RTOS`] retransmission
-/// timeouts `rto`, whichever is longer. As `rto` never exceeds the
-/// Interest lifetime, it is at most `RANGE_LOOKS` · max(first look,
-/// `RANGE_RTOS` · lifetime), however slow or hostile the path.
-fn range_bound(first_look: Duration, rto: Duration) -> Duration {
-    first_look
-        .max(rto.saturating_mul(RANGE_RTOS))
-        .saturating_mul(RANGE_LOOKS)
-}
 /// The most entries one look at the held revocation cuts asks for (spec
 /// §8): a bound on what a cut's runs make a device fetch at once; the next
 /// adoption or new follow asks for the rest.
@@ -1359,12 +1072,6 @@ impl Rtt {
             .saturating_mul(1 << self.backoff)
             .clamp(RTO_MIN, lifetime.max(RTO_MIN))
     }
-
-    /// [`Self::rto`] once a round trip was measured; `None` on a path this
-    /// device has not measured (where `rto` is only the lifetime).
-    fn measured(&self, lifetime: Duration) -> Option<Duration> {
-        self.srtt.map(|_| self.rto(lifetime))
-    }
 }
 
 /// How long the committer waits before it asks the store again for a flush
@@ -1425,9 +1132,6 @@ enum Held {
         signed: [u8; 32],
     },
     Snapshot(Snapshot),
-    /// A version whose keep passed by this device's clock: dropped here,
-    /// never served or stored again (spec §14.1).
-    Expired(Tomb),
 }
 
 /// A log entry refused by the trust context governing its name, kept
@@ -1495,20 +1199,19 @@ struct Peer {
     /// The head of the root last processed in full, in this run or an
     /// earlier one (kept in the store, [`walked_name`]).
     walked: u64,
-    /// What this device followed or peeked at in the namespace when it
+    /// What this device followed in the namespace when it
     /// walked that root: the walk took the folder records above these
     /// only, and the versions under them.
     toward: BTreeSet<Name>,
     /// What this device followed in the namespace when it walked that root
-    /// in full, in this run: the walks took the versions under these (a
-    /// name only peeked at had its records taken, not its versions). Empty
+    /// in full, in this run: the walks took the versions under these. Empty
     /// after a restart, so a name followed then is walked toward anew.
     followed: BTreeSet<Name>,
     /// Nodes and pages processed in full, by subject and page path.
     nodes: HashMap<(Name, Option<Bytes>), [u8; 32]>,
     /// How many times what was processed was forgotten ([`Peer::forget`]):
     /// a walk under way since before records nothing as processed, for it
-    /// went toward less than is followed or peeked at now.
+    /// went toward less than is followed now.
     resets: u64,
     /// Its roots lie in a person's namespace no trust context held here
     /// judges ([`Inner::unjudged`]): refused whoever serves them, so not
@@ -1540,8 +1243,8 @@ enum Unjudged {
 }
 
 impl Peer {
-    /// Forget that walks took `subject` in full — what is followed or
-    /// peeked at under it changed, or a version of it was let go: the root,
+    /// Forget that walks took `subject` in full — what is followed
+    /// under it changed, or a version of it was let go: the root,
     /// and the nodes and pages on the way to it and under it, are walked
     /// again, and no walk under way since before records any as processed.
     fn forget(&mut self, subject: &Name) {
@@ -1806,23 +1509,6 @@ struct St {
     asks: HashMap<Name, usize>,
     /// Answers to introduction asks signed, by the ask's name.
     answers: Kept<Bytes>,
-    /// This device's wall clock (retention only).
-    clock: Clock,
-    /// Collections whose records this device takes without following
-    /// their versions: one-key collections read by head and range (spec
-    /// §5.3, §5.4), and any collection asked before its rule is known.
-    peeks: BTreeSet<Name>,
-    /// Own blocks being filled, by collection (spec §4.1).
-    open: HashMap<Name, OpenBlock>,
-    /// Own signed heads, by one-key collection.
-    heads: HashMap<Name, SignedHead>,
-    /// Heads verified of others' one-key collections, by collection and
-    /// one key: a lower one of the same key is a rollback (kept in the
-    /// store across restarts). Each key's device numbers its own log, so a
-    /// key that takes over a collection has a floor of its own.
-    seen: HashMap<(Name, Writer), SeenHead>,
-    /// The earliest `Keep::Until` date the sweeper is armed for.
-    sweep_at: Option<Timestamp>,
     /// When each held log entry was first verified here, and by which
     /// public key ([`Verified`]).
     verified: HashMap<Name, Verified>,
@@ -1866,9 +1552,6 @@ struct Inner {
     svs: MultiSvs,
     st: Mutex<St>,
     progress: Notify,
-    /// Wakes the expiry sweeper: a version kept until earlier than it is
-    /// armed for arrived.
-    sweep: Arc<Notify>,
     /// Wakes the committer ([`Inner::commit_rounds`]): something was written that
     /// waits for the barrier, or an announcement is wanted.
     commit_wake: Arc<Notify>,
@@ -1940,22 +1623,7 @@ fn held_signer<'a>(st: &'a St, name: &Name, held: &'a Held) -> Option<&'a Writer
             .and_then(|l| st.colls.get(&l.subject?))
             .and_then(|coll| coll.locked.iter().find(|l| l.name == *name))
             .map(|l| &l.writer),
-        Held::Expired(_) => None,
     }
-}
-
-/// Why a one-key collection's head was not taken (spec §5.3).
-#[derive(Debug)]
-enum HeadRefusal {
-    /// Its name, collection or seq do not match each other.
-    NotItsName,
-    /// Its signature does not verify to a trust anchor.
-    NotVerified,
-    /// It is not signed by the collection's one key.
-    NotTheKey,
-    /// Its seq is lower than one this device verified or holds (a replayed
-    /// old head).
-    Rollback { seq: u64, seen: u64 },
 }
 
 /// Why a summary root was not taken.
@@ -2026,7 +1694,7 @@ fn skipped_by(
 }
 
 /// What a collection's versions wait for (spec §5.2): the entries known
-/// here, which of them never apply, and its writers' newest nodes.
+/// here, and which of them never apply.
 #[derive(Clone, Copy)]
 struct Waits<'a> {
     /// The collection: cuts accept versions per collection.
@@ -2034,7 +1702,6 @@ struct Waits<'a> {
     members: Option<&'a Members>,
     entries: &'a HashMap<Writer, BTreeSet<u64>>,
     skipped: &'a HashMap<Writer, BTreeSet<u64>>,
-    listings: &'a HashMap<Writer, Listing>,
     locked: &'a [Locked],
     /// The revocation cuts of keys writing here ([`Coll::revoked`]).
     revoked: &'a HashMap<Writer, Cut>,
@@ -2045,26 +1712,9 @@ struct Waits<'a> {
 impl Waits<'_> {
     /// Whether later versions of `id`'s writer, and versions naming `id` as
     /// a parent, need not wait for it: [`skipped_by`]; or its key is revoked
-    /// and its cut does not accept it ([`Self::outside_cut`]); or, in a
-    /// log-like collection, it is no entry known here though at or below the
-    /// head of its writer's newest node verified here (which lists none
-    /// such: every seq it lists is known), and it is not held.
+    /// and its cut does not accept it ([`Self::outside_cut`]).
     fn never(&self, id: &VersionId) -> bool {
-        skipped_by(self.members, self.skipped, id)
-            || self.outside_cut(id)
-            || (self.members.is_some_and(|m| log_like(&m.rule))
-                && self
-                    .listings
-                    .get(&id.writer)
-                    .is_some_and(|l| id.seq.0 <= l.head)
-                && self
-                    .entries
-                    .get(&id.writer)
-                    .is_none_or(|e| !e.contains(&id.seq.0))
-                && !self
-                    .locked
-                    .iter()
-                    .any(|l| l.writer == id.writer && l.seq == id.seq.0))
+        skipped_by(self.members, self.skipped, id) || self.outside_cut(id)
     }
 
     /// Whether `id`'s key is revoked, its cut does not accept `id`, and no
@@ -2090,8 +1740,7 @@ impl Waits<'_> {
 
 /// The seq of `y` that a version naming `(y, t)` among its parents needs
 /// applied: `t`; or, when `(y, t)` never applies (a cut does not list it,
-/// it was refused for what it carries, it expired, or its writer's newest
-/// node shows it never applies here), the highest version of `y` at or
+/// or it was refused for what it carries), the highest version of `y` at or
 /// below `t` that does: for a cut, the highest it accepts (or, of a revoked
 /// key, an exact re-admission admitted here).
 fn needed(w: &Waits, y: &Writer, t: u64) -> u64 {
@@ -2509,10 +2158,6 @@ struct Signed {
     seq: u64,
     held: HeldVersion,
     pieces: Vec<pieces::Piece>,
-    /// Whether its collection is log-like.
-    log: bool,
-    keep: Keep,
-    dated: Timestamp,
     function: Option<Name>,
 }
 
@@ -2570,7 +2215,7 @@ enum Opening {
 }
 
 /// Open `hv`, a version whose payload travels in pieces, from the pieces
-/// `store` holds (spec §4.1): assembled, each piece checked against its
+/// `store` holds (spec §13.1): assembled, each piece checked against its
 /// manifest, and unsealed under its epoch's key from `keys` (looked for
 /// first: it costs no read of the pieces).
 fn open_held(store: &dyn DataStore, keys: &Keys, hv: &HeldVersion) -> Opening {
@@ -2593,8 +2238,8 @@ fn open_held(store: &dyn DataStore, keys: &Keys, hv: &HeldVersion) -> Opening {
     };
     let op = match key {
         Some(key) => match seal::open_payload(&key, name, &payload) {
-            Some(Inline::Fields(_, op)) => op,
-            _ => return Opening::Bad,
+            Some((_, op)) => op,
+            None => return Opening::Bad,
         },
         None => match wire::decode_payload(Bytes::from(payload)) {
             Ok((_, op)) => op,
@@ -2666,7 +2311,6 @@ struct Late {
 struct Run<'a> {
     members: &'a Members,
     entries: &'a HashMap<Writer, BTreeSet<u64>>,
-    listings: &'a HashMap<Writer, Listing>,
     locked: &'a [Locked],
     revoked: &'a HashMap<Writer, Cut>,
     by_digest: &'a HashMap<[u8; 32], VersionId>,
@@ -2702,7 +2346,6 @@ impl Run<'_> {
             members: Some(self.members),
             entries: self.entries,
             skipped: self.skipped,
-            listings: self.listings,
             locked: self.locked,
             revoked: self.revoked,
             admitted: self.versions,
@@ -3000,7 +2643,6 @@ impl Run<'_> {
                 members: Some(self.members),
                 entries: self.entries,
                 skipped: self.skipped,
-                listings: self.listings,
                 locked: self.locked,
                 revoked: self.revoked,
                 admitted: self.versions,
@@ -3257,7 +2899,6 @@ impl Run<'_> {
                 members: Some(self.members),
                 entries: self.entries,
                 skipped: self.skipped,
-                listings: self.listings,
                 locked: self.locked,
                 revoked: self.revoked,
                 admitted: self.versions,
@@ -3370,16 +3011,15 @@ impl St {
         })
     }
 
-    /// Whether something followed or peeked at lies under `subject`. Under
+    /// Whether something followed lies under `subject`. Under
     /// a root (a namespace) only its own data names count:
     /// `/home/bob/32=data/x` is under `/home/bob`'s root, not `/home`'s.
     fn toward(&self, subject: &Name) -> bool {
         let under = |s: &Name| {
-            [&self.follows, &self.peeks].into_iter().any(|set| {
-                set.range(s.clone()..)
-                    .next()
-                    .is_some_and(|t| t.has_prefix(s))
-            })
+            self.follows
+                .range(s.clone()..)
+                .next()
+                .is_some_and(|t| t.has_prefix(s))
         };
         if wire::is_namespace(subject) {
             under(&wire::data_folder(subject))
@@ -3389,24 +3029,22 @@ impl St {
     }
 
     /// What a walk of a summary of namespace `ns` goes toward: what is
-    /// followed or peeked at in `ns` now.
+    /// followed in `ns` now.
     fn toward_in(&self, ns: &Name) -> BTreeSet<Name> {
         self.follows
             .iter()
-            .chain(&self.peeks)
             .filter(|t| namespace_of(t).as_ref() == Some(ns))
             .cloned()
             .collect()
     }
 
     /// Whether a walk of `device`'s summary of `ns` is owed (spec §17.1):
-    /// something is followed or peeked at in `ns`, and a root of `device`
+    /// something is followed in `ns`, and a root of `device`
     /// verified here is above the head walked in full ([`Peer::walked`],
     /// both kept across restarts), or a name followed in `ns` lies under
     /// none a walk of that device's root in full went toward with it
-    /// followed ([`Peer::followed`]: a name peeked at had its records
-    /// taken, not its versions). Every version such a root lists that the
-    /// device follows and holds not — not expired, cut or
+    /// followed ([`Peer::followed`]). Every version such a root lists that the
+    /// device follows and holds not — not cut or
     /// refused — is in a branch no walk took in full, so the walk stays
     /// owed until one takes it or it is no longer wanted, whatever ended
     /// the walk before. So is a walk of a device whose roots no trust
@@ -3422,9 +3060,9 @@ impl St {
             && (peer.unjudged == Some(Unjudged::Adopted)
                 || peer.head > peer.walked
                 || (peer.head > 0
-                    && toward.iter().any(|t| {
-                        self.follows.contains(t) && !peer.followed.iter().any(|w| t.has_prefix(w))
-                    })))
+                    && toward
+                        .iter()
+                        .any(|t| !peer.followed.iter().any(|w| t.has_prefix(w)))))
     }
 
     /// Whether `device`'s roots of `ns` lie in a person's namespace no
@@ -3441,16 +3079,15 @@ impl St {
         if self.inside(subject) {
             return true;
         }
-        [&self.follows, &self.peeks].into_iter().any(|set| {
-            set.range(subject.clone()..)
-                .take_while(|t| t.has_prefix(subject))
-                .filter_map(|t| t.components().get(subject.len()))
-                .any(|c| {
-                    path.iter()
-                        .enumerate()
-                        .all(|(depth, b)| wire::bucket_of(c, depth) == *b)
-                })
-        })
+        self.follows
+            .range(subject.clone()..)
+            .take_while(|t| t.has_prefix(subject))
+            .filter_map(|t| t.components().get(subject.len()))
+            .any(|c| {
+                path.iter()
+                    .enumerate()
+                    .all(|(depth, b)| wire::bucket_of(c, depth) == *b)
+            })
     }
 
     fn emit(&mut self, about: &Name, change: &Change, writer: &Writer, seq: u64) {
@@ -4021,13 +3658,7 @@ impl St {
             }
         }
         let under = |n: &Name| n.has_prefix(f) && n != f;
-        let colls: BTreeSet<Name> = self
-            .colls
-            .keys()
-            .chain(self.peeks.iter())
-            .filter(|n| under(n))
-            .cloned()
-            .collect();
+        let colls: BTreeSet<Name> = self.colls.keys().filter(|n| under(n)).cloned().collect();
         for c in colls {
             self.refold(&c, rules, me);
         }
@@ -4110,10 +3741,6 @@ impl St {
         for hv in all {
             self.refused.remove(&hv.version.name);
             self.admit_one(hv);
-        }
-        let now = (self.clock)();
-        if let Some(coll) = self.colls.get_mut(c) {
-            coll.mark_gone(now);
         }
         self.apply_ready(c, &delivered);
         let withdrawn: Vec<(VersionId, Refusal)> = names
@@ -4274,21 +3901,6 @@ impl St {
         }
         // Other bytes refused at its name before: these are the ones kept.
         self.other_bytes.remove(&hv.version.name);
-        // A merge rule takes one operation per version: a block carries
-        // many (spec §4.1).
-        if matches!(members.rule, Rule::Merge { .. })
-            && matches!(hv.version.payload, Payload::Block(_))
-        {
-            tracing::debug!(id = ?hv.version.id, "refused: its payload is a block, in a merge collection");
-            coll.skipped
-                .entry(hv.version.id.writer.clone())
-                .or_default()
-                .insert(hv.version.id.seq.0);
-            self.refused
-                .insert(hv.version.name.clone(), Refusal::NotInline);
-            coll.outsiders.push(hv);
-            return false;
-        }
         coll.by_digest.insert(hv.digest, hv.version.id.clone());
         coll.entries
             .entry(hv.version.id.writer.clone())
@@ -4479,7 +4091,6 @@ impl St {
             applied,
             entries,
             skipped,
-            listings,
             locked,
             pending,
             revoked,
@@ -4516,7 +4127,6 @@ impl St {
             let ran = Run {
                 members,
                 entries,
-                listings,
                 locked,
                 revoked,
                 by_digest,
@@ -4839,7 +4449,7 @@ impl St {
     /// that it does not store too, which it noted when it took it.
     fn held_signed(&self, name: &Name) -> Option<[u8; 32]> {
         match self.held.get(name)? {
-            Held::Version(_) | Held::Locked | Held::Expired(_) => {
+            Held::Version(_) | Held::Locked => {
                 held_wire(self, name).and_then(|w| wire::signed_digest(&w))
             }
             Held::Snapshot(_) => self.store.get(name).and_then(|w| wire::signed_digest(&w)),
@@ -4974,189 +4584,6 @@ impl St {
         }
     }
 
-    /// Drop every version of `c` that expired here by this device's clock
-    /// (spec §14.1): a log-like collection's versions only. Each goes out
-    /// of what the collection holds, its record and pieces out of the
-    /// store; a durable tombstone stays, its name answers `Expired` from now
-    /// on, later versions no longer wait for it, and watchers it was
-    /// delivered to are told. Returns the earliest `Keep::Until` date still
-    /// held in `c`.
-    fn expire(&mut self, c: &Name) -> Option<Timestamp> {
-        let now = (self.clock)();
-        let coll = self.colls.get(c)?;
-        if coll.members.as_ref().is_none_or(|m| !log_like(&m.rule)) {
-            return None;
-        }
-        let mut cutoffs: HashMap<(Writer, u32), u64> = HashMap::new();
-        let mut lastn = |id: &VersionId, n: u32| -> u64 {
-            *cutoffs
-                .entry((id.writer.clone(), n))
-                .or_insert_with(|| lastn_cutoff(coll, &id.writer, n))
-        };
-        // Which expire, decided before any is taken out.
-        let ids: BTreeSet<VersionId> = coll
-            .versions
-            .values()
-            .chain(&coll.waiting)
-            .chain(&coll.outsiders)
-            .map(|hv| (hv.version.id.clone(), hv.version.keep))
-            .chain(coll.locked.iter().map(|l| {
-                (
-                    VersionId {
-                        writer: l.writer.clone(),
-                        seq: Seq(l.seq),
-                    },
-                    l.body.keep,
-                )
-            }))
-            .filter(|(id, keep)| expires(*keep, id, now, |n| lastn(id, n)))
-            .map(|(id, _)| id)
-            .collect();
-        if !ids.is_empty() {
-            self.drop_expired(c, |id, _| ids.contains(id));
-        }
-        let coll = self.colls.get_mut(c)?;
-        let marked = coll.mark_gone(now);
-        let held = coll
-            .versions
-            .values()
-            .map(|hv| hv.version.keep)
-            .chain(coll.locked.iter().map(|l| l.body.keep))
-            .filter_map(|k| match k {
-                Keep::Until(t) => Some(t),
-                _ => None,
-            })
-            .min();
-        let bound = coll
-            .listings
-            .values()
-            .filter_map(|l| l.next_bound(now))
-            .min();
-        if marked {
-            self.apply_ready(c, &BTreeSet::new());
-        }
-        held.into_iter().chain(bound).min()
-    }
-
-    /// Drop version `name` (a log entry, or a piece of one) now if it
-    /// expired by this device's clock: checked on every access (spec
-    /// §14.1). Whether it is (now or before) dropped as expired.
-    fn expire_named(&mut self, name: &Name) -> bool {
-        let version = strip_piece(name);
-        let (c, id) = match self.held.get(&version) {
-            Some(Held::Expired(_)) => return true,
-            Some(Held::Version(id)) => match parse_log_name(&version).and_then(|l| l.subject) {
-                Some(c) => (c, id.clone()),
-                None => return false,
-            },
-            Some(Held::Locked) => {
-                let Some(c) = parse_log_name(&version).and_then(|l| l.subject) else {
-                    return false;
-                };
-                let Some(id) = self.colls.get(&c).and_then(|x| version_id(x, &version)) else {
-                    return false;
-                };
-                (c, id)
-            }
-            _ => return false,
-        };
-        let now = (self.clock)();
-        let Some(coll) = self.colls.get(&c) else {
-            return false;
-        };
-        if coll.members.as_ref().is_none_or(|m| !log_like(&m.rule)) {
-            return false;
-        }
-        let keep = coll
-            .versions
-            .get(&id)
-            .map(|hv| hv.version.keep)
-            .or_else(|| {
-                coll.locked
-                    .iter()
-                    .find(|l| l.name == version)
-                    .map(|l| l.body.keep)
-            });
-        let Some(keep) = keep else { return false };
-        if !expires(keep, &id, now, |n| lastn_cutoff(coll, &id.writer, n)) {
-            return false;
-        }
-        self.drop_expired(&c, |x, _| *x == id);
-        true
-    }
-
-    /// Take the versions of `c` that `gone` picks out as expired: tombstone,
-    /// drop, tell (see [`Self::expire`]).
-    fn drop_expired(&mut self, c: &Name, gone: impl Fn(&VersionId, Keep) -> bool) {
-        let St {
-            colls,
-            held,
-            refused,
-            store,
-            watchers,
-            ..
-        } = self;
-        let Some(coll) = colls.get_mut(c) else {
-            return;
-        };
-        let at = coll.at();
-        let dropped = take_out(coll, gone);
-        watchers.retain(|w| !w.tx.is_closed());
-        for (id, name, tomb, _) in dropped {
-            coll.skipped
-                .entry(id.writer.clone())
-                .or_default()
-                .insert(id.seq.0);
-            refused.remove(&name);
-            for (n, _) in store.scan_under(&name, 0) {
-                store.remove(&n);
-            }
-            store.insert(expired_name(&name), wire::encode_tomb(&tomb));
-            if at.contains(&id) {
-                for w in watchers.iter_mut() {
-                    if c.has_prefix(&w.target) {
-                        w.send(Change::Expired {
-                            collection: c.clone(),
-                            id: id.clone(),
-                            keep: tomb.keep,
-                        });
-                    }
-                }
-            }
-            tracing::debug!(%name, keep = ?tomb.keep, "dropped: it expired by this device's clock");
-            held.insert(name, Held::Expired(tomb));
-        }
-    }
-
-    /// Take `body`, a node of `c` by `writer` verified here, as the
-    /// writer's newest unless one with a higher head was (spec §5.2, §7);
-    /// of the same head, the one verified last stands (a writer whose store
-    /// came back with entries it had lost lists them again at its head):
-    /// from now on, an entry of the writer at or below its head that it does
-    /// not list, or lists in a run whose keep bound passed by this device's
-    /// clock, is not waited for unless held — a seq never learned included.
-    /// The caller expires `c` next, which marks them. Returns the earliest
-    /// keep bound of the writer's newest node still ahead, for the sweeper.
-    fn listing(&mut self, c: &Name, writer: &Writer, body: &NodeBody) -> Option<Timestamp> {
-        let now = (self.clock)();
-        let coll = self.colls.get_mut(c)?;
-        if coll
-            .listings
-            .get(writer)
-            .is_none_or(|l| l.head <= body.head)
-        {
-            coll.listings.insert(
-                writer.clone(),
-                Listing {
-                    head: body.head,
-                    entries: body.entries.clone(),
-                    expiry: body.expiry.clone(),
-                },
-            );
-        }
-        coll.listings.get(writer)?.next_bound(now)
-    }
-
     /// Why `c`'s state cannot be read here: its members record names a
     /// merge rule this program does not know (rules are matched by name).
     fn rule_unknown(&self, c: &Name, rules: &MergeRules) -> Option<DataError> {
@@ -5209,7 +4636,6 @@ impl St {
         let ran = Run {
             members,
             entries: &coll.entries,
-            listings: &coll.listings,
             locked: &coll.locked,
             revoked: &coll.revoked,
             by_digest: &coll.by_digest,
@@ -5292,7 +4718,7 @@ impl St {
     }
 
     /// The versions of merge collection `c` in pieces this device is to
-    /// fetch (spec §4.1): pending — admitted and neither applied nor
+    /// fetch (spec §13.1): pending — admitted and neither applied nor
     /// covered by a checkpoint — not opened, and neither being fetched nor
     /// found whole already. A version in the past of another such version
     /// whose pieces are yet to be found waits for that one's: it may be a
@@ -5488,7 +4914,6 @@ impl Device {
         let asks_verifying = config.asks_verifying.max(1);
         let recipient = recipient_key(&keys, &device)?;
         let seal_keys = Keys::new(recipient);
-        let clock = Arc::clone(&config.clock);
         let rules = config.rules.clone();
         let contexts = contexts_by_namespace(validator.keyring());
         let own_key = identity
@@ -5567,12 +4992,6 @@ impl Device {
                 me: Writer::new(identity.key.clone()),
                 asks: HashMap::new(),
                 answers: Kept::new(ANSWERS_KEPT),
-                clock,
-                peeks: BTreeSet::new(),
-                open: HashMap::new(),
-                heads: HashMap::new(),
-                seen: HashMap::new(),
-                sweep_at: None,
                 verified: HashMap::new(),
                 suspected: BTreeMap::new(),
                 contexts,
@@ -5583,7 +5002,6 @@ impl Device {
                 scopes: scoped::Scopes::default(),
             }),
             progress: Notify::new(),
-            sweep: Arc::new(Notify::new()),
             signal_clock: Mutex::new(signal_clock),
             commit_wake: Arc::new(Notify::new()),
             committed: Notify::new(),
@@ -5706,7 +5124,6 @@ impl Device {
         }
         // Merge versions in pieces held from before wait for them.
         inner.fetch_wanted(true);
-        inner.spawn_sweeper();
         Ok(Device { inner })
     }
 
@@ -6077,7 +5494,7 @@ fn relayed_name(node: &Name) -> Name {
 
 /// A walked marker's value: the head walked (8 octets, big-endian), then
 /// the `Name` TLV of each name it was walked toward — what this device
-/// followed or peeked at in the namespace then, whose folder records above
+/// followed in the namespace then, whose folder records above
 /// the walk took (spec §7).
 fn encode_walked(head: u64, toward: &BTreeSet<Name>) -> Bytes {
     let mut out = head.to_be_bytes().to_vec();
@@ -6151,23 +5568,6 @@ fn parse_made_key_name(device: &Name, name: &Name) -> Option<(Name, Epoch)> {
     wire::decode_epoch_of(name.components()[prefix.len()].value.clone())
 }
 
-/// Where the store keeps a tombstone for each version this device dropped
-/// as expired by its clock (`/localhost/ndn-data/expired/<log entry
-/// name>`, its value a [`Tomb`]): it answers `Expired` and never stores the
-/// version again, also after a restart (spec §14.1); an own version's
-/// summary keeps listing it by its keep.
-fn expired_prefix() -> Name {
-    "/localhost/ndn-data/expired".parse().expect("a valid name")
-}
-
-fn expired_name(entry: &Name) -> Name {
-    under(&expired_prefix(), entry)
-}
-
-fn unexpired(name: &Name) -> Option<Name> {
-    over(&expired_prefix(), name)
-}
-
 /// Where the store keeps the second packet a writer signed under a log
 /// entry name it already signed another packet under
 /// (`/localhost/ndn-data/equivocal/<log entry name>`, its value that
@@ -6232,33 +5632,6 @@ fn written_prefix() -> Name {
 
 fn written_name(entry: &Name) -> Name {
     under(&written_prefix(), entry)
-}
-
-/// Where the store keeps, for each one-key collection this device writes,
-/// the seq and batch delay of its newest version
-/// (`/localhost/ndn-data/batched/<collection>`, 16 octets: the seq and the
-/// delay in milliseconds, big-endian), written with the version: the
-/// freshness its head states at that seq is the same after a restart
-/// (spec §5.3, §4.2).
-fn batched_prefix() -> Name {
-    "/localhost/ndn-data/batched".parse().expect("a valid name")
-}
-
-fn batched_name(c: &Name) -> Name {
-    under(&batched_prefix(), c)
-}
-
-fn encode_batched(seq: u64, batch: Duration) -> Bytes {
-    let mut out = Vec::with_capacity(16);
-    out.extend_from_slice(&seq.to_be_bytes());
-    out.extend_from_slice(&(batch.as_millis() as u64).to_be_bytes());
-    Bytes::from(out)
-}
-
-fn decode_batched(value: &[u8]) -> Option<(u64, Duration)> {
-    let seq = u64::from_be_bytes(value.get(..8)?.try_into().ok()?);
-    let ms = u64::from_be_bytes(value.get(8..16)?.try_into().ok()?);
-    Some((seq, Duration::from_millis(ms)))
 }
 
 /// Where the store keeps the keys marked suspected here
@@ -6411,13 +5784,10 @@ impl Inner {
         let mut roots = Vec::new();
         let mut walked = Vec::new();
         let mut keys = Vec::new();
-        let mut expired = Vec::new();
-        let mut heads = Vec::new();
         let mut seen: HashMap<Name, (Timestamp, Option<[u8; 32]>)> = HashMap::new();
         let mut written: HashMap<Name, Bytes> = HashMap::new();
         let mut suspected = BTreeMap::new();
         let mut untrusted: HashMap<Name, String> = HashMap::new();
-        let mut batched = Vec::new();
         let mut writers: HashMap<Name, Writer> = HashMap::new();
         let mut twins = Vec::new();
         let mut scoped_newest = Vec::new();
@@ -6436,12 +5806,6 @@ impl Inner {
             }
             if let Some(entry) = over(&equivocal_prefix(), &name) {
                 twins.push((entry, wire));
-                continue;
-            }
-            if let Some(c) = over(&batched_prefix(), &name) {
-                if let Some((seq, batch)) = decode_batched(&wire) {
-                    batched.push((c, seq, batch));
-                }
                 continue;
             }
             if let Some(entry) = over(&written_prefix(), &name) {
@@ -6473,29 +5837,6 @@ impl Inner {
             }
             if let Some((c, e)) = parse_made_key_name(&self.device, &name) {
                 keys.push((name, c, e, wire));
-                continue;
-            }
-            if let Some(entry) = unexpired(&name) {
-                if let Some(l) = parse_log_name(&entry)
-                    && let Some(c) = l.subject.clone()
-                    && let Some(tomb) = wire::decode_tomb(wire)
-                {
-                    expired.push((entry, c, l, tomb));
-                }
-                continue;
-            }
-            if let Some((d, c)) = parse_head_prefix(&name) {
-                // Its signer, the one key it was verified as.
-                let head = Data::decode(wire.clone()).ok().and_then(|data| {
-                    let (hd, hc, s) = parse_head_name(&data.name)?;
-                    let key = data.sig_info()?.key_locator_name()?;
-                    let body = wire::decode_head(data.content()?.clone()).ok()?;
-                    (hd == d && hc == c && body.seq == s && body.collection == c)
-                        .then(|| (Writer::new((*key).clone()), body))
-                });
-                if let Some((key, body)) = head {
-                    heads.push((d, c, key, body, wire));
-                }
                 continue;
             }
             if let Some(w) = parse_walked(&name, &wire) {
@@ -6554,7 +5895,6 @@ impl Inner {
                 *mine = false;
             }
         }
-        let wrote = |entry: &Name| legacy || written.contains_key(entry);
         // Members records first, by revision; then the other records, so
         // that what they say is known as the versions come back; then
         // versions and snapshots.
@@ -6621,35 +5961,6 @@ impl Inner {
         }
         st.suspected = suspected;
         st.scopes.restore_newest(scoped_newest);
-        // What expired here comes back first, so none of it is taken again.
-        for (entry, c, l, tomb) in expired {
-            let writer = Writer::new(tomb.writer.clone());
-            if l.device == self.device && wrote(&entry) {
-                st.head = st.head.max(l.seq);
-                let ns = namespace_of(&c).expect("a log entry's collection has a namespace");
-                st.trees
-                    .entry(ns.clone())
-                    .or_insert_with(|| Tree::new(ns))
-                    .add(
-                        &c,
-                        l.seq,
-                        Kind::Version(Retain {
-                            keep: tomb.keep,
-                            dated: tomb.first,
-                        }),
-                    );
-            }
-            let coll = st.colls.entry(c).or_default();
-            coll.entries
-                .entry(writer.clone())
-                .or_default()
-                .insert(l.seq);
-            coll.skipped.entry(writer).or_default().insert(l.seq);
-            for (n, _) in self.store.scan_under(&entry, 0) {
-                self.store.remove(&n);
-            }
-            st.held.insert(entry, Held::Expired(tomb));
-        }
         // An own entry moves the log head, refused or not: this device
         // signed that seq. (In a store kept before own entries were
         // recorded, a refused one does not: it may be a copy's.)
@@ -6675,44 +5986,6 @@ impl Inner {
         // The second packets held at a name: evidence beside the version
         // read back under it.
         st.twins.extend(twins);
-        // The newest head verified of each other device's one-key
-        // collection, by its key, so a rolled-back one is still refused;
-        // this device's own, so the same head is served again while its
-        // node is unchanged.
-        for (d, c, key, body, wire) in heads {
-            if d == self.device {
-                st.colls
-                    .entry(c.clone())
-                    .or_default()
-                    .batches
-                    .insert(body.seq, Duration::from_millis(body.freshness));
-                st.heads.insert(
-                    c,
-                    SignedHead {
-                        seq: body.seq,
-                        digest: body.digest,
-                        wire,
-                    },
-                );
-            } else {
-                st.seen.insert(
-                    (c, key),
-                    SeenHead {
-                        seq: body.seq,
-                        this_run: false,
-                        checked: None,
-                        delivered: None,
-                    },
-                );
-            }
-        }
-        // The batch delay of the newest own version of each one-key
-        // collection, stored with it: its head states it again.
-        for (c, seq, batch) in batched {
-            if seq <= st.head {
-                st.colls.entry(c).or_default().batches.insert(seq, batch);
-            }
-        }
         for (device, ns, head) in roots {
             if device != self.device {
                 let peer = st.peers.entry((device, ns)).or_default();
@@ -6730,11 +6003,6 @@ impl Inner {
             }
         }
         st.restoring = false;
-        // What expired while the device was off.
-        let colls: Vec<Name> = st.colls.keys().cloned().collect();
-        for c in colls {
-            st.expire(&c);
-        }
         // A group's reader dropped in the log re-read is history: the
         // records that moved its collections on are held too.
         // What the held records owe now is owed again, whatever
@@ -8448,9 +7716,9 @@ impl Inner {
         // (spec §5.2), and what it covers is never fetched.
         let descending = Descending::new(&self.st);
         let head = body.head;
-        // What the descent goes toward: what is followed or peeked at in
+        // What the descent goes toward: what is followed in
         // `ns` as it starts, and of that what is followed (its versions
-        // taken, not only its records); and how often what was processed
+        // taken); and how often what was processed
         // had been forgotten then ([`Peer::forget`]).
         let (toward, followed, since) = {
             let st = self.st.lock();
@@ -8473,7 +7741,7 @@ impl Inner {
         }
         let mut st = self.st.lock();
         let peer = st.peers.entry(key).or_default();
-        // Processed in full for what is followed or peeked at now, unless
+        // Processed in full for what is followed now, unless
         // that changed meanwhile.
         if peer.resets == since {
             peer.root = Some(digest);
@@ -8633,7 +7901,7 @@ impl Inner {
     /// is kept, so the next descent, from this root or a newer one, does not
     /// fetch it again — unless what was processed was forgotten since the
     /// walk began (`since`, [`Peer::forget`]): a node processed for less
-    /// than is followed or peeked at now is not recorded as processed.
+    /// than is followed now is not recorded as processed.
     fn descend<'a>(
         self: &'a Arc<Self>,
         device: &'a Name,
@@ -8663,9 +7931,7 @@ impl Inner {
                 {
                     return true;
                 }
-                // A collection peeked at: its records only (spec §5.3).
-                let peeked = !inside && st.peeks.contains(&subject);
-                if body.page.is_none() && (inside || peeked) {
+                if body.page.is_none() && inside {
                     let coll = st.colls.entry(subject.clone()).or_default();
                     coll.entries
                         .entry(writer.clone())
@@ -8677,24 +7943,14 @@ impl Inner {
                             records.push(name);
                         }
                     }
-                    if inside {
-                        versions.extend(seqs_of(&body.entries));
-                    }
-                    // What the writer's newest node no longer lists, or
-                    // lists with a keep bound passed, is not waited for, and
-                    // what a newer entry ended is dropped.
-                    let bound = st.listing(&subject, writer, &body);
-                    st.expire(&subject);
-                    if let Some(t) = bound {
-                        self.arm_sweep(&mut st, Keep::Until(t));
-                    }
+                    versions.extend(seqs_of(&body.entries));
                     // Learned entries may make held versions ready.
                     st.apply_ready(&subject, &BTreeSet::new());
                 } else if body.page.is_none()
                     && st.toward(&subject)
                     && wire::check_collection_name(&subject).is_ok()
                 {
-                    // A name above what is followed or peeked at: its
+                    // A name above what is followed: its
                     // members entries only, for a folder record there
                     // governs what lies under it (spec §6).
                     for seq in seqs_of(&body.members) {
@@ -8772,17 +8028,8 @@ impl Inner {
                 .await;
             let versions: Vec<Name> = {
                 let st = self.st.lock();
-                let now = (st.clock)();
-                let coll = st.colls.get(&subject);
                 versions
                     .into_iter()
-                    .filter(|seq| {
-                        // Not shown by the writer's newest node to have
-                        // expired: no longer there to be fetched.
-                        coll.is_none_or(|c| {
-                            c.listings.get(writer).is_none_or(|l| !l.gone(*seq, now))
-                        })
-                    })
                     .map(|seq| log_name(device, Some(&subject), seq))
                     .filter(|name| !st.held.contains_key(name) && !st.refused.contains_key(name))
                     .collect()
@@ -9369,27 +8616,11 @@ impl Inner {
         // An entry the trust context refuses is a thief's (spec §8.1).
         let second = !st.cut_out.contains_key(&name)
             && st.note_seq(&name, &writer, parsed.seq, &record, &wire);
-        // How a log-like collection lists a version by its keep (spec §7).
-        let retain = match (&record, &parsed.subject) {
-            (Record::Version(body), Some(c))
-                if st
-                    .colls
-                    .get(c)
-                    .and_then(|x| x.members.as_ref())
-                    .is_some_and(|m| log_like(&m.rule)) =>
-            {
-                Some(Retain {
-                    keep: body.keep,
-                    dated: body.dated,
-                })
-            }
-            _ => None,
-        };
         if let Some(c) = &parsed.subject {
             if mine {
                 let ns = namespace_of(c).expect("a log entry's collection has a namespace");
                 let kind = match record {
-                    Record::Version(_) => Kind::Version(retain.unwrap_or(Retain::ALWAYS)),
+                    Record::Version(_) => Kind::Version,
                     _ => Kind::Record,
                 };
                 st.trees
@@ -9399,48 +8630,6 @@ impl Inner {
             } else {
                 self.note_peer_head(st, &parsed.device, c, parsed.seq);
             }
-        }
-        // A version of a log-like collection that expired here by this
-        // device's clock is not taken, nor stored (spec §14.1).
-        if let (Record::Version(body), Some(c), Some(r)) = (&record, &parsed.subject, retain)
-            && let Some(coll) = st.colls.get(c)
-            && expires(r.keep, &id, (st.clock)(), |n| {
-                lastn_cutoff(coll, &id.writer, n)
-            })
-        {
-            // A sealed payload is not opened to drop it: whether it is a
-            // block, and its last entry's date, stay unknown.
-            let last = body.sealed.is_none().then(|| {
-                body.block
-                    .as_ref()
-                    .and_then(|b| b.last())
-                    .map_or(body.dated, |e| {
-                        Timestamp(body.dated.0.saturating_add(e.offset))
-                    })
-            });
-            let tomb = Tomb {
-                writer: writer.key().clone(),
-                keep: r.keep,
-                first: body.dated,
-                last,
-            };
-            tracing::debug!(%name, "not taken: it expired by this device's clock");
-            let coll = st.colls.get_mut(c).expect("held above");
-            coll.entries
-                .entry(writer.clone())
-                .or_default()
-                .insert(parsed.seq);
-            coll.skipped
-                .entry(writer.clone())
-                .or_default()
-                .insert(parsed.seq);
-            for (n, _) in self.store.scan_under(&name, 0) {
-                self.store.remove(&n);
-            }
-            self.store
-                .insert(expired_name(&name), wire::encode_tomb(&tomb));
-            st.held.insert(name, Held::Expired(tomb));
-            return;
         }
         // Read back from the store at start, it is stored already.
         if !st.restoring && (mine || matches!(record, Record::Snapshot(_))) {
@@ -9479,11 +8668,6 @@ impl Inner {
                     let _batch = self.stage.batch();
                     self.store.insert(name.clone(), wire);
                     st.accept_members(parsed.seq, body, &writer, &self.config.rules, self.me());
-                    // Versions taken before it waited, their keep not yet
-                    // a date the sweeper wakes for: admitted now, so it
-                    // reads every collection's earliest keep again (spec
-                    // §14.1).
-                    self.sweep.notify_one();
                 } else {
                     tracing::debug!(collection = %c, signer = ?writer, "members record not signed by a device of the collection's namespace; ignored");
                 }
@@ -9494,7 +8678,6 @@ impl Inner {
                 // read under the folder's (spec §6).
                 st.ensure(&c, &self.config.rules, self.me());
                 let seq = parsed.seq;
-                let keep = body.keep;
                 let sealed = body.sealed.is_some();
                 let epoch = body.sealed.as_ref().map(|s| s.epoch.clone());
                 // Read back at start into a merge collection not built yet:
@@ -9572,11 +8755,6 @@ impl Inner {
                 st.admit(Arc::new(HeldVersion::new(
                     version, op, wire, sealed, epoch, chunks,
                 )));
-                // A newer version may end older ones' last N (spec §14.1).
-                if matches!(keep, Keep::LastN(_)) {
-                    st.expire(&c);
-                }
-                self.arm_sweep(st, keep);
             }
             Record::Snapshot(pins) => {
                 let snapshot = Snapshot {
@@ -10546,7 +9724,6 @@ impl Inner {
             .chain(
                 st.colls
                     .keys()
-                    .chain(st.peeks.iter())
                     .filter(|x| *x == c || (folder && x.has_prefix(c)))
                     .collect::<BTreeSet<_>>()
                     .into_iter()
@@ -11550,24 +10727,6 @@ impl Inner {
         Ok(())
     }
 
-    /// The date of an own entry of log-like `c` taken now: the clock, or
-    /// the date of the previous entry if the clock is behind it (spec §4.1),
-    /// so a time range finds them in order.
-    fn date(&self, st: &St, c: &Name) -> Timestamp {
-        let now = (self.config.clock)();
-        let last = st.colls.get(c).and_then(|x| x.last_dated);
-        let open = st.open.get(c).and_then(|o| {
-            o.entries
-                .last()
-                .map(|e| Timestamp(o.first.0.saturating_add(e.offset)))
-        });
-        [Some(now), last, open]
-            .into_iter()
-            .flatten()
-            .max()
-            .unwrap_or(now)
-    }
-
     /// Sign `draft` into `c` as a new own version (the record in force
     /// checked by [`Self::writable`]), sealed with `key`, and hold it; a
     /// payload larger than [`wire::INLINE_MAX`] travels in pieces. A merge
@@ -11589,7 +10748,6 @@ impl Inner {
         type_id: TypeId,
         keep: Keep,
         draft: Draft,
-        batch: Duration,
     ) -> Result<VersionId, DataError> {
         // Refused before the edit touches the state.
         let seq = self.next_seq(st)?;
@@ -11597,7 +10755,7 @@ impl Inner {
             .sign_in(st, c, seq, key, type_id, keep, draft)
             .and_then(|signed| Ok((self.judge_own(st, &signed, true)?, signed)));
         match judged {
-            Ok((judged, signed)) => Ok(self.commit(st, ns, signed, batch, judged)),
+            Ok((judged, signed)) => Ok(self.commit(st, ns, signed, judged)),
             Err(e) => {
                 st.reread(c, &self.config.rules, self.me());
                 Err(e)
@@ -12056,7 +11214,7 @@ impl Inner {
         let record = self.sign_members(st, c, base, (body, made))?;
         self.keep_members(st, c, record);
         self.start_fresh(st, c, temp);
-        Ok(self.commit(st, ns, signed, Duration::ZERO, Some(ruled)))
+        Ok(self.commit(st, ns, signed, Some(ruled)))
     }
 
     /// Sign `draft` as the own version at `seq` of `c`, under its record in
@@ -12072,22 +11230,14 @@ impl Inner {
         keep: Keep,
         draft: Draft,
     ) -> Result<Signed, DataError> {
-        let log = st.colls[c]
-            .members
-            .as_ref()
-            .is_some_and(|m| log_like(&m.rule));
-        let dated = match (&draft, log) {
-            (Draft::Block { first, .. }, _) => *first,
-            (_, true) => self.date(st, c),
-            (_, false) => (self.config.clock)(),
-        };
+        let dated = (self.config.clock)();
         let coll = st.colls.get_mut(c).expect("members known");
         let members = coll.members.as_ref().expect("members known");
         let under = Under {
             readers: members.readers.clone(),
             function: match &members.rule {
                 Rule::Merge { function } => Some(function.clone()),
-                Rule::Log | Rule::OneKey => None,
+                Rule::Log => None,
             },
             parents: coll.parents(),
         };
@@ -12118,12 +11268,10 @@ impl Inner {
         (type_id, keep, dated): (TypeId, Keep, Timestamp),
         draft: Draft,
     ) -> Result<Signed, DataError> {
-        let (content, block, built) = match draft {
-            Draft::Entry(content) => (content, None, None),
-            Draft::Op(op) => (Content::new(), None, Some(op)),
-            Draft::Block { entries, .. } => (Content::new(), Some(entries), None),
+        let (content, built) = match draft {
+            Draft::Entry(content) => (content, None),
+            Draft::Op(op) => (Content::new(), Some(op)),
         };
-        let log = under.function.is_none();
         let op = match &under.function {
             Some(function) => {
                 let Some(state) = state else {
@@ -12146,12 +11294,9 @@ impl Inner {
             None => Bytes::new(),
         };
         let name = log_name(&self.device, Some(c), seq);
-        let payload = match (key, &block) {
-            (Some((_, k)), Some(b)) => seal::seal_bytes(k, &name, &wire::encode_block(b)),
-            (Some((_, k)), None) => seal::seal_payload(k, &name, &content, &op),
-            (None, None) => wire::encode_payload(&content, &op),
-            // An unsealed block stands in the record itself.
-            (None, Some(_)) => Bytes::new(),
+        let payload = match key {
+            Some((_, k)) => seal::seal_payload(k, &name, &content, &op),
+            None => wire::encode_payload(&content, &op),
         };
         if payload.len() as u64 > wire::PAYLOAD_MAX {
             return Err(DataError::TooLarge {
@@ -12162,7 +11307,7 @@ impl Inner {
         }
         // A large entry travels in pieces, whatever the rule (spec §13.1);
         // the record carries its size and manifest root.
-        let (chunks, pieces) = if block.is_none() && payload.len() > wire::INLINE_MAX {
+        let (chunks, pieces) = if payload.len() > wire::INLINE_MAX {
             let (pieces, chunks) = pieces::split(&name, &payload);
             (Some(chunks), pieces)
         } else {
@@ -12194,7 +11339,6 @@ impl Inner {
             op: record_op,
             sealed,
             chunks,
-            block,
         };
         let wire = self.sign(DataBuilder::new(name.clone(), &wire::encode_version(&body)))?;
         let epoch = body.sealed.as_ref().map(|s| s.epoch.clone());
@@ -12215,9 +11359,6 @@ impl Inner {
             seq,
             held,
             pieces,
-            log,
-            keep,
-            dated,
             function: under.function,
         })
     }
@@ -12243,7 +11384,6 @@ impl Inner {
             state,
             entries,
             skipped,
-            listings,
             locked,
             revoked,
             versions,
@@ -12263,7 +11403,6 @@ impl Inner {
             members: members.as_ref(),
             entries,
             skipped,
-            listings,
             locked,
             revoked,
             admitted: versions,
@@ -12286,23 +11425,13 @@ impl Inner {
     /// Keep `signed`, an own version judged (`judged`, under a merge rule):
     /// its seq is the log's head, it and its pieces are stored, listed in
     /// the summary, applied, and delivered. Its id.
-    fn commit(
-        &self,
-        st: &mut St,
-        ns: &Name,
-        signed: Signed,
-        batch: Duration,
-        judged: Option<Ruled>,
-    ) -> VersionId {
+    fn commit(&self, st: &mut St, ns: &Name, signed: Signed, judged: Option<Ruled>) -> VersionId {
         let _batch = self.stage.batch();
         let Signed {
             c,
             seq,
             held,
             pieces,
-            log,
-            keep,
-            dated,
             ..
         } = signed;
         let version = held.version.clone();
@@ -12400,34 +11529,16 @@ impl Inner {
         }
         self.store.insert(name.clone(), held.wire.clone());
         st.held.insert(name, Held::Version(id.clone()));
-        let retain = match log {
-            true => Retain { keep, dated },
-            false => Retain::ALWAYS,
-        };
         st.trees
             .entry(ns.clone())
             .or_insert_with(|| Tree::new(ns.clone()))
-            .add(&c, seq, Kind::Version(retain));
+            .add(&c, seq, Kind::Version);
         let coll = st.colls.get_mut(&c).expect("members known");
         coll.entries
             .entry(id.writer.clone())
             .or_default()
             .insert(seq);
         coll.applied.insert(id.writer.clone(), seq);
-        if log {
-            coll.last_dated = Some(last_dated(&version));
-        }
-        coll.batches.insert(seq, batch);
-        // Stored with the version, so the head of a one-key collection
-        // states the same freshness at the same seq after a restart.
-        if coll
-            .members
-            .as_ref()
-            .is_some_and(|m| matches!(m.rule, Rule::OneKey))
-        {
-            self.store
-                .insert(batched_name(&c), encode_batched(seq, batch));
-        }
         coll.by_digest.insert(held.digest, id.clone());
         // An own operation in pieces is not kept in memory once applied.
         let held = match held.unloaded() {
@@ -12442,150 +11553,7 @@ impl Inner {
                 _ => st.tell(&c, &change),
             }
         }
-        self.arm_sweep(st, keep);
-        // A newer version may end older ones' last N (spec §14.1).
-        if matches!(keep, Keep::LastN(_)) {
-            st.expire(&c);
-        }
         id
-    }
-
-    /// Add an entry to the open block of `c` (spec §4.1), closing the open
-    /// one first when the entry's type, keep class or seal epoch differs
-    /// from its, or when the entry would make its `Block` encoding exceed
-    /// [`wire::INLINE_MAX`]. The receiver of the block's id once signed;
-    /// whether a block closed; and the deadline to arm a timer for, when
-    /// this entry moves the block's close earlier (`deadline`: its arrival
-    /// plus `delay`, the caller's to compute, as only it can refuse one the
-    /// clock cannot hold).
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::type_complexity)]
-    fn add_to_block(
-        &self,
-        st: &mut St,
-        c: &Name,
-        content: Content,
-        type_id: TypeId,
-        keep: Keep,
-        epoch: Option<Epoch>,
-        delay: Duration,
-        deadline: Instant,
-    ) -> (
-        oneshot::Receiver<Result<VersionId, DataError>>,
-        bool,
-        Option<Instant>,
-    ) {
-        let dated = self.date(st, c);
-        let mut closed = false;
-        if let Some(open) = st.open.get(c) {
-            let differs =
-                open.type_id != type_id || !same_keep_class(open.keep, keep) || open.epoch != epoch;
-            let mut entries = open.entries.clone();
-            entries.push(BlockEntryBody {
-                offset: dated.0 - open.first.0,
-                fields: content.clone(),
-            });
-            if differs || wire::encode_block(&entries).len() > wire::INLINE_MAX {
-                closed = self.close_block(st, c).is_some();
-            }
-        }
-        let (tx, rx) = oneshot::channel();
-        let arm = match st.open.get_mut(c) {
-            Some(open) => {
-                open.entries.push(BlockEntryBody {
-                    offset: dated.0 - open.first.0,
-                    fields: content,
-                });
-                if let (Keep::Until(a), Keep::Until(b)) = (open.keep, keep) {
-                    open.keep = Keep::Until(a.max(b));
-                }
-                open.batch = open.batch.max(delay);
-                open.waiters.push(tx);
-                (deadline < open.deadline).then(|| {
-                    open.deadline = deadline;
-                    deadline
-                })
-            }
-            None => {
-                st.open.insert(
-                    c.clone(),
-                    OpenBlock {
-                        type_id,
-                        keep,
-                        epoch,
-                        first: dated,
-                        entries: vec![BlockEntryBody {
-                            offset: 0,
-                            fields: content,
-                        }],
-                        deadline,
-                        batch: delay,
-                        waiters: vec![tx],
-                    },
-                );
-                Some(deadline)
-            }
-        };
-        (rx, closed, arm)
-    }
-
-    /// Close the open block of `c`, if any: sign it as one version (the
-    /// record in force checked again) and tell every put waiting for it.
-    /// Its id, when signed.
-    fn close_block(&self, st: &mut St, c: &Name) -> Option<VersionId> {
-        let open = st.open.remove(c)?;
-        let signed = self
-            .writable(st, c, open.epoch.as_ref())
-            .and_then(|()| match &open.epoch {
-                Some(e) => st
-                    .keys
-                    .key(c, e)
-                    .map(|k| Some((e.clone(), k)))
-                    .ok_or_else(|| DataError::Unavailable { name: c.clone() }),
-                None => Ok(None),
-            })
-            .and_then(|key| {
-                let ns = namespace_of(c).expect("a collection has a namespace");
-                self.write(
-                    st,
-                    c,
-                    &ns,
-                    key.as_ref(),
-                    open.type_id,
-                    open.keep,
-                    Draft::Block {
-                        first: open.first,
-                        entries: open.entries,
-                    },
-                    open.batch,
-                )
-            });
-        if let Err(e) = &signed {
-            tracing::debug!(collection = %c, "a block was not signed: {e}");
-        }
-        for w in open.waiters {
-            let _ = w.send(signed.clone());
-        }
-        signed.ok()
-    }
-
-    /// Close the open block of `c` at `at` if it is still due by then (a
-    /// later entry may have closed it, or a block opened since closes
-    /// later, on its own timer), and announce it.
-    fn arm_block(self: &Arc<Self>, c: Name, at: Instant) {
-        let weak = Arc::downgrade(self);
-        rt::spawn(async move {
-            rt::sleep(at.saturating_duration_since(Instant::now())).await;
-            let Some(inner) = weak.upgrade() else { return };
-            let closed = {
-                let mut st = inner.st.lock();
-                st.open.get(&c).is_some_and(|o| o.deadline <= at)
-                    && inner.close_block(&mut st, &c).is_some()
-            };
-            if closed && let Err(e) = inner.publish_about(&c, &[]).await {
-                tracing::debug!(collection = %c, "a block is not announced: {e}");
-            }
-        });
     }
 
     /// Keep `key`, which this device made as the key of epoch `e` of `c`,
@@ -12921,15 +11889,11 @@ impl Inner {
         // §13.5). Readers ask it for another device's under its own name,
         // `32=held`, when the writer does not answer. Nothing refused or
         // withdrawn here (by its record, a cut, its chain, its group or its
-        // rule). Nothing expired here either (spec §14.1), checked as it is
-        // asked for.
+        // rule).
         let log = parse_log_name(name).or_else(|| parse_piece_name(name).map(|p| p.log));
         if let Some(parsed) = log {
-            let mut st = self.st.lock();
+            let st = self.st.lock();
             let version = strip_piece(name);
-            if st.expire_named(&version) {
-                return None;
-            }
             if parsed.device == self.device {
                 // Published once durable (spec §4.2): above the durable
                 // head, a power loss could take it after a peer saw it.
@@ -12952,20 +11916,6 @@ impl Inner {
                 .store
                 .get(name)
                 .or_else(|| (version == *name).then(|| held_wire(&st, name)).flatten());
-        }
-        // The head of a one-key collection this device writes (spec §5.3):
-        // the newest by its discovery name, any other only by its own.
-        let head = match parse_head_prefix(name) {
-            Some((d, c)) if can_be_prefix => Some((d, c, None)),
-            _ => parse_head_name(name).map(|(d, c, s)| (d, c, Some(s))),
-        };
-        if let Some((device, c, seq)) = head {
-            if device != self.device {
-                return None;
-            }
-            let mut st = self.st.lock();
-            let (s, wire) = self.head(&mut st, &c)?;
-            return seq.is_none_or(|q| q == s).then_some(wire);
         }
         if let Some(s) = parse_summary_name(name)
             && s.device == self.device
@@ -13056,63 +12006,6 @@ impl Inner {
             },
         );
         Some((head, wire))
-    }
-
-    /// The signed head of one-key collection `c`, if this device's key is
-    /// its one key (spec §5.3): its node's head and digest as the log up to
-    /// its durable head fixes them (spec §4.2), and the batch delay of the
-    /// newest version that node lists as freshness (also the packet's
-    /// FreshnessPeriod). Signed only when asked for and the node changed;
-    /// the head's seq and packet.
-    fn head(&self, st: &mut St, c: &Name) -> Option<(u64, Bytes)> {
-        let coll = st.colls.get(c)?;
-        let (key, _) = one_key(coll)?;
-        if key != self.writer {
-            return None;
-        }
-        let ns = namespace_of(c)?;
-        let durable = st.durable;
-        let (seq, node) =
-            st.trees
-                .get_mut(&ns)?
-                .node_at(&self.device, self.writer.key(), c, durable)?;
-        let coll = st.colls.get_mut(c)?;
-        // What the head states of the newest version it lists; the delays
-        // of older versions are no longer stated by any head.
-        let freshness = match coll.batches.range(..=seq).next_back() {
-            Some((&s, &batch)) => {
-                coll.batches = coll.batches.split_off(&s);
-                batch
-            }
-            None => Duration::ZERO,
-        };
-        let digest = wire::implicit_digest(&node);
-        if let Some(h) = st.heads.get(c)
-            && h.seq == seq
-            && h.digest == digest
-        {
-            return Some((seq, h.wire.clone()));
-        }
-        let body = HeadBody {
-            collection: c.clone(),
-            seq,
-            digest,
-            freshness: freshness.as_millis() as u64,
-        };
-        let builder = DataBuilder::new(head_name(&self.device, c, seq), &wire::encode_head(&body))
-            .freshness(freshness);
-        let wire = self.sign(builder).ok()?;
-        self.store
-            .insert(head_prefix(&self.device, c), wire.clone());
-        st.heads.insert(
-            c.clone(),
-            SignedHead {
-                seq,
-                digest,
-                wire: wire.clone(),
-            },
-        );
-        Some((seq, wire))
     }
 
     // ---- seals --------------------------------------------------------------------------------
@@ -13654,39 +12547,26 @@ impl Inner {
                     .map(|v| Got::Version((*v).clone()))
                     .ok_or_else(|| DataError::Unavailable { name: c.clone() })
             }
-            // The one key's newest version held here, by seq: what its
-            // head would name, as of the last one this device verified.
-            Rule::OneKey => {
-                let since = members.since.as_ref();
-                coll.versions
-                    .values()
-                    .map(|hv| &hv.version)
-                    .filter(|v| !since.is_some_and(|s| s.contains(&v.id)))
-                    .max_by(|a, b| a.id.seq.cmp(&b.id.seq))
-                    .map(|v| Got::Version(v.clone()))
-                    .ok_or_else(|| DataError::Unavailable { name: c.clone() })
-            }
         }
     }
 
     /// A log entry by name, read whole (a large payload from its pieces).
     async fn get_log_entry(self: &Arc<Self>, name: &Name) -> Result<Answer, DataError> {
-        let a = self.log_entry(name, true).await;
+        let a = self.log_entry(name).await;
         self.whole(a).await
     }
 
     /// The log entry named `name`, verified, not read whole: held here, or
     /// fetched — by name (its writer, or a cache), else from the devices
     /// that answer for it (`32=held`). A packet that is not its
-    /// writer's (a forged or spliced block, another signer's, one that does
+    /// writer's (a forged or spliced packet, another signer's, one that does
     /// not decode) is dropped and the next source asked
     /// ([`Self::take_data`]); a refusal kept against the name is a decision
-    /// on the genuine writer's own packet. `follow`: follow its collection
-    /// first; else only peek at it, taking its records (spec §5.3). A
+    /// on the genuine writer's own packet. Its collection is followed first. A
     /// version sealed to an audience no record held admits this device to
     /// is judged by signed data only ([`Self::sealed_judged`]).
-    async fn log_entry(self: &Arc<Self>, name: &Name, follow: bool) -> Result<Answer, DataError> {
-        let a = self.log_entry_held(name, follow).await;
+    async fn log_entry(self: &Arc<Self>, name: &Name) -> Result<Answer, DataError> {
+        let a = self.log_entry_held(name).await;
         match parse_log_name(name).and_then(|p| p.subject) {
             Some(c) => self.sealed_judged(name, &c, a).await,
             None => a,
@@ -13695,14 +12575,8 @@ impl Inner {
 
     /// [`Self::log_entry`], a sealed version this device does not read by
     /// the record in force answered [`DataError::Sealed`] as it is.
-    async fn log_entry_held(
-        self: &Arc<Self>,
-        name: &Name,
-        follow: bool,
-    ) -> Result<Answer, DataError> {
+    async fn log_entry_held(self: &Arc<Self>, name: &Name) -> Result<Answer, DataError> {
         let answer = |st: &mut St| -> Option<Result<Answer, DataError>> {
-            // A version whose keep passed is dropped as it is asked for.
-            st.expire_named(name);
             if let Some(why) = st.refused.get(name) {
                 return Some(Err(refused(name, why.clone())));
             }
@@ -13729,10 +12603,6 @@ impl Inner {
                     Err(DataError::Sealed { name: name.clone() })
                 }
                 Held::Record { .. } => Err(DataError::NotFound { name: name.clone() }),
-                Held::Expired(t) => Err(DataError::Expired {
-                    name: name.clone(),
-                    keep: t.keep,
-                }),
             })
         };
         if let Some(a) = answer(&mut self.st.lock()) {
@@ -13741,11 +12611,7 @@ impl Inner {
         let parsed =
             parse_log_name(name).ok_or_else(|| DataError::NotFound { name: name.clone() })?;
         if let Some(c) = &parsed.subject {
-            if follow {
-                self.look(c).await?;
-            } else {
-                self.peek(c).await?;
-            }
+            self.look(c).await?;
         }
         if let Some(a) = answer(&mut self.st.lock()) {
             return a;
@@ -13824,712 +12690,6 @@ impl Inner {
             .unwrap_or_else(|| Err(DataError::Unavailable { name: name.clone() }))
     }
 
-    /// Take the records of `c` without following its versions (spec
-    /// §5.3): its members record is what a one-key read needs, and a range
-    /// read fetches only the blocks it asks for. The first time, and again
-    /// for as long as no members record of it is held (its writers may have
-    /// been unreachable before), look at what every device known to write
-    /// into its namespace holds of it, for at most the first-look time —
-    /// with no such device heard, its group is asked again ([`Self::hail`]).
-    async fn peek(self: &Arc<Self>, c: &Name) -> Result<(), DataError> {
-        check_collection(c)?;
-        let ns = namespace_of(c).expect("checked above");
-        let look = {
-            let mut st = self.st.lock();
-            let new = !st.inside(c) && st.peeks.insert(c.clone());
-            st.ensure(c, &self.config.rules, self.me());
-            let unknown = st.colls.get(c).is_none_or(|x| x.members.is_none());
-            if new || unknown {
-                for ((_, pns), peer) in st.peers.iter_mut() {
-                    if *pns == ns {
-                        peer.forget(c);
-                    }
-                }
-            }
-            new || unknown
-        };
-        self.join(&ns).await?;
-        if look {
-            let devices = self.known_for(&self.st.lock(), &ns);
-            if devices.is_empty() {
-                self.hail(&ns);
-            }
-            let all = futures::future::join_all(devices.iter().map(|d| self.walk(&ns, d)));
-            let _ = rt::timeout(self.config.first_look, all).await;
-        }
-        let c2 = c.clone();
-        self.wait_for(|st| st.colls.get(&c2).is_some_and(|x| x.members.is_some()))
-            .await;
-        Ok(())
-    }
-
-    /// Take `data` as the head of `key`'s one-key collection `c` of device
-    /// `device` (spec §5.3): signed by exactly the one key, for `c`, its seq
-    /// its name's, and not lower than one of that key verified here or than
-    /// a seq of that key known here (held, listed by a verified node, or
-    /// tombstoned) — a rollback, refused also after a restart, as the
-    /// newest head of each key verified is kept in the store. Its receipt
-    /// counts only once the node it names checks out ([`Self::head_of`]).
-    async fn accept_head(
-        &self,
-        c: &Name,
-        key: &Writer,
-        device: &Name,
-        data: &Data,
-    ) -> Result<HeadBody, HeadRefusal> {
-        let named = parse_head_name(&data.name);
-        let Some((_, _, seq)) = named.filter(|(d, hc, _)| d == device && hc == c) else {
-            return Err(HeadRefusal::NotItsName);
-        };
-        let signer = self
-            .verify(data)
-            .await
-            .map_err(|_| HeadRefusal::NotVerified)?;
-        if signer != *key {
-            return Err(HeadRefusal::NotTheKey);
-        }
-        let body = data
-            .content()
-            .and_then(|b| wire::decode_head(b.clone()).ok())
-            .filter(|b| b.collection == *c && b.seq == seq)
-            .ok_or(HeadRefusal::NotItsName)?;
-        let mut st = self.st.lock();
-        let slot = (c.clone(), key.clone());
-        let verified = st.seen.get(&slot).map(|h| h.seq);
-        let known = st.colls.get(c).map_or(0, |x| {
-            let listed = x.entries.get(key).and_then(|s| s.last().copied());
-            let held = x
-                .versions
-                .keys()
-                .rfind(|id| id.writer == *key)
-                .map(|id| id.seq.0);
-            listed.max(held).unwrap_or(0)
-        });
-        let floor = verified.unwrap_or(0).max(known);
-        if seq < floor {
-            return Err(HeadRefusal::Rollback { seq, seen: floor });
-        }
-        if verified.is_none_or(|v| seq > v) {
-            self.store
-                .insert(head_prefix(device, c), data.raw().clone());
-        }
-        let h = st.seen.entry(slot).or_insert(SeenHead {
-            seq,
-            this_run: true,
-            checked: None,
-            delivered: None,
-        });
-        h.seq = seq;
-        h.this_run = true;
-        Ok(body)
-    }
-
-    /// Fetch the head of `key`'s one-key collection `c` from its device
-    /// (`<D>/32=summary/<C>/32=head`, MustBeFresh), take it
-    /// ([`Self::accept_head`]), then fetch the node it names by name and
-    /// check it against the head's digest. The seqs the node lists, and the
-    /// head's receipt, recorded only now that its node checked out. Each
-    /// is asked in place as a walk's packets are (spec §17.1): a miss, or
-    /// a packet refused as not the head or not its node (one that does not
-    /// verify or match, a forgery on the way), is asked again after
-    /// [`retry_pause`], up to [`FETCH_TRIES`] asks; a rollback is a
-    /// decision, not asked again.
-    async fn head_of(
-        self: &Arc<Self>,
-        c: &Name,
-        key: &Writer,
-        device: &Name,
-    ) -> Option<(Vec<u64>, Receipt)> {
-        let mut tries = 0;
-        let (body, at) = loop {
-            if tries > 0 {
-                rt::sleep(retry_pause(tries - 1)).await;
-            }
-            tries += 1;
-            let more = tries < FETCH_TRIES;
-            let data = match self.fetch_once(head_prefix(device, c), true).await {
-                Ok(d) => d,
-                Err(true) if more => continue,
-                Err(_) => return None,
-            };
-            let at = Instant::now();
-            match self.accept_head(c, key, device, &data).await {
-                Ok(b) => break (b, at),
-                Err(HeadRefusal::Rollback { seq, seen }) => {
-                    tracing::warn!(collection = %c, seq, seen, "refused: a head older than one verified, or than a version held (rollback)");
-                    return None;
-                }
-                Err(why) => {
-                    tracing::debug!(name = %data.name, ?why, "refused: a head of a one-key collection");
-                    if !more {
-                        return None;
-                    }
-                }
-            }
-        };
-        let receipt = Receipt {
-            at,
-            freshness: Duration::from_millis(body.freshness),
-        };
-        let seq = body.seq;
-        let node_name = node_name(device, c, seq);
-        let mut tries = 0;
-        let nb = loop {
-            if tries > 0 {
-                rt::sleep(retry_pause(tries - 1)).await;
-            }
-            tries += 1;
-            let more = tries < FETCH_TRIES;
-            let node = match self.fetch_once(node_name.clone(), false).await {
-                Ok(d) => d,
-                Err(true) if more => continue,
-                Err(_) => return None,
-            };
-            let nb = (wire::implicit_digest(node.raw()) == body.digest)
-                .then(|| {
-                    node.content()
-                        .and_then(|b| wire::decode_node(b.clone()).ok())
-                })
-                .flatten()
-                .filter(|nb| {
-                    nb.subject == *c
-                        && nb.writer == *key.key()
-                        && nb.head == seq
-                        && nb.page.is_none()
-                });
-            match nb {
-                Some(nb) => break nb,
-                None => {
-                    tracing::debug!(%node_name, "not the node its head names; ignored");
-                    if !more {
-                        return None;
-                    }
-                }
-            }
-        };
-        let listed: Vec<u64> = seqs_of(&nb.entries).collect();
-        let mut st = self.st.lock();
-        if let Some(h) = st.seen.get_mut(&(c.clone(), key.clone()))
-            && h.seq == seq
-        {
-            h.checked = Some((receipt, listed.clone()));
-        }
-        let coll = st.colls.entry(c.clone()).or_default();
-        coll.entries
-            .entry(key.clone())
-            .or_default()
-            .extend(listed.iter().copied());
-        let bound = st.listing(c, key, &nb);
-        st.expire(c);
-        if let Some(t) = bound {
-            self.arm_sweep(&mut st, Keep::Until(t));
-        }
-        st.apply_ready(c, &BTreeSet::new());
-        Some((listed, receipt))
-    }
-
-    /// `get(C)` of a one-key collection (spec §5.3): its head, the node it
-    /// names, the newest version that node lists — from the store, by
-    /// name, or from a holder — aged from that head's receipt. With no head
-    /// (or no version) to be had, the newest version held here
-    /// ([`Self::newest_held`]): stale, never wrong.
-    async fn newest_one_key(
-        self: &Arc<Self>,
-        c: &Name,
-        key: &Writer,
-        device: &Name,
-    ) -> Result<Answer, DataError> {
-        if *key == self.writer {
-            let got = self.newest(&self.st.lock(), c)?;
-            return Ok(Answer {
-                got,
-                age: Age::Newest {
-                    unconfirmed_for: Duration::ZERO,
-                },
-            });
-        }
-        if let Some((listed, receipt)) = self.head_of(c, key, device).await
-            && let Some(&newest) = listed.last()
-        {
-            match self
-                .log_entry(&log_name(device, Some(c), newest), false)
-                .await
-            {
-                Ok(Answer {
-                    got: Got::Version(v),
-                    ..
-                }) => {
-                    if let Some(h) = self.st.lock().seen.get_mut(&(c.clone(), key.clone()))
-                        && h.delivered.is_none_or(|(_, r)| r.at <= receipt.at)
-                    {
-                        h.delivered = Some((newest, receipt));
-                    }
-                    return Ok(Answer {
-                        got: Got::Version(v),
-                        age: receipt.age(),
-                    });
-                }
-                Err(e @ DataError::Expired { .. }) => return Err(e),
-                other => {
-                    tracing::debug!(collection = %c, newest, ?other, "the newest version its head names is not to be had; answering from what is held");
-                }
-            }
-        }
-        self.newest_held(&self.st.lock(), c, key)
-    }
-
-    /// `get(C)` of `key`'s one-key collection `c` from the newest version
-    /// of the key held here (spec §5.3), its age how long ago it was last
-    /// known the newest: from the receipt of the last head of this run that
-    /// named it the newest and delivered it. A version no head of this run
-    /// named the newest, while a head of the key verified in this run went
-    /// past its seq, has no age this device can bound: `Unavailable` (ask
-    /// again later). With no such head, the age of a log collection.
-    fn newest_held(&self, st: &St, c: &Name, key: &Writer) -> Result<Answer, DataError> {
-        let got = self.newest(st, c)?;
-        let seq = match &got {
-            Got::Version(v) if v.id.writer == *key => Some(v.id.seq.0),
-            _ => None,
-        };
-        let seen = st.seen.get(&(c.clone(), key.clone()));
-        if let Some((s, receipt)) = seen.and_then(|h| h.delivered)
-            && Some(s) == seq
-        {
-            return Ok(Answer {
-                got,
-                age: receipt.age(),
-            });
-        }
-        if let Some(h) = seen.filter(|h| h.this_run && seq.is_none_or(|s| h.seq > s)) {
-            tracing::debug!(collection = %c, head = h.seq, held = ?seq, "a head verified in this run went past the newest version held, which no head of this run named the newest: its age is unknown");
-            return Err(DataError::Unavailable { name: c.clone() });
-        }
-        Ok(Answer {
-            got,
-            age: self.age(st, c),
-        })
-    }
-
-    /// `get` of an entry's name `<V>/32=entry/seg=<index>` (spec §4.1): the
-    /// version `V`, verified as any log entry, and that one entry of it.
-    async fn get_entry(
-        self: &Arc<Self>,
-        name: &Name,
-        version: &Name,
-        index: u32,
-    ) -> Result<Answer, DataError> {
-        let a = self.log_entry(version, false).await;
-        // An error about the block names what was asked for: the entry.
-        let asked = |e: DataError| match e {
-            DataError::Expired { keep, .. } => DataError::Expired {
-                name: name.clone(),
-                keep,
-            },
-            DataError::NotFound { .. } => DataError::NotFound { name: name.clone() },
-            DataError::Unavailable { .. } => DataError::Unavailable { name: name.clone() },
-            DataError::Sealed { .. } => DataError::Sealed { name: name.clone() },
-            other => other,
-        };
-        let Got::Version(v) = self.whole(a).await.map_err(asked)?.got else {
-            return Err(DataError::NotFound { name: name.clone() });
-        };
-        let entry = entries_of(&v)
-            .into_iter()
-            .nth(index as usize)
-            .ok_or_else(|| DataError::NotFound { name: name.clone() })?;
-        Ok(Answer {
-            got: Got::Entries(Entries {
-                collection: v.collection.clone(),
-                writer: v.id.writer.clone(),
-                entries: vec![entry],
-                missing: Vec::new(),
-                expired: Vec::new(),
-                large: Vec::new(),
-            }),
-            age: Age::Exact,
-        })
-    }
-
-    /// One listed block of a range read (spec §5.4), not read whole.
-    async fn probe(self: &Arc<Self>, c: &Name, device: &Name, seq: u64) -> Probe {
-        let name = log_name(device, Some(c), seq);
-        match self.log_entry(&name, false).await {
-            Ok(Answer {
-                got: Got::Version(v),
-                ..
-            }) => match v.payload {
-                Payload::Large { .. } => Probe::Large(v.id, v.dated),
-                _ => Probe::Read(Box::new(v)),
-            },
-            Err(DataError::Expired { .. }) => match self.st.lock().held.get(&name) {
-                Some(Held::Expired(t)) => Probe::Expired(t.first, t.last),
-                _ => Probe::Missing,
-            },
-            // No path answered, or only with a reply refused unkept (one
-            // that did not verify: forged or altered on the way): asking
-            // again may mend it (spec §17.1).
-            Err(DataError::Unavailable { .. }) => Probe::Lost,
-            Err(DataError::Refused { .. }) => {
-                let st = self.st.lock();
-                match st.refused.contains_key(&name) || st.cut_out.contains_key(&name) {
-                    true => Probe::Missing,
-                    false => Probe::Lost,
-                }
-            }
-            _ => Probe::Missing,
-        }
-    }
-
-    /// `get` of a range name `<C>/32=range/<R>` of a one-key collection
-    /// (spec §5.4): the head, the node it names (its `Entries`: every live
-    /// block's seq), then by seq the blocks in the range, or by time a
-    /// search of the listed seqs (interpolation on the blocks' dates,
-    /// alternating with bisection) for the first block whose last entry is
-    /// `≥ from` and the last whose first is `< to`, each probe a block
-    /// fetched and verified, then the blocks between. Only those blocks
-    /// are fetched: the collection is not followed. Its blocks are probed
-    /// within [`range_bound`] from when the head's node lists them (the
-    /// records and the head have bounds of their own, spec §17.1), a probe
-    /// lost on the way probed again in place: a search's up to
-    /// [`SEARCH_TRIES`] times, a block in range until then. The search and
-    /// the fetch of the blocks in range each have that bound, the second
-    /// counted from when the search is done: a search whose probes were
-    /// lost does not take the time of blocks it never asked for. What was
-    /// not probed by then is missing.
-    async fn get_range(
-        self: &Arc<Self>,
-        name: &Name,
-        c: &Name,
-        range: Range,
-    ) -> Result<Answer, DataError> {
-        self.peek(c).await?;
-        let (key, device) = {
-            let st = self.st.lock();
-            let Some(coll) = st.colls.get(c) else {
-                return Err(DataError::Unavailable { name: name.clone() });
-            };
-            let Some(m) = coll.members.as_ref() else {
-                return Err(DataError::Unavailable { name: name.clone() });
-            };
-            if m.rule != Rule::OneKey {
-                return Err(DataError::BadRequest {
-                    name: name.clone(),
-                    why: format!(
-                        "range reads read one key's stream, and {c} is not a one-key collection; \
-                         read its versions by name, or watch it"
-                    ),
-                });
-            }
-            let Some(k) = one_key(coll) else {
-                return Err(DataError::BadRequest {
-                    name: name.clone(),
-                    why: format!(
-                        "range reads read one key's stream, and the members record of {c} names \
-                         no single key <D>/KEY/<id>; its owner names the one key that writes"
-                    ),
-                });
-            };
-            if self.sealed_off(&st, c) {
-                return Err(DataError::Sealed { name: name.clone() });
-            }
-            k
-        };
-        let own = key == self.writer;
-        let listed = match own {
-            true => None,
-            false => self.head_of(c, &key, &device).await,
-        };
-        // An unmeasured path keeps the first looks: its `rto` is only the
-        // lifetime, no evidence the path is slow.
-        let rto = self.rtt.lock().measured(self.config.lifetime);
-        let rto = rto.unwrap_or(Duration::ZERO);
-        let deadline = Instant::now().checked_add(range_bound(self.config.first_look, rto));
-        let (seqs, age) = {
-            let st = self.st.lock();
-            let coll = st.colls.get(c);
-            let known = || -> Vec<u64> {
-                coll.and_then(|x| x.entries.get(&key))
-                    .map(|s| s.iter().copied().collect())
-                    .unwrap_or_default()
-            };
-            match (own, listed) {
-                (true, _) => (
-                    known(),
-                    Age::Newest {
-                        unconfirmed_for: Duration::ZERO,
-                    },
-                ),
-                (false, Some((l, receipt))) => (l, receipt.age()),
-                // No head: what the last head of the one key checked in
-                // this run listed, aged from its receipt; else every seq of
-                // the key known here, with the age of a log collection.
-                (false, None) => match st
-                    .seen
-                    .get(&(c.clone(), key.clone()))
-                    .and_then(|h| h.checked.as_ref())
-                    .filter(|(_, l)| !l.is_empty())
-                {
-                    Some((receipt, l)) => (l.clone(), receipt.age()),
-                    None => (known(), self.age(&st, c)),
-                },
-            }
-        };
-        // Blocks this device dropped as expired are no longer listed by the
-        // writer's node (listing by keep), yet a range read reports them in
-        // `expired`: their tombstones place them by seq and by dates.
-        let seqs: Vec<u64> = {
-            let st = self.st.lock();
-            let mut all: BTreeSet<u64> = seqs.into_iter().collect();
-            if let Some(known) = st.colls.get(c).and_then(|x| x.entries.get(&key)) {
-                all.extend(known.iter().copied().filter(|s| {
-                    matches!(
-                        st.held.get(&log_name(&device, Some(c), *s)),
-                        Some(Held::Expired(_))
-                    )
-                }));
-            }
-            all.into_iter().collect()
-        };
-        let mut probes: HashMap<u64, Probe> = HashMap::new();
-        let picked: Vec<u64> = match range {
-            Range::Seqs(lo, hi) => seqs.into_iter().filter(|s| (lo..=hi).contains(s)).collect(),
-            Range::Times(from, to) => {
-                let n = seqs.len();
-                if n > 0 {
-                    // Anchors for interpolation: the first and the last.
-                    let anchors: BTreeSet<u64> = [seqs[0], seqs[n - 1]].into();
-                    self.probe_all(
-                        c,
-                        &device,
-                        anchors.into_iter().collect(),
-                        &mut probes,
-                        deadline,
-                        SEARCH_TRIES,
-                    )
-                    .await;
-                }
-                let (lo, _) = self
-                    .search(
-                        c,
-                        &device,
-                        &seqs,
-                        &mut probes,
-                        (0, n),
-                        from,
-                        deadline,
-                        |b| b.1 >= from,
-                    )
-                    .await;
-                let (_, hi) = self
-                    .search(c, &device, &seqs, &mut probes, (lo, n), to, deadline, |b| {
-                        b.0 >= to
-                    })
-                    .await;
-                seqs[lo..hi].to_vec()
-            }
-        };
-        // The blocks in range are fetched within a bound of their own, counted from when
-        // they are known: the search's lost probes spend the search's bound, and a bound
-        // they had already spent would leave blocks that were never asked for `missing`
-        // while every one of them is to be had (spec §5.4). A block a probe lost is asked
-        // again in place; what this deadline leaves unprobed is missing.
-        let rto = self.rtt.lock().measured(self.config.lifetime);
-        let fetch_by = Instant::now().checked_add(range_bound(
-            self.config.first_look,
-            rto.unwrap_or(Duration::ZERO),
-        ));
-        let todo: Vec<u64> = picked
-            .iter()
-            .copied()
-            .filter(|s| !settled(&probes, *s))
-            .collect();
-        self.probe_all(c, &device, todo, &mut probes, fetch_by, u32::MAX)
-            .await;
-        let id = |s: u64| VersionId {
-            writer: key.clone(),
-            seq: Seq(s),
-        };
-        let within = |d: Timestamp| match range {
-            Range::Seqs(..) => true,
-            Range::Times(from, to) => from <= d && d < to,
-        };
-        let mut out = Entries {
-            collection: c.clone(),
-            writer: key.clone(),
-            entries: Vec::new(),
-            missing: Vec::new(),
-            expired: Vec::new(),
-            large: Vec::new(),
-        };
-        for s in picked {
-            match probes.remove(&s).unwrap_or(Probe::Missing) {
-                Probe::Read(v) => out
-                    .entries
-                    .extend(entries_of(&v).into_iter().filter(|e| within(e.dated))),
-                Probe::Large(vid, dated) if within(dated) => out.large.push(vid),
-                Probe::Large(..) => {}
-                Probe::Expired(..) => out.expired.push(id(s)),
-                Probe::Missing | Probe::Lost => out.missing.push(id(s)),
-            }
-        }
-        Ok(Answer {
-            got: Got::Entries(out),
-            age,
-        })
-    }
-
-    /// Probe the listed blocks `todo` of a range read (spec §5.4), the
-    /// configured window of them at once, into `probes`, until `deadline`
-    /// (`None`: none this device's clock can hold). A block a probe lost
-    /// ([`Probe::Lost`]) is probed again in place after [`retry_pause`],
-    /// up to `tries` probes of it in all (spec §17.1). Whether every one
-    /// was probed by then.
-    #[allow(clippy::too_many_arguments)]
-    async fn probe_all(
-        self: &Arc<Self>,
-        c: &Name,
-        device: &Name,
-        todo: Vec<u64>,
-        probes: &mut HashMap<u64, Probe>,
-        deadline: Option<Instant>,
-        tries: u32,
-    ) -> bool {
-        let ask = |s: u64, misses: u32| async move {
-            if misses > 0 {
-                rt::sleep(retry_pause(misses - 1)).await;
-            }
-            (s, misses, self.probe(c, device, s).await)
-        };
-        let window = self.config.window.max(1);
-        let mut todo = todo.into_iter();
-        let mut fetching = stream::FuturesUnordered::new();
-        loop {
-            while fetching.len() < window
-                && let Some(s) = todo.next()
-            {
-                fetching.push(ask(s, 0));
-            }
-            let left = deadline.map_or(Duration::MAX, |d| {
-                d.saturating_duration_since(Instant::now())
-            });
-            match rt::timeout(left, fetching.next()).await {
-                Ok(Some((s, misses, Probe::Lost))) if misses + 1 < tries => {
-                    probes.insert(s, Probe::Lost);
-                    fetching.push(ask(s, misses + 1));
-                }
-                Ok(Some((s, _, p))) => {
-                    probes.insert(s, p);
-                }
-                Ok(None) => return true,
-                Err(_) => return false,
-            }
-        }
-    }
-
-    /// The first index in `lo..hi` of `seqs` whose block's dates satisfy
-    /// `pred` (monotone along the stream for an honest writer), searched by
-    /// probing blocks: interpolation on `target` between the nearest known
-    /// dates, alternating with bisection so a skewed stream costs at most
-    /// twice the bisection's probes. Each round probes the guess alone, a
-    /// probe lost on the way probed again in place up to [`SEARCH_TRIES`]
-    /// times, so loss costs the search time, never other blocks. Only when
-    /// no probe reached the guess does the round widen: it probes at once
-    /// the [`SEARCH_WIDEN`] indices nearest it not probed yet, twice as
-    /// many each step none answers, at most the window's worth for the
-    /// guess ([`Self::probe_all`]), and takes the nearest that answers.
-    /// When none answers, the rest of `lo..hi` is not probed: it is counted
-    /// missing, and the caller takes it in whole — so a round costs one
-    /// block while probes answer, withheld blocks cost at most one window
-    /// more, not a probe each, and `deadline` bounds the whole. Except when
-    /// `deadline` itself ended the round and no more than a window of
-    /// blocks is left in `lo..hi`: the bound running out is no evidence that
-    /// they are withheld, so they are left unjudged for the caller to fetch
-    /// within its own bound. Returns `(lo, hi)` narrowed: equal when found.
-    #[allow(clippy::too_many_arguments)]
-    async fn search(
-        self: &Arc<Self>,
-        c: &Name,
-        device: &Name,
-        seqs: &[u64],
-        probes: &mut HashMap<u64, Probe>,
-        (mut lo, mut hi): (usize, usize),
-        target: Timestamp,
-        deadline: Option<Instant>,
-        pred: impl Fn((Timestamp, Timestamp)) -> bool,
-    ) -> (usize, usize) {
-        let window = self.config.window.max(1);
-        let mut round = 0usize;
-        while lo < hi {
-            round += 1;
-            let known = |i: usize, probes: &HashMap<u64, Probe>| probes.get(&seqs[i])?.dates();
-            // Interpolate between the nearest known dates around the window.
-            let below = (0..lo)
-                .rev()
-                .find_map(|i| known(i, probes).map(|d| (i, d.1)));
-            let above = (hi..seqs.len()).find_map(|i| known(i, probes).map(|d| (i, d.0)));
-            let guess = match (round % 2, below, above) {
-                (1, Some((i, a)), Some((j, b))) if b > a => {
-                    let span = (b.0 - a.0) as u128;
-                    let off = (target.0.saturating_sub(a.0) as u128).min(span);
-                    let at = i as u128 + (off * (j - i) as u128) / span;
-                    (at as usize).clamp(lo, hi - 1)
-                }
-                _ => lo + (hi - lo) / 2,
-            };
-            // The guess; when no probe reached it, the nearest indices in
-            // the interval, a step of them at once.
-            let order = || (guess..hi).chain((lo..guess).rev());
-            if !settled(probes, seqs[guess]) {
-                self.probe_all(c, device, vec![seqs[guess]], probes, deadline, SEARCH_TRIES)
-                    .await;
-            }
-            let (mut step, mut widened) = (SEARCH_WIDEN, 0);
-            while widened < window && order().all(|i| known(i, probes).is_none()) {
-                let batch: Vec<u64> = order()
-                    .filter(|i| *i != guess)
-                    .map(|i| seqs[i])
-                    .filter(|s| !settled(probes, *s))
-                    .take(step.min(window - widened))
-                    .collect();
-                if batch.is_empty() {
-                    break;
-                }
-                widened += batch.len();
-                if !self
-                    .probe_all(c, device, batch, probes, deadline, SEARCH_TRIES)
-                    .await
-                {
-                    break;
-                }
-                step *= 2;
-            }
-            let Some((i, d)) = order().find_map(|i| known(i, probes).map(|d| (i, d))) else {
-                // No probe answered. When the bound ran out inside this round that is no
-                // evidence of withholding, and a window of blocks or fewer left unjudged is
-                // what the caller fetches whole, within the bound of its own: asking them
-                // costs no more versions than a widened round does. Otherwise (a window of
-                // probes answered none, or more blocks than a window are unjudged) the
-                // rest of the interval is not probed and is missing.
-                let cut = deadline.is_some_and(|d| Instant::now() >= d);
-                if !(cut && hi - lo <= window) {
-                    for s in &seqs[lo..hi] {
-                        let p = probes.entry(*s).or_insert(Probe::Missing);
-                        if matches!(p, Probe::Lost) {
-                            *p = Probe::Missing;
-                        }
-                    }
-                }
-                return (lo, hi);
-            };
-            if pred(d) {
-                hi = i;
-            } else {
-                lo = i + 1;
-            }
-        }
-        (lo, hi)
-    }
-
     /// An answer with its version read whole: a large payload fetched in
     /// pieces ([`Self::materialize`]).
     async fn whole(self: &Arc<Self>, a: Result<Answer, DataError>) -> Result<Answer, DataError> {
@@ -14544,45 +12704,6 @@ impl Inner {
             other => Ok(other),
         }
     }
-}
-
-/// What a range read found of one listed block (spec §5.4).
-enum Probe {
-    /// Verified: a block, or a version of one entry.
-    Read(Box<Version>),
-    /// A version in pieces, and its date: read it by name.
-    Large(VersionId, Timestamp),
-    /// Expired here: the dates of its first and last entry (`None`: a
-    /// sealed block dropped unopened, its last date unknown).
-    Expired(Timestamp, Option<Timestamp>),
-    /// Not to be had verified, and asking again does not mend it: a
-    /// refusal kept against its name, or a search that stopped short of it.
-    Missing,
-    /// No ask of the probe answered with it verified — lost on the way, or
-    /// answered with a reply that did not verify: asking again may mend it
-    /// (spec §17.1), and it is missing only if no probe of it does.
-    Lost,
-}
-
-impl Probe {
-    /// The dates of its first and last entry, if known. An expired block
-    /// whose last date is unknown may reach any later date: a time search
-    /// takes it as overlapping every range from its first entry on, so a
-    /// range read lists it under `expired`.
-    fn dates(&self) -> Option<(Timestamp, Timestamp)> {
-        match self {
-            Probe::Read(v) => Some((v.dated, last_dated(v))),
-            Probe::Large(_, d) => Some((*d, *d)),
-            Probe::Expired(a, b) => Some((*a, b.unwrap_or(Timestamp(u64::MAX)))),
-            Probe::Missing | Probe::Lost => None,
-        }
-    }
-}
-
-/// Whether a range read is done probing block `s`: probed, and not lost
-/// ([`Probe::Lost`] is probed again).
-fn settled(probes: &HashMap<u64, Probe>, s: u64) -> bool {
-    probes.get(&s).is_some_and(|p| !matches!(p, Probe::Lost))
 }
 
 /// One ask of an asker device this device is working on ([`Inner::ask_slot`]).
@@ -14721,11 +12842,6 @@ impl Inner {
         .await;
         let (data, source) = got?;
         let w = data.raw().clone();
-        let mut st = self.st.lock();
-        if st.expire_named(&strip_piece(name)) {
-            tracing::debug!(%name, "fetched after its version expired here; not kept");
-            return None;
-        }
         self.store.insert(name.clone(), w.clone());
         Some((w, source))
     }
@@ -14736,7 +12852,7 @@ impl Inner {
     /// an empty one once every piece is held. `None` when a piece is not to
     /// be had.
     ///
-    /// Pieces are asked a window at once (spec §4.1, §17.1): the manifest
+    /// Pieces are asked a window at once (spec §13.1, §17.1): the manifest
     /// a level at a time, then the chunks, at most [`Config::window`] of
     /// them in flight, each an owed fetch with its own bounded asks. A
     /// piece not to be had neither stops the walk nor holds back the pieces
@@ -14837,7 +12953,7 @@ impl Inner {
     }
 
     /// Read version `v` whole: a large payload is fetched piece by piece
-    /// and opened (spec §4.1); any other is returned as it is.
+    /// and opened (spec §13.1); any other is returned as it is.
     async fn materialize(self: &Arc<Self>, v: Version) -> Result<Version, DataError> {
         if !matches!(v.payload, Payload::Large { .. }) {
             return Ok(v);
@@ -14859,7 +12975,7 @@ impl Inner {
             .await
             .ok_or_else(unavailable)?;
         let bad = || refused(&v.name, Refusal::BadSignature);
-        // A payload in pieces is one entry: a block always travels inline.
+        // A payload in pieces is one entry.
         let (fields, op) = match epoch {
             Some(e) => {
                 let key = self.st.lock().keys.key(&v.collection, &e).ok_or_else(|| {
@@ -14867,10 +12983,7 @@ impl Inner {
                         name: v.name.clone(),
                     }
                 })?;
-                match seal::open_payload(&key, &v.name, &payload) {
-                    Some(Inline::Fields(fields, op)) => (fields, op),
-                    _ => return Err(bad()),
-                }
+                seal::open_payload(&key, &v.name, &payload).ok_or_else(bad)?
             }
             None => wire::decode_payload(Bytes::from(payload)).map_err(|_| bad())?,
         };
@@ -14988,48 +13101,6 @@ impl Inner {
         });
     }
 
-    // ---- expiry -------------------------------------------------------------------------------
-
-    /// Arm the sweeper for a version kept `keep` just taken, if it is kept
-    /// until earlier than the sweeper wakes for.
-    fn arm_sweep(&self, st: &mut St, keep: Keep) {
-        if let Keep::Until(t) = keep
-            && st.sweep_at.is_none_or(|s| t < s)
-        {
-            st.sweep_at = Some(t);
-            self.sweep.notify_one();
-        }
-    }
-
-    /// Drop what expires on time (spec §14.1): a task that wakes at the
-    /// earliest `Keep::Until` this device holds (or when an earlier one
-    /// arrives), reads its clock again, and expires what passed. Ends with
-    /// the device.
-    fn spawn_sweeper(self: &Arc<Self>) {
-        let weak = Arc::downgrade(self);
-        let sweep = Arc::clone(&self.sweep);
-        rt::spawn(async move {
-            loop {
-                let (next, now) = {
-                    let Some(inner) = weak.upgrade() else { return };
-                    let mut st = inner.st.lock();
-                    let colls: Vec<Name> = st.colls.keys().cloned().collect();
-                    let next = colls.iter().filter_map(|c| st.expire(c)).min();
-                    st.sweep_at = next;
-                    (next, (inner.config.clock)())
-                };
-                let woken = sweep.notified();
-                match next {
-                    Some(t) => {
-                        let wait = Duration::from_millis(t.0.saturating_sub(now.0).max(1));
-                        let _ = rt::timeout(wait, woken).await;
-                    }
-                    None => woken.await,
-                }
-            }
-        });
-    }
-
     /// The device an ask's proof claims asks, by its key locator, and the
     /// proof's packet: unverified, for the checks that cost nothing.
     fn claimed_asker(proof: &Bytes) -> Option<(Data, Name)> {
@@ -15104,109 +13175,11 @@ impl Inner {
     }
 }
 
-/// The id of the version named `name` of `coll`, if this device holds it in
-/// any state (applied, waiting, refused, locked).
-fn version_id(coll: &Coll, name: &Name) -> Option<VersionId> {
-    coll.versions
-        .values()
-        .chain(&coll.waiting)
-        .chain(&coll.outsiders)
-        .find(|hv| hv.version.name == *name)
-        .map(|hv| hv.version.id.clone())
-        .or_else(|| {
-            coll.locked
-                .iter()
-                .find(|l| l.name == *name)
-                .map(|l| VersionId {
-                    writer: l.writer.clone(),
-                    seq: Seq(l.seq),
-                })
-        })
-}
-
-/// Whether `coll` holds version `id` in any state (applied, waiting,
-/// refused, locked).
-fn holds_entry(coll: &Coll, id: &VersionId) -> bool {
-    coll.versions.contains_key(id)
-        || coll
-            .waiting
-            .iter()
-            .chain(&coll.outsiders)
-            .any(|hv| hv.version.id == *id)
-        || coll
-            .locked
-            .iter()
-            .any(|l| l.writer == id.writer && l.seq == id.seq.0)
-}
-
-/// Take out of `coll` every version `gone` picks (by id and keep), in any
-/// state: with its name, what it leaves, and its epoch.
-fn take_out(
-    coll: &mut Coll,
-    gone: impl Fn(&VersionId, Keep) -> bool,
-) -> Vec<(VersionId, Name, Tomb, Option<Epoch>)> {
-    let mut out = Vec::new();
-    let ids: Vec<VersionId> = coll
-        .versions
-        .values()
-        .filter(|hv| gone(&hv.version.id, hv.version.keep))
-        .map(|hv| hv.version.id.clone())
-        .collect();
-    for id in ids {
-        let hv = coll.versions.remove(&id).expect("listed above");
-        coll.pending.remove(&id);
-        out.push((
-            id,
-            hv.version.name.clone(),
-            tomb_of(&hv.version),
-            hv.epoch.clone(),
-        ));
-    }
-    for list in [&mut coll.waiting, &mut coll.outsiders] {
-        list.retain(|hv| {
-            if !gone(&hv.version.id, hv.version.keep) {
-                return true;
-            }
-            out.push((
-                hv.version.id.clone(),
-                hv.version.name.clone(),
-                tomb_of(&hv.version),
-                hv.epoch.clone(),
-            ));
-            false
-        });
-    }
-    coll.locked.retain(|l| {
-        let id = VersionId {
-            writer: l.writer.clone(),
-            seq: Seq(l.seq),
-        };
-        if !gone(&id, l.body.keep) {
-            return true;
-        }
-        // Sealed and never opened: its last entry's date is unknown.
-        let tomb = Tomb {
-            writer: l.writer.key().clone(),
-            keep: l.body.keep,
-            first: l.body.dated,
-            last: None,
-        };
-        out.push((id, l.name.clone(), tomb, Some(l.epoch().clone())));
-        false
-    });
-    out
-}
-
-/// A sealed payload opened: its fields and operation, or its block, into
-/// the record's body.
-fn open_into(body: &mut VersionBody, opened: Inline) {
-    match opened {
-        Inline::Fields(fields, op) => {
-            body.fields = fields;
-            body.op = op;
-        }
-        Inline::Block(entries) => body.block = Some(entries),
-    }
+/// A sealed payload opened: its fields and operation, into the record's
+/// body.
+fn open_into(body: &mut VersionBody, (fields, op): (Content, Bytes)) {
+    body.fields = fields;
+    body.op = op;
 }
 
 /// The version a piece name belongs to; any other name as it is.
@@ -15452,18 +13425,9 @@ fn version_of(
         rule: body.rule,
         digest,
         op,
-        payload: match (body.chunks, body.block) {
-            (Some(c), _) => Payload::Large { size: c.size },
-            (None, Some(entries)) => Payload::Block(
-                entries
-                    .into_iter()
-                    .map(|e| BlockEntry {
-                        dated: Timestamp(body.dated.0.saturating_add(e.offset)),
-                        content: e.fields,
-                    })
-                    .collect(),
-            ),
-            (None, None) => Payload::Entry(body.fields),
+        payload: match body.chunks {
+            Some(c) => Payload::Large { size: c.size },
+            None => Payload::Entry(body.fields),
         },
     }
 }
@@ -15497,7 +13461,7 @@ fn check_collection(c: &Name) -> Result<(), DataError> {
 impl Device {
     /// [`DataLayer::put`] and [`DataLayer::put_op`]: sign `draft` into
     /// `collection` (its record first, for a collection of this namespace
-    /// that has none), batched into a block when asked and the rule allows.
+    /// that has none).
     async fn put_draft(
         &self,
         collection: &Name,
@@ -15506,16 +13470,6 @@ impl Device {
     ) -> Result<VersionId, DataError> {
         let inner = &self.inner;
         check_collection(collection)?;
-        if let Some(delay) = options.batch.filter(|d| *d > BATCH_MAX) {
-            return Err(DataError::BadRequest {
-                name: collection.clone(),
-                why: format!(
-                    "a batch delay of {delay:?} is longer than the {BATCH_MAX:?} an entry may wait \
-                     unsigned (a one-key head states it as the freshness readers add to every \
-                     answer's age); put with a batch of at most {BATCH_MAX:?}, or without batch"
-                ),
-            });
-        }
         let ns = namespace_of(collection).expect("checked above");
         inner.look_behind(collection).await?;
         // Under a folder in force the collection writes under the record in
@@ -15555,17 +13509,6 @@ impl Device {
                     match st.colls.get(collection).is_none_or(|c| c.members.is_none()) {
                         // A record arrived meanwhile: written under it.
                         false => Err(draft),
-                        true if options.batch.is_some() => {
-                            return Err(DataError::BadRequest {
-                                name: collection.clone(),
-                                why: format!(
-                                    "{collection} has no members record yet, and the one it \
-                                     gets merges its versions, one operation per version: its \
-                                     entries are not batched into blocks; put without batch, or \
-                                     share it as a log collection first"
-                                ),
-                            });
-                        }
                         true => Ok(inner.put_fresh(
                             &mut st,
                             collection,
@@ -15585,23 +13528,8 @@ impl Device {
             }
         };
         let key = inner.write_key(collection)?;
-        let PutOptions {
-            type_id,
-            keep,
-            batch,
-        } = options;
-        // An entry larger than a block carries goes alone (in pieces).
-        let alone = |content: &Content| {
-            wire::encode_block(&[BlockEntryBody {
-                offset: 0,
-                fields: content.clone(),
-            }])
-            .len()
-                > wire::INLINE_MAX
-        };
-        // An unbatched version's id; or the block a batched entry waits
-        // for, when its timer is to be armed, and whether a block closed.
-        let step = {
+        let PutOptions { type_id, keep } = options;
+        let id = {
             let mut st = inner.st.lock();
             inner.writable(&st, collection, key.as_ref().map(|(e, _)| e))?;
             let rule = st.colls[collection]
@@ -15610,75 +13538,19 @@ impl Device {
                 .expect("members known")
                 .rule
                 .clone();
-            match (batch, draft) {
-                (_, Draft::Op(_)) if log_like(&rule) => {
-                    return Err(DataError::BadRequest {
-                        name: collection.clone(),
-                        why: format!(
-                            "{collection} is a log collection: its versions carry fields, not a \
-                             merge rule's operation; put the fields"
-                        ),
-                    });
-                }
-                (Some(_), _) if !log_like(&rule) => {
-                    return Err(DataError::BadRequest {
-                        name: collection.clone(),
-                        why: format!(
-                            "{collection} merges its versions, and a merge collection carries one \
-                             operation per version: its entries are not batched into blocks; \
-                             put without batch"
-                        ),
-                    });
-                }
-                (Some(delay), Draft::Entry(content)) if !alone(&content) => {
-                    let Some(deadline) = Instant::now().checked_add(delay) else {
-                        return Err(DataError::BadRequest {
-                            name: collection.clone(),
-                            why: format!(
-                                "this device's clock cannot hold a deadline {delay:?} from now; \
-                                 put with a shorter batch, or without batch"
-                            ),
-                        });
-                    };
-                    let epoch = key.as_ref().map(|(e, _)| e.clone());
-                    let (rx, closed, arm) = inner.add_to_block(
-                        &mut st, collection, content, type_id, keep, epoch, delay, deadline,
-                    );
-                    Err((rx, arm, closed))
-                }
-                (_, draft) => {
-                    // What is open closes first: dates and seqs stay in order.
-                    inner.close_block(&mut st, collection);
-                    Ok(inner.write(
-                        &mut st,
-                        collection,
-                        &ns,
-                        key.as_ref(),
-                        type_id,
-                        keep,
-                        draft,
-                        Duration::ZERO,
-                    )?)
-                }
+            if matches!(draft, Draft::Op(_)) && rule == Rule::Log {
+                return Err(DataError::BadRequest {
+                    name: collection.clone(),
+                    why: format!(
+                        "{collection} is a log collection: its versions carry fields, not a \
+                         merge rule's operation; put the fields"
+                    ),
+                });
             }
+            inner.write(&mut st, collection, &ns, key.as_ref(), type_id, keep, draft)?
         };
-        match step {
-            Ok(id) => {
-                inner.publish_about(collection, &[]).await?;
-                Ok(id)
-            }
-            Err((rx, arm, closed)) => {
-                if let Some(at) = arm {
-                    inner.arm_block(collection.clone(), at);
-                }
-                if closed {
-                    inner.publish_about(collection, &[]).await?;
-                }
-                rx.await.map_err(|_| {
-                    local("the device shut down before the block carrying the entry was signed")
-                })?
-            }
-        }
+        inner.publish_about(collection, &[]).await?;
+        Ok(id)
     }
 }
 
@@ -15690,14 +13562,10 @@ impl DataLayer for Device {
         // Each reading below needs its own keyword in the name: one pass finds them, so a
         // plain collection name (the common read) is parsed by none of them.
         let words = wire::NameWords::of(name);
-        // A version or entry of a merge collection whose state is not built
-        // yet is read from it: built now (spec §5.2). A collection or state
-        // name is followed, which builds it ([`Inner::follow`]).
-        let entry = words.entry().then(|| parse_entry_name(name)).flatten();
-        let of = entry
-            .as_ref()
-            .and_then(|(v, _)| parse_log_name(v)?.subject)
-            .or_else(|| words.log().then(|| parse_log_name(name)?.subject).flatten());
+        // A version of a merge collection whose state is not built yet is
+        // read from it: built now (spec §5.2). A collection or state name
+        // is followed, which builds it ([`Inner::follow`]).
+        let of = words.log().then(|| parse_log_name(name)?.subject).flatten();
         if let Some(c) = of {
             inner.st.lock().awaken(&c);
         }
@@ -15737,52 +13605,27 @@ impl DataLayer for Device {
                 age: Age::Exact,
             });
         }
-        if let Some((version, index)) = entry {
-            return inner.get_entry(name, &version, index).await;
-        }
-        if words.range()
-            && let Some(range) = parse_range_name(name)
-        {
-            return match range {
-                Ok((c, range)) => {
-                    let a = inner.get_range(name, &c, range).await;
-                    inner.sealed_judged(name, &c, a).await
-                }
-                Err(why) => Err(DataError::BadName {
-                    name: name.clone(),
-                    why: why.0,
-                }),
-            };
-        }
         if words.log() && parse_log_name(name).is_some() {
             return inner.get_log_entry(name).await;
         }
         check_collection(name)?;
-        // The rule decides how the newest is found: a one-key collection's
-        // by its head, without following its versions (spec §5.3).
-        let peek = {
+        // A collection not read before: followed, and its members record
+        // waited for (at most the first-look time), so that what the record
+        // seals or governs is known before the answer is judged.
+        let unread = {
             let st = inner.st.lock();
             !st.inside(name) && st.colls.get(name).is_none_or(|x| x.members.is_none())
         };
-        if peek {
-            inner.peek(name).await?;
+        inner.look(name).await?;
+        if unread {
+            inner
+                .wait_for(|st| st.colls.get(name).is_some_and(|x| x.members.is_some()))
+                .await;
         }
-        let (one, sealed) = {
-            let st = inner.st.lock();
-            (
-                st.colls.get(name).and_then(one_key),
-                inner.sealed_off(&st, name),
-            )
-        };
-        if sealed {
+        if inner.sealed_off(&inner.st.lock(), name) {
             let sealed = Err(DataError::Sealed { name: name.clone() });
             return inner.sealed_judged(name, name, sealed).await;
         }
-        if let Some((key, device)) = one {
-            let a = inner.newest_one_key(name, &key, &device).await;
-            return inner.whole(a).await;
-        }
-        inner.look(name).await?;
         inner.known_under_folder(name);
         // A reader holding sealed versions waits (at most the first-look
         // time) for the keys it asks for.
@@ -15920,17 +13763,6 @@ impl DataLayer for Device {
                 Got::State(s) => s.name,
                 Got::Version(v) => v.name,
                 Got::Snapshot(s) => s.name,
-                // An entry's name is immutable, so it pins as it is; a
-                // range read's answer grows with the stream.
-                Got::Entries(_) if wire::parse_entry_name(name).is_some() => name.clone(),
-                Got::Entries(_) => {
-                    return Err(DataError::BadRequest {
-                        name: name.clone(),
-                        why: "a range read's answer grows with its stream, so a snapshot cannot \
-                              pin it; pin the blocks it read, by their names"
-                            .into(),
-                    });
-                }
             };
             pins.push(pin);
         }
@@ -16128,8 +13960,7 @@ impl Inner {
     /// The rule, writers and readers a record of `name` signs for
     /// `members` over `current`, its own record in force (spec §15): the
     /// whole content given, or `current` changed. `None` when a change
-    /// changes nothing: nothing is signed. A one-key record is written by
-    /// exactly one key (spec §5.3), named as a key or as this device.
+    /// changes nothing: nothing is signed.
     fn resolve_share(
         &self,
         name: &Name,
@@ -16142,24 +13973,9 @@ impl Inner {
         };
         let change = match members {
             crate::layer::Sharing::Whole(share) => {
-                let writers = match (&share.rule, share.writers.as_slice()) {
-                    (Rule::OneKey, [w]) if *w == self.device => vec![self.writer.key().clone()],
-                    (Rule::OneKey, [w])
-                        if device_of(w).is_some_and(|d| wire::is_device_name(&d)) =>
-                    {
-                        vec![w.clone()]
-                    }
-                    (Rule::OneKey, _) => {
-                        return Err(bad("a one-key collection is written by exactly one key: \
-                                        name the one key that writes, <D>/KEY/<id>, or this \
-                                        device"
-                            .into()));
-                    }
-                    _ => share.writers.clone(),
-                };
                 return Ok(Some(crate::layer::Share {
                     rule: share.rule.clone(),
-                    writers,
+                    writers: share.writers.clone(),
                     readers: share.readers.clone(),
                 }));
             }
@@ -16226,11 +14042,6 @@ impl Inner {
         }
         if writers == m.writers && readers == m.readers {
             return Ok(None);
-        }
-        if m.rule == Rule::OneKey && writers != m.writers {
-            return Err(bad(
-                "a one-key record's one writer changes only by sharing the record whole".into(),
-            ));
         }
         Ok(Some(crate::layer::Share {
             rule: m.rule.clone(),
@@ -16337,7 +14148,6 @@ mod tests {
             page: None,
             entries: Vec::new(),
             members: Vec::new(),
-            expiry: Vec::new(),
             branches: Branches::Children(Vec::new()),
         };
         let signer = keys.get_signer_sync(key).unwrap();
@@ -16554,7 +14364,6 @@ mod tests {
                 revision: 1,
             },
             keep: crate::Keep::Forever,
-            batch: None,
         };
         let share = crate::layer::Share {
             rule: Rule::Merge {
@@ -16719,7 +14528,6 @@ mod tests {
             op: Bytes::new(),
             sealed,
             chunks: None,
-            block: None,
         }
     }
 
@@ -17452,8 +15260,6 @@ mod tests {
         }
     }
 
-    // ---- slice 4: blocks, one key, expiry, range reads --------------------------------------
-
     /// A namespace authority for `ns`: its key store, its key and the
     /// trust anchor a validator takes.
     async fn authority(ns: &Name) -> (SecurityManager, Name, ndn_security::Certificate) {
@@ -17487,106 +15293,6 @@ mod tests {
             },
         );
         (wire, sig)
-    }
-
-    /// A block of `c` carrying a reading per entry, offsets a minute apart.
-    fn block(c: &Name, readings: &[&'static str]) -> VersionBody {
-        VersionBody {
-            block: Some(
-                readings
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| BlockEntryBody {
-                        offset: i as u64 * 60_000,
-                        fields: Content::new().with("t", Bytes::from_static(r.as_bytes())),
-                    })
-                    .collect(),
-            ),
-            ..version_body(c, None)
-        }
-    }
-
-    #[tokio::test]
-    async fn a_block_entry_verifies_only_through_the_blocks_signature() {
-        let ns = n("/sam");
-        let (authority, issuer, anchor) = authority(&ns).await;
-        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
-        let (sensor_keys, key, cert) = device_key(&authority, &issuer, &sensor).await;
-        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.add_trust_anchor(anchor));
-        validator.adopt_context(context("/rita")).unwrap();
-        validator.cert_cache().insert(cert);
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let dev = start(&reader, &keys_of(&reader), &validator, &store)
-            .await
-            .unwrap();
-        let c = n("/sam/32=data/temps");
-        let (a, b) = (
-            log_name(&sensor, Some(&c), 4),
-            log_name(&sensor, Some(&c), 5),
-        );
-        let genuine = block(&c, &["20.5", "20.7"]);
-        let (wire_a, sig_a) = signed(&sensor_keys, &key, &a, &wire::encode_version(&genuine));
-        // The holder alters one entry, or splices in another block's, and
-        // keeps the block's signature.
-        let forged = block(&c, &["20.5", "99.9"]);
-        let mut spliced = genuine.clone();
-        spliced.block.as_mut().unwrap()[1] = block(&c, &["18.0", "18.2"]).block.unwrap()[1].clone();
-        for (what, body) in [("forged", forged), ("spliced", spliced)] {
-            let sig = sig_a.clone();
-            let signer = sensor_keys.get_signer_sync(&key).unwrap();
-            let wire = DataBuilder::new(a.clone(), &wire::encode_version(&body)).sign_sync(
-                signer.sig_type(),
-                Some(&key),
-                |_| sig,
-            );
-            let refused = dev.inner.take_data(&a, Data::decode(wire).unwrap()).await;
-            assert_eq!(refused, Err(Refusal::BadSignature), "a {what} entry");
-            assert!(
-                !dev.inner.st.lock().held.contains_key(&a),
-                "a {what} block is not held, so the block may be fetched elsewhere"
-            );
-        }
-        // Another block's whole packet under this block's name: refused too.
-        let (wire_b, _) = signed(
-            &sensor_keys,
-            &key,
-            &b,
-            &wire::encode_version(&block(&c, &["18.0"])),
-        );
-        assert!(
-            dev.inner
-                .take_data(&a, Data::decode(wire_b).unwrap())
-                .await
-                .is_err()
-        );
-        dev.inner
-            .take_data(&a, Data::decode(wire_a).unwrap())
-            .await
-            .expect("the genuine block is taken");
-        let st = dev.inner.st.lock();
-        let held = st.colls[&c]
-            .waiting
-            .iter()
-            .find(|hv| hv.version.name == a)
-            .expect("held, waiting for its collection's record");
-        let Payload::Block(entries) = &held.version.payload else {
-            panic!("a block is read as a block");
-        };
-        let read: Vec<_> = entries
-            .iter()
-            .map(|e| e.content.get("t").cloned())
-            .collect();
-        assert_eq!(
-            read,
-            vec![
-                Some(Bytes::from_static(b"20.5")),
-                Some(Bytes::from_static(b"20.7"))
-            ]
-        );
-        assert!(entries[0].dated < entries[1].dated);
-        drop(st);
-        dev.shutdown();
     }
 
     /// The order of the P-256 group.
@@ -17745,297 +15451,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rolled_back_head_is_refused_also_after_a_restart() {
-        let ns = n("/sam");
-        let (authority, issuer, anchor) = authority(&ns).await;
-        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
-        let (sensor_keys, key, cert) = device_key(&authority, &issuer, &sensor).await;
-        // Another key of the same device, certified too.
-        let other = sensor_keys
-            .generate_ed25519(sensor.clone().append("KEY").append("2"))
-            .unwrap();
-        let public = sensor_keys
-            .get_signer_sync(&other)
-            .unwrap()
-            .public_key()
-            .unwrap();
-        let other_cert = authority
-            .certify(&other, public, &issuer, VALIDITY_MS)
-            .await
-            .unwrap();
-        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.add_trust_anchor(anchor));
-        validator.adopt_context(context("/rita")).unwrap();
-        validator.cert_cache().insert(cert);
-        validator.cert_cache().insert(other_cert);
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let reader_keys = keys_of(&reader);
-        let c = n("/sam/32=data/temps");
-        let head = |signer: &Name, seq: u64| {
-            let body = HeadBody {
-                collection: c.clone(),
-                seq,
-                digest: [seq as u8; 32],
-                freshness: 60_000,
-            };
-            let name = head_name(&sensor, &c, seq);
-            let (wire, _) = signed(&sensor_keys, signer, &name, &wire::encode_head(&body));
-            Data::decode(wire).unwrap()
-        };
-        let one = Writer::new(key.clone());
-        let first = start(&reader, &reader_keys, &validator, &store)
-            .await
-            .unwrap();
-        let accept = |dev: &Device, d: Data| {
-            let (inner, c, one, sensor) = (
-                Arc::clone(&dev.inner),
-                c.clone(),
-                one.clone(),
-                sensor.clone(),
-            );
-            async move { inner.accept_head(&c, &one, &sensor, &d).await }
-        };
-        accept(&first, head(&key, 5))
-            .await
-            .expect("a first head is taken");
-        assert!(
-            matches!(
-                accept(&first, head(&other, 9)).await,
-                Err(HeadRefusal::NotTheKey)
-            ),
-            "a head signed by any key but the one key is refused"
-        );
-        first.shutdown();
-        drop(first);
-
-        let again = start(&reader, &reader_keys, &validator, &store)
-            .await
-            .unwrap();
-        let refused = accept(&again, head(&key, 3)).await;
-        assert!(
-            matches!(refused, Err(HeadRefusal::Rollback { seq: 3, seen: 5 })),
-            "a head below the one verified before the restart is refused: {refused:?}"
-        );
-        accept(&again, head(&key, 5))
-            .await
-            .expect("the same head is taken");
-        accept(&again, head(&key, 8))
-            .await
-            .expect("a newer head is taken");
-        again.shutdown();
-    }
-
-    #[tokio::test]
-    async fn a_heads_rollback_floor_is_its_own_keys() {
-        let ns = n("/sam");
-        let (authority, issuer, anchor) = authority(&ns).await;
-        let (old, spare, reader) = (n("/sam/sensor"), n("/sam/spare"), n("/rita/phone"));
-        let (old_keys, old_key, old_cert) = device_key(&authority, &issuer, &old).await;
-        let (spare_keys, spare_key, spare_cert) = device_key(&authority, &issuer, &spare).await;
-        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.add_trust_anchor(anchor));
-        validator.adopt_context(context("/rita")).unwrap();
-        validator.cert_cache().insert(old_cert);
-        validator.cert_cache().insert(spare_cert);
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let reader_keys = keys_of(&reader);
-        let c = n("/sam/32=data/temps");
-        let head = |keys: &SecurityManager, key: &Name, device: &Name, seq: u64| {
-            let body = HeadBody {
-                collection: c.clone(),
-                seq,
-                digest: [seq as u8; 32],
-                freshness: 60_000,
-            };
-            let name = head_name(device, &c, seq);
-            let (wire, _) = signed(keys, key, &name, &wire::encode_head(&body));
-            Data::decode(wire).unwrap()
-        };
-        let accept = |dev: &Device, key: &Name, device: &Name, d: Data| {
-            let (inner, c, one, device) = (
-                Arc::clone(&dev.inner),
-                c.clone(),
-                Writer::new(key.clone()),
-                device.clone(),
-            );
-            async move { inner.accept_head(&c, &one, &device, &d).await }
-        };
-        let first = start(&reader, &reader_keys, &validator, &store)
-            .await
-            .unwrap();
-        accept(&first, &old_key, &old, head(&old_keys, &old_key, &old, 50))
-            .await
-            .expect("the first one key's head is taken");
-        // The owner hands the collection to a spare sensor, whose log is
-        // numbered from its own start.
-        accept(
-            &first,
-            &spare_key,
-            &spare,
-            head(&spare_keys, &spare_key, &spare, 3),
-        )
-        .await
-        .expect("a head of the new one key is not held below the old key's seqs");
-        // A seq of the key known here (a verified node, version or
-        // tombstone) is a floor for its heads.
-        first
-            .inner
-            .st
-            .lock()
-            .colls
-            .entry(c.clone())
-            .or_default()
-            .entries
-            .entry(Writer::new(spare_key.clone()))
-            .or_default()
-            .insert(7);
-        let refused = accept(
-            &first,
-            &spare_key,
-            &spare,
-            head(&spare_keys, &spare_key, &spare, 6),
-        )
-        .await;
-        assert!(
-            matches!(refused, Err(HeadRefusal::Rollback { .. })),
-            "a head below a seq of its key known here is a rollback: {refused:?}"
-        );
-        first.shutdown();
-        drop(first);
-
-        let again = start(&reader, &reader_keys, &validator, &store)
-            .await
-            .unwrap();
-        for (keys, key, device, seq) in [
-            (&old_keys, &old_key, &old, 49),
-            (&spare_keys, &spare_key, &spare, 2),
-        ] {
-            let refused = accept(&again, key, device, head(keys, key, device, seq)).await;
-            assert!(
-                matches!(refused, Err(HeadRefusal::Rollback { .. })),
-                "each key's floor survives a restart: {key} {refused:?}"
-            );
-        }
-        accept(
-            &again,
-            &spare_key,
-            &spare,
-            head(&spare_keys, &spare_key, &spare, 3),
-        )
-        .await
-        .expect("the new key's same head is taken again");
-        again.shutdown();
-    }
-
-    /// The members record of one-key collection `c` naming `key`, taken by
-    /// `dev` as its owner's.
-    fn one_key_record(dev: &Device, c: &Name, key: &Name) {
-        let body = MembersBody {
-            collection: c.clone(),
-            folder: false,
-            revision: 1,
-            rule: Rule::OneKey,
-            writers: vec![key.clone()],
-            readers: Vec::new(),
-            cuts: Vec::new(),
-            epoch: None,
-            key_check: None,
-            since: None,
-            parent: None,
-        };
-        let owner = Writer::new(n("/sam/owner/KEY/1"));
-        let mut st = dev.inner.st.lock();
-        st.accept_members(1, body, &owner, &dev.inner.config.rules, dev.inner.me());
-    }
-
-    #[tokio::test]
-    async fn an_older_version_never_takes_the_age_of_a_newer_head() {
-        let ns = n("/sam");
-        let (authority, issuer, anchor) = authority(&ns).await;
-        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
-        let (sensor_keys, key, cert) = device_key(&authority, &issuer, &sensor).await;
-        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.add_trust_anchor(anchor));
-        validator.adopt_context(context("/rita")).unwrap();
-        validator.cert_cache().insert(cert);
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let dev = start(&reader, &keys_of(&reader), &validator, &store)
-            .await
-            .unwrap();
-        let c = n("/sam/32=data/temps");
-        let one = Writer::new(key.clone());
-        one_key_record(&dev, &c, &key);
-        // Version 1 of the one key, held and applied.
-        hand(
-            &dev,
-            &sensor,
-            &c,
-            1,
-            Record::Version(version_body(&c, None)),
-        );
-        // A head of seq 5 arrives and verifies; the node it names, and
-        // version 5, are withheld.
-        let body = HeadBody {
-            collection: c.clone(),
-            seq: 5,
-            digest: [5; 32],
-            freshness: 60_000,
-        };
-        let (wire, _) = signed(
-            &sensor_keys,
-            &key,
-            &head_name(&sensor, &c, 5),
-            &wire::encode_head(&body),
-        );
-        dev.inner
-            .accept_head(&c, &one, &sensor, &Data::decode(wire).unwrap())
-            .await
-            .expect("the head is taken");
-        // Version 1 was never confirmed the newest in this run, and a head
-        // verified since says the log went past it: no age bounds it.
-        match dev.inner.newest_one_key(&c, &one, &sensor).await {
-            Ok(Answer {
-                got: Got::Version(v),
-                age,
-            }) if v.id.seq.0 < 5 => panic!(
-                "version {} answered with {age:?}, the age of a newer head",
-                v.id.seq.0
-            ),
-            Ok(other) => panic!("answered {other:?}"),
-            Err(e) => assert_eq!(e.next(), crate::NextStep::RetryLater, "{e}"),
-        }
-        // Had a head of this run named version 1 the newest and delivered
-        // it, version 1 is answered, aged from that head's receipt.
-        let confirmed = Receipt {
-            at: Instant::now(),
-            freshness: Duration::from_secs(1),
-        };
-        dev.inner
-            .st
-            .lock()
-            .seen
-            .get_mut(&(c.clone(), one.clone()))
-            .expect("the head is kept")
-            .delivered = Some((1, confirmed));
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let since = confirmed.at.elapsed() + confirmed.freshness;
-        match dev.inner.newest_one_key(&c, &one, &sensor).await {
-            Ok(Answer {
-                got: Got::Version(v),
-                age: Age::Newest { unconfirmed_for },
-            }) => {
-                assert_eq!(v.id.seq.0, 1);
-                assert!(
-                    unconfirmed_for >= since,
-                    "aged from the head that named it the newest: {unconfirmed_for:?}"
-                );
-            }
-            other => panic!("a version confirmed the newest is answered: {other:?}"),
-        }
-        dev.shutdown();
-    }
-
-    #[tokio::test]
     async fn a_packet_from_the_wrong_signer_does_not_refuse_its_name() {
         let ns = n("/sam");
         let (authority, issuer, anchor) = authority(&ns).await;
@@ -18051,7 +15466,7 @@ mod tests {
             .unwrap();
         let c = n("/sam/32=data/temps");
         let a = log_name(&sensor, Some(&c), 4);
-        let content = wire::encode_version(&block(&c, &["20.5"]));
+        let content = wire::encode_version(&version_body(&c, None));
         // A key the trust schema accepts for the name, yet not the
         // sensor's: whoever answers the Interest signs that exact name.
         let (impostor, _) = signed(&authority, &issuer, &a, &content);
@@ -18075,903 +15490,18 @@ mod tests {
         dev.shutdown();
     }
 
-    /// A device of `/alice` whose wall clock reads `clock`, on a forwarder
-    /// that delivers nothing, keeping what it holds in `store`.
-    async fn device_at(
-        device: &Name,
-        keys: &Arc<SecurityManager>,
-        store: &Arc<dyn DataStore>,
-        clock: &Arc<AtomicU64>,
-    ) -> Device {
-        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        let ns = Name::from_components(device.components()[..1].iter().cloned());
-        validator.adopt_context(context(&ns.to_string())).unwrap();
-        let conn: Arc<dyn Connection> = Arc::new(Unconnected);
-        let read = Arc::clone(clock);
-        let config = Config {
-            clock: Arc::new(move || Timestamp(read.load(Ordering::Relaxed))),
-            ..Config::new()
-        };
-        Device::start(
-            Transport {
-                node: Node::from_connection(Arc::clone(&conn)),
-                sync: conn,
-            },
-            device.clone(),
-            Arc::clone(keys),
-            validator,
-            Arc::clone(store),
-            config,
-        )
-        .await
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn an_expired_version_is_dropped_answers_expired_and_is_not_stored_when_fetched_late() {
-        let laptop = n("/alice/laptop");
-        let keys = keys_of(&laptop);
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let clock = Arc::new(AtomicU64::new(1_000));
-        let dev = device_at(&laptop, &keys, &store, &clock).await;
-        let c = n("/alice/32=data/readings");
-        dev.share(&c, share_of(Rule::Log, &["/alice"], Vec::new()))
-            .await
-            .unwrap();
-        let mut changes = dev.watch(&c, &Frontier::new()).await.unwrap();
-        let phone = n("/alice/phone");
-        let kept = |until: u64| VersionBody {
-            keep: Keep::Until(Timestamp(until)),
-            dated: Timestamp(900),
-            ..version_body(&c, None)
-        };
-        let name = log_name(&phone, Some(&c), 1);
-        assert_eq!(
-            hand(&dev, &phone, &c, 1, Record::Version(kept(2_000))),
-            None
-        );
-        assert!(store.contains(&name), "applied, so kept");
-
-        clock.store(2_000, Ordering::Relaxed);
-        let Err(e @ DataError::Expired { keep, .. }) = dev.get(&name).await else {
-            panic!("a version past its keep is answered as expired");
-        };
-        assert_eq!(keep, Keep::Until(Timestamp(2_000)));
-        assert_eq!((e.next(), e.retry()), (crate::NextStep::None, false));
-        assert!(!store.contains(&name), "its record is dropped");
-        assert_eq!(dev.inner.packet_for(&name, false), None, "nor served");
-        let mut seen = Vec::new();
-        while let Ok(Some(Ok(change))) =
-            tokio::time::timeout(Duration::from_millis(50), changes.next()).await
-        {
-            seen.push(change);
-        }
-        let id = VersionId {
-            writer: Writer::new(phone.clone().append("KEY").append("1")),
-            seq: Seq(1),
-        };
-        assert!(
-            seen.iter()
-                .any(|ch| matches!(ch, Change::Expired { collection, id: i, .. } if *i == id && *collection == c)),
-            "its watcher is told: {seen:?}"
-        );
-
-        // Fetched after it expired here: neither taken nor stored.
-        let late = log_name(&phone, Some(&c), 2);
-        hand(&dev, &phone, &c, 2, Record::Version(kept(1_500)));
-        assert!(!store.contains(&late));
-        assert!(matches!(
-            dev.get(&late).await,
-            Err(DataError::Expired { .. })
-        ));
-        dev.shutdown();
-        drop(dev);
-
-        // After a restart, still expired, still not stored.
-        let again = device_at(&laptop, &keys, &store, &clock).await;
-        for v in [&name, &late] {
-            assert!(matches!(again.get(v).await, Err(DataError::Expired { .. })));
-            assert!(!store.contains(v));
-        }
-        again.shutdown();
-    }
-
-    /// A version taken before its collection's members record waits, so its
-    /// keep is no date the sweeper wakes for yet; once the record admits it,
-    /// the sweeper drops it on time, never asked for (spec §14.1).
-    #[tokio::test(start_paused = true)]
-    async fn a_version_admitted_by_a_later_record_is_dropped_on_time() {
-        let repo = n("/alice/repo");
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let clock = Arc::new(AtomicU64::new(1_000));
-        let dev = device_at(&repo, &keys_of(&repo), &store, &clock).await;
-        let c = n("/alice/32=data/readings");
-        let phone = n("/alice/phone");
-        let version = VersionBody {
-            keep: Keep::Until(Timestamp(2_000)),
-            dated: Timestamp(900),
-            ..version_body(&c, None)
-        };
-        let name = log_name(&phone, Some(&c), 2);
-        assert_eq!(hand(&dev, &phone, &c, 2, Record::Version(version)), None);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let members = MembersBody {
-            collection: c.clone(),
-            folder: false,
-            revision: 1,
-            rule: Rule::Log,
-            writers: vec![n("/alice")],
-            readers: Vec::new(),
-            cuts: Vec::new(),
-            epoch: None,
-            key_check: None,
-            since: None,
-            parent: None,
-        };
-        assert_eq!(hand(&dev, &phone, &c, 1, Record::Members(members)), None);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(
-            dev.inner.st.lock().colls[&c]
-                .versions
-                .values()
-                .any(|hv| hv.version.name == name),
-            "admitted once its record came"
-        );
-        clock.store(2_000, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert!(
-            matches!(dev.inner.st.lock().held.get(&name), Some(Held::Expired(_))),
-            "dropped by the sweeper at its keep"
-        );
-        dev.shutdown();
-    }
-
     fn reading(t: u64) -> Content {
         Content::new().with("t", Bytes::from(t.to_string()))
     }
 
-    fn options(batch: Option<Duration>) -> PutOptions {
+    fn options() -> PutOptions {
         PutOptions {
             type_id: crate::TypeId {
                 name: n("/types/reading"),
                 revision: 1,
             },
             keep: Keep::Forever,
-            batch,
         }
-    }
-
-    #[tokio::test]
-    async fn a_one_key_collection_is_written_by_exactly_one_key() {
-        let sensor = n("/sam/sensor");
-        let clock = Arc::new(AtomicU64::new(100));
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let dev = device_at(&sensor, &keys_of(&sensor), &store, &clock).await;
-        let c = n("/sam/32=data/temps");
-        for writers in [&["/sam"][..], &["/sam/sensor/KEY/1", "/sam/other/KEY/1"]] {
-            let Err(e @ DataError::BadRequest { .. }) = dev
-                .share(&c, share_of(Rule::OneKey, writers, Vec::new()))
-                .await
-            else {
-                panic!("a one-key collection shared with {writers:?}");
-            };
-            assert_eq!(e.next(), crate::NextStep::FixRequest);
-        }
-        dev.share(&c, share_of(Rule::OneKey, &["/sam/sensor"], Vec::new()))
-            .await
-            .unwrap();
-        let writers = dev.inner.st.lock().colls[&c]
-            .members
-            .as_ref()
-            .map(|m| m.writers.clone());
-        assert_eq!(
-            writers,
-            Some(vec![dev.writer().key().clone()]),
-            "this device's key"
-        );
-        let merge = n("/sam/32=data/notes");
-        let Err(e @ DataError::BadRequest { .. }) = dev
-            .put(&merge, reading(1), options(Some(Duration::from_millis(1))))
-            .await
-        else {
-            panic!("a batch into a merge collection");
-        };
-        assert_eq!(e.next(), crate::NextStep::FixRequest);
-        dev.shutdown();
-    }
-
-    #[tokio::test]
-    async fn a_range_read_returns_exactly_the_entries_in_range() {
-        let sensor = n("/sam/sensor");
-        let clock = Arc::new(AtomicU64::new(100));
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let dev = device_at(&sensor, &keys_of(&sensor), &store, &clock).await;
-        let c = n("/sam/32=data/temps");
-        dev.share(&c, share_of(Rule::OneKey, &["/sam/sensor"], Vec::new()))
-            .await
-            .unwrap();
-        for t in (100..=1_000).step_by(100) {
-            clock.store(t, Ordering::Relaxed);
-            dev.put(&c, reading(t), options(None)).await.unwrap();
-        }
-        // Three entries of one block, dated alike.
-        clock.store(1_100, Ordering::Relaxed);
-        let batch = Some(Duration::from_millis(20));
-        let ids = futures::future::join_all(
-            (0..3).map(|i| dev.put(&c, reading(1_100 + i), options(batch))),
-        )
-        .await;
-        let block = ids[0].clone().unwrap();
-        assert!(ids.iter().all(|id| id.as_ref() == Ok(&block)), "one block");
-        // A clock gone back still dates entries in order.
-        clock.store(50, Ordering::Relaxed);
-        dev.put(&c, reading(1_200), options(None)).await.unwrap();
-
-        let read = |range: Range| {
-            let dev = dev.clone();
-            let name = wire::range_name(&c, &range);
-            async move {
-                match dev.get(&name).await.unwrap().got {
-                    Got::Entries(e) => e,
-                    other => panic!("a range read answered {other:?}"),
-                }
-            }
-        };
-        let values = |e: &Entries| -> Vec<String> {
-            e.entries
-                .iter()
-                .map(|x| String::from_utf8(x.content.get("t").unwrap().to_vec()).unwrap())
-                .collect()
-        };
-        let times = read(Range::Times(Timestamp(300), Timestamp(750))).await;
-        assert_eq!(values(&times), ["300", "400", "500", "600", "700"]);
-        assert!(times.missing.is_empty() && times.expired.is_empty() && times.large.is_empty());
-        let last = read(Range::Times(Timestamp(1_100), Timestamp(u64::MAX))).await;
-        assert_eq!(values(&last), ["1100", "1101", "1102", "1200"]);
-        assert!(
-            last.entries.windows(2).all(|w| w[0].dated <= w[1].dated),
-            "dated in order"
-        );
-        let none = read(Range::Times(Timestamp(0), Timestamp(100))).await;
-        assert!(none.entries.is_empty());
-        // By seq: exactly the blocks in range; an entry read by its name.
-        let s = block.seq.0;
-        let by_seq = read(Range::Seqs(s, s)).await;
-        assert_eq!(values(&by_seq), ["1100", "1101", "1102"]);
-        let one = &by_seq.entries[1];
-        let Got::Entries(e) = dev.get(&one.name).await.unwrap().got else {
-            panic!("an entry's name answers its entry");
-        };
-        assert_eq!(e.entries, vec![one.clone()]);
-        // A malformed range name says how one is formed.
-        let bad = c
-            .clone()
-            .append_component(ndn_packet::NameComponent::keyword(Bytes::from_static(
-                b"range",
-            )));
-        assert!(matches!(
-            dev.get(&bad).await,
-            Err(DataError::BadName { .. })
-        ));
-        dev.shutdown();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_range_read_of_withheld_blocks_answers_within_its_bound() {
-        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
-        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        validator.adopt_context(context("/rita")).unwrap();
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let dev = start(&reader, &keys_of(&reader), &validator, &store)
-            .await
-            .unwrap();
-        let c = n("/sam/32=data/temps");
-        let key = sensor.clone().append("KEY").append("1");
-        one_key_record(&dev, &c, &key);
-        // A node of the sensor listed these blocks; the sensor sleeps, and
-        // every path withholds them.
-        let listed: BTreeSet<u64> = (1..=64).collect();
-        dev.inner
-            .st
-            .lock()
-            .colls
-            .get_mut(&c)
-            .expect("its record is held")
-            .entries
-            .insert(Writer::new(key.clone()), listed.clone());
-        let t0 = Instant::now();
-        let name = wire::range_name(&c, &Range::Times(Timestamp(0), Timestamp(u64::MAX)));
-        let Got::Entries(e) = dev.get(&name).await.unwrap().got else {
-            panic!("a range read answers entries");
-        };
-        let took = t0.elapsed();
-        // Its probes within their bound (an unmeasured path: the first
-        // looks), after the head's own bound of FETCH_TRIES asks (spec §5.4,
-        // §17.1).
-        let lifetime = dev.inner.config.lifetime + Duration::from_millis(500);
-        let head = lifetime * FETCH_TRIES + retry_pause(0) + retry_pause(1);
-        assert!(
-            took <= range_bound(dev.inner.config.first_look, Duration::ZERO) + head,
-            "a range read answers within its bound: {took:?}"
-        );
-        let missing: BTreeSet<u64> = e.missing.iter().map(|id| id.seq.0).collect();
-        assert_eq!(missing, listed, "what it did not reach is missing");
-        assert!(e.entries.is_empty() && e.expired.is_empty() && e.large.is_empty());
-        dev.shutdown();
-    }
-
-    /// A search whose bound ran out inside a round says nothing of the blocks it did not
-    /// reach: a window of blocks or fewer left in its interval are left unjudged for the
-    /// range read to fetch, never counted missing unasked; more than a window, or a window
-    /// of probes that answered none within the bound, are missing as before.
-    #[tokio::test(start_paused = true)]
-    async fn a_search_cut_by_its_bound_leaves_a_window_of_blocks_unjudged() {
-        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
-        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        validator.adopt_context(context("/rita")).unwrap();
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let dev = start(&reader, &keys_of(&reader), &validator, &store)
-            .await
-            .unwrap();
-        let c = n("/sam/32=data/temps");
-        let key = sensor.clone().append("KEY").append("1");
-        one_key_record(&dev, &c, &key);
-        let window = dev.inner.config.window;
-        let seqs: Vec<u64> = (1..=(window as u64 + 8)).collect();
-        for (blocks, missing) in [(window, false), (window + 8, true)] {
-            let mut probes = HashMap::new();
-            let spent = Some(Instant::now());
-            let found = dev
-                .inner
-                .search(
-                    &c,
-                    &sensor,
-                    &seqs,
-                    &mut probes,
-                    (0, blocks),
-                    Timestamp(0),
-                    spent,
-                    |_| true,
-                )
-                .await;
-            assert_eq!(
-                found,
-                (0, blocks),
-                "a search that found nothing narrows nothing"
-            );
-            for s in &seqs[..blocks] {
-                assert_eq!(
-                    matches!(probes.get(s), Some(Probe::Missing)),
-                    missing,
-                    "{blocks} blocks left by a cut search, block {s}: missing only when more than \
-                     a window"
-                );
-                assert!(
-                    missing || !settled(&probes, *s),
-                    "left unjudged for the fetch"
-                );
-            }
-        }
-        dev.shutdown();
-    }
-
-    /// A reader's link to one writer device: every Interest under the
-    /// writer's name is answered with what the writer serves, except that
-    /// for each name in `lossy` every Interest within `window` of the first
-    /// one asking for it is lost. It records when each name was first
-    /// asked for.
-    struct Lossy {
-        writer: Arc<Inner>,
-        lossy: BTreeSet<Name>,
-        window: Duration,
-        asked: std::sync::Mutex<HashMap<Name, Instant>>,
-        tx: futures::channel::mpsc::UnboundedSender<Bytes>,
-        rx: futures::lock::Mutex<futures::channel::mpsc::UnboundedReceiver<Bytes>>,
-    }
-
-    impl Lossy {
-        fn new(writer: &Device, lossy: BTreeSet<Name>, window: Duration) -> Arc<Self> {
-            let (tx, rx) = futures::channel::mpsc::unbounded();
-            Arc::new(Lossy {
-                writer: Arc::clone(&writer.inner),
-                lossy,
-                window,
-                asked: std::sync::Mutex::new(HashMap::new()),
-                tx,
-                rx: futures::lock::Mutex::new(rx),
-            })
-        }
-
-        /// Which of `names` were asked for.
-        fn asked<'a>(&self, names: impl IntoIterator<Item = &'a Name>) -> BTreeSet<Name> {
-            let asked = self.asked.lock().unwrap();
-            names
-                .into_iter()
-                .filter(|x| asked.contains_key(*x))
-                .cloned()
-                .collect()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Connection for Lossy {
-        async fn send(&self, wire: Bytes) -> Result<(), AppError> {
-            let Ok(interest) = Interest::decode(wire) else {
-                return Ok(());
-            };
-            if !interest.name.has_prefix(&self.writer.device) {
-                return Ok(());
-            }
-            let name = (*interest.name).clone();
-            let first = *self
-                .asked
-                .lock()
-                .unwrap()
-                .entry(name.clone())
-                .or_insert_with(Instant::now);
-            if self.lossy.contains(&name) && first.elapsed() < self.window {
-                return Ok(());
-            }
-            if let Some(reply) = self
-                .writer
-                .packet_for(&name, interest.selectors().can_be_prefix)
-            {
-                let _ = self.tx.unbounded_send(reply);
-            }
-            Ok(())
-        }
-        async fn recv(&self) -> Option<Bytes> {
-            self.rx.lock().await.next().await
-        }
-        async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
-            Ok(())
-        }
-    }
-
-    /// A range read asks a lost probe again in place (spec §5.4, §17.1): a
-    /// block whose first probe is lost — every ask of it, so a whole
-    /// [`FETCH_TRIES`] asks — is probed again, not replaced by its
-    /// neighbours. The search's first guess and a block in range lose their
-    /// first probe; the read probes exactly the blocks a read without loss
-    /// probes, answers every entry in range, none missing, within its bound.
-    #[tokio::test(start_paused = true)]
-    async fn a_lost_range_probe_is_asked_again_in_place_without_widening_the_search() {
-        let ns = n("/sam");
-        let (authority, issuer, anchor) = authority(&ns).await;
-        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
-        let (sensor_keys, key, cert) = device_key(&authority, &issuer, &sensor).await;
-        let clock = Arc::new(AtomicU64::new(100));
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let writer = device_at(&sensor, &sensor_keys, &store, &clock).await;
-        let c = n("/sam/32=data/temps");
-        writer
-            .share(
-                &c,
-                crate::layer::Share {
-                    rule: Rule::OneKey,
-                    writers: vec![key.clone()],
-                    readers: Vec::new(),
-                },
-            )
-            .await
-            .unwrap();
-        // Sixty-four blocks of one reading each, dated 100 apart.
-        let mut blocks = Vec::new();
-        for i in 1..=64u64 {
-            clock.store(i * 100, Ordering::Relaxed);
-            let id = writer
-                .put(&c, reading(i * 100), options(None))
-                .await
-                .unwrap();
-            blocks.push(log_name(&sensor, Some(&c), id.seq.0));
-        }
-        while writer.inner.packet_for(&blocks[63], false).is_none() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        assert!(validator.add_trust_anchor(anchor));
-        validator.adopt_context(context("/rita")).unwrap();
-        validator.cert_cache().insert(cert);
-        let range = Range::Times(Timestamp(2_000), Timestamp(2_350));
-        let read = |link: Arc<Lossy>, first_look: Option<Duration>| {
-            let (reader, validator, c, key) = (
-                reader.clone(),
-                Arc::clone(&validator),
-                c.clone(),
-                key.clone(),
-            );
-            async move {
-                let conn: Arc<dyn Connection> = link;
-                let dev = Device::start(
-                    Transport {
-                        node: Node::from_connection(Arc::clone(&conn)),
-                        sync: conn,
-                    },
-                    reader.clone(),
-                    keys_of(&reader),
-                    validator,
-                    Arc::new(MemoryStore::new()),
-                    Config {
-                        first_look: first_look.unwrap_or(Config::new().first_look),
-                        ..Config::new()
-                    },
-                )
-                .await
-                .unwrap();
-                one_key_record(&dev, &c, &key);
-                let t0 = Instant::now();
-                let got = dev.get(&wire::range_name(&c, &range)).await.unwrap().got;
-                let took = t0.elapsed();
-                let Got::Entries(e) = got else {
-                    panic!("a range read answers entries: {got:?}");
-                };
-                // However slow the path, never past the cap of its bound.
-                let bound = range_bound(dev.inner.config.first_look, dev.inner.config.lifetime);
-                dev.shutdown();
-                (e, took, bound)
-            }
-        };
-        let values = |e: &Entries| -> Vec<String> {
-            e.entries
-                .iter()
-                .map(|x| String::from_utf8(x.content.get("t").unwrap().to_vec()).unwrap())
-                .collect()
-        };
-
-        let clean = Lossy::new(&writer, BTreeSet::new(), Duration::ZERO);
-        let (e, _, _) = read(Arc::clone(&clean), None).await;
-        assert_eq!(values(&e), ["2000", "2100", "2200", "2300"]);
-        let probed = clean.asked(&blocks);
-        // The search's first guess bisects the listed seqs.
-        let (guess, within) = (blocks[32].clone(), blocks[20].clone());
-        assert!(
-            probed.contains(&guess) && probed.contains(&within),
-            "a read without loss probes its first guess and the blocks in range"
-        );
-
-        // Every ask of a probe — FETCH_TRIES asks of a lifetime and the
-        // reply slack, and the pauses between them — is lost.
-        let lifetime = writer.inner.config.lifetime + ndn_app::consumer::REPLY_SLACK;
-        let probe =
-            lifetime * FETCH_TRIES + (0..FETCH_TRIES - 1).map(retry_pause).sum::<Duration>();
-        let lossy = Lossy::new(&writer, [guess.clone(), within].into(), probe);
-        let (e, took, bound) = read(Arc::clone(&lossy), None).await;
-        assert_eq!(
-            lossy.asked(&blocks),
-            probed,
-            "a lost probe does not widen the search: it probes the blocks a read without loss \
-             probes"
-        );
-        assert!(
-            e.missing.is_empty(),
-            "a lost probe is asked again, not answered missing: {:?}",
-            e.missing
-        );
-        assert_eq!(values(&e), ["2000", "2100", "2200", "2300"]);
-        assert!(took <= bound, "within its bound's cap {bound:?}: {took:?}");
-
-        // A search whose probes were lost has spent most of its bound: the blocks in range
-        // are still asked for, each lost once, within a bound of their own, counted from
-        // when the search is done — never answered `missing` unasked while every one of
-        // them is to be had.
-        let first_look = Duration::from_millis(1500);
-        let middle = [blocks[20].clone(), blocks[21].clone()];
-        let spent = Lossy::new(
-            &writer,
-            [guess, middle[0].clone(), middle[1].clone()].into(),
-            probe,
-        );
-        let (e, took, bound) = read(Arc::clone(&spent), Some(first_look)).await;
-        assert!(
-            e.missing.is_empty(),
-            "blocks in range lost once are asked again after the search spent its bound: {:?}",
-            e.missing
-        );
-        assert_eq!(values(&e), ["2000", "2100", "2200", "2300"]);
-        let one = range_bound(first_look, Duration::ZERO);
-        assert!(
-            took > one && took <= bound * 2,
-            "the search and the fetch have a bound each: {took:?} of {one:?} (cap {bound:?})"
-        );
-        writer.shutdown();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_sealed_block_expired_unopened_is_listed_expired_where_it_may_overlap() {
-        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
-        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        validator.adopt_context(context("/rita")).unwrap();
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let dev = start(&reader, &keys_of(&reader), &validator, &store)
-            .await
-            .unwrap();
-        let c = n("/sam/32=data/temps");
-        let key = sensor.clone().append("KEY").append("1");
-        one_key_record(&dev, &c, &key);
-        // A sealed block expires while locked: its last date is unknown.
-        let mut coll = Coll::default();
-        coll.locked.push(Locked {
-            name: log_name(&sensor, Some(&c), 2),
-            wire: Bytes::new(),
-            writer: Writer::new(key.clone()),
-            seq: 2,
-            body: VersionBody {
-                dated: Timestamp(200),
-                ..version_body(
-                    &c,
-                    Some(SealedBody {
-                        epoch: Epoch {
-                            creator: n("/sam/owner"),
-                            seq: Seq(1),
-                        },
-                        ciphertext: Bytes::new(),
-                    }),
-                )
-            },
-        });
-        let (_, _, locked, _) = take_out(&mut coll, |_, _| true).remove(0);
-        assert_eq!(locked.last, None, "a locked block's last date is unknown");
-        let tomb = |first: u64, last: Option<u64>| Tomb {
-            writer: key.clone(),
-            keep: Keep::Until(Timestamp(1)),
-            first: Timestamp(first),
-            last: last.map(Timestamp),
-        };
-        {
-            let mut st = dev.inner.st.lock();
-            for (seq, t) in [
-                (1, tomb(100, Some(150))),
-                (2, locked),
-                (3, tomb(900, Some(950))),
-            ] {
-                st.held
-                    .insert(log_name(&sensor, Some(&c), seq), Held::Expired(t));
-            }
-            st.colls
-                .get_mut(&c)
-                .expect("its record is held")
-                .entries
-                .insert(Writer::new(key.clone()), [1, 2, 3].into());
-        }
-        // From after its first date: it may still overlap the range.
-        let name = wire::range_name(&c, &Range::Times(Timestamp(300), Timestamp(800)));
-        let Got::Entries(e) = dev.get(&name).await.unwrap().got else {
-            panic!("a range read answers entries");
-        };
-        assert!(
-            e.expired.iter().any(|id| id.seq.0 == 2),
-            "listed expired: {e:?}"
-        );
-        dev.shutdown();
-    }
-
-    /// `key`'s version `seq` of `c`, written by `device`, kept forever and
-    /// naming `parent` of its own writer, as a reader holds it.
-    fn held_at(
-        c: &Name,
-        device: &Name,
-        key: &Name,
-        seq: u64,
-        parent: Option<u64>,
-    ) -> Arc<HeldVersion> {
-        let writer = Writer::new(key.clone());
-        let parents = parent
-            .map(|p| {
-                let id = VersionId {
-                    writer: writer.clone(),
-                    seq: Seq(p),
-                };
-                (id, None)
-            })
-            .into_iter()
-            .collect();
-        Arc::new(HeldVersion::new(
-            Version {
-                id: VersionId {
-                    writer,
-                    seq: Seq(seq),
-                },
-                name: log_name(device, Some(c), seq),
-                collection: c.clone(),
-                parents,
-                type_id: TypeId {
-                    name: n("/types/reading"),
-                    revision: 1,
-                },
-                seal: Seal { any_of: Vec::new() },
-                keep: Keep::Forever,
-                dated: Timestamp(0),
-                rule: None,
-                digest: wire::implicit_digest(&[]),
-                op: None,
-                payload: Payload::Entry(Content::new()),
-            },
-            Bytes::new(),
-            Bytes::new(),
-            false,
-            None,
-            None,
-        ))
-    }
-
-    /// `key`'s node of `c` at `head`, listing `entries`, stating `expiry`.
-    fn node_of(
-        c: &Name,
-        key: &Name,
-        head: u64,
-        entries: Vec<(u64, u64)>,
-        expiry: Vec<ExpiryRun>,
-    ) -> NodeBody {
-        NodeBody {
-            subject: c.clone(),
-            writer: key.clone(),
-            head,
-            page: None,
-            entries,
-            members: Vec::new(),
-            expiry,
-            branches: Branches::Children(Vec::new()),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_reader_stops_waiting_for_listed_versions_it_never_held_once_their_keep_bound_passes()
-    {
-        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
-        let clock = Arc::new(AtomicU64::new(1_000));
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let dev = device_at(&reader, &keys_of(&reader), &store, &clock).await;
-        let c = n("/sam/32=data/soil");
-        let key = sensor.clone().append("KEY").append("1");
-        one_key_record(&dev, &c, &key);
-        let writer = Writer::new(key.clone());
-        let last = VersionId {
-            writer: writer.clone(),
-            seq: Seq(7),
-        };
-        let bound = Timestamp(5_000);
-        {
-            let mut st = dev.inner.st.lock();
-            // The writer's newest node lists 2–6, kept until at most the
-            // bound, and 7, kept forever, naming 6; only 7 is held here.
-            st.colls
-                .get_mut(&c)
-                .expect("its record is held")
-                .entries
-                .entry(writer.clone())
-                .or_default()
-                .extend(2..=7);
-            let runs = vec![ExpiryRun {
-                seqs: vec![(2, 6)],
-                until: bound,
-            }];
-            st.listing(&c, &writer, &node_of(&c, &key, 7, vec![(2, 7)], runs));
-            let wake = st.expire(&c);
-            assert!(
-                wake.is_some_and(|t| t <= bound),
-                "the sweeper wakes by the bound: {wake:?}"
-            );
-            st.admit(held_at(&c, &sensor, &key, 7, Some(6)));
-            assert!(
-                !st.colls[&c].at().contains(&last),
-                "waits while the bound is ahead"
-            );
-        }
-        clock.store(bound.0, Ordering::Relaxed);
-        {
-            let mut st = dev.inner.st.lock();
-            st.expire(&c);
-            assert!(
-                st.colls[&c].at().contains(&last),
-                "applied once this device's clock passes the bound"
-            );
-        }
-        dev.shutdown();
-    }
-
-    #[tokio::test]
-    async fn a_reader_does_not_wait_for_a_parent_its_writer_no_longer_lists_and_it_never_learned() {
-        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
-        let clock = Arc::new(AtomicU64::new(1_000));
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let dev = device_at(&reader, &keys_of(&reader), &store, &clock).await;
-        let c = n("/sam/32=data/soil");
-        let key = sensor.clone().append("KEY").append("1");
-        one_key_record(&dev, &c, &key);
-        let writer = Writer::new(key.clone());
-        let id = |s: u64| VersionId {
-            writer: writer.clone(),
-            seq: Seq(s),
-        };
-        let mut st = dev.inner.st.lock();
-        // The writer's newest node, at 8, lists 7 and 8 only: 2–6 expired
-        // before it, and this reader never learned them.
-        st.colls
-            .get_mut(&c)
-            .expect("its record is held")
-            .entries
-            .entry(writer.clone())
-            .or_default()
-            .extend([7, 8]);
-        st.listing(&c, &writer, &node_of(&c, &key, 8, vec![(7, 8)], Vec::new()));
-        st.expire(&c);
-        st.admit(held_at(&c, &sensor, &key, 7, Some(6)));
-        assert!(st.colls[&c].at().contains(&id(7)), "7 does not wait for 6");
-        st.admit(held_at(&c, &sensor, &key, 8, Some(7)));
-        assert!(st.colls[&c].at().contains(&id(8)));
-        // A parent above the node's head may still come: it is waited for.
-        st.admit(held_at(&c, &sensor, &key, 10, Some(9)));
-        assert!(
-            !st.colls[&c].at().contains(&id(10)),
-            "10 waits for 9, above the newest node's head"
-        );
-        drop(st);
-        dev.shutdown();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_batched_entry_waits_no_longer_than_its_delay() {
-        let sensor = n("/sam/sensor");
-        let clock = Arc::new(AtomicU64::new(100));
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let dev = device_at(&sensor, &keys_of(&sensor), &store, &clock).await;
-        let c = n("/sam/32=data/temps");
-        dev.share(&c, share_of(Rule::OneKey, &["/sam/sensor"], Vec::new()))
-            .await
-            .unwrap();
-        let t0 = Instant::now();
-        let first = {
-            let (dev, c) = (dev.clone(), c.clone());
-            tokio::spawn(async move {
-                let id = dev
-                    .put(&c, reading(1), options(Some(Duration::from_secs(10))))
-                    .await;
-                (id, Instant::now())
-            })
-        };
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let second = dev
-            .put(&c, reading(2), options(Some(Duration::from_secs(2))))
-            .await
-            .unwrap();
-        let at2 = Instant::now();
-        let (first, at1) = first.await.unwrap();
-        assert_eq!(first.unwrap(), second, "the two share one block");
-        assert!(
-            at2 - t0 <= Duration::from_secs(3),
-            "the second waited its 2 s"
-        );
-        assert!(at1 - t0 <= Duration::from_secs(3), "the first no longer");
-        let st = dev.inner.st.lock();
-        let v = &st.colls[&c].versions[&second].version;
-        assert!(matches!(&v.payload, Payload::Block(e) if e.len() == 2));
-        drop(st);
-        dev.shutdown();
-    }
-
-    #[tokio::test]
-    async fn a_batch_delay_beyond_the_maximum_is_refused_saying_how() {
-        let sensor = n("/sam/sensor");
-        let clock = Arc::new(AtomicU64::new(100));
-        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-        let dev = device_at(&sensor, &keys_of(&sensor), &store, &clock).await;
-        let c = n("/sam/32=data/temps");
-        dev.share(&c, share_of(Rule::OneKey, &["/sam/sensor"], Vec::new()))
-            .await
-            .unwrap();
-        for batch in [BATCH_MAX + Duration::from_millis(1), Duration::MAX] {
-            let Err(e @ DataError::BadRequest { .. }) =
-                dev.put(&c, reading(1), options(Some(batch))).await
-            else {
-                panic!("a batch of {batch:?} is refused");
-            };
-            assert_eq!(e.next(), crate::NextStep::FixRequest);
-        }
-        // Nothing was left half done: the device still writes.
-        dev.put(&c, reading(2), options(None))
-            .await
-            .expect("a put after a refused one");
-        dev.shutdown();
     }
 
     // ---- revocation as a cut (spec §8) ---------------------------------------------------------
@@ -19412,7 +15942,7 @@ mod tests {
         dev.share(&c, share_of(Rule::Log, &["/sam"], Vec::new()))
             .await
             .unwrap();
-        let id = dev.put(&c, reading(1), options(None)).await.unwrap();
+        let id = dev.put(&c, reading(1), options()).await.unwrap();
         let name = log_name(&phone, Some(&c), id.seq.0);
         // Revoked with a cut that leaves it out: withdrawn here.
         let mut cut = RevocationCut::new(key.clone());
@@ -19913,10 +16443,7 @@ mod tests {
     async fn a_version_a_copy_of_its_key_wrote_under_its_name_is_not_restored_as_its_own() {
         let own = OwnLog::new().await;
         for t in 1..=2 {
-            own.dev
-                .put(&own.c, reading(t), options(None))
-                .await
-                .unwrap();
+            own.dev.put(&own.c, reading(t), options()).await.unwrap();
         }
         let head = own.dev.inner.st.lock().head;
         let (thief, packet) = own.copy_writes(head + 1);
@@ -19945,10 +16472,7 @@ mod tests {
     async fn a_store_kept_before_own_entries_were_recorded_keeps_its_log_head() {
         let own = OwnLog::new().await;
         for t in 1..=2 {
-            own.dev
-                .put(&own.c, reading(t), options(None))
-                .await
-                .unwrap();
+            own.dev.put(&own.c, reading(t), options()).await.unwrap();
         }
         let head = own.dev.inner.st.lock().head;
         // As an earlier release kept it: no record of what it wrote.
@@ -19958,7 +16482,7 @@ mod tests {
         let c = own.c.clone();
         let again = own.restart().await;
         assert_eq!(again.inner.st.lock().head, head);
-        let id = again.put(&c, reading(3), options(None)).await.unwrap();
+        let id = again.put(&c, reading(3), options()).await.unwrap();
         assert_eq!(id.seq.0, head + 1, "it never signs a seq it used");
         again.shutdown();
     }
@@ -19966,10 +16490,7 @@ mod tests {
     #[tokio::test]
     async fn an_entry_at_the_last_seq_under_its_name_never_makes_its_next_write_wrap() {
         let own = OwnLog::new().await;
-        own.dev
-            .put(&own.c, reading(1), options(None))
-            .await
-            .unwrap();
+        own.dev.put(&own.c, reading(1), options()).await.unwrap();
         let head = own.dev.inner.st.lock().head;
         let (thief, packet) = own.copy_writes(u64::MAX);
         let live = own
@@ -19986,7 +16507,7 @@ mod tests {
         let c = own.c.clone();
         let again = own.restart().await;
         assert_eq!(again.inner.st.lock().head, head);
-        let id = again.put(&c, reading(2), options(None)).await.unwrap();
+        let id = again.put(&c, reading(2), options()).await.unwrap();
         assert_eq!(id.seq.0, head + 1, "the next write follows its own head");
         again.shutdown();
     }
@@ -20171,7 +16692,7 @@ mod tests {
         )
         .await
         .unwrap();
-        dev.put(&c, reading(1), options(None)).await.unwrap();
+        dev.put(&c, reading(1), options()).await.unwrap();
         {
             let st = dev.inner.st.lock();
             let coll = &st.colls[&c];
@@ -20296,7 +16817,7 @@ mod tests {
         };
         let mut ids = Vec::new();
         for c in &cs {
-            ids.push(laptop.put(c, reading(1), options(None)).await.unwrap());
+            ids.push(laptop.put(c, reading(1), options()).await.unwrap());
         }
         assert_eq!(relay(&laptop, &reader, &f, e.seq.0), None);
         for (c, id) in cs.iter().zip(&ids) {
@@ -20521,7 +17042,7 @@ mod tests {
         )
         .await
         .unwrap();
-        dev.put(&c, reading(1), options(None)).await.unwrap();
+        dev.put(&c, reading(1), options()).await.unwrap();
         dev.inner.flushed().await;
         let bob = n("/bob");
         let before = dev.inner.st.lock().groups[&bob].announced;
@@ -20534,34 +17055,6 @@ mod tests {
             "back in the reader's group, above what it announced there before"
         );
         again.shutdown();
-    }
-
-    #[tokio::test]
-    async fn an_entry_a_writers_node_of_the_same_head_lists_again_is_wanted_again() {
-        let dev = device_in("/bob/phone", &["/alice", "/bob"]).await;
-        let c = n("/alice/32=data/notebook/page1");
-        let writer = Writer::new(n("/alice/laptop/KEY/1"));
-        let node = |entries: Vec<(u64, u64)>| NodeBody {
-            subject: c.clone(),
-            writer: writer.key().clone(),
-            head: 6,
-            page: None,
-            entries,
-            members: Vec::new(),
-            expiry: Vec::new(),
-            branches: Branches::Children(Vec::new()),
-        };
-        let mut st = dev.inner.st.lock();
-        st.colls.entry(c.clone()).or_default();
-        let now = (st.clock)();
-        // Its store lost seq 4: the node it signed at head 6 lists only 6.
-        st.listing(&c, &writer, &node(vec![(6, 6)]));
-        assert!(st.colls[&c].listings[&writer].gone(4, now));
-        // Back, a node of the same head lists it again.
-        st.listing(&c, &writer, &node(vec![(4, 4), (6, 6)]));
-        assert!(!st.colls[&c].listings[&writer].gone(4, now));
-        drop(st);
-        dev.shutdown();
     }
 }
 

@@ -20,16 +20,8 @@
 //! never has to start over however fast the writer puts. Recently superseded
 //! packets are kept ready, so a reader a few roots behind costs no rebuild.
 //!
-//! A node of a log or one-key collection lists in `Entries` only the
-//! versions unexpired at its reference date `E`, the date of the writer's
-//! newest version in it (spec §7): `Keep::Until(t)` while `t > E`,
-//! `Keep::LastN(n)` while fewer than `n` later versions are listed there.
-//! For those it lists kept `Until` a date it states bounds of their keeps,
-//! in at most [`EXPIRY_RUNS`] runs, so a reader that never held them sees by
-//! its own clock when they expired, however long the writer stays silent.
-//! All of it is fixed by the log up to the node's head, so one name still
-//! has one packet, and a constant stream's node stays bounded by its keep
-//! window.
+//! A node lists in `Entries` every version of the writer's log directly in
+//! its collection, up to the node's head.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -37,103 +29,31 @@ use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent};
 use ndn_packet::encode::DataBuilder;
 
-use crate::version::{Keep, Timestamp};
 use crate::wire::{
-    Branches, ChildRef, EXPIRY_RUNS, ExpiryRun, NodeBody, PAGE_FANOUT, PageRef, bucket_of,
-    encode_node, implicit_digest, node_name, page_name, ranges_of,
+    Branches, ChildRef, NodeBody, PAGE_FANOUT, PageRef, bucket_of, encode_node, implicit_digest,
+    node_name, page_name, ranges_of,
 };
 
 /// How many superseded summary packets a tree keeps ready. A cache only:
 /// any superseded node or page is rebuilt from the log when asked for.
 const RECENT: usize = 4096;
 
-/// How a version is listed by keep: its keep and date, as its record
-/// carries them. A merge collection's versions are listed whatever their
-/// keep ([`Retain::ALWAYS`]): its state needs every operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Retain {
-    pub(crate) keep: Keep,
-    pub(crate) dated: Timestamp,
-}
-
-impl Retain {
-    /// Listed whatever comes later.
-    pub(crate) const ALWAYS: Retain = Retain {
-        keep: Keep::Forever,
-        dated: Timestamp(0),
-    };
-}
-
 /// What a log entry adds to a node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
-    /// A version, listed by its keep.
-    Version(Retain),
+    /// A version.
+    Version,
     /// A record that is not a version: a members record.
     Record,
 }
 
 #[derive(Default)]
 struct TNode {
-    entries: BTreeMap<u64, Retain>,
+    entries: BTreeSet<u64>,
     members: BTreeSet<u64>,
     children: BTreeMap<NameComponent, TNode>,
     head: u64,
     built: Option<Built>,
-}
-
-/// The versions of `entries` up to `h` that a node at head `h` lists: those
-/// unexpired at the date of the newest of them (spec §7).
-fn listed_at(entries: &BTreeMap<u64, Retain>, h: u64) -> Vec<u64> {
-    let upto = entries.range(..=h);
-    let Some((_, newest)) = upto.clone().next_back() else {
-        return Vec::new();
-    };
-    let e = newest.dated;
-    let mut out: Vec<u64> = upto
-        .rev()
-        .enumerate()
-        .filter(|(later, (_, r))| match r.keep {
-            Keep::Until(t) => t > e,
-            Keep::LastN(n) => (*later as u64) < u64::from(n),
-            Keep::Forever => true,
-        })
-        .map(|(_, (s, _))| *s)
-        .collect();
-    out.reverse();
-    out
-}
-
-/// The `Expiry` runs of a node listing `listed` of `entries` (spec §7):
-/// its listed versions kept `Until` a date, in seq order, one run per group
-/// of them with one keep while those are at most [`EXPIRY_RUNS`]; beyond,
-/// split into [`EXPIRY_RUNS`] runs of equal count (the last may hold fewer),
-/// each stating the latest keep in it. Versions kept forever or for the
-/// last n are in none.
-fn expiry_of(entries: &BTreeMap<u64, Retain>, listed: &[u64]) -> Vec<ExpiryRun> {
-    let until: Vec<(u64, Timestamp)> = listed
-        .iter()
-        .filter_map(|s| match entries.get(s)?.keep {
-            Keep::Until(t) => Some((*s, t)),
-            _ => None,
-        })
-        .collect();
-    let groups = until.chunk_by(|(_, a), (_, b)| a == b).collect::<Vec<_>>();
-    let runs: Vec<&[(u64, Timestamp)]> = if groups.len() <= EXPIRY_RUNS {
-        groups
-    } else {
-        until.chunks(until.len().div_ceil(EXPIRY_RUNS)).collect()
-    };
-    runs.into_iter()
-        .map(|run| ExpiryRun {
-            seqs: ranges_of(run.iter().map(|(s, _)| s)),
-            until: run
-                .iter()
-                .map(|(_, t)| *t)
-                .max()
-                .expect("a run is not empty"),
-        })
-        .collect()
 }
 
 /// A node's or page's packets, by page path.
@@ -185,8 +105,8 @@ impl Tree {
         retire(node, &mut retired);
         node.head = node.head.max(seq);
         match kind {
-            Kind::Version(r) => {
-                node.entries.insert(seq, r);
+            Kind::Version => {
+                node.entries.insert(seq);
             }
             Kind::Record => {
                 node.members.insert(seq);
@@ -281,7 +201,7 @@ impl Tree {
                 (head, content)
             }
             None => {
-                let empty = assemble(device, writer, &ns, 0, &BTreeMap::new(), 0, &[], Vec::new());
+                let empty = assemble(device, writer, &ns, 0, &BTreeSet::new(), 0, &[], Vec::new());
                 (0, empty.content)
             }
         }
@@ -294,26 +214,6 @@ impl Tree {
             self.remember(name, wire);
         }
         self.remember(b.name, b.wire);
-    }
-
-    /// `subject`'s node as the log up to `h` fixes it: its head and its
-    /// packet; `None` if it had no entry by then.
-    pub(crate) fn node_at(
-        &mut self,
-        device: &Name,
-        writer: &Name,
-        subject: &Name,
-        h: u64,
-    ) -> Option<(u64, Bytes)> {
-        self.build(device, writer);
-        let node = self.node(subject)?;
-        if node.head <= h {
-            return Some((node.head, node.built.as_ref()?.wire.clone()));
-        }
-        let (b, head) = node_at(node, h, device, writer, subject)?;
-        let wire = b.wire.clone();
-        self.remember_built(b);
-        Some((head, wire))
     }
 
     fn node(&self, subject: &Name) -> Option<&TNode> {
@@ -345,14 +245,14 @@ fn packet(name: &Name, content: &Bytes) -> (Bytes, [u8; 32]) {
 }
 
 /// A node's packet from its parts: one name, one packet. It lists the
-/// versions of `entries` up to `upto` by keep, with their keep bounds.
+/// versions of `entries` up to `upto`.
 #[allow(clippy::too_many_arguments)]
 fn assemble<'a>(
     device: &Name,
     writer: &Name,
     subject: &Name,
     head: u64,
-    entries: &BTreeMap<u64, Retain>,
+    entries: &BTreeSet<u64>,
     upto: u64,
     members: impl IntoIterator<Item = &'a u64>,
     refs: Vec<ChildRef>,
@@ -363,14 +263,12 @@ fn assemble<'a>(
     } else {
         Branches::Pages(paginate(refs, device, writer, subject, &[], &mut pages))
     };
-    let listed = listed_at(entries, upto);
     let body = NodeBody {
         subject: subject.clone(),
         writer: writer.clone(),
         head,
         page: None,
-        entries: ranges_of(&listed),
-        expiry: expiry_of(entries, &listed),
+        entries: ranges_of(entries.range(..=upto)),
         members: ranges_of(members),
         branches,
     };
@@ -430,7 +328,6 @@ fn node_at(
         .entries
         .range(..=h)
         .next_back()
-        .map(|(s, _)| s)
         .into_iter()
         .chain(node.members.range(..=h).next_back())
         .copied()
@@ -559,7 +456,6 @@ fn page(
         page: Some(path.clone()),
         entries: Vec::new(),
         members: Vec::new(),
-        expiry: Vec::new(),
         branches,
     };
     let name = page_name(device, subject, &path, head);
@@ -582,137 +478,7 @@ mod tests {
         s.parse().unwrap()
     }
 
-    const V: Kind = Kind::Version(Retain::ALWAYS);
-
-    fn until(dated: u64, until: u64) -> Kind {
-        Kind::Version(Retain {
-            keep: Keep::Until(Timestamp(until)),
-            dated: Timestamp(dated),
-        })
-    }
-
-    fn entries_of(wire: &Bytes) -> Vec<u64> {
-        let body = decode_node(
-            Data::decode(wire.clone())
-                .unwrap()
-                .content()
-                .unwrap()
-                .clone(),
-        );
-        crate::wire::seqs_of(&body.unwrap().entries).collect()
-    }
-
-    #[test]
-    fn a_node_lists_by_keep_at_its_newest_date_one_packet_per_name() {
-        let (device, writer) = (n("/alice/sensor"), n("/alice/sensor/KEY/1"));
-        let temps = n("/alice/32=data/temps");
-        let last = n("/alice/32=data/last");
-        let mut tree = Tree::new(n("/alice"));
-        tree.add(&temps, 1, until(0, 100));
-        tree.add(&temps, 2, until(50, 150));
-        let (h2, at2) = tree.node_at(&device, &writer, &temps, u64::MAX).unwrap();
-        assert_eq!((h2, entries_of(&at2)), (2, vec![1, 2]));
-        // The newest date moves past the first keep: no longer listed.
-        tree.add(&temps, 3, until(120, 220));
-        let (h3, at3) = tree.node_at(&device, &writer, &temps, u64::MAX).unwrap();
-        assert_eq!((h3, entries_of(&at3)), (3, vec![2, 3]));
-        for kept in [2u64, 3] {
-            let lastn = Kind::Version(Retain {
-                keep: Keep::LastN(2),
-                dated: Timestamp(kept),
-            });
-            tree.add(&last, kept + 2, lastn);
-        }
-        tree.add(
-            &last,
-            6,
-            Kind::Version(Retain {
-                keep: Keep::LastN(2),
-                dated: Timestamp(6),
-            }),
-        );
-        let (_, l) = tree.node_at(&device, &writer, &last, u64::MAX).unwrap();
-        assert_eq!(entries_of(&l), vec![5, 6], "the last 2 by count");
-        // Rebuilt from the log alone, the node at head 2 is the packet it was.
-        tree.recent.clear();
-        tree.recent_wire.clear();
-        let name = node_name(&device, &temps, 2);
-        assert_eq!(
-            tree.packet(&device, &writer, &temps, None, 2, &name),
-            Some(at2)
-        );
-    }
-
-    fn node_of(wire: &Bytes) -> NodeBody {
-        let data = Data::decode(wire.clone()).unwrap();
-        decode_node(data.content().unwrap().clone()).unwrap()
-    }
-
-    /// The keep bound `body` states for `seq`, if a run lists it.
-    fn bound_of(body: &NodeBody, seq: u64) -> Option<Timestamp> {
-        body.expiry
-            .iter()
-            .find(|r| crate::wire::seqs_of(&r.seqs).any(|s| s == seq))
-            .map(|r| r.until)
-    }
-
-    #[test]
-    fn a_node_bounds_the_keep_of_each_version_it_lists_kept_until_a_date() {
-        let (device, writer) = (n("/alice/sensor"), n("/alice/sensor/KEY/1"));
-        let mut tree = Tree::new(n("/alice"));
-        // More keeps than a node states runs, then few: versions kept until
-        // a date among ones kept forever and for the last n.
-        let soil = n("/alice/32=data/soil");
-        let air = n("/alice/32=data/air");
-        let mut keeps = BTreeMap::new();
-        let mut seq = 0;
-        for (c, distinct) in [(&soil, 3 * EXPIRY_RUNS as u64), (&air, 4)] {
-            for i in 0..3 * EXPIRY_RUNS as u64 {
-                seq += 1;
-                let keep = match i % 5 {
-                    0 => Keep::Forever,
-                    1 => Keep::LastN(1000),
-                    _ => Keep::Until(Timestamp(
-                        10_000 + (i * distinct / (3 * EXPIRY_RUNS as u64)),
-                    )),
-                };
-                let dated = Timestamp(i);
-                tree.add(c, seq, Kind::Version(Retain { keep, dated }));
-                keeps.insert(seq, keep);
-            }
-        }
-        for (c, exact) in [(&soil, false), (&air, true)] {
-            let (head, wire) = tree.node_at(&device, &writer, c, u64::MAX).unwrap();
-            let body = node_of(&wire);
-            assert!(
-                body.expiry.len() <= EXPIRY_RUNS,
-                "{c}: {} runs",
-                body.expiry.len()
-            );
-            for s in crate::wire::seqs_of(&body.entries) {
-                match keeps[&s] {
-                    Keep::Until(t) if exact => {
-                        assert_eq!(bound_of(&body, s), Some(t), "{c} seq {s}")
-                    }
-                    Keep::Until(t) => {
-                        assert!(bound_of(&body, s).is_some_and(|b| b >= t), "{c} seq {s}")
-                    }
-                    _ => assert_eq!(bound_of(&body, s), None, "{c} seq {s}"),
-                }
-            }
-            // One packet per name: superseded, the node rebuilt from the log
-            // alone is the packet it was, its bounds included.
-            seq += 1;
-            tree.add(c, seq, V);
-            tree.recent.clear();
-            tree.recent_wire.clear();
-            let name = node_name(&device, c, head);
-            assert_eq!(
-                tree.packet(&device, &writer, c, None, head, &name),
-                Some(wire)
-            );
-        }
-    }
+    const V: Kind = Kind::Version;
 
     #[test]
     fn a_change_moves_only_its_path_and_old_packets_stay_servable() {

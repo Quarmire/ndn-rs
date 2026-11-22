@@ -1,4 +1,4 @@
-//! Large payloads in pieces (spec §4.1): a payload longer than
+//! Large payloads in pieces (spec §13.1): a payload longer than
 //! [`INLINE_MAX`](crate::wire::INLINE_MAX) travels as chunks of
 //! [`CHUNK`](crate::wire::CHUNK) octets under the version's name, listed by a
 //! manifest tree of fan-out [`FANOUT`](crate::wire::FANOUT) whose root's

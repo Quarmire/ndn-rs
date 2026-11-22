@@ -18,14 +18,12 @@
 //! | summary page of `X` | `<D>/32=summary/<X>/32=page/<buckets>/seq=<head>` | DigestSha256; its parent lists its digest |
 //! | seal key | `<D>/32=seal/<X25519 public key>` | the device key |
 //! | grant | `<G>/32=grant/<GrantAsk TLV>` | the granter's device key |
-//! | head of one-key collection `C` | `<D>/32=summary/<C>/32=head/seq=<head>` | the device key |
 //!
 //! `X` is a name of the tree from `O` to a collection: `O/32=data` (the
 //! root's one child) or `O/32=data/<path>`, a folder or collection. Some
 //! names are never fetched: the state name
 //! `<C>/32=state/<F>` (the merged value at frontier `F`, computed by every
-//! reader), an entry of a block `<V>/32=entry/seg=<i>` and a range read
-//! `<C>/32=range/<Range TLV>` (answered from the blocks), and the sync
+//! reader), and the sync
 //! group `<O>/32=sync` (State Vector Sync Interests,
 //! notifications only), [`ndn_security::sync_group`]: the one definition the
 //! forwarder's trust and link libraries route and multicast it by.
@@ -72,12 +70,10 @@ pub mod tlv {
     pub const TYPE_ID: u64 = 0x0528;
     /// A revision (NonNegativeInteger).
     pub const REVISION: u64 = 0x052A;
-    /// Retention: one of `KeepUntil`, `KeepLastN`, `KeepForever`.
+    /// Retention: `KeepForever`.
     pub const KEEP: u64 = 0x052C;
-    /// Keep until this date (ms since the Unix epoch).
+    /// A date (ms since the Unix epoch): an introduction offer's expiry.
     pub const KEEP_UNTIL: u64 = 0x052E;
-    /// Keep the writer's last N versions.
-    pub const KEEP_LAST_N: u64 = 0x0530;
     /// Keep until pruned (empty).
     pub const KEEP_FOREVER: u64 = 0x0532;
     /// A seal: `Audience*`.
@@ -103,7 +99,7 @@ pub mod tlv {
     /// A collection rule: `RuleKind` [+ `Name` of the merge function]; in a
     /// merge version's record, the rule its operation was made for.
     pub const RULE: u64 = 0x0548;
-    /// 0 one key, 1 log, 2 merge.
+    /// 1 log, 2 merge.
     pub const RULE_KIND: u64 = 0x054A;
     /// Writer key-name prefixes: `Name*`.
     pub const WRITERS: u64 = 0x054C;
@@ -183,32 +179,6 @@ pub mod tlv {
     pub const ASKER: u64 = 0x053B;
     /// 32 octets: an introduction's proof (spec §19).
     pub const PROOF: u64 = 0x053F;
-
-    // Slice 4: odd numbers, critical.
-
-    /// A block of small entries under the version's one signature, in a
-    /// version record in place of `Fields` and `MergeOp` (sealed: the
-    /// plaintext of `Sealed`): `BlockEntry+`.
-    pub const BLOCK: u64 = 0x0545;
-    /// One entry of a block: `Offset`, `Fields`.
-    pub const BLOCK_ENTRY: u64 = 0x0547;
-    /// NonNegativeInteger: an entry's milliseconds after its version's
-    /// `Dated`; non-decreasing along the block, the first 0.
-    pub const OFFSET: u64 = 0x0549;
-    /// The Content of a one-key collection's head packet: `Name`
-    /// (collection), `Seq` (its summary node's head), `Digest` (of that
-    /// node's packet), `Freshness`.
-    pub const HEAD_RECORD: u64 = 0x054B;
-    /// NonNegativeInteger: milliseconds, the batch delay of the newest
-    /// version's entries (0 unbatched).
-    pub const FRESHNESS: u64 = 0x054D;
-    /// In a range name: `Dated` (from), `Dated` (to), from < to.
-    pub const TIME_RANGE: u64 = 0x054F;
-    /// In a summary node of a log or one-key collection, a run of the
-    /// versions it lists kept until a date: `SeqRange+` (listed seqs),
-    /// `KeepUntil` (a date at or after each one's keep). A node's runs are
-    /// ascending and disjoint, at most [`EXPIRY_RUNS`](super::EXPIRY_RUNS).
-    pub const EXPIRY: u64 = 0x0553;
 
     // Slice 6: odd numbers, critical.
 
@@ -304,15 +274,12 @@ const MANIFEST: &[u8] = b"manifest";
 const HELD: &[u8] = b"held";
 const ROOT: &[u8] = b"root";
 const ASK: &[u8] = b"ask";
-const HEAD: &[u8] = b"head";
-const ENTRY: &[u8] = b"entry";
-const RANGE: &[u8] = b"range";
 const CUT: &[u8] = b"cut";
 const SIGNAL: &[u8] = b"signal";
 const RUN: &[u8] = b"run";
 
 /// The most payload octets a version carries in its own packet; a larger
-/// payload travels in pieces, whatever the collection's rule (a block never).
+/// payload travels in pieces, whatever the collection's rule.
 pub const INLINE_MAX: usize = 6144;
 
 /// The most payload octets a version carries at all (64 MiB): a reader
@@ -337,12 +304,6 @@ pub const NODE_SEQS: usize = 65_536;
 /// are paged into 16 buckets by the first nibble of SHA-256 of the child's
 /// component, recursively.
 pub const PAGE_FANOUT: usize = 64;
-
-/// The most `Expiry` runs one summary node carries. Its listed versions kept
-/// `Until` a date form one run per group of them, in seq order, with one
-/// keep while those fit; beyond, they split in seq order into this many runs
-/// of equal count, each stating the latest keep in it (spec §7).
-pub const EXPIRY_RUNS: usize = 64;
 
 /// Why bytes do not decode.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -898,7 +859,7 @@ pub fn parse_grant_name(name: &Name) -> Option<(Name, GrantAsk)> {
 
 // ---- slice 3: pieces ----------------------------------------------------------------------------
 
-/// A piece of a large version (spec §4.1): a chunk of its payload, or a node
+/// A piece of a large version (spec §13.1): a chunk of its payload, or a node
 /// of its manifest tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PieceKind {
@@ -1077,16 +1038,13 @@ pub fn parse_held_name(name: &Name) -> Option<(Name, Name)> {
 
 /// The keywords of a name that `get` routes by, found in one pass over its components: each
 /// parser `get` would try needs its own keyword in the name, so a name without it skips the
-/// parser. A necessary condition only: the parsers still judge the name (a `32=range` anywhere
-/// is a range name, and an ill-formed one is a `BadName`).
+/// parser. A necessary condition only: the parsers still judge the name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct NameWords(u8);
 
 impl NameWords {
     const LOG: u8 = 1;
-    const ENTRY: u8 = 2;
-    const STATE: u8 = 4;
-    const RANGE: u8 = 8;
+    const STATE: u8 = 2;
 
     pub(crate) fn of(name: &Name) -> Self {
         let mut bits = 0;
@@ -1096,9 +1054,7 @@ impl NameWords {
             }
             bits |= match c.value.as_ref() {
                 LOG => Self::LOG,
-                ENTRY => Self::ENTRY,
                 STATE => Self::STATE,
-                RANGE => Self::RANGE,
                 _ => 0,
             };
         }
@@ -1109,16 +1065,8 @@ impl NameWords {
         self.0 & Self::LOG != 0
     }
 
-    pub(crate) fn entry(self) -> bool {
-        self.0 & Self::ENTRY != 0
-    }
-
     pub(crate) fn state(self) -> bool {
         self.0 & Self::STATE != 0
-    }
-
-    pub(crate) fn range(self) -> bool {
-        self.0 & Self::RANGE != 0
     }
 }
 
@@ -1150,150 +1098,6 @@ pub(crate) fn served_kind(name: &Name) -> Option<Served> {
         HELD => Some(Served::Held),
         _ => None,
     }
-}
-
-// ---- slice 4: heads, entries, range reads -------------------------------------------------------
-
-/// `<device>/32=summary/<collection>/32=head`: the discovery name of the head
-/// of `device`'s one-key collection `collection` (CanBePrefix, MustBeFresh;
-/// spec §5.3). It ends in `32=head`, which no node, page or root name, nor
-/// the head name of a collection nested under `collection`, extends: only a
-/// head of exactly that collection answers it.
-pub fn head_prefix(device: &Name, collection: &Name) -> Name {
-    summary_prefix(device, collection).append_component(kw(HEAD))
-}
-
-/// A head's name: `<device>/32=summary/<collection>/32=head/seq=<seq>`,
-/// `seq` the writer's highest seq in the collection (its node's head).
-pub fn head_name(device: &Name, collection: &Name, seq: u64) -> Name {
-    head_prefix(device, collection).append_sequence_num(seq)
-}
-
-/// Parse `<device>/32=summary/<collection>/32=head/seq=<seq>`: the device,
-/// the collection and the seq.
-pub fn parse_head_name(name: &Name) -> Option<(Name, Name, u64)> {
-    let (last, rest) = name.components().split_last()?;
-    let seq = last.as_sequence_num()?;
-    let (device, collection) = parse_head_comps(rest)?;
-    Some((device, collection, seq))
-}
-
-/// Parse a head's discovery name `<device>/32=summary/<collection>/32=head`
-/// ([`head_prefix`]): the device and the collection.
-pub fn parse_head_prefix(name: &Name) -> Option<(Name, Name)> {
-    parse_head_comps(name.components())
-}
-
-fn parse_head_comps(comps: &[NameComponent]) -> Option<(Name, Name)> {
-    let at = comps.iter().position(|c| is_kw(c, SUMMARY))?;
-    let (marker, subject) = comps.get(at + 1..)?.split_last()?;
-    if !is_kw(marker, HEAD) || !is_device_comps(&comps[..at]) {
-        return None;
-    }
-    let collection = name_of(subject);
-    is_collection_name(&collection).then(|| (name_of(&comps[..at]), collection))
-}
-
-/// The name of entry `index` (0-based) of the block named `version`:
-/// `<version>/32=entry/seg=<index>` (spec §4.1). A local name, never
-/// fetched: a `get` of it reads the block and answers that one entry.
-pub fn entry_name(version: &Name, index: u32) -> Name {
-    version
-        .clone()
-        .append_component(kw(ENTRY))
-        .append_segment(u64::from(index))
-}
-
-/// Parse `<version>/32=entry/seg=<index>`, `version` a version's log entry
-/// name (with a collection): the version's name and the index.
-pub fn parse_entry_name(name: &Name) -> Option<(Name, u32)> {
-    let (last, rest) = name.components().split_last()?;
-    let index = u32::try_from(last.as_segment()?).ok()?;
-    let (marker, version) = rest.split_last()?;
-    if !is_kw(marker, ENTRY) {
-        return None;
-    }
-    let version = name_of(version);
-    parse_log_name(&version)?.subject?;
-    Some((version, index))
-}
-
-/// What a range read of a one-key collection asks for (spec §5.4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Range {
-    /// The blocks whose seqs lie in `low..=high` (by name).
-    Seqs(u64, u64),
-    /// The entries dated `from ≤ dated < to`.
-    Times(Timestamp, Timestamp),
-}
-
-/// A range read's name: `<collection>/32=range/<SeqRange|TimeRange TLV>`.
-/// A local name, never fetched.
-pub fn range_name(collection: &Name, range: &Range) -> Name {
-    let mut w = TlvWriter::new();
-    match range {
-        Range::Seqs(lo, hi) => w.write_nested(tlv::SEQ_RANGE, |w| {
-            write_nni(w, tlv::SEQ, *lo);
-            write_nni(w, tlv::SEQ, *hi);
-        }),
-        Range::Times(from, to) => w.write_nested(tlv::TIME_RANGE, |w| {
-            write_nni(w, tlv::DATED, from.0);
-            write_nni(w, tlv::DATED, to.0);
-        }),
-    }
-    collection
-        .clone()
-        .append_component(kw(RANGE))
-        .append_component(NameComponent::generic(w.finish()))
-}
-
-/// Parse `<collection>/32=range/<SeqRange|TimeRange TLV>`. `None` when the
-/// name has no `32=range` component (it is no range name); an error saying
-/// how a range name is formed when it has one but is malformed: no
-/// collection before it, not exactly one TLV after it, a seq range with
-/// low > high, or a time range with from ≥ to.
-pub fn parse_range_name(name: &Name) -> Option<Result<(Name, Range), WireError>> {
-    let comps = name.components();
-    let at = comps.iter().position(|c| is_kw(c, RANGE))?;
-    let form = "a range name is <collection>/32=range/<range>, the range one SeqRange (low, \
-                high: blocks by seq, low ≤ high) or TimeRange (from, to: entries dated from ≤ \
-                dated < to, from < to) TLV";
-    let parsed = (|| {
-        let collection = name_of(&comps[..at]);
-        if !is_collection_name(&collection)
-            || at + 2 != comps.len()
-            || comps[at + 1].typ != tlv_type::GENERIC_NAME_COMPONENT
-        {
-            return Err(bad(form));
-        }
-        let mut r = TlvReader::new(comps[at + 1].value.clone());
-        let (typ, value) = r.read_tlv().map_err(|_| bad(form))?;
-        if !r.is_empty() {
-            return Err(bad(form));
-        }
-        let end = match typ {
-            tlv::SEQ_RANGE => tlv::SEQ,
-            tlv::TIME_RANGE => tlv::DATED,
-            _ => return Err(bad(form)),
-        };
-        let mut ends = Vec::with_capacity(2);
-        each(value, |t, v| {
-            if t != end {
-                return Ok(false);
-            }
-            ends.push(read_nni(&v)?);
-            Ok(true)
-        })?;
-        let range = match (typ, ends.as_slice()) {
-            (tlv::SEQ_RANGE, &[lo, hi]) if lo <= hi => Range::Seqs(lo, hi),
-            (tlv::TIME_RANGE, &[from, to]) if from < to => {
-                Range::Times(Timestamp(from), Timestamp(to))
-            }
-            _ => return Err(bad(form)),
-        };
-        Ok((collection, range))
-    })();
-    Some(parsed)
 }
 
 /// A manifest node's Content: the digests it lists, in order.
@@ -1670,7 +1474,7 @@ pub struct VersionBody {
     /// The writer's clock.
     pub dated: Timestamp,
     /// The merge rule the operation was made for (spec §5.1); `None` under
-    /// the log and one-key rules.
+    /// the log rule.
     pub rule: Option<Name>,
     /// The fields the writer set (an empty value removes the field); empty
     /// while the payload is sealed and not opened.
@@ -1681,25 +1485,10 @@ pub struct VersionBody {
     /// The payload sealed: when present, `Fields` and `MergeOp` travel
     /// inside it ([`encode_payload`]) and not beside it.
     pub sealed: Option<SealedBody>,
-    /// The payload carried in pieces (spec §4.1): when present, the
+    /// The payload carried in pieces (spec §13.1): when present, the
     /// payload — sealed or not — travels in them, and neither `Fields` nor
     /// `MergeOp` nor the sealed `Ciphertext` stands in the record.
     pub chunks: Option<ChunksBody>,
-    /// The payload a block of small entries (spec §4.1): when present and
-    /// not sealed, it stands in the record in place of `Fields` and
-    /// `MergeOp`; sealed, it is the ciphertext's plaintext (and `None`
-    /// while not opened).
-    pub block: Option<Vec<BlockEntryBody>>,
-}
-
-/// One entry of a block: its date's offset from the version's `Dated`, and
-/// its fields.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockEntryBody {
-    /// Milliseconds after the version's `Dated`.
-    pub offset: u64,
-    /// The fields.
-    pub fields: Content,
 }
 
 /// A sealed payload: the epoch whose key seals it, and the ciphertext of
@@ -1715,7 +1504,7 @@ pub struct SealedBody {
 }
 
 /// A payload carried in pieces: its octets and the digest of its manifest
-/// tree's root node packet (spec §4.1).
+/// tree's root node packet (spec §13.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ChunksBody {
     /// The payload's octets as carried (sealed: the ciphertext's).
@@ -1847,10 +1636,7 @@ pub fn encode_version(b: &VersionBody) -> Bytes {
                 }
             }
             (None, Some(c)) => write_chunks(w, c),
-            (None, None) => match &b.block {
-                Some(entries) => write_block(w, entries),
-                None => write_payload(w, &b.fields, &b.op),
-            },
+            (None, None) => write_payload(w, &b.fields, &b.op),
         }
     });
     w.finish()
@@ -1904,225 +1690,22 @@ pub fn decode_payload(bytes: Bytes) -> Result<(Content, Bytes), WireError> {
     }
 }
 
-fn write_block(w: &mut TlvWriter, entries: &[BlockEntryBody]) {
-    w.write_nested(tlv::BLOCK, |w| {
-        for e in entries {
-            w.write_nested(tlv::BLOCK_ENTRY, |w| {
-                write_nni(w, tlv::OFFSET, e.offset);
-                write_fields(w, &e.fields);
-            });
-        }
-    });
-}
-
-/// A block's `Block` TLV: what a version record carries in place of its
-/// `Fields` and `MergeOp`, and what a sealed block's ciphertext carries.
-pub fn encode_block(entries: &[BlockEntryBody]) -> Bytes {
-    let mut w = TlvWriter::new();
-    write_block(&mut w, entries);
-    w.finish()
-}
-
-/// The value of a `Block` TLV: at least one entry, each with an offset and
-/// fields, offsets non-decreasing and the first 0.
-fn read_block(value: Bytes) -> Result<Vec<BlockEntryBody>, WireError> {
-    let mut out: Vec<BlockEntryBody> = Vec::new();
-    each(value, |t, v| {
-        if t != tlv::BLOCK_ENTRY {
-            return Ok(false);
-        }
-        let (mut offset, mut fields) = (None, None);
-        each(v, |t, v| {
-            match t {
-                tlv::OFFSET => offset = Some(read_nni(&v)?),
-                tlv::FIELDS => fields = Some(read_fields(v)?),
-                _ => return Ok(false),
-            }
-            Ok(true)
-        })?;
-        let (Some(offset), Some(fields)) = (offset, fields) else {
-            return Err(bad("a block entry has an offset and fields"));
-        };
-        match out.last() {
-            None if offset != 0 => return Err(bad("a block's first entry has offset 0")),
-            Some(prev) if offset < prev.offset => {
-                return Err(bad("a block's offsets are non-decreasing"));
-            }
-            _ => {}
-        }
-        out.push(BlockEntryBody { offset, fields });
-        Ok(true)
-    })?;
-    if out.is_empty() {
-        return Err(bad("a block has at least one entry"));
-    }
-    Ok(out)
-}
-
-/// A version's payload as it travels inline (sealed: once opened).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Inline {
-    /// One entry's fields and the merge function's operation.
-    Fields(Content, Bytes),
-    /// A block of entries.
-    Block(Vec<BlockEntryBody>),
-}
-
-/// Decode an opened sealed payload: `Fields` and `MergeOp`
-/// ([`encode_payload`]), or a `Block` ([`encode_block`]).
-pub fn decode_inline(bytes: Bytes) -> Result<Inline, WireError> {
-    let (mut fields, mut op, mut block) = (None, None, None);
-    each(bytes, |typ, v| {
-        match typ {
-            tlv::FIELDS => fields = Some(read_fields(v)?),
-            tlv::MERGE_OP => op = Some(v),
-            tlv::BLOCK => block = Some(read_block(v)?),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
-    match (fields, op, block) {
-        (Some(f), Some(o), None) => Ok(Inline::Fields(f, o)),
-        (None, None, Some(b)) => Ok(Inline::Block(b)),
-        _ => Err(bad(
-            "a sealed payload carries fields and a merge op, or a block",
-        )),
-    }
-}
-
 fn write_keep(w: &mut TlvWriter, keep: Keep) {
     w.write_nested(tlv::KEEP, |w| match keep {
-        Keep::Until(t) => write_nni(w, tlv::KEEP_UNTIL, t.0),
-        Keep::LastN(n) => write_nni(w, tlv::KEEP_LAST_N, u64::from(n)),
         Keep::Forever => w.write_tlv(tlv::KEEP_FOREVER, &[]),
     });
 }
 
 fn read_keep(v: Bytes) -> Result<Option<Keep>, WireError> {
     let mut keep = None;
-    each(v, |t, v| {
+    each(v, |t, _| {
         keep = Some(match t {
-            tlv::KEEP_UNTIL => Keep::Until(Timestamp(read_nni(&v)?)),
-            tlv::KEEP_LAST_N => {
-                Keep::LastN(u32::try_from(read_nni(&v)?).map_err(|_| bad("last N fits 32 bits"))?)
-            }
             tlv::KEEP_FOREVER => Keep::Forever,
             _ => return Ok(false),
         });
         Ok(true)
     })?;
     Ok(keep)
-}
-
-/// What a device keeps of a version it dropped (expired by its
-/// clock): its writer, its keep and the dates of its first and last entry,
-/// so its own summary goes on listing it as the log does, a `get` answers
-/// why, and a range read places it. A local value, never published.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Tomb {
-    pub(crate) writer: Name,
-    pub(crate) keep: Keep,
-    pub(crate) first: Timestamp,
-    /// `None` when unknown: a sealed block dropped before it was opened,
-    /// whose entries' offsets this device never read.
-    pub(crate) last: Option<Timestamp>,
-}
-
-/// A tombstone's value: its writer, keep and first date, then its last
-/// date when known (one `Dated` for a sealed block dropped unopened).
-pub(crate) fn encode_tomb(t: &Tomb) -> Bytes {
-    let mut w = TlvWriter::new();
-    w.write_nested(tlv::WRITER, |w| write_name(w, &t.writer));
-    write_keep(&mut w, t.keep);
-    write_nni(&mut w, tlv::DATED, t.first.0);
-    if let Some(last) = t.last {
-        write_nni(&mut w, tlv::DATED, last.0);
-    }
-    w.finish()
-}
-
-/// A tombstone's value; `None` for one an earlier revision kept empty.
-pub(crate) fn decode_tomb(value: Bytes) -> Option<Tomb> {
-    let (mut writer, mut keep, mut dates) = (None, None, Vec::with_capacity(2));
-    each(value, |t, v| {
-        match t {
-            tlv::WRITER => writer = Some(read_writer(v)?),
-            tlv::KEEP => keep = read_keep(v)?,
-            tlv::DATED => dates.push(Timestamp(read_nni(&v)?)),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })
-    .ok()?;
-    let (first, last) = match *dates.as_slice() {
-        [first] => (first, None),
-        [first, last] => (first, Some(last)),
-        _ => return None,
-    };
-    Some(Tomb {
-        writer: writer?,
-        keep: keep?,
-        first,
-        last,
-    })
-}
-
-/// The content of a one-key collection's head (spec §5.3).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HeadBody {
-    /// The collection.
-    pub collection: Name,
-    /// The writer's highest seq in it: its summary node's head.
-    pub seq: u64,
-    /// SHA-256 of the writer's summary node packet of the collection at
-    /// `seq`.
-    pub digest: [u8; 32],
-    /// Milliseconds: the batch delay of the newest version's entries (0
-    /// unbatched); also the head packet's FreshnessPeriod.
-    pub freshness: u64,
-}
-
-/// Encode a head record.
-pub fn encode_head(b: &HeadBody) -> Bytes {
-    let mut w = TlvWriter::new();
-    w.write_nested(tlv::HEAD_RECORD, |w| {
-        write_name(w, &b.collection);
-        write_nni(w, tlv::SEQ, b.seq);
-        w.write_tlv(tlv::DIGEST, &b.digest);
-        write_nni(w, tlv::FRESHNESS, b.freshness);
-    });
-    w.finish()
-}
-
-/// Decode a head record.
-pub fn decode_head(content: Bytes) -> Result<HeadBody, WireError> {
-    let mut r = TlvReader::new(content);
-    let (typ, value) = r.read_tlv().map_err(|e| bad(format!("bad TLV: {e:?}")))?;
-    if typ != tlv::HEAD_RECORD || !r.is_empty() {
-        return Err(bad("a head packet carries one head record"));
-    }
-    let (mut collection, mut seq, mut digest, mut freshness) = (None, None, None, None);
-    each(value, |t, v| {
-        match t {
-            tlv_type::NAME => collection = Some(read_name(v)?),
-            tlv::SEQ => seq = Some(read_nni(&v)?),
-            tlv::DIGEST => digest = Some(read_digest(&v)?),
-            tlv::FRESHNESS => freshness = Some(read_nni(&v)?),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
-    match (collection, seq, digest, freshness) {
-        (Some(collection), Some(seq), Some(digest), Some(freshness)) => Ok(HeadBody {
-            collection,
-            seq,
-            digest,
-            freshness,
-        }),
-        _ => Err(bad(
-            "a head record names a collection, a seq, a node digest and a freshness",
-        )),
-    }
 }
 
 /// Encode a members record.
@@ -2135,7 +1718,6 @@ pub fn encode_members(b: &MembersBody) -> Bytes {
         }
         write_nni(w, tlv::REVISION, b.revision);
         w.write_nested(tlv::RULE, |w| match &b.rule {
-            Rule::OneKey => write_nni(w, tlv::RULE_KIND, 0),
             Rule::Log => write_nni(w, tlv::RULE_KIND, 1),
             Rule::Merge { function } => {
                 write_nni(w, tlv::RULE_KIND, 2);
@@ -2254,7 +1836,6 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
     let mut op = None;
     let mut sealed = None;
     let mut chunks = None;
-    let mut block = None;
     let mut rule = None;
     each(value, |typ, v| {
         match typ {
@@ -2331,7 +1912,6 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
                 }
                 chunks = Some(ChunksBody { size, root });
             }
-            tlv::BLOCK => block = Some(read_block(v)?),
             _ => return Ok(false),
         }
         Ok(true)
@@ -2349,19 +1929,13 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
             return Err(bad("a payload in pieces has no ciphertext in its record"));
         }
     };
-    if block.is_some() && (sealed.is_some() || chunks.is_some()) {
-        return Err(bad(
-            "a block stands in its record unsealed, and in its ciphertext sealed; never in \
-             pieces",
-        ));
-    }
-    let elsewhere = sealed.is_some() || chunks.is_some() || block.is_some();
+    let elsewhere = sealed.is_some() || chunks.is_some();
     let (fields, op) = match (fields, op, elsewhere) {
         (None, None, true) => (Content::new(), Bytes::new()),
         (Some(f), Some(o), false) => (f, o),
         (_, _, true) => {
             return Err(bad(
-                "a sealed version, one in pieces or a block carries its fields only there",
+                "a sealed version or one in pieces carries its fields only there",
             ));
         }
         (None, _, false) => return Err(missing("fields")),
@@ -2379,7 +1953,6 @@ fn decode_version(value: Bytes) -> Result<VersionBody, WireError> {
         op,
         sealed,
         chunks,
-        block,
     })
 }
 
@@ -2452,10 +2025,9 @@ fn decode_members(value: Bytes) -> Result<MembersBody, WireError> {
                     Ok(true)
                 })?;
                 rule = Some(match (kind, function) {
-                    (Some(0), None) => Rule::OneKey,
                     (Some(1), None) => Rule::Log,
                     (Some(2), Some(function)) => Rule::Merge { function },
-                    _ => return Err(bad("a rule is one key, log, or merge with a function")),
+                    _ => return Err(bad("a rule is log, or merge with a function")),
                 });
             }
             tlv::WRITERS => {
@@ -2718,60 +2290,6 @@ fn check_ranges(ranges: &[(u64, u64)], head: u64, most: usize) -> Result<(), Wir
     Ok(())
 }
 
-/// Check a node's `Expiry` runs against the seqs it lists: at most
-/// [`EXPIRY_RUNS`], each with seqs, their seqs ascending and disjoint across
-/// all runs, every one listed in `entries` (checked ranges).
-fn check_expiry(runs: &[ExpiryRun], entries: &[(u64, u64)]) -> Result<(), WireError> {
-    if runs.len() > EXPIRY_RUNS {
-        return Err(bad(format!(
-            "a node states {} expiry runs; at most {EXPIRY_RUNS} are stated in one node",
-            runs.len()
-        )));
-    }
-    let mut prev: Option<u64> = None;
-    for run in runs {
-        if run.seqs.is_empty() {
-            return Err(bad("an expiry run names seqs"));
-        }
-        for &(lo, hi) in &run.seqs {
-            if prev.is_some_and(|p| lo <= p) {
-                return Err(bad("expiry runs are ascending and disjoint"));
-            }
-            if !all_listed(entries, lo, hi) {
-                return Err(bad(format!(
-                    "an expiry run names seqs {lo}–{hi}, which the node does not list"
-                )));
-            }
-            prev = Some(hi);
-        }
-    }
-    Ok(())
-}
-
-/// Whether every seq from `lo` to `hi` lies in `ranges` (ascending,
-/// disjoint).
-fn all_listed(ranges: &[(u64, u64)], lo: u64, hi: u64) -> bool {
-    let mut i = ranges.partition_point(|(_, h)| *h < lo);
-    let mut from = lo;
-    while let Some(&(l, h)) = ranges.get(i) {
-        if l > from {
-            return false;
-        }
-        if h >= hi {
-            return true;
-        }
-        from = h + 1;
-        i += 1;
-    }
-    false
-}
-
-/// Whether `seq` lies in `ranges` (ascending, disjoint).
-pub(crate) fn in_ranges(ranges: &[(u64, u64)], seq: u64) -> bool {
-    let i = ranges.partition_point(|(_, hi)| *hi < seq);
-    ranges.get(i).is_some_and(|(lo, _)| *lo <= seq)
-}
-
 // ---- summaries --------------------------------------------------------------------------------
 
 /// A reference to a child summary node.
@@ -2805,17 +2323,6 @@ pub enum Branches {
     Pages(Vec<PageRef>),
 }
 
-/// A run of a summary node's listed versions kept until a date (spec §7):
-/// every seq of `seqs` is listed and kept `Until` a date at or before
-/// `until`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExpiryRun {
-    /// The run's seqs, as ascending, disjoint ranges.
-    pub seqs: Vec<(u64, u64)>,
-    /// A date no earlier than the keep of any of them.
-    pub until: Timestamp,
-}
-
 /// A summary node (or page).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeBody {
@@ -2831,9 +2338,6 @@ pub struct NodeBody {
     pub entries: Vec<(u64, u64)>,
     /// The writer's members records of `subject`.
     pub members: Vec<(u64, u64)>,
-    /// The bounds of the keeps of the versions `entries` lists kept `Until`
-    /// a date, in runs (a log or one-key collection's node; spec §7).
-    pub expiry: Vec<ExpiryRun>,
     /// Sub-collections.
     pub branches: Branches,
 }
@@ -2850,17 +2354,6 @@ pub fn encode_node(b: &NodeBody) -> Bytes {
         }
         write_ranges(w, tlv::ENTRIES, &b.entries);
         write_ranges(w, tlv::MEMBERS_ENTRIES, &b.members);
-        for run in &b.expiry {
-            w.write_nested(tlv::EXPIRY, |w| {
-                for (lo, hi) in &run.seqs {
-                    w.write_nested(tlv::SEQ_RANGE, |w| {
-                        write_nni(w, tlv::SEQ, *lo);
-                        write_nni(w, tlv::SEQ, *hi);
-                    });
-                }
-                write_nni(w, tlv::KEEP_UNTIL, run.until.0);
-            });
-        }
         match &b.branches {
             Branches::Children(c) if c.is_empty() => {}
             Branches::Children(c) => w.write_nested(tlv::CHILDREN, |w| {
@@ -2899,7 +2392,6 @@ pub fn decode_node(content: Bytes) -> Result<NodeBody, WireError> {
     let mut page = None;
     let mut entries = Vec::new();
     let mut members = Vec::new();
-    let mut expiry = Vec::new();
     let mut branches = Branches::Children(Vec::new());
     each(value, |typ, v| {
         match typ {
@@ -2909,22 +2401,6 @@ pub fn decode_node(content: Bytes) -> Result<NodeBody, WireError> {
             tlv::PAGE_PATH => page = Some(v),
             tlv::ENTRIES => entries = read_ranges(v)?,
             tlv::MEMBERS_ENTRIES => members = read_ranges(v)?,
-            tlv::EXPIRY => {
-                let mut until = None;
-                each(v.clone(), |t, v| {
-                    match t {
-                        tlv::SEQ_RANGE => {}
-                        tlv::KEEP_UNTIL if until.is_none() => until = Some(read_nni(&v)?),
-                        tlv::KEEP_UNTIL => return Err(bad("an expiry run states one date")),
-                        _ => return Ok(false),
-                    }
-                    Ok(true)
-                })?;
-                expiry.push(ExpiryRun {
-                    seqs: read_ranges(v)?,
-                    until: Timestamp(until.ok_or_else(|| bad("an expiry run states a date"))?),
-                });
-            }
             tlv::CHILDREN => {
                 let mut list = Vec::new();
                 each(v, |t, v| {
@@ -2996,7 +2472,6 @@ pub fn decode_node(content: Bytes) -> Result<NodeBody, WireError> {
     let head = head.ok_or_else(|| missing("a head"))?;
     check_ranges(&entries, head, NODE_SEQS)?;
     check_ranges(&members, head, NODE_SEQS - seqs_in(&entries))?;
-    check_expiry(&expiry, &entries)?;
     Ok(NodeBody {
         subject: subject.ok_or_else(|| missing("a subject"))?,
         writer: writer.ok_or_else(|| missing("a writer"))?,
@@ -3004,7 +2479,6 @@ pub fn decode_node(content: Bytes) -> Result<NodeBody, WireError> {
         page,
         entries,
         members,
-        expiry,
         branches,
     })
 }
@@ -3606,7 +3080,6 @@ mod tests {
             page: None,
             entries,
             members: vec![(1, 1)],
-            expiry: Vec::new(),
             branches: Branches::Children(Vec::new()),
         };
         let ok = node(9, vec![(2, 4), (6, 9)]);
@@ -3623,70 +3096,6 @@ mod tests {
                 refused.as_ref().is_err_and(|e| e.0.contains(why)),
                 "{refused:?}, expected {why}"
             );
-        }
-    }
-
-    #[test]
-    fn a_node_whose_expiry_runs_are_out_of_order_unlisted_or_too_many_is_refused() {
-        let run = |seqs: Vec<(u64, u64)>, until: u64| ExpiryRun {
-            seqs,
-            until: Timestamp(until),
-        };
-        let node = |expiry: Vec<ExpiryRun>| NodeBody {
-            subject: n("/alice/32=data/soil"),
-            writer: n("/alice/sensor/KEY/1"),
-            head: 200,
-            page: None,
-            entries: vec![(2, 4), (5, 9), (20, 199)],
-            members: vec![(1, 1)],
-            expiry,
-            branches: Branches::Children(Vec::new()),
-        };
-        // A run may span ranges of `Entries` that touch, and skip listed
-        // seqs (kept otherwise) between its ranges.
-        let ok = node(vec![
-            run(vec![(2, 6)], 50),
-            run(vec![(8, 9), (20, 30)], 40),
-            run(vec![(31, 31)], 60),
-        ]);
-        assert_eq!(decode_node(encode_node(&ok)), Ok(ok));
-        for expiry in [
-            // Out of order, overlapping, empty.
-            vec![run(vec![(20, 30)], 5), run(vec![(2, 4)], 5)],
-            vec![run(vec![(2, 6)], 5), run(vec![(6, 9)], 5)],
-            vec![run(vec![(8, 9), (2, 4)], 5)],
-            vec![run(Vec::new(), 5)],
-            // A seq the node does not list.
-            vec![run(vec![(9, 20)], 5)],
-            vec![run(vec![(1, 2)], 5)],
-            vec![run(vec![(199, 200)], 5)],
-            // More runs than one node states.
-            (20..20 + EXPIRY_RUNS as u64 + 1)
-                .map(|s| run(vec![(s, s)], s))
-                .collect(),
-        ] {
-            let refused = decode_node(encode_node(&node(expiry.clone())));
-            assert!(refused.is_err(), "{expiry:?} taken: {refused:?}");
-        }
-        // A run without its date, or with two, is refused too.
-        for dates in [0, 2] {
-            let mut w = TlvWriter::new();
-            w.write_nested(tlv::SUMMARY_NODE, |w| {
-                write_name(w, &n("/alice/32=data/soil"));
-                w.write_nested(tlv::WRITER, |w| write_name(w, &n("/alice/sensor/KEY/1")));
-                write_nni(w, tlv::SEQ, 9);
-                write_ranges(w, tlv::ENTRIES, &[(2, 9)]);
-                w.write_nested(tlv::EXPIRY, |w| {
-                    w.write_nested(tlv::SEQ_RANGE, |w| {
-                        write_nni(w, tlv::SEQ, 2);
-                        write_nni(w, tlv::SEQ, 4);
-                    });
-                    for d in 0..dates {
-                        write_nni(w, tlv::KEEP_UNTIL, 10 + d);
-                    }
-                });
-            });
-            assert!(decode_node(w.finish()).is_err(), "{dates} dates taken");
         }
     }
 
@@ -3716,7 +3125,6 @@ mod tests {
                 ciphertext: Bytes::from_static(b"opaque"),
             }),
             chunks: None,
-            block: None,
         };
         assert_eq!(
             decode_record(encode_version(&body)),
@@ -3774,7 +3182,6 @@ mod tests {
             op: Bytes::from_static(b"op"),
             sealed: None,
             chunks: None,
-            block: None,
         };
         assert_eq!(
             decode_record(encode_version(&body)),
@@ -3817,7 +3224,6 @@ mod tests {
             fields: Content::new(),
             op: Bytes::new(),
             sealed: None,
-            block: None,
             chunks: Some(ChunksBody {
                 size,
                 root: [1; 32],
@@ -3830,97 +3236,6 @@ mod tests {
         );
         // A terabyte claimed: a reader would reserve it whole to read it.
         assert!(decode_record(encode_version(&body(1 << 40))).is_err());
-    }
-
-    #[test]
-    fn heads_entries_ranges_and_blocks_parse_back() {
-        let d = n("/alice/sensor");
-        let c = n("/alice/32=data/temps");
-        let head = head_name(&d, &c, 9);
-        assert_eq!(parse_head_name(&head), Some((d.clone(), c.clone(), 9)));
-        assert_eq!(
-            parse_head_prefix(&head_prefix(&d, &c)),
-            Some((d.clone(), c.clone()))
-        );
-        // A head is no summary node, and a nested collection's head does not
-        // extend the discovery name of its parent's.
-        assert_eq!(parse_summary_name(&head), None);
-        let nested = head_name(&d, &n("/alice/32=data/temps/kitchen"), 3);
-        assert!(!nested.has_prefix(&head_prefix(&d, &c)));
-        assert!(!node_name(&d, &c, 9).has_prefix(&head_prefix(&d, &c)));
-
-        let v = log_name(&d, Some(&c), 4);
-        assert_eq!(parse_entry_name(&entry_name(&v, 7)), Some((v.clone(), 7)));
-        assert_eq!(parse_piece_name(&entry_name(&v, 7)), None);
-        assert_eq!(parse_log_name(&entry_name(&v, 7)), None);
-
-        for r in [
-            Range::Seqs(2, 5),
-            Range::Times(Timestamp(10), Timestamp(20)),
-        ] {
-            assert_eq!(
-                parse_range_name(&range_name(&c, &r)),
-                Some(Ok((c.clone(), r)))
-            );
-        }
-        assert_eq!(parse_range_name(&c), None);
-        // Bounds out of order are malformed, not empty.
-        assert!(matches!(
-            parse_range_name(&range_name(&c, &Range::Seqs(5, 2))),
-            Some(Err(_))
-        ));
-        assert!(matches!(
-            parse_range_name(&range_name(&c, &Range::Times(Timestamp(9), Timestamp(9)))),
-            Some(Err(_))
-        ));
-
-        let entries = vec![
-            BlockEntryBody {
-                offset: 0,
-                fields: Content::new().with("t", &b"20.5"[..]),
-            },
-            BlockEntryBody {
-                offset: 60_000,
-                fields: Content::new().with("t", &b"20.7"[..]),
-            },
-        ];
-        let body = VersionBody {
-            collection: c.clone(),
-            parents: Parents::new(),
-            type_id: TypeId {
-                name: n("/types/reading"),
-                revision: 1,
-            },
-            seal: Seal { any_of: Vec::new() },
-            keep: Keep::Until(Timestamp(1_000_000)),
-            dated: Timestamp(5),
-            rule: None,
-            fields: Content::new(),
-            op: Bytes::new(),
-            sealed: None,
-            chunks: None,
-            block: Some(entries.clone()),
-        };
-        assert_eq!(
-            decode_record(encode_version(&body)),
-            Ok(Record::Version(body))
-        );
-        assert_eq!(
-            decode_inline(encode_block(&entries)),
-            Ok(Inline::Block(entries.clone()))
-        );
-        // Offsets go back, or the first is not 0: refused.
-        let mut back = entries.clone();
-        back.swap(0, 1);
-        assert!(decode_inline(encode_block(&back)).is_err());
-
-        let h = HeadBody {
-            collection: c,
-            seq: 9,
-            digest: [3; 32],
-            freshness: 60_000,
-        };
-        assert_eq!(decode_head(encode_head(&h)), Ok(h));
     }
 
     /// Routing a name by its keyword (`served_kind`, `NameWords`) decides what the chains of
@@ -3943,12 +3258,9 @@ mod tests {
             c.clone(),
             log.clone(),
             log_name(&device, None, 2),
-            entry_name(&log, 1),
             piece_name(&log, PieceKind::Chunk(2)),
             piece_name(&log, PieceKind::Manifest(0)),
             state_name(&c, &Frontier::default()),
-            range_name(&c, &Range::Seqs(1, 4)),
-            head_name(&device, &c, 5),
             root_name(&device, &n("/alice"), 4),
             node_name(&device, &c, 4),
             seal_key_name(&device, &[9; 32]),
@@ -4013,16 +3325,8 @@ mod tests {
                 "{name}: a log name without 32=log"
             );
             assert!(
-                words.entry() || parse_entry_name(name).is_none(),
-                "{name}: an entry name without 32=entry"
-            );
-            assert!(
                 words.state() || parse_state_name(name).is_none(),
                 "{name}: a state name without 32=state"
-            );
-            assert!(
-                words.range() || parse_range_name(name).is_none(),
-                "{name}: a range name without 32=range"
             );
         }
         assert_eq!(seen.len(), 4, "the table reaches every route: {seen:?}");

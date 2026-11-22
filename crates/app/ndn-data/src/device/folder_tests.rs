@@ -80,7 +80,6 @@ fn options() -> PutOptions {
             revision: 1,
         },
         keep: Keep::Forever,
-        batch: None,
     }
 }
 
@@ -200,7 +199,6 @@ fn version(device: &Name, c: &Name, seq: u64, sealed: Option<(&Epoch, &ContentKe
         op: Bytes::new(),
         sealed,
         chunks: None,
-        block: None,
     })
 }
 

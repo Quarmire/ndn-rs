@@ -363,7 +363,6 @@ async fn a_record_listing_many_writers_adopts_at_most_the_cap_and_joins_no_group
                 revision: 1,
             },
             keep: Keep::Forever,
-            batch: None,
         },
     )
     .await

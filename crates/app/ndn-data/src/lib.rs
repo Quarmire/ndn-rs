@@ -16,7 +16,7 @@
 //! collections, which grow. A version is signed by one key — its
 //! [`Writer`] — and is identified by `(writer, seq)` ([`VersionId`]); it names
 //! its parents as [`Parents`]: a [`Frontier`] bound to its tips' digests. A
-//! collection has a [`Rule`] (one key, log or
+//! collection has a [`Rule`] (log or
 //! merge) and an owner-signed [`Members`] record saying who writes and who
 //! reads. Everything else is a version that says something about other
 //! versions: a [`Summary`] (what a collection holds, signed, nested by
@@ -50,7 +50,6 @@
 //! | 1 | versions, members records (owner-signed, writers of any prefix), the merge rule ([`merge`]), signed nested summaries, `get`, `put`, `watch`, `snapshot` of states and versions, `share` that adds |
 //! | 2 | members of other namespaces reached through their own groups, `share` that removes (cuts) and changes the rule, re-check on cut arrival (`Withdrawn`), seals (epoch keys granted to the audience), the log rule |
 //! | 3 | large payloads |
-//! | 4 | signed blocks of small entries under a producer's delay, the one-key rule (a signed head with a freshness bound, rollback refused), retention by expiry (summaries listed by keep), range reads by seq and by time |
 //! | 5 | revocation as a cut, owner re-admission of honest work |
 //! | 7 | the verbs over forwarder management and the mobile FFI |
 //!
@@ -87,8 +86,8 @@ pub use intro::{
     JoinedFolder, Offer, Role,
 };
 pub use layer::{
-    Age, Answer, BATCH_MAX, Change, Changes, DataLayer, Entries, Entry, Equivocal, Got, NotCounted,
-    PutOptions, Share, ShareChange, Sharing, State,
+    Age, Answer, Change, Changes, DataLayer, Equivocal, Got, NotCounted, PutOptions, Share,
+    ShareChange, Sharing, State,
 };
 pub use merge::{
     Counting, MergeError, MergeRule, MergeRules, MergeState, Op, OpKind, Past, Value, Yrs,
@@ -97,6 +96,6 @@ pub use ndn_foundation_types::{Hash, Name};
 pub use signal::{SignalKey, SignalRefusal, SignalScope, SignalSender};
 pub use statement::Snapshot;
 pub use version::{
-    Audience, BlockEntry, Content, Frontier, Keep, Parents, Payload, Seal, Seq, Timestamp, TypeId,
-    Version, VersionId, Writer,
+    Audience, Content, Frontier, Keep, Parents, Payload, Seal, Seq, Timestamp, TypeId, Version,
+    VersionId, Writer,
 };

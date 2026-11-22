@@ -147,7 +147,6 @@ pub(super) fn version(device: &str, c: &Name, seq: u64, parents: &[(&str, u64)])
         op: Bytes::new(),
         sealed: None,
         chunks: None,
-        block: None,
     };
     made(device, c, seq, Record::Version(body))
 }
@@ -181,7 +180,6 @@ pub(super) fn options() -> PutOptions {
             revision: 1,
         },
         keep: Keep::Forever,
-        batch: None,
     }
 }
 

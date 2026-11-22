@@ -209,10 +209,6 @@ pub struct Timestamp(pub u64);
 /// Retention chosen at write (model invariant 7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Keep {
-    /// Keep until this date, by the holder's clock.
-    Until(Timestamp),
-    /// Keep this writer's last `n` versions in the collection.
-    LastN(u32),
     /// Keep forever.
     Forever,
 }
@@ -275,30 +271,11 @@ impl Content {
     }
 }
 
-/// One small entry of a block (model change M6, spec §4.1): its date (the
-/// block's `dated` plus the entry's offset) and its content.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BlockEntry {
-    /// When its writer took it; display and indexing only.
-    pub dated: Timestamp,
-    /// The content.
-    pub content: Content,
-}
-
-/// What a version carries: one entry, a block of many small entries under
-/// one signature, or a large entry carried in pieces.
-///
-/// A block's entries travel inside the block's own signed packet, so each
-/// entry verifies on its own exactly through the block's signature; the
-/// producer states the delay it accepts to fill one (model change M6,
-/// [`PutOptions::batch`](crate::PutOptions::batch)).
+/// What a version carries: one entry, or a large entry carried in pieces.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Payload {
     /// A single entry.
     Entry(Content),
-    /// Several entries under one signature, in order, their dates
-    /// non-decreasing; the first is dated the version's `dated`.
-    Block(Vec<BlockEntry>),
     /// A single entry too large to carry in the version's own packet: it
     /// travels in pieces, each verified against the version's signed
     /// manifest (spec §13.1). Listing and watching report its size; a `get`
@@ -333,7 +310,7 @@ pub struct Version {
     /// The date its writer's clock showed; display only.
     pub dated: Timestamp,
     /// The merge rule its writer made its operation for, by exact name
-    /// (spec §5.1); `None` under the log and one-key rules. A merge
+    /// (spec §5.1); `None` under the log rule. A merge
     /// collection applies it only under that rule.
     pub rule: Option<Name>,
     /// The content.
@@ -344,7 +321,7 @@ pub struct Version {
     pub digest: [u8; 32],
     /// The `MergeOp` octets of a merge version (`rule` is `Some`), as the
     /// rule's [`Op::bytes`](crate::Op::bytes) received them. `None` under
-    /// the log and one-key rules, and while the operation is not open
+    /// the log rule, and while the operation is not open
     /// here: sealed in an epoch whose key this device does not hold, or
     /// carried in pieces and not read whole ([`Payload::Large`]; a `get` of
     /// the version's name reads it whole and fills it).

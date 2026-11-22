@@ -203,7 +203,6 @@ async fn a_walk_that_missed_a_listed_version_fetches_it_later_without_a_new_noti
             revision: 1,
         },
         keep: Keep::Forever,
-        batch: None,
     };
     let id = writer
         .put(&c, Content::new().with("t", Bytes::from("1")), options)
@@ -358,7 +357,6 @@ async fn a_version_missed_inside_a_walk_is_asked_again_in_place_not_after_the_wa
             revision: 1,
         },
         keep: Keep::Forever,
-        batch: None,
     };
     // Versions enough that the walk takes them for far longer than a round
     // of asks of one: two at a time, a second each.
@@ -429,7 +427,7 @@ async fn a_version_missed_inside_a_walk_is_asked_again_in_place_not_after_the_wa
 }
 
 /// A walk that reached the writer's state confirms what it found as of when the writer's
-/// root came to it, not of when its descent ended (spec §5.3, §15): the phone's walk takes
+/// root came to it, not of when its descent ended (spec §15): the phone's walk takes
 /// eighty versions over a slow path, far longer than the root took, and the laptop may
 /// have gone away at any moment of it; the phone's answer is then aged from the root, not
 /// from the walk's end.
@@ -484,7 +482,6 @@ async fn a_walk_confirms_as_of_the_root_not_of_the_end_of_its_descent() {
                 revision: 1,
             },
             keep: Keep::Forever,
-            batch: None,
         };
         last = Some(writer.put(&c, content, options).await.unwrap());
     }
@@ -614,7 +611,6 @@ async fn a_version_written_during_a_long_walk_is_taken_by_a_walk_beside_it() {
             revision: 1,
         },
         keep: Keep::Forever,
-        batch: None,
     };
     let put = |c: Name, i: usize| {
         let (writer, laptop, options) = (&writer, &laptop, &options);
@@ -795,7 +791,6 @@ async fn a_root_refused_before_its_namespace_is_held_is_walked_once_the_namespac
             revision: 1,
         },
         keep: Keep::Forever,
-        batch: None,
     };
     let id = writer
         .put(&c, Content::new().with("t", Bytes::from("1")), options)
@@ -1000,7 +995,6 @@ async fn put_served(writer: &Device, device: &Name, c: &Name, i: usize) -> Name 
             revision: 1,
         },
         keep: Keep::Forever,
-        batch: None,
     };
     let content = Content::new().with("t", Bytes::from(i.to_string()));
     let id = writer.put(c, content, options).await.unwrap();
@@ -2107,7 +2101,6 @@ async fn a_put_under_no_held_record_is_not_ready_at_once_and_goes_through_once_t
             revision: 1,
         },
         keep: Keep::Forever,
-        batch: None,
     };
     let note = |i: usize| Content::new().with("t", Bytes::from(i.to_string()));
     let c = folder.clone().append("note");
@@ -2198,7 +2191,6 @@ async fn a_put_inheriting_a_folder_record_is_not_ready_until_the_phone_was_walke
             revision: 1,
         },
         keep: Keep::Forever,
-        batch: None,
     };
     let note = |i: usize| Content::new().with("t", Bytes::from(i.to_string()));
     let head = me.inner.st.lock().head;

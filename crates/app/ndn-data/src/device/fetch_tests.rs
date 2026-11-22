@@ -131,35 +131,6 @@ async fn a_lost_interest_is_expressed_again_within_its_lifetime() {
     dev.shutdown();
 }
 
-/// A range read's probing lasts as many round trips on a slow path as on a
-/// fast one (spec §5.4, §17.1): each of its looks is the first-look time
-/// or [`RANGE_RTOS`] retransmission timeouts, whichever is longer — so a
-/// path whose round trips near the 2 s lifetime gets 64 s, not 32 s — and
-/// never more than `RANGE_LOOKS` · max(first look, `RANGE_RTOS` · lifetime).
-#[test]
-fn a_range_reads_bound_grows_with_the_measured_round_trip_and_is_capped() {
-    let (look, lifetime) = (Duration::from_secs(4), Duration::from_secs(2));
-    assert_eq!(
-        range_bound(look, Duration::from_millis(250)),
-        Duration::from_secs(32),
-        "a fast path keeps eight first looks"
-    );
-    assert_eq!(
-        range_bound(look, lifetime),
-        Duration::from_secs(64),
-        "a path whose timeout reached the lifetime gets eight looks of four timeouts"
-    );
-    let mut rtt = Rtt::default();
-    for _ in 0..8 {
-        rtt.missed();
-    }
-    assert_eq!(
-        range_bound(look, rtt.rto(lifetime)),
-        Duration::from_secs(64),
-        "no path makes it longer"
-    );
-}
-
 /// The retransmission timeout follows the round trips measured (RFC 6298):
 /// never under [`RTO_MIN`], never over the lifetime, doubled after each ask
 /// that needed a re-expression or missed, until an ask answered by its
@@ -436,7 +407,7 @@ async fn a_nack_for_rate_that_never_stops_costs_a_bounded_number_of_asks() {
     dev.shutdown();
 }
 
-/// A large payload's pieces are fetched a window at once (spec §4.1,
+/// A large payload's pieces are fetched a window at once (spec §13.1,
 /// §17.1): pieces that do not come neither stop the walk nor hold back the
 /// pieces behind them. Every piece that does come is fetched and kept in
 /// the time of two pieces that never come (the first chunk, asked alone

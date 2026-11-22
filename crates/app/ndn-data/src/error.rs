@@ -9,7 +9,7 @@
 use ndn_foundation_types::Name;
 
 use crate::collection::Cut;
-use crate::version::{Keep, Timestamp, VersionId, Writer};
+use crate::version::{Timestamp, VersionId, Writer};
 
 /// What the caller can do about an error, by class. A host words the step
 /// itself.
@@ -74,7 +74,7 @@ pub enum Refusal {
     /// It does not verify: wrong signature, or bytes that do not match its
     /// name (a poisoned cache).
     BadSignature,
-    /// It is a summary, members record or one-key head older than one
+    /// It is a summary or members record older than one
     /// already seen from the same signer.
     Rollback,
     /// It is not sealed, and the collection's members record seals the
@@ -82,9 +82,6 @@ pub enum Refusal {
     /// it. Versions inside the record's `since` (written before the seal)
     /// are not refused for this.
     Unsealed,
-    /// Its payload is a block, and the collection's merge rule needs one
-    /// operation per version (spec §4.1).
-    NotInline,
     /// Its key is marked suspected on this device (it may be in a thief's
     /// hands, [`Device::suspect`](crate::Device::suspect)): no new entry of
     /// it is taken while the mark stands; the entries held from before stay.
@@ -200,11 +197,6 @@ impl std::fmt::Display for Refusal {
                  wrote it before hearing the record that sealed the collection; the writer \
                  writes it again, sealed",
             ),
-            Refusal::NotInline => f.write_str(
-                "its payload is a block of entries, and the collection's merge rule needs one \
-                 operation per version; its writer writes each entry as its own version, or puts \
-                 the stream into a log collection and refers to it by name",
-            ),
             Refusal::Rule { why } => write!(
                 f,
                 "the collection's merge rule refuses its operation ({why}); its writer writes \
@@ -287,15 +279,6 @@ pub enum DataError {
         name: Name,
         /// Why not, and how to name it.
         why: String,
-    },
-    /// The data's keep passed by this device's clock (spec §14.1): it
-    /// dropped it and keeps none of it, whoever else may still hold it.
-    #[error("{name} expired: its keep {keep:?} passed by this device's clock")]
-    Expired {
-        /// The name asked for.
-        name: Name,
-        /// The keep its writer chose.
-        keep: Keep,
     },
     /// The version is refused.
     #[error("version {} of {} is refused: {why}", id.seq.0, id.writer.key())]
@@ -405,7 +388,7 @@ impl DataError {
     pub fn next(&self) -> NextStep {
         match self {
             DataError::Unavailable { .. } | DataError::NotReady { .. } => NextStep::RetryLater,
-            DataError::NotFound { .. } | DataError::Expired { .. } => NextStep::None,
+            DataError::NotFound { .. } => NextStep::None,
             DataError::BadName { .. } | DataError::TooLarge { .. } => NextStep::FixName,
             DataError::Refused { why, .. } => match why {
                 Refusal::OutsideCut(_)
@@ -416,7 +399,6 @@ impl DataError {
                 | Refusal::BeyondOwnLog { .. } => NextStep::AskOwner,
                 Refusal::BadSignature | Refusal::Rollback => NextStep::RetryLater,
                 Refusal::Unsealed
-                | Refusal::NotInline
                 | Refusal::Rule { .. }
                 | Refusal::Parent { .. }
                 | Refusal::OtherRule { .. } => NextStep::None,

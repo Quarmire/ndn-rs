@@ -30,8 +30,8 @@ use super::{Inner, REFRESH_PAUSE_MAX, Rejudge, St, Subject, refuses_more, under}
 use crate::collection::Members;
 use crate::rt::{self, Instant};
 use crate::wire::{
-    LAYOUT_ROLES, namespace_of, parse_ask_name, parse_entry_name, parse_head_name, parse_log_name,
-    parse_piece_name, parse_seal_key_name, parse_signal_run_name, parse_summary_name,
+    LAYOUT_ROLES, namespace_of, parse_ask_name, parse_log_name, parse_piece_name,
+    parse_seal_key_name, parse_signal_run_name, parse_summary_name,
 };
 
 /// The first pause before a namespace the host could not adopt is asked
@@ -148,7 +148,7 @@ fn reached_of(ctx: &SignedTrustContext) -> Reached {
 }
 
 /// What a packet is about, for the scope that judges it: its subject (the
-/// collection of a log entry, a head or a piece; the node of a summary; the
+/// collection of a log entry or a piece; the node of a summary; the
 /// scope of a signal run header) and whether, as a summary node, it may
 /// also lie on the way to a scope.
 pub(super) struct About {
@@ -157,8 +157,8 @@ pub(super) struct About {
 }
 
 /// What the packet named `name` is about, if it is a packet a scope may
-/// judge: a log entry of a collection (its pieces, its block entries), a
-/// one-key head, a summary root, node or page, or a signal run header of a
+/// judge: a log entry of a collection (its pieces), a summary root, node or
+/// page, or a signal run header of a
 /// folder or collection (spec §20). Nothing else — a snapshot, a seal key,
 /// a grant — is about a folder.
 pub(super) fn about(name: &Name) -> Option<About> {
@@ -180,19 +180,10 @@ pub(super) fn about(name: &Name) -> Option<About> {
             toward: true,
         });
     }
-    if let Some((_, collection, _)) = parse_head_name(name) {
-        return Some(About {
-            subject: collection,
-            toward: false,
-        });
-    }
     if let Some(a) = of_entry(name) {
         return Some(a);
     }
-    if let Some(p) = parse_piece_name(name) {
-        return of_entry(&p.version);
-    }
-    parse_entry_name(name).and_then(|(version, _)| of_entry(&version))
+    parse_piece_name(name).and_then(|p| of_entry(&p.version))
 }
 
 /// A person's namespace a record in force lists, as adopted here.

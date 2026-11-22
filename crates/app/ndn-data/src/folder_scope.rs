@@ -7,7 +7,7 @@
 //! whoever asks, and some of what it holds is not sealed (a collection whose
 //! members record names no readers, the members records and summaries
 //! themselves). So the link must carry only the names of the folder: the
-//! entries, pieces, summaries, heads and keys of **collections under the
+//! entries, pieces, summaries and keys of **collections under the
 //! folder**, and the few names of the layer's own that reach them. Everything
 //! else this device holds by name — another folder's collections, a snapshot,
 //! the log of its other namespaces' data, answers — is not carried.
@@ -24,7 +24,7 @@
 //! the link, and they list the next component of every collection beside the
 //! folder with its head and digest — names and counts, never a payload — and
 //! the root and nodes of a namespace are signed to be read by anyone who can
-//! ask. No entry, chunk, head or key of a collection outside the folder
+//! ask. No entry, chunk or key of a collection outside the folder
 //! crosses.
 
 use ndn_packet::Name;
@@ -32,8 +32,8 @@ use ndn_packet::tlv_type::IMPLICIT_SHA256;
 
 use crate::wire::{
     LAYOUT_ROLES, is_data_name, is_kw, is_namespace, log_name, namespace_of, parse_cut_bytes_name,
-    parse_grant_name, parse_head_name, parse_head_prefix, parse_held_name, parse_log_name,
-    parse_piece_name, parse_seal_key_name, parse_signal_run_name, parse_summary_name,
+    parse_grant_name, parse_held_name, parse_log_name, parse_piece_name, parse_seal_key_name,
+    parse_signal_run_name, parse_summary_name,
 };
 
 /// How deep a held packet's name may nest another: a `<H>/32=held/<Name>`
@@ -47,7 +47,7 @@ const HELD_DEPTH: u8 = 2;
 ///
 /// Carried:
 /// - a log entry, a piece of a large version (chunk, manifest node), a cut
-///   manifest node, a one-key head, of a collection **under** `folder`;
+///   manifest node, of a collection **under** `folder`;
 ///   never a snapshot (`<D>/32=log/seq=<n>`, no collection);
 /// - a summary root of `folder`'s namespace and a summary node or page of
 ///   `folder`, of a collection under it, or **on the way** to it (an
@@ -81,7 +81,7 @@ pub fn folder_carries(folder: &Name, name: &Name) -> bool {
 /// **grant asks** (`<G>/32=grant/<GrantAsk>`) of a collection under the folder to
 /// a device `G` of each listed `W`, which holds the key of an epoch it reads in
 /// too (spec §9). Nothing
-/// else: a root's nodes and pages of the folder, and every entry, piece, head
+/// else: a root's nodes and pages of the folder, and every entry, piece
 /// and cut manifest of a collection under the folder, whatever device wrote
 /// it, are [`folder_carries`]'s already;
 /// nothing of a writer's outside the folder is added (not an entry of her other
@@ -228,12 +228,6 @@ fn carries(folder: &Name, name: &Name, held_depth: u8) -> bool {
     if let Some(record) = parse_cut_bytes_name(name) {
         return record.subject.as_ref().is_some_and(|c| within(folder, c));
     }
-    if let Some((_, collection, _)) = parse_head_name(name) {
-        return within(folder, &collection);
-    }
-    if let Some((_, collection)) = parse_head_prefix(name) {
-        return within(folder, &collection);
-    }
     if let Some(summary) = parse_summary_name(name) {
         let subject = &summary.subject;
         return if is_namespace(subject) {
@@ -268,8 +262,8 @@ fn carries(folder: &Name, name: &Name, held_depth: u8) -> bool {
 mod tests {
     use super::*;
     use crate::wire::{
-        PieceKind, RUN_ID_LEN, data_folder, head_name, head_prefix, log_name, node_name, page_name,
-        piece_name, root_name, root_prefix, signal_run_name,
+        PieceKind, RUN_ID_LEN, data_folder, log_name, node_name, page_name, piece_name, root_name,
+        root_prefix, signal_run_name,
     };
 
     fn n(s: &str) -> Name {
@@ -307,8 +301,6 @@ mod tests {
                     folder_carries(&folder, &entry.clone().append_implicit_digest([9; 32])),
                     "{entry} by digest"
                 );
-                assert!(folder_carries(&folder, &head_name(&device, &inside, 5)));
-                assert!(folder_carries(&folder, &head_prefix(&device, &inside)));
             }
             // A sibling, a prefix of it, the namespace's other folder, a
             // folder whose name merely starts like this one, another
@@ -329,8 +321,6 @@ mod tests {
                     &folder,
                     &piece_name(&entry, PieceKind::Chunk(1))
                 ));
-                assert!(!folder_carries(&folder, &head_name(&device, &outside, 5)));
-                assert!(!folder_carries(&folder, &head_prefix(&device, &outside)));
                 assert!(!folder_carries(&folder, &node_name(&device, &outside, 5)));
             }
             // A snapshot names no collection.
@@ -512,13 +502,12 @@ mod tests {
         let namespaces = namespaces();
         let bob = n("/bob/member/phone");
         for name in [
-            // Her other collection's entry, piece, head and node; her other folder's page.
+            // Her other collection's entry, piece and node; her other folder's page.
             log_name(&bob, Some(&n("/bob/32=data/diary")), 3),
             piece_name(
                 &log_name(&bob, Some(&n("/bob/32=data/diary")), 3),
                 PieceKind::Chunk(0),
             ),
-            head_name(&bob, &n("/bob/32=data/diary"), 3),
             node_name(&device, &n("/bob/32=data/diary"), 4),
             page_name(&device, &n("/bob/32=data/diary"), &[1], 4),
             node_name(&device, &data_folder(&n("/bob")), 4),
@@ -794,7 +783,7 @@ mod tests {
         }
         // Not the neighbours: another entry of the folder, another seq, the
         // record's cut under another record, the pieces of an entry of another
-        // collection, a summary, a head, the sync group, the cut's prefix itself.
+        // collection, a summary, the sync group, the cut's prefix itself.
         let other_seq = log_name(&signer, Some(&folder), 8);
         for name in [
             other_seq.clone(),
@@ -803,7 +792,6 @@ mod tests {
             log_name(&n("/alice/member/phone"), Some(&folder), 7),
             log_name(&signer, Some(&n("/alice/32=data/diary")), 7),
             log_name(&signer, None, 7),
-            head_name(&signer, &folder, 7),
             crate::wire::node_name(&signer, &folder, 4),
             crate::wire::root_name(&signer, &n("/alice"), 4),
             cut_bytes_prefix(&record),

@@ -22,7 +22,7 @@ use sha2::Sha256;
 
 use crate::collection::Epoch;
 use crate::version::Content;
-use crate::wire::{self, Inline};
+use crate::wire;
 
 /// The domain label of an epoch key's check.
 const KEY_CHECK: &[u8] = b"ndn-data/seal/check/1";
@@ -91,21 +91,20 @@ impl Keys {
 
 /// Seal a version's fields and operation under `key`, bound to its name.
 pub(crate) fn seal_payload(key: &ContentKey, name: &Name, fields: &Content, op: &[u8]) -> Bytes {
-    seal_bytes(key, name, &wire::encode_payload(fields, op))
+    key.seal(&wire::encode_payload(fields, op), &name.encode_to_tlv())
+        .to_bytes()
 }
 
-/// Seal `plain` (a version's `Fields` and `MergeOp`, or its `Block`) under
-/// `key`, bound to the version's name.
-pub(crate) fn seal_bytes(key: &ContentKey, name: &Name, plain: &[u8]) -> Bytes {
-    key.seal(plain, &name.encode_to_tlv()).to_bytes()
-}
-
-/// Open a version's sealed payload: its fields and operation, or its
-/// block; `None` if it is not `key`'s, or not this name's.
-pub(crate) fn open_payload(key: &ContentKey, name: &Name, ciphertext: &[u8]) -> Option<Inline> {
+/// Open a version's sealed payload: its fields and operation; `None` if it
+/// is not `key`'s, or not this name's.
+pub(crate) fn open_payload(
+    key: &ContentKey,
+    name: &Name,
+    ciphertext: &[u8],
+) -> Option<(Content, Bytes)> {
     let sealed = Sealed::from_bytes(ciphertext).ok()?;
     let plain = key.open(&sealed, &name.encode_to_tlv()).ok()?;
-    wire::decode_inline(Bytes::from(plain)).ok()
+    wire::decode_payload(Bytes::from(plain)).ok()
 }
 
 // ---- asks (spec §19.4) ---------------------------------------------------------------------------
@@ -218,7 +217,7 @@ mod tests {
         let sealed = seal_payload(&k, &name, &fields, b"op");
         assert_eq!(
             open_payload(&k, &name, &sealed),
-            Some(Inline::Fields(fields, Bytes::from_static(b"op")))
+            Some((fields, Bytes::from_static(b"op")))
         );
         let other = n("/alice/laptop/32=log/alice/32=data/notes/seq=6");
         assert_eq!(open_payload(&k, &other, &sealed), None, "bound to its name");
