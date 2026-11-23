@@ -192,9 +192,14 @@ async fn power_cut_child() {
 }
 
 /// Run the child on `engine` in `dir` until it has printed `applied
-/// <at_least>`; kill it with SIGKILL. The last `applied` and `durable` it
-/// printed.
-fn run_and_kill(engine: Engine, dir: &std::path::Path, at_least: u64) -> (u64, u64) {
+/// <at_least>`; let it go on for `linger`, then kill it with SIGKILL. The last
+/// `applied` and `durable` it printed before the kill was sent.
+fn run_and_kill(
+    engine: Engine,
+    dir: &std::path::Path,
+    at_least: u64,
+    linger: Duration,
+) -> (u64, u64) {
     let mut child = ChildRun::start(
         "test_kit::tests::power_cut_child",
         ROLE,
@@ -210,6 +215,7 @@ fn run_and_kill(engine: Engine, dir: &std::path::Path, at_least: u64) -> (u64, u
             _ => {}
         }
     }
+    std::thread::sleep(linger);
     child.kill();
     (applied, durable)
 }
@@ -226,7 +232,7 @@ fn open(engine: Engine, path: &std::path::Path) -> Box<dyn DataStore> {
 /// again, whole batches only.
 fn kill_9_loses_nothing(engine: Engine) {
     let dir = tempfile::tempdir().unwrap();
-    let (applied, _) = run_and_kill(engine, dir.path(), 12);
+    let (applied, _) = run_and_kill(engine, dir.path(), 12, Duration::ZERO);
     let reopened = open(engine, &engine.live(dir.path()));
     let head = head_of(&*reopened);
     assert!(
@@ -241,9 +247,9 @@ fn kill_9_loses_nothing(engine: Engine) {
 /// flushed is there, whole batches only.
 fn a_power_cut_keeps_what_a_returned_flush_covered(engine: Engine) {
     let dir = tempfile::tempdir().unwrap();
-    let (_, durable) = run_and_kill(engine, dir.path(), 12);
+    let (_, durable) = run_and_kill(engine, dir.path(), 12, Duration::ZERO);
     assert!(durable >= 5, "the child flushed before the cut");
-    copy_tree(&dir.path().join("image"), &engine.live(dir.path()));
+    copy_tree(&PowerCut::image(dir.path()), &engine.live(dir.path()));
     let disk = open(engine, &engine.live(dir.path()));
     let head = head_of(&*disk);
     assert!(
@@ -251,6 +257,26 @@ fn a_power_cut_keeps_what_a_returned_flush_covered(engine: Engine) {
         "on {}, the child saw a flush of {durable} return, yet the disk holds {head}",
         engine.label()
     );
+}
+
+/// The power may go at any moment, also while the child is taking the image
+/// of a flush: the image left is the one of an earlier flush, whole. The
+/// child runs on for a different time before each cut, so the cuts fall in
+/// every phase of its cycle of writes, flushes and image copies.
+fn a_power_cut_at_any_moment_leaves_a_whole_image(engine: Engine) {
+    for linger in (2..25).step_by(3) {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, durable) = run_and_kill(engine, dir.path(), 12, Duration::from_millis(linger));
+        copy_tree(&PowerCut::image(dir.path()), &engine.live(dir.path()));
+        let disk = open(engine, &engine.live(dir.path()));
+        let head = head_of(&*disk);
+        assert!(
+            head >= durable,
+            "on {}, cut {linger} ms after batch 12, the child had seen a flush of {durable} \
+             return, yet the disk holds {head}",
+            engine.label()
+        );
+    }
 }
 
 #[test]
@@ -271,4 +297,14 @@ fn a_power_cut_keeps_what_a_returned_flush_covered_on_fjall() {
 #[test]
 fn a_power_cut_keeps_what_a_returned_flush_covered_on_redb() {
     a_power_cut_keeps_what_a_returned_flush_covered(Engine::Redb);
+}
+
+#[test]
+fn a_power_cut_at_any_moment_leaves_a_whole_image_on_fjall() {
+    a_power_cut_at_any_moment_leaves_a_whole_image(Engine::Fjall);
+}
+
+#[test]
+fn a_power_cut_at_any_moment_leaves_a_whole_image_on_redb() {
+    a_power_cut_at_any_moment_leaves_a_whole_image(Engine::Redb);
 }

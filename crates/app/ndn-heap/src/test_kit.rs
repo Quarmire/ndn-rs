@@ -428,11 +428,16 @@ pub(crate) fn copy_tree(from: &Path, to: &Path) {
 
 /// A store whose disk keeps only what is durable: on fjall each returned
 /// `sync` of the inner store, on redb each returned write, copies its files
-/// to `dir/image`, what a power cut leaves.
+/// to a new `dir/image.<n>` and moves `dir/image`, a file naming the newest
+/// whole copy, onto it in one rename ([`Self::image`] is what a power cut
+/// leaves). A kill while a copy is made leaves the previous copy named: a
+/// power cut takes the disk as a flush left it, never a half-written image.
 pub(crate) struct PowerCut {
     inner: Box<dyn DataStore>,
     live: PathBuf,
-    image: PathBuf,
+    dir: PathBuf,
+    /// The copies made so far.
+    images: AtomicUsize,
     /// Whether a write is durable when it returns (redb).
     per_write: bool,
     /// Writes hold it shared; taking the image holds it alone.
@@ -449,14 +454,37 @@ impl PowerCut {
             Engine::Fjall => Box::new(BackendStore::open_fjall(&live).unwrap()),
             Engine::Redb => Box::new(BackendStore::open_redb(&live).unwrap()),
         };
-        let image = dir.join("image");
-        copy_tree(&live, &image);
-        PowerCut {
+        let cut = PowerCut {
             inner,
             live,
-            image,
+            dir: dir.to_path_buf(),
+            images: AtomicUsize::new(0),
             per_write: matches!(engine, Engine::Redb),
             gate: RwLock::new(()),
+        };
+        cut.take_image();
+        cut
+    }
+
+    /// The disk a power cut leaves in `dir`: the newest whole copy.
+    pub(crate) fn image(dir: &Path) -> PathBuf {
+        dir.join(std::fs::read_to_string(dir.join("image")).expect("an image was taken"))
+    }
+
+    /// Copy the live files to a new image and make it the one a power cut
+    /// leaves. Called with writes held off.
+    fn take_image(&self) {
+        let n = self.images.fetch_add(1, Ordering::Relaxed) + 1;
+        let name = format!("image.{n}");
+        copy_tree(&self.live, &self.dir.join(&name));
+        let next = self.dir.join("image.next");
+        std::fs::write(&next, &name).unwrap();
+        std::fs::rename(&next, self.dir.join("image")).unwrap();
+        let older = self.dir.join(format!("image.{}", n - 1));
+        if older.is_dir() {
+            std::fs::remove_dir_all(older).unwrap();
+        } else if older.exists() {
+            std::fs::remove_file(older).unwrap();
         }
     }
 
@@ -465,7 +493,7 @@ impl PowerCut {
         if self.per_write {
             let _alone = self.gate.write();
             op();
-            copy_tree(&self.live, &self.image);
+            self.take_image();
         } else {
             let _shared = self.gate.read();
             op();
@@ -505,7 +533,7 @@ impl DataStore for PowerCut {
     fn sync(&self) -> std::io::Result<()> {
         self.inner.sync()?;
         let _alone = self.gate.write();
-        copy_tree(&self.live, &self.image);
+        self.take_image();
         Ok(())
     }
 }
