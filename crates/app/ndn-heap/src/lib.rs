@@ -36,7 +36,6 @@ mod register;
 mod reserve;
 #[cfg(feature = "wip-revocation")]
 mod revocation;
-#[cfg(feature = "wip-seal")]
 mod seal;
 #[cfg(feature = "wip-serve")]
 mod serve;

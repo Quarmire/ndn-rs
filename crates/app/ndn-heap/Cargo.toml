@@ -55,7 +55,6 @@ ndn-engine = { workspace = true }
 # Each gate is removed when its module lands; none remains at the stage's end.
 wip-log = []
 wip-trust = []
-wip-seal = []
 wip-sync = []
 wip-fetch = []
 wip-serve = []
