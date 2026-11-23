@@ -23,6 +23,9 @@ use crate::space::PutOptions;
 use crate::test_kit::{CrashStore, n};
 use crate::wire::{Entry, log_name};
 
+#[path = "mesh_net_tests.rs"]
+mod net;
+
 /// Devices on one forwarder; the sync group of every namespace is carried.
 struct Mesh {
     engine: ForwarderEngine,

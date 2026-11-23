@@ -793,6 +793,7 @@ impl Heap {
         let batches = {
             let log = inner.log.lock();
             let fold = log.fold();
+            let in_force = fold.in_force();
             let mut ops: Vec<Op> = c.remove.iter().flat_map(|p| log.remove_ops(p)).collect();
             let mut added = BTreeSet::new();
             for (who, role, standing) in c
@@ -810,7 +811,13 @@ impl Heap {
                         id: new_id(),
                         who: who.clone(),
                         role,
-                        epoch: None,
+                        // A reader reads the history of the epoch in force
+                        // (spec §6.6): the Add names it.
+                        epoch: if role == Role::Reader {
+                            in_force.clone()
+                        } else {
+                            None
+                        },
                     });
                 }
             }
