@@ -169,11 +169,17 @@ A version is an immutable record signed by one key. It carries
 - Two different entries of one key at one seq — in one collection or in
   two, of one kind or of two — are **equivocation** (invariant 2). A reader
   holding both keeps both and reports `Change::Equivocation` to the
-  watchers of each collection when both are versions — to each
-  collection's watchers its own version whole and the other collection's
-  by name and id only (`Equivocal::Elsewhere`), never its content or
-  anything opened of it, so a watch of one folder learns nothing of
-  another folder's content — and lists it to every watch begun later
+  watchers of each collection either entry is about: when both are
+  versions, to each collection's watchers its own version whole and the
+  other collection's by name and id only (`Equivocal::Elsewhere`), never
+  its content or anything opened of it, so a watch of one folder learns
+  nothing of another folder's content; when either is a record — a members
+  record (§6) or an introduction's offer or use mark (§19), as when a
+  stolen admin key signs two members records at one seq or at one name —
+  each as `Equivocal::Record`, by name, id and kind (`RecordKind::Members`
+  or `RecordKind::Introduction`) and nothing of what it carries, so a
+  host can mark the key suspected. It
+  lists it to every watch begun later
   while both are held, across restarts too: two packets at one name keep
   the second in the store beside the first (ndn-data: under
   `/localhost/ndn-data/equivocal/<log entry name>`, one per name), stored
@@ -234,9 +240,17 @@ the reader drops it, keeps nothing against the name, and asks the next
 source; the genuine copy is taken when it comes. A reader SHOULD check that
 the key locator names a key of `D` before walking the certificate chain.
 Only a decision on the genuine writer's own packet — refused by the members
-record (§6, §8), unsealed in a sealed collection, or a sealed payload that
-does not open (§9) — is kept against the name, and later versions of that
-writer do not wait for a version so refused (§5).
+record (§6, §8), unsealed in a sealed collection, a sealed payload that
+does not open (§9), or an entry its writer signed that is no kind of
+record this build reads (`Refusal::Unread`, next step `None`: a kind of an
+earlier release this build no longer has, or of a later one; the walk that
+lists it completes without it, and the refusal tells the host to run a
+build that reads it if it is a later release's) — is kept against the name,
+and later versions of that writer do not wait for a version so refused (§5).
+An entry that only fails to decode, with nothing verified of it, is dropped
+as a packet, as above. A device whose newest own entries are of a kind
+this build no longer reads keeps its log head over them: it never signs a
+seq it used (§4.2).
 
 ### 4.2 Durability before publication — durability barrier
 
@@ -474,13 +488,19 @@ the same versions MUST obtain the same state.
   **heads** of a collection are the applied versions in no other applied
   version's past. The register keeps the heads only, so its memory is the
   concurrent writes, never the history.
-- **The value is the head with the highest digest.** The digest is the
-  implicit digest of the version's packet (SHA-256 of the whole Data
-  packet, §4); heads compare as 32 octets, the first most significant. Two
-  devices holding the same versions read the same winner whatever order
-  they arrived in, and a version made over every head settles the value
-  whatever its digest: a version never loses to one in its own past. No
-  clock is read — the date a version carries is display only (§4).
+- **The value is the head with the highest signed digest.** The digest is
+  the digest of the signed region of the version's packet — the Name
+  through the `SignatureInfo`, not the signature value (§4; ndn-data:
+  `wire::signed_digest`); heads compare as 32 octets, the first most
+  significant. It is the same for every copy of the packet: an ECDSA
+  signature value is malleable and a relay may serve another (§4), so the
+  winner never depends on which copy a reader holds. Two devices holding
+  the same versions read the same winner whatever order they arrived in
+  and whichever copy of each they hold, and a version made over every head
+  settles the value whatever its digest: a version never loses to one in
+  its own past. No clock is read — the date a version carries is display
+  only (§4). (A rule that compared the implicit digest, as an earlier
+  build did, picked another winner for a high-S ECDSA packet.)
 - **`by ‖ bytes`.** The value is `by` followed by the winner's `bytes`, the
   octets of its `MergeOp` (what `put_op` wrote, §15). `by` is 32 octets: the
   hash of the self-certifying namespace `/user/<0xA1: hash>`
@@ -534,12 +554,19 @@ is not held back by it.
   `(y, t)` that applies at all is checked against the packet held at
   `(y, t)`: it waits while none is held, and is refused for good
   (`Refusal::Parent`, next step `None`) when the parent carries no digest or
-  the packet held there has another digest. A mismatch means the version
-  was not made over what this reader holds: its writer named a packet that
-  does not exist, or `y` signed two packets at `t` (an equivocation;
-  readers holding different packets at `(y, t)` differ there already).
-  Every reader holding the same packets decides alike, in any arrival order
-  and with no clock.
+  the packet it names signed another thing than the one held there — `y`
+  signed two entries at `t`, an equivocation (§4), which both are then
+  evidence of. A child naming another packet of its parent than the one
+  held — another signature value, which a relay may hand a reader (§4) —
+  is not refused for that: the reader asks for `<parent>/<digest>` by its
+  exact name, as it asks for any packet it is owed, again after the
+  pause (§17.1) while a pending version names it, and while none comes the
+  child waits (its writer's later versions wait behind it). A copy that
+  signed the same thing counts as the same version; one that signed
+  another is the evidence, and the child is refused. A writer naming a
+  parent packet that no one has can only make its own versions wait, never
+  another writer's. Every reader holding the same packets decides alike,
+  in any arrival order and with no clock.
 - **The past every reader sees.** `down(P)` holds the versions at or below
   `P` not refused by their key (a cut that does not list them, a key no
   writer, a revocation, an issuer no longer trusted), admitted, held sealed
@@ -844,11 +871,14 @@ bytes, so no writer's bytes make it refuse another's, and a head that
 loses stays held, served and listed.
 
 **Choosing the digest.** The winner among concurrent heads is the one with
-the highest digest (§5), and a writer signs freely: it can vary its
+the highest signed digest (§5), and a writer signs freely: it can vary its
 version until its digest is the highest of the heads it knows, so its
 write wins a concurrency it is part of. It does no more than any member
 may — write over what it has applied — and every reader holding the same
-versions reads the same winner. A write that must not lose to one it
+versions reads the same winner, whichever copy of each packet it holds: the
+digest is of what the key signed, so a relay serving another signature
+value of an ECDSA writer's packet (§4) changes neither the winner nor the
+parent a later version names. A write that must not lose to one it
 knows is made over it.
 
 **A stale writer and a rule change.** An operation made for one rule could
@@ -2513,9 +2543,11 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   equivocation the collection it is told for — when the two entries at one
   seq are in two collections it is told once for each, tagged with each,
   carrying its own version whole and the other by name and id only (§4),
-  so a watcher of both gets it twice, once per collection. The listing
+  so a watcher of both gets it twice, once per collection; two members or
+  introduction records are told by name, id and kind only
+  (`Equivocal::Record`), for the collection each is about. The listing
   also reports the equivocation evidence held about what is watched,
-  whatever `F`. The listing
+  versions and records alike, whatever `F`. The listing
   reports what is applied; a version held but not applied yet
   (it waits for an earlier one or its key) is not listed and
   comes once it applies,
@@ -2985,8 +3017,8 @@ nothing on the wire. The odd numbers 0x0571–0x057F stay free.
 | Holder withholds | The summary shows what is missing; fetch from another holder. | invariant 4 |
 | Holder rolls back | A summary older than one already seen is refused, also by a reader that restarted since. | invariant 3, §7 |
 | Writer never pauses | Each descent finishes against the root it started from, whose nodes the writer keeps serving; the reader then continues from there and keeps up. | §7 |
-| Writer equivocates | Both entries are kept and reported (`Change::Equivocation`), at one name or at one seq in two collections or of two kinds. | invariant 2, §4 |
-| A writer names a parent seq that does not exist yet (a version over another's future) | Its parent's digest matches no packet at that seq: refused `Refusal::Parent` once the genuine one is held; the other writer's versions apply. | §4, §5 |
+| Writer equivocates | Both entries are kept and reported (`Change::Equivocation`), at one name or at one seq in two collections or of two kinds; for members and introduction records by name, id and kind (`Equivocal::Record`). | invariant 2, §4 |
+| A writer names a parent seq that does not exist yet (a version over another's future), or a parent by another packet than the one held (a relay's copy of an ECDSA writer's entry) | The parent's packet is asked for by its exact name: a copy that signed what the held one did is the same version and the child applies; one that signed another is the evidence and the child is refused `Refusal::Parent`; while none comes the child waits, and so do its writer's later versions, and the other writers' versions apply. | §4, §5 |
 | A stale writer's operation made for an earlier rule | Refused `Refusal::OtherRule`; never read under the rule in force. | §5 |
 | Writer offline, another device holds its work | Readers ask the other devices they hear for the namespace, under their own names, for the writer's newest root, summary nodes, entries and pieces; each answers with the writer's own packets (sealed as ciphertext), verified as from the writer. Nothing pruned, expired, refused or unverified is served. | §13.5 |
 | Holder behind, or withholding | Its older root is not taken below the head verified; the reader gets less, never wrong data, and asks the writer first again once reachable. | §7, §13.5 |
@@ -3150,6 +3182,21 @@ announced). What is owed, and until when:
   pause it falls in. A
   pass something held here asks for — a name followed, a namespace
   adopted — begins at once, whatever notices came.
+- **A first notice answered by a root of head 0 (normative).** A notice
+  says its device moved, so its head is above 0 (§12): a device never
+  walked before whose root that answers a first notice has head 0 is an
+  old copy of the root, replayed or delayed by a party on the path, that
+  must not end the notice — the device would stop announcing once its root
+  was asked, and nothing would ask again. The reader takes that root as
+  any, but the writer counts as not reached, and the next walk of the loop,
+  after the pause above, requires a root above the head held: the writer's
+  own, in rounds as above, or a device's answering for it (§13.5). Only
+  stale copies coming, the writer stays not reached, the loop asks again at
+  most `REFRESH_TRIES` times in a row, and a relay's root above the head
+  is walked as it comes. An old copy of a root of head above 0 at a first
+  contact advances the head and is not caught here: a notice names no
+  entry to fetch (§12.1), so only a notice that does closes that. Nothing
+  is taken on trust: only roots the writer signed are taken.
   Which root answered decides nothing (invariant 1): what is held and owed
   follows from the roots and entries verified, as above.
 - **A group heard from no one (normative).** A first look (§15) that

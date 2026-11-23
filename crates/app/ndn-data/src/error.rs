@@ -108,10 +108,12 @@ pub enum Refusal {
         head: u64,
     },
     /// One of its parents names a packet this reader cannot take as what
-    /// it was made over (spec §5): the packet held at that writer and seq
-    /// has another digest (its writer named a packet that does not exist,
-    /// or that parent's key signed two at one seq — an equivocation), or
-    /// the parent carries no digest.
+    /// it was made over (spec §5): the packet it names signed another
+    /// thing than the one held at that writer and seq (that parent's key
+    /// signed two entries there — an equivocation), or the parent carries
+    /// no digest. A parent named by another packet that signed the same
+    /// thing (another signature value of the same entry) is the same
+    /// version, and a parent named by a packet no one supplies waits.
     Parent {
         /// The parent named.
         parent: VersionId,
