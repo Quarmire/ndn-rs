@@ -24,11 +24,12 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, Waker, ready};
 
 use bytes::Bytes;
 use futures::Stream;
 use ndn_foundation_types::Name;
+use ndn_packet::Data;
 use ndn_security::confidentiality::ContentKey;
 use ndn_sync::StoreOp;
 use parking_lot::Mutex;
@@ -203,12 +204,7 @@ impl Changes {
     /// The next change; `None` once the node has stopped and the queue is
     /// read.
     pub async fn next(&mut self) -> Option<Result<Change, HeapError>> {
-        loop {
-            let slot = futures::future::poll_fn(|cx| self.queue.poll(cx)).await?;
-            if let Some(change) = self.resolve(slot) {
-                return Some(Ok(change));
-            }
-        }
+        futures::StreamExt::next(self).await
     }
 
     /// The change a slot says: a value in pieces is read now, and told only
@@ -226,14 +222,11 @@ impl Stream for Changes {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            match self.queue.poll(cx) {
-                Poll::Ready(Some(slot)) => {
-                    if let Some(change) = self.resolve(slot) {
-                        return Poll::Ready(Some(Ok(change)));
-                    }
-                }
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
+            let Some(slot) = ready!(self.queue.poll(cx)) else {
+                return Poll::Ready(None);
+            };
+            if let Some(change) = self.resolve(slot) {
+                return Poll::Ready(Some(Ok(change)));
             }
         }
     }
@@ -699,19 +692,25 @@ impl SpaceInner {
         }
     }
 
-    /// Tell the watchers, once per entry, that `why` refused it: the judge's
-    /// refusals and the mark on its key, which the log alerts nothing of. A
-    /// transient bad signature, a cut (the log alerts it) and the rest are
-    /// not told here.
-    pub(crate) fn alert_refusal(&self, name: &Name, id: EntryId, why: &Refusal) {
-        if !matches!(
+    /// Tell the watchers, once per entry, that `why` refused the packet
+    /// `data`: the judge's refusals and the mark on its key, which the log
+    /// alerts nothing of. A transient bad signature, a cut (the log alerts
+    /// it) and the rest are not told here.
+    pub(crate) fn alert_refused_packet(&self, data: &Data, why: &Refusal) {
+        let name: &Name = &data.name;
+        let told_here = matches!(
             why,
             Refusal::Lapsed { .. } | Refusal::Untrusted { .. } | Refusal::Suspected { .. }
-        ) {
+        );
+        let Some(entry) = parse_log_name(name).filter(|_| told_here) else {
             return;
-        }
+        };
         let alert = Alert::Refused {
-            id,
+            id: EntryId {
+                device: entry.device,
+                seq: entry.seq,
+                digest: signed_digest_of(data),
+            },
             why: why.clone(),
             next: why.next(),
         };
@@ -727,18 +726,6 @@ impl SpaceInner {
         }
         tracing::warn!(space = %self.name, entry = %name, ?why, "an entry is refused");
         self.tell(Change::Alert(alert));
-    }
-
-    /// [`Self::alert_refusal`] for a packet and what refused it.
-    pub(crate) fn alert_refused_packet(&self, data: &ndn_packet::Data, why: &Refusal) {
-        if let Some(entry) = parse_log_name(&data.name) {
-            let id = EntryId {
-                device: entry.device,
-                seq: entry.seq,
-                digest: signed_digest_of(data),
-            };
-            self.alert_refusal(&data.name, id, why);
-        }
     }
 
     /// The reader check of `get` and `watch`: a sealed space shows nothing
@@ -796,17 +783,17 @@ impl SpaceInner {
                 pieces::PieceError::Incomplete { .. } => {
                     HeapError::Unavailable { name: name.clone() }
                 }
-                other => HeapError::Local {
-                    reason: other.to_string(),
-                },
+                other => HeapError::local(other),
             }
         })?;
         match key {
             None => Ok(Bytes::from(stored)),
             Some(key) => seal::open_payload(&key, &name, &stored)
                 .map(Bytes::from)
-                .ok_or_else(|| HeapError::Local {
-                    reason: format!("the sealed value of {name} does not open under its epoch key"),
+                .ok_or_else(|| {
+                    HeapError::local(format!(
+                        "the sealed value of {name} does not open under its epoch key"
+                    ))
                 }),
         }
     }
@@ -973,9 +960,7 @@ impl Heap {
                 None => bytes.clone(),
                 Some(key) => seal::seal_payload(key, &name, &bytes),
             };
-            let cut = pieces::split(&name, &carried).map_err(|e| HeapError::Local {
-                reason: e.to_string(),
-            })?;
+            let cut = pieces::split(&name, &carried).map_err(HeapError::local)?;
             let (blob, now) = (
                 Payload::Blob {
                     size: cut.size,

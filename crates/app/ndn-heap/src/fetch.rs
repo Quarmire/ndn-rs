@@ -336,21 +336,6 @@ pub(crate) enum Source {
     Relay(Name),
 }
 
-/// What a notice made of a device: the counter it named. Unsigned: it wants
-/// nothing of the log, and the entry it names is probed while the log holds
-/// nothing at or above it.
-#[derive(Default)]
-pub(crate) struct Noticed {
-    pub(crate) high: u64,
-}
-
-impl Noticed {
-    /// A notice named the device at `high`.
-    pub(crate) fn raise(&mut self, high: u64) {
-        self.high = self.high.max(high);
-    }
-}
-
 /// One ask: how many asks of it missed in a row, and when it may be made
 /// again (`None`: one is in flight).
 struct Ask {
@@ -448,6 +433,19 @@ fn within(ranges: &[(u64, u64)], seq: u64) -> bool {
 }
 
 impl Group {
+    /// The entries notices named that the log neither holds nor asks for: a
+    /// device's noticed counter above everything the log asks for without
+    /// proof (`NodeInner::high`). Each is probed alone, until it is held.
+    pub(crate) fn probes(&self) -> Vec<(Name, u64)> {
+        let host = &self.shared.host;
+        let noticed = self.noticed.lock();
+        let named = noticed.iter();
+        named
+            .filter(|&(device, &high)| high > host.high(&self.space, device))
+            .map(|(device, &high)| (device.clone(), high))
+            .collect()
+    }
+
     /// The sources for a packet of `device`, in the order they are tried: the
     /// writer (unless it is this device), then the heard members the log
     /// vouches for.
@@ -513,13 +511,7 @@ impl Group {
         // entry it names, when the log holds nothing at or above it and asks
         // for nothing up to it, is asked for alone; once it is held and
         // verified, the holes below it are the log's to want.
-        let probes: Vec<(Name, u64)> = self
-            .noticed
-            .lock()
-            .iter()
-            .filter(|(device, notice)| notice.high > host.high(space, device))
-            .map(|(device, notice)| (device.clone(), notice.high))
-            .collect();
+        let probes = self.probes();
 
         let mut per: BTreeMap<Name, Vec<(u64, u64)>> = BTreeMap::new();
         let mut exact: BTreeMap<(Name, u64), [u8; 32]> = BTreeMap::new();
@@ -886,14 +878,6 @@ impl Group {
         }
     }
 
-    /// The counter a notice named of `device`, when it is above everything
-    /// the log asks for without proof (`NodeInner::high`): the one entry that is
-    /// probed alone, until it is held.
-    fn unconfirmed(&self, device: &Name) -> Option<u64> {
-        let named = self.noticed.lock().get(device).map_or(0, |n| n.high);
-        (named > self.shared.host.high(&self.space, device)).then_some(named)
-    }
-
     /// Where the own entries stand: none wanted, some wanted (or the entry
     /// the own counter names, not yet probed in vain) that can still be asked
     /// for, or every one asked for in vain.
@@ -905,7 +889,12 @@ impl Group {
             .iter()
             .flat_map(|&(a, b)| a..=b)
             .collect();
-        seqs.extend(self.unconfirmed(me));
+        seqs.extend(
+            self.probes()
+                .into_iter()
+                .find(|(d, _)| d == me)
+                .map(|(_, s)| s),
+        );
         if seqs.is_empty() {
             return OwnState::Done;
         }

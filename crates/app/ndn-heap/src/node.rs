@@ -173,12 +173,6 @@ pub(crate) struct NodeInner {
     serving: Mutex<Option<ServeGuard>>,
 }
 
-fn local(reason: impl Into<String>) -> HeapError {
-    HeapError::Local {
-        reason: reason.into(),
-    }
-}
-
 /// What the store says of a space opened before: a member (1) or a carrier
 /// (2).
 const MEMBER: u8 = 1;
@@ -202,16 +196,16 @@ impl Node {
     ) -> Result<Node, HeapError> {
         let identity = keys
             .signing_identity_for(&device)
-            .map_err(|e| local(format!("no key to sign as {device}: {e}")))?;
+            .map_err(|e| HeapError::local(format!("no key to sign as {device}: {e}")))?;
         if device_of(&identity.key).as_ref() != Some(&device) {
-            return Err(local(format!(
+            return Err(HeapError::local(format!(
                 "the key that signs for {device} is {}, which is not {device}'s own key; give \
                  the device a key named {device}/KEY/<id>",
                 identity.key
             )));
         }
         if !is_device_name(&device) {
-            return Err(local(format!(
+            return Err(HeapError::local(format!(
                 "{device} has a keyword or digest component; a device name is plain components \
                  (<namespace>/<role>/<device>), so the layer's names after it (32=log, 32=seal) \
                  say where it ends"
@@ -219,24 +213,24 @@ impl Node {
         }
         let ns = validator.keyring().context_for(&device).namespace().clone();
         if ns.is_empty() {
-            return Err(local(format!(
+            return Err(HeapError::local(format!(
                 "no trust context covers {device}: the validator holds none whose namespace is \
                  a prefix of it, so nothing says which namespace the device writes for; adopt \
                  its namespace's trust context (enroll the device) and start it again"
             )));
         }
         if !is_namespace(&ns) {
-            return Err(local(format!(
+            return Err(HeapError::local(format!(
                 "{device} lies in the trust context of {ns}, whose namespace has a keyword, \
                  digest or sequence-number component, which a space name \
                  <namespace>/32=data/<name> cannot carry; enroll the device in a namespace of \
                  plain components"
             )));
         }
-        let recipient = seal::recipient_key(&keys, &device).map_err(|e| local(e.to_string()))?;
+        let recipient = seal::recipient_key(&keys, &device).map_err(HeapError::local)?;
         let seal_public = recipient.public();
         let seal_packet = seal::seal_key_packet(&device, &seal_public, &*identity.signer)
-            .map_err(|e| local(e.to_string()))?;
+            .map_err(HeapError::local)?;
         drop(recipient);
 
         let flusher = Flusher::spawn(Arc::clone(&store));
@@ -299,7 +293,7 @@ impl Node {
                 }
             })
             .await
-            .map_err(|e| local(format!("cannot serve {device}: {e}")))?;
+            .map_err(|e| HeapError::local(format!("cannot serve {device}: {e}")))?;
         *inner.serving.lock() = Some(guard);
         for joined in futures::future::join_all(
             held.into_iter()
@@ -388,11 +382,7 @@ impl Node {
     /// Wait for a flush covering everything written so far; the store's
     /// failure once it failed.
     pub async fn flush(&self) -> Result<(), HeapError> {
-        self.inner
-            .flusher
-            .flush()
-            .await
-            .map_err(|e| local(e.to_string()))
+        Ok(self.inner.flusher.flush().await?)
     }
 
     /// Stop cleanly: refuse new puts, drain the publishers, flush, record
@@ -578,8 +568,7 @@ impl NodeInner {
 
     /// The log of `space` from the store, with the judge told what it lists.
     fn open_log(&self, space: &Name) -> Result<Log, HeapError> {
-        let recipient =
-            seal::recipient_key(&self.keys, &self.device).map_err(|e| local(e.to_string()))?;
+        let recipient = seal::recipient_key(&self.keys, &self.device).map_err(HeapError::local)?;
         let log = Log::open(
             Params {
                 space: space.clone(),
@@ -623,7 +612,7 @@ impl NodeInner {
             None => {}
         }
         if self.stopped.load(Ordering::Relaxed) {
-            return Err(local("the node is stopped"));
+            return Err(HeapError::local("the node is stopped"));
         }
         let log = self.open_log(space)?;
         self.store.insert(
@@ -643,7 +632,9 @@ impl NodeInner {
         follower: bool,
     ) -> Result<Arc<SpaceInner>, HeapError> {
         let unclean = log.unclean();
-        let net = self.net().ok_or_else(|| local("the node is stopped"))?;
+        let net = self
+            .net()
+            .ok_or_else(|| HeapError::local("the node is stopped"))?;
         let space = log.space().clone();
         let counter = if follower { 0 } else { log.head() };
         let group = net.join(&space, counter).await?;
@@ -724,7 +715,7 @@ impl NodeInner {
         // What the store holds may be only in the operating system's
         // buffers: it is durable before any of it is published.
         self.flusher.flush().await.map_err(|e| {
-            local(format!(
+            HeapError::local(format!(
                 "the store did not make what it holds durable ({e}); {} publishes only what is \
                  on disk, so it does not start: check the disk or filesystem the store is on, \
                  and start it again",

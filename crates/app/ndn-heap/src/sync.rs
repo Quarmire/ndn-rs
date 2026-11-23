@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::HeapError;
 use crate::face_up::FaceUp;
-use crate::fetch::{self, Asks, Fetcher, Noticed};
+use crate::fetch::{self, Asks, Fetcher};
 use crate::heard::{HEARD_MAX, Heard};
 use crate::log::{Blob, Outcome};
 use crate::node::Config;
@@ -192,22 +192,16 @@ impl Net {
         space: &Name,
         counter: u64,
     ) -> Result<Arc<Group>, HeapError> {
-        let bad = |why: &str| HeapError::BadName {
-            name: space.clone(),
-            why: why.into(),
+        let (Some(group_name), Some(parsed)) = (sync_group_of(space), parse_space_name(space))
+        else {
+            return Err(HeapError::not_a_space(space));
         };
-        let group_name =
-            sync_group_of(space).ok_or_else(|| bad("a space is `<owner>/32=data/<path>`"))?;
-        let owner = parse_space_name(space)
-            .ok_or_else(|| bad("a space is `<owner>/32=data/<path>`"))?
-            .owner;
+        let owner = parsed.owner;
         if self.owners.lock().insert(owner.clone()) {
             let prefix = ndn_security::sync_group(&owner);
             if let Err(e) = self.sync.register_prefix(&prefix).await {
                 self.owners.lock().remove(&owner);
-                return Err(HeapError::Local {
-                    reason: format!("cannot receive {prefix}: {e}"),
-                });
+                return Err(HeapError::local(format!("cannot receive {prefix}: {e}")));
             }
         }
         // The group's state vector keeps the devices heard: at most
@@ -224,11 +218,9 @@ impl Net {
             ..self.shared.cfg.svs.clone()
         };
         let Some(handle) = self.svs.join(group_name.clone(), cfg).await else {
-            return Err(HeapError::Local {
-                reason: format!(
-                    "the sync driver did not join {group_name}: it is joined already, or it has stopped"
-                ),
-            });
+            return Err(HeapError::local(format!(
+                "the sync driver did not join {group_name}: it is joined already, or it has stopped"
+            )));
         };
         let group = Arc::new(Group {
             space: space.clone(),
@@ -303,7 +295,7 @@ pub(crate) struct Group {
     /// The devices heard, bounded ([`Heard`]).
     pub(crate) heard: Mutex<Heard>,
     /// What a notice said of each device heard.
-    pub(crate) noticed: Mutex<BTreeMap<Name, Noticed>>,
+    pub(crate) noticed: Mutex<BTreeMap<Name, u64>>,
     /// The asks in flight or pausing.
     pub(crate) asks: Mutex<Asks>,
     /// The values whose pieces are being gathered.
@@ -354,11 +346,7 @@ impl Group {
             return false;
         }
         let host = &self.shared.host;
-        self.noticed
-            .lock()
-            .entry(host.device().clone())
-            .or_default()
-            .raise(seen);
+        self.raise(host.device().clone(), seen);
         host.note_own_counter(&self.space, seen);
         self.heard_any.store(true, Ordering::Relaxed);
         self.first_vector.notify_waiters();
@@ -403,18 +391,22 @@ impl Group {
             tracing::debug!(%device, high, "not walked: it names no entry, or as many devices are heard in the group already, each vouched for by an admitted entry, and nothing held vouches for this one");
             return;
         }
-        self.noticed.lock().entry(device).or_default().raise(high);
+        self.raise(device, high);
         self.wake.notify_one();
     }
 
     /// Whether a notice named an entry of a device `of` selects that the log
     /// neither holds nor asks for: heard of, and not yet fetched.
     pub(crate) fn heard_unheld(&self, of: impl Fn(&Name) -> bool) -> bool {
-        let host = &self.shared.host;
-        self.noticed
-            .lock()
-            .iter()
-            .any(|(device, notice)| of(device) && notice.high > host.high(&self.space, device))
+        self.probes().iter().any(|(device, _)| of(device))
+    }
+
+    /// A notice named `device` at `high`: kept if it is the highest so far.
+    /// Unsigned: it wants nothing of the log (see [`Self::probes`]).
+    fn raise(&self, device: Name, high: u64) {
+        let mut noticed = self.noticed.lock();
+        let seen = noticed.entry(device).or_default();
+        *seen = (*seen).max(high);
     }
 
     /// Look again at what is wanted, and at the values and keys owed.
