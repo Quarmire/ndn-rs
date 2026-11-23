@@ -130,29 +130,22 @@ impl Flusher {
                 tracing::trace!(target: "ndn_heap::timeline", target, "flush_begin");
                 let flushed = flusher.sync().await;
                 tracing::trace!(target: "ndn_heap::timeline", ok = flushed.is_ok(), "flush_end");
-                {
-                    let mut st = flusher.st.lock();
-                    match flushed {
-                        Ok(()) => st.durable = st.durable.max(target),
-                        Err(why) => {
-                            tracing::warn!(
-                                "the store did not make this node's writes durable ({why}): \
-                                 nothing written since its last flush is promised; check the \
-                                 disk or filesystem the store is on"
-                            );
-                            st.failure = Some(
-                                format!(
-                                    "the store could not make this node's writes durable: \
-                                     {why}. Nothing signed is lost and reads continue, but no \
-                                     seq past what was made durable can be signed, and no \
-                                     Members or Epoch change is published; free space or fix \
-                                     the disk, then restart the node"
-                                )
-                                .into(),
-                            );
-                        }
+                let mut st = flusher.st.lock();
+                match flushed {
+                    Ok(()) => st.durable = st.durable.max(target),
+                    Err(why) => {
+                        let why: Arc<str> = format!(
+                            "the store could not make this node's writes durable: {why}. \
+                             Nothing signed is lost and reads continue, but no seq past what \
+                             was made durable can be signed, and no Members or Epoch change \
+                             is published; free space or fix the disk, then restart the node"
+                        )
+                        .into();
+                        tracing::warn!("{why}");
+                        st.failure = Some(why);
                     }
                 }
+                drop(st);
                 flusher.done.notify_waiters();
             }
         }
