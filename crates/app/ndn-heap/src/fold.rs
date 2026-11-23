@@ -289,18 +289,12 @@ impl Fold {
     /// sorted, the owner never listed. This is what a restarted node needs to
     /// rebuild the cuts of removed writers from the entries alone.
     pub fn removed_writers(&self) -> Vec<(Name, Vec<EntryRef>)> {
-        let mut gone: BTreeMap<&Name, BTreeSet<&EntryRef>> = BTreeMap::new();
-        for (id, added) in &self.facts.adds {
-            if added.role != Role::Writer || added.who == self.owner {
-                continue;
-            }
-            if let Some(tips) = self.facts.removed.get(id) {
-                gone.entry(&added.who).or_default().extend(tips);
-            }
-        }
-        gone.into_iter()
-            .filter(|(who, _)| !self.is_writer(who))
-            .map(|(who, tips)| (who.clone(), tips.into_iter().cloned().collect()))
+        let removed = (self.facts.adds.iter())
+            .filter(|&(id, a)| a.role == Role::Writer && self.facts.removed.contains_key(id));
+        let gone: BTreeSet<&Name> = removed.map(|(_, a)| &a.who).collect();
+        (gone.into_iter())
+            .filter(|who| !self.is_writer(who))
+            .map(|who| (who.clone(), self.removal_tips(who)))
             .collect()
     }
 
