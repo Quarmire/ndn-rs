@@ -38,19 +38,18 @@ use parking_lot::{Mutex, RwLock};
 use crate::error::{HeapError, Refusal, Timestamp};
 use crate::fold::Readers;
 use crate::log::{Alert, Blob, Change, Log, Outcome, Params, Want};
-use crate::register::EntryId;
 use crate::reserve::{Flusher, Publisher};
 use crate::revocation::{self, CutBound, CutProposal};
 use crate::rt;
 use crate::seal::{self, GrantRefusal, Granter, Keys};
 use crate::serve;
-use crate::space::{Follower, Heap, MembersChange, Share, SpaceInner, check_audience, new_id};
+use crate::space::{Follower, Heap, Share, SpaceInner, check_audience, new_id};
 use crate::store::{self, Stage};
 use crate::sync::{Host, Net, NetConfig, Taken};
 use crate::trust::{Adopter, Adoption, Judge, Judged};
 use crate::wire::{
     EpochId, MembersBody, Op, Role, device_of, is_device_name, is_namespace, log_name,
-    parse_log_name, parse_seal_key_name, parse_space_name, signed_digest,
+    parse_log_name, parse_seal_key_name, parse_space_name,
 };
 
 #[cfg(test)]
@@ -271,7 +270,6 @@ impl Node {
             lifetime: config.lifetime,
             window: config.window,
             in_flight: config.in_flight.max(config.window).max(1),
-            settle: config.settle,
             reserve_block: config.reserve_block,
         };
         let inner = Arc::new_cyclic(|me| NodeInner {

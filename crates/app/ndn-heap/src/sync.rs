@@ -30,7 +30,7 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::error::HeapError;
 use crate::face_up::FaceUp;
-use crate::fetch::{self, Asks, Fetcher, Noticed, Recovered};
+use crate::fetch::{self, Asks, Fetcher, Noticed};
 use crate::heard::{HEARD_MAX, Heard};
 use crate::log::{Blob, Outcome, Want};
 use crate::register::EntryId;
@@ -63,9 +63,6 @@ pub(crate) struct NetConfig {
     /// The most asks of every kind in flight at once on the node (default
     /// 256).
     pub in_flight: usize,
-    /// How long a restarting device waits for the first group vector before
-    /// it fetches its own entries from its peers (default 1 s).
-    pub settle: Duration,
     /// `Config.reserve_block`: own entries are fetched back at most four
     /// blocks above the head.
     pub reserve_block: u64,
@@ -78,7 +75,6 @@ impl Default for NetConfig {
             lifetime: Duration::from_secs(2),
             window: 32,
             in_flight: 256,
-            settle: Duration::from_secs(1),
             reserve_block: 1024,
         }
     }

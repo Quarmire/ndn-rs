@@ -20,10 +20,9 @@ use crate::heard::HEARD_MAX;
 use crate::log::Blob;
 use crate::pieces;
 use crate::register::EntryId;
-use crate::reserve::FlushSink;
 use crate::test_kit::n;
 use crate::wire::{
-    EpochId, held_name, log_name, parse_grant_name, parse_held_name, parse_log_name, seal_key_name,
+    EpochId, log_name, parse_grant_name, parse_held_name, parse_log_name, seal_key_name,
     sync_group_of,
 };
 

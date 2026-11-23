@@ -43,7 +43,6 @@ use tokio::sync::Semaphore;
 
 use crate::log::{Blob, Outcome};
 use crate::pieces::{Assembler, Offered};
-use crate::register::EntryId;
 use crate::rt::{self, Instant};
 use crate::sync::{Group, TIMELINE, Taken};
 use crate::wire::{ChunksBody, EpochId, GrantAsk, grant_name, held_name, log_name, seal_key_name};

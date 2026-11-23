@@ -21,10 +21,10 @@ use proptest::prelude::*;
 use super::*;
 use crate::error::NextStep;
 use crate::log::{Alert, Frontier};
-use crate::space::{Changes, PutOptions};
+use crate::space::{Changes, MembersChange, PutOptions};
 use crate::sync::{Host, Taken};
 use crate::test_kit::{CrashStore, Engine, Held, PowerCut, n};
-use crate::wire::{Body, Entry, log_name};
+use crate::wire::{Entry, log_name};
 
 // -- The world the cases run in ----------------------------------------------------
 
