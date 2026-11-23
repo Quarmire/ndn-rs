@@ -3186,13 +3186,13 @@ announced). What is owed, and until when:
   says its device moved, so a root of head 0 that answers the first notice
   of a device never walked before may be an old copy of its root, replayed
   or delayed by a party on the path: the device would stop announcing once
-  its root was asked, and nothing would ask again. The reader takes that
+its root was asked, and nothing would ask again. The reader takes that
   root as any (a device that has signed nothing yet has a head-0 root, and
   is no worse for it), and once, after the pause above, walks the device
-  again, the walk requiring a root above the head held: the writer's own,
-  in rounds as above, or a device's answering for it (§13.5), walked as it
-  comes. Given only stale copies, that walk does not reach the writer: the
-  relay fallback and the loop's asks again apply as for a root that does
+  again, with one ask for its root: the writer's own root above the head
+  held is walked as it comes, and so is a root a device answering for it
+  gives (§13.5) above that head. Given only a root no newer, that walk
+  does not reach the writer: the loop asks again as for a root that does
   not come, and the walk after it takes what answers. An old copy of a
   root of head above 0 at a first contact advances the head and is not
   caught here: a notice names no entry to fetch (§12.1), so only a notice

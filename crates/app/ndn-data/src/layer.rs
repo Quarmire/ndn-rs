@@ -69,6 +69,9 @@ impl Value {
 
 /// What a [`get`](DataLayer::get) found.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+// A `Got` is returned by value from `get` and matched by every host: boxing the
+// version would change each of those matches for a copy that is made once.
+#[allow(clippy::large_enum_variant)]
 pub enum Got {
     /// One exact version: asked by its name, or the newest of a log
     /// collection.

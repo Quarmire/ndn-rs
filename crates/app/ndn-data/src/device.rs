@@ -6695,15 +6695,17 @@ impl Inner {
                 None => (None, None),
             }
         };
-        // A root of it must be above the head a root that answered its first
-        // notice left ([`Peer::after`]), as above those verified before a
-        // notice.
-        let floor = answers.and(held).max(owed);
+        // The one follow-up of a first notice's root that may be an old copy
+        // ([`Peer::after`]) takes the writer's root as it comes, and counts
+        // it as no answer when it is no newer than that head; a relay's
+        // root must be above it.
+        let floor = answers.and(held);
         let above = reach
             .as_ref()
             .filter(|r| r.index > 0)
             .map(|r| r.pass.head.load(Ordering::Relaxed))
-            .max(floor);
+            .max(floor)
+            .max(owed);
         let Some((rooted, relayed)) = self.fetch_root(root, ns, device, above, floor).await else {
             return false;
         };
