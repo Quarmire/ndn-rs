@@ -309,7 +309,9 @@ pub(crate) struct Group {
     pub(crate) relist: AtomicBool,
     pub(crate) stop: CancellationToken,
     svs: Arc<MultiSvs>,
-    observed: Option<Arc<ObservedState>>,
+    /// The driver's observed state to read the own counter from, when it
+    /// keeps one.
+    pub(crate) observed: Option<Arc<ObservedState>>,
     /// The highest counter of this device's own name the group's carriage
     /// showed, as far as the log was told.
     own_seen: AtomicU64,
@@ -323,14 +325,10 @@ impl Group {
     /// Read the counter of this device's own name the group carries and, when
     /// it rose, take it ([`Self::own_counter`]). Whether it rose.
     pub(crate) fn note_own(&self) -> bool {
-        let Some(observed) = &self.observed else {
-            return false;
-        };
         let me = self.shared.host.device();
-        let Some(seen) = observed.seq_for(me).filter(|s| *s > 0) else {
-            return false;
-        };
-        self.own_counter(seen)
+        let seen = (self.observed.as_ref()).and_then(|observed| observed.seq_for(me));
+        seen.filter(|seen| *seen > 0)
+            .is_some_and(|seen| self.own_counter(seen))
     }
 
     /// The counter of this device's own name rose to `seen`: the log hears
@@ -350,12 +348,6 @@ impl Group {
         true
     }
 
-    /// Whether the driver keeps observed state to read the own counter from.
-    pub(crate) fn observes(&self) -> bool {
-        self.observed.is_some()
-    }
-}
-impl Group {
     /// A notice: `update.name` says its counter in this group is
     /// `update.high_seq`. It decides nothing: it is noted, bounded, and the
     /// fetch probes the entry it names. A device at counter 0 has written
@@ -389,12 +381,6 @@ impl Group {
         }
         self.raise(device, high);
         self.wake.notify_one();
-    }
-
-    /// Whether a notice named an entry of a device `of` selects that the log
-    /// neither holds nor asks for: heard of, and not yet fetched.
-    pub(crate) fn heard_unheld(&self, of: impl Fn(&Name) -> bool) -> bool {
-        self.probes().iter().any(|(device, _)| of(device))
     }
 
     /// A notice named `device` at `high`: kept if it is the highest so far.

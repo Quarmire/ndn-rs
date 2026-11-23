@@ -606,7 +606,9 @@ impl SpaceInner {
                 want.digest.is_none() && removed.contains(&node.person_of(&want.device))
             }) || self
                 .group
-                .heard_unheld(|device| removed.contains(&node.person_of(device)));
+                .probes()
+                .iter()
+                .any(|(device, _)| removed.contains(&node.person_of(device)));
             if !owed || rt::Instant::now() >= deadline {
                 return;
             }

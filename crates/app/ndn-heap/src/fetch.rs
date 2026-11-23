@@ -15,7 +15,7 @@
 //! it wanted, asked for in a window ([`Config::window`]), in seq order,
 //! minus what a gap statement declared void. A counter nothing signs
 //! therefore costs [`FETCH_TRIES`] asks and then one ask a minute
-//! ([`probe_pause`]), and wants nothing of the log.
+//! ([`REFRESH_IDLE`]), and wants nothing of the log.
 //!
 //! **Sources.** The writer first, then the heard members vouched for
 //! ([`Heard::relays`]) through `<H>/32=held/<name>`, one after another as the
@@ -73,19 +73,6 @@ const REFRESH_IDLE: Duration = Duration::from_secs(64);
 /// optional (a seal key learned in the background, the first asks of an
 /// entry a counter names): each of at most `1 + REEXPRESS_MAX` Interests.
 pub(crate) const FETCH_TRIES: u32 = 3;
-
-/// The pause before an entry that only an unsigned counter names is asked for
-/// again: [`retry_pause`] for the first [`FETCH_TRIES`] misses, then
-/// [`REFRESH_IDLE`]. The counter decides nothing, so the probe is never given
-/// up (an honest writer away for a while still comes, after a minute at the
-/// latest), and costs a forger one ask a minute.
-fn probe_pause(misses: u32) -> Duration {
-    if misses >= FETCH_TRIES {
-        REFRESH_IDLE
-    } else {
-        retry_pause(misses)
-    }
-}
 
 /// The most times an Interest is expressed again under a fresh nonce within
 /// its lifetime when nothing answers it.
@@ -246,11 +233,12 @@ impl Fetcher {
 
     /// One ask within one Interest lifetime: an Interest nothing answered
     /// within the retransmission timeout ([`Rtt::rto`]) is expressed again
-    /// under a fresh nonce, the timeout doubling each time, at most `most`
-    /// times. A Nack with reason Congestion is asked again by the consumer
-    /// after a short jittered pause ([`Consumer::fetch_reexpressing`]). The
-    /// packet is unverified: the caller hands it to the node.
-    pub(crate) async fn expressed(&self, name: Name, most: u32) -> Result<Data, Miss> {
+    /// under a fresh nonce, the timeout doubling each time, at most
+    /// [`REEXPRESS_MAX`] times. A Nack with reason Congestion is asked again
+    /// by the consumer after a short jittered pause
+    /// ([`Consumer::fetch_reexpressing`]). The packet is unverified: the
+    /// caller hands it to the node.
+    pub(crate) async fn once(&self, name: Name) -> Result<Data, Miss> {
         let _slot = self.slot().await?;
         let rto = self.rtt.lock().rto(self.lifetime);
         tracing::trace!(target: TIMELINE, %name, "fetch_out");
@@ -260,7 +248,7 @@ impl Fetcher {
                 || InterestBuilder::new(name.clone()),
                 self.lifetime,
                 RTO_MIN,
-                (0..most).map(|k| rto.saturating_mul(1 << k)),
+                (0..REEXPRESS_MAX).map(|k| rto.saturating_mul(1 << k)),
             )
             .await;
         match fetched {
@@ -301,11 +289,6 @@ impl Fetcher {
                 })
             }
         }
-    }
-
-    /// [`Self::expressed`], re-expressed up to [`REEXPRESS_MAX`] times.
-    pub(crate) async fn once(&self, name: Name) -> Result<Data, Miss> {
-        self.expressed(name, REEXPRESS_MAX).await
     }
 
     /// A packet asked for in place up to [`FETCH_TRIES`] times with pauses
@@ -628,10 +611,15 @@ impl Group {
                 Taken::Pending(waiting) => tracing::debug!(%name, "not judged yet: {waiting}"),
             }
         }
-        let (misses, pause) = match resolved {
-            true => (0, REFRESH_PAUSE),
-            false if launch.probe => (launch.misses + 1, probe_pause(launch.misses)),
-            false => (launch.misses + 1, retry_pause(launch.misses)),
+        // The counter that names a probe decides nothing, so it is never given
+        // up: after [`FETCH_TRIES`] misses an honest writer away for a while
+        // still comes within a minute, and a forger costs one ask a minute.
+        let (misses, pause) = if resolved {
+            (0, REFRESH_PAUSE)
+        } else if launch.probe && launch.misses >= FETCH_TRIES {
+            (launch.misses + 1, REFRESH_IDLE)
+        } else {
+            (launch.misses + 1, retry_pause(launch.misses))
         };
         self.asks.lock().by.insert(
             (launch.device, launch.seq),
@@ -887,7 +875,7 @@ pub(crate) async fn run(group: Arc<Group>) {
     while !group.stop.is_cancelled() {
         group.note_own();
         let mut wait = group.pump();
-        if group.observes() {
+        if group.observed.is_some() {
             wait = Some(wait.map_or(OWN_POLL * 20, |w| w.min(OWN_POLL * 20)));
         }
         let timer = pin!(async {
