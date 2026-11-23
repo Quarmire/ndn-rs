@@ -236,7 +236,9 @@ impl Net {
             own_seen: AtomicU64::new(0),
             stop: self.stop.child_token(),
             svs: Arc::clone(&self.svs),
-            observed: handle.observed_shared(),
+            observed: handle
+                .observed_shared()
+                .expect("a multi-SVS group keeps observed state"),
         });
         self.groups.lock().insert(space.clone(), Arc::clone(&group));
         rt::spawn(notices(Arc::clone(&group), handle));
@@ -306,9 +308,8 @@ pub(crate) struct Group {
     pub(crate) relist: AtomicBool,
     pub(crate) stop: CancellationToken,
     svs: Arc<MultiSvs>,
-    /// The driver's observed state to read the own counter from, when it
-    /// keeps one.
-    pub(crate) observed: Option<Arc<ObservedState>>,
+    /// The driver's observed state, to read the own counter from.
+    pub(crate) observed: Arc<ObservedState>,
     /// The highest counter of this device's own name the group's carriage
     /// showed, as far as the log was told.
     pub(crate) own_seen: AtomicU64,
@@ -322,8 +323,7 @@ impl Group {
     /// Read the counter of this device's own name the group carries and, when
     /// it rose, take it ([`Self::own_counter`]). Whether it rose.
     pub(crate) fn note_own(&self) -> bool {
-        let me = self.shared.host.device();
-        let seen = (self.observed.as_ref()).and_then(|observed| observed.seq_for(me));
+        let seen = self.observed.seq_for(self.shared.host.device());
         seen.filter(|seen| *seen > 0)
             .is_some_and(|seen| self.own_counter(seen))
     }

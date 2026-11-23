@@ -33,13 +33,12 @@
 //! reservation blocks above the head.
 
 use std::collections::BTreeMap;
-use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::future::{join_all, select};
+use futures::future::join_all;
 use ndn_app::{AppError, Connection, Consumer};
 use ndn_foundation_types::Name;
 use ndn_packet::encode::InterestBuilder;
@@ -852,23 +851,11 @@ impl Group {
 pub(crate) async fn run(group: Arc<Group>) {
     while !group.stop.is_cancelled() {
         group.note_own();
-        let mut wait = group.pump();
-        if group.observed.is_some() {
-            wait = Some(wait.map_or(OWN_POLL * 20, |w| w.min(OWN_POLL * 20)));
-        }
-        let timer = pin!(async {
-            match wait {
-                Some(d) => rt::sleep(d).await,
-                None => futures::future::pending().await,
-            }
-        });
-        let woken = pin!(group.wake.notified());
-        if group
-            .stop
-            .run_until_cancelled(select(woken, timer))
-            .await
-            .is_none()
-        {
+        // The own counter is read from the observed state: nothing wakes the
+        // pump for it, so it looks again at least every `OWN_POLL * 20`.
+        let wait = group.pump().map_or(OWN_POLL * 20, |w| w.min(OWN_POLL * 20));
+        let woken = rt::timeout(wait, group.wake.notified());
+        if group.stop.run_until_cancelled(woken).await.is_none() {
             return;
         }
     }
