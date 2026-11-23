@@ -41,6 +41,11 @@ impl Ranges {
         self.0 = merged;
     }
 
+    /// How many seqs the set holds.
+    pub(super) fn count(&self) -> u64 {
+        self.0.iter().map(|&(lo, hi)| hi - lo + 1).sum()
+    }
+
     pub(super) fn contains(&self, seq: u64) -> bool {
         let at = self.0.partition_point(|&(_, hi)| hi < seq);
         self.0.get(at).is_some_and(|&(lo, _)| lo <= seq)
@@ -171,6 +176,9 @@ pub(super) struct Dev {
     pub high: u64,
     /// The highest held seq and its signed digest; read from its marker.
     pub tip: Option<Link>,
+    /// How many held entries have a status other than closed: refused,
+    /// unreadable, waiting, evidence. The rest were admitted.
+    pub nonvouching: u64,
 }
 
 impl Dev {
@@ -181,6 +189,7 @@ impl Dev {
             voids: Ranges::default(),
             high: 0,
             tip: None,
+            nonvouching: 0,
         }
     }
 
@@ -216,6 +225,7 @@ impl Dev {
             voids,
             high,
             tip: None,
+            nonvouching: 0,
         })
     }
 }

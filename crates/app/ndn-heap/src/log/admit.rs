@@ -576,6 +576,11 @@ impl Log {
         if new == Some(&Status::Closed) {
             self.closed += 1;
         }
+        let counts = |s: Option<&Status>| s.is_some_and(|s| *s != Status::Closed);
+        if let Some(dev) = self.devices.get_mut(device) {
+            dev.nonvouching =
+                (dev.nonvouching + u64::from(counts(new))).saturating_sub(u64::from(counts(old)));
+        }
         let key = store::status_key(&self.space, device, seq);
         match new {
             Some(status) => self.store.insert(key, status.encode()),

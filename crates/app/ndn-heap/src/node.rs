@@ -1108,13 +1108,13 @@ impl Host for NodeInner {
 
     fn vouched(&self, space: &Name, device: &Name) -> bool {
         self.space_of(space)
-            .is_some_and(|s| s.log.lock().holds(device))
+            .is_some_and(|s| s.log.lock().vouches(device))
     }
 
     fn standing(&self, space: &Name, device: &Name) -> Option<bool> {
         let held = self.space_of(space)?;
         let log = held.log.lock();
-        log.holds(device).then(|| log.held_prefix(device) > 0)
+        log.vouches(device).then(|| log.held_prefix(device) > 0)
     }
 
     fn served(&self, space: &Name, device: &Name, seq: u64) -> Option<Bytes> {

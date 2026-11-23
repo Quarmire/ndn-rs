@@ -500,12 +500,20 @@ impl Log {
             });
             self.devices.insert(device, dev);
         }
-        self.closed = self
-            .store
-            .scan_under(&status_prefix(&self.space), 0)
-            .iter()
-            .filter(|(_, v)| v.first() == Some(&1))
-            .count() as u64;
+        let (mut closed, mut counted) = (0, Vec::new());
+        for (key, value) in self.store.scan_under(&status_prefix(&self.space), 0) {
+            match value.first() {
+                Some(1) => closed += 1,
+                Some(_) => counted.extend(store::parse_status_key(&self.space, &key)),
+                None => {}
+            }
+        }
+        self.closed = closed;
+        for (device, _) in counted {
+            if let Some(dev) = self.devices.get_mut(&device) {
+                dev.nonvouching += 1;
+            }
+        }
     }
 
     /// The Members and Epoch entries applied, from `structural/`.
@@ -812,6 +820,16 @@ impl Log {
     }
 
     // -- Catch-up -----------------------------------------------------------------
+
+    /// Whether an admitted entry of `device` is held: one applied, or held
+    /// closed for want of its epoch key. Refused, unreadable, waiting and
+    /// evidence entries do not count: a stranger whose entries were all
+    /// refused is not vouched for. From counts, no entry or marker is read.
+    pub(crate) fn vouches(&self, device: &Name) -> bool {
+        self.devices
+            .get(device)
+            .is_some_and(|d| d.held.count() > d.nonvouching)
+    }
 
     /// Whether at least one entry of `device` is held in this space (any seq,
     /// whatever became of it); a notice alone does not count.
