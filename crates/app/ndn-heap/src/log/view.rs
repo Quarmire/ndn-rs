@@ -186,11 +186,6 @@ impl Log {
             });
         }
     }
-
-    /// The keys marked suspected here.
-    pub(crate) fn suspected_keys(&self) -> Vec<Name> {
-        self.suspected.keys().cloned().collect()
-    }
 }
 
 // -- What the signal gate reads ----------------------------------------------------

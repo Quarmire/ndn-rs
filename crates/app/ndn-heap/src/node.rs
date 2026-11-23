@@ -39,7 +39,7 @@ use crate::error::{HeapError, Refusal, Timestamp};
 use crate::fold::Readers;
 use crate::log::{Alert, Blob, Change, Log, Outcome, Params, Want};
 use crate::reserve::{Flusher, Publisher};
-use crate::revocation::{self, CutBound, CutProposal};
+use crate::revocation::{self, CutBound, CutProposal, Suspicion};
 use crate::rt;
 use crate::seal::{self, GrantRefusal, Granter, Keys};
 use crate::serve;
@@ -171,6 +171,8 @@ pub(crate) struct NodeInner {
     pub(crate) judge: Arc<Judge>,
     raw: Arc<dyn DataStore>,
     pub(crate) stage: Arc<Stage>,
+    /// The keys marked suspected, for every space's log.
+    pub(crate) suspicion: Arc<Suspicion>,
     pub(crate) flusher: Arc<Flusher>,
     pub(crate) config: Config,
     /// The network half; `None` once stopped (the cycle through its `Host`
@@ -281,6 +283,7 @@ impl Node {
             keys,
             judge,
             raw: store,
+            suspicion: Suspicion::open(Arc::clone(&stage) as Arc<dyn DataStore>),
             stage,
             flusher,
             config,
@@ -518,26 +521,24 @@ impl Node {
     /// The cut this node can vouch for if `key` is revoked now (spec §9),
     /// over every space it holds.
     pub fn revocation_cut(&self, key: &Name, bound: &CutBound) -> Result<CutProposal, HeapError> {
-        self.inner
-            .with_logs(|logs| revocation::revocation_cut(logs, &self.inner.judge, key, bound))
+        self.inner.with_logs(|logs| {
+            revocation::revocation_cut(logs, &self.inner.judge, &self.inner.suspicion, key, bound)
+        })
     }
 
     /// Mark `key` suspected since `since`: no new entry of it is taken.
     pub fn suspect(&self, key: &Name, since: Timestamp) -> Result<(), HeapError> {
-        self.inner
-            .with_logs_mut(|logs| revocation::suspect(logs, key, since))
+        self.inner.suspicion.mark(key, since)
     }
 
     /// Lift the mark of `key`. Whether there was one.
     pub fn unsuspect(&self, key: &Name) -> bool {
-        self.inner
-            .with_logs_mut(|logs| revocation::unsuspect(logs, key))
+        self.inner.suspicion.lift(key)
     }
 
     /// Since when `key` is marked suspected here.
     pub fn suspected(&self, key: &Name) -> Option<Timestamp> {
-        self.inner
-            .with_logs(|logs| revocation::suspected(logs, key))
+        self.inner.suspicion.since(key)
     }
 
     /// The entries `key` signed that this node holds refused because its
@@ -608,27 +609,6 @@ impl NodeInner {
         f(&logs)
     }
 
-    fn with_logs_mut<R>(&self, f: impl FnOnce(&mut [&mut Log]) -> R) -> R {
-        let spaces = self.sorted();
-        let mut guards: Vec<_> = spaces.iter().map(|s| s.log.lock()).collect();
-        let mut logs: Vec<&mut Log> = guards.iter_mut().map(|g| &mut **g).collect();
-        f(&mut logs)
-    }
-
-    /// Mark a key a space's log suspected in every space, from the earliest
-    /// time any of them marked it.
-    pub(crate) fn suspect_everywhere(&self, key: &Name) {
-        let now = Timestamp(self.now());
-        self.with_logs_mut(|logs| {
-            let since = logs
-                .iter()
-                .filter_map(|log| log.suspected(key))
-                .min()
-                .unwrap_or(now);
-            let _ = revocation::suspect(logs, key, since);
-        });
-    }
-
     /// The person of a device: the namespace of the context that governs it.
     pub(crate) fn person_of(&self, device: &Name) -> Name {
         let keyring = self.judge.validator().keyring();
@@ -685,6 +665,7 @@ impl NodeInner {
                 space: space.clone(),
                 device: self.device.clone(),
                 person: self.ns.clone(),
+                suspicion: Arc::clone(&self.suspicion),
                 signer: Arc::clone(&self.signer),
                 keys: Keys::new(recipient),
                 block: self.config.reserve_block,
@@ -982,9 +963,8 @@ impl NodeInner {
     async fn on_adoption(self: &Arc<Self>, event: Adoption) {
         match event {
             Adoption::Context(ctx) => {
-                self.with_logs_mut(|logs| {
-                    revocation::lift_revoked(logs, revocation::revoked_by(&self.judge))
-                });
+                self.suspicion
+                    .lift_revoked(revocation::revoked_by(&self.judge));
                 let spaces = self.spaces.read().keys().cloned().collect();
                 self.rejudge(spaces, std::slice::from_ref(ctx.namespace()))
                     .await;

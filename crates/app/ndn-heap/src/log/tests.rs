@@ -15,8 +15,9 @@ use ndn_sync::DataStore;
 use proptest::prelude::*;
 
 use super::*;
-use crate::error::{Cut, NextStep, Refusal};
+use crate::error::{Cut, NextStep, Refusal, Timestamp};
 use crate::reserve::Flusher;
+use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
 use crate::store::{
     self, Marker, ReserveRecord, Stage, equivocal_key, status_key, structural_key, verified_key,
@@ -217,11 +218,13 @@ struct Rig {
     log: Log,
     store: Arc<CrashStore>,
     flusher: Arc<Flusher>,
+    suspicion: Arc<Suspicion>,
 }
 
 fn open_on(store: &Arc<CrashStore>, me: &Dev) -> Rig {
     let raw = Arc::clone(store) as Arc<dyn DataStore>;
     let stage = Stage::new(Arc::clone(&raw));
+    let suspicion = Suspicion::open(Arc::clone(&stage) as Arc<dyn DataStore>);
     let flusher = Flusher::spawn(Arc::clone(&raw));
     let log = Log::open(
         Params {
@@ -230,6 +233,7 @@ fn open_on(store: &Arc<CrashStore>, me: &Dev) -> Rig {
             person: me.person.clone(),
             signer: Arc::clone(&me.signer) as Arc<dyn Signer>,
             keys: Keys::new(RecipientKey::generate()),
+            suspicion: Arc::clone(&suspicion),
             block: BLOCK,
         },
         raw,
@@ -241,6 +245,7 @@ fn open_on(store: &Arc<CrashStore>, me: &Dev) -> Rig {
         log,
         store: Arc::clone(store),
         flusher,
+        suspicion,
     }
 }
 
@@ -476,8 +481,7 @@ async fn two_packets_at_one_name_are_evidence_and_the_key_is_suspected() {
         &a,
         |al| matches!(al, Alert::Equivocation { device, seq: 1 } if *device == bob().name)
     ));
-    assert_eq!(a.effects.suspect, vec![bob().key]);
-    assert!(r.log.suspected(&bob().key).is_some());
+    assert_eq!(r.suspicion.since(&bob().key), Some(Timestamp(NOW)));
     assert_eq!(
         r.store.get(&equivocal_key(&first.name())),
         Some(second.wire.clone())
@@ -535,11 +539,11 @@ async fn a_relays_high_s_copy_changes_nothing() {
     r.applied(&relayed);
     let a = r.admit(&p1);
     assert_eq!(a.outcome, Outcome::Duplicate);
-    assert!(a.effects.alerts.is_empty() && a.effects.suspect.is_empty());
+    assert!(a.effects.alerts.is_empty());
     // p2 chains to the signed digest: the relayed copy satisfies it.
     r.applied(&p2);
     assert_eq!(r.value("/a").as_deref(), Some("two"));
-    assert!(r.log.suspected(&bob().key).is_none());
+    assert!(r.suspicion.since(&bob().key).is_none());
     // The marker records the signed digest, not the wire's.
     let m = Marker::decode(&r.store.get(&verified_key(&p1.name())).unwrap()).unwrap();
     assert_eq!(m.signed_digest, p1.digest);
@@ -592,7 +596,7 @@ async fn equivocation_in_a_members_or_epoch_entry_is_reported_to_the_host() {
         &a,
         |al| matches!(al, Alert::Equivocation { device, seq: 1 } if *device == phone().name)
     ));
-    assert_eq!(a.effects.suspect, vec![phone().key]);
+    assert!(r.suspicion.since(&phone().key).is_some());
     // Both are facts of the space: the fold lists both Adds whichever came
     // first.
     assert!(r.log.fold().is_writer(&n("/bob")));
@@ -1068,6 +1072,7 @@ async fn a_device_that_cannot_read_its_own_ledger_does_not_open_the_space() {
             person: me.person.clone(),
             signer: Arc::clone(&me.signer) as Arc<dyn Signer>,
             keys: Keys::new(RecipientKey::generate()),
+            suspicion: Suspicion::open(Arc::clone(&raw)),
             block: BLOCK,
         },
         Arc::clone(&raw),
@@ -1354,7 +1359,7 @@ async fn an_entry_naming_other_bytes_than_the_one_held_at_its_prev_is_refused_as
         al,
         Alert::Equivocation { seq: 1, .. }
     )));
-    assert_eq!(a.effects.suspect, vec![bob().key]);
+    assert!(r.suspicion.since(&bob().key).is_some());
     assert_eq!(r.value("/b"), None);
     assert!(r.store.contains(&forked.name()), "kept as evidence");
 }
@@ -1542,6 +1547,7 @@ async fn a_cold_open_reads_one_marker_per_device_not_one_per_entry() {
             person: me.person.clone(),
             signer: Arc::clone(&me.signer) as Arc<dyn Signer>,
             keys: Keys::new(RecipientKey::generate()),
+            suspicion: Suspicion::open(Arc::clone(&raw)),
             block: BLOCK,
         },
         Arc::clone(&raw),

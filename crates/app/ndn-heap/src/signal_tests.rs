@@ -30,6 +30,7 @@ use super::*;
 use crate::error::NextStep;
 use crate::log::{Outcome, Params, Signed, Step};
 use crate::reserve::Flusher;
+use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
 use crate::store::Stage;
 use crate::test_kit::{CrashStore, n};
@@ -202,6 +203,7 @@ impl World {
                 person: dev.person.clone(),
                 signer: Arc::clone(&dev.signer),
                 keys: Keys::new(RecipientKey::generate()),
+                suspicion: Suspicion::open(Arc::clone(&raw)),
                 block: 8,
             },
             Arc::clone(&raw),

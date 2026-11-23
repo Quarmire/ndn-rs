@@ -253,7 +253,6 @@ pub(crate) struct Routed {
     /// nothing.
     pub ticket: Option<Ticket>,
     blobs: Vec<Blob>,
-    suspect: Vec<Name>,
     repair: bool,
     nudge: bool,
 }
@@ -436,24 +435,19 @@ impl SpaceInner {
         Routed {
             ticket,
             blobs: fx.blobs,
-            suspect: fx.suspect,
             repair,
             nudge: !fx.wants.is_empty() || fx.membership,
         }
     }
 
     /// What follows a routed call once the lock is let go: blobs whose
-    /// pieces are all held to tell, keys to suspect everywhere, the epoch to
-    /// repair, the fetch to wake.
+    /// pieces are all held to tell, the epoch to repair, the fetch to wake.
     pub(crate) fn finish(self: &Arc<Self>, node: &Arc<NodeInner>, routed: Routed) {
         for blob in routed.blobs {
             // One still to gather is told when its last piece is held.
             if self.is_whole(node, &blob) {
                 self.tell_blob(&blob);
             }
-        }
-        for key in routed.suspect {
-            node.suspect_everywhere(&key);
         }
         if routed.repair {
             self.spawn_repair(node);
@@ -630,7 +624,7 @@ impl SpaceInner {
                     ctx.namespace()
                 ),
             }
-        } else if let Some(since) = log.suspected(key) {
+        } else if let Some(since) = node.suspicion.since(key) {
             Refusal::Suspected {
                 key: key.clone(),
                 since,

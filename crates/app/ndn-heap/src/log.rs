@@ -78,15 +78,16 @@ use ndn_security::confidentiality::ContentKey;
 use ndn_security::{Signer, public_key_digest};
 use ndn_sync::DataStore;
 
-use crate::error::{Cut, HeapError, NextStep, Refusal, Timestamp};
+use crate::error::{Cut, HeapError, NextStep, Refusal};
 use crate::fold::{Fold, Readers};
 use crate::register::{EntryId, Item, Register};
 use crate::reserve::{Flusher, Gate, Reservation, Ticket};
+use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
 use crate::store::{
     self, Corrupt, Link, Marker, Stage, epoch_prefix, heads_prefix, kept_prefix, ledger_key,
     ledger_prefix, parse_epoch_key, parse_kept_key, parse_ledger_key, parse_structural_key,
-    parse_suspected_key, status_prefix, structural_prefix, suspected_prefix,
+    status_prefix, structural_prefix,
 };
 use crate::trust::Verified;
 use crate::wire::{
@@ -123,6 +124,8 @@ pub(crate) struct Params {
     /// This device's keys (its recipient key; epoch keys are added as they
     /// are restored, made or granted).
     pub keys: Keys,
+    /// The device-wide suspicion map: one for every space's log.
+    pub suspicion: Arc<Suspicion>,
     /// `Config.reserve_block`.
     pub block: u64,
 }
@@ -177,8 +180,6 @@ pub(crate) struct Effects {
     pub publish: Option<Publish>,
     /// Blob heads to assemble.
     pub blobs: Vec<Blob>,
-    /// Keys newly suspected (already recorded here); the host may act.
-    pub suspect: Vec<Name>,
     /// The members changed: tell the judge (`Judge::note`) what the space
     /// lists now.
     pub membership: bool,
@@ -402,7 +403,7 @@ pub(crate) struct Log {
     devices: BTreeMap<Name, Dev>,
     /// What each removed device's cut keeps.
     kept: BTreeMap<Name, Kept>,
-    suspected: BTreeMap<Name, Timestamp>,
+    suspicion: Arc<Suspicion>,
     /// Entries held closed.
     closed: u64,
     /// Re-checks owed.
@@ -423,6 +424,7 @@ impl Log {
             person,
             signer,
             keys,
+            suspicion,
             block,
         } = params;
         let owner = parse_space_name(&space)
@@ -460,7 +462,6 @@ impl Log {
             own_tip: None,
             devices: BTreeMap::new(),
             kept: BTreeMap::new(),
-            suspected: BTreeMap::new(),
             closed: 0,
             queue: Vec::new(),
             space,
@@ -468,6 +469,7 @@ impl Log {
             person,
             signer,
             store: stage,
+            suspicion,
             keys,
         };
         log.restore_devices();
@@ -475,7 +477,6 @@ impl Log {
         log.restore_keys();
         log.restore_register()?;
         log.restore_cuts();
-        log.restore_suspected();
         log.restore_own_tip(head);
         Ok(log)
     }
@@ -593,15 +594,6 @@ impl Log {
         let batch = Arc::clone(&self.store);
         let _batch = batch.batch();
         self.sync_kept(&mut fx);
-    }
-
-    fn restore_suspected(&mut self) {
-        for (key, since) in self.store.scan_under(&suspected_prefix(), 0) {
-            if let Some(name) = parse_suspected_key(&key) {
-                let since = since.as_ref().try_into().map_or(0, u64::from_be_bytes);
-                self.suspected.insert(name, Timestamp(since));
-            }
-        }
     }
 
     /// The own tip: the newest own entry held.
@@ -835,29 +827,6 @@ impl Log {
                     .collect::<Vec<_>>()
             })
             .collect()
-    }
-
-    /// When `key` was suspected.
-    pub(crate) fn suspected(&self, key: &Name) -> Option<Timestamp> {
-        self.suspected.get(key).copied()
-    }
-
-    /// Mark `key` suspected from `since`: no new entry of it is taken.
-    pub(crate) fn suspect(&mut self, key: &Name, since: Timestamp) {
-        self.suspected.insert(key.clone(), since);
-        self.store.insert(
-            store::suspected_key(key),
-            Bytes::copy_from_slice(&since.0.to_be_bytes()),
-        );
-    }
-
-    /// Clear the mark. Whether there was one.
-    pub(crate) fn unsuspect(&mut self, key: &Name) -> bool {
-        let was = self.suspected.remove(key).is_some();
-        if was {
-            self.store.remove(&store::suspected_key(key));
-        }
-        was
     }
 
     // -- Catch-up -----------------------------------------------------------------

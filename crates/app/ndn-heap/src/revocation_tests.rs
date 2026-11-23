@@ -165,8 +165,9 @@ impl Chain {
     }
 }
 
-/// One space as this node (Carol's) holds it.
-fn open(store: &Arc<CrashStore>, space: &Name) -> Log {
+/// One space as this node (Carol's) holds it, marking suspicion in
+/// `suspicion`.
+fn open_with(suspicion: &Arc<Suspicion>, store: &Arc<CrashStore>, space: &Name) -> Log {
     let raw = Arc::clone(store) as Arc<dyn DataStore>;
     let me = carol();
     Log::open(
@@ -176,6 +177,7 @@ fn open(store: &Arc<CrashStore>, space: &Name) -> Log {
             person: me.person.clone(),
             signer: Arc::clone(&me.signer) as Arc<dyn Signer>,
             keys: Keys::new(RecipientKey::generate()),
+            suspicion: Arc::clone(suspicion),
             block: 8,
         },
         Arc::clone(&raw),
@@ -204,7 +206,21 @@ fn applied(log: &mut Log, p: &Packet, now: u64) {
 
 /// Alice creates `space` (public) listing `writers`.
 fn found(store: &Arc<CrashStore>, space: &Name, writers: &[&str]) -> Log {
-    let mut log = open(store, space);
+    found_with(&suspicion_of(store), store, space, writers)
+}
+
+/// A fresh suspicion map over `store`.
+fn suspicion_of(store: &Arc<CrashStore>) -> Arc<Suspicion> {
+    Suspicion::open(Arc::clone(store) as Arc<dyn DataStore>)
+}
+
+fn found_with(
+    suspicion: &Arc<Suspicion>,
+    store: &Arc<CrashStore>,
+    space: &Name,
+    writers: &[&str],
+) -> Log {
+    let mut log = open_with(suspicion, store, space);
     let ops = writers
         .iter()
         .zip(1u8..)
@@ -237,6 +253,22 @@ fn authority() -> CutAuthority {
         namespace: n("/bob"),
         certified: BTreeSet::new(),
     }
+}
+
+/// [`super::propose`] with a node that suspects nothing.
+fn propose(
+    logs: &[&Log],
+    authority: &CutAuthority,
+    key: &Name,
+    bound: &CutBound,
+) -> Result<CutProposal, HeapError> {
+    super::propose(
+        logs,
+        &suspicion_of(&Arc::new(CrashStore::new())),
+        authority,
+        key,
+        bound,
+    )
 }
 
 fn lost_at(t: u64) -> CutBound {
@@ -610,7 +642,9 @@ async fn the_authority_is_the_context_the_node_holds_for_the_key() {
     let store = Arc::new(CrashStore::new());
     let mut log = found(&store, &notes(), &["/bob"]);
     applied(&mut log, &Chain::new(bob(), notes()).put("/a", "1"), 1_000);
-    let proposal = revocation_cut(&[&log], &judge, &bob().key, &lost_at(2_000)).unwrap();
+    let suspicion = suspicion_of(&store);
+    let proposal =
+        revocation_cut(&[&log], &judge, &suspicion, &bob().key, &lost_at(2_000)).unwrap();
     let root = proposal.cut.manifest().unwrap();
     assert!(judge.validator().cut_manifests().missing(root).is_empty());
 
@@ -631,31 +665,35 @@ async fn the_authority_is_the_context_the_node_holds_for_the_key() {
 #[tokio::test]
 async fn a_suspected_keys_new_entries_are_not_taken_until_its_revocation() {
     let store = Arc::new(CrashStore::new());
-    let mut a = found(&store, &notes(), &["/bob"]);
-    let mut b = found(&store, &photos(), &["/bob"]);
+    let suspicion = suspicion_of(&store);
+    let mut a = found_with(&suspicion, &store, &notes(), &["/bob"]);
+    let mut b = found_with(&suspicion, &store, &photos(), &["/bob"]);
+    let elsewhere = Chain::new(bob(), photos()).put("/a", "1");
     let mut chain = Chain::new(bob(), notes());
     let one = chain.put("/a", "1");
     let two = chain.put("/b", "2");
     applied(&mut a, &one, 1_000);
 
-    suspect(&mut [&mut a, &mut b], &bob().key, Timestamp(2_000)).unwrap();
-    assert_eq!(suspected(&[&a, &b], &bob().key), Some(Timestamp(2_000)));
-    assert_eq!(
-        b.suspected(&bob().key),
-        Some(Timestamp(2_000)),
-        "every space"
-    );
+    suspicion.mark(&bob().key, Timestamp(2_000)).unwrap();
+    assert_eq!(suspicion.since(&bob().key), Some(Timestamp(2_000)));
     let refused = admit_as(&mut a, &two, None, 3_000);
     assert!(
         matches!(refused, Outcome::Refused(Refusal::Suspected { .. })),
         "{refused:?}"
+    );
+    assert!(
+        matches!(
+            admit_as(&mut b, &elsewhere, None, 3_000),
+            Outcome::Refused(Refusal::Suspected { .. })
+        ),
+        "every space"
     );
     assert!(a.served(&bob().name, 1).is_some(), "what was held stays");
     assert!(a.served(&bob().name, 2).is_none(), "not taken");
 
     // The bound a cut takes by default: when the key was suspected.
     let lost = CutBound {
-        held_before: suspected(&[&a, &b], &bob().key),
+        held_before: suspicion.since(&bob().key),
         ..CutBound::default()
     };
     let proposal = propose(&[&a, &b], &authority(), &bob().key, &lost).unwrap();
@@ -663,34 +701,38 @@ async fn a_suspected_keys_new_entries_are_not_taken_until_its_revocation() {
         proposal.cut.ranges(),
         expected(&bob(), &[(&notes(), &[1])]).ranges()
     );
+    // Without a bound the refusal says since when the key is suspected.
+    let why = refusal(super::propose(
+        &[&a, &b],
+        &suspicion,
+        &authority(),
+        &bob().key,
+        &CutBound::default(),
+    ));
+    assert!(why.contains("marked suspected here since 2000"), "{why}");
 
     // No revocation held: the mark stands.
-    assert!(lift_revoked(&mut [&mut a, &mut b], |_| false).is_empty());
-    assert!(suspected(&[&a, &b], &bob().key).is_some());
+    assert!(suspicion.lift_revoked(|_| false).is_empty());
+    assert!(suspicion.since(&bob().key).is_some());
     // Its revocation is held: the mark ends everywhere.
-    assert_eq!(
-        lift_revoked(&mut [&mut a, &mut b], |k| *k == bob().key),
-        vec![bob().key]
-    );
-    assert_eq!(suspected(&[&a, &b], &bob().key), None);
-    assert_eq!(b.suspected(&bob().key), None);
+    assert_eq!(suspicion.lift_revoked(|k| *k == bob().key), vec![bob().key]);
+    assert_eq!(suspicion.since(&bob().key), None);
     assert_eq!(admit_as(&mut a, &two, None, 4_000), Outcome::Applied);
+    assert_eq!(admit_as(&mut b, &elsewhere, None, 4_000), Outcome::Applied);
 }
 
-/// `unsuspect` lifts the mark on every space, and says whether there was one;
-/// a name that is no key is not marked.
+/// `lift` ends the mark, and says whether there was one; a name that is no
+/// key is not marked.
 #[tokio::test]
-async fn unsuspect_lifts_every_space_and_a_non_key_is_refused() {
-    let store = Arc::new(CrashStore::new());
-    let mut a = found(&store, &notes(), &["/bob"]);
-    let mut b = found(&store, &photos(), &["/bob"]);
+async fn unsuspect_lifts_the_mark_and_a_non_key_is_refused() {
+    let suspicion = suspicion_of(&Arc::new(CrashStore::new()));
     assert!(matches!(
-        suspect(&mut [&mut a, &mut b], &n("/bob/phone"), Timestamp(1)),
+        suspicion.mark(&n("/bob/phone"), Timestamp(1)),
         Err(HeapError::BadRequest { .. })
     ));
-    assert!(!unsuspect(&mut [&mut a, &mut b], &bob().key));
-    suspect(&mut [&mut a, &mut b], &bob().key, Timestamp(1)).unwrap();
-    assert!(unsuspect(&mut [&mut a, &mut b], &bob().key));
-    assert!(a.suspected(&bob().key).is_none() && b.suspected(&bob().key).is_none());
-    assert!(!unsuspect(&mut [&mut a, &mut b], &bob().key));
+    assert!(!suspicion.lift(&bob().key));
+    suspicion.mark(&bob().key, Timestamp(1)).unwrap();
+    assert!(suspicion.lift(&bob().key));
+    assert!(suspicion.since(&bob().key).is_none());
+    assert!(!suspicion.lift(&bob().key));
 }

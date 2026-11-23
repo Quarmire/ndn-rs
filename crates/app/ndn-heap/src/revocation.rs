@@ -22,24 +22,28 @@
 //! the cut file need no change.
 //!
 //! Suspicion is the node's mark on a key it fears is in a thief's hands
-//! ([`suspect`]): no new entry of it is taken, what is held stays. It lives in
-//! every space's log, so these functions work over all of them; the mark ends
-//! with [`unsuspect`], or once a revocation of the key is held
-//! ([`lift_revoked`]), after which the cut decides.
+//! ([`Suspicion::mark`]): no new entry of it is taken, what is held stays. It
+//! is one map for the device, shared by every space's log; the mark ends with
+//! [`Suspicion::lift`], or once a revocation of the key is held
+//! ([`Suspicion::lift_revoked`]), after which the cut decides.
 //!
-//! The functions are free and take the node's logs (the node locks one per
-//! space and passes the guards) and its judge; they hold no state.
+//! The cut functions are free and take the node's logs (the node locks one
+//! per space and passes the guards) and its judge; they hold no state.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::Data;
 use ndn_security::cert_name::key_name_of;
 use ndn_security::{RevocationCut, cut_manifest, public_key_digest};
+use ndn_sync::DataStore;
+use parking_lot::Mutex;
 
 use crate::error::{HeapError, Timestamp};
 use crate::log::{Log, Standing};
+use crate::store::{self, parse_suspected_key, suspected_prefix};
 use crate::trust::Judge;
 use crate::wire::{device_of, implicit_digest, log_name};
 
@@ -152,18 +156,19 @@ pub(crate) fn cut_authority(judge: &Judge, key: &Name) -> Result<CutAuthority, H
 /// bounded by `bound` (see the module docs).
 ///
 /// Refused ([`HeapError::BadRequest`]) when neither bound is given (say when
-/// the device was lost: [`suspected`] is when its key was marked suspected),
+/// the device was lost: `suspicion` says when its key was marked suspected),
 /// when the entries it would keep were verified under two different public
 /// keys, and when no public key of the key can be named.
 pub(crate) fn propose(
     logs: &[&Log],
+    suspicion: &Suspicion,
     authority: &CutAuthority,
     key: &Name,
     bound: &CutBound,
 ) -> Result<CutProposal, HeapError> {
     let key = key_of(key)?;
     if bound.held_before.is_none() && bound.upto.is_empty() {
-        let since = suspected(logs, &key);
+        let since = suspicion.since(&key);
         return Err(bad(format!(
             "a revocation cut keeps what this node held of the key {key} before it was lost, \
              so say when that was: give held_before (the time the device was lost{}) or upto \
@@ -272,11 +277,12 @@ pub(crate) fn propose(
 pub(crate) fn revocation_cut(
     logs: &[&Log],
     judge: &Judge,
+    suspicion: &Suspicion,
     key: &Name,
     bound: &CutBound,
 ) -> Result<CutProposal, HeapError> {
     let authority = cut_authority(judge, key)?;
-    let proposal = propose(logs, &authority, key, bound)?;
+    let proposal = propose(logs, suspicion, &authority, key, bound)?;
     for packet in &proposal.manifest {
         if let Ok(data) = Data::decode(packet.clone()) {
             let _ = judge.validator().cut_manifests().insert(&data);
@@ -320,53 +326,92 @@ pub(crate) fn refused_by_revocation(logs: &[&Log], key: &Name) -> Vec<Name> {
     out
 }
 
-/// Mark `key` (a key name, or one of its certificate names) suspected since
-/// `since`, by this node's clock, in every space: from now on no new entry of
-/// it is taken, and the entries held before stay. `since` is the default
-/// bound of the key's cut ([`CutBound::held_before`]).
-pub(crate) fn suspect(
-    logs: &mut [&mut Log],
-    key: &Name,
-    since: Timestamp,
-) -> Result<(), HeapError> {
-    let key = key_of(key)?;
-    for log in logs.iter_mut() {
-        log.suspect(&key, since);
+/// The keys this node marks suspected (see the module docs): one map for the
+/// device, shared by every space's log, and kept at `suspected/<key>` so it
+/// survives a restart.
+pub(crate) struct Suspicion {
+    marks: Mutex<BTreeMap<Name, Timestamp>>,
+    store: Arc<dyn DataStore>,
+}
+
+impl Suspicion {
+    /// The marks the store holds.
+    pub(crate) fn open(store: Arc<dyn DataStore>) -> Arc<Suspicion> {
+        let marks = store
+            .scan_under(&suspected_prefix(), 0)
+            .into_iter()
+            .filter_map(|(key, since)| {
+                let since = since.as_ref().try_into().map_or(0, u64::from_be_bytes);
+                Some((parse_suspected_key(&key)?, Timestamp(since)))
+            })
+            .collect();
+        Arc::new(Suspicion {
+            marks: Mutex::new(marks),
+            store,
+        })
     }
-    Ok(())
-}
 
-/// Lift the mark of `key` in every space: new entries of it are taken again.
-/// Whether it was marked in any.
-pub(crate) fn unsuspect(logs: &mut [&mut Log], key: &Name) -> bool {
-    let Ok(key) = key_of(key) else {
-        return false;
-    };
-    let mut was = false;
-    for log in logs.iter_mut() {
-        was |= log.unsuspect(&key);
+    /// Since when `key` (a key name, or one of its certificate names) is
+    /// marked suspected. It is the default bound of the key's cut
+    /// ([`CutBound::held_before`]).
+    pub(crate) fn since(&self, key: &Name) -> Option<Timestamp> {
+        self.marks.lock().get(&key_name_of(key)).copied()
     }
-    was
-}
 
-/// Since when `key` is marked suspected: the earliest of the spaces' marks.
-pub(crate) fn suspected(logs: &[&Log], key: &Name) -> Option<Timestamp> {
-    let key = key_name_of(key);
-    logs.iter().filter_map(|log| log.suspected(&key)).min()
-}
+    /// Mark `key` suspected since `since`, by this node's clock: from now on
+    /// no new entry of it is taken in any space, and the entries held before
+    /// stay. Refused when `key` names no key.
+    pub(crate) fn mark(&self, key: &Name, since: Timestamp) -> Result<(), HeapError> {
+        self.set(key_of(key)?, since, true);
+        Ok(())
+    }
 
-/// End the mark of every suspected key that `revoked` says a revocation held
-/// here now covers: its cut decides from then on. Returns the keys lifted,
-/// sorted. The node calls it whenever a context is adopted.
-pub(crate) fn lift_revoked(logs: &mut [&mut Log], revoked: impl Fn(&Name) -> bool) -> Vec<Name> {
-    let marked: BTreeSet<Name> = logs.iter().flat_map(|log| log.suspected_keys()).collect();
-    let lifted: Vec<Name> = marked.into_iter().filter(|key| revoked(key)).collect();
-    for key in &lifted {
-        for log in logs.iter_mut() {
-            log.unsuspect(key);
+    /// [`Self::mark`] for a key the log verified, unless it is marked already
+    /// (the first mark is the one that counts).
+    pub(crate) fn mark_new(&self, key: &Name, since: Timestamp) {
+        self.set(key.clone(), since, false);
+    }
+
+    fn set(&self, key: Name, since: Timestamp, replace: bool) {
+        let mut marks = self.marks.lock();
+        if replace || !marks.contains_key(&key) {
+            self.store.insert(
+                store::suspected_key(&key),
+                Bytes::copy_from_slice(&since.0.to_be_bytes()),
+            );
+            marks.insert(key, since);
         }
     }
-    lifted
+
+    /// Lift the mark of `key`: new entries of it are taken again. Whether
+    /// there was one.
+    pub(crate) fn lift(&self, key: &Name) -> bool {
+        let Ok(key) = key_of(key) else {
+            return false;
+        };
+        let was = self.marks.lock().remove(&key).is_some();
+        if was {
+            self.store.remove(&store::suspected_key(&key));
+        }
+        was
+    }
+
+    /// End the mark of every suspected key that `revoked` says a revocation
+    /// held here now covers: its cut decides from then on. Returns the keys
+    /// lifted, sorted. The node calls it whenever a context is adopted.
+    pub(crate) fn lift_revoked(&self, revoked: impl Fn(&Name) -> bool) -> Vec<Name> {
+        let lifted: Vec<Name> = self
+            .marks
+            .lock()
+            .keys()
+            .filter(|key| revoked(key))
+            .cloned()
+            .collect();
+        for key in &lifted {
+            self.lift(key);
+        }
+        lifted
+    }
 }
 
 /// Whether the trust context `judge` holds for a key revokes it.

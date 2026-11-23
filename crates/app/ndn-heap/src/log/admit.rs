@@ -17,6 +17,7 @@ use ndn_packet::Data;
 use super::chain::{Keeps, RANGES_MAX, Ranges, Status};
 use super::view::{View, write_for};
 use super::*;
+use crate::error::Timestamp;
 use crate::register::ValueChange;
 use crate::wire::{Prev, parse_log_name, signed_digest_of};
 
@@ -221,7 +222,7 @@ impl Log {
                 device: id.device.clone(),
                 seq: id.seq,
             });
-            self.mark_suspect(&v.key, now, fx);
+            self.suspicion.mark_new(&v.key, Timestamp(now));
         }
         outcome
     }
@@ -229,7 +230,7 @@ impl Log {
     /// A suspected key's new entries are not taken, unless the owner's cut
     /// names them: a removed writer's entries are judged by the cut alone.
     fn suspicion(&self, v: &Verified) -> Option<Refusal> {
-        let since = self.suspected(&v.key)?;
+        let since = self.suspicion.since(&v.key)?;
         self.fold.is_writer(&v.person).then(|| Refusal::Suspected {
             key: v.key.clone(),
             since,
@@ -302,7 +303,7 @@ impl Log {
             device: id.device.clone(),
             seq: id.seq,
         });
-        self.mark_suspect(&v.key, now, fx);
+        self.suspicion.mark_new(&v.key, Timestamp(now));
         // What the entry first held here said is absent is no longer taken as
         // said: its writer signed two.
         let retracted = self
@@ -415,7 +416,7 @@ impl Log {
                 device: id.device.clone(),
                 seq: conflict,
             });
-            self.mark_suspect(&v.key, now, fx);
+            self.suspicion.mark_new(&v.key, Timestamp(now));
             let why = Refusal::Chain;
             self.store_fresh(
                 fresh(Some(Status::Refused(why.clone())), link, None),
@@ -536,13 +537,6 @@ impl Log {
         let next = self.devices.get(&id.device)?.held.above(id.seq)?;
         let m = view.marker(&id.device, next)?;
         (m.prev_seq == id.seq && m.prev != id.digest).then_some(id.seq)
-    }
-
-    fn mark_suspect(&mut self, key: &Name, now: u64, fx: &mut Effects) {
-        if !self.suspected.contains_key(key) {
-            self.suspect(key, Timestamp(now));
-            fx.suspect.push(key.clone());
-        }
     }
 
     /// The decision about an entry from what is held: plan 3.5 steps 3 to 5.
