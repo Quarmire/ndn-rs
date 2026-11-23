@@ -11,8 +11,7 @@ use ndn_foundation_types::Name;
 use ndn_sync::DataStore;
 
 use crate::error::{Cut, Refusal};
-use crate::store::{ChainEnd, Link, Marker, verified_key, walk_chain};
-use crate::wire::log_name;
+use crate::store::{ChainEnd, Link, Marker, walk_chain};
 
 /// The most separate runs of held seqs, and the most gap statements, this
 /// device keeps for one device: the `ledger/` record is rewritten with every
@@ -398,10 +397,6 @@ pub(super) enum Keeps {
     Waiting,
 }
 
-fn marker_at(store: &dyn DataStore, device: &Name, space: &Name, seq: u64) -> Option<Marker> {
-    Marker::decode(&store.get(&verified_key(&log_name(device, space, seq)))?)
-}
-
 impl Kept {
     /// The ancestry of `tips`, walked as far as the markers go.
     pub(super) fn compute(
@@ -437,7 +432,7 @@ impl Kept {
                 ChainEnd::Missing { .. } => Some(match walk.links.last() {
                     None => link,
                     Some(last) => {
-                        let m = marker_at(store, device, space, last.seq)
+                        let m = Marker::read(store, device, space, last.seq)
                             .expect("a walked link has its marker");
                         Link {
                             seq: m.prev_seq,
@@ -474,7 +469,7 @@ impl Kept {
             return Keeps::Yes;
         }
         if self.ranges.contains(seq) {
-            return match marker_at(store, device, space, seq) {
+            return match Marker::read(store, device, space, seq) {
                 Some(m) if m.signed_digest == *digest => Keeps::Yes,
                 _ => Keeps::No,
             };

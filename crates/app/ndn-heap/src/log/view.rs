@@ -13,7 +13,7 @@ use super::{Log, decode_wire};
 use crate::error::Refusal;
 use crate::register::{Write, decode_refs};
 use crate::seal::{self, Keys};
-use crate::store::{Marker, equivocal_key, status_key, supers_key, verified_key};
+use crate::store::{Kind, Marker, supers_key};
 use crate::wire::{self, Body, Entry, EntryRef, Payload, PutBody, log_name, signed_digest};
 
 pub(super) struct View<'a> {
@@ -34,16 +34,12 @@ impl<'a> View<'a> {
     }
 
     pub(super) fn marker(&self, device: &Name, seq: u64) -> Option<Marker> {
-        Marker::decode(
-            &self
-                .store
-                .get(&verified_key(&log_name(device, self.space, seq)))?,
-        )
+        Marker::read(self.store, device, self.space, seq)
     }
 
     pub(super) fn status(&self, device: &Name, seq: u64) -> Option<Status> {
         Status::decode(
-            &self.store.get(&status_key(self.space, device, seq))?,
+            &self.store.get(&Kind::STATUS.seq(self.space, device, seq))?,
             device,
         )
     }
@@ -60,7 +56,7 @@ impl<'a> View<'a> {
         self.store
             .get(&name)
             .into_iter()
-            .chain(self.store.get(&equivocal_key(&name)))
+            .chain(self.store.get(&Kind::EQUIVOCAL.of(&name)))
             .collect()
     }
 

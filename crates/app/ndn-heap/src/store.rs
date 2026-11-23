@@ -29,21 +29,142 @@ mod tests;
 
 // -- Keys ------------------------------------------------------------------------
 
-/// `/localhost/ndn-heap`: the prefix of every key that is not an entry.
-fn root() -> &'static Name {
-    static ROOT: LazyLock<Name> =
-        LazyLock::new(|| "/localhost/ndn-heap".parse().expect("a valid name"));
-    &ROOT
-}
+/// A kind of key: the component after `/localhost/ndn-heap` (a prefix no
+/// device serves). Every key is built and read back here, so a kind's keys
+/// and the prefix a scan of them lists cannot disagree.
+///
+/// The kinds in three shapes: [`Self::of`] (`<kind>/<name>`, one record per
+/// name), and with a space, [`Self::device`] (`<kind>/<S>/<device>`) and
+/// [`Self::seq`] (`<kind>/<S>/<device>/<seq 8>`), listed by [`Self::listing`]
+/// and read back by [`Self::parse_device`] and [`Self::parse_seq`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Kind(&'static str);
 
-/// `/localhost/ndn-heap/<kind>`.
-fn kind(kind: &str) -> Name {
-    root().clone().append(kind)
-}
+impl Kind {
+    /// `verified/<entry name>`: that an entry's signature was verified
+    /// ([`Marker`]).
+    pub(crate) const VERIFIED: Kind = Kind("verified");
+    /// `assembled/<entry name>`: that every piece of an entry's value in
+    /// pieces is held and proved (one octet), written after the last piece,
+    /// and in the batch of the entry for a value this device wrote.
+    pub(crate) const ASSEMBLED: Kind = Kind("assembled");
+    /// `equivocal/<entry name>`: the second packet a device signed under an
+    /// entry name it already signed another under.
+    pub(crate) const EQUIVOCAL: Kind = Kind("equivocal");
+    /// `suspected/<key name>`: since when a key is suspected here (ms, 8
+    /// octets big-endian).
+    pub(crate) const SUSPECTED: Kind = Kind("suspected");
+    /// `scoped/<person>`: the scoped trust context kept for a person.
+    pub(crate) const SCOPED: Kind = Kind("scoped");
+    /// `head/<S>`: the device's own head in a space ([`Head`]).
+    pub(crate) const HEAD: Kind = Kind("head");
+    /// `reserve/<S>`: the sequence reserved in a space ([`ReserveRecord`]).
+    pub(crate) const RESERVE: Kind = Kind("reserve");
+    /// `space/<S>`: that the device created or opened a space (one octet).
+    pub(crate) const SPACE: Kind = Kind("space");
+    /// `revoked/<S>`: the revocations of the readers' devices the last epoch
+    /// this device signed accounted for (a 32-octet digest, spec §6.6).
+    pub(crate) const REVOKED: Kind = Kind("revoked");
+    /// `structural/<S>/<device>/<seq 8>`, empty: a Members or Epoch entry.
+    /// Start replays only these.
+    pub(crate) const STRUCTURAL: Kind = Kind("structural");
+    /// `epoch/<S>/<creator>/<seq 8>`: the epoch key this device made, wrapped
+    /// to its seal key.
+    pub(crate) const EPOCH: Kind = Kind("epoch");
+    /// `status/<S>/<device>/<seq 8>`: why a held entry is not applied. Absent
+    /// for an applied entry.
+    pub(crate) const STATUS: Kind = Kind("status");
+    /// `ledger/<S>/<device>`: what the log knows of one device of a space: its
+    /// person, the seqs it holds as ranges and the gaps its entries declared.
+    /// Read at open in place of every `verified/` marker.
+    pub(crate) const LEDGER: Kind = Kind("ledger");
+    /// `heads/<S>/<sha256 of the path TLV>` ([`heads_key`]): the heads of one
+    /// path.
+    pub(crate) const HEADS: Kind = Kind("heads");
+    /// `supers/<S>/<device>/<seq 8>/<digest>` ([`supers_key`]): the entries
+    /// that name an entry in their `after`.
+    pub(crate) const SUPERS: Kind = Kind("supers");
 
-/// `prefix` followed by the components of `name`.
-fn under(prefix: Name, name: &Name) -> Name {
-    Name::from_components(prefix.components().iter().chain(name.components()).cloned())
+    /// `/localhost/ndn-heap/<kind>`: the prefix of every key of the kind.
+    fn root(self) -> Name {
+        static ROOT: LazyLock<Name> =
+            LazyLock::new(|| "/localhost/ndn-heap".parse().expect("a valid name"));
+        ROOT.clone().append(self.0)
+    }
+
+    /// `<kind>/<name>`: the components of `name` follow the kind.
+    pub(crate) fn of(self, name: &Name) -> Name {
+        let root = self.root();
+        Name::from_components(root.components().iter().chain(name.components()).cloned())
+    }
+
+    /// Every `<kind>/<name>` the store holds, with the name and the value, in
+    /// name order.
+    pub(crate) fn named(self, store: &dyn DataStore) -> Vec<(Name, Bytes)> {
+        let prefix = self.root();
+        let skip = prefix.len();
+        let held = store.scan_under(&prefix, 0);
+        held.into_iter()
+            .map(|(key, value)| {
+                (
+                    Name::from_components(key.components()[skip..].iter().cloned()),
+                    value,
+                )
+            })
+            .collect()
+    }
+
+    /// `<kind>/<S>`, `S` one component holding its `Name` TLV: every key of
+    /// the kind in `space` has this prefix, and no other space's has. A space
+    /// name is a prefix of the names of spaces that extend it, so spelled as
+    /// components a scan of one space's keys would list another's.
+    pub(crate) fn listing(self, space: &Name) -> Name {
+        self.root().append_component(tlv_component(space))
+    }
+
+    /// `<kind>/<S>/<device>`, the device as one component too.
+    pub(crate) fn device(self, space: &Name, device: &Name) -> Name {
+        self.listing(space).append_component(tlv_component(device))
+    }
+
+    /// `<kind>/<S>/<device>/<seq 8>`: the seq one component of 8 octets,
+    /// big-endian, so names, which order by length and then bytes, order
+    /// numerically.
+    pub(crate) fn seq(self, space: &Name, device: &Name, seq: u64) -> Name {
+        let seq = NameComponent::generic(Bytes::copy_from_slice(&seq.to_be_bytes()));
+        self.device(space, device).append_component(seq)
+    }
+
+    /// What follows [`Self::listing`] in `key` (nothing when `key` is not one
+    /// of the listing's).
+    fn tail<'k>(self, space: &Name, key: &'k Name) -> &'k [NameComponent] {
+        let prefix = self.listing(space);
+        if key.has_prefix(&prefix) {
+            &key.components()[prefix.len()..]
+        } else {
+            &[]
+        }
+    }
+
+    /// The device a [`Self::device`] key of `space` names.
+    pub(crate) fn parse_device(self, space: &Name, key: &Name) -> Option<Name> {
+        let [device] = self.tail(space, key) else {
+            return None;
+        };
+        Name::decode_from_tlv(device.value.clone()).ok()
+    }
+
+    /// The device and seq a [`Self::seq`] key of `space` names.
+    pub(crate) fn parse_seq(self, space: &Name, key: &Name) -> Option<(Name, u64)> {
+        let [device, seq] = self.tail(space, key) else {
+            return None;
+        };
+        let device = Name::decode_from_tlv(device.value.clone()).ok()?;
+        Some((
+            device,
+            u64::from_be_bytes(seq.value.as_ref().try_into().ok()?),
+        ))
+    }
 }
 
 /// `name` as one component: its `Name` TLV.
@@ -51,200 +172,23 @@ fn tlv_component(name: &Name) -> NameComponent {
     NameComponent::generic(name.encode_to_tlv())
 }
 
-/// A sequence number as one component of 8 octets, big-endian: names order
-/// by length and then bytes, so these order numerically.
-fn seq_component(seq: u64) -> NameComponent {
-    NameComponent::generic(Bytes::copy_from_slice(&seq.to_be_bytes()))
-}
-
-/// Where the record that an own entry's signature was verified sits:
-/// `verified/<entry name>` ([`Marker`]).
-pub(crate) fn verified_key(entry: &Name) -> Name {
-    under(kind("verified"), entry)
-}
-
-/// That every piece of an entry's value in pieces is held and proved:
-/// `assembled/<entry name>` (one octet), written after the last piece, and
-/// in the batch of the entry for a value this device wrote.
-pub(crate) fn assembled_key(entry: &Name) -> Name {
-    under(kind("assembled"), entry)
-}
-
-/// The device's own head in a space: `head/<S>` ([`Head`]).
-pub(crate) fn head_key(space: &Name) -> Name {
-    under(kind("head"), space)
-}
-
-/// The sequence reserved in a space: `reserve/<S>` ([`ReserveRecord`]).
-pub(crate) fn reserve_key(space: &Name) -> Name {
-    under(kind("reserve"), space)
-}
-
-/// That the device created or opened a space: `space/<S>` (one octet).
-pub(crate) fn space_key(space: &Name) -> Name {
-    under(kind("space"), space)
-}
-
-/// The revocations of the readers' devices the last epoch this device signed
-/// accounted for: `revoked/<S>` (a 32-octet digest, spec §6.6).
-pub(crate) fn revoked_key(space: &Name) -> Name {
-    under(kind("revoked"), space)
-}
-
-/// `<kind>/<S>/<device>/<seq 8>`: a record per entry of a device, listed by
-/// [`seq_prefix`].
-fn seq_key(label: &str, space: &Name, device: &Name, seq: u64) -> Name {
-    seq_prefix(label, space)
-        .append_component(tlv_component(device))
-        .append_component(seq_component(seq))
-}
-
-fn seq_prefix(label: &str, space: &Name) -> Name {
-    kind(label).append_component(tlv_component(space))
-}
-
-/// The device and seq a [`seq_key`] of `space` names.
-fn parse_seq_key(label: &str, space: &Name, key: &Name) -> Option<(Name, u64)> {
-    let prefix = seq_prefix(label, space);
-    if !key.has_prefix(&prefix) || key.len() != prefix.len() + 2 {
-        return None;
-    }
-    let comps = key.components();
-    let device = Name::decode_from_tlv(comps[prefix.len()].value.clone()).ok()?;
-    let seq = u64::from_be_bytes(comps[prefix.len() + 1].value.as_ref().try_into().ok()?);
-    Some((device, seq))
-}
-
-/// A Members or Epoch entry: `structural/<S>/<device>/<seq 8>`, empty.
-/// Start replays only these.
-pub(crate) fn structural_key(space: &Name, device: &Name, seq: u64) -> Name {
-    seq_key("structural", space, device, seq)
-}
-
-/// Every [`structural_key`] of `space` has this prefix, and no other
-/// space's has.
-pub(crate) fn structural_prefix(space: &Name) -> Name {
-    seq_prefix("structural", space)
-}
-
-/// The device and seq of a [`structural_key`] of `space`.
-pub(crate) fn parse_structural_key(space: &Name, key: &Name) -> Option<(Name, u64)> {
-    parse_seq_key("structural", space, key)
-}
-
 /// The entries that name the entry `<device>/<seq>` with signed-region digest
-/// `digest` in their `after`: `supers/<S>/<device>/<seq 8>/<digest>`
-/// (`ENTRY_REF*`). The digest is in the key so that a ref naming another
-/// packet at the same name hides nothing.
+/// `digest` in their `after` (`ENTRY_REF*`). The digest is in the key so that
+/// a ref naming another packet at the same name hides nothing.
 pub(crate) fn supers_key(space: &Name, device: &Name, seq: u64, digest: &[u8; 32]) -> Name {
-    seq_key("supers", space, device, seq)
+    Kind::SUPERS
+        .seq(space, device, seq)
         .append_component(NameComponent::generic(Bytes::copy_from_slice(digest)))
-}
-
-/// The epoch key this device made, wrapped to its seal key:
-/// `epoch/<S>/<creator>/<seq 8>`.
-pub(crate) fn epoch_key(space: &Name, creator: &Name, seq: u64) -> Name {
-    seq_key("epoch", space, creator, seq)
-}
-
-/// Every [`epoch_key`] of `space` has this prefix.
-pub(crate) fn epoch_prefix(space: &Name) -> Name {
-    seq_prefix("epoch", space)
-}
-
-/// The creator and seq of an [`epoch_key`] of `space`.
-pub(crate) fn parse_epoch_key(space: &Name, key: &Name) -> Option<(Name, u64)> {
-    parse_seq_key("epoch", space, key)
 }
 
 /// The heads of one path: `heads/<S>/<sha256 of the path TLV>` (the path
 /// TLV, then `ENTRY_REF*`).
 pub(crate) fn heads_key(space: &Name, path_tlv: &[u8]) -> Name {
-    heads_prefix(space).append_component(NameComponent::generic(Bytes::copy_from_slice(
-        &Sha256::digest(path_tlv),
-    )))
-}
-
-/// Every [`heads_key`] of `space` has this prefix.
-pub(crate) fn heads_prefix(space: &Name) -> Name {
-    seq_prefix("heads", space)
-}
-
-/// The second packet a device signed under an entry name it already signed
-/// another under: `equivocal/<entry name>`.
-pub(crate) fn equivocal_key(entry: &Name) -> Name {
-    under(kind("equivocal"), entry)
-}
-
-/// Since when a key is suspected here: `suspected/<key name>` (ms, 8 octets
-/// big-endian).
-pub(crate) fn suspected_key(key: &Name) -> Name {
-    under(kind("suspected"), key)
-}
-
-/// The scoped trust context kept for a person: `scoped/<person>`.
-pub(crate) fn scoped_key(person: &Name) -> Name {
-    under(kind("scoped"), person)
-}
-
-/// `<kind>/<S>/<device>`: a record per device of a space, listed by
-/// [`seq_prefix`] and read back by [`parse_device_key`].
-fn device_key(label: &str, space: &Name, device: &Name) -> Name {
-    seq_prefix(label, space).append_component(tlv_component(device))
-}
-
-/// The device a [`device_key`] of `space` names.
-fn parse_device_key(label: &str, space: &Name, key: &Name) -> Option<Name> {
-    let prefix = seq_prefix(label, space);
-    if !key.has_prefix(&prefix) || key.len() != prefix.len() + 1 {
-        return None;
-    }
-    Name::decode_from_tlv(key.components()[prefix.len()].value.clone()).ok()
-}
-
-/// What the log knows of one device of a space: its person, the seqs it
-/// holds as ranges and the gaps its entries declared: `ledger/<S>/<device>`.
-/// Read at open in place of every `verified/` marker.
-pub(crate) fn ledger_key(space: &Name, device: &Name) -> Name {
-    device_key("ledger", space, device)
-}
-
-/// Every [`ledger_key`] of `space` has this prefix.
-pub(crate) fn ledger_prefix(space: &Name) -> Name {
-    seq_prefix("ledger", space)
-}
-
-/// The device a [`ledger_key`] of `space` names.
-pub(crate) fn parse_ledger_key(space: &Name, key: &Name) -> Option<Name> {
-    parse_device_key("ledger", space, key)
-}
-
-/// Why a held entry is not applied: `status/<S>/<device>/<seq 8>`. Absent
-/// for an applied entry.
-pub(crate) fn status_key(space: &Name, device: &Name, seq: u64) -> Name {
-    seq_key("status", space, device, seq)
-}
-
-/// Every [`status_key`] of `space` has this prefix.
-pub(crate) fn status_prefix(space: &Name) -> Name {
-    seq_prefix("status", space)
-}
-
-/// The device and seq of a [`status_key`] of `space`.
-pub(crate) fn parse_status_key(space: &Name, key: &Name) -> Option<(Name, u64)> {
-    parse_seq_key("status", space, key)
-}
-
-/// Every [`suspected_key`] has this prefix.
-pub(crate) fn suspected_prefix() -> Name {
-    kind("suspected")
-}
-
-/// The key a [`suspected_key`] names.
-pub(crate) fn parse_suspected_key(key: &Name) -> Option<Name> {
-    let prefix = suspected_prefix();
-    key.has_prefix(&prefix)
-        .then(|| Name::from_components(key.components()[prefix.len()..].iter().cloned()))
+    Kind::HEADS
+        .listing(space)
+        .append_component(NameComponent::generic(Bytes::copy_from_slice(
+            &Sha256::digest(path_tlv),
+        )))
 }
 
 // -- Records ---------------------------------------------------------------------
@@ -327,6 +271,17 @@ impl Marker {
             at: be(&bytes[104..112])?,
         })
     }
+
+    /// The marker of the entry `<device>/<seq>` of `space`; `None` when there
+    /// is none, or it cannot be read.
+    pub(crate) fn read(
+        store: &dyn DataStore,
+        device: &Name,
+        space: &Name,
+        seq: u64,
+    ) -> Option<Marker> {
+        Marker::decode(&store.get(&Kind::VERIFIED.of(&log_name(device, space, seq)))?)
+    }
 }
 
 /// The device's own head in a space (`head/<S>`), written with every own
@@ -393,22 +348,12 @@ impl ReserveRecord {
     }
 }
 
-/// The write of a [`Head`], to put in a batch.
-pub(crate) fn head_op(space: &Name, head: Head) -> StoreOp {
-    StoreOp::Insert(head_key(space), head.encode())
-}
-
-/// The write of a [`Marker`] for `entry`, to put in a batch.
-pub(crate) fn verified_op(entry: &Name, marker: &Marker) -> StoreOp {
-    StoreOp::Insert(verified_key(entry), marker.encode())
-}
-
 /// The reservation record of `space`; `Ok(None)` when there is none.
 pub(crate) fn read_reserve(
     store: &dyn DataStore,
     space: &Name,
 ) -> Result<Option<ReserveRecord>, Corrupt> {
-    let key = reserve_key(space);
+    let key = Kind::RESERVE.of(space);
     match store.get(&key) {
         None => Ok(None),
         Some(wire) => ReserveRecord::decode(&wire).map(Some).ok_or(Corrupt {
@@ -420,7 +365,7 @@ pub(crate) fn read_reserve(
 
 /// The head record of `space`; `Ok(None)` when there is none.
 pub(crate) fn read_head(store: &dyn DataStore, space: &Name) -> Result<Option<Head>, Corrupt> {
-    let key = head_key(space);
+    let key = Kind::HEAD.of(space);
     match store.get(&key) {
         None => Ok(None),
         Some(wire) => Head::decode(&wire).map(Some).ok_or(Corrupt {
@@ -433,13 +378,13 @@ pub(crate) fn read_head(store: &dyn DataStore, space: &Name) -> Result<Option<He
 /// Write the reservation record of `space` straight to the store.
 #[cfg(test)]
 pub(crate) fn write_reserve(store: &dyn DataStore, space: &Name, record: ReserveRecord) {
-    store.insert(reserve_key(space), record.encode());
+    store.insert(Kind::RESERVE.of(space), record.encode());
 }
 
 /// Write the head record of `space` straight to the store.
 #[cfg(test)]
 pub(crate) fn write_head(store: &dyn DataStore, space: &Name, head: Head) {
-    store.insert(head_key(space), head.encode());
+    store.insert(Kind::HEAD.of(space), head.encode());
 }
 
 // -- Own head and chains ---------------------------------------------------------
@@ -512,7 +457,7 @@ pub(crate) fn walk_chain(
     let mut links = Vec::new();
     let mut at = tip;
     let end = loop {
-        let Some(wire) = store.get(&verified_key(&log_name(device, space, at.seq))) else {
+        let Some(wire) = store.get(&Kind::VERIFIED.of(&log_name(device, space, at.seq))) else {
             break ChainEnd::Missing { seq: at.seq };
         };
         let Some(marker) = Marker::decode(&wire) else {

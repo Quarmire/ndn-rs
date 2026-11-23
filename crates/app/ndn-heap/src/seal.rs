@@ -29,7 +29,7 @@ use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::fold::Fold;
-use crate::store;
+use crate::store::Kind;
 use crate::wire::{self, EpochId, Grant};
 
 /// The domain label of an epoch key's check.
@@ -330,7 +330,7 @@ impl Keys {
     }
 
     /// What the store is to keep so the held key of `epoch` of `space`
-    /// survives a restart: the store key ([`store::epoch_key`]) and the
+    /// survives a restart: the store key ([`Kind::EPOCH`]) and the
     /// key wrapped to this device's seal key under that name ([`wrap_key`]).
     /// `None` if no key is held for the epoch. The caller writes it in the
     /// batch that makes the key's Epoch entry durable.
@@ -340,7 +340,7 @@ impl Keys {
         epoch: &EpochId,
     ) -> Option<Result<(Name, Bytes), SealError>> {
         let key = self.key(space, epoch)?;
-        let at = store::epoch_key(space, &epoch.creator, epoch.seq);
+        let at = Kind::EPOCH.seq(space, &epoch.creator, epoch.seq);
         Some(wrap_key(&self.public(), key, &at).map(|stored| (at, stored)))
     }
 
@@ -355,7 +355,7 @@ impl Keys {
         named: &[u8; 32],
         stored: Bytes,
     ) -> bool {
-        let at = store::epoch_key(space, &epoch.creator, epoch.seq);
+        let at = Kind::EPOCH.seq(space, &epoch.creator, epoch.seq);
         match unwrap_key(&self.recipient, &at, stored) {
             Some(key) => self.take(space, epoch, named, key),
             None => false,
@@ -750,7 +750,7 @@ mod tests {
         );
         first.hold(&space, e.clone(), key.clone());
         let (at, stored) = first.record(&space, &e).unwrap().unwrap();
-        assert_eq!(at, store::epoch_key(&space, &e.creator, e.seq));
+        assert_eq!(at, Kind::EPOCH.seq(&space, &e.creator, e.seq));
         assert_ne!(
             stored.as_ref(),
             key.expose().as_slice(),

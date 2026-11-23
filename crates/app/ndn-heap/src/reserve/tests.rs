@@ -2,9 +2,7 @@
 //! the crash stores of `test_kit`.
 
 use super::*;
-use crate::store::{
-    Head, ReserveRecord, head_key, read_reserve, reserve_key, write_head, write_reserve,
-};
+use crate::store::{Head, Kind, ReserveRecord, read_reserve, write_head, write_reserve};
 use crate::test_kit::{CrashStore, Held, n};
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -279,7 +277,7 @@ async fn open_is_clean_only_when_the_record_says_so_and_r_is_the_head() {
 #[tokio::test]
 async fn open_refuses_a_reserve_record_it_cannot_read() {
     let store = Arc::new(CrashStore::new());
-    store.insert(reserve_key(&space()), Bytes::from_static(&[1, 2, 3]));
+    store.insert(Kind::RESERVE.of(&space()), Bytes::from_static(&[1, 2, 3]));
     let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
     let err = Reservation::open(
         Arc::clone(&store) as Arc<dyn DataStore>,
@@ -290,7 +288,7 @@ async fn open_refuses_a_reserve_record_it_cannot_read() {
     )
     .err()
     .expect("R is unknown: resuming at the head could reuse a seq a peer saw");
-    assert_eq!(err.key, reserve_key(&space()));
+    assert_eq!(err.key, Kind::RESERVE.of(&space()));
 }
 
 #[tokio::test]
@@ -344,8 +342,8 @@ async fn a_failed_flush_is_sticky_and_refuses_signing_past_r_durable_with_the_di
         "the write was accepted, only not made durable"
     );
     assert!(!store.scan_under(&n("/localhost/ndn-heap"), 0).is_empty());
-    assert!(store.contains(&reserve_key(&space())));
-    assert!(!store.contains(&head_key(&space())));
+    assert!(store.contains(&Kind::RESERVE.of(&space())));
+    assert!(!store.contains(&Kind::HEAD.of(&space())));
 }
 
 // -- The flusher --------------------------------------------------------------

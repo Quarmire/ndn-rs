@@ -327,7 +327,7 @@ impl Register {
     }
 
     /// The register as persisted: `records` are the `heads/<S>/…` rows of
-    /// the space (`scan_under(heads_prefix(S))`), `load` as for
+    /// the space (`scan_under(Kind::HEADS.listing(S))`), `load` as for
     /// [`withdraw`](Self::withdraw). A record that is not what
     /// [`apply`](Self::apply) writes is [`Corrupt`], never skipped.
     pub(crate) fn restore(

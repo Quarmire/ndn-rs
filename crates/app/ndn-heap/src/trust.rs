@@ -41,7 +41,7 @@ use tokio::sync::mpsc;
 
 use crate::error::{Cut, Refusal, Timestamp};
 use crate::rt::{self, Instant};
-use crate::store::scoped_key;
+use crate::store::Kind;
 use crate::wire::{device_of, log_name};
 
 /// The first pause before a person the host could not adopt is asked again;
@@ -264,7 +264,7 @@ struct Scopes {
     /// from her genesis whose newest version is on record.
     ready: bool,
     /// Per person, the newest version adopted here and its content's digest,
-    /// kept in the store ([`scoped_key`]) and never gone back from: released
+    /// kept in the store ([`Kind::SCOPED`]) and never gone back from: released
     /// and adopted again, or after a restart, an older version is refused.
     newest: HashMap<Name, Reached>,
     /// The store's records read back at start, to open again
@@ -493,7 +493,7 @@ fn reached_of(ctx: &SignedTrustContext) -> Reached {
     (ctx.version(), Sha256::digest(ctx.encode_content()).into())
 }
 
-/// What the store keeps of `ctx` ([`scoped_key`]): the version, 8 octets
+/// What the store keeps of `ctx` ([`Kind::SCOPED`]): the version, 8 octets
 /// big-endian, and the SHA-256 of the context's content, 32 octets; then, when
 /// the host gave it, the genesis's signed Data, its length first in 4 octets
 /// big-endian, and the newest version's signed Data (none past version 1,
@@ -516,13 +516,13 @@ fn encode_kept(ctx: &ScopedContext) -> Bytes {
     Bytes::from(out)
 }
 
-/// The version and digest of a [`scoped_key`] record.
+/// The version and digest of a [`Kind::SCOPED`] record.
 fn decode_reached(value: &[u8]) -> Option<Reached> {
     let version = u64::from_be_bytes(value.get(..8)?.try_into().ok()?);
     Some((version, value.get(8..40)?.try_into().ok()?))
 }
 
-/// The context a [`scoped_key`] record keeps, opened again: its genesis
+/// The context a [`Kind::SCOPED`] record keeps, opened again: its genesis
 /// checked as stored ([`Genesis::open_stored`]: signature and genesis rule, no
 /// clock), the newest version's signature checked, both of `person`, and the
 /// version and digest the record names.
@@ -564,13 +564,6 @@ async fn open_kept(person: &Name, value: &Bytes) -> Result<ScopedContext, String
         return Err("its signed Data is not the version it names".into());
     }
     Ok(ctx)
-}
-
-/// The person a [`scoped_key`] names, if it names one.
-fn person_of_key(prefix: &Name, key: &Name) -> Option<Name> {
-    key.has_prefix(prefix)
-        .then(|| Name::from_components(key.components()[prefix.len()..].iter().cloned()))
-        .filter(is_person)
 }
 
 /// Whether a trust context `new` taken after `old` (of the same namespace) may
@@ -633,11 +626,10 @@ impl Judge {
     ) -> Arc<Judge> {
         let (events, inbox) = mpsc::unbounded_channel();
         let mut scopes = Scopes::default();
-        let prefix = scoped_key(&Name::root());
-        for (key, value) in store.scan_under(&prefix, 0) {
-            let Some(person) = person_of_key(&prefix, &key) else {
+        for (person, value) in Kind::SCOPED.named(&*store) {
+            if !is_person(&person) {
                 continue;
-            };
+            }
             if let Some(reached) = decode_reached(&value) {
                 scopes.newest.insert(person.clone(), reached);
                 scopes.kept.push((person, value));
@@ -909,7 +901,7 @@ impl Judge {
                 scopes.adopted.insert(person.clone(), self.hold(ctx));
                 drop(scopes);
                 if let Some(kept) = kept {
-                    self.store.insert(scoped_key(person), kept);
+                    self.store.insert(Kind::SCOPED.of(person), kept);
                 }
                 if refuses && from.is_some() {
                     // After the new view is in force, as the keyring's own

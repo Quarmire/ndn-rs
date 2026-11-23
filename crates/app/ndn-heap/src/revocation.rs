@@ -43,7 +43,7 @@ use parking_lot::Mutex;
 
 use crate::error::{HeapError, Timestamp};
 use crate::log::{Log, Standing};
-use crate::store::{self, parse_suspected_key, suspected_prefix};
+use crate::store::Kind;
 use crate::trust::Judge;
 use crate::wire::{device_of, implicit_digest, log_name};
 
@@ -337,12 +337,12 @@ pub(crate) struct Suspicion {
 impl Suspicion {
     /// The marks the store holds.
     pub(crate) fn open(store: Arc<dyn DataStore>) -> Arc<Suspicion> {
-        let marks = store
-            .scan_under(&suspected_prefix(), 0)
+        let marks = Kind::SUSPECTED
+            .named(&*store)
             .into_iter()
-            .filter_map(|(key, since)| {
+            .map(|(key, since)| {
                 let since = since.as_ref().try_into().map_or(0, u64::from_be_bytes);
-                Some((parse_suspected_key(&key)?, Timestamp(since)))
+                (key, Timestamp(since))
             })
             .collect();
         Arc::new(Suspicion {
@@ -376,7 +376,7 @@ impl Suspicion {
         let mut marks = self.marks.lock();
         if replace || !marks.contains_key(&key) {
             self.store.insert(
-                store::suspected_key(&key),
+                Kind::SUSPECTED.of(&key),
                 Bytes::copy_from_slice(&since.0.to_be_bytes()),
             );
             marks.insert(key, since);
@@ -391,7 +391,7 @@ impl Suspicion {
         };
         let was = self.marks.lock().remove(&key).is_some();
         if was {
-            self.store.remove(&store::suspected_key(&key));
+            self.store.remove(&Kind::SUSPECTED.of(&key));
         }
         was
     }

@@ -43,7 +43,7 @@ use crate::register::{EntryId, Item};
 use crate::reserve::{FlushError, Publisher, Ticket};
 use crate::rt;
 use crate::seal;
-use crate::store;
+use crate::store::Kind;
 use crate::sync::{Group, TIMELINE};
 use crate::trust::Listing;
 use crate::wire::{
@@ -531,7 +531,7 @@ impl SpaceInner {
         }
         let revoked = self.reader_revocations(node, log);
         !revoked.is_empty()
-            && node.store.get(&store::revoked_key(&self.name)).as_deref()
+            && node.store.get(&Kind::REVOKED.of(&self.name)).as_deref()
                 != Some(&revocations_digest(&revoked)[..])
     }
 
@@ -577,7 +577,7 @@ impl SpaceInner {
             let step = log.sign_epoch(audience, now)?;
             if matches!(step, Step::Done(..)) {
                 node.store.insert(
-                    store::revoked_key(&self.name),
+                    Kind::REVOKED.of(&self.name),
                     Bytes::copy_from_slice(&accounted),
                 );
             }
@@ -747,7 +747,7 @@ impl SpaceInner {
     /// whole (`assembled/<entry>`): one lookup, nothing read.
     fn is_whole(&self, node: &NodeInner, blob: &Blob) -> bool {
         let entry = log_name(&blob.id.device, &self.name, blob.id.seq);
-        node.store.contains(&store::assembled_key(&entry))
+        node.store.contains(&Kind::ASSEMBLED.of(&entry))
     }
 
     /// The value in pieces of `blob`, joined from the store and opened:
@@ -767,7 +767,7 @@ impl SpaceInner {
         let stored = pieces::read(&*node.store, &name, &body).map_err(|e| {
             // The store lost or damaged a piece it recorded whole: the value
             // is gathered again, from what the store still holds and the peers.
-            node.store.remove(&store::assembled_key(&name));
+            node.store.remove(&Kind::ASSEMBLED.of(&name));
             node.flusher.note_write();
             self.whole.lock().remove(&blob.id);
             node.nudge(&self.name);
@@ -844,7 +844,7 @@ impl SpaceInner {
     pub(crate) fn assembled(self: &Arc<Self>, node: &Arc<NodeInner>, blob: &Blob) {
         let entry = log_name(&blob.id.device, &self.name, blob.id.seq);
         node.store
-            .insert(store::assembled_key(&entry), Bytes::from_static(&[1]));
+            .insert(Kind::ASSEMBLED.of(&entry), Bytes::from_static(&[1]));
         node.flusher.note_write();
         self.whole.lock().insert(blob.id.clone());
         self.tell_blob(blob);
@@ -1008,7 +1008,7 @@ impl Heap {
                     // the entry's own batch.
                     let mut ops = cut.ops();
                     ops.push(StoreOp::Insert(
-                        store::assembled_key(&name),
+                        Kind::ASSEMBLED.of(&name),
                         Bytes::from_static(&[1]),
                     ));
                     log.put(path, blob.clone(), ops, now).map(Some)

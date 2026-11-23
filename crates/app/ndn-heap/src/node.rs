@@ -44,7 +44,7 @@ use crate::rt;
 use crate::seal::{self, GrantRefusal, Granter, Keys};
 use crate::serve;
 use crate::space::{Follower, Heap, Share, SpaceInner, check_audience, new_id};
-use crate::store;
+use crate::store::{self, Kind};
 use crate::sync::{Host, Net, NetConfig, Taken};
 use crate::trust::{Adopter, Adoption, Judge, Judged};
 use crate::wire::{
@@ -617,13 +617,11 @@ impl NodeInner {
     /// Entries held in `space` (every space when it is the root name):
     /// copies, counted from the markers.
     pub(crate) fn held_in(&self, space: &Name) -> u64 {
-        let prefix = store::verified_key(&Name::root());
-        self.store
-            .scan_under(&prefix, 0)
+        Kind::VERIFIED
+            .named(&*self.store)
             .into_iter()
-            .filter(|(key, _)| {
-                let entry = Name::from_components(key.components()[prefix.len()..].iter().cloned());
-                parse_log_name(&entry).is_some_and(|l| space.is_empty() || l.space == *space)
+            .filter(|(entry, _)| {
+                parse_log_name(entry).is_some_and(|l| space.is_empty() || l.space == *space)
             })
             .count() as u64
     }
@@ -685,7 +683,7 @@ impl NodeInner {
             return Err(local("the node is stopped"));
         }
         self.store.insert(
-            store::space_key(space),
+            Kind::SPACE.of(space),
             Bytes::copy_from_slice(&[if follower { CARRIER } else { MEMBER }]),
         );
         let (log, unclean) = self.open_log(space)?;
@@ -755,12 +753,10 @@ impl NodeInner {
 
     /// Every space the store holds: opened, judged, flushed, joined.
     async fn restore(self: &Arc<Self>) -> Result<(), HeapError> {
-        let prefix = store::space_key(&Name::root());
         let mut held = Vec::new();
-        for (key, mode) in self.store.scan_under(&prefix, 0) {
-            let space = Name::from_components(key.components()[prefix.len()..].iter().cloned());
+        for (space, mode) in Kind::SPACE.named(&*self.store) {
             if parse_space_name(&space).is_none() {
-                tracing::warn!(%key, "a record of a space that is no space name is ignored");
+                tracing::warn!(%space, "a record of a space that is no space name is ignored");
                 continue;
             }
             let (log, unclean) = self.open_log(&space)?;
@@ -831,7 +827,7 @@ impl NodeInner {
         if let Some(net) = self.net() {
             net.leave(space).await;
         }
-        self.store.remove(&store::space_key(space));
+        self.store.remove(&Kind::SPACE.of(space));
         self.flusher.note_write();
         if let Some(held) = held {
             held.closing.store(true, Ordering::Relaxed);

@@ -30,7 +30,7 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::rt;
-use crate::store::{Corrupt, ReserveRecord, read_head, read_reserve, reserve_key};
+use crate::store::{Corrupt, Kind, ReserveRecord, read_head, read_reserve};
 
 #[cfg(test)]
 mod tests;
@@ -434,7 +434,8 @@ impl Reservation {
     /// Write `reserve/<S> = (r, clean 0)` and ask for its flush.
     fn write(&self, st: &mut ReserveState, r: u64) {
         let record = ReserveRecord { r, clean: false };
-        self.store.insert(reserve_key(&self.space), record.encode());
+        self.store
+            .insert(Kind::RESERVE.of(&self.space), record.encode());
         let ticket = self.flusher.note_write();
         st.r = r;
         st.pending.push_back((ticket, r));
@@ -521,7 +522,7 @@ impl Reservation {
             let mut st = self.st.lock();
             st.closed = true;
             self.store.insert(
-                reserve_key(&self.space),
+                Kind::RESERVE.of(&self.space),
                 ReserveRecord {
                     r: head,
                     clean: true,

@@ -19,10 +19,7 @@ use crate::error::{Cut, NextStep, Refusal, Timestamp};
 use crate::reserve::Flusher;
 use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
-use crate::store::{
-    self, Marker, ReserveRecord, equivocal_key, status_key, structural_key, verified_key,
-    walk_chain, write_reserve,
-};
+use crate::store::{self, Kind, Marker, ReserveRecord, walk_chain, write_reserve};
 use crate::test_kit::{CrashStore, n};
 use crate::wire::{
     self, Body, Entry, EntryRef, EpochBody, EpochId, MembersBody, Op, Payload, Prev, PutBody, Role,
@@ -491,7 +488,7 @@ async fn two_packets_at_one_name_are_evidence_and_the_key_is_suspected() {
     ));
     assert_eq!(r.suspicion.since(&bob().key), Some(Timestamp(NOW)));
     assert_eq!(
-        r.store.get(&equivocal_key(&first.name())),
+        r.store.get(&Kind::EQUIVOCAL.of(&first.name())),
         Some(second.wire.clone())
     );
     assert_eq!(r.value("/a").as_deref(), Some("one"), "the first stands");
@@ -553,7 +550,7 @@ async fn a_relays_high_s_copy_changes_nothing() {
     assert_eq!(r.value("/a").as_deref(), Some("two"));
     assert!(r.suspicion.since(&bob().key).is_none());
     // The marker records the signed digest, not the wire's.
-    let m = Marker::decode(&r.store.get(&verified_key(&p1.name())).unwrap()).unwrap();
+    let m = Marker::decode(&r.store.get(&Kind::VERIFIED.of(&p1.name())).unwrap()).unwrap();
     assert_eq!(m.signed_digest, p1.digest);
 }
 
@@ -569,10 +566,13 @@ async fn an_entry_that_verifies_but_does_not_decode_is_recorded_as_refused_and_w
     let a = r.admit(&junk);
     assert_eq!(a.outcome, Outcome::Unreadable);
     assert!(
-        r.store.contains(&verified_key(&junk.name())),
+        r.store.contains(&Kind::VERIFIED.of(&junk.name())),
         "a marker records it"
     );
-    assert!(r.store.contains(&status_key(&space(), &bob().name, 2)));
+    assert!(
+        r.store
+            .contains(&Kind::STATUS.seq(&space(), &bob().name, 2))
+    );
     let walk = walk_chain(
         &*r.store,
         &bob().name,
@@ -848,7 +848,7 @@ async fn an_own_put_is_signed_chained_stored_in_one_batch_and_applied() {
     assert_eq!(r.value("/a").as_deref(), Some("two"));
     let marker = Marker::decode(
         &r.store
-            .get(&verified_key(&log_name(&me.name, &space(), 3)))
+            .get(&Kind::VERIFIED.of(&log_name(&me.name, &space(), 3)))
             .unwrap(),
     )
     .unwrap();
@@ -857,7 +857,10 @@ async fn an_own_put_is_signed_chained_stored_in_one_batch_and_applied() {
         store::read_head(&*r.store, &space()).unwrap().unwrap().seq,
         3
     );
-    assert!(r.store.contains(&structural_key(&space(), &me.name, 1)));
+    assert!(
+        r.store
+            .contains(&Kind::STRUCTURAL.seq(&space(), &me.name, 1))
+    );
 }
 
 #[tokio::test]
@@ -888,7 +891,7 @@ async fn an_epoch_key_is_stored_in_the_batch_of_its_entry() {
     };
     assert!(
         r.store
-            .contains(&store::epoch_key(&space(), &me.name, s.id.seq))
+            .contains(&Kind::EPOCH.seq(&space(), &me.name, s.id.seq))
     );
     assert_eq!(r.log.fold().in_force(), Some(epoch));
     // Sealed puts now work, and a relay cannot read the path.
@@ -1064,7 +1067,7 @@ async fn a_device_that_cannot_read_its_own_ledger_does_not_open_the_space() {
     let me = laptop();
     let store = Arc::new(CrashStore::new());
     store.insert(
-        crate::store::ledger_key(&space(), &me.name),
+        Kind::LEDGER.device(&space(), &me.name),
         Bytes::from_static(b"\xff"),
     );
     let raw = Arc::clone(&store) as Arc<dyn DataStore>;
@@ -1523,7 +1526,7 @@ struct Counting {
 
 impl Counting {
     fn marker(&self, name: &Name) -> bool {
-        name.has_prefix(&verified_key(&Name::root()))
+        name.has_prefix(&Kind::VERIFIED.of(&Name::root()))
     }
 }
 
@@ -1658,7 +1661,7 @@ async fn a_writer_device_under_the_owners_name_but_of_another_person_cannot_carr
         for p in [&grant, &epoch] {
             assert!(
                 !r.store
-                    .contains(&structural_key(&space(), &p.dev.name, p.seq))
+                    .contains(&Kind::STRUCTURAL.seq(&space(), &p.dev.name, p.seq))
             );
         }
     };
@@ -2066,7 +2069,7 @@ async fn an_entry_that_does_not_decode_keeps_the_link_it_states() {
     });
     let p = sign_raw(&bob(), 5, &content.finish());
     assert_eq!(r.admit(&p).outcome, Outcome::Unreadable);
-    let marker = Marker::decode(&r.store.get(&verified_key(&p.name())).unwrap()).unwrap();
+    let marker = Marker::decode(&r.store.get(&Kind::VERIFIED.of(&p.name())).unwrap()).unwrap();
     assert_eq!((marker.prev, marker.prev_seq), ([7; 32], 3));
 }
 

@@ -170,10 +170,10 @@ fn a_corrupt_record_is_an_error_naming_its_key_never_an_absent_one() {
     let store = MemoryStore::new();
     assert_eq!(read_reserve(&store, &space()), Ok(None));
     assert_eq!(read_head(&store, &space()), Ok(None));
-    store.insert(reserve_key(&space()), Bytes::from_static(&[1, 2, 3]));
-    store.insert(head_key(&space()), Bytes::from_static(&[1, 2, 3]));
+    store.insert(Kind::RESERVE.of(&space()), Bytes::from_static(&[1, 2, 3]));
+    store.insert(Kind::HEAD.of(&space()), Bytes::from_static(&[1, 2, 3]));
     let err = read_reserve(&store, &space()).unwrap_err();
-    assert_eq!(err.key, reserve_key(&space()));
+    assert_eq!(err.key, Kind::RESERVE.of(&space()));
     assert!(
         err.to_string().contains("reserve"),
         "the refusal says which record: {err}"
@@ -193,26 +193,28 @@ fn keys_live_under_the_local_prefix_and_never_confuse_a_space_with_one_that_exte
     let entry = log_name(&device(), &s, 4);
     let local = n("/localhost/ndn-heap");
     for key in [
-        verified_key(&entry),
-        head_key(&s),
-        reserve_key(&s),
-        space_key(&s),
-        structural_key(&s, &device(), 1),
+        Kind::VERIFIED.of(&entry),
+        Kind::HEAD.of(&s),
+        Kind::RESERVE.of(&s),
+        Kind::SPACE.of(&s),
+        Kind::STRUCTURAL.seq(&s, &device(), 1),
         heads_key(&s, b"path"),
         supers_key(&s, &device(), 1, &[0; 32]),
-        epoch_key(&s, &device(), 1),
-        equivocal_key(&entry),
-        suspected_key(&n("/alice/laptop/KEY/1")),
-        scoped_key(&n("/alice")),
+        Kind::EPOCH.seq(&s, &device(), 1),
+        Kind::EQUIVOCAL.of(&entry),
+        Kind::SUSPECTED.of(&n("/alice/laptop/KEY/1")),
+        Kind::SCOPED.of(&n("/alice")),
+        Kind::STATUS.seq(&s, &device(), 1),
+        Kind::LEDGER.device(&s, &device()),
     ] {
         assert!(key.has_prefix(&local), "{key} is not under {local}");
     }
     let mut kinds: Vec<Name> = [
-        verified_key(&entry),
-        head_key(&s),
-        reserve_key(&s),
-        space_key(&s),
-        equivocal_key(&entry),
+        Kind::VERIFIED.of(&entry),
+        Kind::HEAD.of(&s),
+        Kind::RESERVE.of(&s),
+        Kind::SPACE.of(&s),
+        Kind::EQUIVOCAL.of(&entry),
     ]
     .into();
     kinds.sort();
@@ -221,28 +223,57 @@ fn keys_live_under_the_local_prefix_and_never_confuse_a_space_with_one_that_exte
 
     // A space is a prefix of the spaces that extend it: what a scan of one
     // space's keys must never return from another's.
-    let mine = structural_prefix(&s);
-    assert!(structural_key(&s, &device(), 5).has_prefix(&mine));
-    assert!(!structural_key(&deeper, &device(), 5).has_prefix(&mine));
-    assert!(!heads_key(&deeper, b"path").has_prefix(&heads_prefix(&s)));
-    assert!(!epoch_key(&deeper, &device(), 5).has_prefix(&epoch_prefix(&s)));
+    let mine = Kind::STRUCTURAL.listing(&s);
+    assert!(Kind::STRUCTURAL.seq(&s, &device(), 5).has_prefix(&mine));
+    assert!(
+        !Kind::STRUCTURAL
+            .seq(&deeper, &device(), 5)
+            .has_prefix(&mine)
+    );
+    assert!(!heads_key(&deeper, b"path").has_prefix(&Kind::HEADS.listing(&s)));
+    assert!(
+        !Kind::EPOCH
+            .seq(&deeper, &device(), 5)
+            .has_prefix(&Kind::EPOCH.listing(&s))
+    );
 
     // The seq orders numerically, and the key parses back.
     let keys: Vec<Name> = [1, 2, 255, 256, 70_000]
         .into_iter()
-        .map(|seq| structural_key(&s, &device(), seq))
+        .map(|seq| Kind::STRUCTURAL.seq(&s, &device(), seq))
         .collect();
     assert!(keys.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
     assert_eq!(
-        parse_structural_key(&s, &keys[3]),
+        Kind::STRUCTURAL.parse_seq(&s, &keys[3]),
         Some((device(), 256)),
         "start replays the structural entries by what the key says"
     );
-    assert_eq!(parse_structural_key(&deeper, &keys[3]), None);
-    assert_eq!(parse_structural_key(&s, &head_key(&s)), None);
+    assert_eq!(Kind::STRUCTURAL.parse_seq(&deeper, &keys[3]), None);
+    assert_eq!(Kind::STRUCTURAL.parse_seq(&s, &Kind::HEAD.of(&s)), None);
+    assert_eq!(Kind::STRUCTURAL.parse_device(&s, &keys[3]), None);
+    let ledger = Kind::LEDGER.device(&s, &device());
+    assert_eq!(Kind::LEDGER.parse_device(&s, &ledger), Some(device()));
+    assert_eq!(Kind::LEDGER.parse_seq(&s, &ledger), None);
 
     assert_ne!(heads_key(&s, b"a"), heads_key(&s, b"b"));
     assert_eq!(heads_key(&s, b"a"), heads_key(&s, b"a"));
+}
+
+#[test]
+fn a_kind_lists_its_names_with_their_values_and_no_other_kinds() {
+    let store = MemoryStore::new();
+    let other = n("/bob/32=data/x");
+    store.insert(Kind::SPACE.of(&space()), bytes("1"));
+    store.insert(Kind::SPACE.of(&other), bytes("2"));
+    store.insert(Kind::HEAD.of(&space()), bytes("3"));
+    let listed: std::collections::BTreeMap<Name, Bytes> =
+        Kind::SPACE.named(&store).into_iter().collect();
+    assert_eq!(
+        listed,
+        [(space(), bytes("1")), (other, bytes("2"))]
+            .into_iter()
+            .collect()
+    );
 }
 
 /// A marker at `seq` of `device` in the space: its digest is `[seq; 32]`,
@@ -250,7 +281,7 @@ fn keys_live_under_the_local_prefix_and_never_confuse_a_space_with_one_that_exte
 fn mark(store: &dyn DataStore, seq: u64, prev_seq: u64) {
     let digest = |s: u64| if s == 0 { [0; 32] } else { [s as u8; 32] };
     store.insert(
-        verified_key(&log_name(&device(), &space(), seq)),
+        Kind::VERIFIED.of(&log_name(&device(), &space(), seq)),
         Marker {
             signed_digest: digest(seq),
             key_digest: [7; 32],
@@ -326,7 +357,7 @@ fn a_chain_walk_names_the_missing_link_the_diverging_one_and_the_corrupt_one() {
 
     // A marker that does not decode is a corrupt link, not a missing one.
     store.insert(
-        verified_key(&log_name(&device(), &space(), 9)),
+        Kind::VERIFIED.of(&log_name(&device(), &space(), 9)),
         Bytes::from_static(&[0; 5]),
     );
     let walk = walk_chain(&store, &device(), &space(), tip(9));

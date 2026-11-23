@@ -788,7 +788,7 @@ async fn a_value_whose_piece_the_store_lost_is_unavailable_and_gathered_again() 
         50_000
     );
     let entry = log_name(&id.device, &space(), id.seq);
-    let marker = crate::store::assembled_key(&entry);
+    let marker = crate::store::Kind::ASSEMBLED.of(&entry);
     assert!(
         dev.store.contains(&marker),
         "the writer records its value whole"

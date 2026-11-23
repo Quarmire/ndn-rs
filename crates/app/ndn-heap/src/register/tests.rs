@@ -14,7 +14,7 @@ use proptest::prelude::*;
 use sha2::{Digest, Sha256};
 
 use super::*;
-use crate::store::{heads_prefix, supers_key};
+use crate::store::{Kind, supers_key};
 use crate::test_kit::n;
 
 /// An entry as the log hands it over.
@@ -143,7 +143,7 @@ impl Replica {
 
     /// Every path's heads, as the store's `heads/` records say.
     fn persisted(&self) -> BTreeMap<Name, BTreeSet<EntryRef>> {
-        let prefix = heads_prefix(&space());
+        let prefix = Kind::HEADS.listing(&space());
         let records = self
             .store
             .iter()
@@ -406,7 +406,7 @@ fn withdrawing_a_head_restores_the_entry_it_superseded() {
     assert!(
         s.store
             .keys()
-            .all(|k| !k.has_prefix(&heads_prefix(&space())))
+            .all(|k| !k.has_prefix(&Kind::HEADS.listing(&space())))
     );
 }
 
@@ -475,7 +475,7 @@ fn an_after_ref_with_a_wrong_digest_hides_nobody() {
         assert!(
             r.store
                 .keys()
-                .all(|k| k.has_prefix(&heads_prefix(&space()))),
+                .all(|k| k.has_prefix(&Kind::HEADS.listing(&space()))),
             "the refused namer's `supers/` record is gone"
         );
     }
@@ -537,7 +537,7 @@ fn memory_is_o_heads_not_o_entries() {
     assert_eq!(
         r.store
             .keys()
-            .filter(|k| k.has_prefix(&heads_prefix(&space())))
+            .filter(|k| k.has_prefix(&Kind::HEADS.listing(&space())))
             .count(),
         1,
         "one record per path"
@@ -603,7 +603,7 @@ fn a_persisted_head_whose_entry_is_gone_is_reported_not_dropped_silently() {
     let a = ent(1, 1, 1, 5, "/f", "a", &[]);
     let mut r = Replica::new();
     r.take(&a);
-    let prefix = heads_prefix(&space());
+    let prefix = Kind::HEADS.listing(&space());
     let records: Vec<_> = r
         .store
         .iter()

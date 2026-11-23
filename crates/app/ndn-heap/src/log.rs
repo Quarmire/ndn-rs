@@ -85,10 +85,7 @@ use crate::register::{EntryId, Item, Register};
 use crate::reserve::{Flusher, Gate, Reservation, Ticket};
 use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
-use crate::store::{
-    self, Batch, Corrupt, Link, Marker, epoch_prefix, heads_prefix, ledger_key, ledger_prefix,
-    parse_epoch_key, parse_ledger_key, parse_structural_key, status_prefix, structural_prefix,
-};
+use crate::store::{self, Batch, Corrupt, Kind, Link, Marker};
 use crate::trust::Verified;
 use crate::wire::{
     self, Body, Entry, EntryRef, EpochId, Payload, PutBody, log_name, parse_space_name,
@@ -479,8 +476,8 @@ impl Log {
     /// The seen-so-far of every device from `ledger/`: one record each; no
     /// marker but the one at each device's highest seq.
     fn restore_devices(&mut self) {
-        for (key, record) in self.store.scan_under(&ledger_prefix(&self.space), 0) {
-            let Some(device) = parse_ledger_key(&self.space, &key) else {
+        for (key, record) in self.store.scan_under(&Kind::LEDGER.listing(&self.space), 0) {
+            let Some(device) = Kind::LEDGER.parse_device(&self.space, &key) else {
                 continue;
             };
             let Some(mut dev) = Dev::from_record(&record) else {
@@ -496,10 +493,10 @@ impl Log {
             self.devices.insert(device, dev);
         }
         let (mut closed, mut counted) = (0, Vec::new());
-        for (key, value) in self.store.scan_under(&status_prefix(&self.space), 0) {
+        for (key, value) in self.store.scan_under(&Kind::STATUS.listing(&self.space), 0) {
             match value.first() {
                 Some(1) => closed += 1,
-                Some(_) => counted.extend(store::parse_status_key(&self.space, &key)),
+                Some(_) => counted.extend(Kind::STATUS.parse_seq(&self.space, &key)),
                 None => {}
             }
         }
@@ -513,8 +510,11 @@ impl Log {
 
     /// The Members and Epoch entries applied, from `structural/`.
     fn replay_structural(&mut self) {
-        for (key, _) in self.store.scan_under(&structural_prefix(&self.space), 0) {
-            let Some((device, seq)) = parse_structural_key(&self.space, &key) else {
+        for (key, _) in self
+            .store
+            .scan_under(&Kind::STRUCTURAL.listing(&self.space), 0)
+        {
+            let Some((device, seq)) = Kind::STRUCTURAL.parse_seq(&self.space, &key) else {
                 continue;
             };
             for wire in self.view().wires_at(&device, seq) {
@@ -546,8 +546,8 @@ impl Log {
     /// The epoch keys this device holds, from `epoch/` (each checked against
     /// the Epoch entry naming it).
     fn restore_keys(&mut self) {
-        for (key, stored) in self.store.scan_under(&epoch_prefix(&self.space), 0) {
-            let Some((creator, seq)) = parse_epoch_key(&self.space, &key) else {
+        for (key, stored) in self.store.scan_under(&Kind::EPOCH.listing(&self.space), 0) {
+            let Some((creator, seq)) = Kind::EPOCH.parse_seq(&self.space, &key) else {
                 continue;
             };
             let epoch = EpochId { creator, seq };
@@ -561,7 +561,7 @@ impl Log {
     }
 
     fn restore_register(&mut self) -> Result<(), HeapError> {
-        let records = self.store.scan_under(&heads_prefix(&self.space), 0);
+        let records = self.store.scan_under(&Kind::HEADS.listing(&self.space), 0);
         let view = View::of(self);
         let restored = Register::restore(self.space.clone(), records, &|r| view.write_of(r))
             .map_err(|e| HeapError::Local {
@@ -581,7 +581,7 @@ impl Log {
     /// entry and piece. A record that cannot be read is an error: a device
     /// that cannot tell what it signed could sign a seq a peer saw again.
     fn stored_head(store: &dyn DataStore, space: &Name, device: &Name) -> Result<u64, HeapError> {
-        let key = ledger_key(space, device);
+        let key = Kind::LEDGER.device(space, device);
         let Some(record) = store.get(&key) else {
             return Ok(0);
         };

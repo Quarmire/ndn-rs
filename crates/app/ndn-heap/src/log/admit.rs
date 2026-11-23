@@ -222,7 +222,7 @@ impl Log {
         };
         let outcome = self.take(arrival, fx);
         if let Some(old) = displaced {
-            self.store.insert(store::equivocal_key(&name), old);
+            self.store.insert(Kind::EQUIVOCAL.of(&name), old);
             self.equivocated(&id, id.seq, v, now, fx);
         }
         outcome
@@ -294,7 +294,7 @@ impl Log {
         fx: &mut Effects,
     ) -> Outcome {
         let name = id.name(&self.space);
-        let at = store::equivocal_key(&name);
+        let at = Kind::EQUIVOCAL.of(&name);
         if let Some(held) = self.store.get(&at) {
             return if signed_digest(&held) == id.digest {
                 Outcome::Duplicate
@@ -465,13 +465,11 @@ impl Log {
     fn adopt_own(&mut self, link: Link) {
         if self.own_tip.is_none_or(|t| t.seq < link.seq) {
             self.own_tip = Some(link);
-            self.store.apply(vec![store::head_op(
-                &self.space,
-                store::Head {
-                    seq: link.seq,
-                    digest: link.digest,
-                },
-            )]);
+            let head = store::Head {
+                seq: link.seq,
+                digest: link.digest,
+            };
+            self.store.insert(Kind::HEAD.of(&self.space), head.encode());
         }
         if self
             .devices
@@ -578,16 +576,14 @@ impl Log {
         let name = f.id.name(&self.space);
         self.store.insert(name.clone(), f.wire.clone());
         let (prev, prev_seq) = f.link.unwrap_or(([0; 32], 0));
-        self.store.apply(vec![store::verified_op(
-            &name,
-            &Marker {
-                signed_digest: f.id.digest,
-                key_digest: f.key_digest,
-                prev,
-                prev_seq,
-                at: now,
-            },
-        )]);
+        let marker = Marker {
+            signed_digest: f.id.digest,
+            key_digest: f.key_digest,
+            prev,
+            prev_seq,
+            at: now,
+        };
+        self.store.insert(Kind::VERIFIED.of(&name), marker.encode());
         let dev = self
             .devices
             .entry(device.clone())
@@ -638,7 +634,7 @@ impl Log {
     pub(super) fn write_ledger(&self, device: &Name) {
         if let Some(dev) = self.devices.get(device) {
             self.store
-                .insert(store::ledger_key(&self.space, device), dev.record());
+                .insert(Kind::LEDGER.device(&self.space, device), dev.record());
         }
     }
 
@@ -659,7 +655,7 @@ impl Log {
             return;
         }
         let name = log_name(device, &self.space, seq);
-        let equivocal = self.store.get(&store::equivocal_key(&name)).is_some();
+        let equivocal = self.store.get(&Kind::EQUIVOCAL.of(&name)).is_some();
         let Some(dev) = self.devices.get_mut(device) else {
             return;
         };
@@ -690,7 +686,7 @@ impl Log {
             dev.nonvouching =
                 (dev.nonvouching + u64::from(counts(new))).saturating_sub(u64::from(counts(old)));
         }
-        let key = store::status_key(&self.space, device, seq);
+        let key = Kind::STATUS.seq(&self.space, device, seq);
         match new {
             Some(status) => self
                 .store
@@ -757,7 +753,7 @@ impl Log {
 
     fn mark_structural(&self, id: &EntryRef) {
         self.store.insert(
-            store::structural_key(&self.space, &id.device, id.seq),
+            Kind::STRUCTURAL.seq(&self.space, &id.device, id.seq),
             Bytes::new(),
         );
     }
@@ -805,7 +801,7 @@ impl Log {
 
     fn unmark_structural(&self, id: &EntryRef) {
         self.store
-            .remove(&store::structural_key(&self.space, &id.device, id.seq));
+            .remove(&Kind::STRUCTURAL.seq(&self.space, &id.device, id.seq));
     }
 
     fn withdrawn_why(&self, status: &Status, device: &Name) -> Refusal {
@@ -943,10 +939,10 @@ impl Log {
                 .map(|(n, d)| (n.clone(), d.held.clone()))
                 .collect()
         };
-        let by_status = |prefix: Name, code: u8, only: Option<&Name>| {
+        let by_status = |code: u8, only: Option<&Name>| {
             let mut found: std::collections::BTreeMap<Name, Ranges> = Default::default();
-            for (key, value) in self.store.scan_under(&prefix, 0) {
-                let Some((device, seq)) = store::parse_status_key(&self.space, &key) else {
+            for (key, value) in self.store.scan_under(&Kind::STATUS.listing(&self.space), 0) {
+                let Some((device, seq)) = Kind::STATUS.parse_seq(&self.space, &key) else {
                     continue;
                 };
                 if value.first() == Some(&code) && only.is_none_or(|o| *o == device) {
@@ -958,8 +954,8 @@ impl Log {
         match scope {
             Scope::Persons(persons) => held(&|d| persons.contains(&d.person)),
             Scope::All => held(&|_| true),
-            Scope::Closed => by_status(status_prefix(&self.space), 1, None),
-            Scope::Waiting(device) => by_status(status_prefix(&self.space), 2, Some(device)),
+            Scope::Closed => by_status(1, None),
+            Scope::Waiting(device) => by_status(2, Some(device)),
         }
     }
 
