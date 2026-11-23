@@ -1061,15 +1061,14 @@ impl Host for NodeInner {
             if self.stopped.load(Ordering::SeqCst) {
                 return Taken::Pending(crate::trust::Waiting::Chain);
             }
-            let admitted = if probe {
+            let (outcome, fx) = if probe {
                 log.admit_probed(&wire, &data, &verified, self.now())
             } else {
                 log.admit(&wire, &data, &verified, self.now())
             };
-            let wrote = !matches!(admitted.outcome, Outcome::Duplicate);
-            let blobs = admitted.effects.blobs.clone();
-            let routed = held.route(self, &log, admitted.effects, wrote);
-            (admitted.outcome, blobs, routed)
+            let wrote = !matches!(outcome, Outcome::Duplicate);
+            let blobs = fx.blobs.clone();
+            (outcome, blobs, held.route(self, &log, fx, wrote))
         };
         tracing::trace!(target: crate::sync::TIMELINE, "admitted");
         held.finish(&self.arc(), routed);

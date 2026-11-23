@@ -141,7 +141,7 @@ impl Log {
         data: &Data,
         verified: &Verified,
         now: u64,
-    ) -> Admitted {
+    ) -> (Outcome, Effects) {
         self.admit_as(wire, data, verified, now, false)
     }
 
@@ -156,7 +156,7 @@ impl Log {
         data: &Data,
         verified: &Verified,
         now: u64,
-    ) -> Admitted {
+    ) -> (Outcome, Effects) {
         self.admit_as(wire, data, verified, now, true)
     }
 
@@ -167,16 +167,13 @@ impl Log {
         verified: &Verified,
         now: u64,
         probe: bool,
-    ) -> Admitted {
+    ) -> (Outcome, Effects) {
         let stage = Arc::clone(&self.store);
         let _batch = stage.batch();
         let mut fx = Effects::default();
         let outcome = self.admit_in(wire, data, verified, now, &mut fx, probe);
         self.settle(&mut fx);
-        Admitted {
-            outcome,
-            effects: fx,
-        }
+        (outcome, fx)
     }
 
     fn admit_in(

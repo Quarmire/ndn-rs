@@ -28,7 +28,8 @@ use zeroize::ZeroizeOnDrop;
 
 use super::*;
 use crate::error::NextStep;
-use crate::log::{Outcome, Params, Signed, Step};
+use crate::log::{Outcome, Params, Step};
+use crate::register::EntryId;
 use crate::reserve::Flusher;
 use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
@@ -252,38 +253,39 @@ fn members(create: Option<bool>, ops: Vec<Op>) -> MembersBody {
     MembersBody { create, ops }
 }
 
+/// An own entry a seat signed.
+struct Signed {
+    id: EntryId,
+}
+
 impl Seat {
-    /// The owner signs a Members entry, waiting for the reservation's flush as
+    /// An own write of the seat's log, waiting for the reservation's flush as
     /// the node does.
-    async fn members(&self, body: MembersBody) -> Signed {
+    async fn signed(&self, mut write: impl FnMut(&mut Log) -> Result<Step, HeapError>) -> Signed {
         loop {
-            let step = self.log.lock().sign_members(body.clone(), NOW).unwrap();
+            let step = write(&mut self.log.lock()).unwrap();
             match step {
-                Step::Done(signed) => return signed,
+                Step::Done(id, _) => return Signed { id },
                 Step::Wait(ticket) => self.flusher.wait_durable(ticket).await.unwrap(),
             }
         }
     }
 
+    /// The owner signs a Members entry.
+    async fn members(&self, body: MembersBody) -> Signed {
+        self.signed(|log| log.sign_members(body.clone(), NOW)).await
+    }
+
     /// The owner signs an Epoch entry for `audience`.
     async fn epoch(&self, audience: &[&str]) -> (Signed, EpochId) {
-        loop {
-            let step = self
-                .log
-                .lock()
-                .sign_epoch(audience.iter().map(|p| n(p)).collect(), NOW)
-                .unwrap();
-            match step {
-                Step::Done(signed) => {
-                    let epoch = EpochId {
-                        creator: self.dev.name.clone(),
-                        seq: signed.id.seq,
-                    };
-                    return (signed, epoch);
-                }
-                Step::Wait(ticket) => self.flusher.wait_durable(ticket).await.unwrap(),
-            }
-        }
+        let signed = self
+            .signed(|log| log.sign_epoch(audience.iter().map(|p| n(p)).collect(), NOW))
+            .await;
+        let epoch = EpochId {
+            creator: self.dev.name.clone(),
+            seq: signed.id.seq,
+        };
+        (signed, epoch)
     }
 
     /// Hand `to` the entry this seat signed, as if fetched and judged.
@@ -298,8 +300,8 @@ impl Seat {
             .get(&log_name(&self.dev.name, &space(), seq))
             .expect("signed and stored");
         let data = Data::decode(wire.clone()).unwrap();
-        let got = to.log.lock().admit(&wire, &data, &self.dev.verified(), NOW);
-        assert_eq!(got.outcome, Outcome::Applied, "{:?}", got.effects.alerts);
+        let (outcome, fx) = to.log.lock().admit(&wire, &data, &self.dev.verified(), NOW);
+        assert_eq!(outcome, Outcome::Applied, "{:?}", fx.alerts);
     }
 
     fn scope(&self) -> Result<SignalScope, HeapError> {

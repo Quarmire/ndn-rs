@@ -205,33 +205,17 @@ pub(crate) enum Outcome {
     Refused(Refusal),
 }
 
-/// [`Log::admit`]'s answer.
+/// What an own write ([`Log::put`], [`Log::sign_members`],
+/// [`Log::sign_epoch`]) came to.
 #[derive(Debug)]
-pub(crate) struct Admitted {
-    /// What became of the entry.
-    pub outcome: Outcome,
-    /// What follows from it.
-    pub effects: Effects,
-}
-
-/// The step an own write is at.
-#[derive(Debug)]
-pub(crate) enum Step<T> {
-    /// Done.
-    Done(T),
+pub(crate) enum Step {
+    /// An own entry signed, stored and applied; what follows from it
+    /// (`publish` is set).
+    Done(EntryId, Effects),
     /// The reservation covering the seq is written and not yet durable: wait
     /// for the ticket outside the lock (`Flusher::wait_durable`), then call
     /// again.
     Wait(Ticket),
-}
-
-/// An own entry signed, stored and applied.
-#[derive(Debug)]
-pub(crate) struct Signed {
-    /// The entry.
-    pub id: EntryId,
-    /// What follows from it (`publish` is set).
-    pub effects: Effects,
 }
 
 /// A change of a space, as `watch` yields it.

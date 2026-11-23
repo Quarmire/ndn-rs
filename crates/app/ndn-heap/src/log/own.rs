@@ -29,7 +29,7 @@ impl Log {
         payload: Payload,
         extra: Vec<StoreOp>,
         now: u64,
-    ) -> Result<Step<Signed>, HeapError> {
+    ) -> Result<Step, HeapError> {
         let epoch = self.judge_own()?;
         if let Some(ticket) = self.gate()? {
             return Ok(Step::Wait(ticket));
@@ -60,11 +60,7 @@ impl Log {
 
     /// Sign a Members entry (the space's creation, additions, removals). Only
     /// a device of the owner's namespace may.
-    pub(crate) fn sign_members(
-        &mut self,
-        body: MembersBody,
-        now: u64,
-    ) -> Result<Step<Signed>, HeapError> {
+    pub(crate) fn sign_members(&mut self, body: MembersBody, now: u64) -> Result<Step, HeapError> {
         self.owner_only()?;
         if let Some(ticket) = self.gate()? {
             return Ok(Step::Wait(ticket));
@@ -82,11 +78,7 @@ impl Log {
     /// Sign an Epoch entry for `audience`: a fresh key, stored (wrapped to
     /// this device's seal key) in the batch of the entry that carries its
     /// check. Only a device of the owner's namespace may.
-    pub(crate) fn sign_epoch(
-        &mut self,
-        audience: Vec<Name>,
-        now: u64,
-    ) -> Result<Step<Signed>, HeapError> {
+    pub(crate) fn sign_epoch(&mut self, audience: Vec<Name>, now: u64) -> Result<Step, HeapError> {
         self.owner_only()?;
         if let Some(ticket) = self.gate()? {
             return Ok(Step::Wait(ticket));
@@ -251,7 +243,7 @@ impl Log {
         extra: Vec<StoreOp>,
         now: u64,
         subject: &Name,
-    ) -> Result<Step<Signed>, HeapError> {
+    ) -> Result<Step, HeapError> {
         let seq = self.next_seq;
         let entry = Entry {
             prev: self.own_prev(seq),
@@ -312,10 +304,7 @@ impl Log {
         self.next_seq = seq.saturating_add(1);
         fx.publish = Some(Publish { seq, structural });
         self.settle(&mut fx);
-        Ok(Step::Done(Signed {
-            id: EntryId::from(&id),
-            effects: fx,
-        }))
+        Ok(Step::Done(EntryId::from(&id), fx))
     }
 
     /// What a removal of `person` binds: per device of the person this device

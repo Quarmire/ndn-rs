@@ -878,11 +878,11 @@ async fn an_interest_during_signing_cannot_get_a_structural_entry_before_its_flu
     };
     let (asked, routed, seq) = {
         let mut log = inner.log.lock();
-        let signed = match log.sign_members(body, node.inner.now()).unwrap() {
-            crate::log::Step::Done(signed) => signed,
-            crate::log::Step::Wait(_) => panic!("the reservation covers the next seq"),
+        let crate::log::Step::Done(id, fx) = log.sign_members(body, node.inner.now()).unwrap()
+        else {
+            panic!("the reservation covers the next seq");
         };
-        let seq = signed.id.seq;
+        let seq = id.seq;
         let (asking, device) = (Arc::clone(&node.inner), dev.name.clone());
         let (began_tx, began_rx) = std::sync::mpsc::channel();
         let asker = std::thread::spawn(move || {
@@ -892,7 +892,7 @@ async fn an_interest_during_signing_cannot_get_a_structural_entry_before_its_flu
         began_rx.recv().unwrap();
         // Give the asker the time to take what it can before the lock.
         std::thread::sleep(Duration::from_millis(200));
-        let routed = inner.route(&node.inner, &log, signed.effects, true);
+        let routed = inner.route(&node.inner, &log, fx, true);
         (asker, routed, seq)
     };
     inner.finish(&node.inner, routed);

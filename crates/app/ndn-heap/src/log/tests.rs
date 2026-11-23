@@ -253,10 +253,23 @@ fn rig(me: &Dev) -> Rig {
     open_on(&Arc::new(CrashStore::new()), me)
 }
 
+/// What a test sees of one entry offered to the log.
+struct Admitted {
+    outcome: Outcome,
+    effects: Effects,
+}
+
+/// What a test sees of one own entry signed.
+struct Signed {
+    id: EntryId,
+    effects: Effects,
+}
+
 impl Rig {
     fn admit(&mut self, p: &Packet) -> Admitted {
         let data = Data::decode(p.wire.clone()).unwrap();
-        self.log.admit(&p.wire, &data, &verified(&p.dev), NOW)
+        let (outcome, effects) = self.log.admit(&p.wire, &data, &verified(&p.dev), NOW);
+        Admitted { outcome, effects }
     }
 
     fn applied(&mut self, p: &Packet) -> Admitted {
@@ -265,32 +278,27 @@ impl Rig {
         a
     }
 
-    /// Own put, waiting for the reservation's flush as the node does.
-    async fn put(&mut self, path: &str, bytes: &str) -> Signed {
+    /// An own write, waiting for the reservation's flush as the node does.
+    async fn signed(
+        &mut self,
+        mut write: impl FnMut(&mut Log) -> Result<Step, HeapError>,
+    ) -> Signed {
         loop {
-            let step = self
-                .log
-                .put(
-                    &n(path),
-                    Payload::Inline(Bytes::from(bytes.to_owned())),
-                    vec![],
-                    NOW,
-                )
-                .unwrap();
-            match step {
-                Step::Done(signed) => return signed,
+            match write(&mut self.log).unwrap() {
+                Step::Done(id, effects) => return Signed { id, effects },
                 Step::Wait(ticket) => self.flusher.wait_durable(ticket).await.unwrap(),
             }
         }
     }
 
+    async fn put(&mut self, path: &str, bytes: &str) -> Signed {
+        let payload = Payload::Inline(Bytes::from(bytes.to_owned()));
+        self.signed(|log| log.put(&n(path), payload.clone(), vec![], NOW))
+            .await
+    }
+
     async fn members(&mut self, body: MembersBody) -> Signed {
-        loop {
-            match self.log.sign_members(body.clone(), NOW).unwrap() {
-                Step::Done(signed) => return signed,
-                Step::Wait(ticket) => self.flusher.wait_durable(ticket).await.unwrap(),
-            }
-        }
+        self.signed(|log| log.sign_members(body.clone(), NOW)).await
     }
 
     fn value(&self, path: &str) -> Option<String> {
@@ -873,12 +881,7 @@ async fn an_epoch_key_is_stored_in_the_batch_of_its_entry() {
     let me = laptop();
     let mut r = rig(&me);
     r.members(members(Some(false), vec![])).await;
-    let s = loop {
-        match r.log.sign_epoch(vec![n("/alice")], NOW).unwrap() {
-            Step::Done(s) => break s,
-            Step::Wait(t) => r.flusher.wait_durable(t).await.unwrap(),
-        }
-    };
+    let s = r.signed(|log| log.sign_epoch(vec![n("/alice")], NOW)).await;
     let epoch = EpochId {
         creator: me.name.clone(),
         seq: s.id.seq,
@@ -1203,10 +1206,9 @@ async fn a_strangers_refused_entries_are_stored_once_and_alert_once() {
     let mut alerts = 0;
     for p in &packets[2..] {
         let data = Data::decode(p.wire.clone()).unwrap();
-        let a = r.log.admit_probed(&p.wire, &data, &verified(&p.dev), NOW);
-        assert_eq!(a.outcome, Outcome::Refused(Refusal::NotMember));
-        alerts += a
-            .effects
+        let (outcome, fx) = r.log.admit_probed(&p.wire, &data, &verified(&p.dev), NOW);
+        assert_eq!(outcome, Outcome::Refused(Refusal::NotMember));
+        alerts += fx
             .alerts
             .iter()
             .filter(|al| matches!(al, Alert::Refused { .. }))

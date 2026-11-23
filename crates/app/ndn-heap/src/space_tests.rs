@@ -279,7 +279,7 @@ async fn a_writer_never_seals_in_an_outgrown_epoch() {
         let step = log
             .sign_members(crate::wire::MembersBody { create: None, ops }, 0)
             .unwrap();
-        assert!(matches!(step, crate::log::Step::Done(_)));
+        assert!(matches!(step, crate::log::Step::Done(..)));
     }
     let refused = heap
         .put(&n("/a"), bytes("two"), PutOptions::default())

@@ -36,7 +36,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{HeapError, Refusal};
 use crate::fold::Readers;
-use crate::log::{Alert, Blob, Change, Effects, Frontier, Log, Members, Signed, Step};
+use crate::log::{Alert, Blob, Change, Effects, Frontier, Log, Members, Step};
 use crate::node::NodeInner;
 use crate::pieces;
 use crate::register::{EntryId, Item};
@@ -293,7 +293,7 @@ const HEADS_PER_READ: usize = 256;
 const REFUSED_MAX: usize = 256;
 
 /// A signing step run under the lock: `None` when there is nothing to sign.
-type Sign<'a> = &'a mut (dyn FnMut(&mut Log) -> Result<Option<Step<Signed>>, HeapError> + Send);
+type Sign<'a> = &'a mut (dyn FnMut(&mut Log) -> Result<Option<Step>, HeapError> + Send);
 
 /// A sealed space lists at most [`AUDIENCE_MAX`] readers, the owner among
 /// them: an epoch names them all. Checked before anything is signed.
@@ -477,9 +477,8 @@ impl SpaceInner {
                 self.own_key_refusal(node, &log)?;
                 match step(&mut log)? {
                     None => return Ok(None),
-                    Some(Step::Done(signed)) => {
-                        let id = signed.id.clone();
-                        let routed = self.route(node, &log, signed.effects, true);
+                    Some(Step::Done(id, fx)) => {
+                        let routed = self.route(node, &log, fx, true);
                         drop(log);
                         let ticket = routed.ticket.expect("a signed entry was written");
                         self.finish(node, routed);
@@ -496,7 +495,7 @@ impl SpaceInner {
     pub(crate) async fn sign_with(
         self: &Arc<Self>,
         node: &Arc<NodeInner>,
-        mut step: impl FnMut(&mut Log) -> Result<Step<Signed>, HeapError> + Send,
+        mut step: impl FnMut(&mut Log) -> Result<Step, HeapError> + Send,
     ) -> Result<(EntryId, Ticket), HeapError> {
         let signed = self
             .attempt(node, &mut |log| step(log).map(Some))
@@ -576,7 +575,7 @@ impl SpaceInner {
             };
             let accounted = revocations_digest(&self.reader_revocations(node, log));
             let step = log.sign_epoch(audience, now)?;
-            if matches!(step, Step::Done(_)) {
+            if matches!(step, Step::Done(..)) {
                 node.stage.insert(
                     store::revoked_key(&self.name),
                     Bytes::copy_from_slice(&accounted),
