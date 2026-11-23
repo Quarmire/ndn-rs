@@ -267,8 +267,6 @@ pub(crate) struct SpaceInner {
     /// A carrier signs nothing and keeps no read key.
     pub(crate) follower: bool,
     pub(crate) closing: AtomicBool,
-    /// Own structural entries not yet covered by a flush: not served.
-    held_back: Mutex<Vec<(u64, Ticket)>>,
     /// Entries of this space whose value is in hand here: inline, or in
     /// pieces that are whole. What [`Self::unassembled`] need not read again.
     whole: Mutex<HashSet<EntryId>>,
@@ -349,7 +347,6 @@ impl SpaceInner {
             watchers: Mutex::new(Vec::new()),
             follower,
             closing: AtomicBool::new(false),
-            held_back: Mutex::new(Vec::new()),
             whole: Mutex::new(HashSet::new()),
             scan: Mutex::new(()),
             standing: Mutex::new(Vec::new()),
@@ -371,15 +368,6 @@ impl SpaceInner {
         for q in self.watchers.lock().drain(..) {
             q.close();
         }
-    }
-
-    /// Whether the own entry at `seq` may be served now: a Members or Epoch
-    /// entry only once a flush covering it returned (spec §4).
-    pub(crate) fn servable(&self, node: &NodeInner, seq: u64) -> bool {
-        let durable = node.flusher.durable();
-        let mut held = self.held_back.lock();
-        held.retain(|(_, t)| *t > durable);
-        !held.iter().any(|(s, _)| *s == seq)
     }
 
     /// The persons the space lists, as the judge adopts them.
@@ -406,9 +394,6 @@ impl SpaceInner {
         if let Some(p) = fx.publish {
             node.signatures.fetch_add(1, Ordering::Relaxed);
             let gate = if p.structural { ticket } else { None };
-            if let Some(t) = gate {
-                self.held_back.lock().push((p.seq, t));
-            }
             self.publisher.submit(p.seq, gate);
         }
         for change in fx.changes {

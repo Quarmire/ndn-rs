@@ -1100,7 +1100,7 @@ impl Host for NodeInner {
         // call that stores it, still under that lock, so no Interest can find
         // it stored and not yet held back.
         let log = held.log.lock();
-        if *device == self.device && !held.servable(self, seq) {
+        if *device == self.device && !held.publisher.servable(seq) {
             return None;
         }
         log.served(device, seq)
@@ -1214,7 +1214,7 @@ impl Host for NodeInner {
             )?;
             // Under the lock: the entry is held back there, in the same stretch
             // that stores it, so no grant can slip in between.
-            if epoch.creator == self.device && !held.servable(self, epoch.seq) {
+            if epoch.creator == self.device && !held.publisher.servable(epoch.seq) {
                 return Err(GrantRefusal::EpochNotNamed);
             }
         }

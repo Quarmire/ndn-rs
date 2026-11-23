@@ -415,21 +415,60 @@ async fn a_stopped_flusher_wakes_its_waiters_with_an_error_not_a_hang() {
 
 // -- The in-order publisher ---------------------------------------------------
 
-#[test]
-fn in_order_releases_a_run_up_to_the_first_unflushed_structural_entry() {
-    let mut queue = InOrder::default();
-    queue.push(1, None);
-    queue.push(2, Some(Ticket(5)));
-    queue.push(3, None);
-    queue.push(4, Some(Ticket(7)));
-    queue.push(5, None);
-    assert_eq!(queue.release(Ticket(4)), vec![1]);
-    assert_eq!(queue.next_gate(), Some(Ticket(5)));
-    assert_eq!(queue.release(Ticket(4)), Vec::<u64>::new());
-    assert_eq!(queue.release(Ticket(5)), vec![2, 3]);
-    assert_eq!(queue.release(Ticket(9)), vec![4, 5]);
-    assert!(queue.is_empty());
-    assert_eq!(queue.next_gate(), None);
+/// A sink that notes with each seq the newest ticket a returned flush had
+/// covered when the seq was published.
+struct Stamped {
+    flusher: Arc<Flusher>,
+    seen: Mutex<Vec<(u64, Ticket)>>,
+}
+
+#[async_trait::async_trait]
+impl FlushSink for Stamped {
+    async fn publish(&self, seq: u64) {
+        self.seen.lock().push((seq, self.flusher.durable()));
+    }
+}
+
+#[tokio::test]
+async fn each_structural_entry_holds_everything_after_it_until_its_own_flush() {
+    let store = Arc::new(Held::default());
+    let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
+    let sink = Arc::new(Stamped {
+        flusher: Arc::clone(&flusher),
+        seen: Mutex::new(Vec::new()),
+    });
+    let publisher = Publisher::spawn(
+        Arc::clone(&flusher),
+        Arc::clone(&sink) as Arc<dyn FlushSink>,
+    );
+    let holding = store.hold();
+    publisher.submit(1, None);
+    store.insert(n("/members/a"), Bytes::from_static(b"a"));
+    let first = flusher.note_write();
+    publisher.submit(2, Some(first));
+    publisher.submit(3, None);
+    store.insert(n("/members/b"), Bytes::from_static(b"b"));
+    let second = flusher.note_write();
+    publisher.submit(4, Some(second));
+    publisher.submit(5, None);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(holding);
+    publisher.drain().await.unwrap();
+
+    let seen = sink.seen.lock().clone();
+    let seqs: Vec<u64> = seen.iter().map(|(seq, _)| *seq).collect();
+    assert_eq!(seqs, [1, 2, 3, 4, 5], "once each, in seq order");
+    for (seq, durable) in seen {
+        let gate = match seq {
+            2 | 3 => first,
+            4 | 5 => second,
+            _ => Ticket(0),
+        };
+        assert!(
+            durable >= gate,
+            "seq {seq} went out before the flush of the structural entry before it"
+        );
+    }
 }
 
 #[derive(Default)]
@@ -478,11 +517,17 @@ async fn a_structural_entry_is_released_only_after_a_flush_that_covers_it() {
         "a structural entry is not announced before a flush covering it returned, nor is \
          anything after it"
     );
+    assert!(
+        !publisher.servable(2),
+        "a structural entry is not served before its flush"
+    );
+    assert!(publisher.servable(1) && publisher.servable(3));
 
     drop(holding);
     publisher.drain().await.unwrap();
     assert_eq!(sink.seen(), [1, 2, 3], "once each, in seq order");
     assert!(flusher.durable() >= ticket);
+    assert!(publisher.servable(2), "and is served after it");
 }
 
 #[tokio::test]

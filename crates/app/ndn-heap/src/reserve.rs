@@ -27,7 +27,7 @@ use std::sync::{Arc, Weak};
 use ndn_foundation_types::Name;
 use ndn_sync::DataStore;
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 
 use crate::rt;
 use crate::store::{Corrupt, Kind, ReserveRecord, read_head, read_reserve};
@@ -501,66 +501,19 @@ pub(crate) trait FlushSink: Send + Sync {
     async fn publish(&self, seq: u64);
 }
 
-/// The publications waiting to go out, in seq order: pure state, no I/O.
-#[derive(Default)]
-pub(crate) struct InOrder {
-    /// `(seq, the ticket of the flush it waits for)`.
-    queue: VecDeque<(u64, Option<Ticket>)>,
-}
-
-impl InOrder {
-    /// Queue the publication of `seq`, to go out once a flush covering
-    /// `gate` returned (at once when `None`). Seqs ascend.
-    pub(crate) fn push(&mut self, seq: u64, gate: Option<Ticket>) {
-        debug_assert!(
-            self.queue.back().is_none_or(|(last, _)| *last < seq),
-            "publications are queued in seq order"
-        );
-        self.queue.push_back((seq, gate));
-    }
-
-    /// The seqs now free to go out, oldest first: the run from the front up
-    /// to the first whose flush `durable` does not cover. A held entry holds
-    /// back everything after it.
-    pub(crate) fn release(&mut self, durable: Ticket) -> Vec<u64> {
-        let mut out = Vec::new();
-        while let Some(&(seq, gate)) = self.queue.front() {
-            if gate.is_some_and(|ticket| ticket > durable) {
-                break;
-            }
-            out.push(seq);
-            self.queue.pop_front();
-        }
-        out
-    }
-
-    /// The ticket the front of the queue waits for; `None` when it waits for
-    /// none (or the queue is empty).
-    pub(crate) fn next_gate(&self) -> Option<Ticket> {
-        self.queue.front().and_then(|&(_, gate)| gate)
-    }
-
-    /// Whether nothing waits.
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-}
-
 #[derive(Default)]
 struct PublisherState {
-    queue: InOrder,
     /// Submitted and not yet handed to the sink.
     outstanding: usize,
     /// Why the front can never be released.
     blocked: Option<FlushError>,
+    /// The own structural entries a returned flush has not covered, with the
+    /// ticket each waits for.
+    held: Vec<(u64, Ticket)>,
 }
 
 struct PublisherShared {
-    flusher: Arc<Flusher>,
     st: Mutex<PublisherState>,
-    /// To the driver: something was submitted.
-    wake: Arc<Notify>,
     /// To [`Publisher::drain`]: a publication went out, or the driver
     /// stopped.
     progress: Notify,
@@ -568,24 +521,34 @@ struct PublisherShared {
 
 /// Publishes every submitted entry once, in seq order, holding an entry that
 /// waits for a flush (and every one after it) until the flush covering it
-/// returned (spec §4, rule 5).
+/// returned (spec §4, rule 5): the driver takes the entries from a queue one
+/// at a time, and waits for a held one's flush before it takes the next.
 pub(crate) struct Publisher {
+    flusher: Arc<Flusher>,
     shared: Arc<PublisherShared>,
+    queue: mpsc::UnboundedSender<(u64, Option<Ticket>)>,
 }
 
 impl Publisher {
     /// Start the publisher. Its task ends when the publisher is dropped, or
     /// when the flusher can no longer cover a held entry.
     pub(crate) fn spawn(flusher: Arc<Flusher>, sink: Arc<dyn FlushSink>) -> Publisher {
-        let wake = Arc::new(Notify::new());
+        let (queue, entries) = mpsc::unbounded_channel();
         let shared = Arc::new(PublisherShared {
-            flusher,
             st: Mutex::new(PublisherState::default()),
-            wake: Arc::clone(&wake),
             progress: Notify::new(),
         });
-        rt::spawn(Self::drive(Arc::downgrade(&shared), wake, sink));
-        Publisher { shared }
+        rt::spawn(Self::drive(
+            entries,
+            Arc::clone(&flusher),
+            Arc::downgrade(&shared),
+            sink,
+        ));
+        Publisher {
+            flusher,
+            shared,
+            queue,
+        }
     }
 
     /// Queue the publication of the own entry at `seq`: at once when `gate`
@@ -594,10 +557,21 @@ impl Publisher {
     pub(crate) fn submit(&self, seq: u64, gate: Option<Ticket>) {
         {
             let mut st = self.shared.st.lock();
-            st.queue.push(seq, gate);
             st.outstanding += 1;
+            st.held.extend(gate.map(|ticket| (seq, ticket)));
         }
-        self.shared.wake.notify_one();
+        // A driver that ended (a flush failed) leaves it unpublished: `drain`
+        // says why.
+        let _ = self.queue.send((seq, gate));
+    }
+
+    /// Whether the own entry at `seq` may be served: a structural entry only
+    /// once a flush covering it returned (spec §4, rule 3).
+    pub(crate) fn servable(&self, seq: u64) -> bool {
+        let durable = self.flusher.durable();
+        let mut st = self.shared.st.lock();
+        st.held.retain(|(_, ticket)| *ticket > durable);
+        !st.held.iter().any(|(held, _)| *held == seq)
     }
 
     /// Wait until everything submitted so far was handed to the sink. The
@@ -619,41 +593,28 @@ impl Publisher {
         }
     }
 
-    async fn drive(shared: Weak<PublisherShared>, wake: Arc<Notify>, sink: Arc<dyn FlushSink>) {
-        loop {
-            wake.notified().await;
-            loop {
-                let Some(shared) = shared.upgrade() else {
-                    return;
-                };
-                let (ready, gate) = {
-                    let mut st = shared.st.lock();
-                    let ready = st.queue.release(shared.flusher.durable());
-                    (ready, st.queue.next_gate())
-                };
-                if !ready.is_empty() {
-                    for seq in ready {
-                        sink.publish(seq).await;
-                        shared.st.lock().outstanding -= 1;
-                        shared.progress.notify_waiters();
-                    }
-                    continue;
-                }
-                let Some(ticket) = gate else {
-                    break;
-                };
-                if let Err(why) = shared.flusher.wait_durable(ticket).await {
-                    shared.st.lock().blocked = Some(why);
-                    shared.progress.notify_waiters();
-                    return;
-                }
+    async fn drive(
+        mut entries: mpsc::UnboundedReceiver<(u64, Option<Ticket>)>,
+        flusher: Arc<Flusher>,
+        shared: Weak<PublisherShared>,
+        sink: Arc<dyn FlushSink>,
+    ) {
+        while let Some((seq, gate)) = entries.recv().await {
+            let flushed = match gate {
+                Some(ticket) => flusher.wait_durable(ticket).await,
+                None => Ok(()),
+            };
+            let Some(shared) = shared.upgrade() else {
+                return;
+            };
+            if let Err(why) = flushed {
+                shared.st.lock().blocked = Some(why);
+                shared.progress.notify_waiters();
+                return;
             }
+            sink.publish(seq).await;
+            shared.st.lock().outstanding -= 1;
+            shared.progress.notify_waiters();
         }
-    }
-}
-
-impl Drop for Publisher {
-    fn drop(&mut self) {
-        self.shared.wake.notify_one();
     }
 }
