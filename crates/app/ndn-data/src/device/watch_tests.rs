@@ -455,6 +455,16 @@ async fn two_members_records_at_one_name_are_told_to_the_watch() {
         .collect();
     assert_eq!(told.len(), 1, "told once, for its collection: {seen:?}");
     assert_eq!(told[0].collection(), &plan());
+    let Change::Equivocation { first, second, .. } = told[0] else {
+        unreachable!()
+    };
+    let record = crate::Equivocal::Record {
+        name: log_name(&n("/alice/phone"), Some(&plan()), 9),
+        id: id("/alice/phone", 9),
+        kind: crate::RecordKind::Members,
+    };
+    assert_eq!(first, &record, "{seen:?}");
+    assert_eq!(second, &record, "both are the one name's records: {seen:?}");
     dev.shutdown();
 }
 
@@ -474,14 +484,37 @@ async fn members_records_of_two_collections_at_one_seq_are_told_for_each() {
         &super::test_kit::made("/alice/phone", &budget(), 9, members(&budget(), 2)),
     );
     let seen = drain(&mut changes).await;
-    let mut told: Vec<Name> = seen
+    let told: Vec<&Change> = seen
         .iter()
         .filter(|c| matches!(c, Change::Equivocation { .. }))
-        .map(|c| c.collection().clone())
         .collect();
-    told.sort();
+    let mut collections: Vec<Name> = told.iter().map(|c| c.collection().clone()).collect();
+    collections.sort();
     let mut want = vec![budget(), plan()];
     want.sort();
-    assert_eq!(told, want, "{seen:?}");
+    assert_eq!(collections, want, "{seen:?}");
+    // Each is told as two members records, by name, id and kind only: the
+    // other collection's entry carries no more.
+    let mut names = vec![
+        log_name(&n("/alice/phone"), Some(&plan()), 9),
+        log_name(&n("/alice/phone"), Some(&budget()), 9),
+    ];
+    names.sort();
+    for c in told {
+        let Change::Equivocation { first, second, .. } = c else {
+            unreachable!()
+        };
+        let mut got = Vec::new();
+        for side in [first, second] {
+            let crate::Equivocal::Record { name, id: i, kind } = side else {
+                panic!("a record, by name, id and kind only: {side:?}");
+            };
+            assert_eq!(*i, id("/alice/phone", 9), "{seen:?}");
+            assert_eq!(*kind, crate::RecordKind::Members, "{seen:?}");
+            got.push(name.clone());
+        }
+        got.sort();
+        assert_eq!(got, names, "{seen:?}");
+    }
     dev.shutdown();
 }
