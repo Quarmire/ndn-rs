@@ -57,11 +57,6 @@ impl DiskFailure {
             reason: why.to_string().into(),
         }
     }
-
-    /// The disk's reason, as the store gave it.
-    pub(crate) fn reason(&self) -> &str {
-        &self.reason
-    }
 }
 
 impl std::fmt::Display for DiskFailure {
@@ -318,6 +313,7 @@ pub(crate) struct Resume {
     pub clean: bool,
 }
 
+#[cfg(test)]
 impl Resume {
     /// Whether seqs lie between the adopted head and the first entry: the
     /// first entry then carries a signed gap statement.
@@ -439,11 +435,13 @@ impl Reservation {
     }
 
     /// The `R` written, durable or not.
+    #[cfg(test)]
     pub(crate) fn reserved(&self) -> u64 {
         self.st.lock().r
     }
 
     /// The `R` a returned flush covered: no seq above it is signed.
+    #[cfg(test)]
     pub(crate) fn durable_r(&self) -> u64 {
         let mut st = self.st.lock();
         self.promote(&mut st);
@@ -483,6 +481,7 @@ impl Reservation {
 
     /// Wait until `seq` may be signed. The error is the disk's reason (the
     /// store failed) or that the node stopped.
+    #[cfg(test)]
     pub(crate) async fn clear_to_sign(&self, seq: u64) -> Result<(), FlushError> {
         loop {
             match self.sign_gate(seq) {
@@ -567,6 +566,7 @@ impl InOrder {
     }
 
     /// Whether nothing waits.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
