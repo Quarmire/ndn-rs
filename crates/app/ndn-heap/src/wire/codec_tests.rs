@@ -661,6 +661,83 @@ fn grant_ask_seal_key_and_manifest_content_round_trip() {
     assert!(decode_manifest(Bytes::new()).is_err());
 }
 
+/// What a sealed Put seals is the entry's `PATH` and payload TLVs, held to
+/// the limits of a plain Put, nothing else.
+#[test]
+fn the_sealed_plaintext_is_a_path_and_one_payload() {
+    for payload in [
+        Payload::Inline(Bytes::from_static(b"secret")),
+        Payload::Inline(Bytes::new()),
+        Payload::Inline(Bytes::from(vec![9; INLINE_MAX])),
+        Payload::Blob {
+            size: 1 << 20,
+            root: [6; 32],
+        },
+    ] {
+        let put = PutBody {
+            path: n("/a/b"),
+            payload,
+        };
+        let plain = encode_sealed_plain(&put).unwrap();
+        assert_eq!(
+            children(&plain)[0].0,
+            tlv::PATH,
+            "the plaintext starts at PATH, not at an ENTRY"
+        );
+        assert_eq!(decode_sealed_plain(&plain), Ok(put));
+    }
+    let put = PutBody {
+        path: n("/a"),
+        payload: Payload::Inline(Bytes::from_static(b"x")),
+    };
+    let plain = encode_sealed_plain(&put).unwrap();
+    // A skippable field passes, a critical one refuses.
+    let with = |typ: u64| {
+        let mut w = TlvWriter::new();
+        w.write_raw(&plain);
+        w.write_tlv(typ, b"future");
+        w.finish()
+    };
+    assert_eq!(decode_sealed_plain(&with(0x0640)), Ok(put.clone()));
+    assert_eq!(
+        decode_sealed_plain(&with(0x063B)),
+        Err(WireError::UnknownCritical(0x063B))
+    );
+    // No payload, two payloads, no path, a path twice.
+    let first = children(&plain);
+    assert!(decode_sealed_plain(&serialize(&first[..1])).is_err());
+    let mut two = first.clone();
+    two.push((
+        tlv::BLOB,
+        serialize(&[
+            (tlv::SIZE, Bytes::from_static(&[1])),
+            (tlv::ROOT, Bytes::from(vec![0; 32])),
+        ]),
+    ));
+    assert!(decode_sealed_plain(&serialize(&two)).is_err());
+    assert!(decode_sealed_plain(&serialize(&first[1..])).is_err());
+    let mut twice = first.clone();
+    twice.push(first[0].clone());
+    assert!(decode_sealed_plain(&serialize(&twice)).is_err());
+    // The limits of a plain Put hold at encode and at decode.
+    let big = PutBody {
+        path: n("/a"),
+        payload: Payload::Inline(Bytes::from(vec![0; INLINE_MAX + 1])),
+    };
+    assert!(matches!(
+        encode_sealed_plain(&big),
+        Err(WireError::TooLarge { .. })
+    ));
+    let deep = PutBody {
+        path: n("/a/b/c/d/e/f/g/h/i"),
+        ..put
+    };
+    assert!(encode_sealed_plain(&deep).is_err());
+    let mut oversize = vec![(tlv::PATH, Bytes::from_static(b"\x08\x01a"))];
+    oversize.push((tlv::INLINE, Bytes::from(vec![0; INLINE_MAX + 1])));
+    assert!(decode_sealed_plain(&serialize(&oversize)).is_err());
+}
+
 fn mutate(wire: &[u8], at: usize, how: u8, byte: u8) -> Vec<u8> {
     let mut out = wire.to_vec();
     let at = at % (out.len() + 1);

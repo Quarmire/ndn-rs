@@ -83,16 +83,7 @@ impl Entry {
                 write_ref(w, r);
             }
             match &self.body {
-                Body::Put(put) => {
-                    write_path(w, &put.path);
-                    match &put.payload {
-                        Payload::Inline(bytes) => w.write_tlv(tlv::INLINE, bytes),
-                        Payload::Blob { size, root } => w.write_nested(tlv::BLOB, |w| {
-                            write_nni(w, tlv::SIZE, *size);
-                            w.write_tlv(tlv::ROOT, root);
-                        }),
-                    }
-                }
+                Body::Put(put) => write_put(w, put),
                 Body::Sealed(sealed) => w.write_nested(tlv::SEALED, |w| {
                     write_epoch_id(w, &sealed.epoch);
                     w.write_tlv(tlv::CIPHERTEXT, &sealed.sealed);
@@ -164,18 +155,7 @@ impl Entry {
             ));
         }
         let (body, body_kind, body_what) = if plain {
-            let path = path.ok_or(WireError::Missing("PATH"))?;
-            let payload = match (inline, blob) {
-                (Some(bytes), None) => Payload::Inline(bytes),
-                (None, Some((size, root))) => Payload::Blob { size, root },
-                (None, None) => return Err(WireError::Missing("INLINE or BLOB")),
-                (Some(_), Some(_)) => {
-                    return Err(WireError::Malformed(
-                        "a write carries INLINE or BLOB, not both; discard the entry",
-                    ));
-                }
-            };
-            (Body::Put(PutBody { path, payload }), Kind::Put, "a write")
+            (Body::Put(put_of(path, inline, blob)?), Kind::Put, "a write")
         } else if let Some(s) = sealed {
             (Body::Sealed(s), Kind::Put, "a sealed write")
         } else if let Some(m) = members {
@@ -233,23 +213,7 @@ impl Entry {
         }
         self.after.iter().try_for_each(check_ref)?;
         match &self.body {
-            Body::Put(put) => {
-                check_path(&put.path)?;
-                match &put.payload {
-                    Payload::Inline(bytes) => {
-                        too_large(bytes.len(), INLINE_MAX, "an inline payload")?;
-                    }
-                    Payload::Blob { size, .. } => {
-                        if *size > PAYLOAD_MAX {
-                            return Err(WireError::TooLarge {
-                                what: "a blob",
-                                size: usize::try_from(*size).unwrap_or(usize::MAX),
-                                max: PAYLOAD_MAX as usize,
-                            });
-                        }
-                    }
-                }
-            }
+            Body::Put(put) => check_put(put)?,
             Body::Sealed(sealed) => {
                 check_device(&sealed.epoch.creator)?;
                 too_large(sealed.sealed.len(), SEALED_MAX, "a sealed payload")?;
@@ -354,7 +318,7 @@ fn check_path(path: &Name) -> Result<(), WireError> {
     )
 }
 
-fn write_path(w: &mut TlvWriter, path: &Name) {
+pub(crate) fn write_path(w: &mut TlvWriter, path: &Name) {
     w.write_nested(tlv::PATH, |w| {
         for c in path.components() {
             w.write_tlv(c.typ, &c.value);
@@ -362,7 +326,84 @@ fn write_path(w: &mut TlvWriter, path: &Name) {
     });
 }
 
-fn write_ref(w: &mut TlvWriter, r: &EntryRef) {
+/// A write's `PATH` and payload TLVs: what an `ENTRY` carries for a plain
+/// Put, and what a sealed Put seals.
+fn write_put(w: &mut TlvWriter, put: &PutBody) {
+    write_path(w, &put.path);
+    match &put.payload {
+        Payload::Inline(bytes) => w.write_tlv(tlv::INLINE, bytes),
+        Payload::Blob { size, root } => w.write_nested(tlv::BLOB, |w| {
+            write_nni(w, tlv::SIZE, *size);
+            w.write_tlv(tlv::ROOT, root);
+        }),
+    }
+}
+
+/// The limits of a write: the path and the payload.
+fn check_put(put: &PutBody) -> Result<(), WireError> {
+    check_path(&put.path)?;
+    match &put.payload {
+        Payload::Inline(bytes) => too_large(bytes.len(), INLINE_MAX, "an inline payload"),
+        Payload::Blob { size, .. } if *size > PAYLOAD_MAX => Err(WireError::TooLarge {
+            what: "a blob",
+            size: usize::try_from(*size).unwrap_or(usize::MAX),
+            max: PAYLOAD_MAX as usize,
+        }),
+        Payload::Blob { .. } => Ok(()),
+    }
+}
+
+/// A write from the fields a decoder found: a path and exactly one payload.
+fn put_of(
+    path: Option<Name>,
+    inline: Option<Bytes>,
+    blob: Option<(u64, [u8; 32])>,
+) -> Result<PutBody, WireError> {
+    let path = path.ok_or(WireError::Missing("PATH"))?;
+    let payload = match (inline, blob) {
+        (Some(bytes), None) => Payload::Inline(bytes),
+        (None, Some((size, root))) => Payload::Blob { size, root },
+        (None, None) => return Err(WireError::Missing("INLINE or BLOB")),
+        (Some(_), Some(_)) => {
+            return Err(WireError::Malformed(
+                "a write carries INLINE or BLOB, not both; discard the entry",
+            ));
+        }
+    };
+    Ok(PutBody { path, payload })
+}
+
+/// The plaintext a sealed Put seals: the TLVs of `PATH` and the payload
+/// (`INLINE` or `BLOB`), with no `ENTRY` around them. Held to the limits of
+/// a plain Put.
+pub(crate) fn encode_sealed_plain(put: &PutBody) -> Result<Bytes, WireError> {
+    check_put(put)?;
+    let mut w = TlvWriter::new();
+    write_put(&mut w, put);
+    Ok(w.finish())
+}
+
+/// Decode what [`encode_sealed_plain`] wrote: a `PATH` and exactly one of
+/// `INLINE` or `BLOB`. An unknown even TLV is skipped, an unknown odd one
+/// refuses.
+pub(crate) fn decode_sealed_plain(plain: &[u8]) -> Result<PutBody, WireError> {
+    too_large(plain.len(), ENTRY_MAX, "a sealed plaintext")?;
+    let (mut path, mut inline, mut blob) = (None, None, None);
+    each(Bytes::copy_from_slice(plain), |t, v| {
+        match t {
+            tlv::PATH => once(&mut path, read_name(v)?, "PATH")?,
+            tlv::INLINE => once(&mut inline, v, "INLINE")?,
+            tlv::BLOB => once(&mut blob, read_blob(v)?, "BLOB")?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    })?;
+    let put = put_of(path, inline, blob)?;
+    check_put(&put)?;
+    Ok(put)
+}
+
+pub(crate) fn write_ref(w: &mut TlvWriter, r: &EntryRef) {
     w.write_nested(tlv::ENTRY_REF, |w| {
         write_name(w, &r.device);
         write_nni(w, tlv::SEQ, r.seq);
@@ -370,7 +411,7 @@ fn write_ref(w: &mut TlvWriter, r: &EntryRef) {
     });
 }
 
-fn read_ref(value: Bytes) -> Result<EntryRef, WireError> {
+pub(crate) fn read_ref(value: Bytes) -> Result<EntryRef, WireError> {
     let (mut device, mut seq, mut digest) = (None, None, None);
     each(value, |t, v| {
         match t {
