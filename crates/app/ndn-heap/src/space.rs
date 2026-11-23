@@ -307,14 +307,13 @@ fn check_path(path: &Name) -> Result<(), HeapError> {
 
 impl SpaceInner {
     pub(crate) fn new(
-        name: Name,
         log: Log,
         publisher: Publisher,
         group: Arc<Group>,
         follower: bool,
     ) -> SpaceInner {
         SpaceInner {
-            name,
+            name: log.space.clone(),
             log: Mutex::new(log),
             publisher,
             group,

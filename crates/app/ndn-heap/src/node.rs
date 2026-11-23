@@ -31,6 +31,7 @@ use bytes::Bytes;
 use ndn_app::{Connection, ServeGuard};
 use ndn_foundation_types::Name;
 use ndn_packet::Data;
+use ndn_security::confidentiality::RecipientKey;
 use ndn_security::{SecurityManager, Signer, Validator};
 use ndn_sync::{DataStore, StoreOp, SvsConfig};
 use parking_lot::{Mutex, RwLock};
@@ -150,7 +151,7 @@ pub(crate) struct NodeInner {
     pub(crate) device: Name,
     pub(crate) ns: Name,
     pub(crate) signer: Arc<dyn Signer>,
-    keys: Arc<SecurityManager>,
+    recipient: RecipientKey,
     pub(crate) judge: Arc<Judge>,
     pub(crate) store: Arc<dyn DataStore>,
     /// The keys marked suspected, for every space's log.
@@ -163,7 +164,6 @@ pub(crate) struct NodeInner {
     spaces: RwLock<BTreeMap<Name, Arc<SpaceInner>>>,
     /// Creating, opening, following and leaving one at a time.
     opening: tokio::sync::Mutex<()>,
-    seal_public: [u8; 32],
     seal_packet: Bytes,
     pub(crate) signatures: AtomicU64,
     /// The certificate fetches signal run headers wait for (spec §11).
@@ -227,10 +227,8 @@ impl Node {
             )));
         }
         let recipient = seal::recipient_key(&keys, &device).map_err(HeapError::local)?;
-        let seal_public = recipient.public();
-        let seal_packet = seal::seal_key_packet(&device, &seal_public, &*identity.signer)
+        let seal_packet = seal::seal_key_packet(&device, &recipient.public(), &*identity.signer)
             .map_err(HeapError::local)?;
-        drop(recipient);
 
         let flusher = Flusher::spawn(Arc::clone(&store));
         let (judge, adoptions) = Judge::new(
@@ -243,7 +241,7 @@ impl Node {
             device: device.clone(),
             ns,
             signer: identity.signer,
-            keys,
+            recipient,
             judge,
             suspicion: Suspicion::open(Arc::clone(&store)),
             store,
@@ -252,7 +250,6 @@ impl Node {
             net: RwLock::new(None),
             spaces: RwLock::new(BTreeMap::new()),
             opening: tokio::sync::Mutex::new(()),
-            seal_public,
             seal_packet,
             signatures: AtomicU64::new(0),
             signal_gate: crate::signal::SignalGate::default(),
@@ -354,13 +351,9 @@ impl Node {
 
     /// The spaces this node has open as a member, by name.
     pub fn spaces(&self) -> Vec<Name> {
-        self.inner
-            .spaces
-            .read()
-            .iter()
-            .filter(|(_, s)| !s.follower)
-            .map(|(name, _)| name.clone())
-            .collect()
+        let spaces = self.inner.sorted();
+        let members = spaces.iter().filter(|s| !s.follower);
+        members.map(|s| s.name.clone()).collect()
     }
 
     /// Carry `space`: join it, verify and store what it holds and serve it,
@@ -559,7 +552,6 @@ impl NodeInner {
 
     /// The log of `space` from the store, with the judge told what it lists.
     fn open_log(&self, space: &Name) -> Result<Log, HeapError> {
-        let recipient = seal::recipient_key(&self.keys, &self.device).map_err(HeapError::local)?;
         let log = Log::open(
             Params {
                 space: space.clone(),
@@ -567,7 +559,7 @@ impl NodeInner {
                 person: self.ns.clone(),
                 suspicion: Arc::clone(&self.suspicion),
                 signer: Arc::clone(&self.signer),
-                keys: Keys::new(recipient),
+                keys: Keys::new(self.recipient.clone()),
                 block: self.config.reserve_block,
             },
             Arc::clone(&self.store),
@@ -627,7 +619,6 @@ impl NodeInner {
         let group = net.join(&space, counter).await?;
         let publisher = Publisher::spawn(Arc::clone(&self.flusher), group.sink());
         let inner = Arc::new(SpaceInner::new(
-            space.clone(),
             log,
             publisher,
             Arc::clone(&group),
@@ -841,22 +832,19 @@ impl NodeInner {
         let Ok(data) = Data::decode(wire.clone()) else {
             return refused(Refusal::BadSignature);
         };
-        let verified = {
-            let mut tries = 0;
-            loop {
-                let generation = self.judge.generation();
-                match self.judge.validate(&data, space).await {
-                    Judged::Valid(v) if self.judge.generation() != generation && tries < 3 => {
-                        tries += 1;
-                        let _ = v;
-                    }
-                    Judged::Valid(v) => break v,
-                    Judged::Refused(why) => {
-                        held.alert_refused_packet(&data, &why);
-                        return refused(why);
-                    }
-                    Judged::Pending(waiting) => return Taken::Pending(waiting),
+        let mut tries = 0;
+        let verified = loop {
+            let generation = self.judge.generation();
+            match self.judge.validate(&data, space).await {
+                Judged::Valid(_) if self.judge.generation() != generation && tries < 3 => {
+                    tries += 1;
                 }
+                Judged::Valid(v) => break v,
+                Judged::Refused(why) => {
+                    held.alert_refused_packet(&data, &why);
+                    return refused(why);
+                }
+                Judged::Pending(waiting) => return Taken::Pending(waiting),
             }
         };
         tracing::trace!(target: crate::sync::TIMELINE, "judged");
@@ -955,7 +943,8 @@ impl NodeInner {
 
     pub(crate) fn seal_key_packet(&self, name: &Name) -> Option<Bytes> {
         let (device, public) = parse_seal_key_name(name)?;
-        (device == self.device && public == self.seal_public).then(|| self.seal_packet.clone())
+        (device == self.device && public == self.recipient.public())
+            .then(|| self.seal_packet.clone())
     }
 
     pub(crate) fn blobs(&self, space: &Name) -> Vec<Blob> {
@@ -982,12 +971,9 @@ impl NodeInner {
     }
 
     pub(crate) fn owed_keys(&self, space: &Name) -> Vec<EpochId> {
-        let Some(held) = self.space_of(space) else {
+        let Some(held) = self.space_of(space).filter(|s| !s.follower) else {
             return Vec::new();
         };
-        if held.follower {
-            return Vec::new();
-        }
         let log = held.log.lock();
         if !log.sealed() {
             return Vec::new();
@@ -1003,7 +989,7 @@ impl NodeInner {
     }
 
     pub(crate) fn seal_public(&self) -> [u8; 32] {
-        self.seal_public
+        self.recipient.public()
     }
 
     pub(crate) async fn validate_device_packet(
