@@ -177,7 +177,8 @@ pub(crate) fn equivocal_key(entry: &Name) -> Name {
     under(kind("equivocal"), entry)
 }
 
-/// That a key is suspected here: `suspected/<key name>` (one octet).
+/// Since when a key is suspected here: `suspected/<key name>` (ms, 8 octets
+/// big-endian).
 pub(crate) fn suspected_key(key: &Name) -> Name {
     under(kind("suspected"), key)
 }
