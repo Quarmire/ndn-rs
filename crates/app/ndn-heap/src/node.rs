@@ -188,8 +188,6 @@ pub(crate) struct NodeInner {
     stopped: AtomicBool,
     failed: Mutex<Option<String>>,
     serving: Mutex<Option<ServeGuard>>,
-    /// Spaces opened at start, until they are joined.
-    restored: Mutex<Vec<Held>>,
 }
 
 fn local(reason: impl Into<String>) -> HeapError {
@@ -294,7 +292,6 @@ impl Node {
             stopped: AtomicBool::new(false),
             failed: Mutex::new(None),
             serving: Mutex::new(None),
-            restored: Mutex::new(Vec::new()),
         });
         let node = Node {
             inner: Arc::clone(&inner),
@@ -307,7 +304,7 @@ impl Node {
         );
         *inner.net.write() = Some(net);
         // From here a failure drops `node`, which stops what was started.
-        inner.restore().await?;
+        let held = inner.restore().await?;
         if let Some(rx) = adoptions {
             rt::spawn(NodeInner::adoption_task(Arc::downgrade(&inner), rx));
         }
@@ -329,7 +326,14 @@ impl Node {
             .await
             .map_err(|e| local(format!("cannot serve {device}: {e}")))?;
         *inner.serving.lock() = Some(guard);
-        inner.join_restored().await?;
+        for joined in futures::future::join_all(
+            held.into_iter()
+                .map(|(log, follower)| inner.join(log, follower)),
+        )
+        .await
+        {
+            joined?;
+        }
         Ok(node)
     }
 
@@ -341,11 +345,7 @@ impl Node {
     pub async fn create(&self, space: &Name, share: Share) -> Result<Heap, HeapError> {
         let inner = &self.inner;
         let _opening = inner.opening.lock().await;
-        let parsed = parse_space_name(space).ok_or_else(|| HeapError::BadName {
-            name: space.clone(),
-            why: "a space is `<owner>/32=data/<name>`".into(),
-        })?;
-        if parsed.owner != inner.ns {
+        if parse_space_name(space).is_some_and(|parsed| parsed.owner != inner.ns) {
             return Err(HeapError::NotOwner {
                 space: space.clone(),
             });
@@ -360,7 +360,7 @@ impl Node {
                 readers.iter().chain(std::iter::once(&inner.ns)).collect();
             check_audience(listed.len())?;
         }
-        let attached = inner.attach(space, false).await?;
+        let attached = inner.hold(space, false).await?;
         let heap = Heap::new(Arc::clone(&attached), Arc::clone(inner));
         match inner.sign_creation(&attached, &share).await {
             Ok(()) => Ok(heap),
@@ -376,24 +376,10 @@ impl Node {
     pub async fn open(&self, space: &Name) -> Result<Heap, HeapError> {
         let inner = &self.inner;
         let _opening = inner.opening.lock().await;
-        parse_space_name(space).ok_or_else(|| HeapError::BadName {
-            name: space.clone(),
-            why: "a space is `<owner>/32=data/<name>`".into(),
-        })?;
-        let held = inner.spaces.read().get(space).cloned();
-        let attached = match held {
-            Some(s) if s.follower => {
-                return Err(HeapError::BadRequest {
-                    why: format!(
-                        "{space} is followed here as a carrier, which reads and writes nothing; \
-                         close the follower before opening the space"
-                    ),
-                });
-            }
-            Some(s) => s,
-            None => inner.attach(space, false).await?,
-        };
-        Ok(Heap::new(attached, Arc::clone(inner)))
+        Ok(Heap::new(
+            inner.hold(space, false).await?,
+            Arc::clone(inner),
+        ))
     }
 
     /// The space `space`, if this node has it open as a member.
@@ -418,23 +404,9 @@ impl Node {
     pub async fn follow(&self, space: &Name) -> Result<Follower, HeapError> {
         let inner = &self.inner;
         let _opening = inner.opening.lock().await;
-        parse_space_name(space).ok_or_else(|| HeapError::BadName {
-            name: space.clone(),
-            why: "a space is `<owner>/32=data/<name>`".into(),
-        })?;
-        let held = inner.spaces.read().get(space).cloned();
-        let attached = match held {
-            Some(s) if !s.follower => {
-                return Err(HeapError::BadRequest {
-                    why: format!("{space} is open here as a member: a member carries it already"),
-                });
-            }
-            Some(s) => s,
-            None => inner.attach(space, true).await?,
-        };
         Ok(Follower {
+            space: inner.hold(space, true).await?,
             node: Arc::clone(inner),
-            space: attached,
         })
     }
 
@@ -554,12 +526,6 @@ impl Drop for Node {
 
 // -- Inside ------------------------------------------------------------------------
 
-/// A space the store holds, opened but not yet joined.
-struct Held {
-    log: Log,
-    follower: bool,
-}
-
 impl NodeInner {
     fn arc(&self) -> Arc<NodeInner> {
         self.me
@@ -646,11 +612,11 @@ impl NodeInner {
 
     // -- Opening ----------------------------------------------------------------
 
-    /// The log of `space` from the store.
+    /// The log of `space` from the store, with the judge told what it lists.
     fn open_log(&self, space: &Name) -> Result<Log, HeapError> {
         let recipient =
             seal::recipient_key(&self.keys, &self.device).map_err(|e| local(e.to_string()))?;
-        Log::open(
+        let log = Log::open(
             Params {
                 space: space.clone(),
                 device: self.device.clone(),
@@ -662,33 +628,56 @@ impl NodeInner {
             },
             Arc::clone(&self.store),
             Arc::clone(&self.flusher),
-        )
+        )?;
+        self.judge.note(space, &SpaceInner::listing(&log));
+        Ok(log)
     }
 
-    /// Hold `space` from now on, and join it.
-    async fn attach(
+    /// `space` as a member or a carrier, with `opening` held: the one held
+    /// already, or one opened, recorded in the store (a restart restores it)
+    /// and joined.
+    async fn hold(
         self: &Arc<Self>,
         space: &Name,
         follower: bool,
     ) -> Result<Arc<SpaceInner>, HeapError> {
+        match self.space_of(space) {
+            Some(s) if s.follower == follower => return Ok(s),
+            Some(_) if follower => {
+                return Err(HeapError::BadRequest {
+                    why: format!("{space} is open here as a member: a member carries it already"),
+                });
+            }
+            Some(_) => {
+                return Err(HeapError::BadRequest {
+                    why: format!(
+                        "{space} is followed here as a carrier, which reads and writes nothing; \
+                         close the follower before opening the space"
+                    ),
+                });
+            }
+            None => {}
+        }
         if self.stopped.load(Ordering::Relaxed) {
             return Err(local("the node is stopped"));
         }
+        let log = self.open_log(space)?;
         self.store.insert(
             Kind::SPACE.of(space),
             Bytes::copy_from_slice(&[if follower { CARRIER } else { MEMBER }]),
         );
-        let log = self.open_log(space)?;
-        self.judge.note(space, &SpaceInner::listing(&log));
         self.flusher.note_write();
-        self.join(Held { log, follower }).await
+        self.join(log, follower).await
     }
 
     /// Join the group of an opened space at its head and take it into the
     /// node; with peers known, wait for them to show what they hold of this
     /// device before anything is signed.
-    async fn join(self: &Arc<Self>, held: Held) -> Result<Arc<SpaceInner>, HeapError> {
-        let Held { log, follower } = held;
+    async fn join(
+        self: &Arc<Self>,
+        log: Log,
+        follower: bool,
+    ) -> Result<Arc<SpaceInner>, HeapError> {
         let unclean = log.unclean();
         let net = self.net().ok_or_else(|| local("the node is stopped"))?;
         let space = log.space().clone();
@@ -733,21 +722,16 @@ impl NodeInner {
         Ok(inner)
     }
 
-    /// Every space the store holds: opened, judged, flushed, joined.
-    async fn restore(self: &Arc<Self>) -> Result<(), HeapError> {
+    /// Every space the store holds: opened, judged, flushed. Joined by the
+    /// caller once the node serves.
+    async fn restore(self: &Arc<Self>) -> Result<Vec<(Log, bool)>, HeapError> {
         let mut held = Vec::new();
         for (space, mode) in Kind::SPACE.named(&*self.store) {
             if parse_space_name(&space).is_none() {
                 tracing::warn!(%space, "a record of a space that is no space name is ignored");
                 continue;
             }
-            held.push(Held {
-                log: self.open_log(&space)?,
-                follower: mode.first() == Some(&CARRIER),
-            });
-        }
-        for h in &held {
-            self.judge.note(h.log.space(), &SpaceInner::listing(&h.log));
+            held.push((self.open_log(&space)?, mode.first() == Some(&CARRIER)));
         }
         self.judge.restore().await;
         // A key revoked while the device was off: what it signed is judged
@@ -761,15 +745,15 @@ impl NodeInner {
             .filter(|ctx| !ctx.revocations().is_empty())
             .map(|ctx| ctx.namespace().clone())
             .collect();
-        for h in &mut held {
+        for (log, _) in &mut held {
             let names: Vec<Name> = revoking
                 .iter()
-                .flat_map(|person| h.log.held_names(person))
+                .flat_map(|person| log.held_names(person))
                 .collect();
-            for (device, seq, why) in self.refusals(h.log.space(), names).await {
-                let fx = h.log.withdraw(&device, seq, why);
+            for (device, seq, why) in self.refusals(log.space(), names).await {
+                let fx = log.withdraw(&device, seq, why);
                 if fx.membership {
-                    self.judge.note(h.log.space(), &SpaceInner::listing(&h.log));
+                    self.judge.note(log.space(), &SpaceInner::listing(log));
                 }
             }
         }
@@ -783,17 +767,7 @@ impl NodeInner {
                 self.device
             ))
         })?;
-        *self.restored.lock() = held;
-        Ok(())
-    }
-
-    async fn join_restored(self: &Arc<Self>) -> Result<(), HeapError> {
-        let held = std::mem::take(&mut *self.restored.lock());
-        let joins = held.into_iter().map(|h| self.join(h));
-        for joined in futures::future::join_all(joins).await {
-            joined?;
-        }
-        Ok(())
+        Ok(held)
     }
 
     /// Stop carrying or holding `space`: left, forgotten, and not restored.
