@@ -485,12 +485,12 @@ async fn a_device_that_is_no_member_uses_no_signals() {
 
     let removal = alice.members(members(None, vec![remove(1)])).await;
     alice.relay(&removal, &bob);
-    for refused in [bob.scope().map(|_| ()), bob.header(&RUN).map(|_| ())] {
-        match refused {
-            Err(e @ HeapError::NotAllowed { .. }) => assert_eq!(e.next(), NextStep::AskOwner),
-            other => panic!("a removed writer's gate: {other:?}"),
-        }
+    match bob.header(&RUN) {
+        Err(e @ HeapError::NotAllowed { .. }) => assert_eq!(e.next(), NextStep::AskOwner),
+        other => panic!("a removed writer sends nothing: {other:?}"),
     }
+    bob.scope()
+        .expect("a public space is read by everybody, a removed writer included");
 
     // A listed writer whose own key is revoked.
     let world = World::new().await;
@@ -677,7 +677,9 @@ async fn a_reader_of_a_sealed_space_gets_scope_and_keys_but_cannot_send_and_its_
         ContentKey::from_bytes(*log.keys().key(&space(), &epoch).unwrap().expose())
     };
     assert!(rita.log.lock().key_arrived(epoch.clone(), key).0);
-    let theirs = rita.scope().expect("a reader with the key receives signals");
+    let theirs = rita
+        .scope()
+        .expect("a reader with the key receives signals");
     let owners = alice.scope().unwrap();
     assert_eq!(theirs.keys.len(), 1);
     assert_eq!(

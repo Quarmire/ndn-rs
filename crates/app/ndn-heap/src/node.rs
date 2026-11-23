@@ -167,7 +167,7 @@ pub(crate) struct NodeInner {
     pub(crate) device: Name,
     ns: Name,
     pub(crate) writer: Writer,
-    signer: Arc<dyn Signer>,
+    pub(crate) signer: Arc<dyn Signer>,
     keys: Arc<SecurityManager>,
     pub(crate) judge: Arc<Judge>,
     raw: Arc<dyn DataStore>,
@@ -183,6 +183,8 @@ pub(crate) struct NodeInner {
     seal_public: [u8; 32],
     seal_packet: Bytes,
     pub(crate) signatures: AtomicU64,
+    /// The certificate fetches signal run headers wait for (spec §11).
+    pub(crate) signal_gate: crate::signal::SignalGate,
     stopped: AtomicBool,
     failed: Mutex<Option<String>>,
     serving: Mutex<Option<ServeGuard>>,
@@ -290,6 +292,7 @@ impl Node {
             seal_public,
             seal_packet,
             signatures: AtomicU64::new(0),
+            signal_gate: crate::signal::SignalGate::default(),
             stopped: AtomicBool::new(false),
             failed: Mutex::new(None),
             serving: Mutex::new(None),
@@ -586,7 +589,7 @@ impl NodeInner {
         self.failed.lock().clone()
     }
 
-    fn space_of(&self, space: &Name) -> Option<Arc<SpaceInner>> {
+    pub(crate) fn space_of(&self, space: &Name) -> Option<Arc<SpaceInner>> {
         self.spaces.read().get(space).cloned()
     }
 

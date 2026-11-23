@@ -13,6 +13,7 @@ use ndn_packet::Data;
 use ndn_security::{Ed25519Verifier, VerifyOutcome};
 use tokio_util::sync::CancellationToken;
 
+use crate::HeapError;
 use crate::error::NextStep;
 use crate::fold::Readers;
 use crate::node::tests::{Dev, cfg, space, world};
@@ -21,7 +22,6 @@ use crate::signal::{RUN_ID_LEN, SignalRefusal};
 use crate::space::{MembersChange, Share};
 use crate::test_kit::n;
 use crate::wire::signal_run_name;
-use crate::HeapError;
 
 const RUN: [u8; RUN_ID_LEN] = [5; RUN_ID_LEN];
 
@@ -144,16 +144,19 @@ async fn a_members_header_is_admitted_at_a_peer_node_and_a_removed_writers_is_no
             key: bob_key
         })
     );
-    eventually("bob holds the removal and signs no more headers", || async {
-        match bob.signal_header(&space(), &RUN, b"run") {
-            Err(e @ HeapError::NotAllowed { .. }) => e.next() == NextStep::AskOwner,
-            _ => false,
-        }
-    })
+    eventually(
+        "bob holds the removal and signs no more headers",
+        || async {
+            match bob.signal_header(&space(), &RUN, b"run") {
+                Err(e @ HeapError::NotAllowed { .. }) => e.next() == NextStep::AskOwner,
+                _ => false,
+            }
+        },
+    )
     .await;
-    assert!(matches!(
-        bob.signal_scope(&space()),
-        Err(HeapError::NotAllowed { .. })
-    ));
+    assert!(
+        bob.signal_scope(&space()).is_ok(),
+        "a public space is read by everybody, a removed writer included"
+    );
     cancel.cancel();
 }

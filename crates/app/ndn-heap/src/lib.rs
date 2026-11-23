@@ -44,5 +44,6 @@ pub use crate::log::{Alert, Change, Frontier, Members};
 pub use crate::node::{Clock, Config, Node, Transport, Writer};
 pub use crate::register::{EntryId, Item};
 pub use crate::revocation::{CutBound, CutProposal};
+pub use crate::signal::{RUN_ID_LEN, SignalKey, SignalRefusal, SignalScope, SignalSender};
 pub use crate::space::{Changes, Follower, Heap, MembersChange, PutOptions, Share};
 pub use crate::trust::{Adopter, Scoping};

@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -48,11 +49,13 @@ use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::error::HeapError;
 use crate::log::Log;
+use crate::node::Node;
 use crate::rt::Instant;
 use crate::seal;
+use crate::space::SpaceInner;
 use crate::trust::Judge;
 use crate::wire::{
-    EpochId, RUN_ID_LEN, device_of, parse_signal_run_name, signal_run_name, sync_group_of,
+    self, EpochId, device_of, parse_signal_run_name, signal_run_name, sync_group_of,
 };
 
 /// The domain label of a space's signal key.
@@ -63,6 +66,9 @@ const SIGNAL_KEY_ID: &[u8] = b"ndn-heap/signal/id/1";
 
 /// The octets of a signal key's id ([`SignalKey::id`]).
 pub const KEY_ID_LEN: usize = 8;
+
+/// The octets of a signal run's id: a run header's last name component.
+pub const RUN_ID_LEN: usize = wire::RUN_ID_LEN;
 
 /// Run headers of one sender namespace that may wait for certificates at once
 /// (spec §11).
@@ -260,18 +266,26 @@ enum NotMember {
 }
 
 /// The person `key` belongs to, if the fold lists that person as a writer and
-/// the trust context governing the key does not revoke it. The context is the
-/// one `judge` judges the key's packets about the space by (spec §11): the
-/// node's own for a person it holds, else the view adopted for the person
-/// while a listing of the space names her as a writer or a reader.
+/// the trust context governing the key does not revoke it: who may send.
 fn member_by(log: &Log, judge: &Judge, key: &Name) -> Result<Name, NotMember> {
+    standing_by(log, judge, key, false)
+}
+
+/// The person `key` belongs to, if the fold lists that person as a writer or,
+/// when `reads`, as a reader (everybody reads a public space), and the trust
+/// context governing the key does not revoke it. The context is the one `judge`
+/// judges the key's packets about the space by (spec §11): the node's own for a
+/// person it holds, else the view adopted for the person while a listing of the
+/// space names her as a writer or a reader.
+fn standing_by(log: &Log, judge: &Judge, key: &Name, reads: bool) -> Result<Name, NotMember> {
     if device_of(key).is_none() {
         return Err(NotMember::Unlisted);
     }
     let view = judge.view_for(key, log.space(), true);
     let context = view.keyring().context_for(key);
     let person = context.namespace();
-    if person.is_empty() || !log.fold().is_writer(person) {
+    let fold = log.fold();
+    if person.is_empty() || !(fold.is_writer(person) || (reads && fold.is_reader(person))) {
         return Err(NotMember::Unlisted);
     }
     match context.is_revoked(key) {
@@ -298,16 +312,19 @@ pub(crate) fn signal_revocations(judge: &Judge) -> u64 {
 }
 
 /// This device may use signals over the space: its creation is held and this
-/// device's key is a member of it.
-fn own_gate(log: &Log, judge: &Judge) -> Result<(), HeapError> {
+/// device's key is a writer of it, or, when `reads`, a reader.
+fn own_gate(log: &Log, judge: &Judge, reads: bool) -> Result<(), HeapError> {
     if log.fold().create().is_none() {
         return Err(HeapError::NotReady {
             name: log.space().clone(),
             why: NO_RECORD.into(),
         });
     }
-    let why = match member_by(log, judge, log.key()) {
+    let why = match standing_by(log, judge, log.key(), reads) {
         Ok(_) => return Ok(()),
+        Err(NotMember::Unlisted) if reads => {
+            "this device is neither a writer nor a reader of it by the entries held"
+        }
         Err(NotMember::Unlisted) => "this device is no writer of it by the entries held",
         Err(NotMember::Revoked) => "the trust context governing this device's key revokes it",
     };
@@ -321,16 +338,20 @@ fn own_gate(log: &Log, judge: &Judge) -> Result<(), HeapError> {
 
 /// What this device may do with signals over the space `log` holds, by the
 /// entries held now (spec §11): its signal keys when the space is sealed, the
-/// sync group to push into and listen on.
+/// sync group to push into and listen on. A writer or a reader gets it (a
+/// reader of a sealed space holds the epoch key and must be able to receive);
+/// only a writer may send ([`signal_header`]) or be admitted ([`signal_member`],
+/// [`signal_sender`], [`signal_admit`]).
 ///
 /// [`HeapError::NotReady`] when the space's creation is not held here yet, or,
 /// sealed, the key of its epoch in force is not held yet (it arrives as a
-/// grant: ask again). [`HeapError::NotAllowed`] when this device is no writer
-/// of the space by those entries, or the trust context governing its key
-/// revokes it. [`HeapError::Sealed`] when it is a writer outside the sealed
-/// space's audience, which may not hold its key.
+/// grant: ask again). [`HeapError::NotAllowed`] when this device is neither a
+/// writer nor a reader of the space by those entries, or the trust context
+/// governing its key revokes it. [`HeapError::Sealed`] when it is in the
+/// sealed space's audience by neither the epoch nor the owner, which may not
+/// hold its key.
 pub(crate) fn signal_scope(log: &Log, judge: &Judge) -> Result<SignalScope, HeapError> {
-    own_gate(log, judge)?;
+    own_gate(log, judge, true)?;
     let space = log.space();
     let keys = match log.sealed() {
         true => sealed_keys(log)?,
@@ -409,7 +430,7 @@ pub(crate) fn signal_header(
             why: format!("this gate holds the space {}, not this one", log.space()),
         });
     }
-    own_gate(log, judge)?;
+    own_gate(log, judge, false)?;
     seal::sign(
         DataBuilder::new(signal_run_name(log.device(), scope, run_id), body),
         signer,
@@ -671,6 +692,136 @@ impl SignalGate {
     }
 }
 
+// -- The node's methods ------------------------------------------------------------------
+
+impl Node {
+    /// The space `space` as a member has it open: the one a signal question is
+    /// about. A space not open here (or carried only) is not decided.
+    fn signal_space(&self, space: &Name) -> Option<Arc<SpaceInner>> {
+        self.inner.space_of(space).filter(|s| !s.follower)
+    }
+
+    /// What this node may do with signals over `space`, by the entries it
+    /// holds (spec §11): its signal keys when the space is sealed, and the
+    /// sync group to push into and listen on. A writer or a reader gets it.
+    ///
+    /// [`HeapError::NotReady`] when the space is not open here or its creation
+    /// is not held yet (retry), or, sealed, the key of its epoch in force has
+    /// not arrived. [`HeapError::NotAllowed`] when this device is neither a
+    /// writer nor a reader of the space, or its key is revoked.
+    /// [`HeapError::Sealed`] when it is outside the sealed space's audience.
+    pub fn signal_scope(&self, space: &Name) -> Result<SignalScope, HeapError> {
+        let held = self.signal_space(space).ok_or_else(|| not_open(space))?;
+        let log = held.log.lock();
+        signal_scope(&log, &self.inner.judge)
+    }
+
+    /// Sign a signal run header for `scope`: Data
+    /// `<device>/32=signal/<scope>/32=run/<run_id>` with Content `body`, signed
+    /// by this device's key. Only a writer sends; refused as
+    /// [`Self::signal_scope`] refuses, except that a sealed space's key need
+    /// not be held. Nothing is stored or served.
+    pub fn signal_header(
+        &self,
+        scope: &Name,
+        run_id: &[u8; RUN_ID_LEN],
+        body: &[u8],
+    ) -> Result<Bytes, HeapError> {
+        let held = self.signal_space(scope).ok_or_else(|| not_open(scope))?;
+        let log = held.log.lock();
+        signal_header(
+            &log,
+            &self.inner.judge,
+            &*self.inner.signer,
+            scope,
+            run_id,
+            body,
+        )
+    }
+
+    /// The signer of another device's run header for `scope`, if it is a
+    /// member (a writer), before anything about it is verified. Synchronous
+    /// and offline.
+    pub fn signal_sender(&self, scope: &Name, data: &Data) -> Result<SignalSender, SignalRefusal> {
+        let held = self
+            .signal_space(scope)
+            .ok_or_else(|| not_open_refusal(scope))?;
+        let log = held.log.lock();
+        signal_sender(&log, &self.inner.judge, scope, data)
+    }
+
+    /// Admit another device's run header for `scope`: its signer is a member
+    /// ([`Self::signal_sender`]) and it verifies by the live rule, fetching
+    /// the certificates of its chain within the signer's person's budget (2
+    /// waiting at a time, a 30 s back-off per device). The header is not kept.
+    pub async fn signal_admit(
+        &self,
+        scope: &Name,
+        data: &Data,
+    ) -> Result<SignalSender, SignalRefusal> {
+        let held = self
+            .signal_space(scope)
+            .ok_or_else(|| not_open_refusal(scope))?;
+        signal_admit(
+            &self.inner.signal_gate,
+            &held.log,
+            &self.inner.judge,
+            scope,
+            data,
+        )
+        .await
+    }
+
+    /// Whether `key` is a member (a writer's key, not revoked) of `scope` now,
+    /// by the entries held: asked for every signal packet. A space not open
+    /// here has no members.
+    pub fn signal_member(&self, scope: &Name, key: &Name) -> bool {
+        self.signal_space(scope)
+            .is_some_and(|held| signal_member(&held.log.lock(), &self.inner.judge, scope, key))
+    }
+
+    /// A count that moves whenever a trust context revoking keys is adopted
+    /// here, the node's own or a view adopted for a person: a transport that
+    /// admitted run headers under one count walks their chains again under
+    /// another.
+    pub fn revocations(&self) -> u64 {
+        signal_revocations(&self.inner.judge)
+    }
+
+    /// This device's signature over `header`, by the key the node signs
+    /// entries with.
+    pub fn sign(&self, header: &[u8]) -> Result<Bytes, HeapError> {
+        self.inner
+            .signer
+            .sign_sync(header)
+            .map_err(|e| HeapError::Local {
+                reason: format!("the device key cannot sign: {e}"),
+            })
+    }
+}
+
+/// Why nothing about `space` is decided: this node has not opened it.
+fn not_open(space: &Name) -> HeapError {
+    HeapError::NotReady {
+        name: space.clone(),
+        why: NOT_OPEN.into(),
+    }
+}
+
+fn not_open_refusal(space: &Name) -> SignalRefusal {
+    SignalRefusal::NotReady {
+        scope: space.clone(),
+        why: NOT_OPEN.into(),
+    }
+}
+
+const NOT_OPEN: &str = "it is not open here as a member; open it (Node::open) so its owner's \
+                        entries arrive, then ask again";
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "signal_tests.rs"]
 mod tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "signal_node_tests.rs"]
+mod node_tests;
