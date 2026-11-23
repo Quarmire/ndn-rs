@@ -727,10 +727,8 @@ impl NodeInner {
                 });
             }
         }
-        let blobs = inner.unassembled(self);
-        if !blobs.is_empty() {
-            self.nudge(&inner.name);
-        }
+        inner.seed_owed(self);
+        self.nudge(&inner.name);
         inner.repair_if_owed(self);
         Ok(inner)
     }
@@ -1116,7 +1114,7 @@ impl NodeInner {
 
     pub(crate) fn blobs(&self, space: &Name) -> Vec<Blob> {
         self.space_of(space)
-            .map_or_else(Vec::new, |s| s.unassembled(self))
+            .map_or_else(Vec::new, |s| s.unassembled())
     }
 
     pub(crate) fn held_piece(&self, space: &Name, name: &Name) -> Option<Bytes> {

@@ -898,10 +898,10 @@ async fn a_rescan_for_values_in_pieces_reads_no_head_it_has_settled() {
             .unwrap();
     }
     let inner = node.inner.space_of(&space()).unwrap();
-    assert!(inner.unassembled(&node.inner).is_empty());
+    assert!(inner.unassembled().is_empty());
     tokio::time::sleep(Duration::from_millis(200)).await;
     let before = held.gets();
-    assert!(inner.unassembled(&node.inner).is_empty());
+    assert!(inner.unassembled().is_empty());
     assert_eq!(
         held.gets(),
         before,

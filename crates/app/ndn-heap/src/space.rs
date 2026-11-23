@@ -20,7 +20,7 @@
 //! [`Change::Lagged`], and the changes after the drop are dropped until it
 //! has been told.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -267,11 +267,10 @@ pub(crate) struct SpaceInner {
     /// A carrier signs nothing and keeps no read key.
     pub(crate) follower: bool,
     pub(crate) closing: AtomicBool,
-    /// Entries of this space whose value is in hand here: inline, or in
-    /// pieces that are whole. What [`Self::unassembled`] need not read again.
-    whole: Mutex<HashSet<EntryId>>,
-    /// Held for the length of one [`Self::unassembled`] scan.
-    scan: Mutex<()>,
+    /// The blob heads whose pieces are not all held, by entry: what
+    /// [`Self::unassembled`] lists. The pieces' own marker (`assembled/`)
+    /// says when one is whole; nothing is read to know it.
+    owed: Mutex<HashMap<EntryId, Blob>>,
     /// Alerts that stay true (evidence of rollback, of equivocation): a
     /// watcher that begins later is told them after the heads.
     standing: Mutex<Vec<Alert>>,
@@ -282,10 +281,6 @@ pub(crate) struct SpaceInner {
 
 /// The most standing alerts a space keeps for watchers that begin later.
 const STANDING_MAX: usize = 32;
-
-/// How many heads' entries one scan for values in pieces reads while it holds
-/// the space's lock; the lock is let go between batches.
-const HEADS_PER_READ: usize = 256;
 
 /// The most refused entries a space remembers having told.
 const REFUSED_MAX: usize = 256;
@@ -341,8 +336,7 @@ impl SpaceInner {
             watchers: Mutex::new(Vec::new()),
             follower,
             closing: AtomicBool::new(false),
-            whole: Mutex::new(HashSet::new()),
-            scan: Mutex::new(()),
+            owed: Mutex::new(HashMap::new()),
             standing: Mutex::new(Vec::new()),
             refused: Mutex::new(VecDeque::new()),
         }
@@ -426,6 +420,8 @@ impl SpaceInner {
             // One still to gather is told when its last piece is held.
             if self.is_whole(node, &blob) {
                 self.tell_blob(&blob);
+            } else {
+                self.owed.lock().insert(blob.id.clone(), blob);
             }
         }
         if routed.repair {
@@ -725,16 +721,17 @@ impl SpaceInner {
     /// Whether every piece of `blob` is held here and the value recorded
     /// whole (`assembled/<entry>`): one lookup, nothing read.
     fn is_whole(&self, node: &NodeInner, blob: &Blob) -> bool {
-        let entry = log_name(&blob.id.device, &self.name, blob.id.seq);
-        node.store.contains(&Kind::ASSEMBLED.of(&entry))
+        node.store
+            .contains(&Kind::ASSEMBLED.of(&blob.id.name(&self.name)))
     }
 
-    /// The value in pieces of `blob`, joined from the store and opened:
-    /// outside the lock. A value not recorded whole is not read at all, so
-    /// nothing of the size its entry declares (up to 64 MiB) is allocated for
-    /// one that cannot be returned.
+    /// The value in pieces of `blob`, joined from the store and opened
+    /// (under its epoch key when the space is private): outside the lock. A
+    /// value not recorded whole is not read at all, so nothing of the size
+    /// its entry declares (up to 64 MiB) is allocated for one that cannot be
+    /// returned.
     fn read_blob(&self, node: &NodeInner, blob: &Blob) -> Result<Bytes, HeapError> {
-        let name = log_name(&blob.id.device, &self.name, blob.id.seq);
+        let name = blob.id.name(&self.name);
         let key = self.blob_key(blob)?;
         if !self.is_whole(node, blob) {
             return Err(HeapError::Unavailable { name });
@@ -748,7 +745,7 @@ impl SpaceInner {
             // is gathered again, from what the store still holds and the peers.
             node.store.remove(&Kind::ASSEMBLED.of(&name));
             node.flusher.note_write();
-            self.whole.lock().remove(&blob.id);
+            self.owed.lock().insert(blob.id.clone(), blob.clone());
             node.nudge(&self.name);
             match e {
                 pieces::PieceError::Incomplete { .. } => {
@@ -759,30 +756,13 @@ impl SpaceInner {
                 },
             }
         })?;
-        self.open_blob(blob, key, stored)
-    }
-
-    /// The value of `blob` from `stored`, the payload its proven pieces
-    /// carry (sealed, under `key`, when the space is private).
-    fn open_blob(
-        &self,
-        blob: &Blob,
-        key: Option<ContentKey>,
-        stored: Vec<u8>,
-    ) -> Result<Bytes, HeapError> {
-        self.whole.lock().insert(blob.id.clone());
         match key {
             None => Ok(Bytes::from(stored)),
-            Some(key) => {
-                let name = log_name(&blob.id.device, &self.name, blob.id.seq);
-                seal::open_payload(&key, &name, &stored)
-                    .map(Bytes::from)
-                    .ok_or_else(|| HeapError::Local {
-                        reason: format!(
-                            "the sealed value of {name} does not open under its epoch key"
-                        ),
-                    })
-            }
+            Some(key) => seal::open_payload(&key, &name, &stored)
+                .map(Bytes::from)
+                .ok_or_else(|| HeapError::Local {
+                    reason: format!("the sealed value of {name} does not open under its epoch key"),
+                }),
         }
     }
 
@@ -818,53 +798,41 @@ impl SpaceInner {
     /// The last piece of `blob` is held: record the value whole (after its
     /// pieces, in write order) and tell.
     pub(crate) fn assembled(self: &Arc<Self>, node: &Arc<NodeInner>, blob: &Blob) {
-        let entry = log_name(&blob.id.device, &self.name, blob.id.seq);
-        node.store
-            .insert(Kind::ASSEMBLED.of(&entry), Bytes::from_static(&[1]));
+        node.store.insert(
+            Kind::ASSEMBLED.of(&blob.id.name(&self.name)),
+            Bytes::from_static(&[1]),
+        );
         node.flusher.note_write();
-        self.whole.lock().insert(blob.id.clone());
+        self.owed.lock().remove(&blob.id);
         self.tell_blob(blob);
     }
 
-    /// The blob heads whose pieces are not all held here. A head found
-    /// inline or whole is remembered ([`Self::whole`]), so a later scan reads
-    /// the entries of the heads it has not seen and no others: the scan runs
-    /// after every entry taken, and one that read every head's entry from
-    /// the store would hold the space's lock for as long as the space is
-    /// large. The reads are made in batches, the lock let go between them,
-    /// and one scan runs at a time: a second begun meanwhile would read the
-    /// heads the first is about to settle.
-    pub(crate) fn unassembled(&self, node: &NodeInner) -> Vec<Blob> {
-        let _scan = self.scan.lock();
-        let pending = {
-            let log = self.log.lock();
-            let mut seen = self.whole.lock();
-            // Superseded heads leave the set only when it outgrows the heads.
-            if seen.len() > 2 * log.register().head_count() + HEADS_PER_READ {
-                seen.clear();
-            }
-            log.unsettled_heads(&seen)
-        };
-        let mut owed = Vec::new();
-        for batch in pending.chunks(HEADS_PER_READ) {
-            let kinds = self.log.lock().payload_kinds(batch);
-            let mut settled = Vec::new();
-            for (id, kind) in batch.iter().zip(kinds) {
-                match kind {
-                    Some(None) => settled.push(id.clone()),
-                    Some(Some(blob)) if self.is_whole(node, &blob) => settled.push(id.clone()),
-                    Some(Some(blob)) => owed.push(blob),
-                    None => {}
-                }
-            }
-            self.whole.lock().extend(settled);
-        }
-        owed
+    /// The blob heads of the log, as they stand at start, whose pieces are
+    /// not all held: owed. One read of each head's entry, once; afterwards
+    /// [`Self::finish`] adds what an entry newly makes a head.
+    pub(crate) fn seed_owed(&self, node: &NodeInner) {
+        let blobs = self.log.lock().items().1;
+        let owed = blobs.into_iter().filter(|b| !self.is_whole(node, b));
+        self.owed.lock().extend(owed.map(|b| (b.id.clone(), b)));
     }
 
-    /// Say a blob this node wrote is whole (its pieces went in its batch).
-    fn mark_whole(&self, id: &EntryId) {
-        self.whole.lock().insert(id.clone());
+    /// The values owed their pieces that are still the head of their path:
+    /// what is fetched, and asked again while owed. One superseded is
+    /// dropped (it comes back if a removal makes it the head again).
+    pub(crate) fn unassembled(&self) -> Vec<Blob> {
+        let mut owed = self.owed.lock();
+        if owed.is_empty() {
+            return Vec::new();
+        }
+        let heads: HashSet<EntryId> = {
+            let log = self.log.lock();
+            log.register()
+                .values()
+                .map(|(_, h)| h.entry.clone())
+                .collect()
+        };
+        owed.retain(|id, _| heads.contains(id));
+        owed.values().cloned().collect()
     }
 }
 
@@ -986,9 +954,8 @@ impl Heap {
                     log.put(path, blob.clone(), ops, now).map(Some)
                 })
                 .await?;
-            if let Some((id, ticket)) = signed {
-                inner.mark_whole(&id);
-                return Ok((id, ticket));
+            if let Some(signed) = signed {
+                return Ok(signed);
             }
         }
     }
