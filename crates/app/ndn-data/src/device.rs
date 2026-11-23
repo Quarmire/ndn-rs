@@ -437,7 +437,15 @@ impl Line {
             }
         }
         let (top, resolve, _) = self.merged.values().next_back().expect("a record is held");
-        self.resolve = *resolve;
+        // A record in force can keep an epoch that a reader it lists is not
+        // of, though no record merged names a reader out of it (a record of a
+        // revision taken onto the one below takes the epoch of another record
+        // than the one adding the reader): it is resolved, in the epoch kept,
+        // as a merge that only adds a reader is (spec §6).
+        self.resolve = match undergrown(top, &self.epochs) {
+            true => (*resolve).max(Resolve::Readers),
+            false => *resolve,
+        };
         if self.own.as_ref() == Some(top) {
             return None;
         }
@@ -544,6 +552,24 @@ fn outgrown(m: &Members, epochs: &BTreeMap<Epoch, Named>) -> bool {
                 .readers
                 .iter()
                 .any(|r| !collection::admitted(r, &m.readers))
+        })
+}
+
+/// Whether `m`, a record in force, lists a reader that no held record naming
+/// its epoch (`epochs`) lists: a merge of concurrent records keeps the epoch
+/// of one of them while listing readers another added (spec §6, §9). The
+/// epoch's key goes only to the readers those records list, so a version
+/// sealed in it would stay closed to such a reader for good; nothing is
+/// sealed in it, and the merge is owed a resolving record ([`Line::take`]),
+/// until a record naming the epoch lists the reader or moves to a new one.
+fn undergrown(m: &Members, epochs: &BTreeMap<Epoch, Named>) -> bool {
+    m.epoch
+        .as_ref()
+        .and_then(|e| epochs.get(e))
+        .is_some_and(|named| {
+            m.readers
+                .iter()
+                .any(|r| !collection::admitted(r, &named.readers))
         })
 }
 
@@ -8962,7 +8988,10 @@ impl Inner {
     /// that has not outgrown its audience ([`outgrown`]: a reader the
     /// record in force no longer admits may hold its key, so nothing is
     /// sealed in it until a device of the audience moves `c` to a new
-    /// epoch; ask again then, spec §6.1).
+    /// epoch; ask again then, spec §6.1) and has not undergrown it
+    /// ([`undergrown`]: the record in force lists a reader no record naming
+    /// the epoch lists, so nothing is sealed in it until the merge is
+    /// resolved; ask again then, spec §6).
     fn writable(&self, st: &St, c: &Name, epoch: Option<&Epoch>) -> Result<(), DataError> {
         let Some(members) = st.colls.get(c).and_then(|x| x.members.as_ref()) else {
             return Err(DataError::Unavailable { name: c.clone() });
@@ -8995,6 +9024,21 @@ impl Inner {
                     "its epoch {e:?} outgrew its audience — a reader the record in force no \
                      longer admits may hold its key — so nothing is sealed in it; put again once \
                      a device of the owner's namespace that reads it has moved it to a new epoch"
+                ),
+            });
+        }
+        if let Some(e) = epoch
+            && st
+                .line_of(&st.seal_subject(c, e))
+                .is_some_and(|(epochs, _)| undergrown(members, epochs))
+        {
+            return Err(DataError::NotReady {
+                name: c.clone(),
+                why: format!(
+                    "the record in force lists a reader that no record naming its epoch {e:?} \
+                     lists — a merge not resolved yet — so a version sealed in it would stay \
+                     closed to that reader; put again once a device of the owner's namespace \
+                     that reads it has signed the record resolving the merge"
                 ),
             });
         }
@@ -12898,6 +12942,111 @@ mod tests {
         assert_eq!(st.head, 3);
         drop(st);
         again.shutdown();
+    }
+
+    /// A merge of concurrent records can list a reader that none of the
+    /// records naming the epoch it keeps lists (the phone removes Bob, in
+    /// an epoch of its own, while the laptop adds Carol): that epoch's key
+    /// goes to the readers those records list, never to Carol, so a version
+    /// sealed in it stays closed to her for good, though the record in
+    /// force lists her. Until the record resolving the merge is held, no
+    /// writer seals in it: `put` answers `NotReady` (`RetryLater`) and signs
+    /// nothing; once it is held, in the new epoch, `put` writes.
+    #[tokio::test]
+    async fn nothing_is_sealed_in_an_epoch_a_merge_lists_a_reader_outside_of() {
+        let device = n("/alice/laptop");
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        validator.adopt_context(context("/alice")).unwrap();
+        let (keys, store): (_, Arc<dyn DataStore>) =
+            (keys_of(&device), Arc::new(MemoryStore::new()));
+        let dev = start(&device, &keys, &validator, &store).await.unwrap();
+        let c = n("/alice/32=data/plan");
+        let person = |s: &str| Audience::Person(n(s));
+        let put = || {
+            dev.put(
+                &c,
+                Content::new().with("text", Bytes::from_static(b"budget")),
+                PutOptions {
+                    type_id: crate::TypeId {
+                        name: n("/types/note"),
+                        revision: 1,
+                    },
+                    keep: crate::Keep::Forever,
+                },
+            )
+        };
+        dev.share(
+            &c,
+            share_of(
+                Rule::Log,
+                &["/alice", "/bob"],
+                vec![person("/alice"), person("/bob")],
+            ),
+        )
+        .await
+        .unwrap();
+        let first = dev.inner.st.lock().colls[&c].members.clone().unwrap();
+        put()
+            .await
+            .expect("the epoch of the record in force admits its readers");
+        dev.share(
+            &c,
+            share_of(
+                Rule::Log,
+                &["/alice", "/bob", "/carol"],
+                vec![person("/alice"), person("/bob"), person("/carol")],
+            ),
+        )
+        .await
+        .unwrap();
+        put()
+            .await
+            .expect("a record that only adds a reader keeps the epoch and names it");
+        let phone = n("/alice/phone");
+        let removed_in = Epoch {
+            creator: phone.clone(),
+            seq: Seq(1),
+        };
+        let key = ContentKey::generate();
+        let removes = MembersBody {
+            collection: c.clone(),
+            folder: false,
+            revision: 2,
+            rule: Rule::Log,
+            writers: vec![n("/alice")],
+            readers: vec![person("/alice")],
+            cuts: vec![CutBody {
+                of: n("/bob"),
+                accept: Accepted::new(),
+            }],
+            epoch: Some(removed_in.clone()),
+            key_check: Some(seal::key_check(&key, &c, &removed_in)),
+            since: None,
+            parent: Some(first.as_parent()),
+        };
+        assert_eq!(hand(&dev, &phone, &c, 1, Record::Members(removes)), None);
+        {
+            let mut st = dev.inner.st.lock();
+            let m = st.colls[&c].members.clone().unwrap();
+            assert_eq!(m.epoch.as_ref(), Some(&removed_in));
+            assert_eq!(m.readers, vec![person("/alice"), person("/carol")]);
+            st.keys.hold(c.clone(), removed_in.clone(), key);
+        }
+        // The merge lists Carol; the epoch it keeps is not hers.
+        let head = dev.inner.st.lock().head;
+        let refused = put().await;
+        assert!(
+            matches!(refused, Err(DataError::NotReady { .. })),
+            "nothing is sealed in an epoch the record in force lists a reader outside of: \
+             {refused:?}"
+        );
+        assert_eq!(dev.inner.st.lock().head, head, "nothing was signed");
+        // The laptop resolves the merge, in a new epoch Carol is of: it writes.
+        dev.inner.settle().await;
+        put()
+            .await
+            .expect("the resolved record's epoch lists every reader of the merge");
+        dev.shutdown();
     }
 
     /// The round-3 review's M5: the laptop removes Carol at revision 2,

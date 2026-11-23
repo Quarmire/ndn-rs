@@ -613,7 +613,11 @@ and, once the rule changed, where the current rule starts.
     they only list a reader no merged record naming that epoch lists (one
     record added a reader while another moved to a new epoch). Devices
     resolving at once sign records of one revision, one parent and one
-    audience, whose merge needs no more.
+    audience, whose merge needs no more. The same holds of the record in
+    force once a record of a revision is taken onto the one below it
+    (**Across revisions**, below): it lists a reader no held record naming
+    its epoch lists when the epoch kept is that of another record than the
+    one adding the reader, and is then resolved in the epoch kept.
 - **Across revisions.** A record of revision `n + 1` signed from a view
   without a record of revision `n` the reader holds names another parent
   than `B`, what revision `n` stands for at the reader (the laptop's
@@ -1818,9 +1822,12 @@ forward ciphertext.
   record carries `Sealed` (the epoch and `nonce ‖ tag ‖ ciphertext`) in
   place of them. A writer MUST NOT seal in an epoch that has outgrown its
   audience (§6.1: a held record naming it lists a reader the record in
-  force no longer admits, who holds its key); `put` answers `NotReady`
-  (next step `RetryLater`) until a record moving the collection to a new
-  epoch is held. A reader opens it with that epoch's key; a payload that
+  force no longer admits, who holds its key), nor in one that has
+  undergrown it (the record in force lists a reader that no held record
+  naming the epoch lists, so the epoch's key is never granted to it: a
+  merge not resolved yet, §6); `put` answers `NotReady` (next step
+  `RetryLater`) until a record moving the collection to a new epoch, or
+  naming the epoch with that reader, is held. A reader opens it with that epoch's key; a payload that
   does not open under it is refused as a bad signature. A reader without
   the key holds the version verified and closed, applies nothing that waits
   on it, and asks for the key if it may hold it. A reader MUST refuse a
