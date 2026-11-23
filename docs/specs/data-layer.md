@@ -3186,7 +3186,7 @@ announced). What is owed, and until when:
   says its device moved, so a root of head 0 that answers the first notice
   of a device never walked before may be an old copy of its root, replayed
   or delayed by a party on the path: the device would stop announcing once
-its root was asked, and nothing would ask again. The reader takes that
+  its root was asked, and nothing would ask again. The reader takes that
   root as any (a device that has signed nothing yet has a head-0 root, and
   is no worse for it), and once, after the pause above, walks the device
   again, with one ask for its root: the writer's own root above the head
