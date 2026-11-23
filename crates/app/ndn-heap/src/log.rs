@@ -415,18 +415,18 @@ impl Log {
             block,
         } = params;
         let owner = parse_space_name(&space)
-            .ok_or_else(|| HeapError::BadName {
-                name: space.clone(),
-                why: "a space is `<owner>/32=data/<name>`".into(),
-            })?
+            .ok_or_else(|| HeapError::not_a_space(&space))?
             .owner;
         let head = Self::stored_head(&*store, &space, &device)?;
         let reservation = Reservation::open(Arc::clone(&store), flusher, &space, block, head)?;
         let key_digest = signer
             .public_key()
             .map(|k| public_key_digest(&k))
-            .ok_or_else(|| HeapError::Local {
-                reason: format!("the device key {} has no public key", signer.key_name()),
+            .ok_or_else(|| {
+                HeapError::local(format!(
+                    "the device key {} has no public key",
+                    signer.key_name()
+                ))
             })?;
         let mut log = Log {
             key: signer.key_name().clone(),

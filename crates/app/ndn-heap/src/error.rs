@@ -286,6 +286,21 @@ pub enum HeapError {
 }
 
 impl HeapError {
+    /// A local failure, storage or keys: `reason` says what failed.
+    pub(crate) fn local(reason: impl fmt::Display) -> HeapError {
+        HeapError::Local {
+            reason: reason.to_string(),
+        }
+    }
+
+    /// `name` is no space name: a space is `<owner>/32=data/<name>`.
+    pub(crate) fn not_a_space(name: &Name) -> HeapError {
+        HeapError::BadName {
+            name: name.clone(),
+            why: "a space is `<owner>/32=data/<name>`".into(),
+        }
+    }
+
     /// Whether the same call, unchanged, can succeed later.
     pub fn retry(&self) -> bool {
         self.next() == NextStep::RetryLater

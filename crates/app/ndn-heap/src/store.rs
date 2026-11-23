@@ -218,9 +218,7 @@ impl std::fmt::Display for Corrupt {
 
 impl From<Corrupt> for HeapError {
     fn from(why: Corrupt) -> HeapError {
-        HeapError::Local {
-            reason: why.to_string(),
-        }
+        HeapError::local(why)
     }
 }
 

@@ -70,14 +70,12 @@ struct Facts {
 
 impl Facts {
     fn absorb(&mut self, carrier: &EntryRef, body: &MembersBody) {
-        if let Some(anyone) = body.create {
-            let better = match &self.create {
-                None => true,
-                Some((held, held_anyone)) => (rank(carrier), anyone) < (rank(held), *held_anyone),
-            };
-            if better {
-                self.create = Some((carrier.clone(), anyone));
-            }
+        if let Some(anyone) = body.create
+            && self.create.as_ref().is_none_or(|(held, held_anyone)| {
+                (rank(carrier), anyone) < (rank(held), *held_anyone)
+            })
+        {
+            self.create = Some((carrier.clone(), anyone));
         }
         for op in &body.ops {
             match op {
@@ -87,10 +85,8 @@ impl Facts {
                     role,
                     epoch,
                 } => {
-                    let better = match self.adds.get(id) {
-                        None => true,
-                        Some(held) => rank(carrier) < rank(&held.carrier),
-                    };
+                    let better =
+                        (self.adds.get(id)).is_none_or(|held| rank(carrier) < rank(&held.carrier));
                     if better {
                         self.adds.insert(
                             *id,
@@ -178,15 +174,12 @@ impl Fold {
             body: body.clone(),
             replaces,
         };
-        match self.epochs.get_mut(&id) {
-            None => {
-                self.epochs.insert(id, new);
-            }
-            Some(held) => {
-                if new.rank() < held.rank() {
-                    *held = new;
-                }
-            }
+        if self
+            .epochs
+            .get(&id)
+            .is_none_or(|held| new.rank() < held.rank())
+        {
+            self.epochs.insert(id, new);
         }
     }
 

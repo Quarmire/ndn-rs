@@ -92,9 +92,7 @@ impl Log {
             .keys
             .record(&self.space, &epoch)
             .expect("the key was just held")
-            .map_err(|e| HeapError::Local {
-                reason: e.to_string(),
-            })?;
+            .map_err(HeapError::local)?;
         let body = Body::Epoch(wire::EpochBody {
             key_check,
             audience,
@@ -228,12 +226,8 @@ impl Log {
         };
         let content = entry.encode().map_err(|e| wire_error(subject, e))?;
         let name = log_name(&self.device, &self.space, seq);
-        let packet =
-            seal::sign(DataBuilder::new(name.clone(), &content), &*self.signer).map_err(|e| {
-                HeapError::Local {
-                    reason: e.to_string(),
-                }
-            })?;
+        let packet = seal::sign(DataBuilder::new(name.clone(), &content), &*self.signer)
+            .map_err(HeapError::local)?;
         let id = EntryRef {
             device: self.device.clone(),
             seq,

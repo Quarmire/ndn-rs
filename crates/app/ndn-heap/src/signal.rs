@@ -311,10 +311,7 @@ pub(crate) fn signal_scope(log: &Log, judge: &Judge) -> Result<SignalScope, Heap
         true => sealed_keys(log)?,
         false => Vec::new(),
     };
-    let group = sync_group_of(space).ok_or_else(|| HeapError::BadName {
-        name: space.clone(),
-        why: "a space is `<owner>/32=data/<name>`".into(),
-    })?;
+    let group = sync_group_of(space).ok_or_else(|| HeapError::not_a_space(space))?;
     Ok(SignalScope {
         space: space.clone(),
         keys,
@@ -383,9 +380,7 @@ pub(crate) fn signal_header(
         DataBuilder::new(signal_run_name(log.device(), scope, run_id), body),
         signer,
     )
-    .map_err(|e| HeapError::Local {
-        reason: e.to_string(),
-    })
+    .map_err(HeapError::local)
 }
 
 // -- Run headers -------------------------------------------------------------------------

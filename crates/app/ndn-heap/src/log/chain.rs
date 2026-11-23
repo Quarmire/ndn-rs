@@ -146,22 +146,9 @@ impl Ranges {
         self.0.iter().flat_map(|&(lo, hi)| lo..=hi)
     }
 
-    fn put(&self, out: &mut BytesMut) {
-        out.put_u32(self.0.len() as u32);
-        for &(lo, hi) in &self.0 {
-            out.put_u64(lo);
-            out.put_u64(hi);
-        }
-    }
-
     fn take(input: &mut Bytes) -> Option<Ranges> {
-        let n = take_u32(input)? as usize;
-        if input.remaining() < n.checked_mul(16)? {
-            return None;
-        }
         let mut ranges = Ranges::default();
-        for _ in 0..n {
-            let (lo, hi) = (input.get_u64(), input.get_u64());
+        for (lo, hi) in take_pairs(input)? {
             if lo > hi || ranges.max().is_some_and(|m| lo <= m.saturating_add(1)) {
                 return None;
             }
@@ -171,8 +158,22 @@ impl Ranges {
     }
 }
 
-fn take_u32(input: &mut Bytes) -> Option<u32> {
-    (input.remaining() >= 4).then(|| input.get_u32())
+/// A count, then that many pairs of `u64`: how a `ledger/` record keeps
+/// ranges and gaps.
+fn put_pairs(out: &mut BytesMut, pairs: impl ExactSizeIterator<Item = (u64, u64)>) {
+    out.put_u32(pairs.len() as u32);
+    for (a, b) in pairs {
+        out.put_u64(a);
+        out.put_u64(b);
+    }
+}
+
+fn take_pairs(input: &mut Bytes) -> Option<Vec<(u64, u64)>> {
+    let n = (input.remaining() >= 4).then(|| input.get_u32())? as usize;
+    if input.remaining() < n.checked_mul(16)? {
+        return None;
+    }
+    Some((0..n).map(|_| (input.get_u64(), input.get_u64())).collect())
 }
 
 /// What the log keeps of one device of the space.
@@ -237,12 +238,8 @@ impl Dev {
         let mut out = BytesMut::new();
         out.put_u16(person.len() as u16);
         out.put_slice(&person);
-        self.held.put(&mut out);
-        out.put_u32(self.gaps.len() as u32);
-        for (&seq, &prev_seq) in &self.gaps {
-            out.put_u64(seq);
-            out.put_u64(prev_seq);
-        }
+        put_pairs(&mut out, self.held.0.iter().copied());
+        put_pairs(&mut out, self.gaps.iter().map(|(&seq, &prev)| (seq, prev)));
         out.freeze()
     }
 
@@ -259,26 +256,18 @@ impl Dev {
         }
         let person = Name::decode_from_tlv(input.split_to(len)).ok()?;
         let held = Ranges::take(&mut input)?;
-        let n = take_u32(&mut input)? as usize;
-        if input.remaining() < n.checked_mul(16)? {
-            return None;
-        }
         let mut gaps = BTreeMap::new();
-        for _ in 0..n {
-            let (seq, prev_seq) = (input.get_u64(), input.get_u64());
+        for (seq, prev_seq) in take_pairs(&mut input)? {
             if prev_seq.checked_add(1)? >= seq || gaps.insert(seq, prev_seq).is_some() {
                 return None;
             }
         }
-        let high = held.max().unwrap_or(0);
         Some(Dev {
-            person,
+            high: held.max().unwrap_or(0),
             held,
             voids: gap_ranges(&gaps),
             gaps,
-            high,
-            tip: None,
-            nonvouching: 0,
+            ..Dev::new(person)
         })
     }
 }

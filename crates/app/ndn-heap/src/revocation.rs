@@ -226,19 +226,19 @@ pub(crate) fn propose(
              operator find which certificate is genuine"
         )));
     }
-    let key_digest = match public.into_iter().next() {
-        Some(digest) => digest,
-        None => match (authority.certified.len(), authority.certified.first()) {
-            (1, Some(digest)) => *digest,
-            _ => {
-                return Err(bad(format!(
-                    "no entry of {key} that this node would keep names the public key that \
-                     verified it, and the certificates held of the key do not name exactly \
-                     one public key; revoke the key without a cut"
-                )));
-            }
-        },
-    };
+    let key_digest = *public
+        .first()
+        .or_else(|| {
+            let certified = &authority.certified;
+            certified.first().filter(|_| certified.len() == 1)
+        })
+        .ok_or_else(|| {
+            bad(format!(
+                "no entry of {key} that this node would keep names the public key that \
+                 verified it, and the certificates held of the key do not name exactly \
+                 one public key; revoke the key without a cut"
+            ))
+        })?;
     let mut cut = RevocationCut::new(key.clone());
     for (prefix, seq, _) in &entries {
         cut.add_seq(prefix, *seq);
@@ -248,12 +248,10 @@ pub(crate) fn propose(
         Vec::new()
     } else {
         let built = cut_manifest::build(&authority.namespace, &key, &entries).map_err(|e| {
-            HeapError::Local {
-                reason: format!("the cut's manifest of {key} is not made: {e}"),
-            }
+            HeapError::local(format!("the cut's manifest of {key} is not made: {e}"))
         })?;
-        cut.set_manifest(built.root).map_err(|e| HeapError::Local {
-            reason: format!("the cut's manifest of {key} is not named: {e}"),
+        cut.set_manifest(built.root).map_err(|e| {
+            HeapError::local(format!("the cut's manifest of {key} is not named: {e}"))
         })?;
         built.packets
     };

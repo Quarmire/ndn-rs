@@ -69,9 +69,7 @@ impl std::fmt::Display for FlushError {
 
 impl From<FlushError> for HeapError {
     fn from(why: FlushError) -> HeapError {
-        HeapError::Local {
-            reason: why.to_string(),
-        }
+        HeapError::local(why)
     }
 }
 
