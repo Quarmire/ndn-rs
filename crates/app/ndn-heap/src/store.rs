@@ -221,22 +221,6 @@ pub(crate) fn parse_ledger_key(space: &Name, key: &Name) -> Option<Name> {
     parse_device_key("ledger", space, key)
 }
 
-/// The seqs a removal cut keeps of one device (chain ancestry of its tips):
-/// `kept/<S>/<device>`.
-pub(crate) fn kept_key(space: &Name, device: &Name) -> Name {
-    device_key("kept", space, device)
-}
-
-/// Every [`kept_key`] of `space` has this prefix.
-pub(crate) fn kept_prefix(space: &Name) -> Name {
-    seq_prefix("kept", space)
-}
-
-/// The device a [`kept_key`] of `space` names.
-pub(crate) fn parse_kept_key(space: &Name, key: &Name) -> Option<Name> {
-    parse_device_key("kept", space, key)
-}
-
 /// Why a held entry is not applied: `status/<S>/<device>/<seq 8>`. Absent
 /// for an applied entry.
 pub(crate) fn status_key(space: &Name, device: &Name, seq: u64) -> Name {

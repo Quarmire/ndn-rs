@@ -672,8 +672,6 @@ impl Log {
         if (kept.ranges.clone(), kept.frontier.clone()) == before {
             return;
         }
-        self.store
-            .insert(store::kept_key(&self.space, device), kept.record());
         fx.wants.extend(frontier_wants(device, kept));
         self.queue.push(Scope::Waiting(device.clone()));
     }
@@ -936,7 +934,8 @@ impl Log {
     }
 
     /// The cut of each removed device: kept as long as the tips the fold says
-    /// are its tips, else computed again.
+    /// are its tips, else computed again from the markers. Nothing of a cut
+    /// is stored: [`Log::open`] computes them all.
     pub(super) fn sync_kept(&mut self, fx: &mut Effects) {
         let mut want: std::collections::BTreeMap<Name, Vec<Link>> = Default::default();
         for (_, tips) in self.fold.removed_writers() {
@@ -951,23 +950,12 @@ impl Log {
             tips.sort_by_key(|l| l.seq);
             tips.dedup();
         }
-        let stale: Vec<Name> = self
-            .kept
-            .keys()
-            .filter(|d| !want.contains_key(*d))
-            .cloned()
-            .collect();
-        for device in stale {
-            self.kept.remove(&device);
-            self.store.remove(&store::kept_key(&self.space, &device));
-        }
+        self.kept.retain(|device, _| want.contains_key(device));
         for (device, tips) in want {
             if self.kept.get(&device).is_some_and(|k| k.tips == tips) {
                 continue;
             }
             let kept = Kept::compute(&*self.store, &device, &self.space, tips);
-            self.store
-                .insert(store::kept_key(&self.space, &device), kept.record());
             fx.wants.extend(frontier_wants(&device, &kept));
             self.kept.insert(device, kept);
         }

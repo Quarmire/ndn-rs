@@ -627,8 +627,10 @@ with exactly those bytes, and it is asked for by that exact digest (§7);
 everything below a frontier is **waiting**, never accepted. Once a walk has
 reached genesis, what it did not reach is not kept: an orphan inside a gap
 that the chain jumps over, anything above a tip, anything before a zero form.
-The kept set is computed once per removal and recomputed when the tips change,
-and is stored (`kept/…`, §4.3).
+The kept set is computed once per removal, extended as the entries of its
+chain arrive, and recomputed when the tips change. It is **not stored**: a
+node computes it again at open, from the tips the fold says and the `verified/`
+markers alone, which gives the same set and the same frontier (§4.3).
 
 **Re-check and withdrawal.** Every change of what decides admission (a
 `Members` or `Epoch` entry, an adopted trust context or person, a revocation, a
@@ -756,7 +758,6 @@ big-endian, so keys order numerically. Other names are appended as components.
 | `suspected/<key name>` | `since` 8 octets, big-endian, ms (`Config.clock`) | when a key is suspected; one record per key, for the whole node: one map shared by every space's log, read once at start |
 | `scoped/<person>` | the adopted trust context of a person (§9.4) | on adoption |
 | `ledger/<S as TLV component>/<device as TLV component>` | what the node holds of one device: the length (2 octets) and the `Name` TLV of its person ‖ the seqs held as a count (4 octets) then `(low 8, high 8)` ranges, ascending, disjoint, non-adjacent ‖ the **counting gap statements** (§3.6) as a count (4 octets) then `(seq 8, prev seq 8)`, ascending; the seqs declared void are derived from them. At most 1,024 ranges and 1,024 gap statements (§3.8) | with every entry taken, and when a gap statement stops or starts counting |
-| `kept/<S as TLV component>/<device as TLV component>` | what the removal cut keeps of one device (§3.8): count 4 ‖ tips `(seq 8 ‖ digest 32)`*, count 4 ‖ frontier `(seq 8 ‖ digest 32)`*, then the seqs reached as ranges | when a removal is applied and as its chain is walked |
 | `status/<S as TLV component>/<device as TLV component>/<seq 8>` | why a held entry is not applied, one octet then its datum: 1 closed, 2 waiting, 3 not readable, 4 `NotMember`, 5 `OutsideCut` (keeps-to seq 8), 6 `Unsealed`, 7 `Sealed`, 8 `Untrusted` (the reason, UTF-8), 10 `Chain`, 11 any other (read back as `BadSignature`); absent for an applied entry | with the entry |
 
 A record the store holds that cannot be read (wrong length, a clean flag other

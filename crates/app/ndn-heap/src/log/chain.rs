@@ -176,21 +176,6 @@ fn take_u32(input: &mut Bytes) -> Option<u32> {
     (input.remaining() >= 4).then(|| input.get_u32())
 }
 
-fn take_link(input: &mut Bytes) -> Option<Link> {
-    if input.remaining() < 40 {
-        return None;
-    }
-    let seq = input.get_u64();
-    let mut digest = [0; 32];
-    input.copy_to_slice(&mut digest);
-    Some(Link { seq, digest })
-}
-
-fn put_link(out: &mut BytesMut, link: &Link) {
-    out.put_u64(link.seq);
-    out.put_slice(&link.digest);
-}
-
 /// What the log keeps of one device of the space.
 #[derive(Clone, Debug)]
 pub(super) struct Dev {
@@ -506,36 +491,5 @@ impl Kept {
         } else {
             Keeps::No
         }
-    }
-
-    /// The `kept/<S>/<device>` record.
-    pub(super) fn record(&self) -> Bytes {
-        let mut out = BytesMut::new();
-        out.put_u32(self.tips.len() as u32);
-        for t in &self.tips {
-            put_link(&mut out, t);
-        }
-        out.put_u32(self.frontier.len() as u32);
-        for f in &self.frontier {
-            put_link(&mut out, f);
-        }
-        self.ranges.put(&mut out);
-        out.freeze()
-    }
-
-    pub(super) fn from_record(record: &Bytes) -> Option<Kept> {
-        let mut input = record.clone();
-        let links = |input: &mut Bytes| {
-            let n = take_u32(input)? as usize;
-            (0..n).map(|_| take_link(input)).collect::<Option<Vec<_>>>()
-        };
-        let tips = links(&mut input)?;
-        let frontier = links(&mut input)?;
-        let ranges = Ranges::take(&mut input)?;
-        Some(Kept {
-            tips,
-            frontier,
-            ranges,
-        })
     }
 }

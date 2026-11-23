@@ -10,7 +10,7 @@
 //! **One write, one batch.** A method that stores opens a [`Stage`] batch
 //! around everything it writes (the entry at its own name, its `verified/`
 //! marker, `ledger/`, `status/`, `head/`, `heads/`, `supers/`, `structural/`,
-//! `epoch/`, `kept/`) and the batch reaches the store as ONE
+//! `epoch/`) and the batch reaches the store as ONE
 //! `DataStore::apply` before the method returns. So the log's [`Effects`]
 //! carry no store ops: they are already written; the node takes its flush
 //! ticket after the call (`Flusher::note_write`) and routes
@@ -27,7 +27,8 @@
 //!    own device's `ledger/` record ([`Log::stored_head`]: it lists every
 //!    stored own entry, decoding or not, and is one read); `structural/`
 //!    replay rebuilds the [`Fold`]; `epoch/` keys into [`Keys`]; `heads/`
-//!    into the [`Register`]; `ledger/` and `kept/`; `suspected/`.
+//!    into the [`Register`]; `ledger/`; the cut of each removed device is
+//!    computed again from the `verified/` markers (none is stored).
 //! 2. **Own write** ([`Log::put`], [`Log::sign_members`], [`Log::sign_epoch`],
 //!    plan "Own put"): the seq is the next above the head, gated by
 //!    [`Reservation::sign_gate`] (the node waits for [`Step::Wait`] outside
@@ -85,9 +86,8 @@ use crate::reserve::{Flusher, Gate, Reservation, Ticket};
 use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
 use crate::store::{
-    self, Corrupt, Link, Marker, Stage, epoch_prefix, heads_prefix, kept_prefix, ledger_key,
-    ledger_prefix, parse_epoch_key, parse_kept_key, parse_ledger_key, parse_structural_key,
-    status_prefix, structural_prefix,
+    self, Corrupt, Link, Marker, Stage, epoch_prefix, heads_prefix, ledger_key, ledger_prefix,
+    parse_epoch_key, parse_ledger_key, parse_structural_key, status_prefix, structural_prefix,
 };
 use crate::trust::Verified;
 use crate::wire::{
@@ -476,7 +476,7 @@ impl Log {
         log.replay_structural();
         log.restore_keys();
         log.restore_register()?;
-        log.restore_cuts();
+        log.sync_kept(&mut Effects::default());
         log.restore_own_tip(head);
         Ok(log)
     }
@@ -577,23 +577,6 @@ impl Log {
         }
         self.register = restored.register;
         Ok(())
-    }
-
-    /// The cuts of removed devices: the records agree with the fold or are
-    /// computed again.
-    fn restore_cuts(&mut self) {
-        for (key, record) in self.store.scan_under(&kept_prefix(&self.space), 0) {
-            if let (Some(device), Some(kept)) = (
-                parse_kept_key(&self.space, &key),
-                Kept::from_record(&record),
-            ) {
-                self.kept.insert(device, kept);
-            }
-        }
-        let mut fx = Effects::default();
-        let batch = Arc::clone(&self.store);
-        let _batch = batch.batch();
-        self.sync_kept(&mut fx);
     }
 
     /// The own tip: the newest own entry held.

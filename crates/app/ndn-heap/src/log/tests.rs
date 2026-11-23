@@ -1394,6 +1394,41 @@ async fn an_owners_removal_binds_what_it_holds_and_the_cut_survives_a_restart() 
     }
 }
 
+/// The cut is computed again from the markers at open (nothing of it is
+/// stored), so a chain that was not whole when the device stopped is found
+/// again with the same exact wants, and walks on as its links arrive.
+#[tokio::test]
+async fn a_cut_whose_chain_is_not_whole_is_walked_again_after_a_restart() {
+    let me = laptop();
+    let mut r = rig(&me);
+    r.members(members(Some(true), vec![add(1, "/bob", Role::Writer)]))
+        .await;
+    let mut b = Chain::new(&bob());
+    let (p1, p2, p3) = (b.put("/p1", "1"), b.put("/p2", "2"), b.put("/p3", "3"));
+    r.applied(&p3);
+    let ops = r.log.remove_ops(&n("/bob"));
+    assert_eq!(ops, vec![remove(1, vec![p3.entry_ref()])]);
+    r.members(members(None, ops)).await;
+    r.flusher.flush().await.unwrap();
+
+    let image = r.crash();
+    let want = |p: &Packet| Want {
+        device: bob().name,
+        first: p.seq,
+        last: p.seq,
+        digest: Some(p.digest),
+    };
+    for mut again in [r, open_on(&image, &me)] {
+        assert!(again.log.missing().contains(&want(&p2)));
+        again.applied(&p2);
+        assert!(again.log.missing().contains(&want(&p1)));
+        assert!(!again.log.missing().contains(&want(&p2)));
+        again.applied(&p1);
+        assert!(again.log.missing().iter().all(|w| w.digest.is_none()));
+        assert_eq!(again.value("/p1").as_deref(), Some("1"));
+    }
+}
+
 #[tokio::test]
 async fn a_withdrawn_entry_is_taken_back_only_when_offered_again_and_verified() {
     let mut r = rig(&carol());
