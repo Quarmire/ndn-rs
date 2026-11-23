@@ -371,7 +371,7 @@ impl Log {
             }
             // The durable `R` an earlier run left, not the extension this
             // run wrote at open.
-            let reserved = self.floor_r;
+            let reserved = self.reservation.floor_r;
             if id.seq > reserved {
                 fx.alerts.push(Alert::RolledBack {
                     reserved,

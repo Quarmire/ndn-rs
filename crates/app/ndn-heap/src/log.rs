@@ -383,11 +383,8 @@ pub(crate) struct Log {
     next_seq: u64,
     /// The highest seq under this device's name in the store, whatever it is.
     own_head: u64,
-    /// The durable `R` the previous run left (read before this run's
-    /// extension): the highest seq an earlier run could have signed.
-    floor_r: u64,
     /// The highest counter heard of this device's own name: unsigned, so
-    /// believed only as far as `floor_r` ([`Self::high`]).
+    /// believed only as far as `reservation.floor_r` ([`Self::high`]).
     own_heard: u64,
     /// The entry the next own entry chains to: the newest own entry applied.
     own_tip: Option<Link>,
@@ -425,10 +422,7 @@ impl Log {
             .owner;
         let local = |why: String| HeapError::Local { reason: why };
         let head = Self::stored_head(&*store, &space, &device)?;
-        let floor_r = store::read_reserve(&*store, &space)
-            .map_err(|e| local(e.to_string()))?
-            .map_or(0, |r| r.r);
-        let opened = Reservation::open(Arc::clone(&store), flusher, &space, block, head)
+        let reservation = Reservation::open(Arc::clone(&store), flusher, &space, block, head)
             .map_err(|e| local(e.to_string()))?;
         let key_digest = signer
             .public_key()
@@ -444,10 +438,9 @@ impl Log {
             key_digest,
             fold: Fold::new(owner),
             register: Register::new(space.clone()),
-            reservation: Arc::new(opened.reservation),
-            next_seq: opened.resume.first_seq,
+            next_seq: reservation.first_seq,
+            reservation: Arc::new(reservation),
             own_head: head,
-            floor_r,
             own_heard: 0,
             own_tip: None,
             devices: BTreeMap::new(),
@@ -631,6 +624,11 @@ impl Log {
         &self.reservation
     }
 
+    /// Whether the last run left the space without a clean close.
+    pub(crate) fn unclean(&self) -> bool {
+        !self.reservation.clean
+    }
+
     /// The highest seq under this device's name in the store, 0 for none.
     pub(crate) fn head(&self) -> u64 {
         self.own_head
@@ -809,7 +807,7 @@ impl Log {
     pub(crate) fn high(&self, device: &Name) -> u64 {
         let held = self.devices.get(device).map_or(0, |d| d.high);
         if *device == self.device {
-            held.max(self.own_heard.min(self.floor_r))
+            held.max(self.own_heard.min(self.reservation.floor_r))
         } else {
             held
         }

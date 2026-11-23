@@ -308,41 +308,6 @@ pub(crate) enum Gate {
     Closed,
 }
 
-/// Where a space's own log resumes after [`Reservation::open`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Resume {
-    /// The seq of the first entry to sign: above the head and above `R`.
-    pub first_seq: u64,
-    /// The own head the resume point was computed from.
-    pub adopted_head: u64,
-    /// Whether the last run closed cleanly with `R` at the head (a clean
-    /// start has no hole and says nothing).
-    pub clean: bool,
-}
-
-#[cfg(test)]
-impl Resume {
-    /// Whether seqs lie between the adopted head and the first entry: the
-    /// first entry then carries a signed gap statement.
-    pub(crate) fn has_gap(&self) -> bool {
-        self.first_seq != self.adopted_head + 1
-    }
-
-    /// The `PREV_SEQ` of the first entry: the adopted head it chains to,
-    /// when there is a gap (0 with the zero digest if nothing is held).
-    pub(crate) fn prev_seq(&self) -> Option<u64> {
-        self.has_gap().then_some(self.adopted_head)
-    }
-}
-
-/// A reservation opened, and where to resume.
-pub(crate) struct Opened {
-    /// The reservation of the (device, space).
-    pub reservation: Reservation,
-    /// Where the log resumes.
-    pub resume: Resume,
-}
-
 struct ReserveState {
     /// The `R` written, durable or not.
     r: u64,
@@ -365,6 +330,14 @@ pub(crate) struct Reservation {
     store: Arc<dyn DataStore>,
     flusher: Arc<Flusher>,
     st: Mutex<ReserveState>,
+    /// The seq of the first entry to sign: above the head and above `R`.
+    pub(crate) first_seq: u64,
+    /// The `R` the previous run left, read before this run's extension: the
+    /// highest seq an earlier run could have signed.
+    pub(crate) floor_r: u64,
+    /// Whether the last run closed cleanly with `R` at the head (a clean
+    /// start has no hole and says nothing).
+    pub(crate) clean: bool,
 }
 
 impl Reservation {
@@ -393,14 +366,12 @@ impl Reservation {
         space: &Name,
         block: u64,
         adopted_head: u64,
-    ) -> Result<Opened, Corrupt> {
+    ) -> Result<Reservation, Corrupt> {
         let reserve = read_reserve(&*store, space)?;
         let head = read_head(&*store, space)?.map_or(0, |h| h.seq);
         let recorded = reserve.map_or(0, |r| r.r);
         let uncovered = flusher.unflushed();
-        let clean = reserve.is_some_and(|r| r.clean && r.r == head) && adopted_head == head;
         let above = adopted_head.max(recorded);
-        let first_seq = above.saturating_add(1);
         let reservation = Reservation {
             space: space.clone(),
             block,
@@ -415,28 +386,25 @@ impl Reservation {
                     .collect(),
                 closed: false,
             }),
+            first_seq: above.saturating_add(1),
+            floor_r: recorded,
+            clean: reserve.is_some_and(|r| r.clean && r.r == head) && adopted_head == head,
         };
-        {
-            let mut st = reservation.st.lock();
-            let r = above.saturating_add(block);
-            reservation.write(&mut st, r);
-        }
-        Ok(Opened {
-            reservation,
-            resume: Resume {
-                first_seq,
-                adopted_head,
-                clean,
-            },
-        })
+        reservation.extend(&mut reservation.st.lock(), above.saturating_add(block));
+        Ok(reservation)
     }
 
-    /// Write `reserve/<S> = (r, clean 0)` and ask for its flush.
-    fn write(&self, st: &mut ReserveState, r: u64) {
-        let record = ReserveRecord { r, clean: false };
+    /// Write `reserve/<S> = (r, clean)` and ask for its flush.
+    fn put(&self, r: u64, clean: bool) -> Ticket {
+        let record = ReserveRecord { r, clean };
         self.store
             .insert(Kind::RESERVE.of(&self.space), record.encode());
-        let ticket = self.flusher.note_write();
+        self.flusher.note_write()
+    }
+
+    /// Reserve up to `r`, not durable until the flush of its write returns.
+    fn extend(&self, st: &mut ReserveState, r: u64) {
+        let ticket = self.put(r, false);
         st.r = r;
         st.pending.push_back((ticket, r));
     }
@@ -483,7 +451,7 @@ impl Reservation {
         let failure = self.flusher.failure();
         if failure.is_none() && seq > st.r.saturating_sub(self.block / 2) {
             let r = st.r.max(seq).saturating_add(self.block);
-            self.write(&mut st, r);
+            self.extend(&mut st, r);
         }
         if seq <= st.durable_r {
             return Gate::Ok;
@@ -518,20 +486,8 @@ impl Reservation {
     /// `head + 1` with no hole. `head` is the own head seq, the one in
     /// `head/<S>`.
     pub(crate) async fn close_clean(&self, head: u64) -> Result<(), FlushError> {
-        let ticket = {
-            let mut st = self.st.lock();
-            st.closed = true;
-            self.store.insert(
-                Kind::RESERVE.of(&self.space),
-                ReserveRecord {
-                    r: head,
-                    clean: true,
-                }
-                .encode(),
-            );
-            self.flusher.note_write()
-        };
-        self.flusher.wait_durable(ticket).await
+        self.st.lock().closed = true;
+        self.flusher.wait_durable(self.put(head, true)).await
     }
 }
 

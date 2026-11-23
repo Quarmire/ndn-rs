@@ -14,7 +14,11 @@ fn space() -> Name {
     n("/alice/32=data/notes")
 }
 
-fn open_on(store: &Arc<impl DataStore + 'static>, flusher: &Arc<Flusher>, adopted: u64) -> Opened {
+fn open_on(
+    store: &Arc<impl DataStore + 'static>,
+    flusher: &Arc<Flusher>,
+    adopted: u64,
+) -> Reservation {
     Reservation::open(
         Arc::clone(store) as Arc<dyn DataStore>,
         Arc::clone(flusher),
@@ -46,9 +50,8 @@ async fn never_signs_above_r_durable() {
     // a reservation covering `seq`.
     let store = Arc::new(CrashStore::new());
     let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
-    let opened = open_on(&store, &flusher, 0);
-    assert_eq!(opened.resume.first_seq, 1);
-    let res = opened.reservation;
+    let res = open_on(&store, &flusher, 0);
+    assert_eq!(res.first_seq, 1);
     for seq in 1..=60 {
         res.clear_to_sign(seq).await.unwrap();
         let on_disk = record(&store.crash());
@@ -64,7 +67,7 @@ async fn never_signs_above_r_durable() {
     // it, whatever R says in memory.
     let store = Arc::new(Held::default());
     let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
-    let res = open_on(&store, &flusher, 0).reservation;
+    let res = open_on(&store, &flusher, 0);
     let holding = store.hold();
     assert!(
         matches!(res.sign_gate(1), Gate::Wait(_)),
@@ -98,7 +101,7 @@ async fn never_signs_above_r_durable() {
 async fn extension_is_requested_at_half_a_block() {
     let store = Arc::new(CrashStore::new());
     let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
-    let res = open_on(&store, &flusher, 0).reservation;
+    let res = open_on(&store, &flusher, 0);
     assert_eq!(
         record(&*store),
         ReserveRecord {
@@ -160,7 +163,7 @@ async fn a_clean_close_marks_clean_and_an_unclean_open_resumes_above_r() {
     // with no gap.
     let store = Arc::new(CrashStore::new());
     let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
-    let res = open_on(&store, &flusher, 0).reservation;
+    let res = open_on(&store, &flusher, 0);
     for seq in 1..=3 {
         res.clear_to_sign(seq).await.unwrap();
     }
@@ -179,17 +182,15 @@ async fn a_clean_close_marks_clean_and_an_unclean_open_resumes_above_r() {
         &Flusher::spawn(Arc::clone(&disk) as Arc<dyn DataStore>),
         3,
     );
-    assert!(again.resume.clean);
-    assert_eq!(again.resume.first_seq, 4);
-    assert!(!again.resume.has_gap());
-    assert_eq!(again.resume.prev_seq(), None);
+    assert!(again.clean);
+    assert_eq!(again.first_seq, 4);
 
     // Unclean: the process stops with R above the head. The next open
     // resumes above R and says it skipped seqs 4..=8: the signed gap
     // statement names the entry it chains to.
     let store = Arc::new(CrashStore::new());
     let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
-    let res = open_on(&store, &flusher, 0).reservation;
+    let res = open_on(&store, &flusher, 0);
     for seq in 1..=3 {
         res.clear_to_sign(seq).await.unwrap();
     }
@@ -210,14 +211,9 @@ async fn a_clean_close_marks_clean_and_an_unclean_open_resumes_above_r() {
         &Flusher::spawn(Arc::clone(&disk) as Arc<dyn DataStore>),
         3,
     );
-    assert!(!again.resume.clean);
-    assert_eq!(
-        again.resume.first_seq,
-        BLOCK + 1,
-        "above R, never at head + 1"
-    );
-    assert!(again.resume.has_gap());
-    assert_eq!(again.resume.prev_seq(), Some(3));
+    assert!(!again.clean);
+    assert_eq!(again.first_seq, BLOCK + 1, "above R, never at head + 1");
+    assert_ne!(again.first_seq, 3 + 1, "seqs lie between head 3 and it");
     assert_eq!(
         record(&*disk),
         ReserveRecord {
@@ -259,9 +255,9 @@ async fn open_is_clean_only_when_the_record_says_so_and_r_is_the_head() {
         let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
         let opened = open_on(&store, &flusher, adopted);
         let why = format!("reserve {reserve:?}, head {head}, names {adopted}");
-        assert_eq!(opened.resume.clean, clean, "{why}");
-        assert_eq!(opened.resume.first_seq, first, "{why}");
-        assert_eq!(opened.resume.has_gap(), gap, "{why}");
+        assert_eq!(opened.clean, clean, "{why}");
+        assert_eq!(opened.first_seq, first, "{why}");
+        assert_eq!(opened.first_seq != adopted + 1, gap, "{why}");
         let r = reserve.map_or(0, |(r, _)| r);
         assert_eq!(
             record(&*store),
@@ -296,7 +292,7 @@ async fn a_failed_flush_is_sticky_and_refuses_signing_past_r_durable_with_the_di
  {
     let store = Arc::new(CrashStore::new());
     let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
-    let res = open_on(&store, &flusher, 0).reservation;
+    let res = open_on(&store, &flusher, 0);
     res.clear_to_sign(1).await.unwrap();
     assert_eq!(res.durable_r(), BLOCK);
 
@@ -519,7 +515,7 @@ async fn a_structural_entry_is_never_released_when_its_flush_fails() {
 async fn a_reopen_in_the_same_process_trusts_only_an_r_a_flush_covered() {
     let store = Arc::new(CrashStore::new());
     let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
-    let first = open_on(&store, &flusher, 0).reservation;
+    let first = open_on(&store, &flusher, 0);
     first.clear_to_sign(1).await.unwrap();
     let holding = store.hold();
     // Past half a block: R + block is written, and the flush is held.
@@ -528,7 +524,7 @@ async fn a_reopen_in_the_same_process_trusts_only_an_r_a_flush_covered() {
     assert_eq!(record(&store.crash()).r, BLOCK, "the disk holds one block");
     drop(first);
 
-    let again = open_on(&store, &flusher, BLOCK / 2 + 1).reservation;
+    let again = open_on(&store, &flusher, BLOCK / 2 + 1);
     for seq in BLOCK + 1..=2 * BLOCK {
         assert!(
             !matches!(again.sign_gate(seq), Gate::Ok),
@@ -549,14 +545,7 @@ async fn a_head_at_the_largest_seq_does_not_overflow_the_reservation() {
     // Review L8: `max(head, R) + 1` and `R + block` on a seq a peer chose.
     let store = Arc::new(CrashStore::new());
     let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
-    let opened = open_on(&store, &flusher, u64::MAX);
-    assert_eq!(
-        opened.resume.first_seq,
-        u64::MAX,
-        "there is no seq above it"
-    );
-    assert!(matches!(
-        opened.reservation.sign_gate(u64::MAX),
-        Gate::Ok | Gate::Wait(_)
-    ));
+    let res = open_on(&store, &flusher, u64::MAX);
+    assert_eq!(res.first_seq, u64::MAX, "there is no seq above it");
+    assert!(matches!(res.sign_gate(u64::MAX), Gate::Ok | Gate::Wait(_)));
 }

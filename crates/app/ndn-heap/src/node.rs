@@ -44,7 +44,7 @@ use crate::rt;
 use crate::seal::{self, GrantRefusal, Granter, Keys};
 use crate::serve;
 use crate::space::{Follower, Heap, Share, SpaceInner, check_audience, new_id};
-use crate::store::{self, Kind};
+use crate::store::Kind;
 use crate::sync::{Host, Net, NetConfig, Taken};
 use crate::trust::{Adopter, Adoption, Judge, Judged};
 use crate::wire::{
@@ -558,7 +558,6 @@ impl Drop for Node {
 struct Held {
     log: Log,
     follower: bool,
-    unclean: bool,
 }
 
 impl NodeInner {
@@ -647,15 +646,11 @@ impl NodeInner {
 
     // -- Opening ----------------------------------------------------------------
 
-    /// The log of `space` from the store, and whether the last run left it
-    /// without a clean close.
-    fn open_log(&self, space: &Name) -> Result<(Log, bool), HeapError> {
-        let reserve = store::read_reserve(&*self.store, space).map_err(|e| local(e.to_string()))?;
-        let head = store::read_head(&*self.store, space).map_err(|e| local(e.to_string()))?;
-        let head_seq = head.map_or(0, |h| h.seq);
+    /// The log of `space` from the store.
+    fn open_log(&self, space: &Name) -> Result<Log, HeapError> {
         let recipient =
             seal::recipient_key(&self.keys, &self.device).map_err(|e| local(e.to_string()))?;
-        let log = Log::open(
+        Log::open(
             Params {
                 space: space.clone(),
                 device: self.device.clone(),
@@ -667,10 +662,7 @@ impl NodeInner {
             },
             Arc::clone(&self.store),
             Arc::clone(&self.flusher),
-        )?;
-        // Read before the open above, which writes the next reservation.
-        let clean = reserve.is_some_and(|r| r.clean && r.r == head_seq) && log.head() == head_seq;
-        Ok((log, !clean))
+        )
     }
 
     /// Hold `space` from now on, and join it.
@@ -686,26 +678,18 @@ impl NodeInner {
             Kind::SPACE.of(space),
             Bytes::copy_from_slice(&[if follower { CARRIER } else { MEMBER }]),
         );
-        let (log, unclean) = self.open_log(space)?;
+        let log = self.open_log(space)?;
         self.judge.note(space, &SpaceInner::listing(&log));
         self.flusher.note_write();
-        self.join(Held {
-            log,
-            follower,
-            unclean,
-        })
-        .await
+        self.join(Held { log, follower }).await
     }
 
     /// Join the group of an opened space at its head and take it into the
     /// node; with peers known, wait for them to show what they hold of this
     /// device before anything is signed.
     async fn join(self: &Arc<Self>, held: Held) -> Result<Arc<SpaceInner>, HeapError> {
-        let Held {
-            log,
-            follower,
-            unclean,
-        } = held;
+        let Held { log, follower } = held;
+        let unclean = log.unclean();
         let net = self.net().ok_or_else(|| local("the node is stopped"))?;
         let space = log.space().clone();
         let counter = if follower { 0 } else { log.head() };
@@ -759,11 +743,9 @@ impl NodeInner {
                 tracing::warn!(%space, "a record of a space that is no space name is ignored");
                 continue;
             }
-            let (log, unclean) = self.open_log(&space)?;
             held.push(Held {
-                log,
+                log: self.open_log(&space)?,
                 follower: mode.first() == Some(&CARRIER),
-                unclean,
             });
         }
         for h in &held {
