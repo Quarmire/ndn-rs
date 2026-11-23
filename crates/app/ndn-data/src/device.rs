@@ -92,8 +92,8 @@ use crate::wire::{
     self, Branches, ChunksBody, CutBody, GrantAsk, MembersBody, NodeBody, PieceKind, Record,
     SealedBody, VersionBody, cut_bytes_prefix, device_of, grant_name, log_name, namespace_of,
     node_name, page_name, parse_cut_bytes_name, parse_grant_name, parse_held_name, parse_log_name,
-    parse_piece_name, parse_seal_key_name, parse_summary_name, piece_name, root_name, root_prefix,
-    seal_key_name, seqs_of, subject_namespace,
+    parse_piece_name, parse_seal_key_name, parse_summary_name, piece_name, piece_names, root_name,
+    root_prefix, seal_key_name, seqs_of, subject_namespace,
 };
 use ndn_security::confidentiality::{ContentKey, RecipientKey, Sealed, wrap_ck_to};
 
@@ -281,10 +281,15 @@ struct HeldVersion {
     epoch: Option<Epoch>,
     /// Its payload in pieces, when it travels so (spec §13.1).
     chunks: Option<ChunksBody>,
+    /// Whether `op` is its operation: inline, or in pieces held whole and
+    /// opened ([`open_held`]). A register version applies only opened;
+    /// once applied, an operation in pieces is let go ([`Self::unloaded`])
+    /// and read again from the pieces when needed.
+    opened: bool,
 }
 
 impl HeldVersion {
-    /// A version as held. Its
+    /// A version as held: opened unless its payload is in pieces. Its
     /// digest is the version's ([`Version::digest`], of `wire`).
     fn new(
         version: Version,
@@ -301,8 +306,26 @@ impl HeldVersion {
             wire,
             sealed,
             epoch,
+            opened: chunks.is_none(),
             chunks,
         }
+    }
+
+    /// This version without its operation in memory, when that travels in
+    /// pieces and is in memory: what is applied needs no operation until
+    /// the state is computed anew, which opens it again from the pieces.
+    /// `None` when there is nothing to let go.
+    fn unloaded(&self) -> Option<Self> {
+        (self.chunks.is_some() && self.opened).then(|| HeldVersion {
+            version: self.version.clone(),
+            op: Bytes::new(),
+            wire: self.wire.clone(),
+            digest: self.digest,
+            sealed: self.sealed,
+            epoch: self.epoch.clone(),
+            chunks: self.chunks,
+            opened: false,
+        })
     }
 }
 
@@ -632,6 +655,11 @@ struct Coll {
     /// that its cut does not accept, and that no exact re-admission brought
     /// in, never applies: nothing waits for it.
     revoked: HashMap<Writer, Cut>,
+    /// Pending versions in pieces found not whole: not looked for again
+    /// until their pieces arrive ([`St::pieces_arrived`]) or the state is
+    /// rebuilt, so an arrival costs no scan of every waiting version's
+    /// pieces.
+    unwhole: BTreeSet<VersionId>,
 }
 
 /// What an own version carries, before it is signed.
@@ -1397,6 +1425,17 @@ struct St {
     /// Per group, the collections and folders whose own record in force
     /// names it a reader.
     sealed_to: HashMap<Name, BTreeSet<Subject>>,
+    /// Large versions whose pieces are being fetched.
+    fetching: BTreeSet<Name>,
+    /// Register versions in pieces a fetch found whole: not fetched again
+    /// while they wait to open (for their epoch's key, or to apply).
+    walked: BTreeSet<Name>,
+    /// Register versions in pieces a fetch did not find whole (yet): not
+    /// fetched again until [`Inner::retry_pieces`] asks.
+    unfound: BTreeSet<Name>,
+    /// Of those, how many fetches of each missed in a row: it is asked again
+    /// after [`retry_pause`] of that, while it is still wanted (spec §17.1).
+    piece_misses: HashMap<Name, u32>,
     /// The first log entry taken here at each seq of each key, of any
     /// collection and any kind: a key's log is one sequence (spec §4).
     seqs: HashMap<(Writer, u64), Name>,
@@ -1789,6 +1828,54 @@ fn apply_own(state: &mut (dyn MergeState + 'static), held: &HeldVersion, past: &
     });
 }
 
+/// What opening a version in pieces found.
+enum Opening {
+    /// Whole and opened: its operation.
+    Opened(Bytes),
+    /// The key of its epoch is not held (yet).
+    NoKey,
+    /// A piece is not held yet.
+    Missing,
+    /// Whole, and its payload does not open: its writer signed what does
+    /// not decode.
+    Bad,
+}
+
+/// Open `hv`, a version whose payload travels in pieces, from the pieces
+/// `store` holds (spec §13.1): assembled, each piece checked against its
+/// manifest, and unsealed under its epoch's key from `keys` (looked for
+/// first: it costs no read of the pieces).
+fn open_held(store: &dyn DataStore, keys: &Keys, hv: &HeldVersion) -> Opening {
+    let Some(chunks) = hv.chunks else {
+        return Opening::Missing;
+    };
+    let key = match &hv.epoch {
+        Some(e) => match keys.key(&hv.version.collection, e) {
+            Some(key) => Some(key),
+            None => return Opening::NoKey,
+        },
+        None => None,
+    };
+    let name = &hv.version.name;
+    if !piece_names(name, &chunks).all(|p| store.contains(&p)) {
+        return Opening::Missing;
+    }
+    let Some(payload) = pieces::assemble(name, &chunks, |p| store.get(p)) else {
+        return Opening::Missing;
+    };
+    let op = match key {
+        Some(key) => match seal::open_payload(&key, name, &payload) {
+            Some((_, op)) => op,
+            None => return Opening::Bad,
+        },
+        None => match wire::decode_payload(Bytes::from(payload)) {
+            Ok((_, op)) => op,
+            Err(_) => return Opening::Bad,
+        },
+    };
+    Opening::Opened(op)
+}
+
 /// The folder a collection is in: its name but the last component.
 fn folder_of(c: &Name) -> Name {
     Name::from_components(c.components()[..c.len().saturating_sub(1)].iter().cloned())
@@ -1815,6 +1902,8 @@ struct Run<'a> {
     entries: &'a HashMap<Writer, BTreeSet<u64>>,
     locked: &'a [Locked],
     revoked: &'a HashMap<Writer, Cut>,
+    store: &'a dyn DataStore,
+    keys: &'a Keys,
     state: Option<&'a mut (dyn MergeState + 'static)>,
     versions: &'a mut BTreeMap<VersionId, Arc<HeldVersion>>,
     skipped: &'a mut HashMap<Writer, BTreeSet<u64>>,
@@ -1822,6 +1911,9 @@ struct Run<'a> {
     pending: &'a mut BTreeSet<VersionId>,
     /// The versions held and refused: those refused in this run join them.
     outsiders: &'a mut Vec<Arc<HeldVersion>>,
+    /// Pending versions in pieces found not whole ([`Coll::unwhole`]): not
+    /// looked for again until their pieces arrive.
+    unwhole: &'a mut BTreeSet<VersionId>,
     out: Vec<Ran>,
 }
 
@@ -1844,6 +1936,7 @@ impl Run<'_> {
 
     fn is_ready(&self, id: &VersionId) -> bool {
         self.pending.contains(id)
+            && !self.unwhole.contains(id)
             && self
                 .versions
                 .get(id)
@@ -1962,6 +2055,41 @@ impl Run<'_> {
         }
     }
 
+    /// Open `id` if its payload is in pieces held whole. Whether it is
+    /// opened (`None`: not yet); refused when it does not open.
+    fn whole(&mut self, id: &VersionId) -> Option<bool> {
+        let hv = self.versions.get(id)?;
+        if hv.opened {
+            return Some(true);
+        }
+        match open_held(self.store, self.keys, hv) {
+            Opening::Opened(op) => {
+                let opened = HeldVersion {
+                    version: hv.version.clone(),
+                    op,
+                    wire: hv.wire.clone(),
+                    digest: hv.digest,
+                    sealed: hv.sealed,
+                    epoch: hv.epoch.clone(),
+                    chunks: hv.chunks,
+                    opened: true,
+                };
+                self.versions.insert(id.clone(), Arc::new(opened));
+                Some(true)
+            }
+            Opening::Missing => {
+                self.unwhole.insert(id.clone());
+                None
+            }
+            Opening::NoKey => None,
+            Opening::Bad => {
+                tracing::debug!(?id, "refused: its payload in pieces does not open");
+                self.refuse(id, Refusal::BadSignature);
+                Some(false)
+            }
+        }
+    }
+
     /// Apply `id`, which is ready. Whether anything moved: not while a
     /// parent that applies is not held here yet.
     fn take(&mut self, id: &VersionId) -> bool {
@@ -1971,14 +2099,13 @@ impl Run<'_> {
             self.out.push(Ran::Applied(id.clone()));
             return true;
         }
-        let hv = Arc::clone(&self.versions[id]);
-        if hv.chunks.is_some() {
-            tracing::debug!(?id, "refused: its operation travels in pieces");
-            let why = "a register version carries its bytes in its own record, and this one's \
-                       travel in pieces";
-            self.refuse(id, Refusal::Rule { why: why.into() });
-            return true;
+        // A version in pieces applies once they are held whole and open.
+        match self.whole(id) {
+            None => return false,
+            Some(false) => return true,
+            Some(true) => {}
         }
+        let hv = Arc::clone(&self.versions[id]);
         match self.parents_hold(id) {
             Ok(true) => {}
             Ok(false) => return false,
@@ -2008,6 +2135,10 @@ impl Run<'_> {
             });
         }
         self.pending.remove(id);
+        // Applied, an operation in pieces is not kept in memory.
+        if let Some(unloaded) = hv.unloaded() {
+            self.versions.insert(id.clone(), Arc::new(unloaded));
+        }
         let a = self.applied.entry(id.writer.clone()).or_insert(0);
         *a = (*a).max(id.seq.0);
         self.out.push(Ran::Applied(id.clone()));
@@ -2713,6 +2844,7 @@ impl St {
             Rule::Merge { function } => merge::rule(function).map(|r| r.start()),
             _ => None,
         };
+        coll.unwhole.clear();
         let names: Vec<(VersionId, Name)> = all
             .iter()
             .filter(|hv| delivered.contains(&hv.version.id))
@@ -2913,6 +3045,7 @@ impl St {
             watchers,
             refused,
             store,
+            keys,
             ..
         } = self;
         let Some(coll) = colls.get_mut(c) else {
@@ -2929,6 +3062,7 @@ impl St {
             pending,
             revoked,
             outsiders,
+            unwhole,
             ..
         } = coll;
         let Some(members) = members.as_ref() else {
@@ -2957,15 +3091,20 @@ impl St {
                 entries,
                 locked,
                 revoked,
+                store: &**store,
+                keys,
                 state: state.as_deref_mut(),
                 versions,
                 skipped,
                 applied,
                 pending,
                 outsiders,
+                unwhole,
                 out: Vec::new(),
             }
             .run();
+            // Only what still waits is remembered not whole.
+            unwhole.retain(|id| pending.contains(id));
             for r in ran {
                 match r {
                     Ran::Applied(id) => deliver(&versions[&id], &mut changes),
@@ -3288,6 +3427,54 @@ impl St {
             )));
         }
     }
+
+    /// The versions of register collection `c` in pieces this device is to
+    /// fetch (spec §13.1): pending — admitted and not applied yet — not
+    /// opened, and neither being fetched nor found whole already. Under a
+    /// rule this device does not know, none: it applies nothing.
+    fn wanted_pieces(&self, c: &Name) -> Vec<(Name, ChunksBody)> {
+        let Some(coll) = self.colls.get(c) else {
+            return Vec::new();
+        };
+        if coll.state.is_none() {
+            return Vec::new();
+        }
+        coll.pending
+            .iter()
+            .filter_map(|id| coll.versions.get(id))
+            .filter(|hv| {
+                !hv.opened
+                    && !self.fetching.contains(&hv.version.name)
+                    && !self.walked.contains(&hv.version.name)
+                    && !self.unfound.contains(&hv.version.name)
+            })
+            .filter_map(|hv| Some((hv.version.name.clone(), hv.chunks?)))
+            .collect()
+    }
+
+    /// Every piece of version `v` of `c` was found: a register version
+    /// waiting for them opens and applies once ready.
+    fn pieces_arrived(&mut self, c: &Name, v: &Name) {
+        let merge = self.colls.get(c).is_some_and(|x| x.state.is_some());
+        if !merge {
+            return;
+        }
+        self.walked.insert(v.clone());
+        if let Some(coll) = self.colls.get_mut(c) {
+            coll.unwhole
+                .retain(|id| coll.versions.get(id).is_none_or(|hv| hv.version.name != *v));
+        }
+        self.apply_ready(c, &BTreeSet::new());
+        // Remembered only while it waits unopened.
+        let waits = self.colls.get(c).is_some_and(|x| {
+            x.versions
+                .values()
+                .any(|hv| hv.version.name == *v && !hv.opened && x.pending.contains(&hv.version.id))
+        });
+        if !waits {
+            self.walked.remove(v);
+        }
+    }
 }
 
 impl Device {
@@ -3412,6 +3599,10 @@ impl Device {
                 owed: BTreeMap::new(),
                 to_follow: BTreeSet::new(),
                 sealed_to: HashMap::new(),
+                fetching: BTreeSet::new(),
+                walked: BTreeSet::new(),
+                unfound: BTreeSet::new(),
+                piece_misses: HashMap::new(),
                 seqs: HashMap::new(),
                 equivocal: HashMap::new(),
                 brought: HashMap::new(),
@@ -3547,7 +3738,8 @@ impl Device {
             inner.join(&g).await?;
             inner.publish(&g);
         }
-        inner.fetch_wanted_bytes();
+        // Register versions in pieces held from before wait for them.
+        inner.fetch_wanted(true);
         Ok(Device { inner })
     }
 
@@ -6115,6 +6307,9 @@ impl Inner {
         };
         let walk = Walk { since, reach };
         let whole = self.descend(device, ns, &writer, body, &walk).await;
+        // The pieces of register versions it brought are fetched once it
+        // took everything it lists.
+        self.fetch_wanted(true);
         if !whole {
             return false;
         }
@@ -6798,7 +6993,7 @@ impl Inner {
                 tracing::debug!(record = %name, "a removal cut's manifest not held whole before its record is taken; asked again");
             }
         }
-        let (chase, withdrawn) = {
+        let (chase, wanted, withdrawn) = {
             let mut st = self.st.lock();
             let members = matches!(record, Record::Members(_));
             let key = key_name_of(writer.key());
@@ -6817,6 +7012,11 @@ impl Inner {
                 .cut_out
                 .values()
                 .any(|o| !o.by_cut() && key_name_of(o.writer.key()) == key);
+            // A register version in pieces waits for them: fetched now.
+            let wanted = match &parsed.subject {
+                Some(c) => st.wanted_pieces(c),
+                None => Vec::new(),
+            };
             // A group's record decides who reads the collections sealed to
             // it: their keys may be asked for now.
             let mut chase = Vec::new();
@@ -6846,10 +7046,13 @@ impl Inner {
             }
             chase.sort();
             chase.dedup();
-            (chase, (wake && withdrawn).then_some(key))
+            (chase, wanted, (wake && withdrawn).then_some(key))
         };
         for c in chase {
             self.chase_keys(&c);
+        }
+        for (v, chunks) in wanted {
+            self.spawn_pieces(v, chunks);
         }
         // Its key verifies again: what was withdrawn of it for its chain
         // may verify too (a new certificate of the key).
@@ -7341,7 +7544,7 @@ impl Inner {
             let inner = Arc::clone(self);
             rt::spawn(async move {
                 let held = inner.fetch_cut_bytes(&full).await;
-                {
+                let fetch: Vec<(Name, ChunksBody)> = {
                     let mut st = inner.st.lock();
                     st.bytes_fetching.remove(&full);
                     if !held {
@@ -7360,9 +7563,15 @@ impl Inner {
                         return;
                     }
                     st.bytes_misses.remove(&full);
+                    let mut fetch = Vec::new();
                     for c in &colls {
                         st.reread(c);
+                        fetch.extend(st.wanted_pieces(c));
                     }
+                    fetch
+                };
+                for (v, chunks) in fetch {
+                    inner.spawn_pieces(v, chunks);
                 }
                 inner.fetch_wanted_bytes();
                 inner.fetch_kept(false);
@@ -9596,20 +9805,13 @@ impl Inner {
                 limit: wire::PAYLOAD_MAX,
             });
         }
-        // A large entry of a log travels in pieces (spec §13.1); the record
-        // carries its size and manifest root. A register's bytes ride in its
-        // record: more than fits is too large.
-        let (chunks, pieces) = if payload.len() <= wire::INLINE_MAX {
-            (None, Vec::new())
-        } else if under.function.is_some() {
-            return Err(DataError::TooLarge {
-                collection: c.clone(),
-                size: payload.len() as u64,
-                limit: wire::INLINE_MAX as u64,
-            });
-        } else {
+        // A large entry travels in pieces, whatever the rule (spec §13.1);
+        // the record carries its size and manifest root.
+        let (chunks, pieces) = if payload.len() > wire::INLINE_MAX {
             let (pieces, chunks) = pieces::split(&name, &payload);
             (Some(chunks), pieces)
+        } else {
+            (None, Vec::new())
         };
         let sealed = key.map(|(epoch, _)| SealedBody {
             epoch: epoch.clone(),
@@ -9648,7 +9850,10 @@ impl Inner {
             wire::implicit_digest(&wire),
             true,
         );
-        let held = HeldVersion::new(version, op, wire, key.is_some(), epoch, chunks);
+        let held = HeldVersion {
+            opened: true,
+            ..HeldVersion::new(version, op, wire, key.is_some(), epoch, chunks)
+        };
         Ok(Signed {
             c: c.clone(),
             seq,
@@ -9739,6 +9944,11 @@ impl Inner {
             .or_default()
             .insert(seq);
         coll.applied.insert(id.writer.clone(), seq);
+        // An own operation in pieces is not kept in memory once applied.
+        let held = match held.unloaded() {
+            Some(unloaded) => unloaded,
+            None => held,
+        };
         coll.versions.insert(id.clone(), Arc::new(held));
         st.emit(&c, &Change::Version(version), &id.writer, seq);
         id
@@ -10601,8 +10811,9 @@ impl Inner {
             .asking
             .remove(&(ask.collection.clone(), ask.epoch.clone()));
         if got {
-            // A group member it opened may make its folder followed.
-            self.fetch_wanted_bytes();
+            // Register versions in pieces it unlocked wait for them; a group
+            // member it opened may make its folder followed.
+            self.fetch_wanted(true);
             self.settle().await;
         } else {
             tracing::debug!(collection = %ask.collection, epoch = ?ask.epoch, "the epoch's key is not owed here (no version held waits for it, or this device may not hold it): not asked again until one arrives");
@@ -11159,6 +11370,98 @@ impl Inner {
             op,
             ..v
         })
+    }
+
+    /// Fetch, in the background, what versions held here wait for: the
+    /// removal cut manifest packets ([`Self::fetch_wanted_bytes`]) — which a
+    /// version may come to wait for as it is admitted on any path, a key
+    /// opening it as much as an entry taken (spec §8, §17.1) — and the
+    /// pieces every register version waits for ([`St::wanted_pieces`]).
+    /// `retry`: also those whose pieces a fetch did not find (asked again
+    /// on what may have changed since: a descent, a key, a start).
+    fn fetch_wanted(self: &Arc<Self>, retry: bool) {
+        self.fetch_wanted_bytes();
+        let wanted: Vec<(Name, ChunksBody)> = {
+            let mut st = self.st.lock();
+            if retry {
+                st.unfound.clear();
+            }
+            st.colls.keys().flat_map(|c| st.wanted_pieces(c)).collect()
+        };
+        for (v, chunks) in wanted {
+            self.spawn_pieces(v, chunks);
+        }
+    }
+
+    /// Fetch every piece of the large version `v` in the background — as a
+    /// reader of a register collection whose version waits for them — then
+    /// open and apply what waited.
+    fn spawn_pieces(self: &Arc<Self>, v: Name, chunks: ChunksBody) {
+        if !self.st.lock().fetching.insert(v.clone()) {
+            return;
+        }
+        tracing::trace!(me = %self.device, name = %v, "fetching the pieces of a version");
+        let inner = Arc::clone(self);
+        rt::spawn(async move {
+            let c = parse_log_name(&v).and_then(|l| l.subject);
+            let whole = match &c {
+                Some(c) => inner.walk_pieces(&v, c, chunks, false).await.is_some(),
+                None => false,
+            };
+            let retry = {
+                let mut st = inner.st.lock();
+                st.fetching.remove(&v);
+                match (&c, whole) {
+                    (Some(c), true) => {
+                        st.unfound.remove(&v);
+                        st.piece_misses.remove(&v);
+                        st.pieces_arrived(c, &v);
+                        None
+                    }
+                    _ => {
+                        tracing::debug!(me = %inner.device, name = %v, "not every piece of a held version is to be had yet; asked again while it waits for them");
+                        st.unfound.insert(v.clone());
+                        let misses = st.piece_misses.entry(v.clone()).or_insert(0);
+                        let pause = retry_pause(*misses);
+                        *misses = misses.saturating_add(1);
+                        Some(pause)
+                    }
+                }
+            };
+            if let Some(pause) = retry {
+                inner.retry_pieces(v, pause);
+            }
+            inner.progress.notify_waiters();
+        });
+    }
+
+    /// Ask again, after `pause`, for the pieces of the register version `v`
+    /// a fetch did not find whole (spec §17.1): if it still waits for them
+    /// and nothing asked for them meanwhile.
+    fn retry_pieces(self: &Arc<Self>, v: Name, pause: Duration) {
+        let weak = Arc::downgrade(self);
+        rt::spawn(async move {
+            rt::sleep(pause).await;
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let wanted = {
+                let mut st = inner.st.lock();
+                if !st.unfound.remove(&v) {
+                    return;
+                }
+                let wanted = parse_log_name(&v)
+                    .and_then(|l| l.subject)
+                    .and_then(|c| st.wanted_pieces(&c).into_iter().find(|(n, _)| *n == v));
+                if wanted.is_none() {
+                    st.piece_misses.remove(&v);
+                }
+                wanted
+            };
+            if let Some((v, chunks)) = wanted {
+                inner.spawn_pieces(v, chunks);
+            }
+        });
     }
 
     /// The device an ask's proof claims asks, by its key locator, and the

@@ -107,12 +107,6 @@ pub enum Refusal {
         /// The last seq this device wrote.
         head: u64,
     },
-    /// The collection's merge rule refuses the version: a register version
-    /// whose bytes travel in pieces, not in its own record.
-    Rule {
-        /// The rule's reason.
-        why: String,
-    },
     /// One of its parents names a packet this reader cannot take as what
     /// it was made over (spec §5): the packet held at that writer and seq
     /// has another digest (its writer named a packet that does not exist,
@@ -195,11 +189,6 @@ impl std::fmt::Display for Refusal {
                 "it is not sealed, and the collection's members record seals it: its writer \
                  wrote it before hearing the record that sealed the collection; the writer \
                  writes it again, sealed",
-            ),
-            Refusal::Rule { why } => write!(
-                f,
-                "the collection's merge rule refuses its operation ({why}); its writer writes \
-                 an operation the rule takes"
             ),
             Refusal::Suspected { key, since } => write!(
                 f,
@@ -397,10 +386,9 @@ impl DataError {
                 | Refusal::Untrusted { .. }
                 | Refusal::BeyondOwnLog { .. } => NextStep::AskOwner,
                 Refusal::BadSignature | Refusal::Rollback => NextStep::RetryLater,
-                Refusal::Unsealed
-                | Refusal::Rule { .. }
-                | Refusal::Parent { .. }
-                | Refusal::OtherRule { .. } => NextStep::None,
+                Refusal::Unsealed | Refusal::Parent { .. } | Refusal::OtherRule { .. } => {
+                    NextStep::None
+                }
             },
             DataError::NotAllowed { .. } | DataError::Sealed { .. } => NextStep::AskOwner,
             DataError::NotOwner { .. } => NextStep::UseOwnerDevice,

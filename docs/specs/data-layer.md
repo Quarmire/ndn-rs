@@ -493,9 +493,7 @@ the same versions MUST obtain the same state.
   version — a later `put_op` over it, or a concurrent head with a higher
   digest, takes over — so a removal stands until someone puts again.
 - **Check and apply.** The register reads none of `bytes` and refuses no
-  operation for them; its one refusal is a version whose bytes travel in
-  pieces, which a register version never does (§13.1, `Refusal::Rule`,
-  next step `None`). Applying a version already applied changes nothing.
+  operation for them. Applying a version already applied changes nothing.
   The state is a function of the applied versions, each with its past, and
   of nothing else — never of arrival order — so a device that starts again
   reads the winner it read before.
@@ -2131,15 +2129,13 @@ A group counter says only "moved": it names neither the collection nor the seq o
 
 A version's payload `P` — `Fields` and `MergeOp` as §16.2 encodes them, or
 its sealed ciphertext (§9) — of more than 6,144 octets (`INLINE_MAX`)
-travels in pieces, in a log collection. A merge collection's version
-carries its bytes inline: `put_op` of more answers `TooLarge`, and a reader
-refuses a merge version whose payload is in pieces (`Refusal::Rule`, next
-step `None`).
+travels in pieces, in a collection of any rule: a register's bytes too.
 
 A payload carries at most 64 MiB (`PAYLOAD_MAX`, 67,108,864 octets) per
 version, as a reader assembles it whole:
-`put` of more answers `TooLarge`, and a reader refuses, when it decodes
-the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
+`put` or `put_op` of more answers `TooLarge`, and a reader refuses, when it
+decodes the record, a `Chunks` whose `Size` is above it (or at most
+`INLINE_MAX`).
 
 - Chunk `i` is `P[4096·i ..]`, at most 4,096 octets, the packet
   `<V>/seg=<i>` (`V` the version's name, `seg=` a SegmentNameComponent).
@@ -2160,6 +2156,14 @@ the record, a `Chunks` whose `Size` is above it (or at most `INLINE_MAX`).
   it (§13.5) by the Interest `<D>/32=held/<Name TLV>`, which the device
   answers (DigestSha256) with the packet inside; a piece that is not
   the one its parent lists is dropped and fetched elsewhere.
+- **In a merge collection.** A version in pieces is admitted, and its pieces
+  fetched as above, by every reader of the collection. Until it is whole it
+  waits as a missing parent does: later versions of its writer and versions
+  naming it wait. Whole, it is opened (when sealed) and applied (§5). A
+  reader does not keep an applied operation in pieces in memory: it is
+  opened again from the pieces when the state is computed anew. A version
+  found not whole is not looked for again until its pieces arrive; a fetch
+  that missed is asked again after a pause (§17.1).
 - **Fetching pieces — round 3.** A read walks a version's pieces a window
   at once: the manifest a level at a time, the nodes of one level at once,
   then the chunks, at most `Config::window` (32 by default) pieces of one
@@ -2209,8 +2213,8 @@ It always serves exactly the packet it holds, never one it signs or
 re-wraps (the `32=held` answer carries the packet unchanged).
 
 **What it never serves.** Nothing refused or withdrawn here: by the record in force (`NotMember`,
-`OutsideCut`), a revocation cut or an untrusted chain (§8) or the rule (a merge
-version in pieces, §13.1) — another reader would refuse it too, and serving it would
+`OutsideCut`), or a revocation cut or an untrusted chain (§8) — another
+reader would refuse it too, and serving it would
 only cost that reader a verification. This holds for every collection the
 device follows: it keeps outsiders' versions and packets withdrawn after it
 stored them, and serves none of them (round 3, review L3). Nothing it holds
@@ -2448,7 +2452,8 @@ joiner's; the joiner then uses the folder with the verbs as any member.
   `at`, past = `down(at)`, so the version supersedes every version the
   device had applied. The device signs the version, applies it, stores and
   publishes it. Empty bytes are a removal; a payload of more than
-  `INLINE_MAX`, sealed or not, answers `TooLarge` (§13.1), nothing signed.
+  `INLINE_MAX`, sealed or not, travels in pieces (§13.1), as in a log
+  collection, and the version applies once they are held.
   Into a log collection it
   answers `BadRequest` (next step `FixRequest`: `put_op` is for merge
   collections); under a rule the device does not know, `RuleUnknown`. It

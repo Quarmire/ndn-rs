@@ -139,7 +139,7 @@ impl Parts {
     }
 }
 
-async fn device(name: &str, others: &[&str]) -> Device {
+pub(super) async fn device(name: &str, others: &[&str]) -> Device {
     Parts::new(name, others).start().await
 }
 
@@ -161,7 +161,7 @@ fn hand(dev: &Device, device: &Name, c: &Name, seq: u64, record: Record) -> Opti
 }
 
 /// Hand `to` the log entry `seq` of `from` about `c`, as `from` signed it.
-fn relay(from: &Device, to: &Device, c: &Name, seq: u64) -> Option<Refusal> {
+pub(super) fn relay(from: &Device, to: &Device, c: &Name, seq: u64) -> Option<Refusal> {
     let name = log_name(from.name(), Some(c), seq);
     let wire = from.inner.store.get(&name).expect("written and stored");
     let content = Data::decode(wire).unwrap().content().unwrap().clone();
@@ -322,8 +322,8 @@ async fn a_refused_edit_leaves_the_merge_state_as_it_was() {
             .value()
     };
     let (before, head) = (value(&dev), dev.inner.st.lock().head);
-    // More than a register's version carries.
-    let huge = Bytes::from(vec![7u8; wire::INLINE_MAX + 1]);
+    // More than a version carries.
+    let huge = Bytes::from(vec![7u8; wire::PAYLOAD_MAX as usize + 1]);
     let refused = dev.put_op(&c, huge, options()).await.unwrap_err();
     assert!(matches!(refused, DataError::TooLarge { .. }), "{refused}");
     assert_eq!(value(&dev), before, "the refused edit is not in the state");
@@ -336,8 +336,8 @@ async fn a_refused_operation_into_a_new_collection_signs_no_members_record() {
     let dev = device("/alice/laptop", &["/alice"]).await;
     let c = n("/alice/32=data/notebook");
     let head = dev.inner.st.lock().head;
-    // A register's bytes ride in its version: more than fits is refused.
-    let big = Bytes::from(vec![7u8; wire::INLINE_MAX + 1]);
+    // More than a version carries.
+    let big = Bytes::from(vec![7u8; wire::PAYLOAD_MAX as usize + 1]);
     let refused = dev.put_op(&c, big, options()).await.unwrap_err();
     assert!(matches!(refused, DataError::TooLarge { .. }), "{refused}");
     {
