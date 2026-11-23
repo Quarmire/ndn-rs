@@ -15,7 +15,7 @@ use ndn_packet::{Data, Interest, SignatureType};
 use ndn_security::self_certifying::{Genesis, self_certifying_name};
 use ndn_security::{
     CertCache, Certificate, Ed25519Signer, Keyring, RevocationCut, ScopedContext, SecurityManager,
-    SignedTrustContext, TrustSchema, Validator,
+    SignedTrustContext, Signer, TrustSchema, Validator,
 };
 use ndn_sync::{DataStore, MemoryStore};
 
@@ -496,7 +496,10 @@ async fn adoption_survives_a_restart() {
         !from.is_empty() && from.iter().all(|v| *v == Some(3)),
         "refreshed from the version kept, never from the genesis: {from:?}"
     );
-    assert!(!host.carries(&ns), "a failed refresh leaves nothing carried");
+    assert!(
+        !host.carries(&ns),
+        "a failed refresh leaves nothing carried"
+    );
     drop(judge);
 
     // A path serving only version 1.
@@ -581,16 +584,29 @@ async fn a_listed_writers_own_device_packets_verify_and_nothing_else_of_hers_doe
     assert_eq!(verified.key, phone.key);
     assert_eq!(verified.person, carol.ns);
 
-    // Signed by another device of her namespace.
+    // Signed by another device of her namespace: the schema refuses it
+    // (a key signs only under its own name).
     let forged = tablet.signs(&seal, &pk);
+    let judged = judge
+        .validate_device_packet(&forged, &phone.name, &space())
+        .await;
     assert!(
-        matches!(
-            judge
-                .validate_device_packet(&forged, &phone.name, &space())
-                .await,
-            Judged::Refused(Refusal::BadSignature)
-        ),
-        "a packet under the phone's name signed by the tablet's key"
+        matches!(judged, Judged::Refused(_)),
+        "a packet under the phone's name signed by the tablet's key: {judged:?}"
+    );
+    // Signed by a key the schema lets sign for it, the namespace's root key,
+    // which belongs to no device: it is not that device's packet.
+    let root = carol.mgr.get_signer_sync(k1).unwrap();
+    let wire = DataBuilder::new(seal.clone(), &pk).sign_sync(root.sig_type(), Some(k1), |region| {
+        root.sign_sync(region).unwrap()
+    });
+    let by_root = Data::decode(wire).unwrap();
+    let judged = judge
+        .validate_device_packet(&by_root, &phone.name, &space())
+        .await;
+    assert!(
+        matches!(judged, Judged::Refused(Refusal::BadSignature)),
+        "a packet under the phone's name signed by a key of another device: {judged:?}"
     );
     // Her seal key is no seal key of another space's.
     let elsewhere = judge
@@ -672,12 +688,16 @@ fn a_listing_past_the_caps_adopts_the_first_and_reports_the_rest() {
         "the first the listing names"
     );
     assert!(
-        scopes.note(&space(), &Listing {
-            writers: people[..50].to_vec(),
-            readers: people[50..90].to_vec(),
-            cut: people[90..].to_vec(),
-        })
-        .is_empty(),
+        scopes
+            .note(
+                &space(),
+                &Listing {
+                    writers: people[..50].to_vec(),
+                    readers: people[50..90].to_vec(),
+                    cut: people[90..].to_vec(),
+                }
+            )
+            .is_empty(),
         "told once, not on every note of the same listing"
     );
 

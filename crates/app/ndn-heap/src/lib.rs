@@ -48,5 +48,4 @@ mod store;
 mod sync;
 #[cfg(test)]
 mod test_kit;
-#[cfg(feature = "wip-trust")]
 mod trust;
