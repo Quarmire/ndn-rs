@@ -664,6 +664,8 @@ impl NodeInner {
             .into_values()
             .collect();
         for space in spaces {
+            // An admission under way ends before the node is stopped.
+            drop(space.log.lock());
             space.close_watchers();
         }
     }
@@ -1070,6 +1072,12 @@ impl Host for NodeInner {
         tracing::trace!(target: crate::sync::TIMELINE, "judged");
         let (outcome, blobs, routed) = {
             let mut log = held.log.lock();
+            // Judging is async: the node may have stopped meanwhile, and what
+            // a stopped node writes is unknown to the log that opens the
+            // store next (a restart over the same store).
+            if self.stopped.load(Ordering::SeqCst) {
+                return Taken::Pending(crate::trust::Waiting::Chain);
+            }
             let admitted = log.admit(&wire, &data, &verified, self.now());
             let wrote = !matches!(admitted.outcome, Outcome::Duplicate);
             let blobs = admitted.effects.blobs.clone();

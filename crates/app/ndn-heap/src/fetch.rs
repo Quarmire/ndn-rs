@@ -595,6 +595,11 @@ impl Group {
                 None
             }
             Some(source) => match self.fetch_original(source, &name).await {
+                // A node that stopped while the entry was on its way (a clean
+                // close, a restart over the same store) takes nothing: what
+                // it wrote now would be unknown to the log that opens the
+                // store next.
+                Ok(_) if self.stop.is_stopped() => None,
                 Ok(wire) => {
                     tracing::trace!(target: TIMELINE, %name, "verify_begin");
                     let taken = host.take(&self.space, wire).await;

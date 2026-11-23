@@ -107,8 +107,11 @@ async fn one_new_entry_reaches_the_watcher_with_one_fetch() {
     let theirs = phone.open(&space()).await.unwrap();
     let mut changes = theirs.watch(&Frontier::new()).await.unwrap();
     eventually("the phone sees the creation", || async { theirs.ready() }).await;
-    // The creation's own traffic ends before the put is counted.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // The creation is held and nothing is wanted before the put is counted.
+    eventually("the phone holds the creation and wants nothing", || async {
+        phone.held() == 1 && Host::missing(&*phone.inner, &space()).is_empty()
+    })
+    .await;
     let before = tap.names().len();
     let id = heap
         .put(&n("/a"), bytes("one"), PutOptions::default())
@@ -372,9 +375,17 @@ async fn a_returning_device_fetches_only_what_changed() {
             .await
             .unwrap();
     }
-    eventually("the phone holds all three", || async {
-        has(&theirs, "/c", "three").await
-    })
+    // Everything is held, the creation and the three puts, and nothing is
+    // wanted: the entry a notice names arrives before the ones below it, so
+    // the value of the last put can be read while a hole is still open.
+    eventually(
+        "the phone holds all four entries and wants none",
+        || async {
+            has(&theirs, "/c", "three").await
+                && phone.held() == 4
+                && Host::missing(&*phone.inner, &space()).is_empty()
+        },
+    )
     .await;
     phone.close().await;
     let later = heap
