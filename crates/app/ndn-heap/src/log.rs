@@ -381,7 +381,7 @@ pub(crate) struct Log {
     fold: Fold,
     register: Register,
     keys: Keys,
-    reservation: Reservation,
+    reservation: Arc<Reservation>,
     /// The seq the next own entry takes.
     next_seq: u64,
     /// The highest seq under this device's name in the store, whatever it is.
@@ -444,7 +444,7 @@ impl Log {
             key_digest,
             fold: Fold::new(owner),
             register: Register::new(space.clone()),
-            reservation: opened.reservation,
+            reservation: Arc::new(opened.reservation),
             next_seq: opened.resume.first_seq,
             own_head: head.as_ref().map_or(0, |h| h.seq),
             own_tip: None,
@@ -645,7 +645,7 @@ impl Log {
     }
 
     /// This device's reservation.
-    pub(crate) fn reservation(&self) -> &Reservation {
+    pub(crate) fn reservation(&self) -> &Arc<Reservation> {
         &self.reservation
     }
 
