@@ -213,6 +213,20 @@ enum Adopted {
     Refused { again: Instant, pause: Duration },
 }
 
+impl Adopted {
+    /// The pause that led to the last failed ask of her, if one failed.
+    fn pause(&self) -> Option<Duration> {
+        match self {
+            Adopted::Held {
+                backoff: Some((_, pause)),
+                ..
+            }
+            | Adopted::Refused { pause, .. } => Some(*pause),
+            _ => None,
+        }
+    }
+}
+
 /// What one space's listing names, once capped.
 #[derive(Debug, PartialEq, Eq)]
 struct Lists {
@@ -235,10 +249,6 @@ struct Scopes {
     /// Per person, the spaces she is listed for within the caps: only these
     /// are adopted, and judged for.
     listed: BTreeMap<Name, BTreeSet<Name>>,
-    /// Of [`Self::listed`], per person, the spaces whose members list her as
-    /// a writer or a reader (not a person only a cut keeps): the spaces her
-    /// own devices' seal keys are judged for.
-    standing: BTreeMap<Name, BTreeSet<Name>>,
     /// How many persons the listings name past the caps, as last warned of.
     over: usize,
     adopted: HashMap<Name, Adopted>,
@@ -270,24 +280,16 @@ impl Scopes {
     /// looked for. Returns the warning to give when the number of persons
     /// left out by the caps changed.
     fn note(&mut self, space: &Name, listing: &Listing) -> Option<String> {
-        let named = listing
+        let mut seen = HashSet::new();
+        let mut named = listing
             .writers
             .iter()
             .chain(&listing.readers)
             .chain(&listing.cut)
-            .filter(|p| is_person(p));
-        let mut seen = HashSet::new();
-        let (mut first, mut rest) = (Vec::new(), 0);
-        for person in named {
-            if !seen.insert(person) {
-                continue;
-            }
-            match first.len() < SCOPE_PER_SPACE {
-                true => first.push(person.clone()),
-                false => rest += 1,
-            }
-        }
-        let members = listing
+            .filter(|p| is_person(p) && seen.insert(*p));
+        let first: Vec<Name> = named.by_ref().take(SCOPE_PER_SPACE).cloned().collect();
+        let rest = named.count();
+        let members: HashSet<Name> = listing
             .writers
             .iter()
             .chain(&listing.readers)
@@ -302,18 +304,11 @@ impl Scopes {
         if self.wants.get(space) == new.as_ref() {
             return None;
         }
-        match new {
-            Some(lists) => {
-                self.wants.insert(space.clone(), lists);
-            }
-            None => {
-                self.wants.remove(space);
-            }
-        }
+        self.wants.remove(space);
+        self.wants.extend(new.map(|lists| (space.clone(), lists)));
         // Listed again from every space's listing, in space order, so that
         // the caps fall the same way whatever order listings came in.
         let mut listed: BTreeMap<Name, BTreeSet<Name>> = BTreeMap::new();
-        let mut standing: BTreeMap<Name, BTreeSet<Name>> = BTreeMap::new();
         let mut over = 0;
         for (name, lists) in &self.wants {
             for person in &lists.first {
@@ -322,29 +317,20 @@ impl Scopes {
                         .entry(person.clone())
                         .or_default()
                         .insert(name.clone());
-                    if lists.members.contains(person) {
-                        standing
-                            .entry(person.clone())
-                            .or_default()
-                            .insert(name.clone());
-                    }
                 } else {
                     over += 1;
                 }
             }
             over += lists.rest;
         }
-        for person in listed
-            .iter()
-            .filter(|(_, spaces)| spaces.contains(space))
-            .map(|(person, _)| person)
-        {
-            if matches!(self.adopted.get(person), Some(Adopted::Held { .. })) {
+        for (person, spaces) in &listed {
+            if spaces.contains(space)
+                && matches!(self.adopted.get(person), Some(Adopted::Held { .. }))
+            {
                 self.stale.insert(person.clone());
             }
         }
         self.listed = listed;
-        self.standing = standing;
         let warning = (over != self.over && over > 0).then(|| over_cap_warning(over));
         self.over = over;
         warning
@@ -354,11 +340,8 @@ impl Scopes {
     /// covers, about `space`: the adopted one when a listing of `space` names
     /// her (`member`: as a writer or a reader) and she is adopted.
     fn view(&self, person: &Name, space: &Name, member: bool) -> Option<Arc<Validator>> {
-        let spaces = match member {
-            true => &self.standing,
-            false => &self.listed,
-        };
-        if !spaces.get(person)?.contains(space) {
+        let lists = self.wants.get(space)?;
+        if !self.listed.get(person)?.contains(space) || member && !lists.members.contains(person) {
             return None;
         }
         match self.adopted.get(person) {
@@ -433,37 +416,22 @@ impl Scopes {
             if held(person) {
                 continue;
             }
-            let ask = match self.adopted.get(person) {
-                None => Some(None),
-                Some(Adopted::Refused { again, .. }) => {
-                    if *again <= now {
-                        Some(None)
-                    } else {
-                        later(*again);
-                        None
-                    }
-                }
+            let (from, not_before) = match self.adopted.get(person) {
+                None => (None, None),
+                Some(Adopted::Refused { again, .. }) => (None, Some(*again)),
                 Some(Adopted::Held { ctx, backoff, .. })
                     if self.stale.contains(person) && !self.refreshing.contains(person) =>
                 {
-                    match backoff.filter(|(at, _)| now < *at) {
-                        Some((at, _)) => {
-                            later(at);
-                            None
-                        }
-                        None => Some(Some(ctx.clone())),
-                    }
+                    (Some(ctx.clone()), backoff.map(|(at, _)| at))
                 }
-                _ => None,
+                _ => continue,
             };
-            let Some(from) = ask else {
+            if let Some(at) = not_before.filter(|at| now < *at) {
+                later(at);
                 continue;
-            };
+            }
             flying += 1;
-            out.push((person.clone(), from));
-        }
-        for (person, from) in &out {
-            match from {
+            match &from {
                 Some(_) => {
                     self.stale.remove(person);
                     self.refreshing.insert(person.clone());
@@ -472,6 +440,7 @@ impl Scopes {
                     self.adopted.insert(person.clone(), Adopted::Asking);
                 }
             }
+            out.push((person.clone(), from));
         }
         let wake = wake.filter(|_| !self.waking);
         if wake.is_some() {
@@ -484,24 +453,23 @@ impl Scopes {
     /// holds (its held context judges them from now on): dropped here, for the
     /// host to release.
     fn release_unlisted(&mut self, held: impl Fn(&Name) -> bool) -> Vec<Name> {
-        let gone: Vec<Name> = self
-            .adopted
-            .iter()
-            .filter(|(person, a)| {
-                matches!(a, Adopted::Held { .. })
-                    && (!self.listed.contains_key(*person) || held(person))
-            })
-            .map(|(person, _)| person.clone())
-            .collect();
+        let listed = &self.listed;
+        let mut gone = Vec::new();
+        self.adopted.retain(|person, a| match a {
+            Adopted::Asking => true,
+            // A refusal no listing calls for any more is forgotten.
+            Adopted::Refused { .. } => listed.contains_key(person),
+            Adopted::Held { .. } => {
+                let keep = listed.contains_key(person) && !held(person);
+                if !keep {
+                    gone.push(person.clone());
+                }
+                keep
+            }
+        });
         for person in &gone {
-            self.adopted.remove(person);
             self.stale.remove(person);
         }
-        // A refusal no listing calls for any more is forgotten.
-        let listed = &self.listed;
-        self.adopted.retain(|person, a| {
-            !matches!(a, Adopted::Refused { .. }) || listed.contains_key(person)
-        });
         gone
     }
 }
@@ -838,16 +806,9 @@ impl Judge {
             match open_kept(&person, &value).await {
                 Ok(ctx) => {
                     tracing::info!(%person, version = ctx.context().version(), "held again at the version kept, for the spaces that list her; refreshed from it");
-                    let view = Arc::new(self.validator.scoped_view(&ctx));
+                    let held = self.hold(ctx);
                     let mut scopes = self.scopes.lock();
-                    scopes.adopted.insert(
-                        person.clone(),
-                        Adopted::Held {
-                            ctx,
-                            view,
-                            backoff: None,
-                        },
-                    );
+                    scopes.adopted.insert(person.clone(), held);
                     scopes.stale.insert(person.clone());
                     restored.push(person);
                 }
@@ -894,9 +855,9 @@ impl Judge {
         let Some(host) = self.adopter.clone() else {
             return;
         };
-        for person in released {
+        for person in &released {
             tracing::info!(%person, "no space lists her any more, or the node holds her: released");
-            host.release_scoped(&person);
+            host.release_scoped(person);
         }
         for (person, from) in asks {
             let judge = Arc::clone(self);
@@ -940,20 +901,12 @@ impl Judge {
             },
             other => other,
         };
-        match got {
+        let why = match got {
             Ok(ctx) if listed => {
                 let refuses = refuses_more(from.as_ref().map(|f| &**f.context()), ctx.context());
                 tracing::info!(%person, version = ctx.context().version(), "adopted by name for judging the entries of the spaces that list her");
                 let kept = scopes.reached(person, &ctx);
-                let view = Arc::new(self.validator.scoped_view(&ctx));
-                scopes.adopted.insert(
-                    person.clone(),
-                    Adopted::Held {
-                        ctx,
-                        view,
-                        backoff: None,
-                    },
-                );
+                scopes.adopted.insert(person.clone(), self.hold(ctx));
                 drop(scopes);
                 if let Some(kept) = kept {
                     self.store.insert(scoped_key(person), kept);
@@ -963,53 +916,58 @@ impl Judge {
                     // revocation epoch moves.
                     self.scoped_revocations.fetch_add(1, Ordering::SeqCst);
                 }
-                Some(refuses)
+                return Some(refuses);
             }
             // Adopted after the last listing that named her went: released.
             Ok(_) => {
                 scopes.adopted.remove(person);
                 drop(scopes);
-                if let Some(host) = &self.adopter {
-                    host.release_scoped(person);
-                }
-                None
+                self.release(person);
+                return None;
             }
-            Err(why) => {
-                if from.is_some() {
-                    // A refresh that failed: the version held still judges,
-                    // and is refreshed again after a growing pause.
-                    let pause = match scopes.adopted.get(person) {
-                        Some(Adopted::Held {
-                            backoff: Some((_, pause)),
-                            ..
-                        }) => (*pause * 2).min(SCOPE_PAUSE_MAX),
-                        _ => SCOPE_PAUSE,
-                    };
-                    if let Some(Adopted::Held { backoff, .. }) = scopes.adopted.get_mut(person) {
-                        *backoff = Some((Instant::now() + pause, pause));
-                    }
-                    scopes.stale.insert(person.clone());
-                    tracing::info!(%person, "not refreshed: {why}; the version held judges meanwhile, and it is refreshed again in {pause:?}");
-                    return None;
-                }
-                let pause = match scopes.adopted.get(person) {
-                    Some(Adopted::Refused { pause, .. }) => (*pause * 2).min(SCOPE_PAUSE_MAX),
-                    _ => SCOPE_PAUSE,
-                };
-                tracing::warn!(%person, "a space lists her, and she is not adopted for it: {why}; her entries there wait, and she is asked again in {pause:?}");
-                scopes.adopted.insert(
-                    person.clone(),
-                    Adopted::Refused {
-                        again: Instant::now() + pause,
-                        pause,
-                    },
-                );
-                drop(scopes);
-                if release && let Some(host) = &self.adopter {
-                    host.release_scoped(person);
-                }
-                None
+            Err(why) => why,
+        };
+        let pause = scopes
+            .adopted
+            .get(person)
+            .and_then(Adopted::pause)
+            .map_or(SCOPE_PAUSE, |last| (last * 2).min(SCOPE_PAUSE_MAX));
+        let again = Instant::now() + pause;
+        if from.is_some() {
+            // A refresh that failed: the version held still judges, and is
+            // refreshed again after a growing pause.
+            if let Some(Adopted::Held { backoff, .. }) = scopes.adopted.get_mut(person) {
+                *backoff = Some((again, pause));
             }
+            scopes.stale.insert(person.clone());
+            tracing::info!(%person, "not refreshed: {why}; the version held judges meanwhile, and it is refreshed again in {pause:?}");
+            return None;
+        }
+        tracing::warn!(%person, "a space lists her, and she is not adopted for it: {why}; her entries there wait, and she is asked again in {pause:?}");
+        scopes
+            .adopted
+            .insert(person.clone(), Adopted::Refused { again, pause });
+        drop(scopes);
+        if release {
+            self.release(person);
+        }
+        None
+    }
+
+    /// The adopted `ctx` and the view of the node's validator that judges by
+    /// it.
+    fn hold(&self, ctx: ScopedContext) -> Adopted {
+        Adopted::Held {
+            view: Arc::new(self.validator.scoped_view(&ctx)),
+            ctx,
+            backoff: None,
+        }
+    }
+
+    /// Tell the host to stop carrying what it kept for `person`.
+    fn release(&self, person: &Name) {
+        if let Some(host) = &self.adopter {
+            host.release_scoped(person);
         }
     }
 
@@ -1038,10 +996,8 @@ impl Judge {
             .scopes
             .lock()
             .release_unlisted(|person| keyring.held_for(person).is_some());
-        if let Some(host) = &self.adopter {
-            for person in released {
-                host.release_scoped(&person);
-            }
+        for person in &released {
+            self.release(person);
         }
         let _ = self.events.send(Adoption::Context(Arc::clone(ctx)));
     }
