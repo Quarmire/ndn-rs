@@ -31,15 +31,15 @@ pub(super) struct Subject<'a> {
 }
 
 impl<'a> Subject<'a> {
-    /// The facts of the entry `id` (named `name`) signed by `v`.
-    fn new(id: &'a EntryRef, v: &'a Verified, name: &'a Name) -> Subject<'a> {
+    /// The facts of the entry that arrived.
+    fn new(a: &'a Arrival<'_>) -> Subject<'a> {
         Subject {
-            device: &id.device,
-            person: &v.person,
-            key: &v.key,
-            seq: id.seq,
-            digest: id.digest,
-            name,
+            device: &a.id.device,
+            person: &a.v.person,
+            key: &a.v.key,
+            seq: a.id.seq,
+            digest: a.id.digest,
+            name: &a.name,
         }
     }
 }
@@ -64,10 +64,12 @@ pub(super) struct Applying {
     pub put: Option<PutBody>,
 }
 
-/// What `take` is given about the entry that arrived: its name, bytes, the
-/// verified signer, the time, and whether only an unsigned counter asked for it.
+/// What admission is given about the entry that arrived: its ref and name,
+/// its bytes, the verified signer, the time, and whether only an unsigned
+/// counter asked for it.
 struct Arrival<'a> {
-    id: &'a EntryRef,
+    id: EntryRef,
+    name: Name,
     wire: &'a Bytes,
     data: &'a Data,
     v: &'a Verified,
@@ -180,51 +182,52 @@ impl Log {
             },
             _ => return Outcome::Refused(Refusal::BadSignature),
         };
-        let mut displaced = None;
-        if let Some(held) = self.view().marker(&id.device, id.seq) {
-            if held.signed_digest == id.digest {
-                return self.duplicate(&id, v, fx);
-            }
-            if !self.displaces(&id, &name, data, v) {
-                return self.second_packet(&id, wire, data, v, now, fx);
-            }
-            // Other bytes were refused here as not on the cut's chain; these
-            // are the bytes it names. They take the name; what was refused
-            // stays as evidence.
-            if let Some(why) = self.suspicion(v) {
-                return Outcome::Refused(why);
-            }
-            let old = self.view().status(&id.device, id.seq);
-            self.set_status(&id.device, id.seq, old.as_ref(), None);
-            displaced = self.view().wire_at(&id.device, id.seq);
-        }
-        if let Some(why) = self.suspicion(v) {
-            return Outcome::Refused(why);
-        }
-        let arrival = Arrival {
-            id: &id,
+        let a = Arrival {
+            id,
+            name,
             wire,
             data,
             v,
             now,
             probe,
         };
-        let outcome = self.take(arrival, fx);
+        let (device, seq) = (&a.id.device, a.id.seq);
+        let held = self.view().marker(device, seq);
+        if let Some(held) = held {
+            if held.signed_digest == a.id.digest {
+                return self.duplicate(&a, fx);
+            }
+            if !self.displaces(&a) {
+                return self.second_packet(&a, fx);
+            }
+        }
+        if let Some(why) = self.suspicion(v) {
+            return Outcome::Refused(why);
+        }
+        // Other bytes were refused here as not on the cut's chain; these are
+        // the bytes it names. They take the name; what was refused stays as
+        // evidence.
+        let displaced = held.and_then(|_| {
+            let old = self.view().status(device, seq);
+            self.set_status(device, seq, old.as_ref(), None);
+            self.view().wire_at(device, seq)
+        });
+        let outcome = self.take(&a, fx);
         if let Some(old) = displaced {
-            self.store.insert(Kind::EQUIVOCAL.of(&name), old);
-            self.equivocated(&id, id.seq, v, now, fx);
+            self.store.insert(Kind::EQUIVOCAL.of(&a.name), old);
+            self.equivocated(&a, seq, fx);
         }
         outcome
     }
 
     /// The device of `id` signed two packets at `seq` (one name, or a chain
     /// that forks there): told to the host, and its key suspected.
-    fn equivocated(&self, id: &EntryRef, seq: u64, v: &Verified, now: u64, fx: &mut Effects) {
+    fn equivocated(&self, a: &Arrival<'_>, seq: u64, fx: &mut Effects) {
         fx.alerts.push(Alert::Equivocation {
-            device: id.device.clone(),
+            device: a.id.device.clone(),
             seq,
         });
-        self.suspicion.mark_new(&v.key, Timestamp(now));
+        self.suspicion.mark_new(&a.v.key, Timestamp(a.now));
     }
 
     /// A suspected key's new entries are not taken, unless the owner's cut
@@ -240,31 +243,31 @@ impl Log {
     /// Whether the held packet at this name was refused as outside a removal
     /// cut (or waits on it), and this one is applied: the cut names these
     /// bytes, and the others must not keep them from coming.
-    fn displaces(&self, id: &EntryRef, name: &Name, data: &Data, v: &Verified) -> bool {
+    fn displaces(&self, a: &Arrival<'_>) -> bool {
         matches!(
-            self.view().status(&id.device, id.seq),
+            self.view().status(&a.id.device, a.id.seq),
             Some(Status::Refused(Refusal::OutsideCut(_)) | Status::Waiting)
-        ) && shape(data, id.seq).is_some_and(|(entry, _, _)| {
-            let subject = Subject::new(id, v, name);
-            matches!(self.assess(&subject, &entry), Verdict::Apply(_))
+        ) && shape(a.data, a.id.seq).is_some_and(|(entry, _, _)| {
+            matches!(self.assess(&Subject::new(a), &entry), Verdict::Apply(_))
         })
     }
 
     /// Another copy of an entry held: nothing new, unless what it was refused
     /// for can change.
-    fn duplicate(&mut self, id: &EntryRef, v: &Verified, fx: &mut Effects) -> Outcome {
-        if let Some(dev) = self.devices.get_mut(&id.device)
-            && dev.person != v.person
+    fn duplicate(&mut self, a: &Arrival<'_>, fx: &mut Effects) -> Outcome {
+        let (device, seq) = (&a.id.device, a.id.seq);
+        if let Some(dev) = self.devices.get_mut(device)
+            && dev.person != a.v.person
         {
-            dev.person = v.person.clone();
-            self.write_ledger(&id.device);
+            dev.person = a.v.person.clone();
+            self.write_ledger(device);
         }
         if self
             .view()
-            .status(&id.device, id.seq)
+            .status(device, seq)
             .is_some_and(|s| s.can_change())
         {
-            self.reassess(&id.device, id.seq, Rejudge::Verified, fx);
+            self.reassess(device, seq, Rejudge::Verified, fx);
         }
         Outcome::Duplicate
     }
@@ -273,17 +276,9 @@ impl Log {
     /// signed two. Both are kept, the key is suspected; a second Members or
     /// Epoch entry is a fact of the space as the first is, so every holder
     /// agrees whichever came first.
-    fn second_packet(
-        &mut self,
-        id: &EntryRef,
-        wire: &Bytes,
-        data: &Data,
-        v: &Verified,
-        now: u64,
-        fx: &mut Effects,
-    ) -> Outcome {
-        let name = id.name(&self.space);
-        let at = Kind::EQUIVOCAL.of(&name);
+    fn second_packet(&mut self, a: &Arrival<'_>, fx: &mut Effects) -> Outcome {
+        let (id, v) = (&a.id, a.v);
+        let at = Kind::EQUIVOCAL.of(&a.name);
         if let Some(held) = self.store.get(&at) {
             return if signed_digest(&held) == id.digest {
                 Outcome::Duplicate
@@ -291,8 +286,8 @@ impl Log {
                 Outcome::Evidence
             };
         }
-        self.store.insert(at, wire.clone());
-        self.equivocated(id, id.seq, v, now, fx);
+        self.store.insert(at, a.wire.clone());
+        self.equivocated(a, id.seq, fx);
         // What the entry first held here said is absent is no longer taken as
         // said: its writer signed two.
         let retracted = self
@@ -302,19 +297,17 @@ impl Log {
         if retracted {
             self.write_ledger(&id.device);
         }
-        if let Some((entry, _, _)) = shape(data, id.seq)
+        if let Some((entry, _, _)) = shape(a.data, id.seq)
             && matches!(entry.body, Body::Members(_) | Body::Epoch(_))
+            && let Verdict::Apply(put) = self.assess(&Subject::new(a), &entry)
         {
-            let subject = Subject::new(id, v, &name);
-            if let Verdict::Apply(put) = self.assess(&subject, &entry) {
-                let applying = Applying {
-                    id: id.clone(),
-                    person: v.person.clone(),
-                    entry,
-                    put,
-                };
-                self.apply_entry(&applying, fx);
-            }
+            let applying = Applying {
+                id: id.clone(),
+                person: v.person.clone(),
+                entry,
+                put,
+            };
+            self.apply_entry(&applying, fx);
         }
         Outcome::Evidence
     }
@@ -331,20 +324,12 @@ impl Log {
     }
 
     /// Plan 3.5 steps 3 to 8 for an entry at a fresh name.
-    fn take(&mut self, arrival: Arrival<'_>, fx: &mut Effects) -> Outcome {
-        let Arrival {
-            id,
-            wire,
-            data,
-            v,
-            now,
-            probe,
-        } = arrival;
-        let name = id.name(&self.space);
-        let shaped = shape(data, id.seq);
+    fn take(&mut self, a: &Arrival<'_>, fx: &mut Effects) -> Outcome {
+        let (id, v, now) = (&a.id, a.v, a.now);
+        let shaped = shape(a.data, id.seq);
         let fresh = |status: Option<Status>, link, applying| Fresh {
             id,
-            wire,
+            wire: a.wire,
             person: &v.person,
             key_digest: v.key_digest,
             link,
@@ -380,13 +365,13 @@ impl Log {
         let stated = shaped
             .as_ref()
             .map(|(_, digest, prev_seq)| (*digest, *prev_seq))
-            .or_else(|| stated_link(data, id.seq));
+            .or_else(|| stated_link(a.data, id.seq));
         if id.device != self.device && self.fragments(id, stated) {
             return Outcome::Refused(Refusal::Fragmented);
         }
 
         let Some((entry, prev, prev_seq)) = shaped else {
-            tracing::warn!(%name, "an entry that verifies and cannot be read is recorded as refused");
+            tracing::warn!(name = %a.name, "an entry that verifies and cannot be read is recorded as refused");
             self.store_fresh(fresh(Some(Status::Unreadable), stated, None), now, fx);
             return Outcome::Unreadable;
         };
@@ -395,10 +380,10 @@ impl Log {
         // 6. The chain: the entry at `PREV_SEQ` must be the one `PREV` names.
         // 3 to 5: carrier, membership, sealing.
         let verdict = if let Some(conflict) = self.chain_conflict(id, &prev, prev_seq) {
-            self.equivocated(id, conflict, v, now, fx);
+            self.equivocated(a, conflict, fx);
             Verdict::Refuse(Refusal::Chain)
         } else {
-            self.assess(&Subject::new(id, v, &name), &entry)
+            self.assess(&Subject::new(a), &entry)
         };
         let (status, outcome, applying) = match verdict {
             Verdict::Apply(put) => {
@@ -419,7 +404,7 @@ impl Log {
                 // answered, and neither stored nor told, so what a stranger
                 // advertises grows neither the store nor the host's alerts.
                 // An entry the log asked for (a hole, a cut's tip) is stored.
-                if probe
+                if a.probe
                     && matches!(why, Refusal::NotMember)
                     && self
                         .devices

@@ -111,17 +111,12 @@ pub(crate) fn write_nni(w: &mut TlvWriter, typ: u64, v: u64) {
 
 /// Read a NonNegativeInteger value.
 pub(crate) fn read_nni(v: &[u8]) -> Result<u64, WireError> {
-    Ok(match v.len() {
-        1 => u64::from(v[0]),
-        2 => u64::from(u16::from_be_bytes([v[0], v[1]])),
-        4 => u64::from(u32::from_be_bytes([v[0], v[1], v[2], v[3]])),
-        8 => u64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]),
-        _ => {
-            return Err(WireError::Malformed(
-                "a NonNegativeInteger is 1, 2, 4 or 8 octets",
-            ));
-        }
-    })
+    if !matches!(v.len(), 1 | 2 | 4 | 8) {
+        return Err(WireError::Malformed(
+            "a NonNegativeInteger is 1, 2, 4 or 8 octets",
+        ));
+    }
+    Ok(v.iter().fold(0, |n, &b| n << 8 | u64::from(b)))
 }
 
 /// Write a `Name` TLV.

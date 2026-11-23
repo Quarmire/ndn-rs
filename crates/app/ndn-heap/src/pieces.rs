@@ -112,8 +112,6 @@ fn packet(name: Name, content: &[u8]) -> Piece {
 /// The pieces of one payload, cut.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Pieces {
-    /// The entry the pieces are under.
-    pub entry: Name,
     /// The chunks in order, then the manifest nodes bottom-up (the root
     /// last).
     pub packets: Vec<Piece>,
@@ -151,13 +149,10 @@ pub(crate) fn split(entry: &Name, payload: &[u8]) -> Result<Pieces, PieceError> 
     }
     let shape = Shape::of(size);
     // An empty payload is one empty chunk, as `Shape` counts it.
-    let cuts: Vec<&[u8]> = if payload.is_empty() {
-        vec![payload]
-    } else {
-        payload.chunks(CHUNK).collect()
-    };
+    let cuts = payload
+        .chunks(CHUNK)
+        .chain(payload.is_empty().then_some(payload));
     let mut packets: Vec<Piece> = cuts
-        .into_iter()
         .enumerate()
         .map(|(i, c)| packet(piece_name(entry, PieceKind::Chunk(i as u64)), c))
         .collect();
@@ -179,7 +174,6 @@ pub(crate) fn split(entry: &Name, payload: &[u8]) -> Result<Pieces, PieceError> 
     }
     let root = below[0];
     Ok(Pieces {
-        entry: entry.clone(),
         packets,
         root,
         size,

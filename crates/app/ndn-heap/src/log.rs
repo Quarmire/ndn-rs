@@ -480,18 +480,14 @@ impl Log {
             });
             self.devices.insert(device, dev);
         }
-        let (mut closed, mut counted) = (0, Vec::new());
         for (key, value) in self.store.scan_under(&Kind::STATUS.listing(&self.space), 0) {
-            match value.first() {
-                Some(1) => closed += 1,
-                Some(_) => counted.extend(Kind::STATUS.parse_seq(&self.space, &key)),
-                None => {}
-            }
-        }
-        self.closed = closed;
-        for (device, _) in counted {
-            if let Some(dev) = self.devices.get_mut(&device) {
-                dev.nonvouching += 1;
+            let dev = Kind::STATUS
+                .parse_seq(&self.space, &key)
+                .and_then(|(device, _)| self.devices.get_mut(&device));
+            match (value.first(), dev) {
+                (Some(1), _) => self.closed += 1,
+                (Some(_), Some(dev)) => dev.nonvouching += 1,
+                _ => {}
             }
         }
     }
