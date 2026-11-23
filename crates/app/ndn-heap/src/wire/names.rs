@@ -22,7 +22,9 @@ use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent, tlv_type};
 use ndn_tlv::{TlvReader, TlvWriter};
 
-use super::prim::{WireError, each, once, read_array, read_epoch_id, read_name, write_epoch_id, write_name};
+use super::prim::{
+    WireError, each, once, read_array, read_epoch_id, read_name, write_epoch_id, write_name,
+};
 use super::tlv;
 use super::types::{EntryRef, EpochId};
 

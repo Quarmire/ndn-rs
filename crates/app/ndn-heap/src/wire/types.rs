@@ -23,7 +23,7 @@ pub(crate) struct Entry {
     /// seq 1.
     pub prev: Option<Prev>,
     /// Put only: the heads of the entry's path this write supersedes
-    /// (at most [`AFTER_MAX`](crate::wire::AFTER_MAX)).
+    /// (at most [`AFTER_MAX`](super::AFTER_MAX)).
     pub after: Vec<EntryRef>,
     /// What the entry says.
     pub body: Body,

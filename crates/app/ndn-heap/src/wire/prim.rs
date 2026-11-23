@@ -33,9 +33,7 @@ pub enum WireError {
         max: usize,
     },
     /// A list over the number of items the layer allows.
-    #[error(
-        "{what} lists {count} items, over the limit of {max}; split it across several entries"
-    )]
+    #[error("{what} lists {count} items, over the limit of {max}; split it across several entries")]
     TooMany {
         /// What lists too many.
         what: &'static str,
@@ -76,11 +74,7 @@ pub enum WireError {
 }
 
 /// A field that may appear once: store it, refuse a second.
-pub(crate) fn once<T>(
-    slot: &mut Option<T>,
-    value: T,
-    what: &'static str,
-) -> Result<(), WireError> {
+pub(crate) fn once<T>(slot: &mut Option<T>, value: T, what: &'static str) -> Result<(), WireError> {
     if slot.replace(value).is_some() {
         return Err(WireError::Duplicate(what));
     }
@@ -125,7 +119,8 @@ pub(crate) fn write_name(w: &mut TlvWriter, name: &Name) {
 
 /// Read the value of a `Name` TLV.
 pub(crate) fn read_name(value: Bytes) -> Result<Name, WireError> {
-    Name::decode(value).map_err(|_| WireError::Malformed("a name is a run of well-formed components"))
+    Name::decode(value)
+        .map_err(|_| WireError::Malformed("a name is a run of well-formed components"))
 }
 
 /// Read a fixed-size octet string.

@@ -122,6 +122,9 @@ fn every_kind() -> Vec<Entry> {
     ]
 }
 
+/// TLVs as `(type, value)`.
+type Tlvs = Vec<(u64, Bytes)>;
+
 /// The TLVs of `value`, as `(type, value)`.
 fn children(value: &Bytes) -> Vec<(u64, Bytes)> {
     let mut r = TlvReader::new(value.clone());
@@ -142,11 +145,7 @@ fn serialize(list: &[(u64, Bytes)]) -> Bytes {
 
 /// `value` with `f` applied to the TLVs found by following `path` (the first
 /// child of each type) from the top.
-fn rewrite(
-    value: &Bytes,
-    path: &[u64],
-    f: &dyn Fn(Vec<(u64, Bytes)>) -> Vec<(u64, Bytes)>,
-) -> Bytes {
+fn rewrite(value: &Bytes, path: &[u64], f: &dyn Fn(Tlvs) -> Tlvs) -> Bytes {
     let mut list = children(value);
     match path.split_first() {
         None => list = f(list),
@@ -159,11 +158,7 @@ fn rewrite(
 }
 
 /// The encoded `entry`, rewritten under its `ENTRY` TLV.
-fn edit(
-    entry: &Entry,
-    path: &[u64],
-    f: &dyn Fn(Vec<(u64, Bytes)>) -> Vec<(u64, Bytes)>,
-) -> Vec<u8> {
+fn edit(entry: &Entry, path: &[u64], f: &dyn Fn(Tlvs) -> Tlvs) -> Vec<u8> {
     let wire = entry.encode().unwrap();
     let (typ, value) = children(&wire).remove(0);
     assert_eq!(typ, tlv::ENTRY);
@@ -232,19 +227,20 @@ fn prev_seq_is_absent_when_the_log_is_dense_and_present_after_a_gap() {
 fn an_unknown_even_tlv_is_skipped_and_an_unknown_odd_one_refuses() {
     // Wherever a record nests: the entry, a ref, a member's addition, a
     // removal, an epoch, a blob, a sealed body.
-    let members = &every_kind()[5];
+    let all = every_kind();
+    let members = &all[5];
     let cases: Vec<(&Entry, Vec<u64>)> = vec![
-        (&every_kind()[0], vec![]),
-        (&every_kind()[0], vec![tlv::ENTRY_REF]),
-        (&every_kind()[2], vec![tlv::BLOB]),
-        (&every_kind()[4], vec![tlv::SEALED]),
-        (&every_kind()[4], vec![tlv::SEALED, tlv::EPOCH_ID]),
+        (&all[0], vec![]),
+        (&all[0], vec![tlv::ENTRY_REF]),
+        (&all[2], vec![tlv::BLOB]),
+        (&all[4], vec![tlv::SEALED]),
+        (&all[4], vec![tlv::SEALED, tlv::EPOCH_ID]),
         (members, vec![tlv::MEMBERS]),
         (members, vec![tlv::MEMBERS, tlv::ADD]),
         (members, vec![tlv::MEMBERS, tlv::REMOVE]),
         (members, vec![tlv::MEMBERS, tlv::CREATE]),
-        (&every_kind()[7], vec![tlv::EPOCH_BODY]),
-        (&every_kind()[7], vec![tlv::EPOCH_BODY, tlv::AUDIENCE]),
+        (&all[7], vec![tlv::EPOCH_BODY]),
+        (&all[7], vec![tlv::EPOCH_BODY, tlv::AUDIENCE]),
     ];
     for (entry, path) in cases {
         // An even type the format does not use (and 0x0640 is outside the
@@ -410,9 +406,10 @@ fn the_worst_case_entry_fits() {
     let name = log_name(&device, &space, u64::MAX);
     let key = device.clone().append("KEY").append("1234567890");
     let signer = Ed25519Signer::from_seed(&[1; 32], key.clone());
-    let wire = DataBuilder::new(name, &content).sign_sync(signer.sig_type(), Some(&key), |region| {
-        signer.sign_sync(region).unwrap()
-    });
+    let wire =
+        DataBuilder::new(name, &content).sign_sync(signer.sig_type(), Some(&key), |region| {
+            signer.sign_sync(region).unwrap()
+        });
     assert!(
         wire.len() <= MAX_NDN_PACKET_SIZE,
         "the worst case is {} octets, over the {MAX_NDN_PACKET_SIZE} an NDN packet may be: \
@@ -441,9 +438,9 @@ fn an_entry_over_8800_octets_is_refused_at_encode() {
     // Eight references to devices with very long names push the content over
     // the size of one NDN packet.
     let long = |i: u8| {
-        Name::from_components((0..10).map(|c| {
-            NameComponent::generic(Bytes::from(vec![b'a' + i + c; 120]))
-        }))
+        Name::from_components(
+            (0..10).map(|c| NameComponent::generic(Bytes::from(vec![b'a' + i + c; 120]))),
+        )
     };
     let mut e = put(Payload::Inline(Bytes::from(vec![0; INLINE_MAX])));
     e.after = (0..AFTER_MAX as u8)
@@ -489,32 +486,36 @@ fn the_limits_of_an_entry_are_held_at_encode_and_decode() {
         e
     };
     assert!(at("/a/b/c/d/e/f/g/h").encode().is_ok());
-    for bad in [
-        "/a/b/c/d/e/f/g/h/i",
-        "/a/32=data/c",
-        "/a/seq=4",
-    ] {
+    for bad in ["/a/b/c/d/e/f/g/h/i", "/a/32=data/c", "/a/seq=4"] {
         assert!(at(bad).encode().is_err(), "{bad}");
     }
-    assert!(Entry { body: Body::Put(PutBody { path: Name::root(), payload: Payload::Inline(Bytes::new()) }), ..inline(0) }.encode().is_err(), "an empty path");
+    assert!(
+        Entry {
+            body: Body::Put(PutBody {
+                path: Name::root(),
+                payload: Payload::Inline(Bytes::new())
+            }),
+            ..inline(0)
+        }
+        .encode()
+        .is_err(),
+        "an empty path"
+    );
     let wide = |octets: usize| {
         let mut e = inline(1);
         e.body = Body::Put(PutBody {
-            // One component: 4 octets of TLV header for a long value.
+            // One component: 2 octets of TLV header and the value.
             path: Name::from_components([NameComponent::generic(Bytes::from(vec![b'a'; octets]))]),
             payload: Payload::Inline(Bytes::from_static(b"x")),
         });
         e
     };
-    assert!(wide(196).encode().is_ok(), "200 octets of path in all");
-    assert!(wide(197).encode().is_err(), "201 octets of path");
+    assert!(wide(198).encode().is_ok(), "200 octets of path in all");
+    assert!(wide(199).encode().is_err(), "201 octets of path");
 
     let mut e = inline(1);
     e.after = (0..=AFTER_MAX as u8).map(eref).collect();
-    assert!(matches!(
-        e.encode(),
-        Err(WireError::TooMany { max: 8, .. })
-    ));
+    assert!(matches!(e.encode(), Err(WireError::TooMany { max: 8, .. })));
 
     let members = |ops: Vec<Op>| Entry {
         prev: dense(),
@@ -591,7 +592,13 @@ fn a_blob_entry_names_its_payload_by_size_and_root_and_refuses_an_absurd_size() 
     ));
     let wire = edit(&blob(5000), &[tlv::BLOB], &|list| {
         list.into_iter()
-            .map(|(t, v)| if t == tlv::ROOT { (t, v.slice(1..)) } else { (t, v) })
+            .map(|(t, v)| {
+                if t == tlv::ROOT {
+                    (t, v.slice(1..))
+                } else {
+                    (t, v)
+                }
+            })
             .collect()
     });
     assert!(Entry::decode(&wire).is_err(), "a root is 32 octets");
@@ -609,11 +616,19 @@ fn grant_ask_seal_key_and_manifest_content_round_trip() {
     let (_, value) = children(&grant.encode()).remove(0);
     let short = rewrite(&value, &[], &|list| {
         list.into_iter()
-            .map(|(t, v)| if t == tlv::EPHEMERAL_KEY { (t, v.slice(1..)) } else { (t, v) })
+            .map(|(t, v)| {
+                if t == tlv::EPHEMERAL_KEY {
+                    (t, v.slice(1..))
+                } else {
+                    (t, v)
+                }
+            })
             .collect()
     });
     let missing = rewrite(&value, &[], &|list| {
-        list.into_iter().filter(|(t, _)| *t != tlv::CIPHERTEXT).collect()
+        list.into_iter()
+            .filter(|(t, _)| *t != tlv::CIPHERTEXT)
+            .collect()
     });
     let critical = rewrite(&value, &[], &|mut list| {
         list.push((0x063B, Bytes::new()));
@@ -636,7 +651,10 @@ fn grant_ask_seal_key_and_manifest_content_round_trip() {
     assert!(decode_seal_key(Bytes::new()).is_err());
 
     let digests: Vec<[u8; 32]> = (0..FANOUT as u8).map(|i| [i; 32]).collect();
-    assert_eq!(decode_manifest(encode_manifest(&digests)), Ok(digests.clone()));
+    assert_eq!(
+        decode_manifest(encode_manifest(&digests)),
+        Ok(digests.clone())
+    );
     let mut over = digests;
     over.push([0; 32]);
     assert!(decode_manifest(encode_manifest(&over)).is_err());

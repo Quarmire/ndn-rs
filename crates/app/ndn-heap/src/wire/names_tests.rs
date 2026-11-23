@@ -56,10 +56,17 @@ fn space_names_of_one_to_four_components_parse_and_five_do_not() {
     ] {
         assert_eq!(parse_space_name(&n(bad)), None, "{bad}");
     }
-    let digest = owner.clone().append_component(kw(b"data")).append_implicit_digest([1; 32]);
+    let digest = owner
+        .clone()
+        .append_component(kw(b"data"))
+        .append_implicit_digest([1; 32]);
     assert_eq!(parse_space_name(&digest), None);
     let typed = n("/home/alice/32=data").append_sequence_num(4);
-    assert_eq!(parse_space_name(&typed), None, "a path component is generic");
+    assert_eq!(
+        parse_space_name(&typed),
+        None,
+        "a path component is generic"
+    );
 }
 
 #[test]
@@ -80,7 +87,10 @@ fn log_name_parses_back_and_refuses_a_device_with_a_keyword() {
     let device = n("/alice/member/laptop");
     let space = n("/alice/32=data/n/f1");
     let name = log_name(&device, &space, 7);
-    assert_eq!(name, n("/alice/member/laptop/32=log/alice/32=data/n/f1/seq=7"));
+    assert_eq!(
+        name,
+        n("/alice/member/laptop/32=log/alice/32=data/n/f1/seq=7")
+    );
     assert_eq!(
         parse_log_name(&name),
         Some(LogName {
@@ -134,11 +144,18 @@ fn seal_key_grant_and_held_names_round_trip_and_refuse_what_they_are_not() {
         .clone()
         .append_component(kw(b"seal"))
         .append_component(NameComponent::new(0x3A, Bytes::copy_from_slice(&[7; 32])));
-    assert_eq!(parse_seal_key_name(&typed), None, "the key is a generic component");
+    assert_eq!(
+        parse_seal_key_name(&typed),
+        None,
+        "the key is a generic component"
+    );
 
     let ask = ask(&space);
     let grant = grant_name(&device, &ask);
-    assert_eq!(parse_grant_name(&grant), Some((device.clone(), ask.clone())));
+    assert_eq!(
+        parse_grant_name(&grant),
+        Some((device.clone(), ask.clone()))
+    );
     // The name carries the ask in one component.
     assert_eq!(grant.len(), device.len() + 2);
     assert_eq!(GrantAsk::decode(ask.encode()), Ok(ask.clone()));
@@ -163,7 +180,10 @@ fn seal_key_grant_and_held_names_round_trip_and_refuse_what_they_are_not() {
             },
         ),
         device.clone().append_component(kw(b"grant")),
-        device.clone().append_component(kw(b"grant")).append("not a TLV"),
+        device
+            .clone()
+            .append_component(kw(b"grant"))
+            .append("not a TLV"),
         n("/alice/32=held/x/32=grant/y"),
     ] {
         assert_eq!(parse_grant_name(&bad), None, "{bad}");
@@ -171,10 +191,16 @@ fn seal_key_grant_and_held_names_round_trip_and_refuse_what_they_are_not() {
 
     let piece = log_name(&n("/bob/phone"), &space, 4);
     let held = held_name(&device, &piece);
-    assert_eq!(parse_held_name(&held), Some((device.clone(), piece.clone())));
+    assert_eq!(
+        parse_held_name(&held),
+        Some((device.clone(), piece.clone()))
+    );
     for bad in [
         device.clone().append_component(kw(b"held")),
-        device.clone().append_component(kw(b"held")).append("not a TLV"),
+        device
+            .clone()
+            .append_component(kw(b"held"))
+            .append("not a TLV"),
         n("/alice/32=seal/x/32=held/y"),
     ] {
         assert_eq!(parse_held_name(&bad), None, "{bad}");
@@ -278,10 +304,16 @@ fn owns_is_a_device_prefix_not_a_component_prefix() {
     let home = n("/home/bob/32=data/x");
     assert!(owns(&home, &n("/home/bob/member/laptop/KEY/1")));
     assert!(!owns(&home, &n("/home/member/hub/KEY/1")));
-    assert!(owns(&n("/home/32=data/x"), &n("/home/bob/member/laptop/KEY/1")));
+    assert!(owns(
+        &n("/home/32=data/x"),
+        &n("/home/bob/member/laptop/KEY/1")
+    ));
     // A name that is no space has no owner.
     assert!(!owns(&n("/alice/notes"), &n("/alice/laptop/KEY/1")));
-    assert_eq!(device_of(&n("/alice/laptop/KEY/1")), Some(n("/alice/laptop")));
+    assert_eq!(
+        device_of(&n("/alice/laptop/KEY/1")),
+        Some(n("/alice/laptop"))
+    );
     assert_eq!(device_of(&n("/alice/laptop")), None);
 }
 
@@ -324,7 +356,11 @@ fn a_reencoded_copy_has_the_same_signed_digest() {
     // another name is another object.
     let (other, _) = signed(&name, b"other", None);
     assert_ne!(signed_digest(&wire), signed_digest(&other));
-    let (renamed, _) = signed(&log_name(&n("/alice/laptop"), &n("/alice/32=data/n"), 2), b"content", None);
+    let (renamed, _) = signed(
+        &log_name(&n("/alice/laptop"), &n("/alice/32=data/n"), 2),
+        b"content",
+        None,
+    );
     assert_ne!(signed_digest(&wire), signed_digest(&renamed));
 }
 
@@ -340,7 +376,10 @@ fn piece_names_are_unique_parse_back_and_cover_the_manifest_tree() {
         (CHUNK * FANOUT) as u64 + 1,
         (CHUNK * FANOUT * FANOUT) as u64 + 1,
     ] {
-        let body = ChunksBody { size, root: [0; 32] };
+        let body = ChunksBody {
+            size,
+            root: [0; 32],
+        };
         let names: Vec<Name> = piece_names(&entry, &body).collect();
         let shape = Shape::of(size);
         assert_eq!(names.len() as u64, shape.pieces(), "size {size}");
@@ -350,7 +389,10 @@ fn piece_names_are_unique_parse_back_and_cover_the_manifest_tree() {
         assert_eq!(names[0], piece_name(&entry, PieceKind::Chunk(0)));
         assert_eq!(
             names.last().unwrap(),
-            &piece_name(&entry, PieceKind::Manifest(shape.manifests().last().unwrap()))
+            &piece_name(
+                &entry,
+                PieceKind::Manifest(shape.manifests().last().unwrap())
+            )
         );
         for name in &names {
             let parsed = parse_piece_name(name).unwrap_or_else(|| panic!("{name}"));
@@ -360,7 +402,10 @@ fn piece_names_are_unique_parse_back_and_cover_the_manifest_tree() {
         // Every node lists children that are pieces of the payload.
         for k in shape.manifests() {
             for child in shape.children(k).unwrap() {
-                assert!(unique.contains(&&piece_name(&entry, child)), "size {size}: {k}");
+                assert!(
+                    unique.contains(&&piece_name(&entry, child)),
+                    "size {size}: {k}"
+                );
             }
         }
     }
