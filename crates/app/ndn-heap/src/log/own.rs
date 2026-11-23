@@ -282,12 +282,7 @@ impl Log {
         let _batch = stage.batch();
         self.store.apply(extra);
         let person = self.person.clone();
-        let applying = Applying {
-            id: id.clone(),
-            person: person.clone(),
-            entry,
-            put,
-        };
+        let applying = Applying::new(id.clone(), person.clone(), entry, put);
         self.store_fresh(
             Fresh {
                 id: &id,

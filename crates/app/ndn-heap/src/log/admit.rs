@@ -31,6 +31,20 @@ pub(super) struct Subject<'a> {
     pub name: &'a Name,
 }
 
+impl<'a> Subject<'a> {
+    /// The facts of the entry `id` (named `name`) signed by `v`.
+    fn new(id: &'a EntryRef, v: &'a Verified, name: &'a Name) -> Subject<'a> {
+        Subject {
+            device: &id.device,
+            person: &v.person,
+            key: &v.key,
+            seq: id.seq,
+            digest: id.digest,
+            name,
+        }
+    }
+}
+
 /// What [`Log::assess`] says of an entry.
 pub(super) enum Verdict {
     /// Apply it; a write comes with its path and payload (opened if sealed).
@@ -49,6 +63,17 @@ pub(super) struct Applying {
     pub person: Name,
     pub entry: Entry,
     pub put: Option<PutBody>,
+}
+
+impl Applying {
+    pub(super) fn new(id: EntryRef, person: Name, entry: Entry, put: Option<PutBody>) -> Applying {
+        Applying {
+            id,
+            person,
+            entry,
+            put,
+        }
+    }
 }
 
 /// What `take` is given about the entry that arrived: its name, bytes, the
@@ -228,14 +253,7 @@ impl Log {
             self.view().status(&id.device, id.seq),
             Some(Status::Refused(Refusal::OutsideCut(_)) | Status::Waiting)
         ) && shape(data, id.seq).is_some_and(|(entry, _, _)| {
-            let subject = Subject {
-                device: &id.device,
-                person: &v.person,
-                key: &v.key,
-                seq: id.seq,
-                digest: id.digest,
-                name,
-            };
+            let subject = Subject::new(id, v, name);
             matches!(self.assess(&subject, &entry), Verdict::Apply(_))
         })
     }
@@ -299,21 +317,9 @@ impl Log {
         if let Some((entry, _, _)) = shape(data, id.seq)
             && matches!(entry.body, Body::Members(_) | Body::Epoch(_))
         {
-            let subject = Subject {
-                device: &id.device,
-                person: &v.person,
-                key: &v.key,
-                seq: id.seq,
-                digest: id.digest,
-                name: &name,
-            };
+            let subject = Subject::new(id, v, &name);
             if let Verdict::Apply(put) = self.assess(&subject, &entry) {
-                let applying = Applying {
-                    id: id.clone(),
-                    person: v.person.clone(),
-                    entry,
-                    put,
-                };
+                let applying = Applying::new(id.clone(), v.person.clone(), entry, put);
                 self.apply_entry(&applying, fx);
             }
         }
@@ -411,22 +417,10 @@ impl Log {
         }
 
         // 3 to 5: carrier, membership, sealing.
-        let subject = Subject {
-            device: &id.device,
-            person: &v.person,
-            key: &v.key,
-            seq: id.seq,
-            digest: id.digest,
-            name: &name,
-        };
+        let subject = Subject::new(id, v, &name);
         match self.assess(&subject, &entry) {
             Verdict::Apply(put) => {
-                let applying = Applying {
-                    id: id.clone(),
-                    person: v.person.clone(),
-                    entry,
-                    put,
-                };
+                let applying = Applying::new(id.clone(), v.person.clone(), entry, put);
                 self.store_fresh(fresh(None, link, Some(applying)), now, fx);
                 Outcome::Applied
             }
@@ -1047,12 +1041,7 @@ impl Log {
                                     digest: l.id.digest,
                                 });
                             }
-                            let applying = Applying {
-                                id: l.id,
-                                person: l.person,
-                                entry: l.entry,
-                                put,
-                            };
+                            let applying = Applying::new(l.id, l.person, l.entry, put);
                             self.apply_entry(&applying, fx);
                         }
                         return;
@@ -1070,12 +1059,7 @@ impl Log {
         self.count_gap(device, seq, &l.marker, l.status.as_ref(), Some(&new));
         if l.status.is_none() {
             let put = self.view().opened_put(&l.entry, &name);
-            let applying = Applying {
-                id: l.id,
-                person: l.person,
-                entry: l.entry,
-                put,
-            };
+            let applying = Applying::new(l.id, l.person, l.entry, put);
             self.unapply(&applying, &new, fx);
         }
     }
