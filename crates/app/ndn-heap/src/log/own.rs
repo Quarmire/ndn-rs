@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_security::confidentiality::ContentKey;
@@ -253,7 +252,6 @@ impl Log {
         let person = self.person.clone();
         let applying = Applying {
             id: id.clone(),
-            name,
             person: person.clone(),
             entry,
             put,

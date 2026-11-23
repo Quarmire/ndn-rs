@@ -108,6 +108,7 @@ impl Ranges {
         out
     }
 
+    #[cfg(test)]
     pub(super) fn to_vec(&self) -> Vec<(u64, u64)> {
         self.0.clone()
     }

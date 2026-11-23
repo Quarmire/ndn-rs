@@ -16,17 +16,35 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::error::{Cut, NextStep, Refusal};
-use crate::reserve::{Flusher, Reservation};
+use crate::reserve::Flusher;
 use crate::seal::{self, Keys};
 use crate::store::{
-    self, Marker, ReserveRecord, Stage, equivocal_key, ledger_key, read_reserve, status_key,
-    structural_key, verified_key, walk_chain, write_reserve,
+    self, Marker, ReserveRecord, Stage, equivocal_key, status_key, structural_key, verified_key,
+    walk_chain, write_reserve,
 };
 use crate::test_kit::{CrashStore, n};
 use crate::wire::{
     self, Body, Entry, EntryRef, EpochBody, EpochId, MembersBody, Op, Payload, Prev, PutBody, Role,
     SealedBody, log_name, signed_digest,
 };
+
+/// What the tests inspect of a log.
+impl Log {
+    /// Whether at least one entry of `device` is held in this space (any seq,
+    /// whatever became of it); a notice alone does not count.
+    fn holds(&self, device: &Name) -> bool {
+        self.devices
+            .get(device)
+            .is_some_and(|d| d.held.max().is_some())
+    }
+
+    /// The seqs `device`'s entries declared absent (gap statements).
+    fn voids(&self, device: &Name) -> Vec<(u64, u64)> {
+        self.devices
+            .get(device)
+            .map_or_else(Vec::new, |d| d.voids.to_vec())
+    }
+}
 
 const NOW: u64 = 1_000;
 const BLOCK: u64 = 8;
@@ -156,11 +174,6 @@ impl Chain {
         self.entry(Body::Members(body), vec![])
     }
 
-    /// Skip `n` seqs without signing them, and say so in the next entry.
-    fn skip(&mut self, n: u64) {
-        self.seq += n;
-    }
-
     /// The next entry after a skip: `PREV_SEQ` names the entry before it.
     fn entry_after_gap(&mut self, body: Body, from: u64, digest: [u8; 32]) -> Packet {
         self.seq += 1;
@@ -203,9 +216,7 @@ fn members(create: Option<bool>, ops: Vec<Op>) -> MembersBody {
 struct Rig {
     log: Log,
     store: Arc<CrashStore>,
-    stage: Arc<Stage>,
     flusher: Arc<Flusher>,
-    me: Dev,
 }
 
 fn open_on(store: &Arc<CrashStore>, me: &Dev) -> Rig {
@@ -229,9 +240,7 @@ fn open_on(store: &Arc<CrashStore>, me: &Dev) -> Rig {
     Rig {
         log,
         store: Arc::clone(store),
-        stage,
         flusher,
-        me: me.clone(),
     }
 }
 
@@ -1199,7 +1208,6 @@ async fn a_replayed_stale_notice_state_never_lowers_what_is_wanted() {
     r.applied(&ps[1]);
     assert_eq!(wanted(&r), vec![(4, 10)]);
     assert_eq!(r.log.held_prefix(&bob().name), 3);
-    assert_eq!(r.log.frontier().get(&bob().name), 3);
 }
 
 #[tokio::test]

@@ -6,13 +6,11 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
-use ndn_packet::Data;
 use ndn_sync::DataStore;
 
 use super::chain::{Dev, Status};
 use super::{Log, decode_wire};
 use crate::error::Refusal;
-use crate::fold::Fold;
 use crate::register::{Write, decode_refs};
 use crate::seal::{self, Keys};
 use crate::store::{Marker, equivocal_key, status_key, supers_key, verified_key};
@@ -21,7 +19,6 @@ use crate::wire::{self, Body, Entry, EntryRef, Payload, PutBody, log_name, signe
 pub(super) struct View<'a> {
     pub store: &'a dyn DataStore,
     pub space: &'a Name,
-    pub fold: &'a Fold,
     pub keys: &'a Keys,
     pub devices: &'a BTreeMap<Name, Dev>,
 }
@@ -31,7 +28,6 @@ impl<'a> View<'a> {
         View {
             store: &*log.store,
             space: &log.space,
-            fold: &log.fold,
             keys: &log.keys,
             devices: &log.devices,
         }

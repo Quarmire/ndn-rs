@@ -13,7 +13,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::Data;
-use ndn_sync::StoreOp;
 
 use super::chain::{Keeps, Ranges, Status};
 use super::view::{View, write_for};
@@ -46,7 +45,6 @@ pub(super) enum Verdict {
 /// An entry to put into the fold or the register.
 pub(super) struct Applying {
     pub id: EntryRef,
-    pub name: Name,
     pub person: Name,
     pub entry: Entry,
     pub put: Option<PutBody>,
@@ -262,7 +260,6 @@ impl Log {
             if let Verdict::Apply(put) = self.assess(&subject, &entry) {
                 let applying = Applying {
                     id: id.clone(),
-                    name,
                     person: v.person.clone(),
                     entry,
                     put,
@@ -361,7 +358,6 @@ impl Log {
             Verdict::Apply(put) => {
                 let applying = Applying {
                     id: id.clone(),
-                    name,
                     person: v.person.clone(),
                     entry,
                     put,
@@ -611,7 +607,6 @@ impl Log {
                 let view = View {
                     store: &*self.store,
                     space: &self.space,
-                    fold: &self.fold,
                     keys: &self.keys,
                     devices: &self.devices,
                 };
@@ -662,7 +657,6 @@ impl Log {
                 let view = View {
                     store: &*self.store,
                     space: &self.space,
-                    fold: &self.fold,
                     keys: &self.keys,
                     devices: &self.devices,
                 };
@@ -918,7 +912,6 @@ impl Log {
                     self.set_status(device, seq, l.status.as_ref(), None);
                     let applying = Applying {
                         id,
-                        name,
                         person: l.person,
                         entry: l.entry,
                         put,
@@ -939,7 +932,6 @@ impl Log {
             let put = self.view().opened_put(&l.entry, &name);
             let applying = Applying {
                 id,
-                name,
                 person: l.person,
                 entry: l.entry,
                 put,
@@ -968,7 +960,6 @@ impl Log {
                             seq,
                             digest: l.marker.signed_digest,
                         },
-                        name,
                         person: l.person,
                         entry: l.entry,
                         put,

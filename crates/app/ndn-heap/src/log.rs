@@ -60,9 +60,9 @@
 //!    changed are judged again from the store; an applied one now refused
 //!    leaves the register (the entries it superseded return) and is reported
 //!    as [`Change::Withdrawn`].
-//! 6. **Catch-up** ([`Log::held_prefix`], [`Log::holes`], [`Log::voids`],
-//!    [`Log::frontier`], [`Log::missing`], [`Log::note_high`]): a notice only
-//!    raises `high`; what is wanted never shrinks except by holding it.
+//! 6. **Catch-up** ([`Log::held_prefix`], [`Log::missing`], [`Log::note_high`]):
+//!    a notice only raises `high`; what is wanted never shrinks except by
+//!    holding it.
 //!
 //! The node validates with the judge and calls these; this module is the
 //! only writer of everything it keeps.
@@ -75,11 +75,11 @@ use ndn_foundation_types::Name;
 use ndn_packet::Data;
 use ndn_security::confidentiality::ContentKey;
 use ndn_security::{Signer, public_key_digest};
-use ndn_sync::{DataStore, StoreOp};
+use ndn_sync::DataStore;
 
 use crate::error::{Cut, HeapError, NextStep, Refusal, Timestamp};
 use crate::fold::{Fold, Readers};
-use crate::register::{EntryId, Head, Item, Register, Write, decode_refs};
+use crate::register::{EntryId, Item, Register};
 use crate::reserve::{Flusher, Gate, Reservation, Ticket};
 use crate::seal::{self, Keys};
 use crate::store::{
@@ -101,9 +101,9 @@ mod view;
 #[cfg(test)]
 mod tests;
 
-use chain::{Dev, Keeps, Kept, Ranges, Status};
+use chain::{Dev, Kept, Status};
+pub(crate) use view::Standing;
 use view::View;
-pub(crate) use view::{HeldEntry, Standing};
 
 // -- Types the node and the API consume -----------------------------------------
 
@@ -866,14 +866,6 @@ impl Log {
             .is_some_and(|d| d.held.count() > d.nonvouching)
     }
 
-    /// Whether at least one entry of `device` is held in this space (any seq,
-    /// whatever became of it); a notice alone does not count.
-    pub(crate) fn holds(&self, device: &Name) -> bool {
-        self.devices
-            .get(device)
-            .is_some_and(|d| d.held.max().is_some())
-    }
-
     /// The highest seq heard of `device` (a notice) or held.
     pub(crate) fn high(&self, device: &Name) -> u64 {
         self.devices.get(device).map_or(0, |d| d.high)
@@ -910,32 +902,6 @@ impl Log {
         self.devices
             .get(device)
             .map_or(0, |d| d.held.prefix_with(&d.voids))
-    }
-
-    /// The seqs of `device` up to its highest heard that are neither held nor
-    /// void, as inclusive ranges.
-    pub(crate) fn holes(&self, device: &Name) -> Vec<(u64, u64)> {
-        self.devices
-            .get(device)
-            .map_or_else(Vec::new, |d| d.held.gaps(d.high, &d.voids))
-    }
-
-    /// The seqs `device`'s entries declared absent (gap statements).
-    pub(crate) fn voids(&self, device: &Name) -> Vec<(u64, u64)> {
-        self.devices
-            .get(device)
-            .map_or_else(Vec::new, |d| d.voids.to_vec())
-    }
-
-    /// How far each device is held (the prefix).
-    pub(crate) fn frontier(&self) -> Frontier {
-        Frontier(
-            self.devices
-                .keys()
-                .map(|d| (d.clone(), self.held_prefix(d)))
-                .filter(|(_, n)| *n > 0)
-                .collect(),
-        )
     }
 
     /// Everything wanted: the holes below each device's highest heard seq, and
