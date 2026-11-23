@@ -40,14 +40,14 @@ define the bytes on the wire:
 
 ### TLV-TYPE numbers
 
-Application TLV-TYPEs of these specs are allocated from 0x0400–0x05FF in
+Application TLV-TYPEs of these specs are allocated from 0x0400–0x06FF in
 blocks, one owner each. Allocate a new block from the free space and add it
 here before using it.
 
 | Block | Owner |
 |---|---|
 | 0x0403–0x040F | free (left below the trust-context block) |
-| 0x0410–0x042F | [trust-context.md](trust-context.md) |
+| 0x0410–0x043E | [trust-context.md](trust-context.md) |
 | 0x0440–0x046C | [ndn-link.md](ndn-link.md) (hello/verdict, the control messages after the verdict — Reachability 0x0440, Presence 0x0446, ObservedAddress 0x0458 and, since round 7, `Departure` 0x044C, §5.9 — and the punch messages) |
 | 0x0470–0x049F | [trust-envelope.md](trust-envelope.md) (the `intro` kind's offer, relay hint and secret: 0x0475–0x0477; its link hint, the octets of data-layer.md §19.2's hint: 0x0478; since round 10 the compact form, names as wire relative to the namespace instead of text: `IntroNamespaceWire` 0x0490, `IntroOfferWire` 0x0492, `IntroRelayWire` 0x0494, all even; the text tags 0x0489, 0x0475, 0x0476 are still read, never written) |
 | 0x04A0–0x04F2 | `links/list` and management outcome details ([ndn-link.md](ndn-link.md), [mgmt-trust.md](mgmt-trust.md)) |
@@ -58,6 +58,8 @@ here before using it.
 | 0x05B0–0x05BF | [data-layer.md](data-layer.md) §19.2 (even numbers; round 4: an introduction code's link hint, carried as the value of the intro envelope's `LinkHint` 0x0478 — `LinkKey` 0x05B0, `LinkCandidate` 0x05B2. Round 10: the hint record a short code names, the Content of the Data `<device>/32=hint/<token>` — `IntroHint` 0x05B4 holding `HintOffer` 0x05B6 (a Name), `LinkKey`, `LinkCandidate`s, `HintRelay` 0x05B8 (a Name, repeatable), `HintUntil` 0x05BC and `Credentials` 0x056F, or `HintGone` 0x05BA (3 expired, 4 closed) with `Credentials`, the whole of a gone mark). Round 4 also reuses `Revision` 0x052A as an optional field of `IntroAnswer` 0x0567: the members revision in force once the asker was admitted (§19.3 step 6) |
 | 0x05C0–0x05DF | quarantined: freed when answers were removed (the old spec is kept in [history/answers.md](history/answers.md)) and not reused; no live specification assigns a number in this block |
 | 0x05E0–0x05FE | quarantined: freed when device events were removed (the old spec is kept in [history/data-layer-events.md](history/data-layer-events.md)) and not reused; no live specification assigns a number in this block |
+| 0x0600–0x063F | [heap.md](heap.md) (the data layer's log entry and its parts: `ENTRY` 0x0601, `KIND` 0x0603, `PREV` 0x0605, `PREV_SEQ` 0x0607, `ENTRY_REF` 0x0609, `PATH` 0x060F, `INLINE` 0x0611, `BLOB` 0x0613, `SEALED` 0x0619, `MEMBERS` 0x0621, `EPOCH_BODY` 0x062F, `GRANT_ASK` 0x0635, `SEAL_KEY` 0x0637, `GRANT` 0x0639 and their fields, §3; odd numbers critical, even numbers skippable and reserved for additive fields; 0x063B–0x063F free) |
+| 0x0640–0x0653 | `ndn-security` custodian remote signer (`ndn-security/src/custodian/custodian/remote_signer.rs:149-159`: sign request and response, request id, region, status, signature, pairing offer, dashboard public key, transport hint, nonce) |
 
 ### Name-component types
 
