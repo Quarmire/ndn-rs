@@ -24,7 +24,7 @@ fn epoch() -> EpochId {
 
 fn ask(space: &Name) -> GrantAsk {
     GrantAsk {
-        seal_key: [9; 32],
+        seal_key: seal_key_name(&n("/alice/laptop"), &[9; 32]),
         space: space.clone(),
         epoch: epoch(),
     }
@@ -159,6 +159,12 @@ fn seal_key_grant_and_held_names_round_trip_and_refuse_what_they_are_not() {
     // The name carries the ask in one component.
     assert_eq!(grant.len(), device.len() + 2);
     assert_eq!(GrantAsk::decode(ask.encode()), Ok(ask.clone()));
+    // The ask names the asker's device through its seal key packet.
+    assert_eq!(
+        parse_seal_key_name(&ask.seal_key),
+        Some((n("/alice/laptop"), [9; 32]))
+    );
+    assert!(GrantAsk::decode(grant.components()[device.len() + 1].value.clone()).is_ok());
     for bad in [
         // an ask for a name that is no space
         grant_name(
@@ -179,6 +185,34 @@ fn seal_key_grant_and_held_names_round_trip_and_refuse_what_they_are_not() {
                 ..ask.clone()
             },
         ),
+        // an ask whose seal key names no seal key packet
+        grant_name(
+            &device,
+            &GrantAsk {
+                seal_key: n("/alice/laptop"),
+                ..ask.clone()
+            },
+        ),
+        grant_name(
+            &device,
+            &GrantAsk {
+                seal_key: n("/alice/laptop/32=seal/short"),
+                ..ask.clone()
+            },
+        ),
+        // the old form: the 32 octets of the key, not its name
+        device
+            .clone()
+            .append_component(kw(b"grant"))
+            .append_component(NameComponent::generic({
+                let mut w = ndn_tlv::TlvWriter::new();
+                w.write_nested(tlv::GRANT_ASK, |w| {
+                    w.write_tlv(tlv::SEAL_KEY, &[9; 32]);
+                    prim::write_name(w, &space);
+                    prim::write_epoch_id(w, &epoch());
+                });
+                w.finish()
+            })),
         device.clone().append_component(kw(b"grant")),
         device
             .clone()
