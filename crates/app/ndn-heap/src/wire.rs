@@ -6,3 +6,23 @@
 
 mod types;
 pub(crate) use types::*;
+
+#[cfg(feature = "wip-wire")]
+mod prim;
+#[cfg(feature = "wip-wire")]
+pub(crate) mod tlv;
+#[cfg(feature = "wip-wire")]
+mod names;
+#[cfg(feature = "wip-wire")]
+mod digest;
+#[cfg(feature = "wip-wire")]
+mod pieces;
+#[cfg(feature = "wip-wire")]
+mod codec;
+#[cfg(feature = "wip-wire")]
+pub(crate) use {codec::*, digest::*, names::*, pieces::*, prim::WireError};
+
+#[cfg(all(test, feature = "wip-wire"))]
+mod names_tests;
+#[cfg(all(test, feature = "wip-wire"))]
+mod codec_tests;
