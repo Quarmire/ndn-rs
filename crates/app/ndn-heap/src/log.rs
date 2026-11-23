@@ -716,6 +716,41 @@ impl Log {
         (items, blobs)
     }
 
+    /// The winning head of `path` when its payload is a blob (assembled by
+    /// the pieces layer); `None` for an inline value, a removal or no head.
+    pub(crate) fn blob_head(&self, path: &Name) -> Option<Blob> {
+        let head = self.register.value(path)?;
+        match self.view().payload_of(&head.entry)? {
+            Payload::Blob { size, root } => Some(Blob {
+                id: EntryId::from(&head.entry),
+                size,
+                root,
+            }),
+            Payload::Inline(_) => None,
+        }
+    }
+
+    /// The epoch key the applied entry was sealed under: `Some(None)` for a
+    /// plain write (public space), `Some(Some(key))` for a sealed one whose
+    /// key is held; `None` when the entry is not held, not applied, not a
+    /// write, or its key is missing.
+    pub(crate) fn entry_key(&self, id: &EntryId) -> Option<Option<ContentKey>> {
+        let id = EntryRef::from(id);
+        let view = self.view();
+        let wire = view.wire_at(&id.device, id.seq)?;
+        if signed_digest(&wire) != id.digest || view.status(&id.device, id.seq).is_some() {
+            return None;
+        }
+        match decode_wire(&wire)?.0.body {
+            Body::Put(_) => Some(None),
+            Body::Sealed(sealed) => self
+                .keys
+                .key(&self.space, &sealed.epoch)
+                .map(|key| Some(key.clone())),
+            Body::Members(_) | Body::Epoch(_) => None,
+        }
+    }
+
     /// The entry's packet, for serving: held, verified and not refused.
     pub(crate) fn served(&self, device: &Name, seq: u64) -> Option<Bytes> {
         let view = self.view();
