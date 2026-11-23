@@ -225,7 +225,6 @@ impl Net {
             group: group_name,
             shared: Arc::clone(&self.shared),
             heard: Mutex::new(Heard::default()),
-            noticed: Mutex::new(BTreeMap::new()),
             asks: Mutex::new(Asks::default()),
             assembling: Mutex::new(HashSet::new()),
             asking: Mutex::new(BTreeSet::new()),
@@ -290,8 +289,6 @@ pub(crate) struct Group {
     pub(crate) shared: Arc<Shared>,
     /// The devices heard, bounded ([`Heard`]).
     pub(crate) heard: Mutex<Heard>,
-    /// What a notice said of each device heard.
-    pub(crate) noticed: Mutex<BTreeMap<Name, u64>>,
     /// The asks in flight or pausing.
     pub(crate) asks: Mutex<Asks>,
     /// The values whose pieces are being gathered.
@@ -314,7 +311,7 @@ pub(crate) struct Group {
     pub(crate) observed: Option<Arc<ObservedState>>,
     /// The highest counter of this device's own name the group's carriage
     /// showed, as far as the log was told.
-    own_seen: AtomicU64,
+    pub(crate) own_seen: AtomicU64,
 }
 
 /// What the group carries of this device's own name is not a notice: the
@@ -340,7 +337,6 @@ impl Group {
             return false;
         }
         let host = &self.shared.host;
-        self.raise(host.device().clone(), seen);
         host.note_own_counter(&self.space, seen);
         self.heard_any.store(true, Ordering::Relaxed);
         self.first_vector.notify_waiters();
@@ -372,23 +368,13 @@ impl Group {
             .lock()
             .hear(device.clone(), high, |d| host.vouched(&self.space, d));
         if let Some(dropped) = &hearing.dropped {
-            self.noticed.lock().remove(dropped);
             self.asks.lock().forget(dropped);
         }
         if !hearing.kept {
             tracing::debug!(%device, high, "not walked: it names no entry, or as many devices are heard in the group already, each vouched for by an admitted entry, and nothing held vouches for this one");
             return;
         }
-        self.raise(device, high);
         self.wake.notify_one();
-    }
-
-    /// A notice named `device` at `high`: kept if it is the highest so far.
-    /// Unsigned: it wants nothing of the log (see [`Self::probes`]).
-    fn raise(&self, device: Name, high: u64) {
-        let mut noticed = self.noticed.lock();
-        let seen = noticed.entry(device).or_default();
-        *seen = (*seen).max(high);
     }
 
     /// Look again at what is wanted, and at the values and keys owed.

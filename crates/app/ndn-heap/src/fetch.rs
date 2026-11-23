@@ -35,6 +35,7 @@
 use std::collections::BTreeMap;
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -405,12 +406,12 @@ impl Group {
     /// proof (`NodeInner::high`). Each is probed alone, until it is held.
     pub(crate) fn probes(&self) -> Vec<(Name, u64)> {
         let host = &self.shared.host;
-        let noticed = self.noticed.lock();
-        let unheld = noticed
-            .iter()
-            .filter(|&(d, &high)| high > host.high(&self.space, d));
+        let own = (host.device(), self.own_seen.load(Ordering::Relaxed));
+        let heard = self.heard.lock();
+        let named = heard.noticed().chain(std::iter::once(own));
+        let unheld = named.filter(|&(d, high)| high > host.high(&self.space, d));
         unheld
-            .map(|(device, &high)| (device.clone(), high))
+            .map(|(device, high)| (device.clone(), high))
             .collect()
     }
 
@@ -531,10 +532,7 @@ impl Group {
             rt::spawn(Arc::clone(self).ask_entry(launch));
         }
 
-        if self
-            .relist
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.relist.swap(false, Ordering::Relaxed) {
             self.assemble(host.blobs(space));
         }
         for epoch in host.owed_keys(space) {
@@ -799,7 +797,7 @@ impl Group {
         let began = Instant::now();
         loop {
             let first = self.first_vector.notified();
-            if self.heard_any.load(std::sync::atomic::Ordering::Relaxed) || self.note_own() {
+            if self.heard_any.load(Ordering::Relaxed) || self.note_own() {
                 break;
             }
             let left = settle.saturating_sub(began.elapsed());
@@ -808,7 +806,7 @@ impl Group {
             }
             let _ = rt::timeout(left.min(OWN_POLL), first).await;
         }
-        let heard = self.heard_any.load(std::sync::atomic::Ordering::Relaxed);
+        let heard = self.heard_any.load(Ordering::Relaxed);
         loop {
             let progress = self.progress.notified();
             self.note_own();

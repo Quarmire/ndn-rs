@@ -48,8 +48,10 @@ pub(crate) struct Hearing {
 /// most [`HEARD_MAX`].
 #[derive(Default)]
 pub(crate) struct Heard {
-    /// Each device heard, with the tick it was last heard at.
-    at: BTreeMap<Name, u64>,
+    /// Each device heard, with the tick it was last heard at and the highest
+    /// counter of its log a notice named: unsigned, so it wants nothing of
+    /// the log, only a probe of the entry it names.
+    at: BTreeMap<Name, (u64, u64)>,
     /// The tick of the newest hearing.
     tick: u64,
 }
@@ -74,6 +76,11 @@ impl Heard {
 }
 
 impl Heard {
+    /// The devices heard, each with the highest counter noticed for it.
+    pub(crate) fn noticed(&self) -> impl Iterator<Item = (&Name, u64)> {
+        self.at.iter().map(|(device, (_, high))| (device, *high))
+    }
+
     /// Note `device` heard now at counter `high` of its log. Past
     /// [`HEARD_MAX`] devices, the one heard longest ago that `vouched` does
     /// not vouch for is dropped — `device` itself when every other one is
@@ -98,11 +105,12 @@ impl Heard {
             return kept(false);
         }
         self.tick += 1;
-        self.at.insert(device.clone(), self.tick);
+        let seen = self.at.entry(device.clone()).or_default();
+        *seen = (self.tick, seen.1.max(high));
         if self.at.len() <= HEARD_MAX {
             return kept(true);
         }
-        let mut by_age: Vec<(u64, &Name)> = self.at.iter().map(|(d, t)| (*t, d)).collect();
+        let mut by_age: Vec<(u64, &Name)> = self.at.iter().map(|(d, (t, _))| (*t, d)).collect();
         by_age.sort_unstable();
         let dropped = by_age
             .iter()
