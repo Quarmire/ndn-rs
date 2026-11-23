@@ -82,6 +82,12 @@ const RTO_MIN: Duration = Duration::from_millis(250);
 /// in reservation blocks.
 const OWN_BLOCKS: u64 = 4;
 
+/// How often the group's observed state is read for a peer's counter of this
+/// device's own name while nothing else wakes the pump (a notice for it never
+/// comes: the driver merges no remote counter into the local name), and how
+/// often a restarting device looks for it within its wait.
+const OWN_POLL: Duration = Duration::from_millis(50);
+
 /// The pause before asking again for something after `misses` asks for it
 /// missed in a row: [`REFRESH_PAUSE`] · 2^`misses`, at most
 /// [`REFRESH_PAUSE_MAX`]; [`REFRESH_IDLE`] from [`REFRESH_TRIES`] misses on.
@@ -504,9 +510,14 @@ impl Group {
                 let high = host.high(space, device);
                 // The entry at `high` is asked first and alone while it is not
                 // held: its own gap statement may declare the seqs below it
-                // absent. Holes below a held entry are real.
+                // absent. Holes below a held entry are real. Not for this
+                // device's own name: the counter heard there may be its own
+                // announcement echoed back (above what was ever signed), so
+                // its own entries are asked for from the head up.
                 let (top, lower) = match ranges.last() {
-                    Some(&(_, last)) if last == high => (Some(last), &ranges[..ranges.len() - 1]),
+                    Some(&(_, last)) if last == high && *device != me => {
+                        (Some(last), &ranges[..ranges.len() - 1])
+                    }
                     _ => (None, &ranges[..]),
                 };
                 let seqs = top
@@ -782,13 +793,24 @@ impl Group {
     /// the log does with them (adoption, rollback evidence) is its own: this
     /// only fetches and hands over.
     pub(crate) async fn recover(&self, settle: Duration) -> Recovered {
-        let first = self.first_vector.notified();
-        if !self.heard_any.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = rt::timeout(settle, first).await;
+        // The first vector: any notice, or a peer's counter for this device's
+        // own name (which is no notice, `Group::note_own`), within `settle`.
+        let began = Instant::now();
+        loop {
+            let first = self.first_vector.notified();
+            if self.heard_any.load(std::sync::atomic::Ordering::Relaxed) || self.note_own() {
+                break;
+            }
+            let left = settle.saturating_sub(began.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            let _ = rt::timeout(left.min(OWN_POLL), first).await;
         }
         let heard = self.heard_any.load(std::sync::atomic::Ordering::Relaxed);
         loop {
             let progress = self.progress.notified();
+            self.note_own();
             match self.own_state() {
                 OwnState::Done => {
                     return Recovered {
@@ -842,7 +864,11 @@ pub(crate) async fn run(group: Arc<Group>) {
         if group.stop.is_stopped() {
             return;
         }
-        let wait = group.pump();
+        group.note_own();
+        let mut wait = group.pump();
+        if group.observes() {
+            wait = Some(wait.map_or(OWN_POLL * 20, |w| w.min(OWN_POLL * 20)));
+        }
         let woken = pin!(group.wake.notified());
         let timer = pin!(async {
             match wait {

@@ -833,3 +833,58 @@ async fn a_published_counter_reaches_a_peer_which_fetches_the_entry_through_the_
         "one fetch, one take"
     );
 }
+
+/// The SVS driver is authoritative for this device's own name and merges no
+/// remote counter into it, so a peer's counter for it is no notice: after a
+/// restart that lost two entries, the peer's vector still names this device
+/// at 2, and the half reads that from the observed state and tells the log.
+#[tokio::test]
+async fn a_peers_counter_for_this_device_is_read_from_the_observed_state() {
+    use crate::test_kit::cluster::Cluster;
+    let mut cluster = Cluster::new(&[LAPTOP, PHONE]).await;
+    let cfg = NetConfig {
+        svs: ndn_sync::SvsConfig::lan(),
+        ..NetConfig::default()
+    };
+    let on_phone = Toyhost::new(PHONE);
+    let phone_net = Net::start(
+        Arc::clone(&on_phone) as Arc<dyn Host>,
+        cfg.clone(),
+        cluster.device(1).node.connection(),
+        Arc::clone(&cluster.device(1).sync),
+    );
+    phone_net.join(&space(), 0).await.expect("phone joins");
+    let before = Toyhost::new(LAPTOP);
+    let laptop_net = Net::start(
+        Arc::clone(&before) as Arc<dyn Host>,
+        cfg.clone(),
+        cluster.device(0).node.connection(),
+        Arc::clone(&cluster.device(0).sync),
+    );
+    let group = laptop_net.join(&space(), 0).await.expect("laptop joins");
+    group.sink().publish(1).await;
+    group.sink().publish(2).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // The laptop restarts with nothing of its own.
+    laptop_net.shutdown();
+    drop(group);
+    let again = cluster.restart(0);
+    let after = Toyhost::new(LAPTOP);
+    let net = Net::start(
+        Arc::clone(&after) as Arc<dyn Host>,
+        cfg,
+        again.node.connection(),
+        Arc::clone(&again.sync),
+    );
+    net.join(&space(), 0).await.expect("laptop joins again");
+    let began = std::time::Instant::now();
+    while !after.st.lock().counters.contains(&(n(LAPTOP), 2)) {
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "the peer's counter for this device never reached the log: {:?}",
+            after.st.lock().counters
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

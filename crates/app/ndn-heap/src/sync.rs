@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -429,6 +429,7 @@ impl Net {
             first_vector: Notify::new(),
             heard_any: AtomicBool::new(false),
             relist: AtomicBool::new(true),
+            own_seen: AtomicU64::new(0),
             stop: Stop::default(),
             tx: handle.tx.clone(),
             observed: handle.observed_shared(),
@@ -509,8 +510,43 @@ pub(crate) struct Group {
     pub(crate) stop: Stop,
     tx: mpsc::Sender<(Name, Option<Bytes>)>,
     observed: Option<Arc<ObservedState>>,
+    /// The highest counter of this device's own name the group's carriage
+    /// showed, as far as the log was told.
+    own_seen: AtomicU64,
 }
 
+/// What the group carries of this device's own name is not a notice: the
+/// SVS driver is authoritative for the local name and merges no remote
+/// counter into it, so a peer's counter for this device (entries it holds
+/// that this device lost) is read from the observed state.
+impl Group {
+    /// Read the counter of this device's own name the group carries and, when
+    /// it rose, tell the log ([`Host::note_counter`]: an alert if above the
+    /// head, and the entries wanted) and wake the pump. Whether it rose.
+    pub(crate) fn note_own(&self) -> bool {
+        let Some(observed) = &self.observed else {
+            return false;
+        };
+        let host = &self.shared.host;
+        let me = host.device();
+        let Some(seen) = observed.seq_for(me).filter(|s| *s > 0) else {
+            return false;
+        };
+        if self.own_seen.fetch_max(seen, Ordering::Relaxed) >= seen {
+            return false;
+        }
+        host.note_counter(&self.space, me, seen);
+        self.heard_any.store(true, Ordering::Relaxed);
+        self.first_vector.notify_waiters();
+        self.wake.notify_one();
+        true
+    }
+
+    /// Whether the driver keeps observed state to read the own counter from.
+    pub(crate) fn observes(&self) -> bool {
+        self.observed.is_some()
+    }
+}
 impl Group {
     /// A notice: `update.name` says its counter in this group is
     /// `update.high_seq`. It decides nothing: it is noted, bounded, and the
@@ -522,6 +558,7 @@ impl Group {
         let host = &self.shared.host;
         let (device, high) = (update.name, update.high_seq);
         tracing::trace!(target: TIMELINE, %device, high, "sync_update");
+        self.note_own();
         self.heard_any.store(true, Ordering::Relaxed);
         self.first_vector.notify_waiters();
         if device == *host.device() {
