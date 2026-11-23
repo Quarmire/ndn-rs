@@ -31,7 +31,6 @@ mod log;
 mod node;
 #[cfg(feature = "wip-pieces")]
 mod pieces;
-#[cfg(feature = "wip-register")]
 mod register;
 mod reserve;
 #[cfg(feature = "wip-revocation")]

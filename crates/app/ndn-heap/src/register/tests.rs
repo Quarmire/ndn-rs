@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_sync::StoreOp;
-use sha2::{Digest, Sha256};
 use proptest::prelude::*;
+use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::store::{heads_prefix, supers_key};
@@ -82,7 +82,6 @@ impl Replica {
                 StoreOp::Remove(name) => {
                     self.store.remove(&name);
                 }
-                other => panic!("the register writes only inserts and removals: {other:?}"),
             }
         }
         effects.changes
@@ -109,12 +108,11 @@ impl Replica {
     fn refuse(&mut self, e: &Ent) -> Vec<ValueChange> {
         self.applied.remove(&e.id);
         let applied = &self.applied;
-        let fx = self.reg.withdraw(
-            &e.id,
-            &e.after,
-            &Self::lookup(&self.store),
-            &|x| applied.get(x).cloned(),
-        );
+        let fx = self
+            .reg
+            .withdraw(&e.id, &e.after, &Self::lookup(&self.store), &|x| {
+                applied.get(x).cloned()
+            });
         self.run(fx)
     }
 
@@ -148,7 +146,10 @@ impl Replica {
             .map(|(k, v)| (k.clone(), v.clone()));
         let restored = Register::restore(space(), records, &|x| self.applied.get(x).cloned())
             .expect("the register's own records restore");
-        assert!(restored.missing.is_empty(), "every persisted head is applied");
+        assert!(
+            restored.missing.is_empty(),
+            "every persisted head is applied"
+        );
         let by_restore: BTreeMap<_, BTreeSet<_>> = restored
             .register
             .paths_with_heads()
@@ -179,7 +180,9 @@ fn expected_heads(applied: &[&Ent]) -> BTreeMap<Name, BTreeSet<EntryRef>> {
 /// The winner of `path` by the definition: the head with the highest
 /// digest, then device, then seq.
 fn expected_winner(heads: &BTreeSet<EntryRef>) -> Option<&EntryRef> {
-    heads.iter().max_by_key(|h| (h.digest, h.device.clone(), h.seq))
+    heads
+        .iter()
+        .max_by_key(|h| (h.digest, h.device.clone(), h.seq))
 }
 
 // -- Ported from ndf's `newest.rs` -------------------------------------------------
@@ -193,7 +196,11 @@ fn a_version_over_another_replaces_it_whatever_the_digests() {
     r.take(&a1);
     let changes = r.take(&a2);
     assert_eq!(r.value("/f"), Some(a2.id.clone()));
-    assert_eq!(r.reg.heads_of(&n("/f")).len(), 1, "the superseded entry is no head");
+    assert_eq!(
+        r.reg.heads_of(&n("/f")).len(),
+        1,
+        "the superseded entry is no head"
+    );
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].was.as_ref().map(|h| &h.entry), Some(&a1.id));
     assert_eq!(changes[0].now.as_ref().map(|h| &h.entry), Some(&a2.id));
@@ -248,7 +255,11 @@ fn two_offline_writers_converge_on_the_highest_digest() {
     // They meet: each applies what the other wrote, in the order it was made.
     a.take_all([&b1, &b2]);
     b.take_all([&a1, &a2]);
-    assert_eq!(a.value("/f"), Some(b2.id.clone()), "the highest digest wins");
+    assert_eq!(
+        a.value("/f"),
+        Some(b2.id.clone()),
+        "the highest digest wins"
+    );
     assert_eq!(a.value("/f"), b.value("/f"));
     assert_eq!(a.heads(), b.heads());
     assert_eq!(a.reg.heads_of(&n("/f")).len(), 2);
@@ -286,7 +297,10 @@ fn a_removal_is_the_newest_until_someone_puts_again() {
     assert_eq!(r.value("/f"), Some(put.id.clone()));
     let changes = r.take(&gone);
     assert_eq!(r.value("/f"), None);
-    assert!(changes[0].now.as_ref().is_some_and(|h| h.removal), "watch sends Removed");
+    assert!(
+        changes[0].now.as_ref().is_some_and(|h| h.removal),
+        "watch sends Removed"
+    );
     // A put that never saw the removal does not undo it when its digest is
     // lower, and does when it is higher: the order is the digest's.
     let blind_low = ent(2, 1, 1, 0, "/f", "z", &[]);
@@ -320,16 +334,27 @@ fn more_than_eight_concurrent_heads_converge() {
     let mut digests: Vec<u8> = after.iter().map(|r| r.digest[0]).collect();
     digests.sort_unstable();
     assert_eq!(digests, (5..=12).map(|i| i * 10).collect::<Vec<u8>>());
-    assert_eq!(after, backward.reg.after_for_put(&n("/f")), "every replica lists the same eight");
+    assert_eq!(
+        after,
+        backward.reg.after_for_put(&n("/f")),
+        "every replica lists the same eight"
+    );
     // The other four remain heads beside the new entry; every replica agrees.
     let put = ent(1, 1, 2, 1, "/f", "next", &[]);
-    let put = Ent { after: after.clone(), ..put };
+    let put = Ent {
+        after: after.clone(),
+        ..put
+    };
     forward.take(&put);
     backward.take(&put);
     assert_eq!(forward.reg.heads_of(&n("/f")).len(), 5);
     assert_eq!(forward.heads(), backward.heads());
     assert_eq!(forward.value("/f"), backward.value("/f"));
-    assert_eq!(forward.value("/f").map(|r| r.digest[0]), Some(40), "the highest remaining head wins");
+    assert_eq!(
+        forward.value("/f").map(|r| r.digest[0]),
+        Some(40),
+        "the highest remaining head wins"
+    );
     // The next put names five and ends the fork.
     let rest = forward.reg.after_for_put(&n("/f"));
     assert_eq!(rest.len(), 5);
@@ -342,7 +367,11 @@ fn withdrawing_a_head_restores_the_entry_it_superseded() {
     let mut r = Replica::new();
     r.take_all([&a, &b]);
     let changes = r.refuse(&b);
-    assert_eq!(r.value("/f"), Some(a.id.clone()), "its place is taken by what it superseded");
+    assert_eq!(
+        r.value("/f"),
+        Some(a.id.clone()),
+        "its place is taken by what it superseded"
+    );
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].was.as_ref().map(|h| &h.entry), Some(&b.id));
     assert_eq!(changes[0].now.as_ref().map(|h| &h.entry), Some(&a.id));
@@ -361,7 +390,11 @@ fn withdrawing_a_head_restores_the_entry_it_superseded() {
     let changes = s.refuse(&a);
     assert_eq!(s.value("/f"), None);
     assert!(changes[0].now.is_none());
-    assert!(s.store.keys().all(|k| !k.has_prefix(&heads_prefix(&space()))));
+    assert!(
+        s.store
+            .keys()
+            .all(|k| !k.has_prefix(&heads_prefix(&space())))
+    );
 }
 
 #[test]
@@ -372,7 +405,11 @@ fn a_withdrawn_namer_gives_a_late_arriving_superseded_entry_its_place_back() {
     let mut r = Replica::new();
     r.take(&namer);
     r.take(&x);
-    assert_eq!(r.heads()[&n("/f")], BTreeSet::from([namer.id.clone()]), "a late x is not a head");
+    assert_eq!(
+        r.heads()[&n("/f")],
+        BTreeSet::from([namer.id.clone()]),
+        "a late x is not a head"
+    );
     assert_eq!(r.value("/f"), Some(namer.id.clone()));
     // The namer is refused before x arrives: x then takes its place.
     let mut s = Replica::new();
@@ -415,7 +452,10 @@ fn memory_is_o_heads_not_o_entries() {
     assert_eq!(r.reg.heads_of(&n("/f")).len(), 1);
     assert_eq!(r.value("/f"), last.map(|l| l.id));
     assert_eq!(
-        r.store.keys().filter(|k| k.has_prefix(&heads_prefix(&space()))).count(),
+        r.store
+            .keys()
+            .filter(|k| k.has_prefix(&heads_prefix(&space())))
+            .count(),
         1,
         "one record per path"
     );
@@ -458,8 +498,14 @@ fn a_duplicate_changes_nothing_and_writes_nothing() {
     r.take_all([&a, &b]);
     let before = (r.heads(), r.store.clone());
     for e in [&a, &b, &a] {
-        let fx = r.reg.apply(&e.id, &e.write, &e.after, &Replica::lookup(&r.store));
-        assert!(fx.writes.is_empty() && fx.changes.is_empty(), "{:?} again", e.id);
+        let fx = r
+            .reg
+            .apply(&e.id, &e.write, &e.after, &Replica::lookup(&r.store));
+        assert!(
+            fx.writes.is_empty() && fx.changes.is_empty(),
+            "{:?} again",
+            e.id
+        );
     }
     assert_eq!((r.heads(), r.store.clone()), before);
 }
@@ -485,7 +531,10 @@ fn a_persisted_head_whose_entry_is_gone_is_reported_not_dropped_silently() {
     bad.truncate(bad.len() - 1);
     value = Bytes::from(bad);
     assert!(Register::restore(space(), vec![(key, value)], &|_| None).is_err());
-    let moved = (n("/localhost/ndn-heap/heads/elsewhere"), r.store.values().next().cloned().unwrap());
+    let moved = (
+        n("/localhost/ndn-heap/heads/elsewhere"),
+        r.store.values().next().cloned().unwrap(),
+    );
     assert!(Register::restore(space(), vec![moved], &|_| None).is_err());
 }
 
@@ -497,7 +546,10 @@ fn an_item_converts_from_a_reference_and_back() {
         digest: [3; 32],
     };
     let id = EntryId::from(&r);
-    assert_eq!((id.device.clone(), id.seq, id.digest), (r.device.clone(), 7, [3; 32]));
+    assert_eq!(
+        (id.device.clone(), id.seq, id.digest),
+        (r.device.clone(), 7, [3; 32])
+    );
     assert_eq!(EntryRef::from(&id), r);
 }
 
@@ -515,7 +567,13 @@ struct Shape {
 
 fn shapes() -> impl Strategy<Value = Vec<Shape>> {
     prop::collection::vec(
-        (0u8..3, any::<bool>(), 0u8..3, 0u8..6, prop::collection::vec(any::<usize>(), 0..4)),
+        (
+            0u8..3,
+            any::<bool>(),
+            0u8..3,
+            0u8..6,
+            prop::collection::vec(any::<usize>(), 0..4),
+        ),
         1..14,
     )
     .prop_map(|v| {
