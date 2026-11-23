@@ -54,6 +54,8 @@ pub(crate) struct Heard {
     tick: u64,
 }
 
+/// What the tests inspect of the devices heard.
+#[cfg(test)]
 impl Heard {
     /// Whether `device` is heard.
     pub(crate) fn contains(&self, device: &Name) -> bool {
@@ -69,7 +71,9 @@ impl Heard {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Name> {
         self.at.keys()
     }
+}
 
+impl Heard {
     /// Note `device` heard now at counter `high` of its log. Past
     /// [`HEARD_MAX`] devices, the one heard longest ago that `vouched` does
     /// not vouch for is dropped — `device` itself when every other one is
