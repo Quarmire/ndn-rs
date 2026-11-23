@@ -302,6 +302,21 @@ impl Fold {
             .collect()
     }
 
+    /// The ids of the Adds naming `person` that still stand, in either role:
+    /// what a removal of the person names. Sorted by id; never any for the
+    /// owner (a Remove of an Add naming the owner is ignored).
+    pub fn standing_ids(&self, person: &Name) -> Vec<[u8; 16]> {
+        if *person == self.owner {
+            return Vec::new();
+        }
+        self.facts
+            .adds
+            .iter()
+            .filter(|(id, a)| a.who == *person && self.stands(id, a))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// The epochs, in the order [`Fold::in_force`] prefers them (ascending).
     pub fn epochs(&self) -> Vec<EpochId> {
         self.epochs.keys().cloned().collect()

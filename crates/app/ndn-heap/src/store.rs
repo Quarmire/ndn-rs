@@ -187,6 +187,82 @@ pub(crate) fn scoped_key(person: &Name) -> Name {
     under(kind("scoped"), person)
 }
 
+/// `<kind>/<S>/<device>`: a record per device of a space, listed by
+/// [`seq_prefix`] and read back by [`parse_device_key`].
+fn device_key(label: &str, space: &Name, device: &Name) -> Name {
+    seq_prefix(label, space).append_component(tlv_component(device))
+}
+
+/// The device a [`device_key`] of `space` names.
+fn parse_device_key(label: &str, space: &Name, key: &Name) -> Option<Name> {
+    let prefix = seq_prefix(label, space);
+    if !key.has_prefix(&prefix) || key.len() != prefix.len() + 1 {
+        return None;
+    }
+    Name::decode_from_tlv(key.components()[prefix.len()].value.clone()).ok()
+}
+
+/// What the log knows of one device of a space: its person, the seqs it
+/// holds as ranges and the gaps its entries declared: `ledger/<S>/<device>`.
+/// Read at open in place of every `verified/` marker.
+pub(crate) fn ledger_key(space: &Name, device: &Name) -> Name {
+    device_key("ledger", space, device)
+}
+
+/// Every [`ledger_key`] of `space` has this prefix.
+pub(crate) fn ledger_prefix(space: &Name) -> Name {
+    seq_prefix("ledger", space)
+}
+
+/// The device a [`ledger_key`] of `space` names.
+pub(crate) fn parse_ledger_key(space: &Name, key: &Name) -> Option<Name> {
+    parse_device_key("ledger", space, key)
+}
+
+/// The seqs a removal cut keeps of one device (chain ancestry of its tips):
+/// `kept/<S>/<device>`.
+pub(crate) fn kept_key(space: &Name, device: &Name) -> Name {
+    device_key("kept", space, device)
+}
+
+/// Every [`kept_key`] of `space` has this prefix.
+pub(crate) fn kept_prefix(space: &Name) -> Name {
+    seq_prefix("kept", space)
+}
+
+/// The device a [`kept_key`] of `space` names.
+pub(crate) fn parse_kept_key(space: &Name, key: &Name) -> Option<Name> {
+    parse_device_key("kept", space, key)
+}
+
+/// Why a held entry is not applied: `status/<S>/<device>/<seq 8>`. Absent
+/// for an applied entry.
+pub(crate) fn status_key(space: &Name, device: &Name, seq: u64) -> Name {
+    seq_key("status", space, device, seq)
+}
+
+/// Every [`status_key`] of `space` has this prefix.
+pub(crate) fn status_prefix(space: &Name) -> Name {
+    seq_prefix("status", space)
+}
+
+/// The device and seq of a [`status_key`] of `space`.
+pub(crate) fn parse_status_key(space: &Name, key: &Name) -> Option<(Name, u64)> {
+    parse_seq_key("status", space, key)
+}
+
+/// Every [`suspected_key`] has this prefix.
+pub(crate) fn suspected_prefix() -> Name {
+    kind("suspected")
+}
+
+/// The key a [`suspected_key`] names.
+pub(crate) fn parse_suspected_key(key: &Name) -> Option<Name> {
+    let prefix = suspected_prefix();
+    key.has_prefix(&prefix)
+        .then(|| Name::from_components(key.components()[prefix.len()..].iter().cloned()))
+}
+
 // -- Records ---------------------------------------------------------------------
 
 /// A record the store holds that cannot be read. Never taken for an absent

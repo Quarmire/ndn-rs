@@ -19,13 +19,13 @@ use crate::error::{Cut, NextStep, Refusal};
 use crate::reserve::{Flusher, Reservation};
 use crate::seal::{self, Keys};
 use crate::store::{
-    self, Marker, Stage, equivocal_key, ledger_key, read_reserve, status_key, structural_key,
-    verified_key, walk_chain, write_reserve, ReserveRecord,
+    self, Marker, ReserveRecord, Stage, equivocal_key, ledger_key, read_reserve, status_key,
+    structural_key, verified_key, walk_chain, write_reserve,
 };
 use crate::test_kit::{CrashStore, n};
 use crate::wire::{
-    self, Body, Entry, EntryRef, EpochBody, EpochId, MembersBody, Op, Payload, Prev, PutBody,
-    Role, SealedBody, log_name, signed_digest,
+    self, Body, Entry, EntryRef, EpochBody, EpochId, MembersBody, Op, Payload, Prev, PutBody, Role,
+    SealedBody, log_name, signed_digest,
 };
 
 const NOW: u64 = 1_000;
@@ -82,7 +82,6 @@ struct Packet {
     dev: Dev,
     seq: u64,
     wire: Bytes,
-    data: Data,
     digest: [u8; 32],
 }
 
@@ -105,7 +104,6 @@ fn sign_raw(d: &Dev, seq: u64, content: &[u8]) -> Packet {
     Packet {
         dev: d.clone(),
         seq,
-        data: Data::decode(wire.clone()).unwrap(),
         digest: signed_digest(&wire),
         wire,
     }
@@ -194,10 +192,7 @@ fn add(id: u8, who: &str, role: Role) -> Op {
 }
 
 fn remove(id: u8, tips: Vec<EntryRef>) -> Op {
-    Op::Remove {
-        id: [id; 16],
-        tips,
-    }
+    Op::Remove { id: [id; 16], tips }
 }
 
 fn members(create: Option<bool>, ops: Vec<Op>) -> MembersBody {
@@ -246,7 +241,8 @@ fn rig(me: &Dev) -> Rig {
 
 impl Rig {
     fn admit(&mut self, p: &Packet) -> Admitted {
-        self.log.admit(&p.wire, &p.data, &verified(&p.dev), NOW)
+        let data = Data::decode(p.wire.clone()).unwrap();
+        self.log.admit(&p.wire, &data, &verified(&p.dev), NOW)
     }
 
     fn applied(&mut self, p: &Packet) -> Admitted {
@@ -320,11 +316,13 @@ async fn withdrawing_a_head_restores_the_entry_it_superseded() {
 
     let fx = r
         .log
-        .withdraw(&second.dev.name, second.seq, Refusal::NotMember, NOW);
+        .withdraw(&second.dev.name, second.seq, Refusal::NotMember);
     assert_eq!(r.value("/a").as_deref(), Some("v1"), "v1 is the head again");
-    assert!(fx.changes.iter().any(
-        |c| matches!(c, Change::Withdrawn { id, why: Refusal::NotMember } if id.seq == 2)
-    ));
+    assert!(
+        fx.changes
+            .iter()
+            .any(|c| matches!(c, Change::Withdrawn { id, why: Refusal::NotMember } if id.seq == 2))
+    );
     assert!(
         fx.changes
             .iter()
@@ -366,14 +364,22 @@ async fn a_removed_writers_entry_inside_the_cut_is_kept_and_outside_it_refused()
     // The tip first: it is the entry the cut names, so it is kept; what it
     // chains to is wanted.
     let a = r.applied(&p2);
-    assert!(a.effects.wants.iter().any(|w| w.device == p2.dev.name && w.first == 1 && w.digest == Some(p1.digest)));
+    assert!(
+        a.effects
+            .wants
+            .iter()
+            .any(|w| w.device == p2.dev.name && w.first == 1 && w.digest == Some(p1.digest))
+    );
     r.applied(&p1);
     let a = r.admit(&p3);
     assert!(matches!(
         a.outcome,
         Outcome::Refused(Refusal::OutsideCut(Cut { keeps_to: 2, .. }))
     ));
-    assert!(has_alert(&a, |al| matches!(al, Alert::OutsideCut { id } if id.seq == 3)));
+    assert!(has_alert(
+        &a,
+        |al| matches!(al, Alert::OutsideCut { id } if id.seq == 3)
+    ));
     assert_eq!(r.value("/p3"), None);
     assert_eq!(r.value("/p2").as_deref(), Some("2"));
 }
@@ -438,7 +444,10 @@ async fn an_orphan_inside_a_gap_is_kept() {
     r.applied(&p3);
     assert_eq!(r.log.voids(&bob().name), vec![(2, 2)]);
     let a = r.applied(&orphan);
-    assert!(!has_alert(&a, |al| matches!(al, Alert::Equivocation { .. })));
+    assert!(!has_alert(&a, |al| matches!(
+        al,
+        Alert::Equivocation { .. }
+    )));
     assert_eq!(r.value("/orphan").as_deref(), Some("2"));
 }
 
@@ -454,10 +463,16 @@ async fn two_packets_at_one_name_are_evidence_and_the_key_is_suspected() {
     r.applied(&first);
     let a = r.admit(&second);
     assert_eq!(a.outcome, Outcome::Evidence);
-    assert!(has_alert(&a, |al| matches!(al, Alert::Equivocation { device, seq: 1 } if *device == bob().name)));
+    assert!(has_alert(
+        &a,
+        |al| matches!(al, Alert::Equivocation { device, seq: 1 } if *device == bob().name)
+    ));
     assert_eq!(a.effects.suspect, vec![bob().key]);
     assert!(r.log.suspected(&bob().key).is_some());
-    assert_eq!(r.store.get(&equivocal_key(&first.name())), Some(second.wire.clone()));
+    assert_eq!(
+        r.store.get(&equivocal_key(&first.name())),
+        Some(second.wire.clone())
+    );
     assert_eq!(r.value("/a").as_deref(), Some("one"), "the first stands");
 
     // Its later entries are not taken while the mark stands.
@@ -470,7 +485,10 @@ async fn two_packets_at_one_name_are_evidence_and_the_key_is_suspected() {
     };
     let _ = next;
     let a = r.admit(&later);
-    assert!(matches!(a.outcome, Outcome::Refused(Refusal::Suspected { .. })));
+    assert!(matches!(
+        a.outcome,
+        Outcome::Refused(Refusal::Suspected { .. })
+    ));
 }
 
 #[tokio::test]
@@ -483,9 +501,13 @@ async fn a_relays_high_s_copy_changes_nothing() {
     r.applied(&creation(&mut owner));
     let mut b = Chain::new(&bob());
     let p1 = b.put("/a", "one");
-    let p2 = b.put("/a", "two");
+    let p2 = b.put_after("/a", "two", vec![p1.entry_ref()]);
     let name = p1.name();
-    let content = p1.data.content().unwrap().clone();
+    let content = Data::decode(p1.wire.clone())
+        .unwrap()
+        .content()
+        .unwrap()
+        .clone();
     let relayed = {
         let wire = DataBuilder::new(name, &content).sign_sync(
             ndn_packet::SignatureType::SignatureEd25519,
@@ -493,7 +515,6 @@ async fn a_relays_high_s_copy_changes_nothing() {
             |_| Bytes::from(vec![0x5a; 64]),
         );
         Packet {
-            data: Data::decode(wire.clone()).unwrap(),
             digest: signed_digest(&wire),
             wire,
             ..p1.clone()
@@ -526,7 +547,10 @@ async fn an_entry_that_verifies_but_does_not_decode_is_recorded_as_refused_and_w
     let junk = sign_raw(&bob(), 2, b"\xff\xfenot an entry");
     let a = r.admit(&junk);
     assert_eq!(a.outcome, Outcome::Unreadable);
-    assert!(r.store.contains(&verified_key(&junk.name())), "a marker records it");
+    assert!(
+        r.store.contains(&verified_key(&junk.name())),
+        "a marker records it"
+    );
     assert!(r.store.contains(&status_key(&space(), &bob().name, 2)));
     let walk = walk_chain(
         &*r.store,
@@ -551,10 +575,14 @@ async fn an_entry_that_verifies_but_does_not_decode_is_recorded_as_refused_and_w
 async fn equivocation_in_a_members_or_epoch_entry_is_reported_to_the_host() {
     let mut r = rig(&carol());
     let one = Chain::new(&phone()).members(members(Some(true), vec![add(1, "/bob", Role::Writer)]));
-    let two = Chain::new(&phone()).members(members(Some(true), vec![add(2, "/carol", Role::Writer)]));
+    let two =
+        Chain::new(&phone()).members(members(Some(true), vec![add(2, "/carol", Role::Writer)]));
     r.applied(&one);
     let a = r.admit(&two);
-    assert!(has_alert(&a, |al| matches!(al, Alert::Equivocation { device, seq: 1 } if *device == phone().name)));
+    assert!(has_alert(
+        &a,
+        |al| matches!(al, Alert::Equivocation { device, seq: 1 } if *device == phone().name)
+    ));
     assert_eq!(a.effects.suspect, vec![phone().key]);
     // Both are facts of the space: the fold lists both Adds whichever came
     // first.
@@ -565,7 +593,8 @@ async fn equivocation_in_a_members_or_epoch_entry_is_reported_to_the_host() {
 #[tokio::test]
 async fn a_members_entry_from_a_device_outside_the_owner_namespace_is_refused() {
     let mut r = rig(&carol());
-    let forged = Chain::new(&bob()).members(members(Some(true), vec![add(1, "/bob", Role::Writer)]));
+    let forged =
+        Chain::new(&bob()).members(members(Some(true), vec![add(1, "/bob", Role::Writer)]));
     let a = r.admit(&forged);
     assert_eq!(a.outcome, Outcome::Refused(Refusal::NotMember));
     assert!(!r.log.fold().is_writer(&n("/bob")));
@@ -581,7 +610,12 @@ async fn an_entry_before_the_members_entry_that_admits_its_writer_waits_for_it()
     assert_eq!(r.value("/a"), None);
     let a = r.applied(&creation(&mut owner));
     assert_eq!(r.value("/a").as_deref(), Some("one"));
-    assert!(a.effects.changes.iter().any(|c| matches!(c, Change::Put(i) if i.bytes == "one")));
+    assert!(
+        a.effects
+            .changes
+            .iter()
+            .any(|c| matches!(c, Change::Put(i) if i.bytes == "one"))
+    );
 }
 
 proptest! {
@@ -680,19 +714,27 @@ async fn a_sealed_entry_without_the_key_is_held_closed_and_opens_when_the_key_ar
     let a = r.admit(&put);
     assert_eq!(a.outcome, Outcome::Closed);
     assert!(r.log.has_closed());
-    assert_eq!(r.value("/secret"), None);
+    // A closed entry's path is unknown, so no read of the space can say.
+    assert!(matches!(
+        r.log.get(&n("/secret")),
+        Err(HeapError::Sealed { .. })
+    ));
 
     let (taken, fx) = r
         .log
-        .key_arrived(s.epoch.clone(), ContentKey::from_bytes(s.key), NOW);
+        .key_arrived(s.epoch.clone(), ContentKey::from_bytes(s.key));
     assert!(taken);
-    assert!(fx.changes.iter().any(|c| matches!(c, Change::Put(i) if i.path == n("/secret") && i.bytes == "hush")));
+    assert!(
+        fx.changes
+            .iter()
+            .any(|c| matches!(c, Change::Put(i) if i.path == n("/secret") && i.bytes == "hush"))
+    );
     assert_eq!(r.value("/secret").as_deref(), Some("hush"));
     assert!(!r.log.has_closed());
     // A key that does not match the Epoch entry's check is dropped.
     let (taken, _) = r
         .log
-        .key_arrived(s.epoch.clone(), ContentKey::from_bytes([9; 32]), NOW);
+        .key_arrived(s.epoch.clone(), ContentKey::from_bytes([9; 32]));
     assert!(!taken || r.value("/secret").is_some());
 }
 
@@ -704,7 +746,14 @@ async fn an_unsealed_entry_in_a_sealed_space_is_refused() {
     let plain = Chain::new(&bob()).put("/a", "in the clear");
     let a = r.admit(&plain);
     assert_eq!(a.outcome, Outcome::Refused(Refusal::Unsealed));
-    assert!(has_alert(&a, |al| matches!(al, Alert::Refused { why: Refusal::Unsealed, next: NextStep::None, .. })));
+    assert!(has_alert(&a, |al| matches!(
+        al,
+        Alert::Refused {
+            why: Refusal::Unsealed,
+            next: NextStep::None,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
@@ -770,19 +819,39 @@ async fn an_own_put_is_signed_chained_stored_in_one_batch_and_applied() {
             seq: None
         })
     );
-    assert_eq!(entry.after, vec![EntryRef::from(&a.id)], "it supersedes the head it saw");
+    assert_eq!(
+        entry.after,
+        vec![EntryRef::from(&a.id)],
+        "it supersedes the head it saw"
+    );
     assert_eq!(r.value("/a").as_deref(), Some("two"));
-    let marker = Marker::decode(&r.store.get(&verified_key(&log_name(&me.name, &space(), 3))).unwrap()).unwrap();
+    let marker = Marker::decode(
+        &r.store
+            .get(&verified_key(&log_name(&me.name, &space(), 3)))
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(marker.signed_digest, b.id.digest);
-    assert_eq!(store::read_head(&*r.store, &space()).unwrap().unwrap().seq, 3);
+    assert_eq!(
+        store::read_head(&*r.store, &space()).unwrap().unwrap().seq,
+        3
+    );
     assert!(r.store.contains(&structural_key(&space(), &me.name, 1)));
 }
 
 #[tokio::test]
 async fn a_structural_entry_says_so_for_the_publisher() {
     let mut r = rig(&laptop());
-    let s = r.members(members(Some(true), vec![add(1, "/bob", Role::Writer)])).await;
-    assert_eq!(s.effects.publish, Some(Publish { seq: 1, structural: true }));
+    let s = r
+        .members(members(Some(true), vec![add(1, "/bob", Role::Writer)]))
+        .await;
+    assert_eq!(
+        s.effects.publish,
+        Some(Publish {
+            seq: 1,
+            structural: true
+        })
+    );
     assert!(s.effects.membership);
 }
 
@@ -797,8 +866,14 @@ async fn an_epoch_key_is_stored_in_the_batch_of_its_entry() {
             Step::Wait(t) => r.flusher.wait_durable(t).await.unwrap(),
         }
     };
-    let epoch = EpochId { creator: me.name.clone(), seq: s.id.seq };
-    assert!(r.store.contains(&store::epoch_key(&space(), &me.name, s.id.seq)));
+    let epoch = EpochId {
+        creator: me.name.clone(),
+        seq: s.id.seq,
+    };
+    assert!(
+        r.store
+            .contains(&store::epoch_key(&space(), &me.name, s.id.seq))
+    );
     assert_eq!(r.log.fold().in_force(), Some(epoch));
     // Sealed puts now work, and a relay cannot read the path.
     r.put("/secret/path", "hush").await;
@@ -813,7 +888,8 @@ async fn an_epoch_key_is_stored_in_the_batch_of_its_entry() {
 async fn a_restart_finds_the_fold_the_register_and_the_held_ranges() {
     let me = laptop();
     let mut r = rig(&me);
-    r.members(members(Some(true), vec![add(1, "/bob", Role::Writer)])).await;
+    r.members(members(Some(true), vec![add(1, "/bob", Role::Writer)]))
+        .await;
     r.put("/a", "one").await;
     let mut b = Chain::new(&bob());
     let (p1, p2) = (b.put("/b", "1"), b.put("/c", "2"));
@@ -841,9 +917,16 @@ async fn the_first_entry_after_an_unclean_open_states_the_gap() {
     let mut again = open_on(&r.crash(), &me);
     let first = again.put("/a", "3").await;
     assert!(first.id.seq > BLOCK, "resumes above R, not at head + 1");
-    assert!(first.effects.alerts.iter().any(|a| matches!(a, Alert::GapSigned { after: 3, resumed } if *resumed == first.id.seq)));
+    assert!(
+        first.effects.alerts.iter().any(
+            |a| matches!(a, Alert::GapSigned { after: 3, resumed } if *resumed == first.id.seq)
+        )
+    );
     let entry = {
-        let wire = again.store.get(&log_name(&me.name, &space(), first.id.seq)).unwrap();
+        let wire = again
+            .store
+            .get(&log_name(&me.name, &space(), first.id.seq))
+            .unwrap();
         Entry::decode(Data::decode(wire).unwrap().content().unwrap()).unwrap()
     };
     assert_eq!(
@@ -857,7 +940,10 @@ async fn the_first_entry_after_an_unclean_open_states_the_gap() {
     // The next one is dense again.
     let next = again.put("/a", "4").await;
     let entry = {
-        let wire = again.store.get(&log_name(&me.name, &space(), next.id.seq)).unwrap();
+        let wire = again
+            .store
+            .get(&log_name(&me.name, &space(), next.id.seq))
+            .unwrap();
         Entry::decode(Data::decode(wire).unwrap().content().unwrap()).unwrap()
     };
     assert_eq!(entry.prev.unwrap().seq, None);
@@ -868,11 +954,21 @@ async fn the_first_entry_after_losing_everything_uses_the_zero_digest_form() {
     let me = laptop();
     let store = Arc::new(CrashStore::new());
     // A record of a reservation, and no entry: the entries were lost.
-    write_reserve(&*store, &space(), ReserveRecord { r: BLOCK, clean: false });
+    write_reserve(
+        &*store,
+        &space(),
+        ReserveRecord {
+            r: BLOCK,
+            clean: false,
+        },
+    );
     let mut r = open_on(&store, &me);
     let s = r.members(members(Some(true), vec![])).await;
     assert_eq!(s.id.seq, BLOCK + 1);
-    let wire = r.store.get(&log_name(&me.name, &space(), s.id.seq)).unwrap();
+    let wire = r
+        .store
+        .get(&log_name(&me.name, &space(), s.id.seq))
+        .unwrap();
     let entry = Entry::decode(Data::decode(wire).unwrap().content().unwrap()).unwrap();
     assert_eq!(
         entry.prev,
@@ -881,7 +977,12 @@ async fn the_first_entry_after_losing_everything_uses_the_zero_digest_form() {
             seq: Some(0)
         })
     );
-    assert!(s.effects.alerts.iter().any(|a| matches!(a, Alert::GapSigned { after: 0, .. })));
+    assert!(
+        s.effects
+            .alerts
+            .iter()
+            .any(|a| matches!(a, Alert::GapSigned { after: 0, .. }))
+    );
 }
 
 #[tokio::test]
@@ -896,13 +997,17 @@ async fn a_clean_open_states_no_gap() {
     let s = again.put("/a", "2").await;
     assert_eq!(s.id.seq, head + 1);
     assert!(s.effects.alerts.is_empty());
-    let wire = again.store.get(&log_name(&me.name, &space(), s.id.seq)).unwrap();
+    let wire = again
+        .store
+        .get(&log_name(&me.name, &space(), s.id.seq))
+        .unwrap();
     let entry = Entry::decode(Data::decode(wire).unwrap().content().unwrap()).unwrap();
     assert_eq!(entry.prev.unwrap().seq, None);
 }
 
 #[tokio::test]
-async fn a_devices_own_head_after_restart_comes_from_every_stored_own_entry_name_even_if_one_does_not_decode() {
+async fn a_devices_own_head_after_restart_comes_from_every_stored_own_entry_name_even_if_one_does_not_decode()
+ {
     let me = laptop();
     let store = Arc::new(CrashStore::new());
     // The entry at seq 5 is under this device's name and is not a packet
@@ -913,12 +1018,25 @@ async fn a_devices_own_head_after_restart_comes_from_every_stored_own_entry_name
     let mut r = open_on(&store, &me);
     assert_eq!(r.log.head(), 5);
     let s = r.members(members(Some(true), vec![])).await;
-    assert!(s.id.seq >= 6, "never signs again at a seq it has a name for");
+    assert!(
+        s.id.seq >= 6,
+        "never signs again at a seq it has a name for"
+    );
     let entry = {
-        let wire = r.store.get(&log_name(&me.name, &space(), s.id.seq)).unwrap();
+        let wire = r
+            .store
+            .get(&log_name(&me.name, &space(), s.id.seq))
+            .unwrap();
         Entry::decode(Data::decode(wire).unwrap().content().unwrap()).unwrap()
     };
-    assert_eq!(entry.prev.as_ref().and_then(|p| p.seq), Some(5));
+    assert_eq!(
+        entry.prev,
+        Some(Prev {
+            digest: signed_digest(&Bytes::from_static(b"torn")),
+            seq: None
+        })
+    );
+    assert_eq!(s.id.seq, 6);
 }
 
 #[tokio::test]
@@ -932,7 +1050,10 @@ async fn an_own_entry_above_r_durable_raises_rolledback_and_is_not_applied() {
         &me,
         500,
         &Entry {
-            prev: Some(Prev { digest: [1; 32], seq: Some(499) }),
+            prev: Some(Prev {
+                digest: [1; 32],
+                seq: Some(499),
+            }),
             after: vec![],
             body: Body::Put(PutBody {
                 path: n("/stolen"),
@@ -942,7 +1063,10 @@ async fn an_own_entry_above_r_durable_raises_rolledback_and_is_not_applied() {
     );
     let a = r.admit(&copy);
     assert_eq!(a.outcome, Outcome::Evidence);
-    assert!(has_alert(&a, |al| matches!(al, Alert::RolledBack { reserved, seen: 500 } if *reserved == durable)));
+    assert!(has_alert(
+        &a,
+        |al| matches!(al, Alert::RolledBack { reserved, seen: 500 } if *reserved == durable)
+    ));
     assert_eq!(r.value("/stolen"), None);
     assert!(r.log.next_seq() > 500, "resumes above it");
     assert!(r.store.contains(&copy.name()), "kept as evidence");
@@ -955,7 +1079,10 @@ async fn an_unbacked_counter_does_not_raise_the_head() {
     r.members(members(Some(true), vec![])).await;
     let head = r.log.head();
     let fx = r.log.note_counter(&me.name, 9_999);
-    assert!(fx.alerts.contains(&Alert::UnbackedCounter { device: me.name.clone(), seen: 9_999 }));
+    assert!(fx.alerts.contains(&Alert::UnbackedCounter {
+        device: me.name.clone(),
+        seen: 9_999
+    }));
     assert_eq!(r.log.head(), head);
     let next = r.put("/a", "x").await;
     assert_eq!(next.id.seq, head + 1);
@@ -973,7 +1100,6 @@ async fn recovery_adopts_only_own_entries_that_verify_chain_and_lie_within_r_dur
         Packet {
             dev: me.clone(),
             seq,
-            data: Data::decode(wire.clone()).unwrap(),
             digest: signed_digest(&wire),
             wire,
         }
@@ -999,14 +1125,20 @@ async fn recovery_adopts_only_own_entries_that_verify_chain_and_lie_within_r_dur
     // not this device's entry.
     let other = Dev {
         key: n("/alice/laptop/KEY/k2"),
-        signer: Arc::new(Ed25519Signer::from_seed(&[99; 32], n("/alice/laptop/KEY/k2"))),
+        signer: Arc::new(Ed25519Signer::from_seed(
+            &[99; 32],
+            n("/alice/laptop/KEY/k2"),
+        )),
         ..me.clone()
     };
     let forged = sign_entry(
         &other,
         4,
         &Entry {
-            prev: Some(Prev { digest: p3.digest, seq: None }),
+            prev: Some(Prev {
+                digest: p3.digest,
+                seq: None,
+            }),
             after: vec![],
             body: Body::Put(PutBody {
                 path: n("/a"),
@@ -1014,7 +1146,10 @@ async fn recovery_adopts_only_own_entries_that_verify_chain_and_lie_within_r_dur
             }),
         },
     );
-    assert_eq!(lost.admit(&forged).outcome, Outcome::Refused(Refusal::BadSignature));
+    assert_eq!(
+        lost.admit(&forged).outcome,
+        Outcome::Refused(Refusal::BadSignature)
+    );
 }
 
 // -- Catch-up bookkeeping --------------------------------------------------------------
@@ -1047,4 +1182,178 @@ async fn a_replayed_stale_notice_state_never_lowers_what_is_wanted() {
     assert_eq!(wanted(&r), vec![(4, 10)]);
     assert_eq!(r.log.held_prefix(&bob().name), 3);
     assert_eq!(r.log.frontier().get(&bob().name), 3);
+}
+
+#[tokio::test]
+async fn an_entry_naming_other_bytes_than_the_one_held_at_its_prev_is_refused_as_a_fork() {
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let p1 = Chain::new(&bob()).put("/a", "one");
+    r.applied(&p1);
+    let forked = sign_entry(
+        &bob(),
+        2,
+        &Entry {
+            prev: Some(Prev {
+                digest: [9; 32],
+                seq: None,
+            }),
+            after: vec![],
+            body: Body::Put(PutBody {
+                path: n("/b"),
+                payload: Payload::Inline(Bytes::from_static(b"two")),
+            }),
+        },
+    );
+    let a = r.admit(&forked);
+    assert_eq!(a.outcome, Outcome::Refused(Refusal::Chain));
+    assert!(has_alert(&a, |al| matches!(
+        al,
+        Alert::Equivocation { seq: 1, .. }
+    )));
+    assert_eq!(a.effects.suspect, vec![bob().key]);
+    assert_eq!(r.value("/b"), None);
+    assert!(r.store.contains(&forked.name()), "kept as evidence");
+}
+
+#[tokio::test]
+async fn an_owners_removal_binds_what_it_holds_and_the_cut_survives_a_restart() {
+    let me = laptop();
+    let mut r = rig(&me);
+    r.members(members(Some(true), vec![add(1, "/bob", Role::Writer)]))
+        .await;
+    let mut b = Chain::new(&bob());
+    let (p1, p2, p3) = (b.put("/p1", "1"), b.put("/p2", "2"), b.put("/p3", "3"));
+    r.applied(&p1);
+    r.applied(&p2);
+    let ops = r.log.remove_ops(&n("/bob"));
+    assert_eq!(ops, vec![remove(1, vec![p2.entry_ref()])]);
+    r.members(members(None, ops)).await;
+    r.flusher.flush().await.unwrap();
+
+    let image = r.crash();
+    for mut again in [r, open_on(&image, &me)] {
+        let a = again.admit(&p3);
+        assert!(
+            matches!(
+                a.outcome,
+                Outcome::Refused(Refusal::OutsideCut(Cut { keeps_to: 2, .. }))
+            ),
+            "{:?}",
+            a.outcome
+        );
+        assert_eq!(again.value("/p2").as_deref(), Some("2"));
+    }
+}
+
+#[tokio::test]
+async fn a_withdrawn_entry_is_taken_back_only_when_offered_again_and_verified() {
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let p1 = Chain::new(&bob()).put("/a", "one");
+    r.applied(&p1);
+    let fx = r.log.withdraw(
+        &bob().name,
+        1,
+        Refusal::Untrusted {
+            why: "its key was revoked".into(),
+        },
+    );
+    assert!(
+        fx.changes
+            .iter()
+            .any(|c| matches!(c, Change::Withdrawn { .. }))
+    );
+    assert_eq!(r.value("/a"), None);
+    // A change of the members does not bring it back: only the judge can say
+    // its key verifies again.
+    r.applied(&owner.members(members(None, vec![add(2, "/carol", Role::Writer)])));
+    assert_eq!(r.value("/a"), None);
+    assert_eq!(r.admit(&p1).outcome, Outcome::Duplicate);
+    assert_eq!(r.value("/a").as_deref(), Some("one"));
+}
+
+/// Counts the reads of markers a store answers.
+struct Counting {
+    inner: Arc<CrashStore>,
+    markers: std::sync::atomic::AtomicUsize,
+}
+
+impl Counting {
+    fn marker(&self, name: &Name) -> bool {
+        name.has_prefix(&verified_key(&Name::root()))
+    }
+}
+
+impl DataStore for Counting {
+    fn insert(&self, name: Name, wire: Bytes) {
+        self.inner.insert(name, wire);
+    }
+    fn get(&self, name: &Name) -> Option<Bytes> {
+        if self.marker(name) {
+            self.markers
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.get(name)
+    }
+    fn find_under(&self, prefix: &Name) -> Option<Bytes> {
+        self.inner.find_under(prefix)
+    }
+    fn scan_under(&self, prefix: &Name, limit: usize) -> Vec<(Name, Bytes)> {
+        let found = self.inner.scan_under(prefix, limit);
+        if self.marker(prefix) {
+            self.markers
+                .fetch_add(found.len(), std::sync::atomic::Ordering::SeqCst);
+        }
+        found
+    }
+    fn remove(&self, name: &Name) {
+        self.inner.remove(name);
+    }
+    fn apply(&self, ops: Vec<ndn_sync::StoreOp>) {
+        self.inner.apply(ops);
+    }
+    fn sync(&self) -> std::io::Result<()> {
+        self.inner.sync()
+    }
+}
+
+#[tokio::test]
+async fn a_cold_open_reads_one_marker_per_device_not_one_per_entry() {
+    let me = carol();
+    let mut r = rig(&me);
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let mut b = Chain::new(&bob());
+    for i in 0..300 {
+        r.applied(&b.put(&format!("/p{}", i % 7), &i.to_string()));
+    }
+    r.flusher.flush().await.unwrap();
+    let counting = Arc::new(Counting {
+        inner: r.crash(),
+        markers: Default::default(),
+    });
+    let raw = Arc::clone(&counting) as Arc<dyn DataStore>;
+    let log = Log::open(
+        Params {
+            space: space(),
+            device: me.name.clone(),
+            person: me.person.clone(),
+            signer: Arc::clone(&me.signer) as Arc<dyn Signer>,
+            keys: Keys::new(RecipientKey::generate()),
+            block: BLOCK,
+        },
+        Arc::clone(&raw),
+        Stage::new(raw),
+        Flusher::spawn(Arc::clone(&counting) as Arc<dyn DataStore>),
+    )
+    .unwrap();
+    assert_eq!(log.held_prefix(&bob().name), 300);
+    let reads = counting.markers.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        reads <= 4,
+        "{reads} markers read for 2 devices and 300 entries"
+    );
 }

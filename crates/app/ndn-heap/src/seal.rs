@@ -158,7 +158,7 @@ pub(crate) fn unwrap_key(
 
 /// Sign `builder` with the device key `signer`, which must sign
 /// synchronously.
-fn sign(builder: DataBuilder, signer: &dyn Signer) -> Result<Bytes, SealError> {
+pub(crate) fn sign(builder: DataBuilder, signer: &dyn Signer) -> Result<Bytes, SealError> {
     let mut failed = None;
     let wire = builder.sign_sync(
         signer.sig_type(),

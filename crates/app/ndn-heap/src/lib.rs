@@ -23,7 +23,6 @@ mod face_up;
 mod fetch;
 mod fold;
 mod heard;
-#[cfg(feature = "wip-log")]
 mod log;
 #[cfg(feature = "wip-node")]
 mod node;
