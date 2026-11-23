@@ -186,18 +186,3 @@ impl Log {
         }
     }
 }
-
-// -- What the signal gate reads ----------------------------------------------------
-
-impl Log {
-    /// This device's key name, `<device>/KEY/<id>`.
-    pub(crate) fn key(&self) -> &Name {
-        &self.key
-    }
-
-    /// This device's person: the namespace of the context that vouches for
-    /// its key.
-    pub(crate) fn person(&self) -> &Name {
-        &self.person
-    }
-}

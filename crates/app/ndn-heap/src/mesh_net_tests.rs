@@ -178,7 +178,7 @@ async fn a_removed_reader_is_refused_every_later_grant() {
         has(&bobs, "/history", "sealed history").await
     })
     .await;
-    let first = heap.inner.log.lock().fold().epochs();
+    let first = heap.inner.log.lock().fold.epochs();
     heap.change(MembersChange {
         remove: vec![n("/bob")],
         ..MembersChange::default()
@@ -220,7 +220,7 @@ async fn a_reader_device_with_a_revoked_key_is_refused_every_grant() {
     let m = mesh(&["/alice/laptop", "/bob/phone"]).await;
     let alice = m.boot(0, fast()).await;
     let heap = alice.create(&space(), private(&["/bob"])).await.unwrap();
-    let epoch = heap.inner.log.lock().fold().in_force().expect("an epoch");
+    let epoch = heap.inner.log.lock().fold.in_force().expect("an epoch");
     let (phone, key) = (
         m.devs[1].name.clone(),
         m.devs[1].name.clone().append("KEY").append("1"),
@@ -256,7 +256,7 @@ async fn concurrent_removals_end_with_one_complete_epoch() {
         .unwrap();
     let theirs = phone.open(&space()).await.unwrap();
     eventually("the phone holds a complete fold", || async {
-        theirs.ready() && theirs.inner.log.lock().fold().complete()
+        theirs.ready() && theirs.inner.log.lock().fold.complete()
     })
     .await;
     let remove = |who: &str| MembersChange {
@@ -268,7 +268,7 @@ async fn concurrent_removals_end_with_one_complete_epoch() {
     b.unwrap();
     let state = |heap: &Heap| {
         let log = heap.inner.log.lock();
-        let fold = log.fold();
+        let fold = &log.fold;
         (fold.complete(), fold.in_force(), fold.readers())
     };
     eventually(
@@ -355,7 +355,7 @@ async fn a_reader_added_by_an_add_and_removed_reads_nothing_written_after() {
                 .inner
                 .log
                 .lock()
-                .keys()
+                .keys
                 .key(&space(), &sealed.epoch)
                 .is_none(),
             "a removed reader holds only the keys it was granted before"

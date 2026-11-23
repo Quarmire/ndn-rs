@@ -566,13 +566,12 @@ fn refuses_more(old: Option<&SignedTrustContext>, new: &SignedTrustContext) -> b
 /// The validator bridge of a node, and the persons it has adopted for its
 /// spaces.
 pub(crate) struct Judge {
-    validator: Arc<Validator>,
+    pub(crate) validator: Arc<Validator>,
     store: Arc<dyn DataStore>,
     adopter: Option<Arc<dyn Adopter>>,
     scopes: Mutex<Scopes>,
     /// What the log re-checks on, in order.
     events: mpsc::UnboundedSender<Adoption>,
-    inbox: Mutex<Option<mpsc::UnboundedReceiver<Adoption>>>,
     /// How many person adoptions so far refused more than the version before
     /// them: what a keyring's own revocation epoch counts for its contexts.
     scoped_revocations: AtomicU64,
@@ -585,12 +584,13 @@ impl Judge {
     /// are never adopted and their entries wait. The records kept in the store
     /// before are read back here and opened again by [`Self::restore`], which
     /// the caller runs once the listings of the spaces it holds are noted
-    /// ([`Self::note`]).
+    /// ([`Self::note`]). With it, the stream of what the log re-checks on:
+    /// its one reader.
     pub(crate) fn new(
         validator: Arc<Validator>,
         store: Arc<dyn DataStore>,
         adopter: Option<Arc<dyn Adopter>>,
-    ) -> Arc<Judge> {
+    ) -> (Arc<Judge>, mpsc::UnboundedReceiver<Adoption>) {
         let (events, inbox) = mpsc::unbounded_channel();
         let mut scopes = Scopes::default();
         for (person, value) in Kind::SCOPED.named(&*store) {
@@ -609,7 +609,6 @@ impl Judge {
             adopter,
             scopes: Mutex::new(scopes),
             events,
-            inbox: Mutex::new(Some(inbox)),
             scoped_revocations: AtomicU64::new(0),
         });
         // The listener runs on the adopting thread: it only releases what the
@@ -620,18 +619,7 @@ impl Judge {
                 judge.context_adopted(ctx);
             }
         });
-        judge
-    }
-
-    /// The node's own validator.
-    pub(crate) fn validator(&self) -> &Arc<Validator> {
-        &self.validator
-    }
-
-    /// The stream of what the log re-checks on: its first and only reader
-    /// takes it (`None` afterwards).
-    pub(crate) fn adoptions(&self) -> Option<mpsc::UnboundedReceiver<Adoption>> {
-        self.inbox.lock().take()
+        (judge, inbox)
     }
 
     /// A counter that moves whenever a verdict given before may have changed

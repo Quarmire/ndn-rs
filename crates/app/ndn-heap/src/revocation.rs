@@ -121,7 +121,7 @@ fn signer_of(wire: &Bytes) -> Option<Name> {
 /// here governs the key: its namespace's trust context must be adopted first.
 pub(crate) fn cut_authority(judge: &Judge, key: &Name) -> Result<CutAuthority, HeapError> {
     let key = key_of(key)?;
-    let validator = judge.validator();
+    let validator = &judge.validator;
     let ctx = validator.keyring().context_for(&key);
     if ctx.namespace().is_empty() {
         return Err(bad(format!(
@@ -179,7 +179,7 @@ pub(crate) fn propose(
     let mut left_out = Vec::new();
     let mut public: BTreeSet<[u8; 32]> = BTreeSet::new();
     for log in logs {
-        let space = log.space();
+        let space = &log.space;
         let prefix = log_prefix(&device, space);
         log.each_held(&device, |held| {
             if !matches!(held.standing, Standing::Live | Standing::Unreadable) {
@@ -277,7 +277,7 @@ pub(crate) fn revocation_cut(
     let proposal = propose(logs, suspicion, &authority, key, bound)?;
     for packet in &proposal.manifest {
         if let Ok(data) = Data::decode(packet.clone()) {
-            let _ = judge.validator().cut_manifests().insert(&data);
+            let _ = judge.validator.cut_manifests().insert(&data);
         }
     }
     Ok(proposal)
@@ -298,7 +298,7 @@ pub(crate) fn refused_by_revocation(logs: &[&Log], key: &Name) -> Vec<Name> {
     };
     let mut out = Vec::new();
     for log in logs {
-        let space = log.space();
+        let space = &log.space;
         log.each_held(&device, |held| {
             if held.standing != Standing::Revoked {
                 return;
@@ -408,7 +408,7 @@ impl Suspicion {
 
 /// Whether the trust context `judge` holds for a key revokes it.
 pub(crate) fn revoked_by(judge: &Judge) -> impl Fn(&Name) -> bool + '_ {
-    move |key| judge.validator().keyring().context_for(key).is_revoked(key)
+    move |key| judge.validator.keyring().context_for(key).is_revoked(key)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

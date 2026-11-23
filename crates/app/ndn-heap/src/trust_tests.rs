@@ -145,15 +145,24 @@ fn other_space() -> Name {
     n("/alice/32=data/other")
 }
 
-/// Alice's judge over `store`, adopting through `host`, restored.
-async fn judge_of(host: &Arc<Host>, store: &Arc<dyn DataStore>) -> Arc<Judge> {
-    let judge = Judge::new(
+/// Alice's judge over `store`, adopting through `host`, restored, with the
+/// stream of what the log re-checks on.
+async fn judge_and_events(
+    host: &Arc<Host>,
+    store: &Arc<dyn DataStore>,
+) -> (Arc<Judge>, mpsc::UnboundedReceiver<Adoption>) {
+    let (judge, events) = Judge::new(
         alice_validator(),
         Arc::clone(store),
         Some(Arc::clone(host) as Arc<dyn Adopter>),
     );
     judge.restore().await;
-    judge
+    (judge, events)
+}
+
+/// [`judge_and_events`], the events left unread.
+async fn judge_of(host: &Arc<Host>, store: &Arc<dyn DataStore>) -> Arc<Judge> {
+    judge_and_events(host, store).await.0
 }
 
 fn writers(persons: &[&Name]) -> Listing {
@@ -324,7 +333,7 @@ async fn adopting(carol: &Carol, phone: &Phone) -> (Arc<Host>, Arc<Judge>) {
     host.serve(&[&carol.genesis().await]);
     let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
     let judge = judge_of(&host, &store).await;
-    judge.validator().cert_cache().insert(phone.cert.clone());
+    judge.validator.cert_cache().insert(phone.cert.clone());
     judge.note(&space(), &writers(&[&n("/alice"), &carol.ns]));
     assert!(
         until(|| judge.adopted_version(&carol.ns).is_some(), 30).await,
@@ -404,9 +413,8 @@ async fn an_unheld_person_is_judged_pending_until_adopted() {
     let host = Arc::new(Host::default());
     host.serve(&[&carol.genesis().await]);
     let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-    let judge = judge_of(&host, &store).await;
-    judge.validator().cert_cache().insert(phone.cert.clone());
-    let mut events = judge.adoptions().expect("the first to ask has the events");
+    let (judge, mut events) = judge_and_events(&host, &store).await;
+    judge.validator.cert_cache().insert(phone.cert.clone());
     let entry = phone.entry(&space(), 1);
 
     let before = judge.validate(&entry, &space()).await;
@@ -430,7 +438,7 @@ async fn an_unheld_person_is_judged_pending_until_adopted() {
         other => panic!("announced: {other:?}"),
     }
 
-    let hostless = Judge::new(alice_validator(), Arc::clone(&store), None);
+    let (hostless, _) = Judge::new(alice_validator(), Arc::clone(&store), None);
     hostless.restore().await;
     hostless.note(&space(), &writers(&[&carol.ns]));
     tokio::time::sleep(Duration::from_secs(120)).await;
@@ -473,7 +481,7 @@ async fn adoption_survives_a_restart() {
     let host = Arc::new(Host::default());
     host.serve(&[&v1, &t2, &t3, &t4]);
     let alice = alice_validator();
-    let judge = Judge::new(
+    let (judge, _) = Judge::new(
         alice,
         Arc::clone(&store),
         Some(Arc::clone(&host) as Arc<dyn Adopter>),
@@ -505,7 +513,7 @@ async fn adoption_survives_a_restart() {
     // A path serving only version 1.
     let host = Arc::new(Host::default());
     host.serve(&[&v1]);
-    let judge = Judge::new(
+    let (judge, _) = Judge::new(
         alice_validator(),
         Arc::clone(&store),
         Some(Arc::clone(&host) as Arc<dyn Adopter>),
@@ -547,12 +555,12 @@ async fn an_adopted_person_judges_at_once_after_a_restart_with_no_host_reachable
     drop(judge);
 
     let silent = Arc::new(Host::default());
-    let judge = Judge::new(
+    let (judge, _) = Judge::new(
         alice_validator(),
         Arc::clone(&store),
         Some(Arc::clone(&silent) as Arc<dyn Adopter>),
     );
-    judge.validator().cert_cache().insert(phone.cert.clone());
+    judge.validator.cert_cache().insert(phone.cert.clone());
     judge.note(&space(), &writers(&[&carol.ns]));
     judge.restore().await;
     valid(judge.validate(&phone.entry(&space(), 1), &space()).await);
@@ -571,7 +579,7 @@ async fn a_listed_writers_own_device_packets_verify_and_nothing_else_of_hers_doe
     let phone = Phone::new(&carol.mgr, &carol.ns, k1, "member", "phone").await;
     let tablet = Phone::new(&carol.mgr, &carol.ns, k1, "member", "tablet").await;
     let (_, judge) = adopting(&carol, &phone).await;
-    judge.validator().cert_cache().insert(tablet.cert.clone());
+    judge.validator.cert_cache().insert(tablet.cert.clone());
     let pk = [9u8; 32];
     let seal = seal_key_name(&phone.name, &pk);
     let packet = phone.signs(&seal, &pk);
@@ -648,7 +656,7 @@ async fn a_person_no_listing_names_has_nothing_judged() {
     let phone = Phone::new(&carol.mgr, &carol.ns, k1, "member", "phone").await;
     let daves = Phone::new(&dave_mgr, &dave.0, &dave.1, "member", "phone").await;
     let (_, judge) = adopting(&carol, &phone).await;
-    judge.validator().cert_cache().insert(daves.cert.clone());
+    judge.validator.cert_cache().insert(daves.cert.clone());
     let judged = judge.validate(&daves.entry(&space(), 1), &space()).await;
     assert!(
         matches!(&judged, Judged::Pending(Waiting::Adoption(p)) if *p == dave.0),
@@ -780,13 +788,11 @@ fn bob_log_prefix() -> Name {
     Name::from_components(entry.components()[..entry.len() - 1].iter().cloned())
 }
 
-/// A judge over the namespace `/home/bob`: root `/home/bob/KEY/root`, CA
-/// `/home/bob/CA/KEY/ca` certified by the root, the phone's key certified by
-/// the CA, valid `leaf`; `edit` shapes the context (revocations, cuts).
-async fn bob(
+/// [`bob`], with the stream of what the log re-checks on.
+async fn bob_and_events(
     leaf: (u64, u64),
     edit: impl FnOnce(SignedTrustContext) -> SignedTrustContext,
-) -> (Arc<Judge>, Ed25519Signer) {
+) -> (Arc<Judge>, mpsc::UnboundedReceiver<Adoption>, Ed25519Signer) {
     let root = signer("/home/bob/KEY/root", 70);
     let ca = signer(CA_KEY, 71);
     let phone = signer(PHONE_KEY, 72);
@@ -806,7 +812,19 @@ async fn bob(
     cache.insert(leaf);
     let validator = Arc::new(Validator::with_keyring(keyring, cache, None, 5));
     let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
-    (Judge::new(validator, store, None), phone)
+    let (judge, events) = Judge::new(validator, store, None);
+    (judge, events, phone)
+}
+
+/// A judge over the namespace `/home/bob`: root `/home/bob/KEY/root`, CA
+/// `/home/bob/CA/KEY/ca` certified by the root, the phone's key certified by
+/// the CA, valid `leaf`; `edit` shapes the context (revocations, cuts).
+async fn bob(
+    leaf: (u64, u64),
+    edit: impl FnOnce(SignedTrustContext) -> SignedTrustContext,
+) -> (Arc<Judge>, Ed25519Signer) {
+    let (judge, _, phone) = bob_and_events(leaf, edit).await;
+    (judge, phone)
 }
 
 /// A packet signed by a key of the namespace the node holds is ok, names the
@@ -909,15 +927,13 @@ async fn the_other_refusals_are_untrusted_or_a_bad_signature() {
 /// what is judged by revocation changed.
 #[tokio::test]
 async fn a_context_the_keyring_adopts_is_announced() {
-    let (judge, _) = bob((PAST, u64::MAX), |c| c).await;
-    let mut events = judge.adoptions().unwrap();
-    assert!(judge.adoptions().is_none(), "one reader of the events");
+    let (judge, mut events, _) = bob_and_events((PAST, u64::MAX), |c| c).await;
     let before = judge.generation();
     let revoking = SignedTrustContext::hierarchical(n("/home/bob"))
         .with_version(2)
         .with_revocation(n(PHONE_KEY));
     judge
-        .validator()
+        .validator
         .keyring()
         .adopt_update(Arc::new(revoking))
         .ok();

@@ -613,6 +613,7 @@ fn judge_over(ctx: SignedTrustContext, certs: Vec<Certificate>) -> Arc<Judge> {
         Arc::new(MemoryStore::new()) as Arc<dyn DataStore>,
         None,
     )
+    .0
 }
 
 /// The cut is made in the namespace of the context this node holds for the
@@ -644,7 +645,7 @@ async fn the_authority_is_the_context_the_node_holds_for_the_key() {
     let proposal =
         revocation_cut(&[&log], &judge, &suspicion, &bob().key, &lost_at(2_000)).unwrap();
     let root = proposal.cut.manifest().unwrap();
-    assert!(judge.validator().cut_manifests().missing(root).is_empty());
+    assert!(judge.validator.cut_manifests().missing(root).is_empty());
 
     assert!(!revoked_by(&judge)(&bob().key));
     let revoking = judge_over(

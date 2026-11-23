@@ -265,7 +265,7 @@ pub(crate) fn recipient_key(
 pub(crate) struct Keys {
     /// This device's recipient key: grants and stored epoch keys are wrapped
     /// to its public half.
-    recipient: RecipientKey,
+    pub(crate) recipient: RecipientKey,
     /// Epoch keys, each checked against the Epoch entry naming its epoch.
     held: HashMap<Name, HashMap<EpochId, ContentKey>>,
 }
@@ -282,11 +282,6 @@ impl Keys {
             recipient,
             held: HashMap::new(),
         }
-    }
-
-    /// This device's recipient key.
-    pub(crate) fn recipient(&self) -> &RecipientKey {
-        &self.recipient
     }
 
     /// The public half of the recipient key: the seal key this device
@@ -754,7 +749,7 @@ mod tests {
         );
 
         // A restart: the same recipient key, no epoch key held.
-        let mut second = Keys::new(first.recipient().clone());
+        let mut second = Keys::new(first.recipient.clone());
         assert!(
             !second.restore(&space, &e, &[0; 32], stored.clone()),
             "a stored key that fails the check is dropped"
@@ -796,10 +791,10 @@ mod tests {
         let wire = grant_packet(&asker.public(), &key, &name, &granter_signer).unwrap();
         let data = Data::decode(wire).unwrap();
         assert_eq!(*data.name, name);
-        let opened = unwrap_key(asker.recipient(), &name, data.content().unwrap().clone());
+        let opened = unwrap_key(&asker.recipient, &name, data.content().unwrap().clone());
         assert_eq!(opened.unwrap().expose(), key.expose());
         let other = n("/alice/laptop/32=grant/y");
-        assert!(unwrap_key(asker.recipient(), &other, data.content().unwrap().clone()).is_none());
+        assert!(unwrap_key(&asker.recipient, &other, data.content().unwrap().clone()).is_none());
     }
 
     fn signer(key: &str, seed: u8) -> Ed25519Signer {

@@ -211,7 +211,7 @@ impl World {
         .unwrap();
         Seat {
             log: Mutex::new(log),
-            judge: Judge::new(Arc::clone(&self.validator), raw, None),
+            judge: Judge::new(Arc::clone(&self.validator), raw, None).0,
             gate: SignalGate::default(),
             store,
             flusher,
@@ -620,7 +620,7 @@ async fn a_sealed_space_gives_its_audience_the_keys_of_its_epochs() {
     );
     let key = {
         let log = alice.log.lock();
-        let held = log.keys().key(&space(), &e1).unwrap();
+        let held = log.keys.key(&space(), &e1).unwrap();
         ContentKey::from_bytes(*held.expose())
     };
     assert!(bob.log.lock().key_arrived(e1.clone(), key).0);
@@ -678,7 +678,7 @@ async fn a_reader_of_a_sealed_space_gets_scope_and_keys_but_cannot_send_and_its_
     }
     let key = {
         let log = alice.log.lock();
-        ContentKey::from_bytes(*log.keys().key(&space(), &epoch).unwrap().expose())
+        ContentKey::from_bytes(*log.keys.key(&space(), &epoch).unwrap().expose())
     };
     assert!(rita.log.lock().key_arrived(epoch.clone(), key).0);
     let theirs = rita

@@ -367,18 +367,18 @@ struct FoldView {
 
 /// One space on one device.
 pub(crate) struct Log {
-    space: Name,
-    device: Name,
-    person: Name,
+    pub(crate) space: Name,
+    pub(crate) device: Name,
+    pub(crate) person: Name,
     /// This device's key name and the digest of its public key.
-    key: Name,
+    pub(crate) key: Name,
     key_digest: [u8; 32],
     signer: Arc<dyn Signer>,
     store: Batch,
-    fold: Fold,
-    register: Register,
-    keys: Keys,
-    reservation: Arc<Reservation>,
+    pub(crate) fold: Fold,
+    pub(crate) register: Register,
+    pub(crate) keys: Keys,
+    pub(crate) reservation: Arc<Reservation>,
     /// The seq the next own entry takes.
     next_seq: u64,
     /// The highest seq under this device's name in the store, whatever it is.
@@ -567,36 +567,6 @@ impl Log {
 
     fn view(&self) -> View<'_> {
         View::of(self)
-    }
-
-    /// The space.
-    pub(crate) fn space(&self) -> &Name {
-        &self.space
-    }
-
-    /// This device.
-    pub(crate) fn device(&self) -> &Name {
-        &self.device
-    }
-
-    /// The membership fold.
-    pub(crate) fn fold(&self) -> &Fold {
-        &self.fold
-    }
-
-    /// The register of heads.
-    pub(crate) fn register(&self) -> &Register {
-        &self.register
-    }
-
-    /// This device's keys.
-    pub(crate) fn keys(&self) -> &Keys {
-        &self.keys
-    }
-
-    /// This device's reservation.
-    pub(crate) fn reservation(&self) -> &Arc<Reservation> {
-        &self.reservation
     }
 
     /// Whether the last run left the space without a clean close.

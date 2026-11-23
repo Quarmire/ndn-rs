@@ -253,16 +253,16 @@ pub enum SignalRefusal {
 /// reader.
 fn standing(log: &Log, judge: &Judge, key: &Name, reads: bool) -> Result<Name, SignalRefusal> {
     let not_member = || SignalRefusal::NotMember {
-        scope: log.space().clone(),
+        scope: log.space.clone(),
         key: key.clone(),
     };
     if device_of(key).is_none() {
         return Err(not_member());
     }
-    let view = judge.view_for(key, log.space(), true);
+    let view = judge.view_for(key, &log.space, true);
     let context = view.keyring().context_for(key);
     let person = context.namespace();
-    let fold = log.fold();
+    let fold = &log.fold;
     if person.is_empty() || !(fold.is_writer(person) || (reads && fold.is_reader(person))) {
         return Err(not_member());
     }
@@ -274,19 +274,19 @@ fn standing(log: &Log, judge: &Judge, key: &Name, reads: bool) -> Result<Name, S
 
 /// [`Node::signal_member`] over one space.
 pub(crate) fn signal_member(log: &Log, judge: &Judge, scope: &Name, key: &Name) -> bool {
-    scope == log.space() && standing(log, judge, key, false).is_ok()
+    scope == &log.space && standing(log, judge, key, false).is_ok()
 }
 
 /// This device may use signals over the space: its creation is held and this
 /// device's key is a writer of it, or, when `reads`, a reader.
 fn own_gate(log: &Log, judge: &Judge, reads: bool) -> Result<(), HeapError> {
-    if log.fold().create().is_none() {
+    if log.fold.create().is_none() {
         return Err(HeapError::NotReady {
-            name: log.space().clone(),
+            name: log.space.clone(),
             why: NO_RECORD.into(),
         });
     }
-    let why = match standing(log, judge, log.key(), reads) {
+    let why = match standing(log, judge, &log.key, reads) {
         Ok(_) => return Ok(()),
         Err(SignalRefusal::BadSignature { .. }) => {
             "the trust context governing this device's key revokes it"
@@ -294,9 +294,9 @@ fn own_gate(log: &Log, judge: &Judge, reads: bool) -> Result<(), HeapError> {
         Err(_) if reads => "this device is neither a writer nor a reader of it by the entries held",
         Err(_) => "this device is no writer of it by the entries held",
     };
-    tracing::debug!(space = %log.space(), key = %log.key(), "signals refused: {why}");
+    tracing::debug!(space = %log.space, key = %log.key, "signals refused: {why}");
     Err(HeapError::NotAllowed {
-        space: log.space().clone(),
+        space: log.space.clone(),
         why: format!("{why}; ask the owner to add this device's person to the space"),
     })
 }
@@ -306,7 +306,7 @@ fn own_gate(log: &Log, judge: &Judge, reads: bool) -> Result<(), HeapError> {
 /// [`Node::signal_scope`] over the space `log` holds.
 pub(crate) fn signal_scope(log: &Log, judge: &Judge) -> Result<SignalScope, HeapError> {
     own_gate(log, judge, true)?;
-    let space = log.space();
+    let space = &log.space;
     let keys = match log.sealed() {
         true => sealed_keys(log)?,
         false => Vec::new(),
@@ -324,7 +324,7 @@ pub(crate) fn signal_scope(log: &Log, judge: &Judge) -> Result<SignalScope, Heap
 /// first, then those of the other epochs whose keys are held, by seq, highest
 /// first.
 fn sealed_keys(log: &Log) -> Result<Vec<SignalKey>, HeapError> {
-    let (space, fold) = (log.space(), log.fold());
+    let (space, fold) = (&log.space, &log.fold);
     let Some(epoch) = fold.in_force() else {
         return Err(HeapError::NotReady {
             name: space.clone(),
@@ -333,8 +333,8 @@ fn sealed_keys(log: &Log) -> Result<Vec<SignalKey>, HeapError> {
                 .into(),
         });
     };
-    let Some(content) = log.keys().key(space, &epoch) else {
-        let person = log.person();
+    let Some(content) = log.keys.key(space, &epoch) else {
+        let person = &log.person;
         if person != fold.owner() && !fold.audience(&epoch).contains(person) {
             return Err(HeapError::Sealed {
                 space: space.clone(),
@@ -353,7 +353,7 @@ fn sealed_keys(log: &Log) -> Result<Vec<SignalKey>, HeapError> {
         .epochs()
         .into_iter()
         .filter(|e| *e != epoch)
-        .filter_map(|e| Some(SignalKey::derive(log.keys().key(space, &e)?, space, &e)))
+        .filter_map(|e| Some(SignalKey::derive(log.keys.key(space, &e)?, space, &e)))
         .collect();
     keys.sort_by(|a, b| (b.epoch.seq, &b.epoch.creator).cmp(&(a.epoch.seq, &a.epoch.creator)));
     keys.insert(0, SignalKey::derive(content, space, &epoch));
@@ -369,15 +369,15 @@ pub(crate) fn signal_header(
     run_id: &[u8; RUN_ID_LEN],
     body: &[u8],
 ) -> Result<Bytes, HeapError> {
-    if scope != log.space() {
+    if scope != &log.space {
         return Err(HeapError::BadName {
             name: scope.clone(),
-            why: format!("this gate holds the space {}, not this one", log.space()),
+            why: format!("this gate holds the space {}, not this one", log.space),
         });
     }
     own_gate(log, judge, false)?;
     seal::sign(
-        DataBuilder::new(signal_run_name(log.device(), scope, run_id), body),
+        DataBuilder::new(signal_run_name(&log.device, scope, run_id), body),
         signer,
     )
     .map_err(HeapError::local)
@@ -396,10 +396,10 @@ pub(crate) fn signal_sender(
         scope: scope.clone(),
         why,
     };
-    if scope != log.space() {
+    if scope != &log.space {
         return Err(malformed(format!(
             "this gate holds the space {}, not {scope}",
-            log.space()
+            log.space
         )));
     }
     let Some(run) = parse_signal_run_name(&header.name) else {
@@ -424,7 +424,7 @@ pub(crate) fn signal_sender(
             run.device
         )));
     }
-    if log.fold().create().is_none() {
+    if log.fold.create().is_none() {
         return Err(SignalRefusal::NotReady {
             scope: scope.clone(),
             why: NO_RECORD.into(),

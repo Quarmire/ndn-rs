@@ -353,7 +353,7 @@ impl SpaceInner {
 
     /// The persons the space lists, as the judge adopts them.
     pub(crate) fn listing(log: &Log) -> Listing {
-        let fold = log.fold();
+        let fold = &log.fold;
         Listing {
             writers: fold.writers(),
             readers: match fold.readers() {
@@ -396,7 +396,7 @@ impl SpaceInner {
             repair = !self.follower
                 && log.sealed()
                 && log.owner_only().is_ok()
-                && (!log.fold().complete() || self.revocation_owed(node, log));
+                && (!log.fold.complete() || self.revocation_owed(node, log));
         }
         Routed {
             ticket,
@@ -473,7 +473,7 @@ impl SpaceInner {
     /// The revocations held here of keys under the namespace of a person the
     /// space reads for: the lost devices that may hold an epoch key.
     fn reader_revocations(&self, node: &NodeInner, log: &Log) -> BTreeSet<Name> {
-        let Readers::Persons(readers) = log.fold().readers() else {
+        let Readers::Persons(readers) = log.fold.readers() else {
             return BTreeSet::new();
         };
         readers
@@ -490,7 +490,7 @@ impl SpaceInner {
     fn revocation_owed(&self, node: &NodeInner, log: &Log) -> bool {
         if self.follower
             || !log.sealed()
-            || log.fold().create() != Some(false)
+            || log.fold.create() != Some(false)
             || log.owner_only().is_err()
         {
             return false;
@@ -528,7 +528,7 @@ impl SpaceInner {
     ) -> Result<Option<(EntryId, Ticket)>, HeapError> {
         let now = node.now();
         self.attempt(node, &mut |log| {
-            let fold = log.fold();
+            let fold = &log.fold;
             let owed = self.revocation_owed(node, log);
             if fold.create() != Some(false)
                 || (fold.complete() && !owed)
@@ -626,8 +626,8 @@ impl SpaceInner {
     /// suspected, signs nothing: peers would refuse it, and the host should
     /// hear why now.
     fn own_key_refusal(&self, node: &NodeInner, log: &Log) -> Result<(), HeapError> {
-        let key = log.key();
-        let ctx = node.judge.validator().keyring().context_for(key);
+        let key = &log.key;
+        let ctx = node.judge.validator.keyring().context_for(key);
         let why = if ctx.is_revoked(key) {
             Refusal::Untrusted {
                 why: format!(
@@ -645,7 +645,7 @@ impl SpaceInner {
             return Ok(());
         };
         Err(HeapError::Refused {
-            name: log_name(log.device(), &self.name, log.next_seq()),
+            name: log_name(&log.device, &self.name, log.next_seq()),
             why,
         })
     }
@@ -653,7 +653,7 @@ impl SpaceInner {
     /// A writer that is no reader of a sealed space cannot seal in it: told
     /// as it is, not as a wait that never ends.
     fn may_seal(&self, log: &Log) -> Result<(), HeapError> {
-        let (fold, person) = (log.fold(), log.person());
+        let (fold, person) = (&log.fold, &log.person);
         if log.sealed() && fold.is_writer(person) && !fold.is_reader(person) {
             return Err(HeapError::NotAllowed {
                 space: self.name.clone(),
@@ -671,12 +671,12 @@ impl SpaceInner {
     /// of every epoch whose key it lacks (the key comes by the grant pull),
     /// else [`HeapError::Sealed`].
     fn sealed_error(&self, log: &Log) -> HeapError {
-        let (fold, person) = (log.fold(), log.person());
+        let (fold, person) = (&log.fold, &log.person);
         let waits = fold.is_reader(person)
             && fold
                 .epochs()
                 .iter()
-                .filter(|e| log.keys().key(&self.name, e).is_none())
+                .filter(|e| log.keys.key(&self.name, e).is_none())
                 .all(|e| fold.audience(e).contains(person));
         if waits {
             HeapError::NotReady {
@@ -731,7 +731,7 @@ impl SpaceInner {
     /// The reader check of `get` and `watch`: a sealed space shows nothing
     /// to a person outside its audience.
     fn check_reader(&self, log: &Log) -> Result<(), HeapError> {
-        if log.sealed() && !log.fold().is_reader(log.person()) {
+        if log.sealed() && !log.fold.is_reader(&log.person) {
             return Err(HeapError::Sealed {
                 space: self.name.clone(),
             });
@@ -803,7 +803,7 @@ impl SpaceInner {
     fn blob_change(&self, node: &NodeInner, blob: &Blob) -> Option<Change> {
         let bytes = self.read_blob(node, blob).ok()?;
         let log = self.log.lock();
-        let (path, head) = log.register().values().find(|(_, h)| h.entry == blob.id)?;
+        let (path, head) = log.register.values().find(|(_, h)| h.entry == blob.id)?;
         Some(Change::Put(head.item(path, bytes)))
     }
 
@@ -814,7 +814,7 @@ impl SpaceInner {
         let current = self
             .log
             .lock()
-            .register()
+            .register
             .values()
             .any(|(_, h)| h.entry == blob.id);
         if !current {
@@ -858,7 +858,7 @@ impl SpaceInner {
         }
         let heads: HashSet<EntryId> = {
             let log = self.log.lock();
-            log.register()
+            log.register
                 .values()
                 .map(|(_, h)| h.entry.clone())
                 .collect()
@@ -952,7 +952,7 @@ impl Heap {
                 let epoch = log.judge_own()?;
                 let key = epoch
                     .as_ref()
-                    .and_then(|e| log.keys().key(&inner.name, e).cloned());
+                    .and_then(|e| log.keys.key(&inner.name, e).cloned());
                 (log.next_seq(), epoch, key)
             };
             let name = log_name(self.node.device(), &inner.name, seq);
@@ -1012,7 +1012,7 @@ impl Heap {
         };
         let bytes = inner.read_blob(&self.node, &blob)?;
         let log = inner.log.lock();
-        match log.register().value(path) {
+        match log.register.value(path) {
             Some(head) if head.entry == blob.id => Ok(Some(head.item(path, bytes))),
             _ => log.get(path),
         }
@@ -1078,7 +1078,7 @@ impl Heap {
     /// everything heard of is held.
     pub fn ready(&self) -> bool {
         let log = self.inner.log.lock();
-        log.fold().create().is_some() && log.missing().is_empty()
+        log.fold.create().is_some() && log.missing().is_empty()
     }
 
     /// Change who the space lists. Only an owner device signs members
@@ -1093,7 +1093,7 @@ impl Heap {
         inner.look_for_removed(node, &c.remove).await;
         let ops = {
             let log = inner.log.lock();
-            let fold = log.fold();
+            let fold = &log.fold;
             if let Readers::Persons(current) = fold.readers() {
                 let mut after: BTreeSet<Name> = current.into_iter().collect();
                 for person in &c.remove {

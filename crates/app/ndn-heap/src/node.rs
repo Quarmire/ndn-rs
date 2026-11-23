@@ -234,12 +234,11 @@ impl Node {
         drop(recipient);
 
         let flusher = Flusher::spawn(Arc::clone(&store));
-        let judge = Judge::new(
+        let (judge, adoptions) = Judge::new(
             Arc::clone(&validator),
             Arc::clone(&store),
             config.adopter.clone(),
         );
-        let adoptions = judge.adoptions();
         let inner = Arc::new_cyclic(|me| NodeInner {
             me: me.clone(),
             device: device.clone(),
@@ -274,9 +273,7 @@ impl Node {
         *inner.net.write() = Some(net);
         // From here a failure drops `node`, which stops what was started.
         let held = inner.restore().await?;
-        if let Some(rx) = adoptions {
-            rt::spawn(NodeInner::adoption_task(Arc::downgrade(&inner), rx));
-        }
+        rt::spawn(NodeInner::adoption_task(Arc::downgrade(&inner), adoptions));
         rt::spawn(NodeInner::failure_task(
             Arc::downgrade(&inner),
             Arc::clone(&inner.flusher),
@@ -406,7 +403,7 @@ impl Node {
             let log = space.log.lock();
             let head = log.head();
             (log.next_seq() == head + 1).then(|| {
-                let reservation = Arc::clone(log.reservation());
+                let reservation = Arc::clone(&log.reservation);
                 async move { reservation.close_clean(head).await }
             })
         });
@@ -539,7 +536,7 @@ impl NodeInner {
 
     /// The person of a device: the namespace of the context that governs it.
     pub(crate) fn person_of(&self, device: &Name) -> Name {
-        let keyring = self.judge.validator().keyring();
+        let keyring = self.judge.validator.keyring();
         keyring
             .unheld_personal_namespace(device)
             .unwrap_or_else(|| keyring.context_for(device).namespace().clone())
@@ -635,7 +632,7 @@ impl NodeInner {
         let net = self
             .net()
             .ok_or_else(|| HeapError::local("the node is stopped"))?;
-        let space = log.space().clone();
+        let space = log.space.clone();
         let counter = if follower { 0 } else { log.head() };
         let group = net.join(&space, counter).await?;
         let publisher = Publisher::spawn(Arc::clone(&self.flusher), group.sink());
@@ -693,7 +690,7 @@ impl NodeInner {
         // again by the contexts held now.
         let revoking: Vec<Name> = self
             .judge
-            .validator()
+            .validator
             .keyring()
             .contexts()
             .iter()
@@ -705,10 +702,10 @@ impl NodeInner {
                 .iter()
                 .flat_map(|person| log.held_names(person))
                 .collect();
-            for (device, seq, why) in self.refusals(log.space(), names).await {
+            for (device, seq, why) in self.refusals(&log.space, names).await {
                 let fx = log.withdraw(&device, seq, why);
                 if fx.membership {
-                    self.judge.note(log.space(), &SpaceInner::listing(log));
+                    self.judge.note(&log.space, &SpaceInner::listing(log));
                 }
             }
         }
@@ -1011,12 +1008,12 @@ impl NodeInner {
         if !log.sealed() {
             return Vec::new();
         }
-        let fold = log.fold();
+        let fold = &log.fold;
         let in_force = fold.in_force();
         fold.epochs()
             .into_iter()
-            .filter(|e| fold.audience(e).contains(log.person()))
-            .filter(|e| log.keys().key(space, e).is_none())
+            .filter(|e| fold.audience(e).contains(&log.person))
+            .filter(|e| log.keys.key(space, e).is_none())
             .filter(|e| log.has_closed() || in_force.as_ref() == Some(e))
             .collect()
     }
@@ -1046,7 +1043,7 @@ impl NodeInner {
         };
         let (taken, routed) = {
             let mut log = held.log.lock();
-            let Some(key) = seal::unwrap_key(log.keys().recipient(), name, content) else {
+            let Some(key) = seal::unwrap_key(&log.keys.recipient, name, content) else {
                 return false;
             };
             let (taken, fx) = log.key_arrived(epoch.clone(), key);
@@ -1073,8 +1070,8 @@ impl NodeInner {
             let log = held.log.lock();
             seal::may_grant(
                 &Granter {
-                    fold: log.fold(),
-                    keys: log.keys(),
+                    fold: &log.fold,
+                    keys: &log.keys,
                     space,
                     revoked: asker_key.is_some_and(|k| self.judge.key_revoked(k, space)),
                 },
@@ -1101,7 +1098,7 @@ impl NodeInner {
     ) -> Option<Bytes> {
         self.may_grant(space, epoch, asker, Some(asker_key)).ok()?;
         let held = self.space_of(space)?;
-        let key = held.log.lock().keys().key(space, epoch)?.clone();
+        let key = held.log.lock().keys.key(space, epoch)?.clone();
         let packet = seal::grant_packet(to, &key, name, &*self.signer).ok()?;
         self.signatures.fetch_add(1, Ordering::Relaxed);
         Some(packet)

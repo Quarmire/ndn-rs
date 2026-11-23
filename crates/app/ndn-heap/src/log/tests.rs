@@ -607,8 +607,8 @@ async fn equivocation_in_a_members_or_epoch_entry_is_reported_to_the_host() {
     assert!(r.suspicion.since(&phone().key).is_some());
     // Both are facts of the space: the fold lists both Adds whichever came
     // first.
-    assert!(r.log.fold().is_writer(&n("/bob")));
-    assert!(r.log.fold().is_writer(&n("/carol")));
+    assert!(r.log.fold.is_writer(&n("/bob")));
+    assert!(r.log.fold.is_writer(&n("/carol")));
 }
 
 #[tokio::test]
@@ -618,7 +618,7 @@ async fn a_members_entry_from_a_device_outside_the_owner_namespace_is_refused() 
         Chain::new(&bob()).members(members(Some(true), vec![add(1, "/bob", Role::Writer)]));
     let a = r.admit(&forged);
     assert_eq!(a.outcome, Outcome::Refused(Refusal::NotMember));
-    assert!(!r.log.fold().is_writer(&n("/bob")));
+    assert!(!r.log.fold.is_writer(&n("/bob")));
 }
 
 #[tokio::test]
@@ -661,7 +661,7 @@ proptest! {
         prop_assert_eq!(r.value("/p1"), Some("1".to_owned()));
         prop_assert_eq!(r.value("/p2"), Some("2".to_owned()));
         prop_assert_eq!(r.value("/p3"), None);
-        prop_assert!(!r.log.fold().is_writer(&n("/bob")));
+        prop_assert!(!r.log.fold.is_writer(&n("/bob")));
     }
 }
 
@@ -893,7 +893,7 @@ async fn an_epoch_key_is_stored_in_the_batch_of_its_entry() {
         r.store
             .contains(&Kind::EPOCH.seq(&space(), &me.name, s.id.seq))
     );
-    assert_eq!(r.log.fold().in_force(), Some(epoch));
+    assert_eq!(r.log.fold.in_force(), Some(epoch));
     // Sealed puts now work, and a relay cannot read the path.
     r.put("/secret/path", "hush").await;
     let wire = r.store.get(&log_name(&me.name, &space(), 3)).unwrap();
@@ -916,7 +916,7 @@ async fn a_restart_finds_the_fold_the_register_and_the_held_ranges() {
     r.applied(&p2);
     r.flusher.flush().await.unwrap();
     let again = open_on(&r.crash(), &me);
-    assert!(again.log.fold().is_writer(&n("/bob")));
+    assert!(again.log.fold.is_writer(&n("/bob")));
     assert_eq!(again.value("/a").as_deref(), Some("one"));
     assert_eq!(again.value("/c").as_deref(), Some("2"));
     assert_eq!(again.log.held_prefix(&bob().name), 2);
@@ -1011,7 +1011,7 @@ async fn a_clean_open_states_no_gap() {
     r.members(members(Some(true), vec![])).await;
     r.put("/a", "1").await;
     let head = r.log.head();
-    r.log.reservation().close_clean(head).await.unwrap();
+    r.log.reservation.close_clean(head).await.unwrap();
     let mut again = open_on(&r.crash(), &me);
     let s = again.put("/a", "2").await;
     assert_eq!(s.id.seq, head + 1);
@@ -1262,7 +1262,7 @@ async fn recovery_adopts_only_own_entries_that_verify_chain_and_lie_within_r_dur
     );
     let mut lost = open_on(&image, &me);
     lost.flusher.flush().await.unwrap();
-    assert!(lost.log.reservation().durable_r() >= 3);
+    assert!(lost.log.reservation.durable_r() >= 3);
     // 3 chains to 2, which is not held: it is held, waiting, and not applied.
     let a = lost.admit(&p3);
     assert_eq!(a.outcome, Outcome::Waiting);
@@ -1495,7 +1495,7 @@ async fn an_entry_that_names_another_writers_entry_wrongly_or_at_another_path_hi
     r.applied(&p1);
     let heads = |r: &Rig, path: &str| -> Vec<EntryRef> {
         r.log
-            .register()
+            .register
             .heads_of(&n(path))
             .iter()
             .map(|h| h.entry.clone())
@@ -1621,7 +1621,7 @@ async fn a_members_entry_that_only_removes_a_reader_is_a_membership_change() {
         c,
         Change::Members(m) if m.readers == Readers::Persons(vec![n("/alice")])
     )));
-    assert!(!r.log.fold().complete(), "an epoch is owed");
+    assert!(!r.log.fold.complete(), "an epoch is owed");
 }
 
 /// A device whose name lies under the owner's but whose key a sub-namespace
@@ -1649,13 +1649,13 @@ async fn a_writer_device_under_the_owners_name_but_of_another_person_cannot_carr
     );
     let all = [&create, &grant, &epoch];
     let nothing_carried = |r: &Rig| {
-        assert!(r.log.fold().is_writer(&n("/alice/kid")), "it is a writer");
+        assert!(r.log.fold.is_writer(&n("/alice/kid")), "it is a writer");
         assert!(
-            !r.log.fold().is_writer(&n("/carol")),
+            !r.log.fold.is_writer(&n("/carol")),
             "its Members entry did not apply"
         );
         assert!(
-            r.log.fold().epochs().is_empty(),
+            r.log.fold.epochs().is_empty(),
             "its Epoch entry did not apply"
         );
         for p in [&grant, &epoch] {
@@ -1686,8 +1686,8 @@ async fn a_writer_device_under_the_owners_name_but_of_another_person_cannot_carr
     let mut again = open_on(&r.crash(), &carol());
     nothing_carried(&again);
     again.applied(&owner.members(members(None, vec![remove(1, vec![])])));
-    assert!(!again.log.fold().is_writer(&n("/carol")));
-    assert!(again.log.fold().epochs().is_empty());
+    assert!(!again.log.fold.is_writer(&n("/carol")));
+    assert!(again.log.fold.epochs().is_empty());
 }
 
 #[tokio::test]

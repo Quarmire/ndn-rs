@@ -302,15 +302,15 @@ async fn a_reader_added_by_change_and_removed_again_cannot_open_the_next_put() {
     let dev = solo().await;
     let (node, _) = boot(&dev, cfg()).await;
     let heap = node.create(&space(), private(&[])).await.unwrap();
-    let first = heap.inner.log.lock().fold().in_force().expect("an epoch");
+    let first = heap.inner.log.lock().fold.in_force().expect("an epoch");
     heap.change(changed(&[], &["/bob"], &[])).await.unwrap();
     assert_eq!(
-        heap.inner.log.lock().fold().in_force(),
+        heap.inner.log.lock().fold.in_force(),
         Some(first.clone()),
         "an added reader needs no new epoch: it is granted the one in force"
     );
     heap.change(changed(&[], &[], &["/bob"])).await.unwrap();
-    let now = heap.inner.log.lock().fold().in_force().expect("an epoch");
+    let now = heap.inner.log.lock().fold.in_force().expect("an epoch");
     assert_ne!(now, first, "bob holds the old key: a new epoch is signed");
     let id = heap
         .put(&n("/after"), bytes("not for bob"), PutOptions::default())
@@ -330,7 +330,7 @@ async fn revoking_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_on
     let devs = world(&["/alice/laptop", "/bob/phone"]).await;
     let (node, _) = boot(&devs[0], cfg()).await;
     let heap = node.create(&space(), private(&["/bob"])).await.unwrap();
-    let in_force = |heap: &Heap| heap.inner.log.lock().fold().in_force();
+    let in_force = |heap: &Heap| heap.inner.log.lock().fold.in_force();
     let first = in_force(&heap).expect("an epoch");
     let revoking = ndn_security::SignedTrustContext::hierarchical(n("/bob"))
         .with_version(2)
@@ -353,7 +353,7 @@ async fn revoking_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_on
     let second = second.expect("an owner device signs a new epoch for the revocation");
     {
         let log = heap.inner.log.lock();
-        let fold = log.fold();
+        let fold = &log.fold;
         assert!(fold.complete());
         assert_eq!(
             fold.epoch_tips(),
@@ -382,7 +382,7 @@ async fn revoking_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_on
     let (node, _) = boot(&devs[0], cfg()).await;
     let heap = node.open(&space()).await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(heap.inner.log.lock().fold().epochs().len(), 2);
+    assert_eq!(heap.inner.log.lock().fold.epochs().len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -393,7 +393,7 @@ async fn an_owner_device_signs_the_epoch_a_members_entry_of_another_leaves_incom
     let (phone, _) = boot(&devs[1], cfg()).await;
     let theirs = phone.open(&space()).await.unwrap();
     deliver(&devs[0], &phone).await;
-    assert!(theirs.inner.log.lock().fold().complete());
+    assert!(theirs.inner.log.lock().fold.complete());
     // The laptop removes bob and does not sign the epoch (it goes dark).
     {
         let mut log = heap.inner.log.lock();
@@ -419,7 +419,7 @@ async fn an_owner_device_signs_the_epoch_a_members_entry_of_another_leaves_incom
     );
     // On arrival the phone, an owner device, repairs the epoch.
     for _ in 0..100 {
-        if theirs.inner.log.lock().fold().complete() {
+        if theirs.inner.log.lock().fold.complete() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -715,7 +715,7 @@ async fn a_device_of_another_person_under_the_owners_name_is_refused_at_once_and
 
     let inner = kid.inner.space_of(&space()).unwrap();
     let log = inner.log.lock();
-    assert!(log.sealed() && !log.fold().complete());
+    assert!(log.sealed() && !log.fold.complete());
     let routed = inner.route(
         &kid.inner,
         &log,
