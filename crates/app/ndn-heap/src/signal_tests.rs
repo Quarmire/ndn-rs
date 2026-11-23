@@ -648,6 +648,69 @@ async fn a_sealed_space_gives_its_audience_the_keys_of_its_epochs() {
     );
 }
 
+/// A reader of a sealed space holds the epoch key, so it gets the scope and
+/// the keys it needs to receive signals; it is no writer, so it cannot send
+/// (no header is signed) and the headers it signs are not admitted anywhere. A
+/// person the space does not list at all gets no scope.
+#[tokio::test]
+async fn a_reader_of_a_sealed_space_gets_scope_and_keys_but_cannot_send_and_its_headers_are_not_admitted()
+ {
+    let world = World::new().await;
+    let alice = world.seat("/alice/laptop").await;
+    let rita = world.seat("/rita/pad").await;
+    let eve = world.seat("/eve/pc").await;
+    let creation = alice
+        .members(members(Some(false), vec![add(1, "/rita", Role::Reader)]))
+        .await;
+    let (first, epoch) = alice.epoch(&["/alice", "/rita"]).await;
+    for seat in [&rita, &eve] {
+        alice.relay(&creation, seat);
+        alice.relay(&first, seat);
+    }
+
+    match rita.scope() {
+        Err(e @ HeapError::NotReady { .. }) => assert!(e.retry(), "{e}"),
+        other => panic!("the reader's key has not arrived: {other:?}"),
+    }
+    let key = {
+        let log = alice.log.lock();
+        ContentKey::from_bytes(*log.keys().key(&space(), &epoch).unwrap().expose())
+    };
+    assert!(rita.log.lock().key_arrived(epoch.clone(), key).0);
+    let theirs = rita.scope().expect("a reader with the key receives signals");
+    let owners = alice.scope().unwrap();
+    assert_eq!(theirs.keys.len(), 1);
+    assert_eq!(
+        (theirs.keys[0].id, theirs.keys[0].expose()),
+        (owners.keys[0].id, owners.keys[0].expose())
+    );
+    assert_eq!(theirs.listen, owners.listen);
+
+    match rita.header(&RUN) {
+        Err(e @ HeapError::NotAllowed { .. }) => assert_eq!(e.next(), NextStep::AskOwner),
+        other => panic!("a reader sends nothing: {other:?}"),
+    }
+    let forged = header_by(&rita.dev, &space());
+    assert!(!alice.member(&rita.dev.key), "a reader is no member");
+    assert!(!rita.member(&rita.dev.key));
+    assert_eq!(
+        alice.admit(&forged).await,
+        Err(SignalRefusal::NotMember {
+            scope: space(),
+            key: rita.dev.key.clone()
+        })
+    );
+    assert!(matches!(
+        alice.sender(&forged),
+        Err(SignalRefusal::NotMember { .. })
+    ));
+
+    assert!(
+        matches!(eve.scope(), Err(HeapError::NotAllowed { .. })),
+        "a person the space does not list gets no scope"
+    );
+}
+
 // -- Run headers ------------------------------------------------------------------------
 
 /// A header of a member is admitted, its signer answered, and nothing is
