@@ -220,6 +220,11 @@ impl Net {
                 "the sync driver did not join {group_name}: it is joined already, or it has stopped"
             )));
         };
+        let Some(observed) = handle.observed_shared() else {
+            return Err(HeapError::local(format!(
+                "the sync driver keeps no observed state for {group_name}; it needs a multi-SVS group"
+            )));
+        };
         let group = Arc::new(Group {
             space: space.clone(),
             group: group_name,
@@ -236,9 +241,7 @@ impl Net {
             own_seen: AtomicU64::new(0),
             stop: self.stop.child_token(),
             svs: Arc::clone(&self.svs),
-            observed: handle
-                .observed_shared()
-                .expect("a multi-SVS group keeps observed state"),
+            observed,
         });
         self.groups.lock().insert(space.clone(), Arc::clone(&group));
         rt::spawn(notices(Arc::clone(&group), handle));
