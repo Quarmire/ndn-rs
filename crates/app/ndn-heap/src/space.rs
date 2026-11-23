@@ -24,10 +24,11 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Waker, ready};
+use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
 use futures::Stream;
+use futures::task::AtomicWaker;
 use ndn_foundation_types::Name;
 use ndn_packet::Data;
 use ndn_security::confidentiality::ContentKey;
@@ -100,33 +101,27 @@ enum Slot {
     Blob(Blob),
 }
 
+#[derive(Default)]
 struct QueueState {
-    /// What the watch listed as it began.
-    listed: VecDeque<Slot>,
     /// Live changes, at most the queue's capacity.
     live: VecDeque<Slot>,
     /// Changes dropped since the watcher last read.
     missed: u64,
     closed: bool,
-    waker: Option<Waker>,
 }
 
-/// One watcher's changes.
+/// One watcher's live changes.
 pub(crate) struct Queue {
     st: Mutex<QueueState>,
+    waker: AtomicWaker,
     cap: usize,
 }
 
 impl Queue {
-    fn new(listed: VecDeque<Slot>, cap: usize) -> Arc<Queue> {
+    fn new(cap: usize) -> Arc<Queue> {
         Arc::new(Queue {
-            st: Mutex::new(QueueState {
-                listed,
-                live: VecDeque::new(),
-                missed: 0,
-                closed: false,
-                waker: None,
-            }),
+            st: Mutex::default(),
+            waker: AtomicWaker::new(),
             cap: cap.max(1),
         })
     }
@@ -142,7 +137,7 @@ impl Queue {
     }
 
     fn put(&self, slot: Slot) {
-        let waker = {
+        {
             let mut st = self.st.lock();
             if st.closed {
                 return;
@@ -152,22 +147,13 @@ impl Queue {
             } else {
                 st.live.push_back(slot);
             }
-            st.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
         }
+        self.waker.wake();
     }
 
     pub(crate) fn close(&self) {
-        let waker = {
-            let mut st = self.st.lock();
-            st.closed = true;
-            st.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        self.st.lock().closed = true;
+        self.waker.wake();
     }
 
     fn is_closed(&self) -> bool {
@@ -175,8 +161,9 @@ impl Queue {
     }
 
     fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<Slot>> {
+        self.waker.register(cx.waker());
         let mut st = self.st.lock();
-        if let Some(slot) = st.listed.pop_front().or_else(|| st.live.pop_front()) {
+        if let Some(slot) = st.live.pop_front() {
             return Poll::Ready(Some(slot));
         }
         if st.missed > 0 {
@@ -186,7 +173,6 @@ impl Queue {
         if st.closed {
             return Poll::Ready(None);
         }
-        st.waker = Some(cx.waker().clone());
         Poll::Pending
     }
 }
@@ -195,6 +181,8 @@ impl Queue {
 /// changes as they happen. Ends when the node stops. A value in pieces is
 /// read from the store as the watch reaches it, one at a time.
 pub struct Changes {
+    /// What the watch listed as it began: never lagged.
+    listed: VecDeque<Slot>,
     queue: Arc<Queue>,
     space: Arc<SpaceInner>,
     node: Arc<NodeInner>,
@@ -220,9 +208,13 @@ impl Changes {
 impl Stream for Changes {
     type Item = Result<Change, HeapError>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            let Some(slot) = ready!(self.queue.poll(cx)) else {
+            let next = match self.listed.pop_front() {
+                Some(slot) => Poll::Ready(Some(slot)),
+                None => self.queue.poll(cx),
+            };
+            let Some(slot) = ready!(next) else {
                 return Poll::Ready(None);
             };
             if let Some(change) = self.resolve(slot) {
@@ -501,8 +493,10 @@ impl SpaceInner {
                 != Some(&revocations_digest(&revoked)[..])
     }
 
-    /// Spawn the epoch a revocation of a reader's device key owes, if any.
-    pub(crate) fn repair_if_owed(self: &Arc<Self>, node: &Arc<NodeInner>) {
+    /// Look again at what the space wants at once, and spawn the epoch a
+    /// revocation of a reader's device key owes, if any.
+    pub(crate) fn settle(self: &Arc<Self>, node: &Arc<NodeInner>) {
+        node.nudge(&self.name);
         if self.revocation_owed(node, &self.log.lock()) {
             self.spawn_repair(node);
         }
@@ -1019,7 +1013,7 @@ impl Heap {
     /// already cover, then the changes as they happen.
     pub async fn watch(&self, since: &Frontier) -> Result<Changes, HeapError> {
         let inner = &self.inner;
-        let queue = {
+        let (listed, queue) = {
             let log = inner.log.lock();
             inner.check_reader(&log)?;
             let (items, blobs) = log.items();
@@ -1052,14 +1046,17 @@ impl Heap {
                     .iter()
                     .map(|(_, a)| Slot::Change(Change::Alert(a.clone()))),
             );
-            let queue = Queue::new(listed, self.node.config.watch_queue);
+            let queue = Queue::new(self.node.config.watch_queue);
             inner.watchers.lock().push(Arc::clone(&queue));
-            queue
+            (listed, queue)
         };
-        if let Some(why) = self.node.failure() {
-            queue.push(Change::Alert(Alert::StoreFailed { why }));
+        if let Some(why) = self.node.flusher.failure() {
+            queue.push(Change::Alert(Alert::StoreFailed {
+                why: why.to_string(),
+            }));
         }
         Ok(Changes {
+            listed,
             queue,
             space: Arc::clone(&self.inner),
             node: Arc::clone(&self.node),

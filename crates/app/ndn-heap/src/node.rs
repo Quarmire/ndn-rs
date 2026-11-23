@@ -41,7 +41,7 @@ use crate::log::{Alert, Blob, Change, Log, Outcome, Params, Want};
 use crate::reserve::{Flusher, Publisher};
 use crate::revocation::{self, CutBound, CutProposal, Suspicion};
 use crate::rt;
-use crate::seal::{self, GrantRefusal, Granter, Keys};
+use crate::seal::{self, GrantRefusal, Keys};
 use crate::serve;
 use crate::space::{Follower, Heap, Share, SpaceInner, check_audience};
 use crate::store::Kind;
@@ -169,7 +169,6 @@ pub(crate) struct NodeInner {
     /// The certificate fetches signal run headers wait for (spec §11).
     pub(crate) signal_gate: crate::signal::SignalGate,
     stopped: AtomicBool,
-    failed: Mutex<Option<String>>,
     serving: Mutex<Option<ServeGuard>>,
 }
 
@@ -258,7 +257,6 @@ impl Node {
             signatures: AtomicU64::new(0),
             signal_gate: crate::signal::SignalGate::default(),
             stopped: AtomicBool::new(false),
-            failed: Mutex::new(None),
             serving: Mutex::new(None),
         });
         let node = Node {
@@ -514,10 +512,6 @@ impl NodeInner {
         }
     }
 
-    pub(crate) fn failure(&self) -> Option<String> {
-        self.failed.lock().clone()
-    }
-
     pub(crate) fn space_of(&self, space: &Name) -> Option<Arc<SpaceInner>> {
         self.spaces.read().get(space).cloned()
     }
@@ -591,22 +585,18 @@ impl NodeInner {
         space: &Name,
         follower: bool,
     ) -> Result<Arc<SpaceInner>, HeapError> {
-        match self.space_of(space) {
-            Some(s) if s.follower == follower => return Ok(s),
-            Some(_) if follower => {
-                return Err(HeapError::BadRequest {
-                    why: format!("{space} is open here as a member: a member carries it already"),
-                });
-            }
-            Some(_) => {
-                return Err(HeapError::BadRequest {
-                    why: format!(
-                        "{space} is followed here as a carrier, which reads and writes nothing; \
-                         close the follower before opening the space"
-                    ),
-                });
-            }
-            None => {}
+        if let Some(held) = self.space_of(space) {
+            let why = if held.follower == follower {
+                return Ok(held);
+            } else if follower {
+                format!("{space} is open here as a member: a member carries it already")
+            } else {
+                format!(
+                    "{space} is followed here as a carrier, which reads and writes nothing; \
+                     close the follower before opening the space"
+                )
+            };
+            return Err(HeapError::BadRequest { why });
         }
         if self.stopped.load(Ordering::Relaxed) {
             return Err(HeapError::local("the node is stopped"));
@@ -669,8 +659,7 @@ impl NodeInner {
             }
         }
         inner.seed_owed(self);
-        self.nudge(&inner.name);
-        inner.repair_if_owed(self);
+        inner.settle(self);
         Ok(inner)
     }
 
@@ -786,8 +775,7 @@ impl NodeInner {
                 };
                 held.finish(self, routed);
             }
-            self.nudge(&space);
-            held.repair_if_owed(self);
+            held.settle(self);
         }
     }
 
@@ -805,16 +793,12 @@ impl NodeInner {
                 spaces,
                 refuses,
             } => {
-                if refuses {
-                    self.rejudge(spaces, std::slice::from_ref(&person)).await;
+                let persons = if refuses {
+                    std::slice::from_ref(&person)
                 } else {
-                    for space in spaces {
-                        self.nudge(&space);
-                        if let Some(held) = self.space_of(&space) {
-                            held.repair_if_owed(self);
-                        }
-                    }
-                }
+                    &[]
+                };
+                self.rejudge(spaces, persons).await;
             }
         }
     }
@@ -837,10 +821,10 @@ impl NodeInner {
             return;
         };
         let Some(inner) = node.upgrade() else { return };
-        let why = why.to_string();
-        *inner.failed.lock() = Some(why.clone());
         for space in inner.sorted() {
-            space.tell(Change::Alert(Alert::StoreFailed { why: why.clone() }));
+            space.tell(Change::Alert(Alert::StoreFailed {
+                why: why.to_string(),
+            }));
         }
     }
 
@@ -1066,23 +1050,13 @@ impl NodeInner {
     ) -> Result<(), GrantRefusal> {
         let held = self.space_of(space).ok_or(GrantRefusal::EpochNotNamed)?;
         let person = self.person_of(asker);
-        {
-            let log = held.log.lock();
-            seal::may_grant(
-                &Granter {
-                    fold: &log.fold,
-                    keys: &log.keys,
-                    space,
-                    revoked: asker_key.is_some_and(|k| self.judge.key_revoked(k, space)),
-                },
-                epoch,
-                &person,
-            )?;
-            // Under the lock: the entry is held back there, in the same stretch
-            // that stores it, so no grant can slip in between.
-            if epoch.creator == self.device && !held.publisher.servable(epoch.seq) {
-                return Err(GrantRefusal::EpochNotNamed);
-            }
+        let log = held.log.lock();
+        let revoked = asker_key.is_some_and(|k| self.judge.key_revoked(k, space));
+        seal::may_grant(&log.fold, &log.keys, space, epoch, &person, revoked)?;
+        // Under the lock: the entry is held back there, in the same stretch
+        // that stores it, so no grant can slip in between.
+        if epoch.creator == self.device && !held.publisher.servable(epoch.seq) {
+            return Err(GrantRefusal::EpochNotNamed);
         }
         Ok(())
     }

@@ -584,63 +584,49 @@ impl Group {
     /// by the node when it came. Whatever happens, the next pass sees the
     /// log's answer: held, or still wanted.
     async fn ask_entry(self: Arc<Self>, launch: Launch) {
-        let host = &self.shared.host;
         let name = log_name(&launch.device, &self.space, launch.seq);
         let sources = self.sources(&launch.device);
-        let taken = match sources.get(launch.misses as usize % sources.len().max(1)) {
+        let wire = match sources.get(launch.misses as usize % sources.len().max(1)) {
+            Some(source) => self.fetch_original(source, &name).await.ok(),
             None => {
                 tracing::debug!(%name, "no one to ask for it: this device is the writer and no heard member vouches for the log yet");
                 None
             }
-            Some(source) => match self.fetch_original(source, &name).await {
-                // A node that stopped while the entry was on its way (a clean
-                // close, a restart over the same store) takes nothing: what
-                // it wrote now would be unknown to the log that opens the
-                // store next.
-                Ok(_) if self.stop.is_cancelled() => None,
-                Ok(wire) => {
-                    // A cut names its bytes: others are not handed to the
-                    // log, and the next source is asked.
-                    if launch
-                        .digest
-                        .is_some_and(|want| signed_digest(&wire) != want)
-                    {
-                        tracing::debug!(%name, "not the bytes the cut keeps: the next source is asked");
-                        None
-                    } else {
-                        tracing::trace!(target: TIMELINE, %name, "verify_begin");
-                        let taken = host.take(&self.space, wire, launch.probe).await;
-                        tracing::trace!(target: TIMELINE, %name, "verify_end");
-                        Some(taken)
-                    }
-                }
-                Err(_) => None,
-            },
         };
+        // A node that stopped while the entry was on its way (a clean close, a
+        // restart over the same store) takes nothing: what it wrote now would
+        // be unknown to the log that opens the store next. A cut names its
+        // bytes: others are not handed to the log, and the next source is
+        // asked.
+        let wire = wire.filter(|_| !self.stop.is_cancelled()).filter(|wire| {
+            let right = launch.digest.is_none_or(|want| signed_digest(wire) == want);
+            if !right {
+                tracing::debug!(%name, "not the bytes the cut keeps: the next source is asked");
+            }
+            right
+        });
         let mut resolved = false;
-        match taken {
-            Some(Taken::Decided { outcome, blobs }) => {
-                match &outcome {
-                    Outcome::Refused(why) => tracing::debug!(%name, "refused: {why}"),
-                    // Held now: the next pass sees what is still wanted.
-                    Outcome::Applied | Outcome::Closed | Outcome::Waiting | Outcome::Unreadable => {
-                        resolved = true
+        if let Some(wire) = wire {
+            tracing::trace!(target: TIMELINE, %name, "verify_begin");
+            let taken = self.shared.host.take(&self.space, wire, launch.probe).await;
+            tracing::trace!(target: TIMELINE, %name, "verify_end");
+            match taken {
+                Taken::Decided { outcome, blobs } => {
+                    // Held now: the next pass sees what is still wanted. Not
+                    // newly held (a refusal, a duplicate, evidence): if the
+                    // log still wants this entry, this answer resolved
+                    // nothing, and the next ask goes to another source.
+                    resolved = matches!(
+                        outcome,
+                        Outcome::Applied | Outcome::Closed | Outcome::Waiting | Outcome::Unreadable
+                    );
+                    if !resolved {
+                        tracing::debug!(%name, "not taken: {outcome:?}");
                     }
-                    // Not newly held: if the log still wants this entry, this
-                    // answer resolved nothing, and the next ask goes to
-                    // another source.
-                    Outcome::Duplicate | Outcome::Evidence => {
-                        tracing::debug!(%name, "already held, or kept as evidence: {outcome:?}");
-                    }
-                }
-                if !blobs.is_empty() {
                     self.assemble(blobs);
                 }
+                Taken::Pending(waiting) => tracing::debug!(%name, "not judged yet: {waiting}"),
             }
-            Some(Taken::Pending(waiting)) => {
-                tracing::debug!(%name, "not judged yet: {waiting}");
-            }
-            None => {}
         }
         let (misses, pause) = match resolved {
             true => (0, REFRESH_PAUSE),
@@ -858,30 +844,17 @@ impl Group {
         loop {
             let progress = self.progress.notified();
             self.note_own();
-            match self.own_state() {
-                OwnState::Done => {
-                    return Recovered {
-                        heard,
-                        complete: true,
-                    };
-                }
-                OwnState::GaveUp => {
-                    return Recovered {
-                        heard,
-                        complete: false,
-                    };
-                }
-                OwnState::Owed => {
-                    let _ = rt::timeout(Duration::from_millis(100), progress).await;
-                }
+            if let Some(complete) = self.own_complete() {
+                return Recovered { heard, complete };
             }
+            let _ = rt::timeout(Duration::from_millis(100), progress).await;
         }
     }
 
-    /// Where the own entries stand: none wanted, some wanted (or the entry
-    /// the own counter names, not yet probed in vain) that can still be asked
-    /// for, or every one asked for in vain.
-    fn own_state(&self) -> OwnState {
+    /// Whether the own entries are done: `Some(true)` when none is wanted,
+    /// `Some(false)` when every one wanted (or the entry the own counter
+    /// names) was asked for in vain, `None` while one can still be asked for.
+    fn own_complete(&self) -> Option<bool> {
         let host = &self.shared.host;
         let me = host.device();
         let mut seqs: Vec<u64> = self
@@ -896,23 +869,16 @@ impl Group {
                 .map(|(_, s)| s),
         );
         if seqs.is_empty() {
-            return OwnState::Done;
+            return Some(true);
         }
         let asks = self.asks.lock();
-        for seq in seqs {
-            match asks.by.get(&(me.clone(), seq)) {
-                Some(ask) if ask.misses >= FETCH_TRIES => {}
-                _ => return OwnState::Owed,
-            }
-        }
-        OwnState::GaveUp
+        let owed = seqs.iter().any(|&seq| {
+            asks.by
+                .get(&(me.clone(), seq))
+                .is_none_or(|ask| ask.misses < FETCH_TRIES)
+        });
+        (!owed).then_some(false)
     }
-}
-
-enum OwnState {
-    Done,
-    Owed,
-    GaveUp,
 }
 
 /// The pump of one group: look at what the log wants whenever woken, and when
