@@ -24,6 +24,7 @@ define the bytes on the wire:
 | Spec | Covers |
 |---|---|
 | [data-layer.md](data-layer.md) | Data layer: versions, collections, members, summaries, cuts, seals and types and the four verbs; slices 1–3, 5 and 6 normative (versions, members, the built-in newest register `/ndf/merge/newest/v=1`, nested summaries, sync notice, seals, large payloads; revocation cuts; folder members records, introductions (joining a folder by a code); TLV 0x0520–0x057F), later slices skeleton |
+| [heap.md](heap.md) | Heap (`ndn-heap`, replaces data-layer.md for the new crate): a signed hash-chained log per writer and space, entries and their TLVs, names, membership as an operation fold in which removal wins, epoch seals and grants, durability by sequence reservation with recovery from peers and a signed gap statement, the TLV registry 0x0600–0x063F |
 | [signals.md](signals.md) | Signals: ephemeral live data (presence, cursors, live edits) between the members of a folder; run keys and run headers, packets signed by the run key and sealed under the folder epoch's signal key, the push into the namespaces' sync groups, the local leg over shared-memory rings, receiver checks, limits, threat notes; TLV 0x0580–0x05AF |
 | [did-ndn-spec.md](did-ndn-spec.md) | `did:ndn` method |
 | [service-layer.md](service-layer.md) | Service layer |
