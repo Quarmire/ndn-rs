@@ -425,7 +425,14 @@ impl SpaceInner {
                 match step(&mut log)? {
                     None => return Ok(None),
                     Some(Step::Done(id, fx)) => {
-                        let routed = self.route(node, &log, fx, true);
+                        let mut routed = self.route(node, &log, fx, true);
+                        // The epoch an own Members entry owes is signed by its
+                        // signer, in line ([`Self::sign_members`]): a task of
+                        // its own could sign it after the caller returned, or
+                        // before the caller's own repair and leave that one
+                        // with nothing to sign and a ticket that does not cover
+                        // the epoch.
+                        routed.repair = false;
                         drop(log);
                         let ticket = routed.ticket.expect("a signed entry was written");
                         self.finish(node, routed);

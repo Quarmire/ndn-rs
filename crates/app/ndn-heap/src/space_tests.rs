@@ -262,6 +262,20 @@ async fn a_writer_in_a_private_space_seals_and_a_reader_outside_the_audience_get
     );
 }
 
+/// Bob is removed and the new epoch is not signed yet: the epoch in force
+/// lists a person who is no reader. Signed under the lock and applied, as
+/// another owner device's Members entry would be, but not routed: nothing is
+/// told to repair.
+fn outgrow_the_epoch(heap: &Heap) {
+    let mut log = heap.inner.log.lock();
+    let ops = log.remove_ops(&n("/bob"));
+    assert!(!ops.is_empty());
+    let step = log
+        .sign_members(crate::wire::MembersBody { create: None, ops }, 0)
+        .unwrap();
+    assert!(matches!(step, crate::log::Step::Done(..)));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_writer_never_seals_in_an_outgrown_epoch() {
     let dev = solo().await;
@@ -270,17 +284,7 @@ async fn a_writer_never_seals_in_an_outgrown_epoch() {
     heap.put(&n("/a"), bytes("one"), PutOptions::default())
         .await
         .unwrap();
-    // Bob is removed and the new epoch is not signed yet: the epoch in force
-    // lists a person who is no reader.
-    {
-        let mut log = heap.inner.log.lock();
-        let ops = log.remove_ops(&n("/bob"));
-        assert!(!ops.is_empty());
-        let step = log
-            .sign_members(crate::wire::MembersBody { create: None, ops }, 0)
-            .unwrap();
-        assert!(matches!(step, crate::log::Step::Done(..)));
-    }
+    outgrow_the_epoch(&heap);
     let refused = heap
         .put(&n("/a"), bytes("two"), PutOptions::default())
         .await
@@ -292,6 +296,36 @@ async fn a_writer_never_seals_in_an_outgrown_epoch() {
     heap.put(&n("/a"), bytes("two"), PutOptions::default())
         .await
         .unwrap();
+}
+
+/// The epoch an own Members entry owes is signed by the call that signed the
+/// entry, before it returns: no task is left behind to sign it later. Such a
+/// task could sign an epoch the caller did not expect, or beat the caller's own
+/// repair to it and so leave the caller waiting on a flush that does not cover
+/// the epoch (a `create` that returned before its epoch was served). On one
+/// thread a task spawned by the call is still alive when it returns.
+#[tokio::test(flavor = "current_thread")]
+async fn an_own_members_entry_spawns_no_task_to_sign_its_epoch() {
+    let dev = solo().await;
+    let (node, _) = boot(&dev, cfg()).await;
+    let heap = node.create(&space(), private(&["/bob"])).await.unwrap();
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    let alive = || {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    };
+    let before = alive();
+    heap.inner
+        .sign_with(&heap.node, |log| {
+            let ops = log.remove_ops(&n("/bob"));
+            log.sign_members(crate::wire::MembersBody { create: None, ops }, 0)
+        })
+        .await
+        .unwrap();
+    assert_eq!(alive(), before, "the entry left a task behind");
 }
 
 /// A reader added by `change` holds the key of the epoch in force; removing

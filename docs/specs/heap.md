@@ -2071,7 +2071,8 @@ anything is signed, §6.3). It signs the
 creation (`CREATE`, with `ANYONE` 1 for `Readers::Anyone`) and one `ADD` per
 listed person (the owner is implicit, a person listed twice in one role once;
 more than 32 operations go in further `Members` entries), then, unless the space
-is public, its first epoch (§6.3), and returns after the flush that covers
+is public, its first epoch (§6.3), signed by the call itself (no task is left
+behind to sign it later), and returns after the flush that covers
 them (§4.7). An error after the first of them was signed leaves what was signed
 in the store, as nothing signed is retracted (§4.6); the space is left. Two
 owner devices that both `create` one name make two creations, and the fold keeps
@@ -2810,7 +2811,7 @@ Each property of §1.6 is held by one module and shown by named tests (the
 | 2 | Other bytes at a kept seq are refused | `log/chain.rs` | `other_bytes_at_a_kept_seq_are_refused` |
 | 3 | Membership converges; removal wins | `fold.rs` | `fold_state_is_independent_of_arrival_order`, `removal_beats_an_add_of_the_same_id`, `a_fresh_id_readmits`, `concurrent_removals_leave_a_complete_epoch_after_each_owner_device_repairs` |
 | 4 | A late removal or revocation withdraws what was applied | `log/admit.rs`, `node.rs` | `a_late_cut_withdraws_what_it_does_not_keep`, `withdrawing_a_head_restores_the_entry_it_superseded` (log, register), `a_context_the_keyring_adopts_is_announced` |
-| 5 | A writer never seals in an outgrown epoch: one a removed reader holds, or a revoked reader device may hold | `fold.rs`, `log/own.rs`, `space.rs` | `a_writer_never_seals_in_an_outgrown_epoch`, `a_removed_reader_leaves_no_epoch_in_force_until_the_owner_repairs`, `a_reader_added_to_an_epoch_and_removed_leaves_it_out_of_force`, `a_reader_added_by_change_and_removed_again_cannot_open_the_next_put`, `revoking_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_once` |
+| 5 | A writer never seals in an outgrown epoch: one a removed reader holds, or a revoked reader device may hold | `fold.rs`, `log/own.rs`, `space.rs` | `a_writer_never_seals_in_an_outgrown_epoch`, `an_own_members_entry_spawns_no_task_to_sign_its_epoch`, `a_removed_reader_leaves_no_epoch_in_force_until_the_owner_repairs`, `a_reader_added_to_an_epoch_and_removed_leaves_it_out_of_force`, `a_reader_added_by_change_and_removed_again_cannot_open_the_next_put`, `revoking_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_once` |
 | 6 | An epoch key goes only to whom the records admit, and is checked | `seal.rs`, `serve.rs` | `may_grant_refuses_each_condition_and_names_which`, `a_key_that_fails_the_key_check_is_dropped`, `a_non_reader_gets_no_answer_and_the_granter_fetches_nothing`, `a_removed_reader_is_refused_every_later_grant`, `an_asker_with_a_revoked_key_gets_no_grant`, `a_kept_seal_key_and_grant_are_not_served_after_the_judge_moves` |
 | 7 | An unsealed entry in a sealed space is refused | `log/admit.rs` | `an_unsealed_entry_in_a_sealed_space_is_refused`, `a_sealed_entry_in_a_public_space_is_refused` |
 | 8 | Digests are signed-region digests | `wire/digest.rs`, `log/admit.rs` | `a_reencoded_copy_has_the_same_signed_digest`, `a_relays_high_s_copy_changes_nothing` |
