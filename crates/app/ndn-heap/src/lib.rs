@@ -17,7 +17,6 @@
 mod rt;
 mod wire;
 
-#[cfg(feature = "wip-error")]
 mod error;
 #[cfg(feature = "wip-face-up")]
 mod face_up;
