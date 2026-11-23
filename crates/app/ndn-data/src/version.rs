@@ -316,9 +316,16 @@ pub struct Version {
     /// The content.
     pub payload: Payload,
     /// The implicit digest of the version's packet: SHA-256 of its whole
-    /// Data wire, its content address — what a parent's digest names, and
-    /// what the register breaks a tie by (spec §4, §5).
+    /// Data wire, its content address — what a parent's digest names (spec
+    /// §4, §5). It differs between two copies of a packet that differ only
+    /// in an ECDSA signature value; [`Self::signed`] does not.
     pub digest: [u8; 32],
+    /// The digest of what the version's key signed: SHA-256 of the packet's
+    /// signed region, the Name through the `SignatureInfo` (ndn-data:
+    /// `wire::signed_digest`). The same on every copy of the packet, and
+    /// what the register breaks a tie by (spec §5): of concurrent heads the
+    /// highest wins.
+    pub signed: [u8; 32],
     /// The `MergeOp` octets of a merge version (`rule` is `Some`), as the
     /// register applies them. `None` under the log rule, and while the
     /// operation is not open

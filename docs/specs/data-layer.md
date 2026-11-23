@@ -3183,20 +3183,21 @@ announced). What is owed, and until when:
   pass something held here asks for — a name followed, a namespace
   adopted — begins at once, whatever notices came.
 - **A first notice answered by a root of head 0 (normative).** A notice
-  says its device moved, so its head is above 0 (§12): a device never
-  walked before whose root that answers a first notice has head 0 is an
-  old copy of the root, replayed or delayed by a party on the path, that
-  must not end the notice — the device would stop announcing once its root
-  was asked, and nothing would ask again. The reader takes that root as
-  any, but the writer counts as not reached, and the next walk of the loop,
-  after the pause above, requires a root above the head held: the writer's
-  own, in rounds as above, or a device's answering for it (§13.5). Only
-  stale copies coming, the writer stays not reached, the loop asks again at
-  most `REFRESH_TRIES` times in a row, and a relay's root above the head
-  is walked as it comes. An old copy of a root of head above 0 at a first
-  contact advances the head and is not caught here: a notice names no
-  entry to fetch (§12.1), so only a notice that does closes that. Nothing
-  is taken on trust: only roots the writer signed are taken.
+  says its device moved, so a root of head 0 that answers the first notice
+  of a device never walked before may be an old copy of its root, replayed
+  or delayed by a party on the path: the device would stop announcing once
+  its root was asked, and nothing would ask again. The reader takes that
+  root as any (a device that has signed nothing yet has a head-0 root, and
+  is no worse for it), and once, after the pause above, walks the device
+  again, the walk requiring a root above the head held: the writer's own,
+  in rounds as above, or a device's answering for it (§13.5), walked as it
+  comes. Given only stale copies, that walk does not reach the writer: the
+  relay fallback and the loop's asks again apply as for a root that does
+  not come, and the walk after it takes what answers. An old copy of a
+  root of head above 0 at a first contact advances the head and is not
+  caught here: a notice names no entry to fetch (§12.1), so only a notice
+  that does closes that. Nothing is taken on trust: only roots the writer
+  signed are taken.
   Which root answered decides nothing (invariant 1): what is held and owed
   follows from the roots and entries verified, as above.
 - **A group heard from no one (normative).** A first look (§15) that

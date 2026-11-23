@@ -159,6 +159,36 @@ async fn readers_holding_either_wire_of_a_head_read_one_winner() {
     );
 }
 
+/// A version a host reads carries the digest the register breaks ties by
+/// (`Version::signed`): the same on every copy of its packet, while the
+/// implicit digest (`Version::digest`) differs between the copies. A host
+/// that checks which head must win reads this one.
+#[tokio::test]
+async fn a_version_carries_the_digest_the_register_breaks_ties_by() {
+    let c = notes();
+    let (original, copy) = two_wires(&c, b"from the phone");
+    let mut listed = Vec::new();
+    for held in [&original, &copy] {
+        let dev = register_device().await;
+        give(&dev, held);
+        let mut changes = dev.watch(&c, &Frontier::new()).await.unwrap();
+        let seen = drain(&mut changes).await;
+        let Some(Change::Version(v)) = seen.iter().find(|c| matches!(c, Change::Version(_))) else {
+            panic!("the watch lists the version: {seen:?}");
+        };
+        listed.push(v.clone());
+        dev.shutdown();
+    }
+    assert_eq!(listed[0].signed, listed[1].signed, "one signed version");
+    assert_eq!(
+        listed[0].signed,
+        wire::signed_digest(&original.packet).unwrap()
+    );
+    assert_eq!(listed[0].digest, wire::implicit_digest(&original.packet));
+    assert_eq!(listed[1].digest, wire::implicit_digest(&copy.packet));
+    assert_ne!(listed[0].digest, listed[1].digest, "two wires");
+}
+
 /// A version made over the packet its writer signed applies on a reader that
 /// holds a copy of that parent in another signature value: the parent is
 /// the same signed version, and the exact packet the child names is asked

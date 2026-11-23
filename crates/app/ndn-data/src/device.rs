@@ -305,10 +305,9 @@ impl HeldVersion {
         epoch: Option<Epoch>,
         chunks: Option<ChunksBody>,
     ) -> Self {
-        let signed = wire::signed_digest(&wire).unwrap_or(version.digest);
         HeldVersion {
             digest: version.digest,
-            signed,
+            signed: version.signed,
             version,
             op,
             wire,
@@ -1300,10 +1299,11 @@ struct Peer {
     /// The root that answered the first notice of this device (no root of it
     /// verified before) was no newer than the head held then, 0: a notice
     /// means the writer moved, so that root may be an old copy the network
-    /// delayed. The head it left: the next walk requires a root above it,
-    /// from the writer or a device answering for it, and a walk that is
-    /// given none is not reached ([`Inner::refresh`], spec §17.1). Cleared
-    /// by the first root above it.
+    /// delayed. The head it left: the one follow-up walk that comes after
+    /// the pause ([`Inner::follow_stale_root`]) takes it and requires a
+    /// root above it, from the writer or a device answering for it; given
+    /// none, that walk does not reach the writer ([`Inner::refresh`], spec
+    /// §17.1).
     after: Option<u64>,
 }
 
@@ -3290,7 +3290,7 @@ impl St {
         }
         let op = body.op.clone();
         let chunks = body.chunks;
-        let version = version_of(name, &writer, seq, body, wire::implicit_digest(&wire), true);
+        let version = version_of(name, &writer, seq, body, &wire, true);
         Some(Ok(HeldVersion::new(
             version, op, wire, sealed, epoch, chunks,
         )))
@@ -3404,7 +3404,7 @@ impl St {
         writer: &Writer,
         seq: u64,
         record: &Record,
-        wire: &[u8],
+        wire: &Bytes,
     ) -> bool {
         let key = (writer.clone(), seq);
         let first = match self.seqs.get(&key) {
@@ -3434,7 +3434,7 @@ impl St {
                 writer,
                 seq,
                 body.clone(),
-                wire::implicit_digest(wire),
+                wire,
                 body.sealed.is_none(),
             ))),
             Record::Members(body) => Side::Record {
@@ -3855,14 +3855,7 @@ impl St {
             }
             let op = body.op.clone();
             let chunks = body.chunks;
-            let version = version_of(
-                &name,
-                &writer,
-                seq,
-                body,
-                wire::implicit_digest(&wire),
-                true,
-            );
+            let version = version_of(&name, &writer, seq, body, &wire, true);
             self.held.insert(name, Held::Version(version.id.clone()));
             self.admit(Arc::new(HeldVersion::new(
                 version, op, wire, true, epoch, chunks,
@@ -6693,13 +6686,14 @@ impl Inner {
         let key = (device.clone(), ns.clone());
         let answers = reach.as_ref().and_then(|r| r.answers);
         let (held, owed) = {
-            let st = self.st.lock();
-            let peer = st.peers.get(&key);
-            (
-                peer.filter(|p| p.head > 0 || p.root.is_some())
-                    .map(|p| p.head),
-                peer.and_then(|p| p.after),
-            )
+            let mut st = self.st.lock();
+            match st.peers.get_mut(&key) {
+                Some(p) => (
+                    (p.head > 0 || p.root.is_some()).then_some(p.head),
+                    p.after.take(),
+                ),
+                None => (None, None),
+            }
         };
         // A root of it must be above the head a root that answered its first
         // notice left ([`Peer::after`]), as above those verified before a
@@ -6723,28 +6717,18 @@ impl Inner {
             return false;
         }
         let Rooted { data, writer, body } = rooted;
+        // The follow-up of a first notice's root that may be an old copy
+        // ([`Peer::after`]) got no root above the head: only stale copies
+        // came, so the writer is not reached, and the loop asks again.
+        let stale = owed.is_some_and(|a| body.head <= a);
         // The first root of a device, answering its first notice, that is no
         // newer than the head held before it (0): the writer moved, so it
         // may be an old copy a hostile or a delayed path replayed, which
-        // must not end the notice. The writer is asked again after the
-        // pause for a root above it, and is not reached until one comes
-        // ([`Peer::after`], spec §17.1).
-        let stale = {
-            let mut st = self.st.lock();
-            let peer = st.peers.entry(key.clone()).or_default();
-            match owed {
-                Some(a) if body.head > a => {
-                    peer.after = None;
-                    false
-                }
-                Some(_) => true,
-                None if answers.is_some() && held.is_none() && !relayed && body.head == 0 => {
-                    peer.after = Some(body.head);
-                    true
-                }
-                None => false,
-            }
-        };
+        // must not end the notice. One more walk follows after the pause,
+        // requiring a root above it ([`Peer::after`], spec §17.1).
+        if owed.is_none() && answers.is_some() && held.is_none() && !relayed && body.head == 0 {
+            self.follow_stale_root(ns, device, body.head);
+        }
         if let Some(r) = &reach {
             r.pass.head.fetch_max(body.head, Ordering::Relaxed);
         }
@@ -6834,6 +6818,31 @@ impl Inner {
                 .insert(walked_name(device, ns), encode_walked(head, &peer.toward));
         }
         !unreached && !stale
+    }
+
+    /// The root that answered `device`'s first notice in `ns` was no newer
+    /// than `head` (0), which a notice cannot announce: it may be an old
+    /// copy the network delayed, and the device stops announcing once its
+    /// root was asked. After the pause the loop walks it once more, the walk
+    /// requiring a root above `head` ([`Peer::after`]); once only. Which
+    /// root answers decides nothing else (invariant 1).
+    fn follow_stale_root(self: &Arc<Self>, ns: &Name, device: &Name, head: u64) {
+        self.st
+            .lock()
+            .peers
+            .entry((device.clone(), ns.clone()))
+            .or_default()
+            .after = Some(head);
+        let weak = Arc::downgrade(self);
+        let (ns, device) = (ns.clone(), device.clone());
+        rt::spawn(async move {
+            rt::sleep(retry_pause(0)).await;
+            if let Some(inner) = weak.upgrade()
+                && !inner.stopped.load(Ordering::Relaxed)
+            {
+                inner.refresh_loop(ns, device, 0, false);
+            }
+        });
     }
 
     /// One pass of `device`'s refresh loop of `ns` ([`Self::refresh_loop`],
@@ -7706,7 +7715,7 @@ impl Inner {
                         &writer,
                         seq,
                         body.clone(),
-                        wire::implicit_digest(&wire),
+                        &wire,
                         body.sealed.is_none(),
                     ))),
                 };
@@ -7869,7 +7878,7 @@ impl Inner {
                 }
                 let op = body.op.clone();
                 let chunks = body.chunks;
-                let version = version_of(&name, &writer, seq, body, digest, true);
+                let version = version_of(&name, &writer, seq, body, &wire, true);
                 st.held
                     .insert(name.clone(), Held::Version(version.id.clone()));
                 st.admit(Arc::new(HeldVersion::new(
@@ -10425,14 +10434,7 @@ impl Inner {
         };
         let wire = self.sign(DataBuilder::new(name.clone(), &wire::encode_version(&body)))?;
         let epoch = body.sealed.as_ref().map(|s| s.epoch.clone());
-        let version = version_of(
-            &name,
-            &self.writer,
-            seq,
-            body,
-            wire::implicit_digest(&wire),
-            true,
-        );
+        let version = version_of(&name, &self.writer, seq, body, &wire, true);
         let held = HeldVersion {
             opened: true,
             ..HeldVersion::new(version, op, wire, key.is_some(), epoch, chunks)
@@ -12433,8 +12435,9 @@ fn refused(name: &Name, why: Refusal) -> DataError {
     DataError::Refused { id, why }
 }
 
-/// The version `body` signed by `writer` at `seq` describes, its packet's
-/// implicit digest `digest`. `open`: whether its payload is open here (not
+/// The version `body` signed by `writer` at `seq` describes, in the packet
+/// `wire`: its implicit digest and the digest of what its key signed.
+/// `open`: whether its payload is open here (not
 /// sealed, or opened), so that its operation is the body's; a merge
 /// version's operation is carried ([`Version::op`]) only then, and only
 /// when it stands in the record, not in pieces.
@@ -12443,9 +12446,11 @@ fn version_of(
     writer: &Writer,
     seq: u64,
     body: VersionBody,
-    digest: [u8; 32],
+    wire: &Bytes,
     open: bool,
 ) -> Version {
+    let digest = wire::implicit_digest(wire);
+    let signed = wire::signed_digest(wire).unwrap_or(digest);
     let op = (open && body.rule.is_some() && body.chunks.is_none()).then_some(body.op);
     Version {
         id: VersionId {
@@ -12461,6 +12466,7 @@ fn version_of(
         dated: body.dated,
         rule: body.rule,
         digest,
+        signed,
         op,
         payload: match body.chunks {
             Some(c) => Payload::Large { size: c.size },
@@ -12472,13 +12478,12 @@ fn version_of(
 impl Locked {
     /// The version it is, its payload not open: no fields, no operation.
     fn version(&self) -> Version {
-        let digest = wire::implicit_digest(&self.wire);
         version_of(
             &self.name,
             &self.writer,
             self.seq,
             self.body.clone(),
-            digest,
+            &self.wire,
             false,
         )
     }
