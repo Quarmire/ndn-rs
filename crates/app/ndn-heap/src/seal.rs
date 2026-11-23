@@ -160,24 +160,18 @@ pub(crate) fn unwrap_key(
 /// synchronously.
 pub(crate) fn sign(builder: DataBuilder, signer: &dyn Signer) -> Result<Bytes, SealError> {
     let mut failed = None;
-    let wire = builder.sign_sync(
-        signer.sig_type(),
-        Some(signer.key_name()),
-        |region| match signer.sign_sync(region) {
-            Ok(sig) => sig,
-            Err(e) => {
-                failed = Some(e);
-                Bytes::new()
-            }
-        },
-    );
-    match failed {
-        Some(e) => Err(SealError::Sign {
+    let wire = builder.sign_sync(signer.sig_type(), Some(signer.key_name()), |region| {
+        signer.sign_sync(region).unwrap_or_else(|e| {
+            failed = Some(e);
+            Bytes::new()
+        })
+    });
+    failed.map_or(Ok(wire), |e| {
+        Err(SealError::Sign {
             key: signer.key_name().clone(),
             reason: e.to_string(),
-        }),
-        None => Ok(wire),
-    }
+        })
+    })
 }
 
 /// The answer to a grant ask: the Data packet `name` (`<G>/32=grant/<ask>`)
