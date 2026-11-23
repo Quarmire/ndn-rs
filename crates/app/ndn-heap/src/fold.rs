@@ -171,13 +171,7 @@ impl Fold {
     /// two bodies for one id (equivocation, which the log reports) leaves the
     /// least of them by `(key_check, audience, replaces)`.
     pub fn apply_epoch(&mut self, id: EpochId, body: &EpochBody, after: &[EntryRef]) {
-        let mut replaces: Vec<EpochId> = after
-            .iter()
-            .map(|r| EpochId {
-                creator: r.device.clone(),
-                seq: r.seq,
-            })
-            .collect();
+        let mut replaces: Vec<EpochId> = after.iter().map(EpochId::from).collect();
         replaces.sort();
         replaces.dedup();
         let new = Epoch {

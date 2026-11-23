@@ -121,6 +121,16 @@ pub(crate) struct EpochId {
     pub seq: u64,
 }
 
+impl From<&EntryRef> for EpochId {
+    /// The epoch the Epoch entry `r` made.
+    fn from(r: &EntryRef) -> EpochId {
+        EpochId {
+            creator: r.device.clone(),
+            seq: r.seq,
+        }
+    }
+}
+
 /// A Members entry: at most 32 operations.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) struct MembersBody {

@@ -132,15 +132,15 @@ fn the_markers_round_trip() {
         "a marker of another length is not read as one"
     );
 
-    let head = Head {
+    let head = Link {
         seq: 77,
         digest: [9; 32],
     };
     let wire = head.encode();
     assert_eq!(wire.len(), 40);
     assert_eq!(&wire[..8], &77u64.to_be_bytes());
-    assert_eq!(Head::decode(&wire), Some(head));
-    assert_eq!(Head::decode(&wire[..39]), None);
+    assert_eq!(Link::decode(&wire), Some(head));
+    assert_eq!(Link::decode(&wire[..39]), None);
 
     for record in [
         ReserveRecord { r: 0, clean: false },

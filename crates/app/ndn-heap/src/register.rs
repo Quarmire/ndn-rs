@@ -343,6 +343,7 @@ impl Register {
 
     /// How many heads the register holds in all: what its memory is
     /// proportional to.
+    #[cfg(test)]
     pub(crate) fn head_count(&self) -> usize {
         self.at.len()
     }

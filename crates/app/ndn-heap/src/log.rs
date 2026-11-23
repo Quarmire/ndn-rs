@@ -82,7 +82,7 @@ use ndn_sync::DataStore;
 use crate::error::{Cut, HeapError, NextStep, Refusal};
 use crate::fold::{Fold, Readers};
 use crate::register::{EntryId, Item, Register};
-use crate::reserve::{Flusher, Gate, Reservation, Ticket};
+use crate::reserve::{Flusher, Reservation, Ticket};
 use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
 use crate::store::{self, Batch, Kind, Link, Marker};
@@ -517,14 +517,10 @@ impl Log {
                 };
                 match &entry.body {
                     Body::Members(body) => self.fold.apply_members(&id, body),
-                    Body::Epoch(body) => self.fold.apply_epoch(
-                        EpochId {
-                            creator: device.clone(),
-                            seq,
-                        },
-                        body,
-                        &entry.after,
-                    ),
+                    Body::Epoch(body) => {
+                        self.fold
+                            .apply_epoch(EpochId::from(&id), body, &entry.after)
+                    }
                     _ => {}
                 }
             }

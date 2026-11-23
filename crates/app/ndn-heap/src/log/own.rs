@@ -200,14 +200,7 @@ impl Log {
                 ),
             });
         }
-        match self.reservation.sign_gate(self.next_seq) {
-            Gate::Ok => Ok(None),
-            Gate::Wait(ticket) => Ok(Some(ticket)),
-            Gate::Refused(why) => Err(why.into()),
-            Gate::Closed => Err(HeapError::Local {
-                reason: "the node is closing, so no more entries are signed".into(),
-            }),
-        }
+        Ok(self.reservation.sign_gate(self.next_seq)?)
     }
 
     /// The link the next own entry states: the stored tip, dense or with the
@@ -276,7 +269,12 @@ impl Log {
         );
         self.store.apply(extra);
         let person = self.person.clone();
-        let applying = Applying::new(id.clone(), person.clone(), entry, put);
+        let applying = Applying {
+            id: id.clone(),
+            person: person.clone(),
+            entry,
+            put,
+        };
         self.store_fresh(
             Fresh {
                 id: &id,

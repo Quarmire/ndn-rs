@@ -2,7 +2,7 @@
 //! the crash stores of `test_kit`.
 
 use super::*;
-use crate::store::{Head, Kind, ReserveRecord, read_reserve, write_head, write_reserve};
+use crate::store::{Kind, Link, ReserveRecord, read_reserve, write_head, write_reserve};
 use crate::test_kit::{CrashStore, Held, n};
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -70,7 +70,7 @@ async fn never_signs_above_r_durable() {
     let res = open_on(&store, &flusher, 0);
     let holding = store.hold();
     assert!(
-        matches!(res.sign_gate(1), Gate::Wait(_)),
+        matches!(res.sign_gate(1), Ok(Some(_))),
         "the first put waits for the flush at open"
     );
     assert_eq!(res.durable_r(), 0);
@@ -81,13 +81,13 @@ async fn never_signs_above_r_durable() {
     let holding = store.hold();
     for seq in 2..=BLOCK {
         assert!(
-            matches!(res.sign_gate(seq), Gate::Ok),
+            matches!(res.sign_gate(seq), Ok(None)),
             "seq {seq} is within R_durable"
         );
     }
     assert_eq!(res.reserved(), 2 * BLOCK, "the extension was written");
     assert!(
-        matches!(res.sign_gate(BLOCK + 1), Gate::Wait(_)),
+        matches!(res.sign_gate(BLOCK + 1), Ok(Some(_))),
         "R is {} in memory, but the flush covering it has not returned",
         res.reserved()
     );
@@ -112,7 +112,7 @@ async fn extension_is_requested_at_half_a_block() {
     );
     res.clear_to_sign(1).await.unwrap();
     for seq in 1..=BLOCK / 2 {
-        res.sign_gate(seq);
+        let _ = res.sign_gate(seq);
     }
     assert_eq!(
         record(&*store).r,
@@ -120,7 +120,7 @@ async fn extension_is_requested_at_half_a_block() {
         "up to R - block/2 nothing is written"
     );
 
-    res.sign_gate(BLOCK / 2 + 1);
+    let _ = res.sign_gate(BLOCK / 2 + 1);
     assert_eq!(
         record(&*store),
         ReserveRecord {
@@ -137,10 +137,10 @@ async fn extension_is_requested_at_half_a_block() {
     );
 
     for seq in BLOCK / 2 + 1..=2 * BLOCK - BLOCK / 2 {
-        res.sign_gate(seq);
+        let _ = res.sign_gate(seq);
     }
     assert_eq!(record(&*store).r, 2 * BLOCK, "it is written once per block");
-    res.sign_gate(2 * BLOCK - BLOCK / 2 + 1);
+    let _ = res.sign_gate(2 * BLOCK - BLOCK / 2 + 1);
     assert_eq!(record(&*store).r, 3 * BLOCK);
 }
 
@@ -150,7 +150,7 @@ fn own_head(store: &dyn DataStore, head: u64) {
     write_head(
         store,
         &space(),
-        Head {
+        Link {
             seq: head,
             digest: [head as u8; 32],
         },
@@ -171,7 +171,7 @@ async fn a_clean_close_marks_clean_and_an_unclean_open_resumes_above_r() {
     res.close_clean(3).await.unwrap();
     assert_eq!(
         res.sign_gate(4),
-        Gate::Closed,
+        Err(FlushError::Stopped),
         "a closed reservation signs nothing"
     );
 
@@ -302,7 +302,7 @@ async fn a_failed_flush_is_sticky_and_refuses_signing_past_r_durable_with_the_di
     for seq in 2..=BLOCK {
         assert_eq!(
             res.sign_gate(seq),
-            Gate::Ok,
+            Ok(None),
             "seq {seq} is within R_durable"
         );
     }
@@ -315,16 +315,16 @@ async fn a_failed_flush_is_sticky_and_refuses_signing_past_r_durable_with_the_di
         why.to_string().contains("disk") && why.to_string().contains("restart"),
         "and says what to do: {why}"
     );
-    assert_eq!(res.sign_gate(BLOCK + 1), Gate::Refused(why.clone()));
+    assert_eq!(res.sign_gate(BLOCK + 1), Err(why.clone()));
     assert_eq!(
         res.sign_gate(BLOCK),
-        Gate::Ok,
+        Ok(None),
         "nothing signed is retracted"
     );
 
     // Sticky: the disk comes back, the flusher does not trust it.
     store.heal_syncs();
-    assert_eq!(res.sign_gate(BLOCK + 1), Gate::Refused(why.clone()));
+    assert_eq!(res.sign_gate(BLOCK + 1), Err(why.clone()));
     assert!(matches!(flusher.flush().await, Err(FlushError::Disk(_))));
     assert_eq!(
         why,
@@ -564,7 +564,7 @@ async fn a_reopen_in_the_same_process_trusts_only_an_r_a_flush_covered() {
     first.clear_to_sign(1).await.unwrap();
     let holding = store.hold();
     // Past half a block: R + block is written, and the flush is held.
-    first.sign_gate(BLOCK / 2 + 1);
+    let _ = first.sign_gate(BLOCK / 2 + 1);
     assert_eq!(record(&*store).r, 2 * BLOCK);
     assert_eq!(record(&store.crash()).r, BLOCK, "the disk holds one block");
     drop(first);
@@ -572,7 +572,7 @@ async fn a_reopen_in_the_same_process_trusts_only_an_r_a_flush_covered() {
     let again = open_on(&store, &flusher, BLOCK / 2 + 1);
     for seq in BLOCK + 1..=2 * BLOCK {
         assert!(
-            !matches!(again.sign_gate(seq), Gate::Ok),
+            !matches!(again.sign_gate(seq), Ok(None)),
             "seq {seq} may be signed, but a power cut leaves R = {}",
             record(&store.crash()).r
         );
@@ -582,7 +582,7 @@ async fn a_reopen_in_the_same_process_trusts_only_an_r_a_flush_covered() {
     drop(holding);
     flusher.flush().await.unwrap();
     assert!(again.durable_r() >= 2 * BLOCK, "a covering flush returned");
-    assert!(matches!(again.sign_gate(2 * BLOCK), Gate::Ok));
+    assert!(matches!(again.sign_gate(2 * BLOCK), Ok(None)));
 }
 
 #[tokio::test]
@@ -592,5 +592,5 @@ async fn a_head_at_the_largest_seq_does_not_overflow_the_reservation() {
     let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
     let res = open_on(&store, &flusher, u64::MAX);
     assert_eq!(res.first_seq, u64::MAX, "there is no seq above it");
-    assert!(matches!(res.sign_gate(u64::MAX), Gate::Ok | Gate::Wait(_)));
+    assert!(res.sign_gate(u64::MAX).is_ok());
 }

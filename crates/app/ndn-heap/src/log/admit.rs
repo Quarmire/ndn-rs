@@ -64,17 +64,6 @@ pub(super) struct Applying {
     pub put: Option<PutBody>,
 }
 
-impl Applying {
-    pub(super) fn new(id: EntryRef, person: Name, entry: Entry, put: Option<PutBody>) -> Applying {
-        Applying {
-            id,
-            person,
-            entry,
-            put,
-        }
-    }
-}
-
 /// What `take` is given about the entry that arrived: its name, bytes, the
 /// verified signer, the time, and whether only an unsigned counter asked for it.
 struct Arrival<'a> {
@@ -318,7 +307,12 @@ impl Log {
         {
             let subject = Subject::new(id, v, &name);
             if let Verdict::Apply(put) = self.assess(&subject, &entry) {
-                let applying = Applying::new(id.clone(), v.person.clone(), entry, put);
+                let applying = Applying {
+                    id: id.clone(),
+                    person: v.person.clone(),
+                    entry,
+                    put,
+                };
                 self.apply_entry(&applying, fx);
             }
         }
@@ -408,7 +402,12 @@ impl Log {
         };
         let (status, outcome, applying) = match verdict {
             Verdict::Apply(put) => {
-                let applying = Applying::new(id.clone(), v.person.clone(), entry, put);
+                let applying = Applying {
+                    id: id.clone(),
+                    person: v.person.clone(),
+                    entry,
+                    put,
+                };
                 (None, Outcome::Applied, Some(applying))
             }
             Verdict::Closed => (Some(Status::Closed), Outcome::Closed, None),
@@ -465,11 +464,7 @@ impl Log {
     fn adopt_own(&mut self, link: Link) {
         if self.own_tip.is_none_or(|t| t.seq < link.seq) {
             self.own_tip = Some(link);
-            let head = store::Head {
-                seq: link.seq,
-                digest: link.digest,
-            };
-            self.store.insert(Kind::HEAD.of(&self.space), head.encode());
+            self.store.insert(Kind::HEAD.of(&self.space), link.encode());
         }
         if self
             .devices
@@ -714,48 +709,58 @@ impl Log {
         match &a.entry.body {
             Body::Put(_) | Body::Sealed(_) => {
                 let put = a.put.as_ref().expect("a write that is applied is opened");
-                let write = write_for(put, a.person.clone());
-                let view = View {
-                    store: &self.store,
-                    space: &self.space,
-                    keys: &self.keys,
-                    devices: &self.devices,
-                };
-                let eff =
-                    self.register
-                        .apply(&a.id, &write, &a.entry.after, &|x| view.namers(x), &|x| {
-                            view.write_of(x)
-                        });
-                self.store.apply(eff.writes);
-                self.value_changes(eff.changes, Some((&a.id, put)), fx);
+                let changes = self.register_step(a, Some(put));
+                self.value_changes(changes, Some((&a.id, put)), fx);
             }
             Body::Members(body) => {
                 let before = self.fold_view();
                 self.fold.apply_members(&a.id, body);
-                self.mark_structural(&a.id);
+                self.structural(&a.id, true);
                 self.fold_changed(before, fx);
             }
             Body::Epoch(body) => {
-                self.fold.apply_epoch(
-                    EpochId {
-                        creator: a.id.device.clone(),
-                        seq: a.id.seq,
-                    },
-                    body,
-                    &a.entry.after,
-                );
-                self.mark_structural(&a.id);
+                self.fold
+                    .apply_epoch(EpochId::from(&a.id), body, &a.entry.after);
+                self.structural(&a.id, true);
                 self.queue.push(Scope::Closed);
                 fx.membership = true;
             }
         }
     }
 
-    fn mark_structural(&self, id: &EntryRef) {
-        self.store.insert(
-            Kind::STRUCTURAL.seq(&self.space, &id.device, id.seq),
-            Bytes::new(),
-        );
+    /// The register takes in (`put`: the write the entry made) or gives back
+    /// (`None`) an entry, and the writes it makes go in the batch. The
+    /// changes of the winners are returned.
+    fn register_step(&mut self, a: &Applying, put: Option<&PutBody>) -> Vec<ValueChange> {
+        let view = View {
+            store: &self.store,
+            space: &self.space,
+            keys: &self.keys,
+            devices: &self.devices,
+        };
+        let (namers, load) = (&|x: &EntryRef| view.namers(x), &|x: &EntryRef| {
+            view.write_of(x)
+        });
+        let eff = match put {
+            Some(put) => {
+                let write = write_for(put, a.person.clone());
+                self.register
+                    .apply(&a.id, &write, &a.entry.after, namers, load)
+            }
+            None => self.register.withdraw(&a.id, &a.entry.after, namers, load),
+        };
+        self.store.apply(eff.writes);
+        eff.changes
+    }
+
+    /// Mark (or unmark) a Members or Epoch entry as applied: start replays
+    /// only these.
+    fn structural(&self, id: &EntryRef, on: bool) {
+        let key = Kind::STRUCTURAL.seq(&self.space, &id.device, id.seq);
+        match on {
+            true => self.store.insert(key, Bytes::new()),
+            false => self.store.remove(&key),
+        }
     }
 
     /// An applied entry is refused after the fact: out of the fold or the
@@ -768,40 +773,21 @@ impl Log {
         });
         match &a.entry.body {
             Body::Put(_) | Body::Sealed(_) => {
-                let view = View {
-                    store: &self.store,
-                    space: &self.space,
-                    keys: &self.keys,
-                    devices: &self.devices,
-                };
-                let eff =
-                    self.register
-                        .withdraw(&a.id, &a.entry.after, &|x| view.namers(x), &|x| {
-                            view.write_of(x)
-                        });
-                self.store.apply(eff.writes);
-                self.value_changes(eff.changes, None, fx);
+                let changes = self.register_step(a, None);
+                self.value_changes(changes, None, fx);
             }
             Body::Members(_) => {
                 let before = self.fold_view();
                 self.fold.withdraw_members(&a.id);
-                self.unmark_structural(&a.id);
+                self.structural(&a.id, false);
                 self.fold_changed(before, fx);
             }
             Body::Epoch(_) => {
-                self.fold.withdraw_epoch(&EpochId {
-                    creator: a.id.device.clone(),
-                    seq: a.id.seq,
-                });
-                self.unmark_structural(&a.id);
+                self.fold.withdraw_epoch(&EpochId::from(&a.id));
+                self.structural(&a.id, false);
                 fx.membership = true;
             }
         }
-    }
-
-    fn unmark_structural(&self, id: &EntryRef) {
-        self.store
-            .remove(&Kind::STRUCTURAL.seq(&self.space, &id.device, id.seq));
     }
 
     fn withdrawn_why(&self, status: &Status, device: &Name) -> Refusal {
@@ -1021,7 +1007,12 @@ impl Log {
                                     digest: l.id.digest,
                                 });
                             }
-                            let applying = Applying::new(l.id, l.person, l.entry, put);
+                            let applying = Applying {
+                                id: l.id,
+                                person: l.person,
+                                entry: l.entry,
+                                put,
+                            };
                             self.apply_entry(&applying, fx);
                         }
                         return;
@@ -1039,7 +1030,12 @@ impl Log {
         self.count_gap(device, seq, &l.marker, l.status.as_ref(), Some(&new));
         if l.status.is_none() {
             let put = self.view().opened_put(&l.entry, &name);
-            let applying = Applying::new(l.id, l.person, l.entry, put);
+            let applying = Applying {
+                id: l.id,
+                person: l.person,
+                entry: l.entry,
+                put,
+            };
             self.unapply(&applying, &new, fx);
         }
     }

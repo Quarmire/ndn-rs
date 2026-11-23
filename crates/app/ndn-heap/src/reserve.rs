@@ -272,21 +272,6 @@ impl Drop for Flusher {
 
 // -- Reservation --------------------------------------------------------------
 
-/// What [`Reservation::sign_gate`] says of a seq.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Gate {
-    /// It is covered by a durable reservation: sign.
-    Ok,
-    /// The reservation covering it is written but not durable: wait for
-    /// the ticket ([`Flusher::wait_durable`]), then ask again.
-    Wait(Ticket),
-    /// The store failed, so the reservation never will be durable: refuse
-    /// the put with the disk's reason.
-    Refused(FlushError),
-    /// The reservation was closed: the node takes no more puts.
-    Closed,
-}
-
 struct ReserveState {
     /// The `R` written, durable or not.
     r: u64,
@@ -414,17 +399,20 @@ impl Reservation {
         st.durable_r
     }
 
-    /// Whether `seq`, the next to sign, may be signed now. Call it before
+    /// Whether `seq`, the next to sign, may be signed now: `Ok(None)` sign,
+    /// `Ok(Some(ticket))` wait for the ticket ([`Flusher::wait_durable`]) and
+    /// ask again, `Err` refused (the store failed, with the disk's reason, or
+    /// the reservation was closed or the flusher stopped). Call it before
     /// signing. When `seq` is above `R - block/2` it writes
     /// `reserve/<S> = (R + block, clean 0)` (straight to the store) and asks
     /// the flusher; so the answer for a `seq` that only just came into reach
-    /// is usually [`Gate::Ok`] and the extension is flushed ahead of need.
+    /// is usually `Ok(None)` and the extension is flushed ahead of need.
     /// Once the store failed nothing is written: what `R_durable` covers is
     /// still signed, nothing above it.
-    pub(crate) fn sign_gate(&self, seq: u64) -> Gate {
+    pub(crate) fn sign_gate(&self, seq: u64) -> Result<Option<Ticket>, FlushError> {
         let mut st = self.st.lock();
         if st.closed {
-            return Gate::Closed;
+            return Err(FlushError::Stopped);
         }
         self.promote(&mut st);
         let failure = self.flusher.failure();
@@ -433,15 +421,15 @@ impl Reservation {
             self.extend(&mut st, r);
         }
         if seq <= st.durable_r {
-            return Gate::Ok;
+            return Ok(None);
         }
         if let Some(why) = failure {
-            return Gate::Refused(FlushError::Disk(why));
+            return Err(FlushError::Disk(why));
         }
         match st.pending.iter().find(|(_, r)| *r >= seq) {
-            Some(&(ticket, _)) => Gate::Wait(ticket),
+            Some(&(ticket, _)) => Ok(Some(ticket)),
             // Nothing can be written to reach `seq`: the flusher stopped.
-            None => Gate::Refused(FlushError::Stopped),
+            None => Err(FlushError::Stopped),
         }
     }
 
@@ -449,14 +437,10 @@ impl Reservation {
     /// store failed) or that the node stopped.
     #[cfg(test)]
     pub(crate) async fn clear_to_sign(&self, seq: u64) -> Result<(), FlushError> {
-        loop {
-            match self.sign_gate(seq) {
-                Gate::Ok => return Ok(()),
-                Gate::Wait(ticket) => self.flusher.wait_durable(ticket).await?,
-                Gate::Refused(why) => return Err(why),
-                Gate::Closed => return Err(FlushError::Stopped),
-            }
+        while let Some(ticket) = self.sign_gate(seq)? {
+            self.flusher.wait_durable(ticket).await?;
         }
+        Ok(())
     }
 
     /// Close cleanly after the node's publications were drained and flushed:

@@ -356,10 +356,8 @@ impl Keys {
         stored: Bytes,
     ) -> bool {
         let at = Kind::EPOCH.seq(space, &epoch.creator, epoch.seq);
-        match unwrap_key(&self.recipient, &at, stored) {
-            Some(key) => self.take(space, epoch, named, key),
-            None => false,
-        }
+        unwrap_key(&self.recipient, &at, stored)
+            .is_some_and(|key| self.take(space, epoch, named, key))
     }
 
     /// Take a key granted for `epoch` of `space` only if a held
@@ -373,10 +371,8 @@ impl Keys {
         epoch: &EpochId,
         key: ContentKey,
     ) -> bool {
-        match fold.epoch_body(epoch) {
-            Some(body) => self.take(space, epoch, &body.key_check, key),
-            None => false,
-        }
+        fold.epoch_body(epoch)
+            .is_some_and(|body| self.take(space, epoch, &body.key_check, key))
     }
 }
 

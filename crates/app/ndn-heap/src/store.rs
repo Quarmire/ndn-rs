@@ -57,7 +57,7 @@ impl Kind {
     pub(crate) const SUSPECTED: Kind = Kind("suspected");
     /// `scoped/<person>`: the scoped trust context kept for a person.
     pub(crate) const SCOPED: Kind = Kind("scoped");
-    /// `head/<S>`: the device's own head in a space ([`Head`]).
+    /// `head/<S>`: the device's own head in a space ([`Link`]).
     pub(crate) const HEAD: Kind = Kind("head");
     /// `reserve/<S>`: the sequence reserved in a space ([`ReserveRecord`]).
     pub(crate) const RESERVE: Kind = Kind("reserve");
@@ -288,25 +288,17 @@ impl Marker {
     }
 }
 
-/// The device's own head in a space (`head/<S>`), written with every own
-/// entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Head {
-    /// The seq of the newest own entry.
-    pub seq: u64,
-    /// Its signed-region digest.
-    pub digest: [u8; 32],
-}
-
-impl Head {
+impl Link {
+    /// The `head/<S>` record: the device's own head in a space, the link of
+    /// its newest own entry, written with every own entry.
     pub(crate) fn encode(&self) -> Bytes {
         [&self.seq.to_be_bytes()[..], &self.digest].concat().into()
     }
 
     /// `None` for anything but exactly 40 octets.
-    pub(crate) fn decode(bytes: &[u8]) -> Option<Head> {
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Link> {
         let bytes: &[u8; 40] = bytes.try_into().ok()?;
-        Some(Head {
+        Some(Link {
             seq: be(&bytes[..8])?,
             digest: array(&bytes[8..])?,
         })
@@ -370,9 +362,9 @@ pub(crate) fn read_reserve(
 }
 
 /// The head record of `space`; `Ok(None)` when there is none.
-pub(crate) fn read_head(store: &dyn DataStore, space: &Name) -> Result<Option<Head>, Corrupt> {
+pub(crate) fn read_head(store: &dyn DataStore, space: &Name) -> Result<Option<Link>, Corrupt> {
     read(store, Kind::HEAD.of(space), "head record", |w| {
-        Head::decode(w)
+        Link::decode(w)
     })
 }
 
@@ -384,7 +376,7 @@ pub(crate) fn write_reserve(store: &dyn DataStore, space: &Name, record: Reserve
 
 /// Write the head record of `space` straight to the store.
 #[cfg(test)]
-pub(crate) fn write_head(store: &dyn DataStore, space: &Name, head: Head) {
+pub(crate) fn write_head(store: &dyn DataStore, space: &Name, head: Link) {
     store.insert(Kind::HEAD.of(space), head.encode());
 }
 
