@@ -38,17 +38,15 @@
 //! the faces) and, for a batch that lost events, a face it cannot name. The
 //! total bound is one gate on the one send the sync driver has.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::pin::pin;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use futures::future::{BoxFuture, Either, select};
+use futures::future::BoxFuture;
 use ndn_app::{Connection, RouteEvents, RouteNews};
 use ndn_foundation_types::Name;
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::rt::{self, Instant};
 
@@ -76,45 +74,38 @@ pub(crate) enum Verdict {
     Waiting,
 }
 
-/// When each group was last announced because a face came up, when the last
-/// [`TOTAL_PER_SECOND`] announcements of all groups were made, and which
-/// groups are waiting their turn.
+/// Which groups are waiting their turn, and the announcements of all groups
+/// made within the last [`EVERY`].
 #[derive(Default)]
 pub(crate) struct Gate {
-    last: BTreeMap<Name, Instant>,
     waiting: BTreeSet<Name>,
-    /// Times of the announcements made within the last [`EVERY`], oldest
-    /// first: never more than [`TOTAL_PER_SECOND`].
-    sent: VecDeque<Instant>,
+    /// Each announcement made within the last [`EVERY`] with its group,
+    /// oldest first: never more than [`TOTAL_PER_SECOND`], and the newest of
+    /// a group is when it was last announced.
+    sent: VecDeque<(Instant, Name)>,
 }
 
 impl Gate {
     /// How long from `now` until `group` may be announced: its own second
-    /// since its last announcement, and room in the total.
-    fn wait(&mut self, now: Instant, group: &Name) -> Duration {
-        while self
-            .sent
-            .front()
-            .is_some_and(|&t| now.saturating_duration_since(t) >= EVERY)
-        {
+    /// since its last announcement, and room in the total. Zero: it is
+    /// announced now, and recorded as so.
+    fn claim(&mut self, now: Instant, group: &Name) -> Duration {
+        let left = |at: Instant| EVERY.saturating_sub(now.saturating_duration_since(at));
+        while self.sent.front().is_some_and(|&(at, _)| left(at).is_zero()) {
             self.sent.pop_front();
         }
-        let own = self.last.get(group).map_or(Duration::ZERO, |&last| {
-            EVERY.saturating_sub(now.saturating_duration_since(last))
-        });
-        let total = match self.sent.front() {
-            Some(&oldest) if self.sent.len() >= TOTAL_PER_SECOND => {
-                EVERY.saturating_sub(now.saturating_duration_since(oldest))
-            }
-            _ => Duration::ZERO,
-        };
-        own.max(total)
-    }
-
-    /// `group` is announced at `now`.
-    fn record(&mut self, now: Instant, group: &Name) {
-        self.last.insert(group.clone(), now);
-        self.sent.push_back(now);
+        let own = self.sent.iter().rev().find(|(_, g)| g == group);
+        let total = self
+            .sent
+            .front()
+            .filter(|_| self.sent.len() >= TOTAL_PER_SECOND);
+        let wait = own.into_iter().chain(total).map(|&(at, _)| left(at)).max();
+        let wait = wait.unwrap_or_default();
+        if wait.is_zero() {
+            self.waiting.remove(group);
+            self.sent.push_back((now, group.clone()));
+        }
+        wait
     }
 
     /// A route came up for `group` at `now`.
@@ -122,59 +113,53 @@ impl Gate {
         if self.waiting.contains(group) {
             return Verdict::Waiting;
         }
-        let wait = self.wait(now, group);
+        let wait = self.claim(now, group);
         if wait.is_zero() {
-            self.record(now, group);
-            Verdict::Now
-        } else {
-            self.waiting.insert(group.clone());
-            Verdict::After(wait)
+            return Verdict::Now;
         }
+        self.waiting.insert(group.clone());
+        Verdict::After(wait)
     }
 
     /// A wait of [`Verdict::After`] is over at `now`: `None` when `group` is
     /// to be announced now (once per wait), else the time to wait again (the
     /// total had no room: other groups' announcements took it).
     pub(crate) fn due(&mut self, now: Instant, group: &Name) -> Option<Duration> {
-        let wait = self.wait(now, group);
-        if !wait.is_zero() {
-            return Some(wait);
-        }
-        self.waiting.remove(group);
-        self.record(now, group);
-        None
+        Some(self.claim(now, group)).filter(|wait| !wait.is_zero())
     }
 }
 
-/// Whether the node stopped the task, and a way to wake it to see so.
-#[derive(Default)]
-struct Stop {
-    stopped: AtomicBool,
-    wake: Notify,
+/// What the task and each announcement waiting for its turn share.
+struct Shared {
+    /// The names of every sync group the node has joined, as of the asking.
+    groups: Box<dyn Fn() -> Vec<Name> + Send + Sync>,
+    /// Send the group's state vector now (the node's `MultiSvs::announce`).
+    announce: Box<dyn Fn(Name) -> BoxFuture<'static, ()> + Send + Sync>,
+    gate: Mutex<Gate>,
+    /// Cancelled when the node stops the task.
+    stop: CancellationToken,
 }
 
-impl Stop {
-    fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Relaxed)
+impl Shared {
+    /// The groups that a route toward `prefix` covers (the group, its owner's
+    /// namespace, or above), all of them when `prefix` is `None`.
+    fn covered_by(&self, prefix: Option<&Name>) -> Vec<Name> {
+        (self.groups)()
+            .into_iter()
+            .filter(|g| prefix.is_none_or(|p| g.has_prefix(p)))
+            .collect()
     }
 }
-
-/// The sync groups of the node, all of them.
-type Groups = Arc<dyn Fn() -> Vec<Name> + Send + Sync>;
-
-/// Send the group's state vector now (the node's `MultiSvs::announce`).
-type Announce = Arc<dyn Fn(Name) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// The task that announces a group when a route covering it comes up. It ends
 /// when the forwarder is gone, or when this is stopped or dropped.
 pub(crate) struct FaceUp {
-    stop: Arc<Stop>,
+    stop: CancellationToken,
 }
 
 impl FaceUp {
-    /// Follow the routes of `conn` and announce each group of `groups` (the
-    /// names of every sync group the node has joined, as of the asking) that
-    /// a route coming up covers, with `announce`. Nothing is followed, and
+    /// Follow the routes of `conn` and announce each group of `groups` that a
+    /// route coming up covers, with `announce`. Nothing is followed, and
     /// nothing announced, when `conn` cannot tell its routes
     /// ([`Connection::routes`]).
     pub(crate) fn spawn(
@@ -182,14 +167,15 @@ impl FaceUp {
         groups: impl Fn() -> Vec<Name> + Send + Sync + 'static,
         announce: impl Fn(Name) -> BoxFuture<'static, ()> + Send + Sync + 'static,
     ) -> FaceUp {
-        let stop = Arc::new(Stop::default());
+        let stop = CancellationToken::new();
         if let Some(routes) = conn.routes() {
-            rt::spawn(run(
-                routes,
-                Arc::new(groups),
-                Arc::new(announce),
-                Arc::clone(&stop),
-            ));
+            let shared = Shared {
+                groups: Box::new(groups),
+                announce: Box::new(announce),
+                gate: Mutex::default(),
+                stop: stop.clone(),
+            };
+            rt::spawn(run(routes, Arc::new(shared)));
         }
         FaceUp { stop }
     }
@@ -197,8 +183,7 @@ impl FaceUp {
     /// End the task: no announcement is made after this returns, one waiting
     /// for its second is never made.
     pub(crate) fn stop(&self) {
-        self.stop.stopped.store(true, Ordering::Relaxed);
-        self.stop.wake.notify_one();
+        self.stop.cancel();
     }
 }
 
@@ -208,60 +193,33 @@ impl Drop for FaceUp {
     }
 }
 
-/// The groups among `groups` that a route toward `prefix` covers (the group,
-/// its owner's namespace, or above), all of them when `prefix` is `None`.
-fn covered_by(groups: &Groups, prefix: Option<&Name>) -> Vec<Name> {
-    groups()
-        .into_iter()
-        .filter(|g| prefix.is_none_or(|p| g.has_prefix(p)))
-        .collect()
-}
-
 /// Announce each group a route comes up for, as a batch: once per group
 /// however many routes of the batch cover it, at most once per [`EVERY`]
 /// per group (the first at once, a later one at the end of the second, so
 /// the last face up is told too), and at most [`TOTAL_PER_SECOND`] in any
 /// second over every group (the rest wait for room, in the seconds that
 /// follow, none dropped).
-async fn run(mut routes: RouteEvents, groups: Groups, announce: Announce, stop: Arc<Stop>) {
-    let gate = Arc::new(Mutex::new(Gate::default()));
-    loop {
-        let first = {
-            let next = pin!(routes.next());
-            let stopped = pin!(stop.wake.notified());
-            match select(next, stopped).await {
-                Either::Left((Some(news), _)) => news,
-                _ => return,
-            }
-        };
-        if stop.is_stopped() {
-            return;
-        }
+async fn run(mut routes: RouteEvents, shared: Arc<Shared>) {
+    while let Some(Some(first)) = shared.stop.run_until_cancelled(routes.next()).await {
         let mut covered = BTreeSet::new();
         let mut news = Some(first);
         while let Some(item) = news {
-            match item {
-                RouteNews::Up(prefix) => covered.extend(covered_by(&groups, Some(&prefix))),
-                RouteNews::Missed => covered.extend(covered_by(&groups, None)),
-            }
+            covered.extend(match item {
+                RouteNews::Up(prefix) => shared.covered_by(Some(&prefix)),
+                RouteNews::Missed => shared.covered_by(None),
+            });
             news = routes.next_ready();
         }
         let now = Instant::now();
         for group in covered {
-            let verdict = gate.lock().ask(now, &group);
+            let verdict = shared.gate.lock().ask(now, &group);
             match verdict {
                 Verdict::Now => {
                     tracing::debug!(%group, "a face carrying the group came up: its state announced");
-                    announce(group).await;
+                    (shared.announce)(group).await;
                 }
                 Verdict::After(wait) => {
-                    rt::spawn(announce_when_due(
-                        group,
-                        wait,
-                        Arc::clone(&gate),
-                        Arc::clone(&announce),
-                        Arc::clone(&stop),
-                    ));
+                    rt::spawn(announce_when_due(group, wait, Arc::clone(&shared)));
                 }
                 Verdict::Waiting => {}
             }
@@ -269,26 +227,21 @@ async fn run(mut routes: RouteEvents, groups: Groups, announce: Announce, stop: 
     }
 }
 
-/// Wait `wait`, then until `gate` has room for `group`, and announce it,
+/// Wait `wait`, then until the gate has room for `group`, and announce it,
 /// unless the task was stopped meanwhile.
-async fn announce_when_due(
-    group: Name,
-    mut wait: Duration,
-    gate: Arc<Mutex<Gate>>,
-    announce: Announce,
-    stop: Arc<Stop>,
-) {
-    loop {
-        rt::sleep(wait).await;
-        if stop.is_stopped() {
-            return;
-        }
-        let due = gate.lock().due(Instant::now(), &group);
+async fn announce_when_due(group: Name, mut wait: Duration, shared: Arc<Shared>) {
+    while shared
+        .stop
+        .run_until_cancelled(rt::sleep(wait))
+        .await
+        .is_some()
+    {
+        let due = shared.gate.lock().due(Instant::now(), &group);
         match due {
             Some(again) => wait = again,
             None => {
                 tracing::debug!(%group, "a face carrying the group came up a while ago: its state announced");
-                announce(group).await;
+                (shared.announce)(group).await;
                 return;
             }
         }

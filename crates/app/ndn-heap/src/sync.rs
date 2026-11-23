@@ -92,11 +92,10 @@ pub(crate) struct Net {
     pub(crate) shared: Arc<Shared>,
     svs: Arc<MultiSvs>,
     sync: Arc<dyn Connection>,
-    groups: Mutex<BTreeMap<Name, Arc<Group>>>,
+    /// The groups joined, by space; the face-up announcement lists their
+    /// names.
+    groups: Arc<Mutex<BTreeMap<Name, Arc<Group>>>>,
     owners: Mutex<BTreeSet<Name>>,
-    /// The names of the sync groups joined, what the face-up announcement
-    /// lists.
-    names: Arc<Mutex<BTreeSet<Name>>>,
     stop: CancellationToken,
     face_up: FaceUp,
 }
@@ -137,12 +136,12 @@ impl Net {
                 }
             });
         }
-        let names: Arc<Mutex<BTreeSet<Name>>> = Arc::default();
+        let groups: Arc<Mutex<BTreeMap<Name, Arc<Group>>>> = Arc::default();
         let face_up = FaceUp::spawn(
             Arc::clone(&sync),
             {
-                let names = Arc::clone(&names);
-                move || names.lock().iter().cloned().collect()
+                let groups = Arc::clone(&groups);
+                move || groups.lock().values().map(|g| g.group.clone()).collect()
             },
             {
                 let svs = Arc::clone(&svs);
@@ -166,9 +165,8 @@ impl Net {
             shared,
             svs,
             sync,
-            groups: Mutex::new(BTreeMap::new()),
+            groups,
             owners: Mutex::new(BTreeSet::new()),
-            names,
             stop,
             face_up,
         })
@@ -224,7 +222,7 @@ impl Net {
         };
         let group = Arc::new(Group {
             space: space.clone(),
-            group: group_name.clone(),
+            group: group_name,
             shared: Arc::clone(&self.shared),
             heard: Mutex::new(Heard::default()),
             noticed: Mutex::new(BTreeMap::new()),
@@ -242,7 +240,6 @@ impl Net {
             observed: handle.observed_shared(),
         });
         self.groups.lock().insert(space.clone(), Arc::clone(&group));
-        self.names.lock().insert(group_name);
         rt::spawn(notices(Arc::clone(&group), handle));
         rt::spawn(fetch::run(Arc::clone(&group)));
         Ok(group)
@@ -253,7 +250,6 @@ impl Net {
         let group = self.groups.lock().remove(space);
         if let Some(group) = group {
             group.stop.cancel();
-            self.names.lock().remove(&group.group);
             self.svs.leave(group.group.clone()).await;
         }
     }
