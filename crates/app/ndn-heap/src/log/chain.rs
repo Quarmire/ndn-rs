@@ -188,14 +188,6 @@ pub(super) struct Dev {
     /// entry that stated one → the `PREV_SEQ` it named. What it declares
     /// absent is `(PREV_SEQ + 1, seq - 1)`.
     pub gaps: BTreeMap<u64, u64>,
-    /// The seqs the counting gap statements declared absent (derived from
-    /// `gaps`).
-    pub voids: Ranges,
-    /// The highest seq held of it. Never lowered; a counter heard raises
-    /// nothing here.
-    pub high: u64,
-    /// The highest held seq and its signed digest; read from its marker.
-    pub tip: Option<Link>,
     /// How many held entries have a status other than closed: refused,
     /// unreadable, waiting, evidence. The rest were admitted.
     pub nonvouching: u64,
@@ -207,29 +199,19 @@ impl Dev {
             person,
             held: Ranges::default(),
             gaps: BTreeMap::new(),
-            voids: Ranges::default(),
-            high: 0,
-            tip: None,
             nonvouching: 0,
         }
     }
 
-    /// The entry at `seq` stated a gap after `prev_seq` and counts: the seqs
-    /// between are absent.
-    pub(super) fn state_gap(&mut self, seq: u64, prev_seq: u64) {
-        self.gaps.insert(seq, prev_seq);
-        self.voids.insert_range(prev_seq + 1, seq - 1);
+    /// The highest seq held of it. A counter heard raises nothing here.
+    pub(super) fn high(&self) -> u64 {
+        self.held.max().unwrap_or(0)
     }
 
-    /// The entry at `seq` no longer counts (it was refused, or found
-    /// equivocal): what only it declared absent is wanted again. Whether it
-    /// had stated a gap.
-    pub(super) fn retract_gap(&mut self, seq: u64) -> bool {
-        if self.gaps.remove(&seq).is_none() {
-            return false;
-        }
-        self.voids = gap_ranges(&self.gaps);
-        true
+    /// The seqs the counting gap statements declared absent.
+    pub(super) fn voids(&self) -> Ranges {
+        let runs = self.gaps.iter().map(|(&seq, &prev)| (prev + 1, seq - 1));
+        Ranges::merged(runs.collect())
     }
 
     /// The `ledger/<S>/<device>` record.
@@ -243,8 +225,7 @@ impl Dev {
         out.freeze()
     }
 
-    /// The device a record says, without its tip (the marker of its highest
-    /// seq is the log's to read).
+    /// The device a record says.
     pub(super) fn from_record(record: &Bytes) -> Option<Dev> {
         let mut input = record.clone();
         if input.remaining() < 2 {
@@ -263,22 +244,11 @@ impl Dev {
             }
         }
         Some(Dev {
-            high: held.max().unwrap_or(0),
             held,
-            voids: gap_ranges(&gaps),
             gaps,
             ..Dev::new(person)
         })
     }
-}
-
-/// The seqs declared absent by `gaps` (seq → `PREV_SEQ`).
-fn gap_ranges(gaps: &BTreeMap<u64, u64>) -> Ranges {
-    Ranges::merged(
-        gaps.iter()
-            .map(|(&seq, &prev)| (prev + 1, seq - 1))
-            .collect(),
-    )
 }
 
 /// Why a held entry is not applied: the `status/` record. An applied entry

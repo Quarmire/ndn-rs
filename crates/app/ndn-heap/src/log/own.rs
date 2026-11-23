@@ -168,12 +168,12 @@ impl Log {
 
     /// `Ok(None)`: the next seq may be signed now; `Some(ticket)`: wait for it.
     fn gate(&self) -> Result<Option<Ticket>, HeapError> {
-        if self.next_seq <= self.own_head {
+        if self.next_seq <= self.head() {
             return Err(HeapError::Local {
                 reason: format!(
                     "this device holds an entry of its own at seq {}, the last seq there is, so \
                      it can sign no more in this space; use another device or another space",
-                    self.own_head
+                    self.head()
                 ),
             });
         }

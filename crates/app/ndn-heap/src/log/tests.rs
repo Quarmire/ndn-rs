@@ -40,7 +40,7 @@ impl Log {
     fn voids(&self, device: &Name) -> Vec<(u64, u64)> {
         self.devices
             .get(device)
-            .map_or_else(Vec::new, |d| d.voids.to_vec())
+            .map_or_else(Vec::new, |d| d.voids().to_vec())
     }
 }
 

@@ -81,7 +81,7 @@ use ndn_sync::DataStore;
 
 use crate::error::{Cut, HeapError, NextStep, Refusal};
 use crate::fold::{Fold, Readers};
-use crate::register::{EntryId, Item, Register};
+use crate::register::{EntryId, Head, Item, Register};
 use crate::reserve::{Flusher, Reservation, Ticket};
 use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
@@ -162,16 +162,6 @@ pub(crate) struct Blob {
     pub size: u64,
     /// The manifest tree's root digest.
     pub root: [u8; 32],
-}
-
-impl Blob {
-    /// The blob head of the entry `id` when `payload` is in pieces.
-    fn of(id: EntryId, payload: &Payload) -> Option<Blob> {
-        match *payload {
-            Payload::Blob { size, root } => Some(Blob { id, size, root }),
-            Payload::Inline(_) => None,
-        }
-    }
 }
 
 /// What a call asks of the node beyond the writes it already made.
@@ -356,8 +346,9 @@ enum Scope {
 /// changed.
 #[derive(Clone, Debug, PartialEq)]
 struct FoldView {
-    writers: Vec<Name>,
-    removed: Vec<(Name, Vec<EntryRef>)>,
+    /// Each writer (`true`, no tips) and each removed person (`false`, the
+    /// tips the removal binds).
+    standing: BTreeMap<Name, (bool, Vec<EntryRef>)>,
     create: Option<bool>,
     readers: Readers,
     /// What decides whether the owner's devices owe an Epoch entry.
@@ -381,8 +372,6 @@ pub(crate) struct Log {
     pub(crate) reservation: Arc<Reservation>,
     /// The seq the next own entry takes.
     next_seq: u64,
-    /// The highest seq under this device's name in the store, whatever it is.
-    own_head: u64,
     /// The highest counter heard of this device's own name: unsigned, so
     /// believed only as far as `reservation.floor_r` ([`Self::high`]).
     own_heard: u64,
@@ -435,7 +424,6 @@ impl Log {
             register: Register::new(space.clone()),
             next_seq: reservation.first_seq,
             reservation: Arc::new(reservation),
-            own_head: head,
             own_heard: 0,
             own_tip: None,
             devices: BTreeMap::new(),
@@ -455,9 +443,12 @@ impl Log {
         log.restore_keys();
         log.restore_register()?;
         log.sync_kept(&mut Effects::default());
-        // The own tip is the newest own entry held, which the ledger restore
-        // read the marker of.
-        log.own_tip = log.devices.get(&log.device).and_then(|d| d.tip);
+        // The own tip is the newest own entry held.
+        let head = log.head();
+        log.own_tip = log.view().marker(&log.device, head).map(|m| Link {
+            seq: head,
+            digest: m.signed_digest,
+        });
         Ok(log)
     }
 
@@ -468,16 +459,10 @@ impl Log {
             let Some(device) = Kind::LEDGER.parse_device(&self.space, &key) else {
                 continue;
             };
-            let Some(mut dev) = Dev::from_record(&record) else {
+            let Some(dev) = Dev::from_record(&record) else {
                 tracing::warn!(%key, "a ledger record that cannot be read is ignored; the entries are held and will be found again");
                 continue;
             };
-            dev.tip = dev.held.max().and_then(|seq| {
-                self.view().marker(&device, seq).map(|m| Link {
-                    seq,
-                    digest: m.signed_digest,
-                })
-            });
             self.devices.insert(device, dev);
         }
         for (key, value) in self.store.scan_under(&Kind::STATUS.listing(&self.space), 0) {
@@ -560,7 +545,7 @@ impl Log {
     fn stored_head(store: &dyn DataStore, space: &Name, device: &Name) -> Result<u64, HeapError> {
         let key = Kind::LEDGER.device(space, device);
         let ledger = store::read(store, key, "ledger record", Dev::from_record)?;
-        Ok(ledger.map_or(0, |dev| dev.high))
+        Ok(ledger.map_or(0, |dev| dev.high()))
     }
 
     // -- Reads --------------------------------------------------------------------
@@ -576,7 +561,7 @@ impl Log {
 
     /// The highest seq under this device's name in the store, 0 for none.
     pub(crate) fn head(&self) -> u64 {
-        self.own_head
+        self.devices.get(&self.device).map_or(0, Dev::high)
     }
 
     /// The seq the next own entry takes.
@@ -615,23 +600,35 @@ impl Log {
         let Some(head) = self.register.value(path) else {
             return Ok(None);
         };
-        match self.view().payload_of(&head.entry) {
-            Some(Payload::Inline(bytes)) => Ok(Some(head.item(path, bytes))),
+        match self.shown(path, head) {
+            Some(Ok(item)) => Ok(Some(item)),
             _ => Err(HeapError::Unavailable {
                 name: head.entry.name(&self.space),
             }),
         }
     }
 
+    /// What the head of `path` is to the API: an inline value, or a blob head
+    /// the pieces layer assembles; `None` when its payload is not held.
+    pub(super) fn shown(&self, path: &Name, head: &Head) -> Option<Result<Item, Blob>> {
+        Some(match self.view().payload_of(&head.entry)? {
+            Payload::Inline(bytes) => Ok(head.item(path, bytes)),
+            Payload::Blob { size, root } => Err(Blob {
+                id: head.entry.clone(),
+                size,
+                root,
+            }),
+        })
+    }
+
     /// Every path's current value that is inline, for a watcher's first
     /// listing, and the blob heads the pieces layer must assemble.
     pub(crate) fn items(&self) -> (Vec<Item>, Vec<Blob>) {
-        let view = self.view();
         let (mut items, mut blobs) = (Vec::new(), Vec::new());
         for (path, head) in self.register.values() {
-            match view.payload_of(&head.entry) {
-                Some(Payload::Inline(bytes)) => items.push(head.item(path, bytes)),
-                Some(payload) => blobs.extend(Blob::of(EntryId::from(&head.entry), &payload)),
+            match self.shown(path, head) {
+                Some(Ok(item)) => items.push(item),
+                Some(Err(blob)) => blobs.push(blob),
                 None => {}
             }
         }
@@ -641,11 +638,7 @@ impl Log {
     /// The winning head of `path` when its payload is a blob (assembled by
     /// the pieces layer); `None` for an inline value, a removal or no head.
     pub(crate) fn blob_head(&self, path: &Name) -> Option<Blob> {
-        let head = self.register.value(path)?;
-        Blob::of(
-            EntryId::from(&head.entry),
-            &self.view().payload_of(&head.entry)?,
-        )
+        self.shown(path, self.register.value(path)?)?.err()
     }
 
     /// The epoch key the applied entry was sealed under: `Some(None)` for a
@@ -722,7 +715,7 @@ impl Log {
     /// probed once, alone, and becomes a want only when the entry named
     /// there is held and verified.
     pub(crate) fn high(&self, device: &Name) -> u64 {
-        let held = self.devices.get(device).map_or(0, |d| d.high);
+        let held = self.devices.get(device).map_or(0, Dev::high);
         if *device == self.device {
             held.max(self.own_heard.min(self.reservation.floor_r))
         } else {
@@ -739,7 +732,7 @@ impl Log {
             .entry(self.device.clone())
             .or_insert_with(|| Dev::new(self.person.clone()));
         let mut fx = Effects::default();
-        if seen > self.own_head {
+        if seen > self.head() {
             fx.alerts.push(Alert::UnbackedCounter {
                 device: self.device.clone(),
                 seen,
@@ -758,7 +751,7 @@ impl Log {
     pub(crate) fn held_prefix(&self, device: &Name) -> u64 {
         self.devices
             .get(device)
-            .map_or(0, |d| d.held.prefix_with(&d.voids))
+            .map_or(0, |d| d.held.prefix_with(&d.voids()))
     }
 
     /// Everything wanted: the holes below the highest seq held of each device
@@ -777,7 +770,7 @@ impl Log {
             if !walked {
                 continue;
             }
-            for (first, last) in dev.held.gaps(self.high(device), &dev.voids) {
+            for (first, last) in dev.held.gaps(self.high(device), &dev.voids()) {
                 out.push(Want {
                     device: device.clone(),
                     first,

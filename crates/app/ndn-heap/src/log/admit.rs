@@ -7,8 +7,6 @@
 //! it changes ([`Log::settle`]): an entry never depends on the order things
 //! arrived in.
 
-use std::collections::BTreeSet;
-
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::Data;
@@ -515,25 +513,12 @@ impl Log {
             .or_insert_with(|| Dev::new(f.person.clone()));
         dev.person = f.person.clone();
         dev.held.insert(seq);
-        dev.high = dev.high.max(seq);
-        let link = Link {
-            seq,
-            digest: f.id.digest,
-        };
-        if dev.tip.is_none_or(|t| t.seq < seq) {
-            dev.tip = Some(link);
-        }
         let status = f.verdict.as_ref().err();
-        if admitted(status) {
-            self.count_gap(device, seq, prev_seq, true);
-        }
-        self.write_ledger(device);
+        self.count_gap(device, seq, prev_seq, admitted(status));
         self.set_status(device, seq, None, status);
-        if *device == self.device {
-            self.own_head = self.own_head.max(seq);
-            if status.is_none() {
-                self.adopt_own(link);
-            }
+        if *device == self.device && status.is_none() {
+            let digest = f.id.digest;
+            self.adopt_own(Link { seq, digest });
         }
         if let Ok(entry) = f.verdict {
             self.set_applied(f.id, f.person, entry, true, fx);
@@ -573,18 +558,14 @@ impl Log {
             self.store.get(&Kind::EQUIVOCAL.of(&name)).is_some()
         };
         let add = counts && prev_seq + 1 < seq && !equivocal();
-        let Some(dev) = self.devices.get_mut(device) else {
-            return;
-        };
-        let changed = if add {
-            dev.state_gap(seq, prev_seq);
-            true
-        } else {
-            !counts && dev.retract_gap(seq)
-        };
-        if changed {
-            self.write_ledger(device);
+        if let Some(dev) = self.devices.get_mut(device) {
+            if add {
+                dev.gaps.insert(seq, prev_seq);
+            } else if !counts {
+                dev.gaps.remove(&seq);
+            }
         }
+        self.write_ledger(device);
     }
 
     /// Replace the status record of an entry (`old` is what it is now).
@@ -608,9 +589,13 @@ impl Log {
     // -- Applying ------------------------------------------------------------------
 
     fn fold_view(&self) -> FoldView {
+        let writers = self.fold.writers().into_iter();
+        let mut standing: BTreeMap<_, _> = writers.map(|p| (p, (true, Vec::new()))).collect();
+        for (person, tips) in self.fold.removed_writers() {
+            standing.insert(person, (false, tips));
+        }
         FoldView {
-            writers: self.fold.writers(),
-            removed: self.fold.removed_writers(),
+            standing,
             create: self.fold.create(),
             readers: self.fold.readers(),
             in_force: self.fold.in_force(),
@@ -723,21 +708,16 @@ impl Log {
 
     /// Changes of the register's winners as the API says them.
     fn value_changes(&self, changes: Vec<ValueChange>, fx: &mut Effects) {
-        for vc in changes {
-            match (vc.now, vc.was) {
-                (Some(head), _) if head.removal => fx
-                    .changes
-                    .push(Change::Removed(head.item(&vc.path, Bytes::new()))),
-                (Some(head), _) => match self.view().payload_of(&head.entry) {
-                    Some(Payload::Inline(bytes)) => {
-                        fx.changes.push(Change::Put(head.item(&vc.path, bytes)));
-                    }
-                    Some(blob) => fx.blobs.extend(Blob::of(head.entry.clone(), &blob)),
+        for ValueChange { path, was, now } in changes {
+            match (now, was) {
+                (Some(head), _) if !head.removal => match self.shown(&path, &head) {
+                    Some(Ok(item)) => fx.changes.push(Change::Put(item)),
+                    Some(Err(blob)) => fx.blobs.push(blob),
                     None => {}
                 },
-                (None, Some(was)) => fx
+                (Some(gone), _) | (None, Some(gone)) => fx
                     .changes
-                    .push(Change::Removed(was.item(&vc.path, Bytes::new()))),
+                    .push(Change::Removed(gone.item(&path, Bytes::new()))),
                 (None, None) => {}
             }
         }
@@ -757,26 +737,12 @@ impl Log {
             self.queue.push(Scope::All);
             return;
         }
-        let mut persons: BTreeSet<Name> = before
-            .writers
-            .iter()
-            .chain(&after.writers)
-            .filter(|p| before.writers.contains(p) != after.writers.contains(p))
-            .cloned()
-            .collect();
-        for (person, _) in before.removed.iter().chain(&after.removed) {
-            let tips_of = |side: &[(Name, Vec<EntryRef>)]| {
-                side.iter()
-                    .find(|(p, _)| p == person)
-                    .map(|(_, t)| t.clone())
-            };
-            if tips_of(&before.removed) != tips_of(&after.removed) {
-                persons.insert(person.clone());
-            }
-        }
-        if !persons.is_empty() {
-            self.queue.push(Scope::Persons(persons));
-        }
+        let (was, now) = (&before.standing, &after.standing);
+        let persons = was
+            .keys()
+            .chain(now.keys())
+            .filter(|p| was.get(*p) != now.get(*p));
+        self.queue.push(Scope::Persons(persons.cloned().collect()));
     }
 
     /// The cut of each removed device: kept as long as the tips the fold says
