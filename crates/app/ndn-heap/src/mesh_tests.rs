@@ -316,8 +316,13 @@ async fn d12_a_restored_old_image_with_peers_online_raises_rolledback_and_reuses
             .unwrap()
             .seq;
     }
-    eventually("the phone holds the newest", || async {
+    // The newest value is no proof the phone holds every entry the laptop
+    // signed: a hole below it is fetched on its own pace, and what only the
+    // laptop held is lost with its disk. Wait for the whole chain.
+    eventually("the phone holds every entry the laptop signed", || async {
         has(&theirs, "/a", "v29").await
+            && phone.inner.high(&space(), &m.devs[0].name) >= top
+            && theirs.inner.log.lock().missing().is_empty()
     })
     .await;
     drop(heap);
