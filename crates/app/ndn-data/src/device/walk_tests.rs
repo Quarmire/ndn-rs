@@ -1079,6 +1079,47 @@ async fn a_notice_answered_by_an_old_copy_of_the_writers_root_asks_the_writer_ag
     writer.shutdown();
 }
 
+/// The laptop's root from before it wrote anything — head 0, signed and
+/// valid — is replayed to the phone in answer to its first notice of the
+/// laptop (the phone never verified a root of it before), after the laptop
+/// wrote its version. The laptop announces nothing more, and its root ask
+/// was the one thing it waited for. The phone does not take that root as
+/// the writer's answer to the notice: a notice means the writer's head is
+/// above 0, so the phone asks again after the pause for a root above the
+/// one it holds, and takes the version (review L1, r5 at fault seed 38).
+#[tokio::test(start_paused = true)]
+async fn a_replayed_root_of_head_zero_does_not_hold_back_the_writers_last_write() {
+    let (laptop, phone) = (n("/wendy/laptop"), n("/wendy/phone"));
+    let (ns, keys, validator) = wendy(&[&laptop, &phone]).await;
+    let writer = start_on(
+        &laptop,
+        Arc::clone(&keys[0]),
+        validator(),
+        Arc::new(Unconnected),
+    )
+    .await;
+    let root = root_prefix(&laptop, &ns);
+    let empty = writer
+        .inner
+        .packet_for(&root, true)
+        .expect("the writer serves its root before it wrote anything");
+    let c = n("/wendy/32=data/notes");
+    share_log(&writer, &c, &ns).await;
+    let version = put_served(&writer, &laptop, &c, 0).await;
+    let net = Net::new(&[&writer], root.clone());
+    *net.stale.lock().unwrap() = Some(empty);
+    let reader = start_on(&phone, Arc::clone(&keys[1]), validator(), net.clone()).await;
+    reader.inner.follow(&c).await.unwrap();
+    reader.inner.on_update(&ns, notice(&laptop));
+    assert!(
+        held_within(&reader, &version, 60).await,
+        "a replayed root of head 0 answering the first notice of a writer does not end it: the \
+         writer's root is asked again for one above the head held"
+    );
+    reader.shutdown();
+    writer.shutdown();
+}
+
 /// The tablet holds the laptop's root of its second version; the phone
 /// walked the first. The laptop writes a third and announces it, but its
 /// root does not reach the phone in the walk's first two rounds, so the walk

@@ -1297,6 +1297,14 @@ struct Peer {
     /// Interest carried holds nothing back for longer than those tries, and
     /// a real device that a faulty path kept from one walk still does.
     unreached: bool,
+    /// The root that answered the first notice of this device (no root of it
+    /// verified before) was no newer than the head held then, 0: a notice
+    /// means the writer moved, so that root may be an old copy the network
+    /// delayed. The head it left: the next walk requires a root above it,
+    /// from the writer or a device answering for it, and a walk that is
+    /// given none is not reached ([`Inner::refresh`], spec §17.1). Cleared
+    /// by the first root above it.
+    after: Option<u64>,
 }
 
 /// Where another device's roots stand that no trust context held here
@@ -6684,14 +6692,19 @@ impl Inner {
         // §17.1).
         let key = (device.clone(), ns.clone());
         let answers = reach.as_ref().and_then(|r| r.answers);
-        let floor = answers.and_then(|_| {
-            self.st
-                .lock()
-                .peers
-                .get(&key)
-                .filter(|p| p.head > 0 || p.root.is_some())
-                .map(|p| p.head)
-        });
+        let (held, owed) = {
+            let st = self.st.lock();
+            let peer = st.peers.get(&key);
+            (
+                peer.filter(|p| p.head > 0 || p.root.is_some())
+                    .map(|p| p.head),
+                peer.and_then(|p| p.after),
+            )
+        };
+        // A root of it must be above the head a root that answered its first
+        // notice left ([`Peer::after`]), as above those verified before a
+        // notice.
+        let floor = answers.and_then(|_| held).max(owed);
         let above = reach
             .as_ref()
             .filter(|r| r.index > 0)
@@ -6710,6 +6723,28 @@ impl Inner {
             return false;
         }
         let Rooted { data, writer, body } = rooted;
+        // The first root of a device, answering its first notice, that is no
+        // newer than the head held before it (0): the writer moved, so it
+        // may be an old copy a hostile or a delayed path replayed, which
+        // must not end the notice. The writer is asked again after the
+        // pause for a root above it, and is not reached until one comes
+        // ([`Peer::after`], spec §17.1).
+        let stale = {
+            let mut st = self.st.lock();
+            let peer = st.peers.entry(key.clone()).or_default();
+            match owed {
+                Some(a) if body.head > a => {
+                    peer.after = None;
+                    false
+                }
+                Some(_) => true,
+                None if answers.is_some() && held.is_none() && !relayed && body.head == 0 => {
+                    peer.after = Some(body.head);
+                    true
+                }
+                None => false,
+            }
+        };
         if let Some(r) = &reach {
             r.pass.head.fetch_max(body.head, Ordering::Relaxed);
         }
@@ -6745,7 +6780,7 @@ impl Inner {
             let st = self.st.lock();
             if st.peers.get(&key).and_then(|p| p.root) == Some(digest) && !st.owes_walk(device, ns)
             {
-                return !unreached;
+                return !unreached && !stale;
             }
         }
         let head = body.head;
@@ -6798,7 +6833,7 @@ impl Inner {
             self.store
                 .insert(walked_name(device, ns), encode_walked(head, &peer.toward));
         }
-        !unreached
+        !unreached && !stale
     }
 
     /// One pass of `device`'s refresh loop of `ns` ([`Self::refresh_loop`],
