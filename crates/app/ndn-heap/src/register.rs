@@ -44,7 +44,7 @@ use crate::wire::{
 #[cfg(test)]
 mod tests;
 
-/// Which entry wrote a value: [`EntryRef`] under the name readers know it
+/// Which entry wrote a value: `EntryRef` under the name readers know it
 /// by (`Change`, `put`'s result, `Item::id`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EntryId {
@@ -373,6 +373,7 @@ impl Register {
     }
 
     /// Every path that has heads, with them, the winner first.
+    #[cfg(test)]
     pub(crate) fn paths_with_heads(&self) -> impl Iterator<Item = (&Name, &[Head])> {
         self.paths.iter().map(|(p, hs)| (p, hs.as_slice()))
     }
