@@ -203,3 +203,11 @@ pub(crate) trait Host: Send + Sync + 'static {
         name: &Name,
     ) -> Option<Bytes>;
 }
+
+#[cfg(test)]
+#[path = "net_kit.rs"]
+pub(crate) mod net_kit;
+
+#[cfg(test)]
+#[path = "sync_tests.rs"]
+mod tests;
