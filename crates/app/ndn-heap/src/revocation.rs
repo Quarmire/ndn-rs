@@ -43,7 +43,7 @@ use crate::log::{Log, Standing};
 use crate::trust::Judge;
 use crate::wire::{device_of, implicit_digest, log_name};
 
-/// What bounds the revocation cut a node vouches for ([`propose`]): its own
+/// What bounds the revocation cut a node vouches for (`propose`): its own
 /// observation, never anything the revoked key signed. At least one is given.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CutBound {
@@ -59,7 +59,7 @@ pub struct CutBound {
     pub upto: BTreeMap<Name, u64>,
 }
 
-/// A revocation cut a node vouches for ([`propose`]).
+/// A revocation cut a node vouches for (`propose`).
 #[derive(Clone, Debug)]
 pub struct CutProposal {
     /// The cut, with the digest of the public key that verified its entries

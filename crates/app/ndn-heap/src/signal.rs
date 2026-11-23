@@ -91,7 +91,7 @@ const NO_RECORD: &str = "its creation, the owner's first members entry, is not h
 // -- What the transport is given ---------------------------------------------------------
 
 /// What this device may do with signals over a space, by the entries it holds
-/// ([`signal_scope`]).
+/// (`signal_scope`).
 #[derive(Clone, Debug)]
 pub struct SignalScope {
     /// The space asked about.
@@ -173,7 +173,7 @@ impl fmt::Debug for SignalKey {
 }
 
 /// The signer of a run header, a member of the space by the entries held
-/// ([`signal_sender`], [`signal_admit`]).
+/// (`signal_sender`, `signal_admit`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignalSender {
     /// The key that signed it.
@@ -187,7 +187,7 @@ pub struct SignalSender {
     pub namespace: Name,
 }
 
-/// Why a run header is not admitted ([`signal_admit`]). Each says what to do.
+/// Why a run header is not admitted (`signal_admit`). Each says what to do.
 /// None is kept: a refused header is dropped with its run.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SignalRefusal {
