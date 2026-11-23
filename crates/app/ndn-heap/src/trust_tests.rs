@@ -12,7 +12,7 @@ use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, SignatureType};
-use ndn_security::self_certifying::{Genesis, self_certifying_name};
+use ndn_security::self_certifying::self_certifying_name;
 use ndn_security::{
     CertCache, Certificate, Ed25519Signer, Keyring, RevocationCut, ScopedContext, SecurityManager,
     SignedTrustContext, Signer, TrustSchema, Validator,

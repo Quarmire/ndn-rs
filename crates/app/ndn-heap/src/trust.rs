@@ -761,6 +761,7 @@ impl Judge {
     }
 
     /// The version of `person`'s context adopted here for spaces, if one is.
+    #[cfg(test)]
     pub(crate) fn adopted_version(&self, person: &Name) -> Option<u64> {
         match self.scopes.lock().adopted.get(person) {
             Some(Adopted::Held { ctx, .. }) => Some(ctx.context().version()),
