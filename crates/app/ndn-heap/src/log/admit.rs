@@ -588,6 +588,9 @@ impl Log {
             writers: self.fold.writers(),
             removed: self.fold.removed_writers(),
             create: self.fold.create(),
+            readers: self.fold.readers(),
+            in_force: self.fold.in_force(),
+            complete: self.fold.complete(),
         }
     }
 

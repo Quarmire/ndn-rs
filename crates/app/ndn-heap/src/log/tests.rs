@@ -1357,3 +1357,26 @@ async fn a_cold_open_reads_one_marker_per_device_not_one_per_entry() {
         "{reads} markers read for 2 devices and 300 entries"
     );
 }
+
+#[tokio::test]
+async fn a_members_entry_that_only_removes_a_reader_is_a_membership_change() {
+    // Another owner device's entry leaves the epoch in force for a reader
+    // who is gone: the host must hear it, so the owner devices can repair.
+    let mut r = rig(&laptop());
+    let mut owner = Chain::new(&phone());
+    r.applied(&owner.members(members(Some(false), vec![add(1, "/bob", Role::Reader)])));
+    r.applied(&owner.entry(
+        Body::Epoch(EpochBody {
+            key_check: [1; 32],
+            audience: vec![n("/alice"), n("/bob")],
+        }),
+        vec![],
+    ));
+    let a = r.applied(&owner.members(members(None, vec![remove(1, vec![])])));
+    assert!(a.effects.membership);
+    assert!(a.effects.changes.iter().any(|c| matches!(
+        c,
+        Change::Members(m) if m.readers == Readers::Persons(vec![n("/alice")])
+    )));
+    assert!(!r.log.fold().complete(), "an epoch is owed");
+}

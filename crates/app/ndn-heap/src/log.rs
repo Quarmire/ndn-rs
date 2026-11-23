@@ -366,6 +366,10 @@ struct FoldView {
     writers: Vec<Name>,
     removed: Vec<(Name, Vec<EntryRef>)>,
     create: Option<bool>,
+    readers: Readers,
+    /// What decides whether the owner's devices owe an Epoch entry.
+    in_force: Option<EpochId>,
+    complete: bool,
 }
 
 /// One space on one device.
