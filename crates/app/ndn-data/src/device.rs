@@ -4710,6 +4710,9 @@ impl Inner {
         let mut writers: HashMap<Name, Writer> = HashMap::new();
         let mut twins = Vec::new();
         let mut scoped_newest = Vec::new();
+        // Entries under this device's name that this build cannot read (an
+        // old family's records): not restored, yet seqs of its log.
+        let mut unread: Vec<(Name, Bytes, u64)> = Vec::new();
         for (name, wire) in self.store.scan_under(&Name::root(), 0) {
             if notes::is_stored(&name) {
                 continue;
@@ -4770,16 +4773,17 @@ impl Inner {
                 roots.extend(kept_root(&name, &wire));
                 continue;
             };
-            let Ok(data) = Data::decode(wire.clone()) else {
-                continue;
-            };
-            let Some(key) = data.sig_info().and_then(|s| s.key_locator_name()) else {
-                continue;
-            };
-            let Some(record) = data
-                .content()
-                .and_then(|c| wire::decode_record(c.clone()).ok())
-            else {
+            let decoded = Data::decode(wire.clone()).ok().and_then(|data| {
+                let key = data.sig_info().and_then(|s| s.key_locator_name())?;
+                let record = data
+                    .content()
+                    .and_then(|c| wire::decode_record(c.clone()).ok())?;
+                Some((key, record))
+            });
+            let Some((key, record)) = decoded else {
+                if parsed.device == self.device {
+                    unread.push((name, wire, parsed.seq));
+                }
                 continue;
             };
             // One writer per key, shared by its entries (a name read from
@@ -4814,6 +4818,24 @@ impl Inner {
                 *mine = false;
             }
         }
+        // What this device wrote and no longer reads (a hold, a prune, a group:
+        // kinds of an earlier release) is not restored but is still a seq it
+        // signed: its log head covers it before and whatever it decodes as, or
+        // the next write signs it again (self-equivocation) and the peers that
+        // took it refuse the next root as a rollback. Judged by the marker
+        // written with it, as the entries restored are.
+        let mut unread_head = 0;
+        for (name, wire, seq) in unread {
+            let digest = wire::implicit_digest(&wire);
+            if legacy {
+                self.store
+                    .insert(written_name(&name), Bytes::copy_from_slice(&digest));
+            } else if written.get(&name).map(|d| d.as_ref()) != Some(digest.as_slice()) {
+                tracing::warn!(%name, "an entry under this device's name that it did not write and this build cannot read: not counted in its log head");
+                continue;
+            }
+            unread_head = unread_head.max(seq);
+        }
         // Members records first, by revision; then the other records, so
         // that what they say is known as the versions come back; then
         // versions.
@@ -4829,6 +4851,7 @@ impl Inner {
         // The store is read back from here until everything is read: what is
         // taken is stored already.
         st.restoring = true;
+        st.head = st.head.max(unread_head);
         // What the trust context refused for its chain stays withdrawn
         // until judged again ([`Self::rejudge`]); what a held trust context
         // revokes outside its cut stays refused across a restart (spec §8):
@@ -15287,6 +15310,51 @@ mod tests {
         assert_eq!(again.inner.st.lock().head, head);
         let id = again.put(&c, reading(3), options()).await.unwrap();
         assert_eq!(id.seq.0, head + 1, "it never signs a seq it used");
+        again.shutdown();
+    }
+
+    /// Entries this device signed under its own name, of kinds this build no
+    /// longer decodes (an upgraded store: hold, prune and group records), are
+    /// still seqs it used: the log head covers them, so it never signs one
+    /// of those seqs again (self-equivocation) and peers that decoded them do
+    /// not refuse its next root as a rollback.
+    #[tokio::test]
+    async fn an_own_entry_this_build_cannot_decode_still_moves_the_log_head() {
+        let own = OwnLog::new().await;
+        for t in 1..=2 {
+            own.dev.put(&own.c, reading(t), options()).await.unwrap();
+        }
+        let head = own.dev.inner.st.lock().head;
+        let kinds: [&[u8]; 3] = [
+            &[0xFD, 0x05, 0x25, 0x01, 0x00], // a hold
+            &[0xFD, 0x05, 0x39, 0x01, 0x00], // a prune
+            &[0xFD, 0x05, 0x57, 0x01, 0x00], // a group of versions
+        ];
+        for (i, content) in kinds.into_iter().enumerate() {
+            let seq = head + 1 + i as u64;
+            let name = log_name(&own.phone, Some(&own.c), seq);
+            let content = Bytes::copy_from_slice(content);
+            assert!(
+                wire::decode_record(content.clone()).is_err(),
+                "a record this build does not decode"
+            );
+            let (packet, _) = signed(&own.keys, &own.key, &name, &content);
+            // As this device kept it: the entry and its marker.
+            own.store.insert(
+                written_name(&name),
+                Bytes::copy_from_slice(&wire::implicit_digest(&packet)),
+            );
+            own.store.insert(name, packet);
+        }
+        let c = own.c.clone();
+        let again = own.restart().await;
+        assert_eq!(
+            again.inner.st.lock().head,
+            head + 3,
+            "this device signed those seqs"
+        );
+        let id = again.put(&c, reading(3), options()).await.unwrap();
+        assert_eq!(id.seq.0, head + 4, "it never signs a seq it used");
         again.shutdown();
     }
 
