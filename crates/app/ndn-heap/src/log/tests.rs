@@ -1380,3 +1380,83 @@ async fn a_members_entry_that_only_removes_a_reader_is_a_membership_change() {
     )));
     assert!(!r.log.fold().complete(), "an epoch is owed");
 }
+
+/// A device whose name lies under the owner's but whose key a sub-namespace
+/// context vouches for: `/alice/kid` of the person `/alice/kid`.
+fn kid() -> Dev {
+    dev("/alice/kid", "/alice/kid", 5)
+}
+
+#[tokio::test]
+async fn a_writer_device_under_the_owners_name_but_of_another_person_cannot_carry_members_or_epoch_entries()
+ {
+    let mut owner = Chain::new(&phone());
+    let create = owner.members(members(
+        Some(true),
+        vec![add(1, "/alice/kid", Role::Writer)],
+    ));
+    let mut k = Chain::new(&kid());
+    let grant = k.members(members(None, vec![add(2, "/carol", Role::Writer)]));
+    let epoch = k.entry(
+        Body::Epoch(EpochBody {
+            key_check: [3; 32],
+            audience: vec![n("/alice")],
+        }),
+        vec![],
+    );
+    let all = [&create, &grant, &epoch];
+    let nothing_carried = |r: &Rig| {
+        assert!(r.log.fold().is_writer(&n("/alice/kid")), "it is a writer");
+        assert!(
+            !r.log.fold().is_writer(&n("/carol")),
+            "its Members entry did not apply"
+        );
+        assert!(
+            r.log.fold().epochs().is_empty(),
+            "its Epoch entry did not apply"
+        );
+        for p in [&grant, &epoch] {
+            assert!(
+                !r.store
+                    .contains(&structural_key(&space(), &p.dev.name, p.seq))
+            );
+        }
+    };
+    for order in [[0, 1, 2], [1, 2, 0], [2, 0, 1]] {
+        let mut r = rig(&carol());
+        for i in order {
+            let a = r.admit(all[i]);
+            if i != 0 {
+                assert_eq!(a.outcome, Outcome::Refused(Refusal::NotMember), "{order:?}");
+            }
+        }
+        nothing_carried(&r);
+    }
+
+    // Held in the store, it is judged the same at a restart and at a re-check
+    // that another Members entry of the owner starts.
+    let mut r = rig(&carol());
+    for p in all {
+        r.admit(p);
+    }
+    r.flusher.flush().await.unwrap();
+    let mut again = open_on(&r.crash(), &carol());
+    nothing_carried(&again);
+    again.applied(&owner.members(members(None, vec![remove(1, vec![])])));
+    assert!(!again.log.fold().is_writer(&n("/carol")));
+    assert!(again.log.fold().epochs().is_empty());
+}
+
+#[tokio::test]
+async fn a_device_of_another_person_under_the_owners_name_does_not_sign_members_or_epoch_entries() {
+    let mut r = rig(&kid());
+    let nothing = members(Some(true), vec![]);
+    assert!(matches!(
+        r.log.sign_members(nothing, NOW),
+        Err(HeapError::NotOwner { .. })
+    ));
+    assert!(matches!(
+        r.log.sign_epoch(vec![n("/alice")], NOW),
+        Err(HeapError::NotOwner { .. })
+    ));
+}
