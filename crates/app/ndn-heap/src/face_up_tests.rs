@@ -55,7 +55,6 @@ impl Connection for Mute {
 /// channel of `capacity`.
 struct Rig {
     tell: Arc<Tell>,
-    groups: Arc<Mutex<Vec<Name>>>,
     told: Arc<Mutex<Vec<(Name, Instant)>>>,
     began: Instant,
     face_up: FaceUp,
@@ -84,7 +83,6 @@ impl Rig {
         );
         Rig {
             tell,
-            groups,
             told,
             began: Instant::now(),
             face_up,

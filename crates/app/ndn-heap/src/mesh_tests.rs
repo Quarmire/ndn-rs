@@ -8,7 +8,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use ndn_app::EngineAppExt;
 use ndn_engine::{EngineBuilder, ForwarderEngine};
 use ndn_foundation_types::Name;
@@ -16,7 +15,7 @@ use ndn_sync::DataStore;
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use super::tests::{Dev, bytes, cfg, durable, next, public, space, until, world};
+use super::tests::{Dev, bytes, cfg, durable, public, space, until, world};
 use super::*;
 use crate::log::{Alert, Frontier};
 use crate::space::PutOptions;

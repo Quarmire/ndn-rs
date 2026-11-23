@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
-use ndn_sync::DataStore;
 
 use super::*;
 use crate::error::NextStep;

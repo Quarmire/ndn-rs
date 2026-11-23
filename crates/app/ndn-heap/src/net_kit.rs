@@ -65,7 +65,6 @@ pub(crate) struct Wire {
     peak: AtomicUsize,
     inbound: mpsc::UnboundedSender<Bytes>,
     rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Bytes>>,
-    registered: Mutex<Vec<Name>>,
 }
 
 impl Wire {
@@ -82,7 +81,6 @@ impl Wire {
             peak: AtomicUsize::new(0),
             inbound,
             rx: tokio::sync::Mutex::new(rx),
-            registered: Mutex::new(Vec::new()),
         })
     }
 
@@ -140,11 +138,6 @@ impl Wire {
     pub(crate) fn answers(&self) -> usize {
         self.answers.lock().len()
     }
-
-    /// The prefixes registered on this face.
-    pub(crate) fn registered(&self) -> Vec<Name> {
-        self.registered.lock().clone()
-    }
 }
 
 #[async_trait::async_trait]
@@ -188,8 +181,7 @@ impl Connection for Wire {
         self.rx.lock().await.recv().await
     }
 
-    async fn register_prefix(&self, prefix: &Name) -> Result<(), AppError> {
-        self.registered.lock().push(prefix.clone());
+    async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
         Ok(())
     }
 }

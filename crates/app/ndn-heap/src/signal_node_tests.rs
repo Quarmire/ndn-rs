@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use ndn_app::EngineAppExt;
 use ndn_engine::EngineBuilder;
-use ndn_foundation_types::Name;
 use ndn_packet::Data;
 use ndn_security::{Ed25519Verifier, VerifyOutcome};
 use tokio_util::sync::CancellationToken;

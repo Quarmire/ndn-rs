@@ -1,6 +1,6 @@
 //! The cluster the API cases run over: devices of one or more persons on ONE
-//! `ndn_engine::ForwarderEngine`, each with its own key, validator, store
-//! and the two halves of the transport the node takes (a `Node` for
+//! `ndn_engine::ForwarderEngine`, each with its own store and the two halves
+//! of the transport the node takes (a `Node` for
 //! Interest/Data and a sync face for the group's Sync Interests).
 //!
 //! The engine carries the sync group of every person's namespace
@@ -9,56 +9,28 @@
 //! every other device that registered that prefix, never back to its own.
 //!
 //! A device is killed by ending its faces and restarted by minting new ones
-//! for the same name, key, validator and store: what a node's restart finds.
+//! for the same name and store: what a node's restart finds.
 
 use std::sync::Arc;
 
-use bytes::Bytes;
-use ndn_app::{AppError, Connection, EngineAppExt, EngineBuilder, Node};
+use ndn_app::{Connection, EngineAppExt, EngineBuilder, Node};
 use ndn_engine::ForwarderEngine;
 use ndn_foundation_types::Name;
-use ndn_security::{SecurityManager, SignedTrustContext, TrustSchema, Validator};
 use ndn_sync::{DataStore, MemoryStore};
 use tokio_util::sync::CancellationToken;
 
 use crate::test_kit::n;
 
-/// A forwarder that never delivers anything: a single-node case hands the
-/// node the packets it would have fetched.
-pub(crate) struct Unconnected;
-
-#[async_trait::async_trait]
-impl Connection for Unconnected {
-    async fn send(&self, _wire: Bytes) -> Result<(), AppError> {
-        Ok(())
-    }
-    async fn recv(&self) -> Option<Bytes> {
-        futures::future::pending().await
-    }
-    async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
-        Ok(())
-    }
-}
-
 /// One device: what a node is started with, and its faces.
 pub(crate) struct DeviceKit {
     /// The device's name, e.g. `/alice/laptop`.
     pub name: Name,
-    /// The device's signing key, `<name>/KEY/1`.
-    pub key: Name,
-    /// The device's keys: an Ed25519 key named [`Self::key`].
-    pub keys: Arc<SecurityManager>,
-    /// A validator that has adopted the hierarchical trust context of every
-    /// namespace of the cluster.
-    pub validator: Arc<Validator>,
     /// The device's store: shared by every run of the device.
     pub store: Arc<dyn DataStore>,
     /// The node's face for Interest and Data; moves into the transport.
     pub node: Node,
     /// The node's face for Sync Interests; moves into the transport.
     pub sync: Arc<dyn Connection>,
-    /// The engine the faces are on; none for a device on [`Unconnected`].
-    engine: Option<ForwarderEngine>,
     /// Ends the faces of the current run.
     cancel: CancellationToken,
 }
@@ -67,82 +39,21 @@ impl DeviceKit {
     fn on_engine(
         engine: &ForwarderEngine,
         name: &str,
-        namespaces: &[Name],
         store: Arc<dyn DataStore>,
         cancel: CancellationToken,
     ) -> Self {
         let (node, sync) = faces_on(engine, &cancel);
-        Self::with(
-            name,
-            namespaces,
-            store,
-            node,
-            sync,
-            Some(engine.clone()),
-            cancel,
-        )
-    }
-
-    /// A device on a forwarder that delivers nothing (single-node cases):
-    /// `name` in the trust contexts of `namespaces`, over `store`.
-    pub(crate) fn solo(name: &str, namespaces: &[&str], store: Arc<dyn DataStore>) -> Self {
-        let conn: Arc<dyn Connection> = Arc::new(Unconnected);
-        let namespaces: Vec<Name> = namespaces.iter().map(|ns| n(ns)).collect();
-        Self::with(
-            name,
-            &namespaces,
-            store,
-            Node::from_connection(Arc::clone(&conn)),
-            conn,
-            None,
-            CancellationToken::new(),
-        )
-    }
-
-    fn with(
-        name: &str,
-        namespaces: &[Name],
-        store: Arc<dyn DataStore>,
-        node: Node,
-        sync: Arc<dyn Connection>,
-        engine: Option<ForwarderEngine>,
-        cancel: CancellationToken,
-    ) -> Self {
-        let name = n(name);
-        let key = name.clone().append("KEY").append("1");
-        let keys = Arc::new(SecurityManager::new());
-        keys.generate_ed25519(key.clone())
-            .expect("an Ed25519 key for the device");
-        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-        for ns in namespaces {
-            validator
-                .adopt_context(Arc::new(SignedTrustContext::hierarchical(ns.clone())))
-                .expect("the namespace's trust context is adopted");
-        }
         Self {
-            name,
-            key,
-            keys,
-            validator,
+            name: n(name),
             store,
             node,
             sync,
-            engine,
             cancel,
         }
-    }
-
-    /// A fresh pair of faces for this device on its engine, for a run that
-    /// needs more than the one in [`Self::node`] and [`Self::sync`] (a node
-    /// started a second time over the same store). Ended by [`Self::kill`].
-    /// Panics on a device that has no engine.
-    pub(crate) fn faces(&self) -> (Node, Arc<dyn Connection>) {
-        let engine = self.engine.as_ref().expect("a device on an engine");
-        faces_on(engine, &self.cancel)
     }
 
     /// End every face of the device's current run: the device is off the
-    /// network. Its store, key and validator stay.
+    /// network. Its store stays.
     pub(crate) fn kill(&self) {
         self.cancel.cancel();
     }
@@ -200,13 +111,7 @@ impl Cluster {
         let devices = devices
             .iter()
             .map(|(device, store)| {
-                DeviceKit::on_engine(
-                    &engine,
-                    device,
-                    &namespaces,
-                    Arc::clone(store),
-                    CancellationToken::new(),
-                )
+                DeviceKit::on_engine(&engine, device, Arc::clone(store), CancellationToken::new())
             })
             .collect();
         Self { engine, devices }
@@ -217,19 +122,13 @@ impl Cluster {
         &self.devices[i]
     }
 
-    /// Every device.
-    pub(crate) fn devices(&self) -> &[DeviceKit] {
-        &self.devices
-    }
-
-    /// End device `i`'s faces; its store, key and validator stay.
+    /// End device `i`'s faces; its store stays.
     pub(crate) fn kill(&self, i: usize) {
         self.devices[i].kill();
     }
 
-    /// Device `i` again, as a restarted node finds it: the same name, key,
-    /// validator and store, new faces (the old ones are ended first when
-    /// they are not).
+    /// Device `i` again, as a restarted node finds it: the same name and
+    /// store, new faces (the old ones are ended first when they are not).
     pub(crate) fn restart(&mut self, i: usize) -> &DeviceKit {
         let old = &mut self.devices[i];
         old.kill();

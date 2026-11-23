@@ -85,7 +85,6 @@ struct Packet {
     dev: Dev,
     name: Name,
     wire: Bytes,
-    digest: [u8; 32],
 }
 
 impl Packet {
@@ -123,7 +122,6 @@ impl Chain {
             dev: self.dev.clone(),
             name,
             wire,
-            digest,
         }
     }
 
