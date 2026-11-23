@@ -11,7 +11,8 @@ use ndn_foundation_types::Name;
 use ndn_sync::DataStore;
 
 use crate::error::{Cut, Refusal};
-use crate::store::{ChainEnd, Link, Marker, walk_chain};
+use crate::store::{Kind, Link, Marker};
+use crate::wire::{EntryRef, log_name};
 
 /// The most separate runs of held seqs, and the most gap statements, this
 /// device keeps for one device: the `ledger/` record is rewritten with every
@@ -27,18 +28,9 @@ impl Ranges {
     pub(super) fn insert(&mut self, seq: u64) {
         match self.0.last_mut() {
             Some((_, hi)) if hi.checked_add(1) == Some(seq) => *hi = seq,
-            Some((_, hi)) if *hi >= seq => self.insert_range(seq, seq),
+            Some((_, hi)) if *hi >= seq => *self = self.union(&Ranges(vec![(seq, seq)])),
             _ => self.0.push((seq, seq)),
         }
-    }
-
-    pub(super) fn insert_range(&mut self, lo: u64, hi: u64) {
-        if lo > hi {
-            return;
-        }
-        let mut all = std::mem::take(&mut self.0);
-        all.push((lo, hi));
-        *self = Ranges::merged(all);
     }
 
     /// The set of the runs `all`, in any order, overlapping or touching.
@@ -84,14 +76,6 @@ impl Ranges {
         self.0.last().map(|&(_, hi)| hi)
     }
 
-    /// The largest `n` with every seq of `1..=n` in the set.
-    pub(super) fn prefix(&self) -> u64 {
-        match self.0.first() {
-            Some(&(1, hi)) => hi,
-            _ => 0,
-        }
-    }
-
     /// The largest seq in the set below `seq`.
     pub(super) fn below(&self, seq: u64) -> Option<u64> {
         let at = self.0.partition_point(|&(lo, _)| lo < seq);
@@ -111,9 +95,12 @@ impl Ranges {
         Ranges::merged(self.0.iter().chain(&also.0).copied().collect())
     }
 
-    /// [`Self::prefix`] of the union with `also`.
+    /// The largest `n` with every seq of `1..=n` in the union with `also`.
     pub(super) fn prefix_with(&self, also: &Ranges) -> u64 {
-        self.union(also).prefix()
+        match self.union(also).0.first() {
+            Some(&(1, hi)) => hi,
+            _ => 0,
+        }
     }
 
     /// The seqs of `1..=upto` in neither this set nor `also`, as ranges.
@@ -344,18 +331,6 @@ pub(super) struct Kept {
     pub ranges: Ranges,
 }
 
-/// What a cut says of one entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Keeps {
-    /// On a kept chain, as the very bytes the chain names.
-    Yes,
-    /// Not on any kept chain, or other bytes than the chain names.
-    No,
-    /// The chain is not whole below it: undecided until the missing links
-    /// arrive. Never accepted meanwhile.
-    Waiting,
-}
-
 impl Kept {
     /// The ancestry of `tips`, walked as far as the markers go.
     pub(super) fn compute(
@@ -373,34 +348,41 @@ impl Kept {
         kept
     }
 
-    /// Walk on from every link the chain was waiting at. Call it when an
-    /// entry of the device arrived.
+    /// Walk on from every link the chain was waiting at, through the
+    /// `verified/` markers alone (no entry is read, so nothing is decoded):
+    /// each entry reached is kept. A walk ends at the chain's first entry,
+    /// and at a marker that cannot be read or does not link to a lower seq
+    /// (nothing more to wait for), or at a link whose marker is not held or
+    /// records other bytes than the chain names there: that link is the
+    /// frontier, the entry to fetch. Call it when an entry of the device
+    /// arrived.
     pub(super) fn advance(&mut self, store: &dyn DataStore, device: &Name, space: &Name) {
-        let pending = std::mem::take(&mut self.frontier);
-        for link in pending {
-            let walk = walk_chain(store, device, space, link);
-            for l in &walk.links {
-                self.ranges.insert(l.seq);
-            }
-            let next = match walk.end {
-                ChainEnd::Genesis | ChainEnd::Corrupt { .. } => None,
-                ChainEnd::Diverges { seq, expected, .. } => Some(Link {
-                    seq,
-                    digest: expected,
-                }),
-                ChainEnd::Missing { .. } => Some(match walk.links.last() {
-                    None => link,
-                    Some(last) => {
-                        let m = Marker::read(store, device, space, last.seq)
-                            .expect("a walked link has its marker");
-                        Link {
-                            seq: m.prev_seq,
-                            digest: m.prev,
-                        }
-                    }
-                }),
+        for mut at in std::mem::take(&mut self.frontier) {
+            let stopped = loop {
+                let key = Kind::VERIFIED.of(&log_name(device, space, at.seq));
+                let Some(wire) = store.get(&key) else {
+                    break Some(at);
+                };
+                let Some(m) = Marker::decode(&wire) else {
+                    break None;
+                };
+                if m.signed_digest != at.digest {
+                    break Some(at);
+                }
+                let genesis = m.prev == [0; 32] && m.prev_seq == 0;
+                if !genesis && (m.prev_seq == 0 || m.prev_seq >= at.seq) {
+                    break None;
+                }
+                self.ranges.insert(at.seq);
+                if genesis {
+                    break None;
+                }
+                at = Link {
+                    seq: m.prev_seq,
+                    digest: m.prev,
+                };
             };
-            if let Some(next) = next
+            if let Some(next) = stopped
                 && !self.frontier.contains(&next)
             {
                 self.frontier.push(next);
@@ -413,30 +395,39 @@ impl Kept {
         self.tips.iter().map(|t| t.seq).max().unwrap_or(0)
     }
 
-    /// What the cut says of the entry `(seq, digest)` of the device.
+    /// What the cut says of the entry `id`: `Ok` when it is on a kept chain
+    /// as the very bytes the chain names. Else the status it is held under:
+    /// waiting while the chain below it is not whole (undecided until the
+    /// missing links arrive; never accepted meanwhile), refused when it is
+    /// off every kept chain or other bytes than the chain names.
     pub(super) fn keeps(
         &self,
         store: &dyn DataStore,
-        device: &Name,
         space: &Name,
-        seq: u64,
-        digest: &[u8; 32],
-    ) -> Keeps {
+        id: &EntryRef,
+    ) -> Result<(), Status> {
+        let (device, seq) = (&id.device, id.seq);
+        let outside = || {
+            Status::Refused(Refusal::OutsideCut(Cut {
+                device: device.clone(),
+                keeps_to: self.keeps_to(),
+            }))
+        };
         if let Some(f) = self.frontier.iter().find(|f| f.seq == seq)
-            && f.digest == *digest
+            && f.digest == id.digest
         {
-            return Keeps::Yes;
+            return Ok(());
         }
         if self.ranges.contains(seq) {
             return match Marker::read(store, device, space, seq) {
-                Some(m) if m.signed_digest == *digest => Keeps::Yes,
-                _ => Keeps::No,
+                Some(m) if m.signed_digest == id.digest => Ok(()),
+                _ => Err(outside()),
             };
         }
-        if self.frontier.iter().any(|f| seq < f.seq) {
-            Keeps::Waiting
+        Err(if self.frontier.iter().any(|f| seq < f.seq) {
+            Status::Waiting
         } else {
-            Keeps::No
-        }
+            outside()
+        })
     }
 }

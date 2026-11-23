@@ -11,7 +11,7 @@ use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::Data;
 
-use super::chain::{Keeps, RANGES_MAX, Ranges, Status};
+use super::chain::{RANGES_MAX, Ranges, Status};
 use super::view::{View, head_for};
 use super::*;
 use crate::error::Timestamp;
@@ -466,25 +466,12 @@ impl Log {
     /// What a removed writer's cut says of the entry: `Ok` when the cut keeps
     /// it.
     fn cutting(&self, id: &EntryRef, person: &Name) -> Result<(), Status> {
-        let has_tip = self
-            .fold
-            .removal_tips(person)
-            .iter()
-            .any(|t| t.device == id.device);
-        if !has_tip {
+        let tips = self.fold.removal_tips(person);
+        if !tips.iter().any(|t| t.device == id.device) {
             return Err(Status::Refused(Refusal::NotMember));
         }
-        let Some(kept) = self.kept.get(&id.device) else {
-            return Err(Status::Waiting);
-        };
-        match kept.keeps(&self.store, &id.device, &self.space, id.seq, &id.digest) {
-            Keeps::Yes => Ok(()),
-            Keeps::Waiting => Err(Status::Waiting),
-            Keeps::No => Err(Status::Refused(Refusal::OutsideCut(Cut {
-                device: id.device.clone(),
-                keeps_to: kept.keeps_to(),
-            }))),
-        }
+        let kept = self.kept.get(&id.device).ok_or(Status::Waiting)?;
+        kept.keeps(&self.store, &self.space, id)
     }
 }
 

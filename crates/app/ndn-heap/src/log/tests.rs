@@ -11,7 +11,7 @@ use ndn_packet::Data;
 use ndn_packet::encode::DataBuilder;
 use ndn_security::confidentiality::{ContentKey, RecipientKey};
 use ndn_security::{Ed25519Signer, Signer, public_key_digest};
-use ndn_sync::DataStore;
+use ndn_sync::{DataStore, MemoryStore};
 use proptest::prelude::*;
 
 use super::*;
@@ -19,7 +19,7 @@ use crate::error::{Cut, NextStep, Refusal, Timestamp};
 use crate::reserve::Flusher;
 use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
-use crate::store::{self, Kind, Marker, ReserveRecord, walk_chain, write_reserve};
+use crate::store::{self, Kind, Marker, ReserveRecord, write_reserve};
 use crate::test_kit::{CrashStore, n};
 use crate::wire::{
     self, Body, Entry, EntryRef, EpochBody, EpochId, MembersBody, Op, Payload, Prev, PutBody, Role,
@@ -573,16 +573,16 @@ async fn an_entry_that_verifies_but_does_not_decode_is_recorded_as_refused_and_w
         r.store
             .contains(&Kind::STATUS.seq(&space(), &bob().name, 2))
     );
-    let walk = walk_chain(
+    let walked = Kept::compute(
         &*r.store,
         &bob().name,
         &space(),
-        store::Link {
+        vec![store::Link {
             seq: 2,
             digest: junk.digest,
-        },
+        }],
     );
-    assert!(walk.is_complete(), "{walk:?}");
+    assert!(walked.frontier.is_empty(), "{walked:?}");
     assert_eq!(r.log.held_prefix(&bob().name), 2);
     assert!(
         r.log.missing().iter().all(|w| w.device != bob().name),
@@ -590,6 +590,84 @@ async fn an_entry_that_verifies_but_does_not_decode_is_recorded_as_refused_and_w
     );
     // Offered again it is a duplicate, never decoded again.
     assert_eq!(r.admit(&junk).outcome, Outcome::Duplicate);
+}
+
+/// A marker at `seq` of `bob` in the space: its digest is `[seq; 32]`, its
+/// previous entry `prev_seq` (digest `[prev_seq; 32]`, zero from 0).
+fn mark(store: &dyn DataStore, seq: u64, prev_seq: u64) {
+    let digest = |s: u64| if s == 0 { [0; 32] } else { [s as u8; 32] };
+    store.insert(
+        Kind::VERIFIED.of(&log_name(&bob().name, &space(), seq)),
+        Marker {
+            signed_digest: digest(seq),
+            key_digest: [7; 32],
+            prev: digest(prev_seq),
+            prev_seq,
+            at: 1,
+        }
+        .encode(),
+    );
+}
+
+fn tip(seq: u64) -> store::Link {
+    store::Link {
+        seq,
+        digest: [seq as u8; 32],
+    }
+}
+
+fn walk(store: &dyn DataStore, tip: store::Link) -> Kept {
+    Kept::compute(store, &bob().name, &space(), vec![tip])
+}
+
+#[test]
+fn a_cut_walk_reads_markers_only_and_follows_a_declared_gap() {
+    // No entry is stored anywhere: only markers. 1 <- 2 <- 3, then the
+    // device lost 4 and 5 and signed 6 over 3 (a gap statement).
+    let store = MemoryStore::new();
+    mark(&store, 1, 0);
+    mark(&store, 2, 1);
+    mark(&store, 3, 2);
+    mark(&store, 6, 3);
+    let walked = walk(&store, tip(6));
+    assert_eq!(walked.ranges.to_vec(), vec![(1, 3), (6, 6)]);
+    assert!(
+        walked.frontier.is_empty(),
+        "the chain reaches its first entry"
+    );
+}
+
+#[test]
+fn a_cut_walk_names_the_missing_link_the_diverging_one_and_ends_at_the_corrupt_one() {
+    let store = MemoryStore::new();
+    mark(&store, 1, 0);
+    mark(&store, 3, 2);
+    mark(&store, 4, 3);
+    let walked = walk(&store, tip(4));
+    assert_eq!(walked.ranges.to_vec(), vec![(3, 4)]);
+    assert_eq!(walked.frontier, vec![tip(2)], "the entry to fetch next");
+
+    // The tip's digest is not the marker's: another packet at that seq.
+    let other = store::Link {
+        seq: 4,
+        digest: [0xee; 32],
+    };
+    let walked = walk(&store, other);
+    assert!(walked.ranges.to_vec().is_empty());
+    assert_eq!(walked.frontier, vec![other], "the bytes the chain names");
+
+    // A marker whose previous seq is not below its own would loop for ever.
+    mark(&store, 8, 8);
+    let walked = walk(&store, tip(8));
+    assert!(walked.frontier.is_empty() && walked.ranges.to_vec().is_empty());
+
+    // A marker that does not decode is a corrupt link, not a missing one.
+    store.insert(
+        Kind::VERIFIED.of(&log_name(&bob().name, &space(), 9)),
+        Bytes::from_static(&[0; 5]),
+    );
+    let walked = walk(&store, tip(9));
+    assert!(walked.frontier.is_empty() && walked.ranges.to_vec().is_empty());
 }
 
 #[tokio::test]
