@@ -379,3 +379,60 @@ pub(crate) fn served_kind(name: &Name) -> Option<Served> {
         _ => None,
     }
 }
+
+const SIGNAL: &[u8] = b"signal";
+const RUN: &[u8] = b"run";
+
+/// The octets of a signal run's id: the first 16 octets of the SHA-256 of the
+/// run's public key.
+pub(crate) const RUN_ID_LEN: usize = 16;
+
+/// A signal run header's name:
+/// `<device>/32=signal/<scope>/32=run/<run>`, `device` the device whose key
+/// signs it, `scope` the space the run's signals are of and `run` the run's
+/// id, one generic component.
+pub(crate) fn signal_run_name(device: &Name, scope: &Name, run: &[u8; RUN_ID_LEN]) -> Name {
+    let mut comps = device.components().to_vec();
+    comps.push(kw(SIGNAL));
+    comps.extend(scope.components().iter().cloned());
+    comps.push(kw(RUN));
+    comps.push(NameComponent::generic(Bytes::copy_from_slice(run)));
+    Name::from_components(comps)
+}
+
+/// A parsed signal run header name ([`signal_run_name`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SignalRunName {
+    /// The device whose key signs the header.
+    pub device: Name,
+    /// The space the run's signals are of.
+    pub scope: Name,
+    /// The run's id.
+    pub run: [u8; RUN_ID_LEN],
+}
+
+/// Parse `<device>/32=signal/<scope>/32=run/<run>`: the device is everything
+/// before the first `32=signal` (a device name has no keyword), the scope a
+/// space name, the run a generic component of exactly [`RUN_ID_LEN`] octets.
+/// `None` for any other name.
+pub(crate) fn parse_signal_run_name(name: &Name) -> Option<SignalRunName> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| is_kw(c, SIGNAL))?;
+    let [scope @ .., run_kw, run] = &comps[at + 1..] else {
+        return None;
+    };
+    if !is_device_comps(&comps[..at])
+        || !is_kw(run_kw, RUN)
+        || run.typ != tlv_type::GENERIC_NAME_COMPONENT
+    {
+        return None;
+    }
+    let run: [u8; RUN_ID_LEN] = run.value.as_ref().try_into().ok()?;
+    let scope = name_of(scope);
+    parse_space_name(&scope)?;
+    Some(SignalRunName {
+        device: name_of(&comps[..at]),
+        scope,
+        run,
+    })
+}

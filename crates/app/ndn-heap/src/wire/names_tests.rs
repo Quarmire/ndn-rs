@@ -452,3 +452,46 @@ fn piece_names_are_unique_parse_back_and_cover_the_manifest_tree() {
         assert!(parse_piece_name(&n(bad)).is_none(), "{bad}");
     }
 }
+
+#[test]
+fn signal_run_names_round_trip_and_refuse_what_they_are_not() {
+    let device = n("/alice/laptop");
+    let scope = n("/alice/32=data/chat/room");
+    let run = [7u8; RUN_ID_LEN];
+    let name = signal_run_name(&device, &scope, &run);
+    assert_eq!(
+        name,
+        n("/alice/laptop/32=signal/alice/32=data/chat/room/32=run").append(run)
+    );
+    assert_eq!(
+        parse_signal_run_name(&name),
+        Some(SignalRunName {
+            device: device.clone(),
+            scope: scope.clone(),
+            run
+        })
+    );
+    let with_run =
+        |run: &[u8]| n("/alice/laptop/32=signal/alice/32=data/chat/room/32=run").append(run);
+    for bad in [
+        // a run id of 15 or 17 octets
+        with_run(&run[..15]),
+        with_run(&[7; RUN_ID_LEN + 1]),
+        // a scope that is no space, none at all
+        signal_run_name(&device, &n("/alice/notes"), &run),
+        n("/alice/laptop/32=signal/32=run").append(run),
+        // a device with a keyword or a digest
+        signal_run_name(&n("/alice/32=held/laptop"), &scope, &run),
+        signal_run_name(
+            &device.clone().append_implicit_digest([1; 32]),
+            &scope,
+            &run,
+        ),
+        // the run id not generic, no run keyword
+        n("/alice/laptop/32=signal/alice/32=data/chat/room/32=run")
+            .append_component(NameComponent::new(0x3A, Bytes::copy_from_slice(&run))),
+        n("/alice/laptop/32=signal/alice/32=data/chat/room").append(run),
+    ] {
+        assert_eq!(parse_signal_run_name(&bad), None, "{bad}");
+    }
+}
