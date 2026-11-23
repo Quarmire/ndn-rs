@@ -168,7 +168,7 @@ pub(crate) fn log_prefix(device: &Name, space: &Name) -> Name {
 }
 
 /// An entry's name: `<device>/32=log/<space>/seq=<seq>`.
-pub(crate) fn log_name(device: &Name, space: &Name, seq: u64) -> Name {
+pub fn log_name(device: &Name, space: &Name, seq: u64) -> Name {
     log_prefix(device, space).append_component(NameComponent::sequence_num(seq))
 }
 

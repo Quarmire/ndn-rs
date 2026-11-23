@@ -641,6 +641,19 @@ impl Log {
         self.shown(self.register.value(path)?)?.err()
     }
 
+    /// Whether the entry `id` is applied here: held as exactly those signed
+    /// bytes (the marker of its verification names the digest), verified,
+    /// chained and admitted, and neither refused, waiting on a cut, closed
+    /// for want of its epoch key nor unreadable (it has no `status/`
+    /// record), and not withdrawn since. Two reads of the store, no entry
+    /// is decoded.
+    pub(crate) fn applied(&self, id: &EntryId) -> bool {
+        let view = self.view();
+        view.marker(&id.device, id.seq)
+            .is_some_and(|marker| marker.signed_digest == id.digest)
+            && view.status(&id.device, id.seq).is_none()
+    }
+
     /// The epoch key the applied entry was sealed under: `Some(None)` for a
     /// plain write (public space), `Some(Some(key))` for a sealed one whose
     /// key is held; `None` when the entry is not held, not applied, not a

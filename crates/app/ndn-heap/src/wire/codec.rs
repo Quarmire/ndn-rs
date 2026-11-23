@@ -67,8 +67,11 @@ const ZERO_DIGEST: [u8; 32] = [0; 32];
 
 impl Entry {
     /// The entry's encoding: one `ENTRY` TLV, the Content of its packet.
-    /// Refuses an entry the format cannot carry, or one over [`ENTRY_MAX`].
-    pub(crate) fn encode(&self) -> Result<Bytes, WireError> {
+    /// Refuses an entry the format cannot carry (a list over its limit, a
+    /// path outside 1 to 8 components or 200 octets, an inline payload over
+    /// 6,144 octets, a `PREV` that is not consistent with its `PREV_SEQ`),
+    /// or an encoding that would not fit in one packet.
+    pub fn encode(&self) -> Result<Bytes, WireError> {
         self.validate()?;
         let mut w = TlvWriter::new();
         w.write_nested(tlv::ENTRY, |w| {
@@ -116,7 +119,7 @@ impl Entry {
     /// Decode the Content of a log packet. Refuses what [`Entry::encode`]
     /// would, an unknown critical TLV, a `KIND` that disagrees with the body,
     /// and anything not well-formed.
-    pub(crate) fn decode(content: &[u8]) -> Result<Entry, WireError> {
+    pub fn decode(content: &[u8]) -> Result<Entry, WireError> {
         too_large(content.len(), ENTRY_MAX, "the entry")?;
         let value = only(
             Bytes::copy_from_slice(content),

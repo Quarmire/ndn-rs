@@ -12,7 +12,7 @@
 #![deny(missing_docs)]
 
 mod rt;
-mod wire;
+pub mod wire;
 
 mod error;
 mod face_up;
@@ -31,6 +31,8 @@ mod serve;
 mod signal;
 mod space;
 mod store;
+#[cfg(test)]
+mod surface_tests;
 mod sync;
 #[cfg(test)]
 mod test_kit;

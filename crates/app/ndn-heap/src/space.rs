@@ -1043,6 +1043,21 @@ impl Heap {
         self.inner.log.lock().members()
     }
 
+    /// Whether this node has applied the entry `id`: it holds exactly those
+    /// signed bytes (the id's digest is the signed-region digest), verified
+    /// and chained to its writer's log, and admitted it: the writer's person
+    /// was a member, inside the cut if removed. An entry refused (not a
+    /// member, outside a cut, a plain write in a sealed space, ...),
+    /// waiting for the cut of a removed writer, held closed for want of its
+    /// epoch's key, unreadable, withdrawn since, never held, or held as
+    /// other bytes is not applied. Every applied entry counts, one a later
+    /// write has superseded too, which [`get`](Self::get) no longer shows. It
+    /// reads what is held under the space's lock and never waits for the
+    /// network.
+    pub fn applied(&self, id: &EntryId) -> bool {
+        self.inner.log.lock().applied(id)
+    }
+
     /// Whether the first catch-up is done: the space's creation is seen and
     /// everything heard of is held.
     pub fn ready(&self) -> bool {

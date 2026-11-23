@@ -658,6 +658,54 @@ offered again and verifies.
 - **A hole is not a retraction.** A gap statement lets readers stop waiting;
   it removes nothing a peer holds (§3.6).
 
+### 3.10 The public wire module
+
+The crate exports its wire format as `ndn_heap::wire`, so that a program that is
+not a node (the conformance suite, §13) can build, name, sign, read and digest
+entries exactly as a node does. Nothing else of the module is public (the
+names of grants, held copies, seal keys and signal runs, the pieces, the record
+codecs, the TLV registry are the layer's own). There is no switch and no
+feature behind it: it is the format this section and §2 specify.
+
+```rust
+pub mod wire {
+    pub struct Entry { pub prev: Option<Prev>, pub after: Vec<EntryRef>, pub body: Body }
+    impl Entry {
+        pub fn kind(&self) -> Kind;
+        pub fn encode(&self) -> Result<Bytes, WireError>;      // the ENTRY TLV (§3.2)
+        pub fn decode(content: &[u8]) -> Result<Entry, WireError>;   // §3.4
+    }
+    pub struct Prev { pub digest: [u8; 32], pub seq: Option<u64> }      // §3.6
+    pub struct EntryRef { pub device: Name, pub seq: u64, pub digest: [u8; 32] }
+    pub enum Kind { Put, Members, Epoch }
+    pub enum Body { Put(PutBody), Sealed(SealedBody), Members(MembersBody), Epoch(EpochBody) }
+    pub struct PutBody { pub path: Name, pub payload: Payload }
+    pub enum Payload { Inline(Bytes), Blob { size: u64, root: [u8; 32] } }
+    // SealedBody, EpochId, MembersBody, Op, Role, EpochBody: the shapes of §5, §6.
+    pub enum WireError { /* §3.4 refusals */ }
+    pub fn log_name(device: &Name, space: &Name, seq: u64) -> Name;       // §2.2
+    pub fn sign_entry(signer: &dyn Signer, name: &Name, entry: &Entry)
+                      -> Result<Bytes, SignError>;
+    pub enum SignError { Wire(WireError), Signer { key: Name, reason: String } }
+    pub fn signed_digest(wire: &Bytes) -> [u8; 32];                      // §1.5
+    pub fn signed_digest_of(data: &Data) -> [u8; 32];
+}
+```
+
+`sign_entry` is the function a node signs its own entries with: it encodes
+`entry`, builds the Data packet at `name` and signs it synchronously with
+`signer` (the KeyLocator is `signer`'s key name), so a program that holds a
+device's `Signer` can write the entry that device would have written at any
+`(device, space, seq)`, with any `PREV`/`PREV_SEQ` and `after`, a Put body
+whose empty inline payload is a removal. It does not check that `name` is a log
+name or that `signer` belongs to the device the name carries: it signs what it
+is given, and a node judges the packet by §3.8 as it judges any packet from the
+network (a key naming another device, a non-member's writer, a chain that does
+not connect and the rest are refused there). The entry's id is
+`(device, seq, signed_digest(&packet))`. `Entry::decode` reads the Content of a
+stored packet back (`Data::decode`, then `content()`) into the fields it was
+built from.
+
 ## 4. Durability, normative
 
 A node signs an entry, stores it and publishes it **before** it is on disk.
@@ -2121,6 +2169,7 @@ impl Heap {
     pub async fn watch(&self, since: &Frontier) -> Result<Changes, HeapError>;
     pub fn members(&self) -> Members;
     pub fn ready(&self) -> bool;
+    pub fn applied(&self, id: &EntryId) -> bool;
     pub async fn change(&self, c: MembersChange) -> Result<EntryId, HeapError>;
 }
 pub struct PutOptions { pub durable: Option<bool> }
@@ -2202,6 +2251,19 @@ from the fold (§5.4), the owner first; it never waits. **`ready()`** says the
 first catch-up is done: the space's creation is held and everything heard of
 is held (§7.4). A host that opens a space made elsewhere waits for it before it
 reads `members()`, and before any call that answers `NotReady` for the creation.
+
+**`applied(id)`** says whether this node has applied the entry `id` (an
+`EntryId` from `put`, `change`, an `Item` or a peer): it holds exactly those
+signed bytes (the digest is the signed-region digest, §1.5), verified and
+chained to its writer's log, and admitted it (§3.8): the writer's person was a
+member, inside the cut if removed, and the entry was neither refused, waiting
+on a removal cut, held closed for want of its epoch's key, unreadable, nor
+withdrawn since (§3.8, re-check). An entry never held, or held as other bytes
+at its name, is not applied. Every applied entry counts, one a later write
+superseded too: `get` shows only the heads, `applied` is how a host (or the
+suite's "device D holds entry E") sees the entries below them. It reads the
+space's records under the space's lock, never waits for the network or the
+disk's flush, and is not a durability statement (§4.9).
 
 **`change(c)`** edits who the space lists and only an owner device signs it:
 `NotOwner` (`UseOwnerDevice`) from any other, including a device under the

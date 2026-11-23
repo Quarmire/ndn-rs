@@ -2,7 +2,6 @@
 //! the cut a removal lists (plan 3.5 "Own put").
 
 use ndn_foundation_types::Name;
-use ndn_packet::encode::DataBuilder;
 use ndn_security::confidentiality::ContentKey;
 use ndn_sync::StoreOp;
 
@@ -10,7 +9,7 @@ use super::admit::{Fresh, link_of};
 use super::chain::Status;
 use super::*;
 use crate::wire::{
-    AFTER_MAX, Body, Entry, EntryRef, MembersBody, Op, Prev, Role, SealedBody, WireError,
+    AFTER_MAX, Body, Entry, EntryRef, MembersBody, Op, Prev, Role, SealedBody, SignError, WireError,
 };
 
 impl Log {
@@ -205,10 +204,11 @@ impl Log {
             body,
         };
         let subject = subject.unwrap_or(&self.space);
-        let content = entry.encode().map_err(|e| wire_error(subject, e))?;
         let name = log_name(&self.device, &self.space, seq);
-        let packet = seal::sign(DataBuilder::new(name.clone(), &content), &*self.signer)
-            .map_err(HeapError::local)?;
+        let packet = wire::sign_entry(&*self.signer, &name, &entry).map_err(|e| match e {
+            SignError::Wire(e) => wire_error(subject, e),
+            signer @ SignError::Signer { .. } => HeapError::local(signer),
+        })?;
         let id = EntryRef {
             device: self.device.clone(),
             seq,

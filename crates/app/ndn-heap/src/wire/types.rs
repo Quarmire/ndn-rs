@@ -1,5 +1,6 @@
 //! The shapes of what a log entry says (spec §3). Pure data: the TLV codec
-//! is `wire::codec`, the names are `wire::names`.
+//! is `wire::codec` ([`Entry::encode`], [`Entry::decode`]), the names are
+//! `wire::names`.
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
@@ -7,7 +8,7 @@ use ndn_foundation_types::Name;
 /// What an entry is, as the `KIND` TLV says it (spec §3.2). Derived from the
 /// entry's body; a decoder refuses an entry whose `KIND` and body disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Kind {
+pub enum Kind {
     /// A write at a path (plain or sealed).
     Put = 0,
     /// Membership operations: the space's creation, additions, removals.
@@ -18,13 +19,12 @@ pub(crate) enum Kind {
 
 /// The Content of every log packet.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Entry {
+pub struct Entry {
     /// The link to the writer's previous entry in this space. Absent only at
     /// seq 1.
     pub prev: Option<Prev>,
     /// Put: the heads of the entry's path this write supersedes. Epoch: the
-    /// epochs this one replaces. Members: none. At most
-    /// [`AFTER_MAX`](super::AFTER_MAX).
+    /// epochs this one replaces. Members: none. At most 8.
     pub after: Vec<EntryRef>,
     /// What the entry says.
     pub body: Body,
@@ -32,7 +32,7 @@ pub(crate) struct Entry {
 
 impl Entry {
     /// The entry's [`Kind`], from its body.
-    pub(crate) fn kind(&self) -> Kind {
+    pub fn kind(&self) -> Kind {
         match self.body {
             Body::Put(_) | Body::Sealed(_) => Kind::Put,
             Body::Members(_) => Kind::Members,
@@ -43,7 +43,7 @@ impl Entry {
 
 /// `PREV` (+ `PREV_SEQ`): the chain link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Prev {
+pub struct Prev {
     /// The signed-region digest of the entry at `seq` (or of `seq - 1` when
     /// `seq` is `None`); 32 zero octets with `seq == Some(0)` say "this
     /// device lost everything before" (the signed gap statement, spec §4).
@@ -66,7 +66,7 @@ pub struct EntryRef {
 
 /// What an entry says.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Body {
+pub enum Body {
     /// A plain write.
     Put(PutBody),
     /// A write sealed in an epoch (path and payload are inside).
@@ -80,7 +80,7 @@ pub(crate) enum Body {
 /// A plain write: one path, one payload. An empty inline payload is a
 /// removal.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PutBody {
+pub struct PutBody {
     /// Relative to the space: 1 to 8 generic components, at most 200 octets.
     pub path: Name,
     /// The value.
@@ -89,7 +89,7 @@ pub(crate) struct PutBody {
 
 /// A payload: in the entry, or in pieces under it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Payload {
+pub enum Payload {
     /// At most `INLINE_MAX` octets, empty for a removal.
     Inline(Bytes),
     /// Larger: `size` octets in pieces under the entry's name, the manifest
@@ -105,7 +105,7 @@ pub(crate) enum Payload {
 /// A write sealed in an epoch. The plaintext sealed is the TLV bytes of
 /// `PATH` + payload; the AAD is the entry's `Name` TLV.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SealedBody {
+pub struct SealedBody {
     /// The epoch whose key sealed it.
     pub epoch: EpochId,
     /// `nonce ‖ tag ‖ ciphertext` (`Sealed::to_bytes`).
@@ -114,7 +114,7 @@ pub(crate) struct SealedBody {
 
 /// An epoch: the Epoch entry that made it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct EpochId {
+pub struct EpochId {
     /// The owner device that signed the Epoch entry.
     pub creator: Name,
     /// Its seq.
@@ -133,7 +133,7 @@ impl From<&EntryRef> for EpochId {
 
 /// A Members entry: at most 32 operations.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub(crate) struct MembersBody {
+pub struct MembersBody {
     /// The space's creation (once): `Some(anyone)` says whether readers are
     /// everybody.
     pub create: Option<bool>,
@@ -143,7 +143,7 @@ pub(crate) struct MembersBody {
 
 /// One membership operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Op {
+pub enum Op {
     /// Admit `who` (a person's namespace, matched exactly) in `role`.
     Add {
         /// Names this addition; a removal names the ids it removes.
@@ -167,7 +167,7 @@ pub(crate) enum Op {
 
 /// A member's role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum Role {
+pub enum Role {
     /// May write.
     Writer = 0,
     /// May read.
@@ -176,7 +176,7 @@ pub(crate) enum Role {
 
 /// An Epoch entry's body.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct EpochBody {
+pub struct EpochBody {
     /// `key_check` of the epoch key (HKDF, spec §6): tells a reader the key
     /// it was granted is the epoch's.
     pub key_check: [u8; 32],
