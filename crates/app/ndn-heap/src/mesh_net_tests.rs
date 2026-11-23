@@ -22,7 +22,7 @@ use crate::log::Outcome;
 use crate::node::tests::private;
 use crate::seal::{self, GrantRefusal};
 use crate::space::MembersChange;
-use crate::sync::{Host, Taken};
+use crate::sync::Taken;
 use crate::wire::{Body, Entry as WireEntry, Payload, PutBody};
 
 /// A face that counts the Interests a node expresses through it.
@@ -109,7 +109,7 @@ async fn one_new_entry_reaches_the_watcher_with_one_fetch() {
     eventually("the phone sees the creation", || async { theirs.ready() }).await;
     // The creation is held and nothing is wanted before the put is counted.
     eventually("the phone holds the creation and wants nothing", || async {
-        phone.held() == 1 && Host::missing(&*phone.inner, &space()).is_empty()
+        phone.held() == 1 && phone.inner.missing(&space()).is_empty()
     })
     .await;
     let before = tap.names().len();
@@ -467,7 +467,7 @@ async fn a_returning_device_fetches_only_what_changed() {
         || async {
             has(&theirs, "/c", "three").await
                 && phone.held() == 4
-                && Host::missing(&*phone.inner, &space()).is_empty()
+                && phone.inner.missing(&space()).is_empty()
         },
     )
     .await;

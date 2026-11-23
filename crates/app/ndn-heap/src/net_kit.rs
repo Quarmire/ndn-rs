@@ -28,7 +28,7 @@ use crate::error::Refusal;
 use crate::log::{Blob, Outcome, Want};
 use crate::register::EntryId;
 use crate::seal::GrantRefusal;
-use crate::sync::{Host, Taken};
+use crate::sync::Taken;
 use crate::test_kit::n;
 use crate::trust::{Judged, Verified};
 use crate::wire::{EpochId, log_name, parse_log_name};
@@ -318,6 +318,51 @@ pub(crate) struct Toy {
     pub generation: u64,
     /// The keys the toy says are revoked.
     pub revoked_keys: BTreeSet<Name>,
+}
+
+/// What the network half asks of the node, as the toy host answers it: the
+/// seam the node's own methods ([`crate::node::NodeInner`]) are put behind in
+/// tests only (`sync::HostRef`); production calls them directly. `space` is
+/// a space name the node has open; for one it does not hold each method
+/// answers with nothing.
+#[async_trait::async_trait]
+pub(crate) trait Host: Send + Sync + 'static {
+    fn device(&self) -> &Name;
+    async fn take(&self, space: &Name, wire: Bytes, probe: bool) -> Taken;
+    fn missing(&self, space: &Name) -> Vec<Want>;
+    fn high(&self, space: &Name, device: &Name) -> u64;
+    fn head(&self, space: &Name) -> u64;
+    fn note_own_counter(&self, space: &Name, seen: u64);
+    fn vouched(&self, space: &Name, device: &Name) -> bool;
+    fn standing(&self, space: &Name, device: &Name) -> Option<bool>;
+    fn served(&self, space: &Name, device: &Name, seq: u64) -> Option<Bytes>;
+    fn served_piece(&self, space: &Name, device: &Name, seq: u64, piece: &Name) -> Option<Bytes>;
+    fn seal_key_packet(&self, name: &Name) -> Option<Bytes>;
+    fn blobs(&self, space: &Name) -> Vec<Blob>;
+    fn held_piece(&self, space: &Name, name: &Name) -> Option<Bytes>;
+    fn keep_pieces(&self, space: &Name, ops: Vec<StoreOp>);
+    fn assembled(&self, space: &Name, blob: &Blob);
+    fn owed_keys(&self, space: &Name) -> Vec<EpochId>;
+    fn seal_public(&self) -> [u8; 32];
+    async fn validate_device_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged;
+    fn key_arrived(&self, space: &Name, epoch: &EpochId, name: &Name, content: Bytes) -> bool;
+    fn generation(&self) -> u64;
+    fn may_grant(
+        &self,
+        space: &Name,
+        epoch: &EpochId,
+        asker: &Name,
+        key: Option<&Name>,
+    ) -> Result<(), GrantRefusal>;
+    fn grant_packet(
+        &self,
+        space: &Name,
+        epoch: &EpochId,
+        asker: &Name,
+        key: &Name,
+        to: &[u8; 32],
+        name: &Name,
+    ) -> Option<Bytes>;
 }
 
 /// The toy host.

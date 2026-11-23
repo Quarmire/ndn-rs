@@ -1,7 +1,7 @@
 //! Direct fetch of the entry a notice names, catch-up, pieces, and the
 //! reader's half of the grant pull (spec §7).
 //!
-//! **Level-triggered.** This half asks for whatever [`Host::missing`] lists
+//! **Level-triggered.** This half asks for whatever `NodeInner::missing` lists
 //! and stops asking only when the log holds it. A replayed, stale or lower
 //! notice therefore never ends an ask, and a device that comes back asks only
 //! for what changed.
@@ -914,7 +914,7 @@ impl Group {
     }
 
     /// The counter a notice named of `device`, when it is above everything
-    /// the log asks for without proof ([`Host::high`]): the one entry that is
+    /// the log asks for without proof (`NodeInner::high`): the one entry that is
     /// probed alone, until it is held.
     fn unconfirmed(&self, device: &Name) -> Option<u64> {
         let named = self.noticed.lock().get(device).map_or(0, |n| n.high);

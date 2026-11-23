@@ -1,12 +1,12 @@
 //! The network half of a heap node: sync groups, the notice, direct fetch,
 //! catch-up, serving and the grant pull (spec §7).
 //!
-//! Everything this half needs of the node it asks through [`Host`], a narrow
-//! trait the node implements over its spaces; nothing in `sync`, `fetch` or
-//! `serve` reaches a [`Log`](crate::log::Log) or the store itself. The node
-//! validates and admits what arrives (`Host::take`: the judge, then
+//! Everything this half needs of the node it asks of [`NodeInner`]
+//! (`take`, `missing`, `served`, …); nothing in `sync`, `fetch` or `serve`
+//! reaches a [`Log`](crate::log::Log) or the store itself. The node
+//! validates and admits what arrives (`NodeInner::take`: the judge, then
 //! `Log::admit` under the space's lock, the flush ticket, watchers, re-check);
-//! this half asks for what the log says is missing (`Host::missing`), and
+//! this half asks for what the log says is missing (`NodeInner::missing`), and
 //! answers what the log says it may serve.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -20,10 +20,9 @@ use futures::FutureExt;
 use futures::future::{Either, select};
 use ndn_app::Connection;
 use ndn_foundation_types::Name;
-use ndn_packet::{Data, Interest};
+use ndn_packet::Interest;
 use ndn_sync::{
-    MultiSvs, ObservedState, ProducerVouch, StoreOp, SvsConfig, SyncHandle, SyncUpdate,
-    spawn_multi_svs,
+    MultiSvs, ObservedState, ProducerVouch, SvsConfig, SyncHandle, SyncUpdate, spawn_multi_svs,
 };
 use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc};
@@ -32,13 +31,12 @@ use crate::error::HeapError;
 use crate::face_up::FaceUp;
 use crate::fetch::{self, Asks, Fetcher, Noticed};
 use crate::heard::{HEARD_MAX, Heard};
-use crate::log::{Blob, Outcome, Want};
+use crate::log::{Blob, Outcome};
 use crate::register::EntryId;
 use crate::reserve::FlushSink;
 use crate::rt;
-use crate::seal::GrantRefusal;
 use crate::serve::Granting;
-use crate::trust::{Judged, Waiting};
+use crate::trust::Waiting;
 use crate::wire::{EpochId, parse_space_name, sync_group_of};
 
 /// The `tracing` target of the timeline events (level `trace`): the few
@@ -98,153 +96,12 @@ pub(crate) enum Taken {
     Pending(Waiting),
 }
 
-/// Everything the network half needs of the node, and nothing else. `space`
-/// is always a space name (`<O>/32=data/…`) the node has open; for a space it
-/// does not hold, each method answers with nothing (no wants, no packet, no
-/// vouching).
-///
-/// Methods are synchronous unless they validate, which may fetch
-/// certificates. None holds a lock across an `.await`.
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-pub(crate) trait Host: Send + Sync + 'static {
-    /// This device.
-    fn device(&self) -> &Name;
-
-    // -- admission --------------------------------------------------------------
-
-    /// Take a packet fetched as an entry of `space`: decode it, judge it
-    /// (`Judge::validate`), admit it (`Log::admit`, or `Log::admit_probed`
-    /// when `probe`: it was fetched only because an unsigned counter named
-    /// it) under the space's lock with everything that follows (flush
-    /// ticket, publication routing, watchers, re-check of what it changed).
-    /// Nothing is applied for a packet that does not verify.
-    async fn take(&self, space: &Name, wire: Bytes, probe: bool) -> Taken;
-
-    // -- what the log wants and knows --------------------------------------------
-
-    /// Everything wanted of `space`: `Log::missing`. It shrinks only by
-    /// holding, so a replayed notice never ends an ask.
-    fn missing(&self, space: &Name) -> Vec<Want>;
-
-    /// The highest seq of `device` in `space` that is asked for without a
-    /// probe (`Log::high`): what is held of it, and for this device also its
-    /// own counter within what it reserved. A counter above it names an
-    /// entry that is probed alone until it is held.
-    fn high(&self, space: &Name, device: &Name) -> u64;
-
-    /// This device's own head in `space` (`Log::head`).
-    fn head(&self, space: &Name) -> u64;
-
-    /// A counter was heard of this device's own name in `space`
-    /// (`Log::note_own_counter`): above its head the node raises
-    /// `Alert::UnbackedCounter`, and the log wants the entries within what
-    /// this device reserved; the head moves only when a verified entry is
-    /// taken (D17). A counter of another device is not told to the log: it
-    /// is unsigned, and the entry it names is probed ([`Self::high`]).
-    fn note_own_counter(&self, space: &Name, seen: u64);
-
-    /// Whether an admitted entry of `device` is held in `space`: what keeps
-    /// a device among the devices heard whatever a Sync Interest names.
-    fn vouched(&self, space: &Name, device: &Name) -> bool;
-
-    /// How `device` stands as a source for another device's packets
-    /// (`Heard::relays`): `None` when it is not vouched for or has ended,
-    /// `Some(true)` when its entries were held first.
-    fn standing(&self, space: &Name, device: &Name) -> Option<bool>;
-
-    // -- serving ----------------------------------------------------------------
-
-    /// The packet of the entry `<device>/32=log/<space>/seq=<seq>` as this
-    /// device may serve it: its own entry at or below its head and not held
-    /// back (a structural entry not yet durable), or another device's entry
-    /// only if it is held and admitted. `None` otherwise.
-    fn served(&self, space: &Name, device: &Name, seq: u64) -> Option<Bytes>;
-
-    /// The piece `piece` (a name under that entry's) of an entry
-    /// [`Self::served`] would serve, from the store.
-    fn served_piece(&self, space: &Name, device: &Name, seq: u64, piece: &Name) -> Option<Bytes>;
-
-    /// This device's seal key packet when `name` is its name
-    /// (`<device>/32=seal/<public key>`).
-    fn seal_key_packet(&self, name: &Name) -> Option<Bytes>;
-
-    // -- values in pieces -------------------------------------------------------
-
-    /// The entries of `space` that carry a value in pieces and whose pieces
-    /// are not all held: what is fetched at open and asked again while owed.
-    fn blobs(&self, space: &Name) -> Vec<Blob>;
-
-    /// The copy of the piece `name` of an entry of `space` that the store
-    /// holds, if any: what an assembly begun in an earlier run resumes from
-    /// (it is proven again before it counts).
-    fn held_piece(&self, space: &Name, name: &Name) -> Option<Bytes>;
-
-    /// Pieces of an entry of `space` that arrived and proved: write them as
-    /// one batch, now. Nothing says the value is whole yet.
-    fn keep_pieces(&self, space: &Name, ops: Vec<StoreOp>);
-
-    /// Every piece of `blob`'s entry is held and proved: record the value as
-    /// whole (its `assembled/` marker) and tell the watchers.
-    fn assembled(&self, space: &Name, blob: &Blob);
-
-    // -- grants, reader side ----------------------------------------------------
-
-    /// The epochs of `space` whose key is owed: a held owner-signed Epoch
-    /// entry names it, this device may hold it, it does not, and an entry
-    /// waits for it or it is the epoch in force.
-    fn owed_keys(&self, space: &Name) -> Vec<EpochId>;
-
-    /// The public half of this device's recipient key: the seal key its
-    /// grant asks name.
-    fn seal_public(&self) -> [u8; 32];
-
-    /// Judge a packet signed by a device key that is not an entry (a seal
-    /// key packet, a grant) for `space`, valid only if the key is
-    /// `device`'s (`Judge::validate_device_packet`).
-    async fn validate_device_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged;
-
-    /// A grant arrived: unwrap `content` (wrapped under the grant's `name`)
-    /// with the recipient key and hold the key for `epoch` if it matches the
-    /// check of a held owner-signed Epoch entry (`Log::key_arrived`), which
-    /// opens what it unlocks. Whether the key was taken.
-    fn key_arrived(&self, space: &Name, epoch: &EpochId, name: &Name, content: Bytes) -> bool;
-
-    // -- grants, granter side ---------------------------------------------------
-
-    /// A counter that moves whenever a verdict given before may have changed
-    /// for the worse (`Judge::generation`): what a granter's kept seal keys and
-    /// grants are valid for.
-    fn generation(&self) -> u64;
-
-    /// Whether the key of `epoch` of `space` may be granted to a device
-    /// `asker`: all five conditions of `seal::may_grant` for the asker's
-    /// person and device key, and an epoch this device made only once its entry
-    /// is durable. `key` is the key that signed the asker's seal key packet
-    /// once that is judged (`None` before: the condition on it is not
-    /// checked).
-    fn may_grant(
-        &self,
-        space: &Name,
-        epoch: &EpochId,
-        asker: &Name,
-        key: Option<&Name>,
-    ) -> Result<(), GrantRefusal>;
-
-    /// The grant packet named `name`, wrapping the key of `epoch` to the seal
-    /// key `to` of device `asker` (whose seal key packet `key` signed) and
-    /// signed by this device: decided again as [`Self::may_grant`]. `None`
-    /// when it is refused now or cannot be signed.
-    fn grant_packet(
-        &self,
-        space: &Name,
-        epoch: &EpochId,
-        asker: &Name,
-        key: &Name,
-        to: &[u8; 32],
-        name: &Name,
-    ) -> Option<Bytes>;
-}
+/// What the network half holds of the node: the node itself. Tests put the
+/// toy host of [`net_kit`] in its place behind a trait object.
+#[cfg(not(test))]
+pub(crate) type HostRef = Arc<crate::node::NodeInner>;
+#[cfg(test)]
+pub(crate) type HostRef = Arc<dyn net_kit::Host>;
 
 // -- Stopping --------------------------------------------------------------------------------------
 
@@ -285,7 +142,7 @@ impl Stop {
 /// What every group and the server share: the node, its tuning, its fetching
 /// and what a granter keeps.
 pub(crate) struct Shared {
-    pub(crate) host: Arc<dyn Host>,
+    pub(crate) host: HostRef,
     pub(crate) cfg: NetConfig,
     pub(crate) fetcher: Fetcher,
     pub(crate) grants: Granting,
@@ -315,7 +172,7 @@ impl Net {
     /// The one SVS driver, the packet pumps between it and `sync`, and the
     /// announcement of a group when a link comes up are started here.
     pub(crate) fn start(
-        host: Arc<dyn Host>,
+        host: HostRef,
         cfg: NetConfig,
         fetch: Arc<dyn Connection>,
         sync: Arc<dyn Connection>,
@@ -561,7 +418,7 @@ impl Group {
     }
 
     /// The counter of this device's own name rose to `seen`: the log hears
-    /// it ([`Host::note_own_counter`]: an alert if above the head, the
+    /// it (`NodeInner::note_own_counter`: an alert if above the head, the
     /// entries within its reservation wanted), the fetch notes it to probe
     /// the entry it names, and the pump wakes. Whether it rose.
     fn own_counter(&self, seen: u64) -> bool {
@@ -592,7 +449,7 @@ impl Group {
     /// fetch probes the entry it names. A device at counter 0 has written
     /// nothing and is ignored; a name nothing vouches for never displaces one
     /// that is vouched for; this device's own counter is the log's to alert
-    /// on ([`Host::note_own_counter`]).
+    /// on (`NodeInner::note_own_counter`).
     pub(crate) fn on_update(&self, update: SyncUpdate) {
         let host = &self.shared.host;
         let (device, high) = (update.name, update.high_seq);

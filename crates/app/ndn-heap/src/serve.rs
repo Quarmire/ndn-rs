@@ -4,7 +4,7 @@
 //! ([`served_kind`]):
 //!
 //! * `<D>/32=log/<S>/seq=<n>` and the pieces under it: the entry, as far as
-//!   the node lets it be served ([`Host::served`]): its own entry at or below
+//!   the node lets it be served (`NodeInner::served`): its own entry at or below
 //!   its head and not held back (a structural entry waits for its flush).
 //! * `<H>/32=held/<Name>`: a packet this device keeps of another device,
 //!   only if the node holds and admitted it (a follower serves what it
@@ -12,7 +12,7 @@
 //!   have been signed by this device.
 //! * `<D>/32=seal/<key>`: this device's seal key packet.
 //! * `<G>/32=grant/<ask>`: the key of an epoch, **only** when the node says
-//!   the asker may have it ([`Host::may_grant`]); anything else is not
+//!   the asker may have it (`NodeInner::may_grant`); anything else is not
 //!   answered and this device fetches nothing for it. Then the asker's seal key
 //!   packet is fetched and judged (once per key: kept while verified and while
 //!   the judge's generation is the one it was verified in), the node decides
@@ -35,7 +35,7 @@ use parking_lot::Mutex;
 
 use crate::rt;
 use crate::seal::seal_key_matches;
-use crate::sync::{Host, Net, Shared};
+use crate::sync::{HostRef, Net, Shared};
 use crate::trust::Judged;
 use crate::wire::{
     GrantAsk, Served, parse_grant_name, parse_held_name, parse_log_name, parse_piece_name,
@@ -57,7 +57,7 @@ const SEAL_LEARNING_MAX: usize = 64;
 const SEAL_LEARNING_PER_ASKER: usize = 2;
 
 /// A map that keeps the last `cap` entries put in it, for one generation of
-/// the judge (`Host::generation`): an entry put or asked for under another
+/// the judge (`NodeInner::generation`): an entry put or asked for under another
 /// generation is not there, and putting under a new one drops the rest. What
 /// a revocation may have changed is judged again, not served from here.
 struct Kept<V> {
@@ -166,8 +166,8 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
         return reply(&name, responder, None).await;
     }
     let packet = match served_kind(&name) {
-        Some(Served::Log) => log_packet(&*host, &me, &name),
-        Some(Served::Held) => held_packet(&*host, &me, &name),
+        Some(Served::Log) => log_packet(&host, &me, &name),
+        Some(Served::Held) => held_packet(&host, &me, &name),
         Some(Served::Seal) => parse_seal_key_name(&name)
             .filter(|(device, _)| *device == me)
             .and_then(|_| host.seal_key_packet(&name)),
@@ -206,7 +206,7 @@ async fn reply(name: &Name, responder: Responder, packet: Option<Bytes>) {
 }
 
 /// An entry of this device, or a piece under one, as the node serves it.
-fn log_packet(host: &dyn Host, me: &Name, name: &Name) -> Option<Bytes> {
+fn log_packet(host: &HostRef, me: &Name, name: &Name) -> Option<Bytes> {
     if let Some(log) = parse_log_name(name) {
         return if log.device == *me {
             host.served(&log.space, &log.device, log.seq)
@@ -226,7 +226,7 @@ fn log_packet(host: &dyn Host, me: &Name, name: &Name) -> Option<Bytes> {
 /// What this device answers under its own name (`32=held`) for the packet
 /// `original` of any device: only what the node serves, in a DigestSha256
 /// wrapper.
-fn held_packet(host: &dyn Host, me: &Name, name: &Name) -> Option<Bytes> {
+fn held_packet(host: &HostRef, me: &Name, name: &Name) -> Option<Bytes> {
     let (holder, original) = parse_held_name(name)?;
     if holder != *me {
         return None;

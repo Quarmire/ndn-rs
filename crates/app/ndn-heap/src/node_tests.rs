@@ -4,7 +4,7 @@
 //! Devices are real: each has a key certified by its namespace's root, and
 //! every device's validator holds every namespace's context and every
 //! certificate, so entries one node signs another can be handed
-//! (`Host::take`) and judged as a fetch would.
+//! (`NodeInner::take`) and judged as a fetch would.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,9 +22,95 @@ use super::*;
 use crate::error::NextStep;
 use crate::log::{Alert, Frontier};
 use crate::space::{Changes, MembersChange, PutOptions};
-use crate::sync::{Host, Taken};
+use crate::sync::Taken;
 use crate::test_kit::{CrashStore, Engine, Held, Metered, PowerCut, n};
 use crate::wire::{Entry, log_name};
+
+/// The network half reaches the node through the toy-host seam in tests
+/// (`sync::HostRef`); each method is the node's own.
+#[async_trait::async_trait]
+impl crate::sync::net_kit::Host for NodeInner {
+    fn device(&self) -> &Name {
+        NodeInner::device(self)
+    }
+    async fn take(&self, space: &Name, wire: Bytes, probe: bool) -> Taken {
+        NodeInner::take(self, space, wire, probe).await
+    }
+    fn missing(&self, space: &Name) -> Vec<Want> {
+        NodeInner::missing(self, space)
+    }
+    fn high(&self, space: &Name, device: &Name) -> u64 {
+        NodeInner::high(self, space, device)
+    }
+    fn head(&self, space: &Name) -> u64 {
+        NodeInner::head(self, space)
+    }
+    fn note_own_counter(&self, space: &Name, seen: u64) {
+        NodeInner::note_own_counter(self, space, seen);
+    }
+    fn vouched(&self, space: &Name, device: &Name) -> bool {
+        NodeInner::vouched(self, space, device)
+    }
+    fn standing(&self, space: &Name, device: &Name) -> Option<bool> {
+        NodeInner::standing(self, space, device)
+    }
+    fn served(&self, space: &Name, device: &Name, seq: u64) -> Option<Bytes> {
+        NodeInner::served(self, space, device, seq)
+    }
+    fn served_piece(&self, space: &Name, device: &Name, seq: u64, piece: &Name) -> Option<Bytes> {
+        NodeInner::served_piece(self, space, device, seq, piece)
+    }
+    fn seal_key_packet(&self, name: &Name) -> Option<Bytes> {
+        NodeInner::seal_key_packet(self, name)
+    }
+    fn blobs(&self, space: &Name) -> Vec<Blob> {
+        NodeInner::blobs(self, space)
+    }
+    fn held_piece(&self, space: &Name, name: &Name) -> Option<Bytes> {
+        NodeInner::held_piece(self, space, name)
+    }
+    fn keep_pieces(&self, space: &Name, ops: Vec<StoreOp>) {
+        NodeInner::keep_pieces(self, space, ops);
+    }
+    fn assembled(&self, space: &Name, blob: &Blob) {
+        NodeInner::assembled(self, space, blob);
+    }
+    fn owed_keys(&self, space: &Name) -> Vec<EpochId> {
+        NodeInner::owed_keys(self, space)
+    }
+    fn seal_public(&self) -> [u8; 32] {
+        NodeInner::seal_public(self)
+    }
+    async fn validate_device_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged {
+        NodeInner::validate_device_packet(self, space, data, device).await
+    }
+    fn key_arrived(&self, space: &Name, epoch: &EpochId, name: &Name, content: Bytes) -> bool {
+        NodeInner::key_arrived(self, space, epoch, name, content)
+    }
+    fn generation(&self) -> u64 {
+        NodeInner::generation(self)
+    }
+    fn may_grant(
+        &self,
+        space: &Name,
+        epoch: &EpochId,
+        asker: &Name,
+        key: Option<&Name>,
+    ) -> Result<(), GrantRefusal> {
+        NodeInner::may_grant(self, space, epoch, asker, key)
+    }
+    fn grant_packet(
+        &self,
+        space: &Name,
+        epoch: &EpochId,
+        asker: &Name,
+        key: &Name,
+        to: &[u8; 32],
+        name: &Name,
+    ) -> Option<Bytes> {
+        NodeInner::grant_packet(self, space, epoch, asker, key, to, name)
+    }
+}
 
 // -- The world the cases run in ----------------------------------------------------
 

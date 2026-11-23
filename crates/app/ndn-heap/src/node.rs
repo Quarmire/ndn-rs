@@ -3,7 +3,7 @@
 //! [`Node::start`] makes a device's heap layer: its identity checks, the
 //! flusher, the judge, the network half ([`Net`]), and every space the store
 //! holds, restored. [`NodeInner`] is what the network half asks questions of
-//! ([`Host`]) and what a [`Heap`] reaches its device through; each space is a
+//! (`take`, `missing`, `served`, …) and what a [`Heap`] reaches its device through; each space is a
 //! [`SpaceInner`] (one log behind one lock, its publisher, its watchers).
 //!
 //! **Start**, in this order, so nothing the store holds is published before
@@ -45,7 +45,7 @@ use crate::seal::{self, GrantRefusal, Granter, Keys};
 use crate::serve;
 use crate::space::{Follower, Heap, Share, SpaceInner, check_audience, new_id};
 use crate::store::Kind;
-use crate::sync::{Host, Net, NetConfig, Taken};
+use crate::sync::{HostRef, Net, NetConfig, Taken};
 use crate::trust::{Adopter, Adoption, Judge, Judged};
 use crate::wire::{
     EpochId, MembersBody, Op, Role, device_of, is_device_name, is_namespace, log_name,
@@ -174,7 +174,7 @@ pub(crate) struct NodeInner {
     pub(crate) suspicion: Arc<Suspicion>,
     pub(crate) flusher: Arc<Flusher>,
     pub(crate) config: Config,
-    /// The network half; `None` once stopped (the cycle through its `Host`
+    /// The network half; `None` once stopped (the cycle through its host
     /// ends there).
     net: RwLock<Option<Arc<Net>>>,
     spaces: RwLock<BTreeMap<Name, Arc<SpaceInner>>>,
@@ -300,7 +300,7 @@ impl Node {
             inner: Arc::clone(&inner),
         };
         let net = Net::start(
-            Arc::clone(&inner) as Arc<dyn Host>,
+            Arc::clone(&inner) as HostRef,
             net_config,
             transport.node.connection(),
             transport.sync,
@@ -983,18 +983,10 @@ impl NodeInner {
             space.tell(Change::Alert(Alert::StoreFailed { why: why.clone() }));
         }
     }
-}
 
-// -- What the network half asks ----------------------------------------------------
+    // -- What the network half asks -------------------------------------------------
 
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-impl Host for NodeInner {
-    fn device(&self) -> &Name {
-        &self.device
-    }
-
-    async fn take(&self, space: &Name, wire: Bytes, probe: bool) -> Taken {
+    pub(crate) async fn take(&self, space: &Name, wire: Bytes, probe: bool) -> Taken {
         let refused = |why| Taken::Decided {
             outcome: Outcome::Refused(why),
             blobs: Vec::new(),
@@ -1053,21 +1045,21 @@ impl Host for NodeInner {
         Taken::Decided { outcome, blobs }
     }
 
-    fn missing(&self, space: &Name) -> Vec<Want> {
+    pub(crate) fn missing(&self, space: &Name) -> Vec<Want> {
         self.space_of(space)
             .map_or_else(Vec::new, |s| s.log.lock().missing())
     }
 
-    fn high(&self, space: &Name, device: &Name) -> u64 {
+    pub(crate) fn high(&self, space: &Name, device: &Name) -> u64 {
         self.space_of(space)
             .map_or(0, |s| s.log.lock().high(device))
     }
 
-    fn head(&self, space: &Name) -> u64 {
+    pub(crate) fn head(&self, space: &Name) -> u64 {
         self.space_of(space).map_or(0, |s| s.log.lock().head())
     }
 
-    fn note_own_counter(&self, space: &Name, seen: u64) {
+    pub(crate) fn note_own_counter(&self, space: &Name, seen: u64) {
         let Some(held) = self.space_of(space) else {
             return;
         };
@@ -1079,18 +1071,18 @@ impl Host for NodeInner {
         held.finish(&self.arc(), routed);
     }
 
-    fn vouched(&self, space: &Name, device: &Name) -> bool {
+    pub(crate) fn vouched(&self, space: &Name, device: &Name) -> bool {
         self.space_of(space)
             .is_some_and(|s| s.log.lock().vouches(device))
     }
 
-    fn standing(&self, space: &Name, device: &Name) -> Option<bool> {
+    pub(crate) fn standing(&self, space: &Name, device: &Name) -> Option<bool> {
         let held = self.space_of(space)?;
         let log = held.log.lock();
         log.vouches(device).then(|| log.held_prefix(device) > 0)
     }
 
-    fn served(&self, space: &Name, device: &Name, seq: u64) -> Option<Bytes> {
+    pub(crate) fn served(&self, space: &Name, device: &Name, seq: u64) -> Option<Bytes> {
         let held = self.space_of(space)?;
         // Whether an own entry may be served is decided under the log's lock:
         // a Members or Epoch entry is recorded as held back by the signing
@@ -1103,7 +1095,13 @@ impl Host for NodeInner {
         log.served(device, seq)
     }
 
-    fn served_piece(&self, space: &Name, device: &Name, seq: u64, piece: &Name) -> Option<Bytes> {
+    pub(crate) fn served_piece(
+        &self,
+        space: &Name,
+        device: &Name,
+        seq: u64,
+        piece: &Name,
+    ) -> Option<Bytes> {
         if !piece.has_prefix(&log_name(device, space, seq)) {
             return None;
         }
@@ -1111,35 +1109,35 @@ impl Host for NodeInner {
         self.store.get(piece)
     }
 
-    fn seal_key_packet(&self, name: &Name) -> Option<Bytes> {
+    pub(crate) fn seal_key_packet(&self, name: &Name) -> Option<Bytes> {
         let (device, public) = parse_seal_key_name(name)?;
         (device == self.device && public == self.seal_public).then(|| self.seal_packet.clone())
     }
 
-    fn blobs(&self, space: &Name) -> Vec<Blob> {
+    pub(crate) fn blobs(&self, space: &Name) -> Vec<Blob> {
         self.space_of(space)
             .map_or_else(Vec::new, |s| s.unassembled(self))
     }
 
-    fn held_piece(&self, space: &Name, name: &Name) -> Option<Bytes> {
+    pub(crate) fn held_piece(&self, space: &Name, name: &Name) -> Option<Bytes> {
         self.space_of(space)?;
         self.store.get(name)
     }
 
-    fn keep_pieces(&self, space: &Name, ops: Vec<StoreOp>) {
+    pub(crate) fn keep_pieces(&self, space: &Name, ops: Vec<StoreOp>) {
         if self.space_of(space).is_some() {
             self.store.apply(ops);
             self.flusher.note_write();
         }
     }
 
-    fn assembled(&self, space: &Name, blob: &Blob) {
+    pub(crate) fn assembled(&self, space: &Name, blob: &Blob) {
         if let Some(held) = self.space_of(space) {
             held.assembled(&self.arc(), blob);
         }
     }
 
-    fn owed_keys(&self, space: &Name) -> Vec<EpochId> {
+    pub(crate) fn owed_keys(&self, space: &Name) -> Vec<EpochId> {
         let Some(held) = self.space_of(space) else {
             return Vec::new();
         };
@@ -1160,15 +1158,26 @@ impl Host for NodeInner {
             .collect()
     }
 
-    fn seal_public(&self) -> [u8; 32] {
+    pub(crate) fn seal_public(&self) -> [u8; 32] {
         self.seal_public
     }
 
-    async fn validate_device_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged {
+    pub(crate) async fn validate_device_packet(
+        &self,
+        space: &Name,
+        data: &Data,
+        device: &Name,
+    ) -> Judged {
         self.judge.validate_device_packet(data, device, space).await
     }
 
-    fn key_arrived(&self, space: &Name, epoch: &EpochId, name: &Name, content: Bytes) -> bool {
+    pub(crate) fn key_arrived(
+        &self,
+        space: &Name,
+        epoch: &EpochId,
+        name: &Name,
+        content: Bytes,
+    ) -> bool {
         let Some(held) = self.space_of(space) else {
             return false;
         };
@@ -1184,11 +1193,11 @@ impl Host for NodeInner {
         taken
     }
 
-    fn generation(&self) -> u64 {
+    pub(crate) fn generation(&self) -> u64 {
         self.judge.generation()
     }
 
-    fn may_grant(
+    pub(crate) fn may_grant(
         &self,
         space: &Name,
         epoch: &EpochId,
@@ -1218,7 +1227,7 @@ impl Host for NodeInner {
         Ok(())
     }
 
-    fn grant_packet(
+    pub(crate) fn grant_packet(
         &self,
         space: &Name,
         epoch: &EpochId,

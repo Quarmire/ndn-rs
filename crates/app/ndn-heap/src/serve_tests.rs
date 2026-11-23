@@ -15,7 +15,7 @@ use ndn_packet::{Data, NackReason};
 use super::*;
 use crate::seal::GrantRefusal;
 use crate::sync::net_kit::*;
-use crate::sync::{Host, Net, NetConfig};
+use crate::sync::{Net, NetConfig};
 use crate::test_kit::n;
 use crate::wire::{
     EpochId, GrantAsk, PieceKind, encode_seal_key, grant_name, held_name, log_name, piece_name,

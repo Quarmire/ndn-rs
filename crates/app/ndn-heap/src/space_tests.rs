@@ -14,7 +14,6 @@ use crate::log::Alert;
 use crate::node::tests::{
     boot, bytes, cfg, deliver, durable, next, private, public, solo, space, until, world,
 };
-use crate::sync::Host;
 use crate::test_kit::n;
 use crate::wire::{Body, Entry, log_name};
 

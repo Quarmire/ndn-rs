@@ -791,10 +791,7 @@ impl SpaceInner {
     fn blob_change(&self, node: &NodeInner, blob: &Blob) -> Option<Change> {
         let bytes = self.read_blob(node, blob).ok()?;
         let log = self.log.lock();
-        let (path, head) = log
-            .register()
-            .values()
-            .find(|(_, h)| EntryId::from(&h.entry) == blob.id)?;
+        let (path, head) = log.register().values().find(|(_, h)| h.entry == blob.id)?;
         Some(Change::Put(head.item(path, bytes)))
     }
 
@@ -807,7 +804,7 @@ impl SpaceInner {
             .lock()
             .register()
             .values()
-            .any(|(_, h)| EntryId::from(&h.entry) == blob.id);
+            .any(|(_, h)| h.entry == blob.id);
         if !current {
             return;
         }
@@ -1019,7 +1016,7 @@ impl Heap {
         let bytes = inner.read_blob(&self.node, &blob)?;
         let log = inner.log.lock();
         match log.register().value(path) {
-            Some(head) if EntryId::from(&head.entry) == blob.id => Ok(Some(head.item(path, bytes))),
+            Some(head) if head.entry == blob.id => Ok(Some(head.item(path, bytes))),
             _ => log.get(path),
         }
     }
