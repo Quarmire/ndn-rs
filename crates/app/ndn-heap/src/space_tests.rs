@@ -382,7 +382,9 @@ async fn a_path_the_codec_accepts_is_not_refused() {
     // 8 components of 22 octets: the codec counts a 2-octet header each, 192
     // in all, under its limit of 200.
     let part = "a".repeat(22);
-    let path = n(&format!("/{part}/{part}/{part}/{part}/{part}/{part}/{part}/{part}"));
+    let path = n(&format!(
+        "/{part}/{part}/{part}/{part}/{part}/{part}/{part}/{part}"
+    ));
     heap.put(&path, bytes("deep"), PutOptions::default())
         .await
         .expect("a path the codec carries is carried");
@@ -398,7 +400,10 @@ async fn an_audience_over_the_cap_is_refused_before_anything_is_signed() {
         .create(&space(), private(&refs))
         .await
         .expect_err("300 readers are more than an epoch lists");
-    assert!(matches!(refused, HeapError::BadRequest { .. }), "{refused:?}");
+    assert!(
+        matches!(refused, HeapError::BadRequest { .. }),
+        "{refused:?}"
+    );
     assert_eq!(refused.next(), NextStep::FixRequest);
     let text = refused.to_string();
     assert!(text.contains("256") && text.contains("301"), "{text}");
@@ -419,13 +424,16 @@ async fn an_audience_over_the_cap_is_refused_before_anything_is_signed() {
         .expect_err("250 + 50 + the owner is over the cap");
     assert_eq!(refused.next(), NextStep::FixRequest);
     assert_eq!(node.inner.head(&space()), head, "nothing was signed");
-    assert_eq!(heap.members().readers, Readers::Persons({
-        let mut all = vec![n("/alice")];
-        let mut rest: Vec<Name> = few.iter().map(|r| n(r)).collect();
-        rest.sort();
-        all.extend(rest);
-        all
-    }));
+    assert_eq!(
+        heap.members().readers,
+        Readers::Persons({
+            let mut all = vec![n("/alice")];
+            let mut rest: Vec<Name> = few.iter().map(|r| n(r)).collect();
+            rest.sort();
+            all.extend(rest);
+            all
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -449,7 +457,10 @@ async fn a_writer_outside_the_audience_is_told_so_not_to_retry() {
         .put(&n("/a"), bytes("x"), PutOptions::default())
         .await
         .expect_err("bob may write and cannot seal");
-    assert!(matches!(refused, HeapError::NotAllowed { .. }), "{refused:?}");
+    assert!(
+        matches!(refused, HeapError::NotAllowed { .. }),
+        "{refused:?}"
+    );
     assert_eq!(refused.next(), NextStep::AskOwner);
     let text = refused.to_string();
     assert!(
@@ -510,9 +521,16 @@ async fn a_refusal_the_judge_or_the_mark_makes_is_alerted_once_and_replayed() {
     })
     .await;
     match alert {
-        Alert::Refused { id: refused, why, next } => {
+        Alert::Refused {
+            id: refused,
+            why,
+            next,
+        } => {
             assert_eq!(refused.seq, id.seq);
-            assert!(matches!(why, crate::error::Refusal::Suspected { .. }), "{why:?}");
+            assert!(
+                matches!(why, crate::error::Refusal::Suspected { .. }),
+                "{why:?}"
+            );
             assert_eq!(next, why.next());
         }
         other => panic!("{other:?}"),

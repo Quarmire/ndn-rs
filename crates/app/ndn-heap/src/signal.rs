@@ -331,6 +331,7 @@ fn own_gate(log: &Log, judge: &Judge, reads: bool) -> Result<(), HeapError> {
     tracing::debug!(space = %log.space(), key = %log.key(), "signals refused: {why}");
     Err(HeapError::NotAllowed {
         space: log.space().clone(),
+        why: format!("{why}; ask the owner to add this device's person to the space"),
     })
 }
 

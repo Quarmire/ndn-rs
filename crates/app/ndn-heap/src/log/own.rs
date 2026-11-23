@@ -144,6 +144,9 @@ impl Log {
             } else {
                 HeapError::NotAllowed {
                     space: self.space.clone(),
+                    why: "this device's person is not a writer of the space; ask the owner to \
+                          add it as a writer"
+                        .into(),
                 }
             });
         }

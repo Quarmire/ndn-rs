@@ -32,7 +32,7 @@ use ndn_foundation_types::Name;
 use ndn_sync::DataStore;
 use parking_lot::Mutex;
 
-use crate::error::HeapError;
+use crate::error::{HeapError, Refusal};
 use crate::fold::Readers;
 use crate::log::{Alert, Blob, Change, Effects, Frontier, Log, Members, Signed, Step};
 use crate::node::NodeInner;
@@ -44,8 +44,8 @@ use crate::seal;
 use crate::sync::{Group, TIMELINE};
 use crate::trust::Listing;
 use crate::wire::{
-    ChunksBody, INLINE_MAX, MembersBody, Op, PATH_COMPONENTS_MAX, PATH_OCTETS_MAX, PAYLOAD_MAX,
-    Payload, Role, log_name, owns,
+    AUDIENCE_MAX, ChunksBody, INLINE_MAX, MembersBody, Op, PAYLOAD_MAX, Payload, Role, log_name,
+    owns, parse_log_name, signed_digest_of,
 };
 
 #[cfg(test)]
@@ -227,13 +227,33 @@ pub(crate) struct SpaceInner {
     /// Alerts that stay true (evidence of rollback, of equivocation): a
     /// watcher that begins later is told them after the heads.
     standing: Mutex<Vec<Alert>>,
+    /// The entries whose refusal was told, last [`REFUSED_MAX`], with the
+    /// alert: a watcher that begins later is told them after the heads.
+    refused: Mutex<VecDeque<(Name, Alert)>>,
 }
 
 /// The most standing alerts a space keeps for watchers that begin later.
 const STANDING_MAX: usize = 32;
 
+/// The most refused entries a space remembers having told.
+const REFUSED_MAX: usize = 256;
+
 /// A signing step run under the lock: `None` when there is nothing to sign.
 type Sign<'a> = &'a mut (dyn FnMut(&mut Log) -> Result<Option<Step<Signed>>, HeapError> + Send);
+
+/// A sealed space lists at most [`AUDIENCE_MAX`] readers, the owner among
+/// them: an epoch names them all. Checked before anything is signed.
+pub(crate) fn check_audience(readers: usize) -> Result<(), HeapError> {
+    if readers > AUDIENCE_MAX {
+        return Err(HeapError::BadRequest {
+            why: format!(
+                "a sealed space lists at most {AUDIENCE_MAX} readers, the owner included, and \
+                 this asks for {readers}: list fewer readers, or make the space public"
+            ),
+        });
+    }
+    Ok(())
+}
 
 fn flush_error(e: FlushError) -> HeapError {
     HeapError::Local {
@@ -241,29 +261,13 @@ fn flush_error(e: FlushError) -> HeapError {
     }
 }
 
-/// A path is 1 to 8 generic components of at most 200 octets in all.
+/// A path is the codec's: 1 to 8 generic components within its octet limit
+/// (`wire::check_path`, the one definition).
 fn check_path(path: &Name) -> Result<(), HeapError> {
-    let comps = path.components();
-    let octets: usize = comps.iter().map(|c| c.value.len() + 4).sum();
-    let bad = |why: &str| HeapError::BadName {
+    crate::wire::check_path(path).map_err(|e| HeapError::BadName {
         name: path.clone(),
-        why: why.into(),
-    };
-    if comps.is_empty() || comps.len() > PATH_COMPONENTS_MAX {
-        return Err(bad("a path is 1 to 8 components below the space"));
-    }
-    if comps
-        .iter()
-        .any(|c| c.typ != ndn_foundation_types::tlv_type::GENERIC_NAME_COMPONENT)
-    {
-        return Err(bad(
-            "a path has generic components only (no keyword, digest or typed component)",
-        ));
-    }
-    if octets > PATH_OCTETS_MAX {
-        return Err(bad("a path is at most 200 octets in all"));
-    }
-    Ok(())
+        why: e.to_string(),
+    })
 }
 
 impl SpaceInner {
@@ -285,6 +289,7 @@ impl SpaceInner {
             held_back: Mutex::new(Vec::new()),
             whole: Mutex::new(HashSet::new()),
             standing: Mutex::new(Vec::new()),
+            refused: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -413,6 +418,7 @@ impl SpaceInner {
             }
             let wait = {
                 let mut log = self.log.lock();
+                self.own_key_refusal(node, &log)?;
                 match step(&mut log)? {
                     None => return Ok(None),
                     Some(Step::Done(signed)) => {
@@ -482,6 +488,118 @@ impl SpaceInner {
             }
             node.nudge(&self.name);
             rt::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A device whose own key is revoked by a context held here, or marked
+    /// suspected, signs nothing: peers would refuse it, and the host should
+    /// hear why now.
+    fn own_key_refusal(&self, node: &NodeInner, log: &Log) -> Result<(), HeapError> {
+        let key = log.key();
+        let ctx = node.judge.validator().keyring().context_for(key);
+        let why = if ctx.is_revoked(key) {
+            Refusal::Untrusted {
+                why: format!(
+                    "the trust context of {} revokes this device's key {key}: it signs nothing \
+                     until the namespace's owner enrolls the device with a new key",
+                    ctx.namespace()
+                ),
+            }
+        } else if let Some(since) = log.suspected(key) {
+            Refusal::Suspected {
+                key: key.clone(),
+                since,
+            }
+        } else {
+            return Ok(());
+        };
+        Err(HeapError::Refused {
+            name: log_name(log.device(), &self.name, log.next_seq()),
+            why,
+        })
+    }
+
+    /// A writer that is no reader of a sealed space cannot seal in it: told
+    /// as it is, not as a wait that never ends.
+    fn may_seal(&self, log: &Log) -> Result<(), HeapError> {
+        let (fold, person) = (log.fold(), log.person());
+        if log.sealed() && fold.is_writer(person) && !fold.is_reader(person) {
+            return Err(HeapError::NotAllowed {
+                space: self.name.clone(),
+                why: "the space is sealed and this device's person may write but is not in its \
+                      audience, so nothing it writes could be sealed for the readers; ask the \
+                      owner to add this person as a reader"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// What a read of a sealed space with an entry held closed answers: a
+    /// wait when this device's person reads the space and is in the audience
+    /// of every epoch whose key it lacks (the key comes by the grant pull),
+    /// else [`HeapError::Sealed`].
+    fn sealed_error(&self, log: &Log) -> HeapError {
+        let (fold, person) = (log.fold(), log.person());
+        let waits = fold.is_reader(person)
+            && fold
+                .epochs()
+                .iter()
+                .filter(|e| log.keys().key(&self.name, e).is_none())
+                .all(|e| fold.audience(e).contains(person));
+        if waits {
+            HeapError::NotReady {
+                name: self.name.clone(),
+                why: "an entry of it is sealed in an epoch whose key this device is entitled to \
+                      and is being fetched from the devices that hold it (the grant pull)"
+                    .into(),
+            }
+        } else {
+            HeapError::Sealed {
+                space: self.name.clone(),
+            }
+        }
+    }
+
+    /// Tell the watchers, once per entry, that `why` refused it: the judge's
+    /// refusals and the mark on its key, which the log alerts nothing of. A
+    /// transient bad signature, a cut (the log alerts it) and the rest are
+    /// not told here.
+    pub(crate) fn alert_refusal(&self, name: &Name, id: EntryId, why: &Refusal) {
+        if !matches!(
+            why,
+            Refusal::Lapsed { .. } | Refusal::Untrusted { .. } | Refusal::Suspected { .. }
+        ) {
+            return;
+        }
+        let alert = Alert::Refused {
+            id,
+            why: why.clone(),
+            next: why.next(),
+        };
+        {
+            let mut told = self.refused.lock();
+            if told.iter().any(|(n, _)| n == name) {
+                return;
+            }
+            if told.len() >= REFUSED_MAX {
+                told.pop_front();
+            }
+            told.push_back((name.clone(), alert.clone()));
+        }
+        tracing::warn!(space = %self.name, entry = %name, ?why, "an entry is refused");
+        self.tell(Change::Alert(alert));
+    }
+
+    /// [`Self::alert_refusal`] for a packet and what refused it.
+    pub(crate) fn alert_refused_packet(&self, data: &ndn_packet::Data, why: &Refusal) {
+        if let Some(entry) = parse_log_name(&data.name) {
+            let id = EntryId {
+                device: entry.device,
+                seq: entry.seq,
+                digest: signed_digest_of(data),
+            };
+            self.alert_refusal(&data.name, id, why);
         }
     }
 
@@ -653,6 +771,7 @@ impl Heap {
         let now = self.node.now();
         self.inner
             .sign_with(&self.node, |log| {
+                self.inner.may_seal(log)?;
                 log.put(path, Payload::Inline(bytes.clone()), vec![], now)
             })
             .await
@@ -666,6 +785,7 @@ impl Heap {
         loop {
             let (seq, epoch, key) = {
                 let log = inner.log.lock();
+                inner.may_seal(&log)?;
                 let epoch = log.judge_own()?;
                 let key = epoch
                     .as_ref()
@@ -689,6 +809,7 @@ impl Heap {
             );
             let signed = inner
                 .attempt(&self.node, &mut |log| {
+                    inner.may_seal(log)?;
                     if log.next_seq() != seq || log.judge_own()? != epoch {
                         return Ok(None);
                     }
@@ -714,6 +835,7 @@ impl Heap {
             let log = inner.log.lock();
             inner.check_reader(&log)?;
             match log.get(path) {
+                Err(HeapError::Sealed { .. }) => return Err(inner.sealed_error(&log)),
                 Err(e @ HeapError::Unavailable { .. }) => match log.blob_head(path) {
                     Some(blob) => blob,
                     None => return Err(e),
@@ -743,6 +865,13 @@ impl Heap {
                 .map(Change::Put)
                 .collect();
             listed.extend(inner.standing.lock().iter().cloned().map(Change::Alert));
+            listed.extend(
+                inner
+                    .refused
+                    .lock()
+                    .iter()
+                    .map(|(_, a)| Change::Alert(a.clone())),
+            );
             let queue = Queue::new(listed, self.node.config.watch_queue);
             inner.watchers.lock().push(Arc::clone(&queue));
             (queue, blobs)
@@ -794,6 +923,15 @@ impl Heap {
             let log = inner.log.lock();
             let fold = log.fold();
             let in_force = fold.in_force();
+            if let Readers::Persons(current) = fold.readers() {
+                let mut after: BTreeSet<Name> = current.into_iter().collect();
+                for person in &c.remove {
+                    after.remove(person);
+                }
+                after.extend(c.add_readers.iter().cloned());
+                after.insert(fold.owner().clone());
+                check_audience(after.len())?;
+            }
             let mut ops: Vec<Op> = c.remove.iter().flat_map(|p| log.remove_ops(p)).collect();
             let mut added = BTreeSet::new();
             for (who, role, standing) in c

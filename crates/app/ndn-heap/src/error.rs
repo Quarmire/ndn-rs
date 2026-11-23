@@ -249,10 +249,12 @@ pub enum HeapError {
         limit: u64,
     },
     /// This device's key may not write into the space.
-    #[error("this device's key may not write into {space}; ask the owner to add it as a writer")]
+    #[error("this device may not write into {space}: {why}")]
     NotAllowed {
         /// The space.
         space: Name,
+        /// Why, and what to do about it.
+        why: String,
     },
     /// This device is not in the data's seal audience.
     #[error(
@@ -390,7 +392,10 @@ mod tests {
                 name: n(),
                 limit: 8000,
             },
-            HeapError::NotAllowed { space: n() },
+            HeapError::NotAllowed {
+                space: n(),
+                why: "its person is no writer; ask the owner to add it".into(),
+            },
             HeapError::Sealed { space: n() },
             HeapError::NotOwner { space: n() },
             HeapError::BadRequest {
@@ -610,7 +615,10 @@ mod tests {
             (Code::NotMember, Next::AskOwner)
         );
         assert_eq!(
-            of(HeapError::NotAllowed { space: n() }),
+            of(HeapError::NotAllowed {
+                space: n(),
+                why: "x".into()
+            }),
             (Code::NotMember, Next::AskOwner)
         );
         assert_eq!(

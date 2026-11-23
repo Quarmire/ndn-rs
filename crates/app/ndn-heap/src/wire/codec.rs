@@ -299,7 +299,7 @@ fn component_octets(c: &NameComponent) -> usize {
     header + len
 }
 
-fn check_path(path: &Name) -> Result<(), WireError> {
+pub(crate) fn check_path(path: &Name) -> Result<(), WireError> {
     let comps = path.components();
     if comps.is_empty()
         || comps.len() > PATH_COMPONENTS_MAX
