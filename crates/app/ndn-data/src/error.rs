@@ -128,6 +128,11 @@ pub enum Refusal {
         /// The rule in force.
         in_force: Name,
     },
+    /// Its writer signed it (the signature verifies), and it is not a record
+    /// this build reads: a kind of an earlier release this build no longer
+    /// has (a hold, a prune, a group of versions), or of a later one. It is
+    /// skipped: the writer's later versions do not wait for it.
+    Unread,
 }
 
 impl std::fmt::Display for Refusal {
@@ -228,6 +233,12 @@ impl std::fmt::Display for Refusal {
                 made_for
                     .as_ref()
                     .map_or_else(|| "none".to_owned(), ToString::to_string)
+            ),
+            Refusal::Unread => f.write_str(
+                "its writer signed it, and it is not a kind of record this build reads (one \
+                 of an earlier release this build no longer has, or of a later release): it \
+                 is skipped, and the writer's later versions apply without it; run a build \
+                 that reads it if it is a later release's",
             ),
         }
     }
@@ -386,9 +397,10 @@ impl DataError {
                 | Refusal::Untrusted { .. }
                 | Refusal::BeyondOwnLog { .. } => NextStep::AskOwner,
                 Refusal::BadSignature | Refusal::Rollback => NextStep::RetryLater,
-                Refusal::Unsealed | Refusal::Parent { .. } | Refusal::OtherRule { .. } => {
-                    NextStep::None
-                }
+                Refusal::Unsealed
+                | Refusal::Parent { .. }
+                | Refusal::OtherRule { .. }
+                | Refusal::Unread => NextStep::None,
             },
             DataError::NotAllowed { .. } | DataError::Sealed { .. } => NextStep::AskOwner,
             DataError::NotOwner { .. } => NextStep::UseOwnerDevice,

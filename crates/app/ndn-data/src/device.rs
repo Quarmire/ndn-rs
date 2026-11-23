@@ -7185,11 +7185,13 @@ impl Inner {
 
     /// Verify and take a fetched log entry named `name`. A packet that is
     /// not its name's writer's — a signature that fails, a signer of
-    /// another device (checked before the chain walk), a record that does
-    /// not decode or is about another collection — is refused as a packet
+    /// another device (checked before the chain walk), a record about
+    /// another collection — is refused as a packet
     /// and nothing is kept against the name: whoever answers an Interest can
     /// make such a packet, and the genuine copy may still come from another
-    /// source. Only what the genuine writer signed is decided against the
+    /// source. A record that does not decode is the writer's own once the
+    /// signature verifies, and is recorded against its name as refused for
+    /// what it carries ([`Self::refuse_unread`]). Only what the genuine writer signed is decided against the
     /// name ([`Self::take`]); so is a packet its key signed that a
     /// revocation refuses ([`Self::refuse_outside_cut`]). A new entry of a
     /// key suspected here is not taken ([`Refusal::Suspected`]), nor one
@@ -7200,6 +7202,43 @@ impl Inner {
     /// judged again ([`Self::rejudge`]).
     async fn take_data(self: &Arc<Self>, name: &Name, data: Data) -> Result<(), Refusal> {
         self.take_entry(name, data, true).await
+    }
+
+    /// The entry `name`, verified as its writer's, does not decode as a
+    /// record this build reads (a kind of an earlier or a later release). It
+    /// is recorded against its name as refused for what it carries
+    /// ([`Refusal::Unread`]) and its seq is skipped, as any such entry is
+    /// ([`Coll::skipped`]): a walk that lists it completes, and the writer's
+    /// later versions do not wait for it for good. An entry about no
+    /// collection, or of a collection this device does not follow, is
+    /// dropped as a packet, as before.
+    fn refuse_unread(
+        &self,
+        name: &Name,
+        parsed: &wire::LogName,
+        writer: &Writer,
+    ) -> Result<(), Refusal> {
+        let Some(c) = &parsed.subject else {
+            return Err(Refusal::BadSignature);
+        };
+        let mut st = self.st.lock();
+        if st.held.contains_key(name) || st.refused.contains_key(name) {
+            return Ok(());
+        }
+        if !st.track(c, writer, self.config.writer_collections) {
+            return Err(Refusal::BadSignature);
+        }
+        st.ensure(c);
+        tracing::debug!(%name, "a verified entry of a kind this build does not read: skipped");
+        st.refused.insert(name.clone(), Refusal::Unread);
+        if let Some(coll) = st.colls.get_mut(c) {
+            coll.skipped
+                .entry(writer.clone())
+                .or_default()
+                .insert(parsed.seq);
+        }
+        st.apply_ready(c, &BTreeSet::new());
+        Ok(())
     }
 
     /// [`Self::take_data`]; `wake`: judge again what is withdrawn of its
@@ -7248,12 +7287,16 @@ impl Inner {
         if device_of(writer.key()).as_ref() != Some(&parsed.device) {
             return Err(Refusal::BadSignature);
         }
-        let Some(record) = data
+        let record = match data
             .content()
             .and_then(|c| wire::decode_record(c.clone()).ok())
-            .filter(|r| r.subject() == parsed.subject)
-        else {
-            return Err(Refusal::BadSignature);
+        {
+            Some(record) if record.subject() == parsed.subject => record,
+            Some(_) => return Err(Refusal::BadSignature),
+            // Its writer's key signed it (the signature is verified): a kind
+            // of record this build does not read, not a packet someone made
+            // up to answer an Interest.
+            None => return self.refuse_unread(name, &parsed, &writer),
         };
         // A version a removal cut keeps is taken only with the bytes the
         // cut's manifests list (spec §8): other bytes at its name are refused
@@ -14313,6 +14356,64 @@ mod tests {
         let st = dev.inner.st.lock();
         assert!(st.held.contains_key(&a) && !st.refused.contains_key(&a));
         drop(st);
+        dev.shutdown();
+    }
+
+    /// An entry its writer signed that this build cannot read (a kind of an
+    /// earlier release) is that writer's own, verified: it is recorded against
+    /// its name as refused for what it carries and skipped, so a walk that
+    /// lists it completes and the writer's later versions do not wait for it
+    /// for good.
+    #[tokio::test]
+    async fn a_verified_entry_this_build_cannot_read_is_skipped_not_waited_for() {
+        let ns = n("/sam");
+        let (authority, issuer, anchor) = authority(&ns).await;
+        let (sensor, reader) = (n("/sam/sensor"), n("/rita/phone"));
+        let (sensor_keys, key, cert) = device_key(&authority, &issuer, &sensor).await;
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        assert!(validator.add_trust_anchor(anchor));
+        validator.adopt_context(context("/rita")).unwrap();
+        validator.cert_cache().insert(cert);
+        let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+        let dev = start(&reader, &keys_of(&reader), &validator, &store)
+            .await
+            .unwrap();
+        let c = n("/sam/32=data/temps");
+        let (first, second) = (
+            log_name(&sensor, Some(&c), 1),
+            log_name(&sensor, Some(&c), 2),
+        );
+        // A hold of an earlier release, signed by the sensor's key.
+        let unread = Bytes::from_static(&[0xFD, 0x05, 0x25, 0x01, 0x00]);
+        assert!(wire::decode_record(unread.clone()).is_err());
+        let (packet, _) = signed(&sensor_keys, &key, &first, &unread);
+        dev.inner
+            .take_data(&first, Data::decode(packet).unwrap())
+            .await
+            .expect("a verified entry its writer signed is recorded, not dropped as a packet");
+        let writer = Writer::new(key.clone());
+        {
+            let st = dev.inner.st.lock();
+            assert!(
+                st.refused.contains_key(&first),
+                "refused for what it carries"
+            );
+            let waits = st.colls[&c].waits(&c);
+            let id = |seq| VersionId {
+                writer: writer.clone(),
+                seq: Seq(seq),
+            };
+            assert!(waits.never(&id(1)), "nothing waits for it");
+            assert!(!waits.never(&id(2)), "only it is skipped");
+        }
+        // The writer's next version is taken as any other.
+        let content = wire::encode_version(&version_body(&c, None));
+        let (next, _) = signed(&sensor_keys, &key, &second, &content);
+        dev.inner
+            .take_data(&second, Data::decode(next).unwrap())
+            .await
+            .expect("its later version is taken");
+        assert!(dev.inner.st.lock().held.contains_key(&second));
         dev.shutdown();
     }
 
