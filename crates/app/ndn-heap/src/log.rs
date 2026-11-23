@@ -802,6 +802,14 @@ impl Log {
 
     // -- Catch-up -----------------------------------------------------------------
 
+    /// Whether at least one entry of `device` is held in this space (any seq,
+    /// whatever became of it); a notice alone does not count.
+    pub(crate) fn holds(&self, device: &Name) -> bool {
+        self.devices
+            .get(device)
+            .is_some_and(|d| d.held.max().is_some())
+    }
+
     /// The highest seq heard of `device` (a notice) or held.
     pub(crate) fn high(&self, device: &Name) -> u64 {
         self.devices.get(device).map_or(0, |d| d.high)
