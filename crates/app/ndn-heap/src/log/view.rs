@@ -11,6 +11,7 @@ use ndn_sync::DataStore;
 
 use super::chain::{Dev, Status};
 use super::{Log, decode_wire};
+use crate::error::Refusal;
 use crate::fold::Fold;
 use crate::register::{Write, decode_refs};
 use crate::seal::{self, Keys};
@@ -126,5 +127,86 @@ pub(super) fn write_for(put: &PutBody, person: Name) -> Write {
         person,
         removal,
         size,
+    }
+}
+
+// -- What a revocation cut reads ---------------------------------------------------
+
+/// Where one held entry stands, as a revocation cut sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// Applied, or held closed: a cut may keep it.
+    Live,
+    /// Verified and does not decode: a cut leaves it out and lists it.
+    Unreadable,
+    /// Refused as outside a cut while its writer's person still writes: only
+    /// the revocation of its key does that.
+    Revoked,
+    /// Any other refusal, or waiting on a removal cut: not the key's work a
+    /// cut vouches for.
+    Gone,
+}
+
+/// One entry held of a device: what a cut reads of it.
+#[derive(Clone, Debug)]
+pub(crate) struct HeldEntry {
+    /// Its seq.
+    pub seq: u64,
+    /// Where it stands.
+    pub standing: Standing,
+    /// What was kept when it was verified; `None` if the record is gone or
+    /// cannot be read.
+    pub marker: Option<Marker>,
+    /// The packet at its name, only if it is the one the marker verified.
+    pub wire: Option<Bytes>,
+}
+
+impl Log {
+    /// Call `f` for every entry held of `device` in this space, by seq, one
+    /// at a time (a packet is read only for the entry at hand).
+    pub(crate) fn each_held(&self, device: &Name, mut f: impl FnMut(HeldEntry)) {
+        let Some(dev) = self.devices.get(device) else {
+            return;
+        };
+        let view = self.view();
+        let writes = self.fold.is_writer(&dev.person);
+        for seq in dev.held.seqs() {
+            let standing = match view.status(device, seq) {
+                None | Some(Status::Closed) => Standing::Live,
+                Some(Status::Unreadable) => Standing::Unreadable,
+                Some(Status::Refused(Refusal::OutsideCut(_))) if writes => Standing::Revoked,
+                Some(_) => Standing::Gone,
+            };
+            let marker = view.marker(device, seq);
+            let wire = view
+                .wire_at(device, seq)
+                .filter(|w| marker.is_some_and(|m| signed_digest(w) == m.signed_digest));
+            f(HeldEntry {
+                seq,
+                standing,
+                marker,
+                wire,
+            });
+        }
+    }
+
+    /// The keys marked suspected here.
+    pub(crate) fn suspected_keys(&self) -> Vec<Name> {
+        self.suspected.keys().cloned().collect()
+    }
+}
+
+// -- What the signal gate reads ----------------------------------------------------
+
+impl Log {
+    /// This device's key name, `<device>/KEY/<id>`.
+    pub(crate) fn key(&self) -> &Name {
+        &self.key
+    }
+
+    /// This device's person: the namespace of the context that vouches for
+    /// its key.
+    pub(crate) fn person(&self) -> &Name {
+        &self.person
     }
 }

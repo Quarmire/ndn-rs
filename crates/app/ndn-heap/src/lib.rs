@@ -29,7 +29,6 @@ mod node;
 mod pieces;
 mod register;
 mod reserve;
-#[cfg(feature = "wip-revocation")]
 mod revocation;
 mod seal;
 #[cfg(feature = "wip-serve")]

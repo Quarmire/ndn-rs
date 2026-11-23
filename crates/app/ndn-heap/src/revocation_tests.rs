@@ -321,7 +321,9 @@ async fn a_cut_keeps_exactly_what_the_device_holds_verified() {
 
     // No entry and no certificate: no public key to bind.
     let nothing = dev("/bob/tablet", "/bob", "k1", 9);
-    assert!(refusal(propose(&logs, &authority(), &nothing.key, &lost_at(2_000))).contains("public"));
+    assert!(
+        refusal(propose(&logs, &authority(), &nothing.key, &lost_at(2_000))).contains("public")
+    );
     // Neither bound given: say when the device was lost.
     assert!(
         refusal(propose(
@@ -333,7 +335,12 @@ async fn a_cut_keeps_exactly_what_the_device_holds_verified() {
         .contains("held_before")
     );
     // Not a key name.
-    refusal(propose(&logs, &authority(), &n("/bob/phone"), &lost_at(2_000)));
+    refusal(propose(
+        &logs,
+        &authority(),
+        &n("/bob/phone"),
+        &lost_at(2_000),
+    ));
 }
 
 /// The bound is this node's own observation: what it first verified at or
@@ -392,7 +399,10 @@ async fn an_unreadable_entry_is_left_out_and_listed() {
     let garbage = chain.unreadable();
     let three = chain.put("/c", "3");
     applied(&mut log, &one, 1_000);
-    assert_eq!(admit_as(&mut log, &garbage, None, 1_000), Outcome::Unreadable);
+    assert_eq!(
+        admit_as(&mut log, &garbage, None, 1_000),
+        Outcome::Unreadable
+    );
     applied(&mut log, &three, 1_000);
 
     let proposal = propose(&[&log], &authority(), &bob().key, &lost_at(2_000)).unwrap();
@@ -521,7 +531,11 @@ async fn the_cut_names_satisfy_check_cut_names() {
     let proposal = propose(&[&a, &b], &authority(), &bob().key, &bound).unwrap();
     assert_eq!(proposal.cut.ranges().len(), 2);
     for range in proposal.cut.ranges() {
-        assert!(range.prefix.has_prefix(&ndn_cert::device_log_of(&bob().key)));
+        assert!(
+            range
+                .prefix
+                .has_prefix(&ndn_cert::device_log_of(&bob().key))
+        );
     }
 
     let ctx = SignedTrustContext::hierarchical(n("/bob"));
@@ -566,7 +580,11 @@ fn judge_over(ctx: SignedTrustContext, certs: Vec<Certificate>) -> Arc<Judge> {
         cache.insert(cert);
     }
     let validator = Arc::new(Validator::with_keyring(keyring, cache, None, 5));
-    Judge::new(validator, Arc::new(MemoryStore::new()) as Arc<dyn DataStore>, None)
+    Judge::new(
+        validator,
+        Arc::new(MemoryStore::new()) as Arc<dyn DataStore>,
+        None,
+    )
 }
 
 /// The cut is made in the namespace of the context this node holds for the
@@ -624,7 +642,11 @@ async fn a_suspected_keys_new_entries_are_not_taken_until_its_revocation() {
 
     suspect(&mut [&mut a, &mut b], &bob().key, Timestamp(2_000)).unwrap();
     assert_eq!(suspected(&[&a, &b], &bob().key), Some(Timestamp(2_000)));
-    assert_eq!(b.suspected(&bob().key), Some(Timestamp(2_000)), "every space");
+    assert_eq!(
+        b.suspected(&bob().key),
+        Some(Timestamp(2_000)),
+        "every space"
+    );
     let refused = admit_as(&mut a, &two, None, 3_000);
     assert!(
         matches!(refused, Outcome::Refused(Refusal::Suspected { .. })),

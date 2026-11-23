@@ -103,6 +103,7 @@ mod tests;
 
 use chain::{Dev, Keeps, Kept, Ranges, Status};
 use view::View;
+pub(crate) use view::{HeldEntry, Standing};
 
 // -- Types the node and the API consume -----------------------------------------
 

@@ -63,7 +63,6 @@ wip-serve = []
 wip-node = []
 wip-space = []
 wip-signal = []
-wip-revocation = []
 
 [lints]
 workspace = true
