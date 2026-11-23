@@ -426,7 +426,7 @@ impl Log {
     pub(super) fn assess(&self, s: &Subject<'_>, entry: &Entry) -> Verdict {
         let structural = matches!(entry.body, Body::Members(_) | Body::Epoch(_));
         // 3. Only an owner device carries Members and Epoch entries.
-        if structural && !wire::owns(&self.space, s.key) {
+        if structural && !(wire::owns(&self.space, s.key) && s.person == self.fold.owner()) {
             return Verdict::Refuse(Refusal::NotMember);
         }
         // 4. The signer's person writes, or was removed and the entry is

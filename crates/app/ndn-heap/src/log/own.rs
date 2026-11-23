@@ -119,7 +119,7 @@ impl Log {
     }
 
     fn owner_only(&self) -> Result<(), HeapError> {
-        if wire::owns(&self.space, &self.key) {
+        if wire::owns(&self.space, &self.key) && self.person == *self.fold.owner() {
             Ok(())
         } else {
             Err(HeapError::NotOwner {
