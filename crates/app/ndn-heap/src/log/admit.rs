@@ -299,7 +299,9 @@ impl Log {
         // evidence of a key copy or an old image; below, it is adopted only
         // if this device's key signed it and it chains to what is held.
         if id.device == self.device {
-            let reserved = self.reservation.durable_r();
+            // What an earlier run could have signed: the durable `R` it left,
+            // not the extension this run wrote at open.
+            let reserved = self.floor_r;
             if id.seq > reserved {
                 let link = shaped.as_ref().map(|(_, d, s)| (*d, *s));
                 let status = Some(Status::Refused(Refusal::AboveReservation { reserved }));
@@ -319,6 +321,7 @@ impl Log {
             {
                 return Outcome::Refused(Refusal::Chain);
             }
+            self.next_seq = self.next_seq.max(id.seq + 1);
         }
 
         let Some((entry, prev, prev_seq)) = shaped else {

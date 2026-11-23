@@ -390,6 +390,9 @@ pub(crate) struct Log {
     next_seq: u64,
     /// The highest seq under this device's name in the store, whatever it is.
     own_head: u64,
+    /// The durable `R` the previous run left (read before this run's
+    /// extension): the highest seq an earlier run could have signed.
+    floor_r: u64,
     /// The entry the next own entry chains to: the newest own entry applied.
     own_tip: Option<Link>,
     devices: BTreeMap<Name, Dev>,
@@ -426,6 +429,9 @@ impl Log {
             .owner;
         let local = |why: String| HeapError::Local { reason: why };
         let head = store::own_head_from_names(&*stage, &device, &space);
+        let floor_r = store::read_reserve(&*stage, &space)
+            .map_err(|e| local(e.to_string()))?
+            .map_or(0, |r| r.r);
         let opened = Reservation::open(
             raw,
             flusher,
@@ -451,6 +457,7 @@ impl Log {
             reservation: Arc::new(opened.reservation),
             next_seq: opened.resume.first_seq,
             own_head: head.as_ref().map_or(0, |h| h.seq),
+            floor_r,
             own_tip: None,
             devices: BTreeMap::new(),
             kept: BTreeMap::new(),

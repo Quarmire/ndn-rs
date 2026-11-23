@@ -1042,9 +1042,18 @@ async fn a_devices_own_head_after_restart_comes_from_every_stored_own_entry_name
 #[tokio::test]
 async fn an_own_entry_above_r_durable_raises_rolledback_and_is_not_applied() {
     let me = laptop();
-    let mut r = rig(&me);
+    let image = Arc::new(CrashStore::new());
+    write_reserve(
+        &*image,
+        &space(),
+        ReserveRecord {
+            r: BLOCK,
+            clean: false,
+        },
+    );
+    let mut r = open_on(&image, &me);
     r.members(members(Some(true), vec![])).await;
-    let durable = r.log.reservation().durable_r();
+    let durable = BLOCK;
     // A copy of this device's key signed seq 500.
     let copy = sign_entry(
         &me,
@@ -1108,7 +1117,16 @@ async fn recovery_adopts_only_own_entries_that_verify_chain_and_lie_within_r_dur
 
     // A device that lost everything but its reservation record; peers
     // still hold what it signed.
-    let mut lost = open_on(&Arc::new(CrashStore::new()), &me);
+    let image = Arc::new(CrashStore::new());
+    write_reserve(
+        &*image,
+        &space(),
+        ReserveRecord {
+            r: BLOCK,
+            clean: false,
+        },
+    );
+    let mut lost = open_on(&image, &me);
     lost.flusher.flush().await.unwrap();
     assert!(lost.log.reservation().durable_r() >= 3);
     // 3 chains to 2, which is not held: not adopted, nothing stored.
@@ -1459,4 +1477,63 @@ async fn a_device_of_another_person_under_the_owners_name_does_not_sign_members_
         r.log.sign_epoch(vec![n("/alice")], NOW),
         Err(HeapError::NotOwner { .. })
     ));
+}
+
+#[tokio::test]
+async fn an_old_image_adopts_what_the_previous_run_could_have_signed_and_resumes_above_the_rest() {
+    // d12 at unit level: the image's R is BLOCK; peers hold seq 1..=12 of
+    // this device. What this run's own extension covers (9..=16) is not what
+    // an earlier run signed.
+    let me = laptop();
+    let mut source = rig(&me);
+    source.members(members(Some(true), vec![])).await;
+    for i in 0..11 {
+        source.put("/a", &i.to_string()).await;
+    }
+    let packet = |seq: u64| {
+        let wire = source
+            .store
+            .get(&log_name(&me.name, &space(), seq))
+            .unwrap();
+        Packet {
+            dev: me.clone(),
+            seq,
+            digest: signed_digest(&wire),
+            wire,
+        }
+    };
+    let image = Arc::new(CrashStore::new());
+    write_reserve(
+        &*image,
+        &space(),
+        ReserveRecord {
+            r: BLOCK,
+            clean: false,
+        },
+    );
+    let mut old = open_on(&image, &me);
+    old.flusher.flush().await.unwrap();
+    for seq in 1..=12 {
+        let a = old.admit(&packet(seq));
+        if seq <= BLOCK {
+            assert_eq!(a.outcome, Outcome::Applied, "seq {seq}");
+        } else {
+            assert_eq!(a.outcome, Outcome::Evidence, "seq {seq}");
+            assert!(has_alert(&a, |al| matches!(
+                al,
+                Alert::RolledBack { reserved, seen } if *reserved == BLOCK && *seen == seq
+            )));
+        }
+    }
+    assert_eq!(old.log.head(), 12);
+    assert_eq!(old.log.next_seq(), 13, "above everything a peer holds");
+    let s = old.members(members(None, vec![])).await;
+    assert_eq!(s.id.seq, 13);
+    assert!(s.effects.alerts.iter().any(|a| matches!(
+        a,
+        Alert::GapSigned {
+            after: 8,
+            resumed: 13
+        }
+    )));
 }
