@@ -8,8 +8,8 @@
 //! * [`PowerCut`] and [`ChildRun`] run the case on fjall and redb in a child
 //!   process that is killed with SIGKILL.
 //!
-//! The cluster of nodes the API cases run over joins this module as a
-//! submodule of its own, behind the `wip-test-kit` feature, when it lands.
+//! * [`cluster`]: devices over one `ndn_engine` forwarder, for the cases that
+//!   need more than one node.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
@@ -23,10 +23,9 @@ use ndn_foundation_types::Name;
 use ndn_sync::{DataStore, MemoryStore, StoreOp};
 use parking_lot::{Condvar, Mutex, RwLock};
 
+mod cluster;
 #[cfg(test)]
 mod tests;
-#[cfg(feature = "wip-test-kit")]
-mod cluster;
 
 /// A name from its URI. Panics on a malformed one: a test's typo.
 pub(crate) fn n(uri: &str) -> Name {
