@@ -60,6 +60,7 @@ enum MultiControl {
     },
     Leave(Name),
     Announce(Name),
+    PublishAt(Name, u64),
 }
 
 /// Spawn a multiplexed SVS driver over one shared face (`send`/`recv`). All
@@ -108,6 +109,18 @@ impl MultiSvs {
     /// Nothing when `group` is not joined.
     pub async fn announce(&self, group: Name) {
         let _ = self.control_tx.send(MultiControl::Announce(group)).await;
+    }
+
+    /// Publish in `group` with the application's own seq: the group's local
+    /// counter becomes `seq` (never lower than it was) and the state vector
+    /// is emitted at once. For a producer that numbers its own data: the
+    /// counter then names that data's seq, and a seq it never had is not
+    /// announced between two it did. Nothing when `group` is not joined.
+    pub async fn publish_at(&self, group: Name, seq: u64) {
+        let _ = self
+            .control_tx
+            .send(MultiControl::PublishAt(group, seq))
+            .await;
     }
 
     /// Stop the driver and every group it carries.
@@ -387,6 +400,12 @@ async fn multi_task(
                     gc.announce(&send).await;
                 }
             }
+
+            Event::Control(MultiControl::PublishAt(group, seq)) => {
+                if let Some(gc) = groups.get_mut(&group) {
+                    gc.on_publish_at(seq, &send).await;
+                }
+            }
         }
     }
 }
@@ -468,6 +487,32 @@ mod tests {
             assert_eq!(upd.high_seq, 1, "group {g}");
         }
         drop(a_handles);
+    }
+
+    /// A producer that numbers its own data publishes with that number: the
+    /// peer is told the counter is the seq, not one more than the last
+    /// counter, and a lower seq never lowers it.
+    #[tokio::test]
+    async fn publish_at_announces_the_seq_the_application_gives() {
+        let (a_send, a_recv, b_send, b_recv) = brokered();
+        let a = spawn_multi_svs("/node/a".parse().unwrap(), a_send, a_recv);
+        let b = spawn_multi_svs("/node/b".parse().unwrap(), b_send, b_recv);
+        let g: Name = "/g".parse().unwrap();
+        let _ha = a.join(g.clone(), cfg()).await.expect("A join");
+        let mut hb = b.join(g.clone(), cfg()).await.expect("B join");
+        async fn next(hb: &mut SyncHandle) -> crate::SyncUpdate {
+            tokio::time::timeout(Duration::from_secs(5), hb.recv())
+                .await
+                .expect("no update")
+                .expect("update")
+        }
+        a.publish_at(g.clone(), 7).await;
+        let upd = next(&mut hb).await;
+        assert_eq!((upd.publisher.as_str(), upd.high_seq), ("/node/a", 7));
+        a.publish_at(g.clone(), 3).await;
+        a.publish_at(g.clone(), 8).await;
+        let upd = next(&mut hb).await;
+        assert_eq!(upd.high_seq, 8, "a lower seq did not lower the counter");
     }
 
     /// A stalled group (its two-phase consumer never drains, so its update channel jams) must NOT

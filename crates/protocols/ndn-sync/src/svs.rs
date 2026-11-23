@@ -88,6 +88,12 @@ impl SvsNode {
         self.core.write().await.advance()
     }
 
+    /// Set the local sequence to `seq`, never lowering it, and return the
+    /// new value ([`SvsCore::advance_to`](ndn_svs_core::SvsCore::advance_to)).
+    pub async fn advance_to(&self, seq: u64) -> u64 {
+        self.core.write().await.advance_to(seq)
+    }
+
     /// Merge received state-vector entries, returning
     /// `(canonical_node_string, gap_from, gap_to)` seq ranges to fetch.
     ///

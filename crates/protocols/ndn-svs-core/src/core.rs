@@ -198,6 +198,19 @@ impl SvsCore {
         entry.1
     }
 
+    /// Set the local sequence number to `seq` (never lowering it) and return
+    /// the new value: for a producer whose data carries its own numbering, so
+    /// that the counter it advertises is the seq of the entry it publishes and
+    /// a seq it never had is not announced as if it were one.
+    pub fn advance_to(&mut self, seq: u64) -> u64 {
+        let entry = self
+            .vector
+            .entry(self.local_name.clone())
+            .or_insert((self.local_boot, 0));
+        entry.1 = entry.1.max(seq);
+        entry.1
+    }
+
     /// Merge received state-vector entries, returning
     /// `(canonical_node_string, gap_from, gap_to)` seq ranges to fetch.
     ///
@@ -375,6 +388,15 @@ mod tests {
             2,
             "advance continues from local, not remote"
         );
+    }
+
+    #[test]
+    fn advance_to_sets_the_local_seq_and_never_lowers_it() {
+        let mut node = SvsCore::with_boot_seq(&name("a"), 0, 2);
+        assert_eq!(node.advance_to(9), 9, "jumps to the seq of the entry");
+        assert_eq!(node.local_seq(), 9);
+        assert_eq!(node.advance_to(4), 9, "a lower seq changes nothing");
+        assert_eq!(node.advance(), 10, "advance continues from it");
     }
 
     #[test]

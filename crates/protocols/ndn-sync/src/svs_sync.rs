@@ -514,6 +514,17 @@ impl GroupCore {
         self.next_send = Instant::now() + jitter_interval(&self.config);
     }
 
+    /// A local publication whose seq the application numbers itself: the
+    /// counter becomes `seq` (never lower than it was), drop suppression,
+    /// announce immediately.
+    pub(crate) async fn on_publish_at(&mut self, seq: u64, send: &mpsc::Sender<Bytes>) {
+        self.node.advance_to(seq).await;
+        self.suppressing = false;
+        self.recorded.clear();
+        self.emit(send).await;
+        self.next_send = Instant::now() + jitter_interval(&self.config);
+    }
+
     /// Two-phase commit (D-44 / N-3): advance the deferred vector for a
     /// validated+stored `(publisher, seq)`.
     pub(crate) async fn on_ack(&mut self, key: &str, seq: u64) {
