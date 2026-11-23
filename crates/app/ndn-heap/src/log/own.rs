@@ -169,13 +169,11 @@ impl Log {
     /// `Ok(None)`: the next seq may be signed now; `Some(ticket)`: wait for it.
     fn gate(&self) -> Result<Option<Ticket>, HeapError> {
         if self.next_seq <= self.head() {
-            return Err(HeapError::Local {
-                reason: format!(
-                    "this device holds an entry of its own at seq {}, the last seq there is, so \
-                     it can sign no more in this space; use another device or another space",
-                    self.head()
-                ),
-            });
+            return Err(HeapError::local(format!(
+                "this device holds an entry of its own at seq {}, the last seq there is, so it \
+                 can sign no more in this space; use another device or another space",
+                self.head()
+            )));
         }
         Ok(self.reservation.sign_gate(self.next_seq)?)
     }
@@ -183,10 +181,7 @@ impl Log {
     /// The link the next own entry states: the stored tip, dense or with the
     /// signed gap statement; the zero digest when nothing is held.
     fn own_prev(&self, seq: u64) -> Option<Prev> {
-        let tip = self.own_tip.unwrap_or(Link {
-            seq: 0,
-            digest: [0; 32],
-        });
+        let tip = self.own_tip.unwrap_or_default();
         (seq > 1).then_some(Prev {
             digest: tip.digest,
             seq: (tip.seq.checked_add(1) != Some(seq)).then_some(tip.seq),

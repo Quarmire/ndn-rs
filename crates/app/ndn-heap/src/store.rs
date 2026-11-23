@@ -381,7 +381,7 @@ pub(crate) fn write_head(store: &dyn DataStore, space: &Name, head: Link) {
 // -- Own head and chains ---------------------------------------------------------
 
 /// One entry of a chain: its seq and signed-region digest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Link {
     /// The entry's seq.
     pub seq: u64,
