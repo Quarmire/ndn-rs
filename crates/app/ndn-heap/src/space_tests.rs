@@ -371,3 +371,180 @@ async fn a_path_that_is_no_path_is_refused_by_name() {
     assert!(matches!(e, HeapError::BadName { .. }), "{e:?}");
     assert_eq!(e.next(), NextStep::FixName);
 }
+
+// -- Findings of the spec owner's review ----------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_the_codec_accepts_is_not_refused() {
+    let dev = solo().await;
+    let (node, _) = boot(&dev, cfg()).await;
+    let heap = node.create(&space(), public()).await.unwrap();
+    // 8 components of 22 octets: the codec counts a 2-octet header each, 192
+    // in all, under its limit of 200.
+    let part = "a".repeat(22);
+    let path = n(&format!("/{part}/{part}/{part}/{part}/{part}/{part}/{part}/{part}"));
+    heap.put(&path, bytes("deep"), PutOptions::default())
+        .await
+        .expect("a path the codec carries is carried");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_audience_over_the_cap_is_refused_before_anything_is_signed() {
+    let dev = solo().await;
+    let (node, _) = boot(&dev, cfg()).await;
+    let readers: Vec<String> = (0..300).map(|i| format!("/r{i}")).collect();
+    let refs: Vec<&str> = readers.iter().map(String::as_str).collect();
+    let refused = node
+        .create(&space(), private(&refs))
+        .await
+        .expect_err("300 readers are more than an epoch lists");
+    assert!(matches!(refused, HeapError::BadRequest { .. }), "{refused:?}");
+    assert_eq!(refused.next(), NextStep::FixRequest);
+    let text = refused.to_string();
+    assert!(text.contains("256") && text.contains("301"), "{text}");
+    assert!(node.space(&space()).is_none(), "nothing was opened");
+    assert!(
+        !dev.store.contains(&log_name(&dev.name, &space(), 1)),
+        "nothing was signed"
+    );
+
+    // The same cap holds for a change of a space made within it.
+    let few: Vec<&str> = refs[..250].to_vec();
+    let heap = node.create(&space(), private(&few)).await.unwrap();
+    let head = node.inner.head(&space());
+    let more: Vec<&str> = refs[250..].to_vec();
+    let refused = heap
+        .change(changed(&[], &more, &[]))
+        .await
+        .expect_err("250 + 50 + the owner is over the cap");
+    assert_eq!(refused.next(), NextStep::FixRequest);
+    assert_eq!(node.inner.head(&space()), head, "nothing was signed");
+    assert_eq!(heap.members().readers, Readers::Persons({
+        let mut all = vec![n("/alice")];
+        let mut rest: Vec<Name> = few.iter().map(|r| n(r)).collect();
+        rest.sort();
+        all.extend(rest);
+        all
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_writer_outside_the_audience_is_told_so_not_to_retry() {
+    let devs = world(&["/alice/laptop", "/bob/laptop"]).await;
+    let (alice, _) = boot(&devs[0], cfg()).await;
+    alice
+        .create(
+            &space(),
+            Share {
+                readers: Readers::Persons(vec![n("/carol")]),
+                writers: vec![n("/bob")],
+            },
+        )
+        .await
+        .unwrap();
+    let (bob, _) = boot(&devs[1], cfg()).await;
+    let heap = bob.open(&space()).await.unwrap();
+    deliver(&devs[0], &bob).await;
+    let refused = heap
+        .put(&n("/a"), bytes("x"), PutOptions::default())
+        .await
+        .expect_err("bob may write and cannot seal");
+    assert!(matches!(refused, HeapError::NotAllowed { .. }), "{refused:?}");
+    assert_eq!(refused.next(), NextStep::AskOwner);
+    let text = refused.to_string();
+    assert!(
+        text.contains("sealed") && text.contains("audience") && text.contains("reader"),
+        "the refusal says why and what to do: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_audience_member_waiting_for_its_key_is_told_to_retry_not_sealed() {
+    let devs = world(&["/alice/laptop", "/bob/laptop"]).await;
+    let (alice, _) = boot(&devs[0], cfg()).await;
+    let heap = alice.create(&space(), private(&["/bob"])).await.unwrap();
+    heap.put(&n("/secret"), bytes("for bob"), PutOptions::default())
+        .await
+        .unwrap();
+    let (bob, _) = boot(&devs[1], cfg()).await;
+    let theirs = bob.open(&space()).await.unwrap();
+    deliver(&devs[0], &bob).await;
+    let waiting = theirs
+        .get(&n("/secret"))
+        .await
+        .expect_err("the entry is held closed: bob has no key yet");
+    assert!(matches!(waiting, HeapError::NotReady { .. }), "{waiting:?}");
+    assert_eq!(waiting.next(), NextStep::RetryLater);
+    assert!(
+        waiting.to_string().contains("grant"),
+        "it says the key is being fetched: {waiting}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_the_judge_or_the_mark_makes_is_alerted_once_and_replayed() {
+    let devs = world(&["/alice/laptop", "/bob/laptop"]).await;
+    let (alice, _) = boot(&devs[0], cfg()).await;
+    let heap = alice.create(&space(), public()).await.unwrap();
+    let (bob, _) = boot(&devs[1], cfg()).await;
+    let theirs = bob.open(&space()).await.unwrap();
+    deliver(&devs[0], &bob).await;
+    let mut changes = theirs.watch(&Frontier::new()).await.unwrap();
+    // Bob marks alice's laptop key suspected: its new entries are not taken.
+    let key = devs[0].name.clone().append("KEY").append("1");
+    bob.suspect(&key, crate::error::Timestamp(1)).unwrap();
+    let id = heap
+        .put(&n("/a"), bytes("x"), PutOptions::default())
+        .await
+        .unwrap();
+    let wire = devs[0]
+        .store
+        .get(&log_name(&devs[0].name, &space(), id.seq))
+        .unwrap();
+    for _ in 0..2 {
+        bob.inner.take(&space(), wire.clone()).await;
+    }
+    let alert = until(&mut changes, |c| match c {
+        Change::Alert(a @ Alert::Refused { .. }) => Some(a.clone()),
+        _ => None,
+    })
+    .await;
+    match alert {
+        Alert::Refused { id: refused, why, next } => {
+            assert_eq!(refused.seq, id.seq);
+            assert!(matches!(why, crate::error::Refusal::Suspected { .. }), "{why:?}");
+            assert_eq!(next, why.next());
+        }
+        other => panic!("{other:?}"),
+    }
+    // Once: the second take of the same entry says nothing more.
+    let more = tokio::time::timeout(Duration::from_millis(300), changes.next()).await;
+    assert!(more.is_err(), "told twice of one entry: {more:?}");
+    // A watcher that begins later is told what is still true.
+    let mut late = theirs.watch(&Frontier::new()).await.unwrap();
+    until(&mut late, |c| match c {
+        Change::Alert(Alert::Refused { .. }) => Some(()),
+        _ => None,
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_whose_key_is_revoked_here_is_refused_by_name() {
+    let dev = solo().await;
+    let (node, _) = boot(&dev, cfg()).await;
+    let heap = node.create(&space(), public()).await.unwrap();
+    let key = dev.name.clone().append("KEY").append("1");
+    let revoking = ndn_security::SignedTrustContext::hierarchical(n("/alice"))
+        .with_version(2)
+        .with_revocation(key);
+    dev.validator
+        .keyring()
+        .adopt_update(Arc::new(revoking))
+        .expect("adopted");
+    let refused = heap
+        .put(&n("/a"), bytes("x"), PutOptions::default())
+        .await
+        .expect_err("a revoked key signs nothing");
+    assert!(matches!(refused, HeapError::Refused { .. }), "{refused:?}");
+}
