@@ -2,7 +2,7 @@
 //! proof, a sealed payload shows only its size, the pieces of a payload land
 //! in one batch and only when all of them are held.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -422,18 +422,6 @@ fn the_plan_asks_for_nodes_before_chunks_and_never_beyond_the_window() {
     assert_eq!(wanted[1], piece_name(&e, PieceKind::Chunk(0)));
     assert_eq!(wanted[4], piece_name(&e, PieceKind::Chunk(3)));
     assert_eq!(asm.next_wanted(usize::MAX).len(), 1 + FANOUT);
-}
-
-#[test]
-fn the_pieces_a_holder_lacks_are_those_its_store_does_not_hold() {
-    let e = entry();
-    let pieces = split(&e, &payload(CHUNK * 3)).unwrap();
-    let all: Vec<Name> = pieces.packets.iter().map(|p| p.name.clone()).collect();
-    assert_eq!(pieces.wanted(|_| false), all);
-    assert!(pieces.wanted(|_| true).is_empty());
-    let held: BTreeSet<Name> = all[1..3].iter().cloned().collect();
-    let lacking = pieces.wanted(|name| held.contains(name));
-    assert_eq!(lacking, vec![all[0].clone(), all[3].clone()]);
 }
 
 #[test]

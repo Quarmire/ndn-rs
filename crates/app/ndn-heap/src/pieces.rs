@@ -122,20 +122,12 @@ pub(crate) struct Pieces {
 
 impl Pieces {
     /// What the entry carries for this payload.
+    #[cfg(test)]
     pub(crate) fn blob(&self) -> ChunksBody {
         ChunksBody {
             size: self.size,
             root: self.root,
         }
-    }
-
-    /// The names of the pieces `have` does not say it holds, in packet order.
-    pub(crate) fn wanted(&self, have: impl Fn(&Name) -> bool) -> Vec<Name> {
-        self.packets
-            .iter()
-            .filter(|p| !have(&p.name))
-            .map(|p| p.name.clone())
-            .collect()
     }
 
     /// Every piece as a write, to be applied in one batch.
