@@ -136,22 +136,6 @@ impl Default for Config {
     }
 }
 
-/// Who signs: a device's key.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Writer(Name);
-
-impl Writer {
-    /// The writer whose key is named `key`.
-    pub fn new(key: Name) -> Writer {
-        Writer(key)
-    }
-
-    /// The key name.
-    pub fn key(&self) -> &Name {
-        &self.0
-    }
-}
-
 // -- The node ----------------------------------------------------------------------
 
 /// A device's heap layer.
@@ -165,7 +149,6 @@ pub(crate) struct NodeInner {
     me: Weak<NodeInner>,
     pub(crate) device: Name,
     pub(crate) ns: Name,
-    pub(crate) writer: Writer,
     pub(crate) signer: Arc<dyn Signer>,
     keys: Arc<SecurityManager>,
     pub(crate) judge: Arc<Judge>,
@@ -272,7 +255,6 @@ impl Node {
         };
         let inner = Arc::new_cyclic(|me| NodeInner {
             me: me.clone(),
-            writer: Writer::new(identity.key.clone()),
             device: device.clone(),
             ns,
             signer: identity.signer,
@@ -471,9 +453,9 @@ impl Node {
         &self.inner.ns
     }
 
-    /// The writer this device signs as: its key.
-    pub fn writer(&self) -> &Writer {
-        &self.inner.writer
+    /// The key this device signs with.
+    pub fn writer(&self) -> &Name {
+        self.inner.signer.key_name()
     }
 
     /// Signatures this node has made (entries and grants).
@@ -484,7 +466,8 @@ impl Node {
     /// Entries this node holds, copies of others' and its own, in every
     /// space.
     pub fn held(&self) -> u64 {
-        self.inner.held_in(&Name::root())
+        self.inner
+            .with_logs(|logs| logs.iter().map(|log| log.held_count()).sum())
     }
 
     /// The cut this node can vouch for if `key` is revoked now (spec §9),
@@ -577,18 +560,6 @@ impl NodeInner {
         keyring
             .unheld_personal_namespace(device)
             .unwrap_or_else(|| keyring.context_for(device).namespace().clone())
-    }
-
-    /// Entries held in `space` (every space when it is the root name):
-    /// copies, counted from the markers.
-    pub(crate) fn held_in(&self, space: &Name) -> u64 {
-        Kind::VERIFIED
-            .named(&*self.store)
-            .into_iter()
-            .filter(|(entry, _)| {
-                parse_log_name(entry).is_some_and(|l| space.is_empty() || l.space == *space)
-            })
-            .count() as u64
     }
 
     fn shutdown(&self) {

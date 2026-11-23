@@ -2003,7 +2003,7 @@ impl Node {
     pub fn shutdown(&self);
     pub fn name(&self) -> &Name;
     pub fn namespace(&self) -> &Name;
-    pub fn writer(&self) -> &Writer;
+    pub fn writer(&self) -> &Name;
     pub fn signatures(&self) -> u64;
     pub fn held(&self) -> u64;
     pub fn revocation_cut(&self, key: &Name, bound: &CutBound)
@@ -2025,7 +2025,7 @@ impl Node {
 ```
 
 The crate exports exactly these, the types they use (`Transport`, `Config`,
-`Clock`, `Writer`, `Share`, `Readers`, `MembersChange`, `Members`, `PutOptions`,
+`Clock`, `Share`, `Readers`, `MembersChange`, `Members`, `PutOptions`,
 `Frontier`, `Item`, `EntryId`, `Change`, `Changes`, `Alert`, `Follower`,
 `HeapError`, `NextStep`, `Refusal`, `Cut`, `Timestamp`, `CutBound`,
 `CutProposal`, `RUN_ID_LEN`, `SignalScope`, `SignalKey`, `SignalSender`,
@@ -2103,8 +2103,8 @@ clean close, flushes, and stops; the next start has no hole. **`shutdown`**,
 and `Drop`, stop at once: every watch ends, whatever the
 flusher had not made durable is not, and the next start is unclean (§4.9).
 
-`name()`, `namespace()` and `writer()` are the device, its person and the key it
-signs with (`Writer::key()`). `signatures()` counts the signatures the node
+`name()`, `namespace()` and `writer()` are the device, its person and the name of
+the key it signs with. `signatures()` counts the signatures the node
 made (entries and grants); `held()` the entries it holds in every space, copies
 of others' and its own; the suite's cost columns read them (§13).
 `revocation_cut`, `suspect`, `unsuspect`, `suspected` and

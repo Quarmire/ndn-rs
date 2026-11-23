@@ -88,7 +88,7 @@ async fn a_members_header_is_admitted_at_a_peer_node_and_a_removed_writers_is_no
     bob.open(&space()).await.unwrap();
 
     // Before the creation reaches it, a device decides nothing.
-    let bob_key = bob.writer().key().clone();
+    let bob_key = bob.writer().clone();
     eventually("bob holds the creation, so it may use signals", || async {
         bob.signal_scope(&space()).is_ok()
     })

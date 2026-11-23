@@ -40,7 +40,7 @@ use crate::log::{Alert, Blob, Change, Effects, Frontier, Log, Members, Step};
 use crate::node::NodeInner;
 use crate::pieces;
 use crate::register::{EntryId, Item};
-use crate::reserve::{Publisher, Ticket};
+use crate::reserve::{FlushError, Publisher, Ticket};
 use crate::rt;
 use crate::seal;
 use crate::store::Kind;
@@ -443,9 +443,7 @@ impl SpaceInner {
     ) -> Result<Option<(EntryId, Ticket)>, HeapError> {
         loop {
             if self.closing.load(Ordering::Relaxed) {
-                return Err(HeapError::Local {
-                    reason: "the node is closing, so no more entries are signed".into(),
-                });
+                return Err(FlushError::Stopped.into());
             }
             let wait = {
                 let mut log = self.log.lock();
@@ -1195,7 +1193,7 @@ impl std::fmt::Debug for Follower {
 impl Follower {
     /// Entries of the space held here (copies).
     pub fn held(&self) -> u64 {
-        self.node.held_in(&self.space.name)
+        self.space.log.lock().held_count()
     }
 
     /// Stop carrying the space: it is left, and not carried after a restart.

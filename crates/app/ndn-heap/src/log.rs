@@ -786,6 +786,11 @@ impl Log {
         fx
     }
 
+    /// Entries held, of every device (copies of others' and its own).
+    pub(crate) fn held_count(&self) -> u64 {
+        self.devices.values().map(|d| d.held.count()).sum()
+    }
+
     /// The largest `n` such that every seq of `1..=n` of `device` is held or
     /// declared void.
     pub(crate) fn held_prefix(&self, device: &Name) -> u64 {
