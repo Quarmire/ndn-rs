@@ -23,7 +23,7 @@
 //! device owns. Every ask that is not answered is Nacked, never left to time
 //! out.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -51,11 +51,6 @@ const GRANTS_KEPT: usize = 4096;
 /// reader can name any number of seal keys of its own device, and none of them
 /// is to take the node's fetch slots from its own fetches.
 const GRANTS_PER_ASKER: usize = 32;
-
-/// The most seal keys learned in the background at once, and the most of one
-/// asker's.
-const SEAL_LEARNING_MAX: usize = 64;
-const SEAL_LEARNING_PER_ASKER: usize = 2;
 
 /// A map that keeps the last [`GRANTS_KEPT`] entries put in it, for one
 /// generation of the judge (`NodeInner::generation`): an entry put or asked
@@ -103,14 +98,12 @@ impl<V: Clone> Kept<V> {
     }
 }
 
-/// What a granter keeps: the grants it answered, the seal keys it verified,
-/// the ones it is still learning and how many asks of each asker it is
-/// working on.
+/// What a granter keeps: the grants it answered, the seal keys it verified
+/// and how many asks of each asker it is working on.
 #[derive(Default)]
 pub(crate) struct Granting {
     grants: Mutex<Kept<Bytes>>,
     seal_keys: Mutex<Kept<Name>>,
-    learning: Mutex<BTreeSet<Name>>,
     asks: Counts,
 }
 
@@ -219,8 +212,7 @@ async fn grant(shared: &Arc<Shared>, name: &Name, ask: GrantAsk) -> Option<Bytes
                 Err(_) => None,
             };
             let Some(key) = verified else {
-                tracing::debug!(%asker, "grant not answered: its seal key did not come, or did not verify as its own; asked again in the background");
-                learn_seal_key(shared, ask, asker, public);
+                tracing::debug!(%asker, "grant not answered: its seal key did not come, or did not verify as its own; the asker's next round asks again");
                 return None;
             };
             shared
@@ -264,42 +256,6 @@ async fn seal_key_verified(
         Judged::Valid(v) => Some(v.key),
         _ => None,
     }
-}
-
-/// Ask again, in the background, for the seal key a grant's ask in place did
-/// not get: up to the fetch tries, one run per key, and, verified, it is kept,
-/// so the asker's next round of grant asks is answered at once. Only an asker
-/// the node admits gets here: a stranger costs no asks. A run beyond the caps
-/// is not started; the asker's next ask starts it once one ends.
-fn learn_seal_key(shared: &Arc<Shared>, ask: GrantAsk, asker: Name, public: [u8; 32]) {
-    {
-        let mut learning = shared.grants.learning.lock();
-        if learning.contains(&ask.seal_key) {
-            return;
-        }
-        let of_asker = learning.iter().filter(|k| k.has_prefix(&asker)).count();
-        if learning.len() >= SEAL_LEARNING_MAX || of_asker >= SEAL_LEARNING_PER_ASKER {
-            tracing::debug!(%asker, "seal key not asked again in the background: as many runs are under way as this device allows; the asker's next grant ask starts it once one ends");
-            return;
-        }
-        learning.insert(ask.seal_key.clone());
-    }
-    let shared = Arc::clone(shared);
-    rt::spawn(async move {
-        let generation = shared.host.generation();
-        let got = match shared.fetcher.owed(ask.seal_key.clone()).await {
-            Some(data) => seal_key_verified(&shared, &data, &ask, &asker, &public).await,
-            None => None,
-        };
-        if let Some(key) = got {
-            shared
-                .grants
-                .seal_keys
-                .lock()
-                .insert(generation, ask.seal_key.clone(), key);
-        }
-        shared.grants.learning.lock().remove(&ask.seal_key);
-    });
 }
 
 #[cfg(test)]

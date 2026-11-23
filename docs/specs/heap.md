@@ -1289,9 +1289,8 @@ each), **for one generation of its judge**: a counter that moves whenever a
 revoking context is adopted or a person's newer version refuses more
 (`Judge::generation`). What was kept under another generation is not served;
 the packet is fetched and judged again. It works on at most 32 asks of one
-asker device at a time; a seal key that does not come in place is asked for in
-the background (at most 3 asks, at most 2 runs per asker device and 64 in all),
-and the asker's next round is answered from the key then kept. An epoch that
+asker device at a time; a seal key that does not come in place gets no answer
+now, and the asker's next round asks for it again. An epoch that
 this device itself made is not granted until its `Epoch` entry has been
 flushed (it is not servable before), so that a power loss cannot take the entry
 and leave the key granted. Every ask a device does not answer is Nacked, never
@@ -1531,8 +1530,7 @@ The conditions and the cryptography are §6.5. As implemented:
   (§9.1), unwrapped with the recipient key under the grant's name, and taken
   only if the log accepts it (§6.2); one that fails is dropped and the asking
   goes on.
-- **Granter.** §6.5, with its bounds (asks per asker, seal keys learned in the
-  background, grants kept).
+- **Granter.** §6.5, with its bounds (asks per asker, grants kept).
 
 ### 7.9 Routing is the forwarder's
 

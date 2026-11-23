@@ -70,8 +70,8 @@ const REFRESH_TRIES: u32 = 16;
 const REFRESH_IDLE: Duration = Duration::from_secs(64);
 
 /// The most asks one thing is asked for in a row where asking again is
-/// optional (a seal key learned in the background, the first asks of an
-/// entry a counter names): each of at most `1 + REEXPRESS_MAX` Interests.
+/// optional (the first asks of an entry a counter names): each of at most
+/// `1 + REEXPRESS_MAX` Interests.
 pub(crate) const FETCH_TRIES: u32 = 3;
 
 /// The most times an Interest is expressed again under a fresh nonce within
@@ -289,22 +289,6 @@ impl Fetcher {
                 })
             }
         }
-    }
-
-    /// A packet asked for in place up to [`FETCH_TRIES`] times with pauses
-    /// between: the asks a caller makes where nothing else asks again for it.
-    pub(crate) async fn owed(&self, name: Name) -> Option<Data> {
-        for tries in 0..FETCH_TRIES {
-            if tries > 0 {
-                rt::sleep(retry_pause(tries - 1)).await;
-            }
-            match self.once(name.clone()).await {
-                Ok(d) => return Some(d),
-                Err(Miss::Again) => {}
-                Err(Miss::Gone) => return None,
-            }
-        }
-        None
     }
 }
 
