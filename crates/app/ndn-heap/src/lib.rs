@@ -29,7 +29,6 @@ mod heard;
 mod log;
 #[cfg(feature = "wip-node")]
 mod node;
-#[cfg(feature = "wip-pieces")]
 mod pieces;
 mod register;
 mod reserve;

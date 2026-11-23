@@ -43,15 +43,16 @@ fn holders(pieces: &Pieces) -> BTreeMap<Name, Bytes> {
 fn fetch(asm: &mut Assembler, held: &BTreeMap<Name, Bytes>, window: usize) {
     while !asm.is_complete() {
         let wanted = asm.next_wanted(window);
-        assert!(!wanted.is_empty(), "an incomplete assembly always wants something");
+        assert!(
+            !wanted.is_empty(),
+            "an incomplete assembly always wants something"
+        );
         for name in wanted {
             let wire = held.get(&name).expect("a holder has every piece").clone();
             assert_eq!(asm.offer(wire), Ok(Offered::Accepted), "{name}");
         }
     }
 }
-
-
 
 #[test]
 fn a_1_mib_payload_round_trips_through_pieces() {
@@ -93,14 +94,16 @@ fn a_payload_splits_into_pieces_its_manifest_lists_and_reassembles() {
         let mut stack = vec![(PieceKind::Manifest(0), pieces.root)];
         while let Some((kind, digest)) = stack.pop() {
             let wire = &by_name[&piece_name(&v, kind)];
-            match open(&v, &shape, kind, wire, &digest).expect("verifies") {
-                Opened::Node(listed) => {
-                    let PieceKind::Manifest(k) = kind else { unreachable!() };
+            match kind {
+                PieceKind::Manifest(k) => {
+                    let listed = open_node(&v, &shape, k, wire, &digest).expect("verifies");
                     for (kid, d) in shape.children(k).unwrap().into_iter().zip(listed).rev() {
                         stack.push((kid, d));
                     }
                 }
-                Opened::Chunk(bytes) => out.extend_from_slice(&bytes),
+                PieceKind::Chunk(i) => {
+                    out.extend_from_slice(&open_chunk(&v, &shape, i, wire, &digest).unwrap())
+                }
             }
         }
         assert_eq!(out, payload, "size {size}");
@@ -124,12 +127,12 @@ fn a_piece_from_a_stranger_verifies_by_digest_alone() {
     // proven by the digest its parent lists.
     let copy = Bytes::copy_from_slice(&chunk0.wire);
     assert!(matches!(
-        open(&e, &shape, PieceKind::Chunk(0), &copy, &chunk0.digest),
-        Ok(Opened::Chunk(c)) if c.len() == CHUNK
+        open_chunk(&e, &shape, 0, &copy, &chunk0.digest),
+        Ok(c) if c.len() == CHUNK
     ));
     assert!(matches!(
-        open(&e, &shape, PieceKind::Manifest(0), &root.wire, &pieces.root),
-        Ok(Opened::Node(d)) if d.len() == 4
+        open_node(&e, &shape, 0, &root.wire, &pieces.root),
+        Ok(d) if d.len() == 4
     ));
 
     // One flipped bit, anywhere, is another packet.
@@ -138,7 +141,7 @@ fn a_piece_from_a_stranger_verifies_by_digest_alone() {
         bad[at] ^= 1;
         assert!(
             matches!(
-                open(&e, &shape, PieceKind::Chunk(0), &Bytes::from(bad), &chunk0.digest),
+                open_chunk(&e, &shape, 0, &Bytes::from(bad), &chunk0.digest),
                 Err(PieceError::Wrong { .. })
             ),
             "bit flipped at {at}"
@@ -147,12 +150,18 @@ fn a_piece_from_a_stranger_verifies_by_digest_alone() {
     // A genuine, well-formed piece of another slot or another entry is not
     // the piece asked for.
     assert!(matches!(
-        open(&e, &shape, PieceKind::Chunk(1), &chunk0.wire, &chunk0.digest),
+        open_chunk(&e, &shape, 1, &chunk0.wire, &chunk0.digest),
         Err(PieceError::Wrong { .. })
     ));
     let alien = split(&other_entry(), &payload(4096 * 3 + 10)).unwrap();
     assert!(matches!(
-        open(&e, &shape, PieceKind::Chunk(0), &alien.packets[0].wire, &alien.packets[0].digest),
+        open_chunk(
+            &e,
+            &shape,
+            0,
+            &alien.packets[0].wire,
+            &alien.packets[0].digest
+        ),
         Err(PieceError::Wrong { .. })
     ));
 }
@@ -177,12 +186,17 @@ fn a_sealed_payload_shows_only_its_size() {
     assert_eq!(a.size as usize, sealed_a.len());
     assert!(a.size as usize > secret_a.len());
     let shape_of = |p: &Pieces| -> Vec<(Name, usize)> {
-        p.packets.iter().map(|p| (p.name.clone(), p.wire.len())).collect()
+        p.packets
+            .iter()
+            .map(|p| (p.name.clone(), p.wire.len()))
+            .collect()
     };
     assert_eq!(shape_of(&a), shape_of(&b));
     for p in &a.packets {
         assert!(
-            !p.wire.windows(16).any(|w| secret_a.windows(16).any(|s| s == w)),
+            !p.wire
+                .windows(16)
+                .any(|w| secret_a.windows(16).any(|s| s == w)),
             "{} carries plaintext",
             p.name
         );
@@ -216,7 +230,10 @@ fn pieces_are_written_in_one_batch() {
     let stage = Stage::new(backing.clone());
     let mut asm = Assembler::new(e.clone(), pieces.blob()).unwrap();
     while !asm.is_complete() {
-        assert!(asm.take_ops().is_none(), "an incomplete assembly hands nothing over");
+        assert!(
+            asm.take_ops().is_none(),
+            "an incomplete assembly hands nothing over"
+        );
         for name in asm.next_wanted(8) {
             asm.offer(held[&name].clone()).unwrap();
         }
@@ -248,7 +265,10 @@ fn a_blob_head_is_unavailable_until_assembled() {
 
     // Nothing held, then everything but one chunk: `Incomplete`, naming the
     // first piece it lacks, never a short value.
-    assert!(matches!(read(&store, &e, &blob), Err(PieceError::Incomplete { .. })));
+    assert!(matches!(
+        read(&store, &e, &blob),
+        Err(PieceError::Incomplete { .. })
+    ));
     let missing = piece_name(&e, PieceKind::Chunk(4));
     for (name, wire) in &held {
         if *name != missing {
@@ -257,7 +277,9 @@ fn a_blob_head_is_unavailable_until_assembled() {
     }
     assert_eq!(
         read(&store, &e, &blob),
-        Err(PieceError::Incomplete { missing: missing.clone() })
+        Err(PieceError::Incomplete {
+            missing: missing.clone()
+        })
     );
 
     // The assembler agrees: incomplete hands nothing over.
@@ -275,14 +297,20 @@ fn a_manifest_shape_that_disagrees_with_the_declared_size_is_refused() {
     // The root of a 300-chunk tree under a claim of two chunks: the entry
     // says a size the tree it names cannot have.
     let big = split(&e, &payload(CHUNK * 300)).unwrap();
-    let lying = ChunksBody { size: (CHUNK * 2) as u64, root: big.root };
+    let lying = ChunksBody {
+        size: (CHUNK * 2) as u64,
+        root: big.root,
+    };
     let mut asm = Assembler::new(e.clone(), lying).unwrap();
     let root = big.packets.last().unwrap().wire.clone();
     assert!(matches!(asm.offer(root), Err(PieceError::Shape { .. })));
 
     // The root of a one-chunk tree under a claim of 300 chunks.
     let small = split(&e, &payload(CHUNK)).unwrap();
-    let lying = ChunksBody { size: (CHUNK * 300) as u64, root: small.root };
+    let lying = ChunksBody {
+        size: (CHUNK * 300) as u64,
+        root: small.root,
+    };
     let mut asm = Assembler::new(e.clone(), lying).unwrap();
     assert!(matches!(
         asm.offer(small.packets.last().unwrap().wire.clone()),
@@ -291,11 +319,16 @@ fn a_manifest_shape_that_disagrees_with_the_declared_size_is_refused() {
 
     // A tree that lists a short chunk where the size wants a full one.
     let short = split(&e, &payload(CHUNK + 904)).unwrap();
-    let lying = ChunksBody { size: (CHUNK * 2) as u64, root: short.root };
+    let lying = ChunksBody {
+        size: (CHUNK * 2) as u64,
+        root: short.root,
+    };
     let held = holders(&short);
     let mut asm = Assembler::new(e.clone(), lying).unwrap();
-    asm.offer(held[&piece_name(&e, PieceKind::Manifest(0))].clone()).unwrap();
-    asm.offer(held[&piece_name(&e, PieceKind::Chunk(0))].clone()).unwrap();
+    asm.offer(held[&piece_name(&e, PieceKind::Manifest(0))].clone())
+        .unwrap();
+    asm.offer(held[&piece_name(&e, PieceKind::Chunk(0))].clone())
+        .unwrap();
     assert!(matches!(
         asm.offer(held[&piece_name(&e, PieceKind::Chunk(1))].clone()),
         Err(PieceError::Shape { .. })
@@ -315,7 +348,10 @@ fn a_tampered_piece_is_refused_alone() {
     let mut bad = held[&root_name].to_vec();
     let at = bad.len() - 1;
     bad[at] ^= 1;
-    assert!(matches!(asm.offer(Bytes::from(bad)), Err(PieceError::Wrong { .. })));
+    assert!(matches!(
+        asm.offer(Bytes::from(bad)),
+        Err(PieceError::Wrong { .. })
+    ));
     assert_eq!(asm.next_wanted(8), vec![root_name.clone()]);
     asm.offer(held[&root_name].clone()).unwrap();
 
@@ -323,8 +359,17 @@ fn a_tampered_piece_is_refused_alone() {
     // are taken.
     let c2 = piece_name(&e, PieceKind::Chunk(2));
     let mut bad = held[&c2].to_vec();
+    let at = bad.len() - 100;
+    bad[at] ^= 0x80;
+    assert!(matches!(
+        asm.offer(Bytes::from(bad)),
+        Err(PieceError::Wrong { .. })
+    ));
+    // A flip in the name is a packet of no piece of this payload, or of
+    // another: refused either way, nothing kept.
+    let mut bad = held[&c2].to_vec();
     bad[40] ^= 0x80;
-    assert!(matches!(asm.offer(Bytes::from(bad)), Err(PieceError::Wrong { .. })));
+    assert!(asm.offer(Bytes::from(bad)).is_err());
     for name in asm.next_wanted(8) {
         if name != c2 {
             assert_eq!(asm.offer(held[&name].clone()), Ok(Offered::Accepted));
@@ -352,9 +397,13 @@ fn the_plan_asks_for_nodes_before_chunks_and_never_beyond_the_window() {
     let mut asm = Assembler::new(e.clone(), pieces.blob()).unwrap();
 
     // Only the root is known to be wanted: nothing else is listed yet.
-    assert_eq!(asm.next_wanted(100), vec![piece_name(&e, PieceKind::Manifest(0))]);
+    assert_eq!(
+        asm.next_wanted(100),
+        vec![piece_name(&e, PieceKind::Manifest(0))]
+    );
     assert!(asm.next_wanted(0).is_empty());
-    asm.offer(held[&piece_name(&e, PieceKind::Manifest(0))].clone()).unwrap();
+    asm.offer(held[&piece_name(&e, PieceKind::Manifest(0))].clone())
+        .unwrap();
 
     // Its two children (the bottom level) before any chunk, and then chunks
     // in order only once their node is held.
@@ -393,19 +442,29 @@ fn a_payload_over_payload_max_is_refused() {
     let big = vec![0u8; PAYLOAD_MAX as usize + 1];
     assert_eq!(
         split(&e, &big).map(|_| ()),
-        Err(PieceError::Oversize { size: PAYLOAD_MAX + 1 })
+        Err(PieceError::Oversize {
+            size: PAYLOAD_MAX + 1
+        })
     );
-    let blob = ChunksBody { size: PAYLOAD_MAX + 1, root: [7; 32] };
+    let blob = ChunksBody {
+        size: PAYLOAD_MAX + 1,
+        root: [7; 32],
+    };
     assert_eq!(
         Assembler::new(e.clone(), blob).map(|_| ()),
-        Err(PieceError::Oversize { size: PAYLOAD_MAX + 1 })
+        Err(PieceError::Oversize {
+            size: PAYLOAD_MAX + 1
+        })
     );
     assert!(matches!(
         join(&e, &blob, |_| None),
         Err(PieceError::Oversize { .. })
     ));
     // The most there is, is taken: only its pieces are missing.
-    let blob = ChunksBody { size: PAYLOAD_MAX, root: [7; 32] };
+    let blob = ChunksBody {
+        size: PAYLOAD_MAX,
+        root: [7; 32],
+    };
     assert!(Assembler::new(e.clone(), blob).is_ok());
     assert!(matches!(
         join(&e, &blob, |_| None),
