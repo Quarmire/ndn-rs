@@ -203,9 +203,7 @@ impl Log {
         match self.reservation.sign_gate(self.next_seq) {
             Gate::Ok => Ok(None),
             Gate::Wait(ticket) => Ok(Some(ticket)),
-            Gate::Refused(why) => Err(HeapError::Local {
-                reason: why.to_string(),
-            }),
+            Gate::Refused(why) => Err(why.into()),
             Gate::Closed => Err(HeapError::Local {
                 reason: "the node is closing, so no more entries are signed".into(),
             }),

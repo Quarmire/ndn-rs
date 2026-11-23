@@ -85,7 +85,7 @@ use crate::register::{EntryId, Item, Register};
 use crate::reserve::{Flusher, Gate, Reservation, Ticket};
 use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
-use crate::store::{self, Batch, Corrupt, Kind, Link, Marker};
+use crate::store::{self, Batch, Kind, Link, Marker};
 use crate::trust::Verified;
 use crate::wire::{
     self, Body, Entry, EntryRef, EpochId, Payload, PutBody, log_name, parse_space_name,
@@ -420,18 +420,13 @@ impl Log {
                 why: "a space is `<owner>/32=data/<name>`".into(),
             })?
             .owner;
-        let local = |why: String| HeapError::Local { reason: why };
         let head = Self::stored_head(&*store, &space, &device)?;
-        let reservation = Reservation::open(Arc::clone(&store), flusher, &space, block, head)
-            .map_err(|e| local(e.to_string()))?;
+        let reservation = Reservation::open(Arc::clone(&store), flusher, &space, block, head)?;
         let key_digest = signer
             .public_key()
             .map(|k| public_key_digest(&k))
-            .ok_or_else(|| {
-                local(format!(
-                    "the device key {} has no public key",
-                    signer.key_name()
-                ))
+            .ok_or_else(|| HeapError::Local {
+                reason: format!("the device key {} has no public key", signer.key_name()),
             })?;
         let mut log = Log {
             key: signer.key_name().clone(),
@@ -556,10 +551,7 @@ impl Log {
     fn restore_register(&mut self) -> Result<(), HeapError> {
         let records = self.store.scan_under(&Kind::HEADS.listing(&self.space), 0);
         let view = View::of(self);
-        let restored = Register::restore(self.space.clone(), records, &|r| view.write_of(r))
-            .map_err(|e| HeapError::Local {
-                reason: e.to_string(),
-            })?;
+        let restored = Register::restore(self.space.clone(), records, &|r| view.write_of(r))?;
         for lost in &restored.missing {
             tracing::warn!(entry = %lost.name(&self.space), "a head the store names is not held and applied; it returns when the entry does");
         }
@@ -575,17 +567,8 @@ impl Log {
     /// that cannot tell what it signed could sign a seq a peer saw again.
     fn stored_head(store: &dyn DataStore, space: &Name, device: &Name) -> Result<u64, HeapError> {
         let key = Kind::LEDGER.device(space, device);
-        let Some(record) = store.get(&key) else {
-            return Ok(0);
-        };
-        let dev = Dev::from_record(&record).ok_or_else(|| HeapError::Local {
-            reason: Corrupt {
-                key,
-                what: "ledger record",
-            }
-            .to_string(),
-        })?;
-        Ok(dev.high)
+        let ledger = store::read(store, key, "ledger record", Dev::from_record)?;
+        Ok(ledger.map_or(0, |dev| dev.high))
     }
 
     // -- Reads --------------------------------------------------------------------

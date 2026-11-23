@@ -876,10 +876,7 @@ impl NodeInner {
             last = Some(epoch);
         }
         if let Some((_, ticket)) = last {
-            self.flusher
-                .wait_durable(ticket)
-                .await
-                .map_err(|e| local(e.to_string()))?;
+            self.flusher.wait_durable(ticket).await?;
         }
         Ok(())
     }

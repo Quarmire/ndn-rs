@@ -22,6 +22,7 @@ use ndn_sync::{DataStore, StoreOp};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
+use crate::error::HeapError;
 use crate::wire::log_name;
 
 #[cfg(test)]
@@ -215,7 +216,13 @@ impl std::fmt::Display for Corrupt {
     }
 }
 
-impl std::error::Error for Corrupt {}
+impl From<Corrupt> for HeapError {
+    fn from(why: Corrupt) -> HeapError {
+        HeapError::Local {
+            reason: why.to_string(),
+        }
+    }
+}
 
 fn array<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
     bytes.try_into().ok()
@@ -245,24 +252,21 @@ pub(crate) struct Marker {
 }
 
 impl Marker {
-    /// Octets of an encoded marker.
-    pub(crate) const LEN: usize = 112;
-
     pub(crate) fn encode(&self) -> Bytes {
-        let mut out = Vec::with_capacity(Self::LEN);
-        out.extend_from_slice(&self.signed_digest);
-        out.extend_from_slice(&self.key_digest);
-        out.extend_from_slice(&self.prev);
-        out.extend_from_slice(&self.prev_seq.to_be_bytes());
-        out.extend_from_slice(&self.at.to_be_bytes());
-        Bytes::from(out)
+        [
+            &self.signed_digest[..],
+            &self.key_digest,
+            &self.prev,
+            &self.prev_seq.to_be_bytes(),
+            &self.at.to_be_bytes(),
+        ]
+        .concat()
+        .into()
     }
 
-    /// `None` for anything but exactly [`Self::LEN`] octets.
+    /// `None` for anything but exactly 112 octets.
     pub(crate) fn decode(bytes: &[u8]) -> Option<Marker> {
-        if bytes.len() != Self::LEN {
-            return None;
-        }
+        let bytes: &[u8; 112] = bytes.try_into().ok()?;
         Some(Marker {
             signed_digest: array(&bytes[..32])?,
             key_digest: array(&bytes[32..64])?,
@@ -296,17 +300,12 @@ pub(crate) struct Head {
 
 impl Head {
     pub(crate) fn encode(&self) -> Bytes {
-        let mut out = Vec::with_capacity(40);
-        out.extend_from_slice(&self.seq.to_be_bytes());
-        out.extend_from_slice(&self.digest);
-        Bytes::from(out)
+        [&self.seq.to_be_bytes()[..], &self.digest].concat().into()
     }
 
     /// `None` for anything but exactly 40 octets.
     pub(crate) fn decode(bytes: &[u8]) -> Option<Head> {
-        if bytes.len() != 40 {
-            return None;
-        }
+        let bytes: &[u8; 40] = bytes.try_into().ok()?;
         Some(Head {
             seq: be(&bytes[..8])?,
             digest: array(&bytes[8..])?,
@@ -325,17 +324,14 @@ pub(crate) struct ReserveRecord {
 
 impl ReserveRecord {
     pub(crate) fn encode(&self) -> Bytes {
-        let mut out = Vec::with_capacity(9);
-        out.extend_from_slice(&self.r.to_be_bytes());
-        out.push(u8::from(self.clean));
-        Bytes::from(out)
+        [&self.r.to_be_bytes()[..], &[u8::from(self.clean)]]
+            .concat()
+            .into()
     }
 
     /// `None` for anything but 9 octets with a clean flag of 0 or 1.
     pub(crate) fn decode(bytes: &[u8]) -> Option<ReserveRecord> {
-        if bytes.len() != 9 {
-            return None;
-        }
+        let bytes: &[u8; 9] = bytes.try_into().ok()?;
         let clean = match bytes[8] {
             0 => false,
             1 => true,
@@ -348,31 +344,36 @@ impl ReserveRecord {
     }
 }
 
+/// The record at `key` decoded by `decode`; `Ok(None)` when there is none,
+/// and an error naming the key (`what` it is) when it cannot be read.
+pub(crate) fn read<T>(
+    store: &dyn DataStore,
+    key: Name,
+    what: &'static str,
+    decode: impl FnOnce(&Bytes) -> Option<T>,
+) -> Result<Option<T>, Corrupt> {
+    let Some(wire) = store.get(&key) else {
+        return Ok(None);
+    };
+    decode(&wire).map(Some).ok_or(Corrupt { key, what })
+}
+
 /// The reservation record of `space`; `Ok(None)` when there is none.
 pub(crate) fn read_reserve(
     store: &dyn DataStore,
     space: &Name,
 ) -> Result<Option<ReserveRecord>, Corrupt> {
     let key = Kind::RESERVE.of(space);
-    match store.get(&key) {
-        None => Ok(None),
-        Some(wire) => ReserveRecord::decode(&wire).map(Some).ok_or(Corrupt {
-            key,
-            what: "reservation record",
-        }),
-    }
+    read(store, key, "reservation record", |w| {
+        ReserveRecord::decode(w)
+    })
 }
 
 /// The head record of `space`; `Ok(None)` when there is none.
 pub(crate) fn read_head(store: &dyn DataStore, space: &Name) -> Result<Option<Head>, Corrupt> {
-    let key = Kind::HEAD.of(space);
-    match store.get(&key) {
-        None => Ok(None),
-        Some(wire) => Head::decode(&wire).map(Some).ok_or(Corrupt {
-            key,
-            what: "head record",
-        }),
-    }
+    read(store, Kind::HEAD.of(space), "head record", |w| {
+        Head::decode(w)
+    })
 }
 
 /// Write the reservation record of `space` straight to the store.

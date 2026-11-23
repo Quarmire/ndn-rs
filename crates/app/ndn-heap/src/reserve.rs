@@ -29,6 +29,7 @@ use ndn_sync::DataStore;
 use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc};
 
+use crate::error::HeapError;
 use crate::rt;
 use crate::store::{Corrupt, Kind, ReserveRecord, read_head, read_reserve};
 
@@ -43,40 +44,13 @@ mod tests;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Ticket(pub(crate) u64);
 
-/// Why the store could not make writes durable: the disk's own reason, with
-/// what to do. Kept by the flusher for good: nothing it holds can be
-/// promised durable any more.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DiskFailure {
-    reason: Arc<str>,
-}
-
-impl DiskFailure {
-    fn new(why: &std::io::Error) -> DiskFailure {
-        DiskFailure {
-            reason: why.to_string().into(),
-        }
-    }
-}
-
-impl std::fmt::Display for DiskFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the store could not make this node's writes durable: {}. Nothing signed is lost and \
-             reads continue, but no seq past what was made durable can be signed, and no \
-             Members or Epoch change is published; free space or fix the disk, then restart the \
-             node",
-            self.reason
-        )
-    }
-}
-
 /// Why a wait for a flush ended without the flush.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FlushError {
-    /// The store failed to sync (sticky).
-    Disk(DiskFailure),
+    /// The store failed to sync (sticky): the disk's own reason, with what to
+    /// do. Kept by the flusher for good: nothing it holds can be promised
+    /// durable any more.
+    Disk(Arc<str>),
     /// The node is closing or stopped: nothing more is flushed.
     Stopped,
 }
@@ -84,7 +58,7 @@ pub(crate) enum FlushError {
 impl std::fmt::Display for FlushError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FlushError::Disk(why) => why.fmt(f),
+            FlushError::Disk(why) => f.write_str(why),
             FlushError::Stopped => f.write_str(
                 "the node is closing or stopped, so nothing more is made durable; open the \
                  space again on a new node",
@@ -93,7 +67,13 @@ impl std::fmt::Display for FlushError {
     }
 }
 
-impl std::error::Error for FlushError {}
+impl From<FlushError> for HeapError {
+    fn from(why: FlushError) -> HeapError {
+        HeapError::Local {
+            reason: why.to_string(),
+        }
+    }
+}
 
 #[derive(Default)]
 struct FlushState {
@@ -101,7 +81,7 @@ struct FlushState {
     issued: u64,
     /// Every ticket up to this is covered by a returned flush.
     durable: u64,
-    failure: Option<DiskFailure>,
+    failure: Option<Arc<str>>,
     stopped: bool,
 }
 
@@ -130,72 +110,71 @@ impl Flusher {
         flusher
     }
 
+    /// Flush until nothing written is unsynced, the store fails or the
+    /// flusher stops (then the task ends).
     async fn run(flusher: Weak<Flusher>, wake: Arc<Notify>) {
         loop {
             wake.notified().await;
             let Some(flusher) = flusher.upgrade() else {
                 return;
             };
-            if flusher.st.lock().stopped {
-                return;
-            }
-            flusher.rounds().await;
-        }
-    }
-
-    /// Flush until nothing written is unsynced, the store fails, or the
-    /// flusher stops.
-    async fn rounds(&self) {
-        loop {
-            let target = {
-                let st = self.st.lock();
-                if st.stopped || st.failure.is_some() || st.durable >= st.issued {
-                    return;
-                }
-                st.issued
-            };
-            tracing::trace!(target: "ndn_heap::timeline", target, "flush_begin");
-            let flushed = self.sync().await;
-            tracing::trace!(target: "ndn_heap::timeline", ok = flushed.is_ok(), "flush_end");
-            {
-                let mut st = self.st.lock();
-                match flushed {
-                    Ok(()) => st.durable = st.durable.max(target),
-                    Err(why) => {
-                        tracing::warn!(
-                            "the store did not make this node's writes durable ({why}): nothing \
-                             written since its last flush is promised; check the disk or \
-                             filesystem the store is on"
-                        );
-                        st.failure = Some(DiskFailure::new(&why));
+            loop {
+                let target = {
+                    let st = flusher.st.lock();
+                    if st.stopped {
+                        return;
+                    }
+                    if st.failure.is_some() || st.durable >= st.issued {
+                        break;
+                    }
+                    st.issued
+                };
+                tracing::trace!(target: "ndn_heap::timeline", target, "flush_begin");
+                let flushed = flusher.sync().await;
+                tracing::trace!(target: "ndn_heap::timeline", ok = flushed.is_ok(), "flush_end");
+                {
+                    let mut st = flusher.st.lock();
+                    match flushed {
+                        Ok(()) => st.durable = st.durable.max(target),
+                        Err(why) => {
+                            tracing::warn!(
+                                "the store did not make this node's writes durable ({why}): \
+                                 nothing written since its last flush is promised; check the \
+                                 disk or filesystem the store is on"
+                            );
+                            st.failure = Some(
+                                format!(
+                                    "the store could not make this node's writes durable: \
+                                     {why}. Nothing signed is lost and reads continue, but no \
+                                     seq past what was made durable can be signed, and no \
+                                     Members or Epoch change is published; free space or fix \
+                                     the disk, then restart the node"
+                                )
+                                .into(),
+                            );
+                        }
                     }
                 }
+                flusher.done.notify_waiters();
             }
-            self.done.notify_waiters();
         }
     }
 
     /// The store's barrier, on a blocking thread: a flush takes as long as
-    /// the disk does. A store whose flush returns at once is flushed inline.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// the disk does. A store whose flush returns at once is flushed inline,
+    /// and so is a browser store, which commits each write durably.
     async fn sync(&self) -> std::io::Result<()> {
-        if self.store.sync_is_immediate() {
-            return self.store.sync();
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.store.sync_is_immediate() {
+            let store = Arc::clone(&self.store);
+            return tokio::task::spawn_blocking(move || store.sync())
+                .await
+                .unwrap_or_else(|e| {
+                    Err(std::io::Error::other(format!(
+                        "the flush did not finish ({e})"
+                    )))
+                });
         }
-        let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || store.sync())
-            .await
-            .unwrap_or_else(|e| {
-                Err(std::io::Error::other(format!(
-                    "the flush did not finish ({e})"
-                )))
-            })
-    }
-
-    /// The store's barrier. A browser store commits each write durably, so
-    /// this returns at once there.
-    #[cfg(target_arch = "wasm32")]
-    async fn sync(&self) -> std::io::Result<()> {
         self.store.sync()
     }
 
@@ -227,29 +206,35 @@ impl Flusher {
     }
 
     /// The store's failure, once it failed.
-    pub(crate) fn failure(&self) -> Option<DiskFailure> {
+    pub(crate) fn failure(&self) -> Option<Arc<str>> {
         self.st.lock().failure.clone()
+    }
+
+    /// Wait until `ready` answers from the state; every flush, failure and
+    /// stop wakes it.
+    async fn until<T>(&self, ready: impl Fn(&FlushState) -> Option<T>) -> T {
+        loop {
+            let notified = self.done.notified();
+            if let Some(answer) = ready(&self.st.lock()) {
+                return answer;
+            }
+            notified.await;
+        }
     }
 
     /// Wait until a flush covering `ticket` returned. A ticket a flush
     /// covered before the store failed is durable whatever happened since.
     pub(crate) async fn wait_durable(&self, ticket: Ticket) -> Result<(), FlushError> {
-        loop {
-            let notified = self.done.notified();
-            {
-                let st = self.st.lock();
-                if st.durable >= ticket.0 {
-                    return Ok(());
-                }
-                if let Some(why) = &st.failure {
-                    return Err(FlushError::Disk(why.clone()));
-                }
-                if st.stopped {
-                    return Err(FlushError::Stopped);
-                }
+        self.until(|st| {
+            if st.durable >= ticket.0 {
+                Some(Ok(()))
+            } else if let Some(why) = &st.failure {
+                Some(Err(FlushError::Disk(why.clone())))
+            } else {
+                st.stopped.then_some(Err(FlushError::Stopped))
             }
-            notified.await;
-        }
+        })
+        .await
     }
 
     /// Wait for a flush covering everything written so far.
@@ -260,20 +245,14 @@ impl Flusher {
 
     /// Wait until the store fails; `None` if the flusher stops first. The
     /// node raises its store-failed alert on it.
-    pub(crate) async fn failed(&self) -> Option<DiskFailure> {
-        loop {
-            let notified = self.done.notified();
-            {
-                let st = self.st.lock();
-                if let Some(why) = &st.failure {
-                    return Some(why.clone());
-                }
-                if st.stopped {
-                    return None;
-                }
-            }
-            notified.await;
-        }
+    pub(crate) async fn failed(&self) -> Option<Arc<str>> {
+        self.until(|st| {
+            st.failure
+                .clone()
+                .map(Some)
+                .or_else(|| st.stopped.then_some(None))
+        })
+        .await
     }
 
     /// Stop at once: waiters are woken with [`FlushError::Stopped`] and no

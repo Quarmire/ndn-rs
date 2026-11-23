@@ -40,7 +40,7 @@ use crate::log::{Alert, Blob, Change, Effects, Frontier, Log, Members, Step};
 use crate::node::NodeInner;
 use crate::pieces;
 use crate::register::{EntryId, Item};
-use crate::reserve::{FlushError, Publisher, Ticket};
+use crate::reserve::{Publisher, Ticket};
 use crate::rt;
 use crate::seal;
 use crate::store::Kind;
@@ -307,12 +307,6 @@ pub(crate) fn check_audience(readers: usize) -> Result<(), HeapError> {
     Ok(())
 }
 
-fn flush_error(e: FlushError) -> HeapError {
-    HeapError::Local {
-        reason: e.to_string(),
-    }
-}
-
 /// The digest of a set of revoked keys: what an epoch signed accounts for.
 fn revocations_digest(revoked: &BTreeSet<Name>) -> [u8; 32] {
     let mut hash = Sha256::new();
@@ -472,7 +466,7 @@ impl SpaceInner {
                     Some(Step::Wait(ticket)) => ticket,
                 }
             };
-            node.flusher.wait_durable(wait).await.map_err(flush_error)?;
+            node.flusher.wait_durable(wait).await?;
         }
     }
 
@@ -933,11 +927,7 @@ impl Heap {
             .durable
             .unwrap_or_else(|| !self.inner.log.lock().has_peers());
         if durable {
-            self.node
-                .flusher
-                .wait_durable(ticket)
-                .await
-                .map_err(flush_error)?;
+            self.node.flusher.wait_durable(ticket).await?;
         }
         tracing::trace!(target: TIMELINE, seq = id.seq, durable, "put_returns");
         Ok(id)
@@ -1176,10 +1166,7 @@ impl Heap {
                     .into(),
             });
         };
-        node.flusher
-            .wait_durable(ticket)
-            .await
-            .map_err(flush_error)?;
+        node.flusher.wait_durable(ticket).await?;
         Ok(id)
     }
 }
