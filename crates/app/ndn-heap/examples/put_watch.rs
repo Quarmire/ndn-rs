@@ -695,7 +695,7 @@ async fn cold_open(dir: &Path, entries: usize, paths: usize) -> String {
     );
     let _ = writeln!(
         out,
-        "| reopen | store open ms | Node::start ms | first get ms | start + first get ms |\n|---|---|---|---|---|"
+        "| reopen | store open ms | Node::start ms | first get ms | start + first get ms | first watch listing ms |\n|---|---|---|---|---|---|"
     );
     let probe = name(&format!("/e/{}", (entries / 2) % paths));
     for (round, clean) in [
@@ -712,13 +712,19 @@ async fn cold_open(dir: &Path, entries: usize, paths: usize) -> String {
         let got = heap.get(&probe).await.expect("a get");
         let first_get = t.elapsed();
         assert!(got.is_some(), "the first get finds the entry");
+        // A watcher's first listing reads every head's entry from the store.
+        let t = Instant::now();
+        let changes = heap.watch(&Frontier::new()).await.expect("a watch");
+        let first_watch = t.elapsed();
+        drop(changes);
         let _ = writeln!(
             out,
-            "| {round} | {:.1} | {:.1} | {:.3} | {:.1} |",
+            "| {round} | {:.1} | {:.1} | {:.3} | {:.1} | {:.1} |",
             ms(t_store),
             ms(started),
             ms(first_get),
-            ms(started + first_get)
+            ms(started + first_get),
+            ms(first_watch)
         );
         drop(heap);
         if clean {
