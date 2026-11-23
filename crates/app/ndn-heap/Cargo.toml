@@ -54,7 +54,6 @@ ndn-engine = { workspace = true }
 # own feature, so a sibling's half-written module never breaks the build.
 # Each gate is removed when its module lands; none remains at the stage's end.
 wip-wire = []
-wip-fold = []
 wip-store = []
 wip-reserve = []
 wip-log = []

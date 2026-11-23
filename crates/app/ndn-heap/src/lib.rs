@@ -22,7 +22,6 @@ mod error;
 mod face_up;
 #[cfg(feature = "wip-fetch")]
 mod fetch;
-#[cfg(feature = "wip-fold")]
 mod fold;
 #[cfg(feature = "wip-heard")]
 mod heard;
