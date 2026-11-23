@@ -360,7 +360,7 @@ fn piece_names_are_unique_parse_back_and_cover_the_manifest_tree() {
         // Every node lists children that are pieces of the payload.
         for k in shape.manifests() {
             for child in shape.children(k).unwrap() {
-                assert!(names.contains(&piece_name(&entry, child)), "size {size}: {k}");
+                assert!(unique.contains(&&piece_name(&entry, child)), "size {size}: {k}");
             }
         }
     }
