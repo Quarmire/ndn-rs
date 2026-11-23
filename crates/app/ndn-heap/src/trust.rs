@@ -58,7 +58,7 @@ const SCOPE_ASKS: usize = 4;
 
 /// The most persons one space adopts here: its writers, then its readers,
 /// then those kept only by a cut, in the order the listing gives. The rest are
-/// not adopted for it, and [`Judge::note`] tells the caller.
+/// not adopted for it, and [`Judge::note`] warns of them.
 pub(crate) const SCOPE_PER_SPACE: usize = 64;
 
 /// The most persons listed here for all spaces together, whether or not the
@@ -168,18 +168,6 @@ pub(crate) struct Listing {
     pub cut: Vec<Name>,
 }
 
-/// Persons a space's members list that are not adopted for it, past
-/// [`SCOPE_PER_SPACE`] or [`SCOPE_NAMESPACES`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Excess {
-    /// The space.
-    pub space: Name,
-    /// The persons left out, in the listing's order.
-    pub persons: Vec<Name>,
-    /// Why, and what to do.
-    pub why: String,
-}
-
 /// What the log re-checks on: a trust context the keyring adopted, or a
 /// person adopted for spaces. Delivered in order by [`Judge::adoptions`].
 #[derive(Clone, Debug)]
@@ -231,7 +219,7 @@ struct Lists {
     /// The first [`SCOPE_PER_SPACE`]: those it may adopt.
     first: Vec<Name>,
     /// The rest: never adopted for it.
-    rest: Vec<Name>,
+    rest: usize,
     /// Of both, those that write or read (not only kept by a cut).
     members: HashSet<Name>,
 }
@@ -251,8 +239,8 @@ struct Scopes {
     /// a writer or a reader (not a person only a cut keeps): the spaces her
     /// own devices' seal keys are judged for.
     standing: BTreeMap<Name, BTreeSet<Name>>,
-    /// Per space, the persons its listing names past the caps, as last told.
-    over: BTreeMap<Name, Vec<Name>>,
+    /// How many persons the listings name past the caps, as last warned of.
+    over: usize,
     adopted: HashMap<Name, Adopted>,
     /// Held persons a new listing named since their last adoption: they are
     /// refreshed (by continuity from the version held).
@@ -279,8 +267,9 @@ impl Scopes {
     /// names, within [`SCOPE_PER_SPACE`] for it and [`SCOPE_NAMESPACES`] in
     /// all. A person it names that is adopted already is refreshed: a changed
     /// listing is where a person's newer version (a recovery, a revocation) is
-    /// looked for. Returns the spaces whose persons past the caps changed.
-    fn note(&mut self, space: &Name, listing: &Listing) -> Vec<Excess> {
+    /// looked for. Returns the warning to give when the number of persons
+    /// left out by the caps changed.
+    fn note(&mut self, space: &Name, listing: &Listing) -> Option<String> {
         let named = listing
             .writers
             .iter()
@@ -288,14 +277,14 @@ impl Scopes {
             .chain(&listing.cut)
             .filter(|p| is_person(p));
         let mut seen = HashSet::new();
-        let (mut first, mut rest) = (Vec::new(), Vec::new());
+        let (mut first, mut rest) = (Vec::new(), 0);
         for person in named {
             if !seen.insert(person) {
                 continue;
             }
             match first.len() < SCOPE_PER_SPACE {
                 true => first.push(person.clone()),
-                false => rest.push(person.clone()),
+                false => rest += 1,
             }
         }
         let members = listing
@@ -311,7 +300,7 @@ impl Scopes {
             members,
         });
         if self.wants.get(space) == new.as_ref() {
-            return Vec::new();
+            return None;
         }
         match new {
             Some(lists) => {
@@ -325,7 +314,7 @@ impl Scopes {
         // the caps fall the same way whatever order listings came in.
         let mut listed: BTreeMap<Name, BTreeSet<Name>> = BTreeMap::new();
         let mut standing: BTreeMap<Name, BTreeSet<Name>> = BTreeMap::new();
-        let mut past: BTreeMap<Name, (usize, Vec<Name>)> = BTreeMap::new();
+        let mut over = 0;
         for (name, lists) in &self.wants {
             for person in &lists.first {
                 if listed.contains_key(person) || listed.len() < SCOPE_NAMESPACES {
@@ -340,17 +329,10 @@ impl Scopes {
                             .insert(name.clone());
                     }
                 } else {
-                    let p = past.entry(name.clone()).or_default();
-                    p.0 += 1;
-                    p.1.push(person.clone());
+                    over += 1;
                 }
             }
-            if !lists.rest.is_empty() {
-                past.entry(name.clone())
-                    .or_default()
-                    .1
-                    .extend(lists.rest.iter().cloned());
-            }
+            over += lists.rest;
         }
         for person in listed
             .iter()
@@ -363,20 +345,9 @@ impl Scopes {
         }
         self.listed = listed;
         self.standing = standing;
-        let mut told = Vec::new();
-        let mut over = BTreeMap::new();
-        for (name, (device_wide, persons)) in past {
-            if self.over.get(&name) != Some(&persons) {
-                told.push(Excess {
-                    space: name.clone(),
-                    why: excess_why(&name, persons.len() - device_wide, device_wide),
-                    persons: persons.clone(),
-                });
-            }
-            over.insert(name, persons);
-        }
+        let warning = (over != self.over && over > 0).then(|| over_cap_warning(over));
         self.over = over;
-        told
+        warning
     }
 
     /// The view that judges a packet of `person`, a namespace no context held
@@ -535,28 +506,15 @@ impl Scopes {
     }
 }
 
-/// Why `space`'s listing names persons not adopted for it: `per_space` past
-/// [`SCOPE_PER_SPACE`], `device_wide` past [`SCOPE_NAMESPACES`].
-fn excess_why(space: &Name, per_space: usize, device_wide: usize) -> String {
-    let mut why = Vec::new();
-    if per_space > 0 {
-        why.push(format!(
-            "{per_space} past the first {SCOPE_PER_SPACE} its members list, the most one space \
-             adopts"
-        ));
-    }
-    if device_wide > 0 {
-        why.push(format!(
-            "{device_wide} past the {SCOPE_NAMESPACES} persons' namespaces this node adopts for \
-             all spaces together"
-        ));
-    }
+/// The one warning for `over` persons the caps leave out, with why and what to
+/// do.
+fn over_cap_warning(over: usize) -> String {
     format!(
-        "the members of {space} list too many persons' namespaces to adopt here: {}; their \
-         entries in {space} are judged by no view while they are not adopted. The owner lists \
-         too many persons: have it list fewer, or adopt those namespaces on this node itself \
-         (an anchor link naming them)",
-        why.join(", and ")
+        "the members lists of the spaces list too many persons' namespaces to adopt here: \
+         {over} are past the first {SCOPE_PER_SPACE} of a space or the {SCOPE_NAMESPACES} \
+         this node adopts for all spaces together; their entries are judged by no view \
+         while they are not adopted. The owners list too many persons: have them list \
+         fewer, or adopt those namespaces on this node itself (an anchor link naming them)"
     )
 }
 
@@ -848,15 +806,13 @@ impl Judge {
     /// The listing of `space` is now `listing` (an empty one when no fold
     /// lists anyone): the self-certifying persons it names that the node does
     /// not hold are adopted through the host, those adopted that no listing
-    /// names any more are released. Returns what the listing names past the
-    /// caps, when that changed, to be told.
-    pub(crate) fn note(self: &Arc<Self>, space: &Name, listing: &Listing) -> Vec<Excess> {
-        let told = self.scopes.lock().note(space, listing);
-        for excess in &told {
-            tracing::warn!(space = %excess.space, "{}", excess.why);
+    /// names any more are released. When the persons the caps leave out
+    /// changed, the one warning is logged.
+    pub(crate) fn note(self: &Arc<Self>, space: &Name, listing: &Listing) {
+        if let Some(warning) = self.scopes.lock().note(space, listing) {
+            tracing::warn!("{warning}");
         }
         self.adopt_listed();
-        told
     }
 
     /// At start, after the listings of the spaces held are noted: each person

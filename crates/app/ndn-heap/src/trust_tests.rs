@@ -660,27 +660,23 @@ async fn a_person_no_listing_names_has_nothing_judged() {
 
 /// A space lists at most `SCOPE_PER_SPACE` persons for adoption, the first it
 /// lists (writers, then readers, then those kept by a cut), and the rest are
-/// told with why and what to do; all spaces together list at most
+/// warned of once, with why and what to do; all spaces together list at most
 /// `SCOPE_NAMESPACES`, the spaces served in name order.
 #[test]
-fn a_listing_past_the_caps_adopts_the_first_and_reports_the_rest() {
+fn a_listing_past_the_caps_adopts_the_first_and_warns_once_of_the_rest() {
     let mut scopes = Scopes::default();
     let people: Vec<Name> = (0..100).map(user).collect();
-    let told = scopes.note(
-        &space(),
-        &Listing {
-            writers: people[..50].to_vec(),
-            readers: people[50..90].to_vec(),
-            cut: people[90..].to_vec(),
-        },
-    );
-    assert_eq!(told.len(), 1);
-    assert_eq!(told[0].space, space());
-    assert_eq!(told[0].persons, people[SCOPE_PER_SPACE..].to_vec());
+    let listing = Listing {
+        writers: people[..50].to_vec(),
+        readers: people[50..90].to_vec(),
+        cut: people[90..].to_vec(),
+    };
+    let warning = scopes.note(&space(), &listing).expect("one warning");
     assert!(
-        told[0].why.contains("too many") && told[0].why.contains("list fewer"),
-        "why, and what to do: {}",
-        told[0].why
+        warning.contains(&format!("{} are past", 100 - SCOPE_PER_SPACE))
+            && warning.contains("too many")
+            && warning.contains("list fewer"),
+        "why, and what to do: {warning}"
     );
     assert_eq!(
         scopes.listed.keys().cloned().collect::<BTreeSet<_>>(),
@@ -688,17 +684,8 @@ fn a_listing_past_the_caps_adopts_the_first_and_reports_the_rest() {
         "the first the listing names"
     );
     assert!(
-        scopes
-            .note(
-                &space(),
-                &Listing {
-                    writers: people[..50].to_vec(),
-                    readers: people[50..90].to_vec(),
-                    cut: people[90..].to_vec(),
-                }
-            )
-            .is_empty(),
-        "told once, not on every note of the same listing"
+        scopes.note(&space(), &listing).is_none(),
+        "warned once, not on every note of the same listing"
     );
 
     // Five spaces of 60 distinct persons each: 300 listed, 256 kept, the
@@ -722,14 +709,12 @@ fn a_listing_past_the_caps_adopts_the_first_and_reports_the_rest() {
         );
     }
     assert_eq!(scopes.listed.len(), SCOPE_NAMESPACES);
-    assert_eq!(
-        scopes.over.keys().collect::<Vec<_>>(),
-        vec![&spaces[4]],
-        "the cap falls on the last space by name, and only it is told"
-    );
-    assert_eq!(
-        scopes.over[&spaces[4]],
-        (16..60).map(|j| distinct(4, j)).collect::<Vec<_>>()
+    assert_eq!(scopes.over, 300 - SCOPE_NAMESPACES);
+    assert!(
+        (0..60).all(|j| scopes.listed.contains_key(&distinct(0, j)))
+            && (0..16).all(|j| scopes.listed.contains_key(&distinct(4, j)))
+            && (16..60).all(|j| !scopes.listed.contains_key(&distinct(4, j))),
+        "the cap falls on the last space by name, on the persons it lists last"
     );
 }
 

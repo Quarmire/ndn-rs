@@ -1773,7 +1773,8 @@ the spaces that list her. It goes into no keyring the node judges by.
   not held: the first **64** for one space (`SCOPE_PER_SPACE`) and at most **256**
   persons in all spaces (`SCOPE_NAMESPACES`, spaces taken in name order so the cap
   falls the same way in any order). The rest are not adopted for it, and the
-  node logs and tells the host which and what to do.
+  node logs **one warning** (when the number left out changes) that says how many,
+  why, and what to do.
 - **The host's side.** `trait Adopter { fn adopt_scoped(&self, namespace, held:
   Option<&ScopedContext>) -> Scoping; fn release_scoped(&self, namespace); }`.
   `adopt_scoped` fetches her genesis (version 1, checked as the genesis her name
