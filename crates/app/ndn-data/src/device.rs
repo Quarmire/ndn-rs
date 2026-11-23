@@ -1144,7 +1144,7 @@ enum Held {
 
 /// One entry of an equivocation, as a watch is told of it ([`Equivocal`]).
 enum Side {
-    Version(Version),
+    Version(Box<Version>),
     /// A members or introduction record: by name, id and kind only.
     Record {
         name: Name,
@@ -3429,14 +3429,14 @@ impl St {
         // A version is told whole to its own collection's watchers; a record
         // by name and kind only, to the watchers of the collection it is about.
         let second = match record {
-            Record::Version(body) => Side::Version(version_of(
+            Record::Version(body) => Side::Version(Box::new(version_of(
                 name,
                 writer,
                 seq,
                 body.clone(),
                 wire::implicit_digest(wire),
                 body.sealed.is_none(),
-            )),
+            ))),
             Record::Members(body) => Side::Record {
                 name: name.clone(),
                 id: VersionId {
@@ -3470,7 +3470,7 @@ impl St {
     /// record by name and kind.
     fn side_held(&self, name: &Name) -> Option<Side> {
         if let Some(v) = self.held_version(name) {
-            return Some(Side::Version(v));
+            return Some(Side::Version(Box::new(v)));
         }
         let Held::Record { writer, kind, .. } = self.held.get(name)? else {
             return None;
@@ -3521,8 +3521,8 @@ impl St {
             };
             let second = match &first {
                 Side::Version(_) => match self.reload(name, self.twins[name].clone()) {
-                    Some(Ok(hv)) => Side::Version(hv.version),
-                    Some(Err(lk)) => Side::Version(lk.version()),
+                    Some(Ok(hv)) => Side::Version(Box::new(hv.version)),
+                    Some(Err(lk)) => Side::Version(Box::new(lk.version())),
                     None => continue,
                 },
                 Side::Record { .. } => self.side_held(name).expect("held"),
@@ -6704,7 +6704,7 @@ impl Inner {
         // A root of it must be above the head a root that answered its first
         // notice left ([`Peer::after`]), as above those verified before a
         // notice.
-        let floor = answers.and_then(|_| held).max(owed);
+        let floor = answers.and(held).max(owed);
         let above = reach
             .as_ref()
             .filter(|r| r.index > 0)
