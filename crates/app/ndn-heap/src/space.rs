@@ -998,35 +998,22 @@ impl Heap {
             let log = inner.log.lock();
             inner.check_reader(&log)?;
             let (items, blobs) = log.items();
-            let mut listed: VecDeque<Slot> = items
-                .into_iter()
-                .filter(|item| item.id.seq > since.get(&item.id.device))
-                .map(|item| Slot::Change(Change::Put(item)))
-                .collect();
             // A value in pieces is a reference here: it is read from the
             // store when the watch reaches it, and skipped then if its
             // pieces are not all held (it is told when its last is).
-            listed.extend(
-                blobs
-                    .into_iter()
-                    .filter(|blob| blob.id.seq > since.get(&blob.id.device))
-                    .map(Slot::Blob),
-            );
-            listed.extend(
-                inner
-                    .standing
-                    .lock()
-                    .iter()
-                    .cloned()
-                    .map(|a| Slot::Change(Change::Alert(a))),
-            );
-            listed.extend(
-                inner
-                    .refused
-                    .lock()
-                    .iter()
-                    .map(|(_, a)| Slot::Change(Change::Alert(a.clone()))),
-            );
+            let heads = (items.into_iter())
+                .filter(|item| item.id.seq > since.get(&item.id.device))
+                .map(|item| Slot::Change(Change::Put(item)));
+            let blobs = (blobs.into_iter())
+                .filter(|blob| blob.id.seq > since.get(&blob.id.device))
+                .map(Slot::Blob);
+            let listed: VecDeque<Slot> = {
+                let (standing, refused) = (inner.standing.lock(), inner.refused.lock());
+                let alerts = (standing.iter())
+                    .chain(refused.iter().map(|(_, alert)| alert))
+                    .map(|alert| Slot::Change(Change::Alert(alert.clone())));
+                heads.chain(blobs).chain(alerts).collect()
+            };
             let queue = Queue::new(self.node.config.watch_queue);
             inner.watchers.lock().push(Arc::clone(&queue));
             (listed, queue)
