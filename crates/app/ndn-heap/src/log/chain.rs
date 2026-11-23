@@ -310,49 +310,42 @@ pub(super) enum Status {
 }
 
 impl Status {
-    pub(super) fn encode(&self) -> Bytes {
-        let mut out = BytesMut::new();
+    /// The one octet of the `status/` record: the kind, nothing more. What a
+    /// refusal says besides its kind (the seq a cut keeps to, the judge's
+    /// text) is told to the host when the refusal is made and read from no
+    /// record, so none is stored; a status read back has those payloads
+    /// empty and compares by its code.
+    pub(super) fn code(&self) -> u8 {
         match self {
-            Status::Closed => out.put_u8(1),
-            Status::Waiting => out.put_u8(2),
-            Status::Unreadable => out.put_u8(3),
-            Status::Refused(Refusal::NotMember) => out.put_u8(4),
-            Status::Refused(Refusal::OutsideCut(cut)) => {
-                out.put_u8(5);
-                out.put_u64(cut.keeps_to);
-            }
-            Status::Refused(Refusal::Unsealed) => out.put_u8(6),
-            Status::Refused(Refusal::Sealed) => out.put_u8(7),
-            Status::Refused(Refusal::Untrusted { why }) => {
-                out.put_u8(8);
-                out.put_slice(why.as_bytes());
-            }
-            Status::Refused(Refusal::Chain) => out.put_u8(10),
+            Status::Closed => 1,
+            Status::Waiting => 2,
+            Status::Unreadable => 3,
+            Status::Refused(Refusal::NotMember) => 4,
+            Status::Refused(Refusal::OutsideCut(_)) => 5,
+            Status::Refused(Refusal::Unsealed) => 6,
+            Status::Refused(Refusal::Sealed) => 7,
+            Status::Refused(Refusal::Untrusted { .. }) => 8,
+            Status::Refused(Refusal::Chain) => 10,
             // The rest are never kept as a status (Lapsed and Suspected are
             // not recorded, Rollback is not an entry's); they read back as
             // the refusal that closes a copy's way in.
-            Status::Refused(_) => out.put_u8(11),
+            Status::Refused(_) => 11,
         }
-        out.freeze()
     }
 
     pub(super) fn decode(record: &[u8], device: &Name) -> Option<Status> {
-        let (&code, rest) = record.split_first()?;
-        let be = |b: &[u8]| Some(u64::from_be_bytes(b.try_into().ok()?));
-        Some(match code {
+        Some(match record.first()? {
             1 => Status::Closed,
             2 => Status::Waiting,
             3 => Status::Unreadable,
             4 => Status::Refused(Refusal::NotMember),
             5 => Status::Refused(Refusal::OutsideCut(Cut {
                 device: device.clone(),
-                keeps_to: be(rest)?,
+                keeps_to: 0,
             })),
             6 => Status::Refused(Refusal::Unsealed),
             7 => Status::Refused(Refusal::Sealed),
-            8 => Status::Refused(Refusal::Untrusted {
-                why: String::from_utf8_lossy(rest).into_owned(),
-            }),
+            8 => Status::Refused(Refusal::Untrusted { why: String::new() }),
             10 => Status::Refused(Refusal::Chain),
             11 => Status::Refused(Refusal::BadSignature),
             _ => return None,

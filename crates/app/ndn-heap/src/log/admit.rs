@@ -742,7 +742,9 @@ impl Log {
         }
         let key = store::status_key(&self.space, device, seq);
         match new {
-            Some(status) => self.store.insert(key, status.encode()),
+            Some(status) => self
+                .store
+                .insert(key, Bytes::copy_from_slice(&[status.code()])),
             None if old.is_some() => self.store.remove(&key),
             None => {}
         }
@@ -1091,7 +1093,7 @@ impl Log {
                 }
             }
         };
-        if l.status.as_ref() == Some(&new) {
+        if l.status.as_ref().is_some_and(|s| s.code() == new.code()) {
             return;
         }
         self.set_status(device, seq, l.status.as_ref(), Some(&new));
