@@ -17,7 +17,7 @@ use super::names::{is_device_name, is_namespace};
 use super::pieces::{FANOUT, PAYLOAD_MAX};
 use super::prim::{
     WireError, each, fields, once, only, read_array, read_digest, read_epoch_id, read_name,
-    read_nni, write_epoch_id, write_name, write_nni,
+    read_nni, record, write_epoch_id, write_name, write_nni,
 };
 use super::tlv;
 use super::types::{
@@ -376,12 +376,12 @@ fn check_put(put: &PutBody) -> Result<(), WireError> {
 fn put_of(
     path: Option<Name>,
     inline: Option<Bytes>,
-    blob: Option<(u64, [u8; 32])>,
+    blob: Option<Payload>,
 ) -> Result<PutBody, WireError> {
     let path = path.ok_or(WireError::Missing("PATH"))?;
     let payload = match (inline, blob) {
         (Some(bytes), None) => Payload::Inline(bytes),
-        (None, Some((size, root))) => Payload::Blob { size, root },
+        (None, Some(blob)) => blob,
         (None, None) => return Err(WireError::Missing("INLINE or BLOB")),
         (Some(_), Some(_)) => {
             return Err(WireError::Malformed(
@@ -427,22 +427,11 @@ pub(crate) fn write_ref(w: &mut TlvWriter, r: &EntryRef) {
 }
 
 pub(crate) fn read_ref(value: Bytes) -> Result<EntryRef, WireError> {
-    let (mut device, mut seq, mut digest) = (None, None, None);
-    fields!(value, |v| {
-        tlv_type::NAME => once(&mut device, read_name(v)?, "an entry reference's device")?,
-        tlv::SEQ => once(&mut seq, read_nni(&v)?, "an entry reference's seq")?,
-        tlv::DIGEST => once(&mut digest, read_digest(&v)?, "an entry reference's digest")?,
-    });
-    let (Some(device), Some(seq), Some(digest)) = (device, seq, digest) else {
-        return Err(WireError::Missing(
-            "a device, a seq or a digest of an entry reference",
-        ));
-    };
-    Ok(EntryRef {
-        device,
-        seq,
-        digest,
-    })
+    Ok(record!(EntryRef, value, "an entry reference", |v| {
+        device: tlv_type::NAME => read_name(v)?,
+        seq: tlv::SEQ => read_nni(&v)?,
+        digest: tlv::DIGEST => read_digest(&v)?,
+    }))
 }
 
 fn write_op(w: &mut TlvWriter, op: &Op) {
@@ -538,47 +527,25 @@ fn read_create(value: Bytes) -> Result<bool, WireError> {
     anyone.ok_or(WireError::Missing("ANYONE of CREATE"))
 }
 
-fn read_blob(value: Bytes) -> Result<(u64, [u8; 32]), WireError> {
-    let (mut size, mut root) = (None, None);
-    fields!(value, |v| {
-        tlv::SIZE => once(&mut size, read_nni(&v)?, "SIZE")?,
-        tlv::ROOT => once(&mut root, read_digest(&v)?, "ROOT")?,
-    });
-    let (Some(size), Some(root)) = (size, root) else {
-        return Err(WireError::Missing("the SIZE or the ROOT of a blob"));
-    };
-    Ok((size, root))
+fn read_blob(value: Bytes) -> Result<Payload, WireError> {
+    Ok(record!(Payload::Blob, value, "a blob", |v| {
+        size: tlv::SIZE => read_nni(&v)?,
+        root: tlv::ROOT => read_digest(&v)?,
+    }))
 }
 
 fn read_sealed(value: Bytes) -> Result<SealedBody, WireError> {
-    let (mut epoch, mut sealed) = (None, None);
-    fields!(value, |v| {
-        tlv::EPOCH_ID => once(&mut epoch, read_epoch_id(v)?, "a sealed body's epoch")?,
-        tlv::CIPHERTEXT => once(&mut sealed, v, "CIPHERTEXT")?,
-    });
-    let (Some(epoch), Some(sealed)) = (epoch, sealed) else {
-        return Err(WireError::Missing(
-            "the EPOCH_ID or the CIPHERTEXT of a sealed body",
-        ));
-    };
-    Ok(SealedBody { epoch, sealed })
+    Ok(record!(SealedBody, value, "a sealed body", |v| {
+        epoch: tlv::EPOCH_ID => read_epoch_id(v)?,
+        sealed: tlv::CIPHERTEXT => v,
+    }))
 }
 
 fn read_epoch_body(value: Bytes) -> Result<EpochBody, WireError> {
-    let (mut key_check, mut audience) = (None, None);
-    fields!(value, |v| {
-        tlv::KEY_CHECK => once(&mut key_check, read_digest(&v)?, "KEY_CHECK")?,
-        tlv::AUDIENCE => once(&mut audience, read_audience(v)?, "AUDIENCE")?,
-    });
-    let (Some(key_check), Some(audience)) = (key_check, audience) else {
-        return Err(WireError::Missing(
-            "the KEY_CHECK or the AUDIENCE of an epoch",
-        ));
-    };
-    Ok(EpochBody {
-        key_check,
-        audience,
-    })
+    Ok(record!(EpochBody, value, "an epoch", |v| {
+        key_check: tlv::KEY_CHECK => read_digest(&v)?,
+        audience: tlv::AUDIENCE => read_audience(v)?,
+    }))
 }
 
 fn read_audience(value: Bytes) -> Result<Vec<Name>, WireError> {
@@ -611,22 +578,10 @@ impl Grant {
     /// Decode the Content of a grant packet.
     pub(crate) fn decode(content: Bytes) -> Result<Grant, WireError> {
         let value = only(content, tlv::GRANT, "a grant packet carries one GRANT")?;
-        let (mut ephemeral, mut ciphertext) = (None, None);
-        fields!(value, |v| {
-            tlv::EPHEMERAL_KEY => {
-                once(&mut ephemeral, read_array(&v, "an ephemeral key is 32 octets")?, "EPHEMERAL_KEY")?
-            },
-            tlv::CIPHERTEXT => once(&mut ciphertext, v, "CIPHERTEXT")?,
-        });
-        let (Some(ephemeral), Some(ciphertext)) = (ephemeral, ciphertext) else {
-            return Err(WireError::Missing(
-                "the EPHEMERAL_KEY or the CIPHERTEXT of a grant",
-            ));
-        };
-        Ok(Grant {
-            ephemeral,
-            ciphertext,
-        })
+        Ok(record!(Grant, value, "a grant", |v| {
+            ephemeral: tlv::EPHEMERAL_KEY => read_array(&v, "an ephemeral key is 32 octets")?,
+            ciphertext: tlv::CIPHERTEXT => v,
+        }))
     }
 }
 

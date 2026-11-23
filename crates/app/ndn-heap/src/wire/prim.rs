@@ -25,6 +25,27 @@ macro_rules! fields {
 }
 pub(crate) use fields;
 
+/// Read a record whose every field appears exactly once: builds
+/// `Type { field, … }` from what `read` makes of the TLV value `v` of each
+/// field's TLV-TYPE, refusing a field twice or absent (the error names `what`
+/// the record is and the field).
+macro_rules! record {
+    ($ty:path, $value:expr, $what:literal, |$v:ident| {
+        $($f:ident: $typ:pat => $read:expr),+ $(,)?
+    }) => {{
+        $(let mut $f = None;)+
+        $crate::wire::fields!($value, |$v| {
+            $($typ => $crate::wire::once(&mut $f, $read, concat!($what, "'s ", stringify!($f)))?),+
+        });
+        $ty {
+            $($f: $f.ok_or($crate::wire::WireError::Missing(
+                concat!($what, "'s ", stringify!($f)),
+            ))?),+
+        }
+    }};
+}
+pub(crate) use record;
+
 /// Why bytes are not a record of the layer (or a record cannot be written).
 /// Every refusal says what is wrong and what to do about it.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
