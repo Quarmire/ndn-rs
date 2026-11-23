@@ -30,8 +30,11 @@ enum Hop {
 enum WalkOutcome {
     /// The chain reached a trust anchor — or, under
     /// [`Validator::accept_signed`], the packet's signer verified it; carries
-    /// the cert names walked.
-    Trusted(Vec<Name>),
+    /// the cert names walked, and for a Data packet the
+    /// [`public_key_digest`](crate::public_key_digest) of the key (a
+    /// certificate's, or an anchor's) whose public key verified its
+    /// signature.
+    Trusted(Vec<Name>, Option<[u8; 32]>),
     /// A cert in the chain couldn't be resolved (cache miss + no/failed fetch);
     /// carries the name of the first unresolved cert.
     Pending(Arc<Name>),
@@ -240,6 +243,7 @@ impl Validator {
                     inner,
                     trust_path: TrustPath::DigestSha256,
                     verified_at: now_ns(),
+                    signer_key: None,
                 };
                 return result(ValidationResult::Valid(Box::new(safe)));
             }
@@ -278,7 +282,7 @@ impl Validator {
             )
             .await
         {
-            WalkOutcome::Trusted(chain_names) => {
+            WalkOutcome::Trusted(chain_names, signer_key) => {
                 let Ok(inner) = Data::decode(data.raw().clone()) else {
                     return result(ValidationResult::Invalid(TrustError::InvalidSignature));
                 };
@@ -286,6 +290,7 @@ impl Validator {
                     inner,
                     trust_path: TrustPath::CertChain(chain_names),
                     verified_at: now_ns(),
+                    signer_key,
                 };
                 result(ValidationResult::Valid(Box::new(safe)))
             }
@@ -372,7 +377,7 @@ impl Validator {
             )
             .await
         {
-            WalkOutcome::Trusted(_) => InterestValidationOutcome::Valid,
+            WalkOutcome::Trusted(..) => InterestValidationOutcome::Valid,
             WalkOutcome::Pending(_) | WalkOutcome::RefusedCopy(_) => {
                 InterestValidationOutcome::Pending
             }
@@ -518,11 +523,17 @@ impl Validator {
         let signed_packet = |depth: usize| packet.filter(|_| durable && depth == 0);
         let trusted = |chain_names: Vec<Name>,
                        revoked: Option<TrustError>,
-                       missing: Option<Arc<Name>>| match (revoked, missing) {
+                       missing: Option<Arc<Name>>,
+                       signer_key: Option<[u8; 32]>| match (revoked, missing)
+        {
             (Some(refused), _) => WalkOutcome::Invalid(refused),
             (None, Some(missing)) => WalkOutcome::Pending(missing),
-            (None, None) => WalkOutcome::Trusted(chain_names),
+            (None, None) => WalkOutcome::Trusted(chain_names, signer_key),
         };
+        // The digest of the public key that verified the packet itself
+        // (depth 0 of a walk with a packet), taken from the hop that just
+        // verified it: no second verification.
+        let mut signer_key: Option<[u8; 32]> = None;
         let mut chain_names: Vec<Name> = Vec::new();
         let mut seen: HashSet<Arc<Name>> = HashSet::new();
         let mut taken: Taken = Vec::new();
@@ -670,10 +681,15 @@ impl Validator {
                                 }
                             }
                         }
+                        if depth == 0 && packet.is_some() {
+                            signer_key = Some(crate::public_key_digest(&anchor.public_key));
+                        }
                         chain_names.push(current_key_name.as_ref().clone());
                         match self.reached_anchor(&taken, suspect) {
                             Some(refused) => refused,
-                            None => trusted(chain_names, revoked_signer, missing_manifest),
+                            None => {
+                                trusted(chain_names, revoked_signer, missing_manifest, signer_key)
+                            }
                         }
                     }
                     Ok(VerifyOutcome::Invalid) => {
@@ -827,9 +843,12 @@ impl Validator {
                 }
             }
 
+            if verifies && depth == 0 && packet.is_some() {
+                signer_key = Some(crate::public_key_digest(&cert.public_key));
+            }
             chain_names.push(current_key_name.as_ref().clone());
             if !require_anchor {
-                return trusted(chain_names, revoked_signer, missing_manifest);
+                return trusted(chain_names, revoked_signer, missing_manifest, signer_key);
             }
 
             let Some(issuer) = &cert.issuer else {
@@ -1365,7 +1384,7 @@ impl Validator {
                     )
                     .await;
                 match walked {
-                    WalkOutcome::Trusted(_) if self.anchor_required(&cert.name) => {
+                    WalkOutcome::Trusted(..) if self.anchor_required(&cert.name) => {
                         self.cert_cache.admit(&cert);
                         return Ok(true);
                     }
@@ -3556,6 +3575,62 @@ mod tests {
             .await;
             let data = signed(log_name("notes", 2), b"v", &bob.phone);
             assert!(valid(&bob.validator.validate_durable(&data).await));
+        }
+
+        /// A durable validation names the digest of the public key that
+        /// verified the packet — the certificate it resolved to, not just
+        /// the key's name — for a consumer that binds entries to keys; an
+        /// integrity-only (digest) packet names none.
+        #[tokio::test]
+        async fn validate_durable_names_the_digest_of_the_key_that_verified() {
+            let digest_of = |result: ValidationResult| match result {
+                ValidationResult::Valid(safe) => safe.signer_key_digest(),
+                other => panic!("not valid: {other:?}"),
+            };
+            let bob = bob(u64::MAX, (PAST, u64::MAX), true, |c| c).await;
+            let honest = signed(log_name("notes", 1), b"v", &bob.phone);
+            assert_eq!(
+                digest_of(bob.validator.validate_durable(&honest).await),
+                Some(phone_key_digest())
+            );
+            assert_eq!(
+                digest_of(bob.validator.validate_durable_cached(&honest).await.0),
+                Some(phone_key_digest())
+            );
+
+            // Another public key certified under the phone's key name: the
+            // digest is the one of the key whose certificate verified.
+            let other = signer(PHONE, 99);
+            let recertified = cert(&other, &signer(CA, 71), "CA2", PAST, u64::MAX).await;
+            bob.validator.cert_cache().insert(decoded(&recertified));
+            let by_other = signed(log_name("notes", 2), b"v", &other);
+            let expected = crate::public_key_digest(&other.public_key_bytes());
+            assert_ne!(expected, phone_key_digest());
+            assert_eq!(
+                digest_of(bob.validator.validate_durable(&by_other).await),
+                Some(expected)
+            );
+            assert_eq!(
+                digest_of(bob.validator.validate_durable(&honest).await),
+                Some(phone_key_digest())
+            );
+
+            // A packet signed by a trust anchor's own key: the anchor's key.
+            let root = signer("/home/bob/KEY/root", 70);
+            let by_root = signed(log_name("notes", 3), b"v", &root);
+            assert_eq!(
+                digest_of(bob.validator.validate_durable(&by_root).await),
+                Some(crate::public_key_digest(&root.public_key_bytes()))
+            );
+
+            // Integrity only: no signer, no digest.
+            let wire = ndn_packet::encode::DataBuilder::new(log_name("notes", 4), b"v")
+                .sign_digest_sha256();
+            let packet = Data::decode(wire).unwrap();
+            assert_eq!(
+                digest_of(bob.validator.validate_durable(&packet).await),
+                None
+            );
         }
 
         /// A listed role is refused once lapsed whatever the role: under

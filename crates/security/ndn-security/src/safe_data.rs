@@ -33,6 +33,7 @@ pub struct SafeData {
     pub(crate) inner: Data,
     pub(crate) trust_path: TrustPath,
     pub(crate) verified_at: u64,
+    pub(crate) signer_key: Option<[u8; 32]>,
 }
 
 impl SafeData {
@@ -44,6 +45,7 @@ impl SafeData {
             inner: data,
             trust_path: TrustPath::LocalFace { uid },
             verified_at: now_ns(),
+            signer_key: None,
         }
     }
 
@@ -66,6 +68,16 @@ impl SafeData {
 
     pub fn verified_at(&self) -> u64 {
         self.verified_at
+    }
+
+    /// The [`public_key_digest`](crate::public_key_digest) of the key that
+    /// verified the Data's signature: the certificate (or trust anchor) the
+    /// chain walk resolved the signer to, not merely the key's name, which
+    /// two certificates of different keys may share. `None` where no key
+    /// verified it: a `DigestSha256` packet, a local-face packet, an
+    /// adopted trust context.
+    pub fn signer_key_digest(&self) -> Option<[u8; 32]> {
+        self.signer_key
     }
 }
 

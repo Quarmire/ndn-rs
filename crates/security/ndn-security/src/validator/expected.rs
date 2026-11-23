@@ -322,6 +322,7 @@ impl Validator {
                 anchor: anchor.name.as_ref().clone(),
             },
             verified_at: now_ns(),
+            signer_key: None,
         })))
     }
 }

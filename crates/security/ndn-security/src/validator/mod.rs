@@ -533,6 +533,7 @@ impl Validator {
                         inner,
                         trust_path: crate::safe_data::TrustPath::DigestSha256,
                         verified_at: now_ns(),
+                        signer_key: None,
                     };
                     ValidationResult::Valid(Box::new(safe))
                 }
@@ -606,6 +607,7 @@ impl Validator {
                         key_name.as_ref().clone(),
                     ]),
                     verified_at: now_ns(),
+                    signer_key: Some(crate::public_key_digest(&cert.public_key)),
                 };
                 ValidationResult::Valid(Box::new(safe))
             }
