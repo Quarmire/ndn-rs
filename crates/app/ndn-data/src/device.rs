@@ -9665,7 +9665,11 @@ impl Inner {
                     "the record in force lists a reader that no record naming its epoch {e:?} \
                      lists — a merge not resolved yet — so a version sealed in it would stay \
                      closed to that reader; put again once a device of the owner's namespace \
-                     that reads it has signed the record resolving the merge"
+                     that reads it has signed the record resolving the merge; the epoch was \
+                     created by {creator}, so bring that device online (or another device of \
+                     the owner's namespace that reads the collection), and puts wait until one \
+                     has",
+                    creator = e.creator
                 ),
             });
         }
@@ -13858,6 +13862,13 @@ mod tests {
             matches!(refused, Err(DataError::NotReady { .. })),
             "nothing is sealed in an epoch the record in force lists a reader outside of: \
              {refused:?}"
+        );
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("/alice/phone")),
+            "the message names the device that created the epoch it waits for, which the \
+             owner brings online: {refused:?}"
         );
         assert_eq!(dev.inner.st.lock().head, head, "nothing was signed");
         // The laptop resolves the merge, in a new epoch Carol is of: it writes.
