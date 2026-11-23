@@ -51,9 +51,8 @@ impl Log {
                 })
             }
         };
-        let mut after = self.register.after_for_put(path);
-        after.truncate(AFTER_MAX);
-        self.sign_next(body, after, Some(put), extra, now, path)
+        let after = self.register.after_for_put(path);
+        self.sign_next(body, after, Some(put), extra, now)
     }
 
     /// Sign a Members entry (the space's creation, additions, removals). Only
@@ -63,14 +62,7 @@ impl Log {
         if let Some(ticket) = self.gate()? {
             return Ok(Step::Wait(ticket));
         }
-        self.sign_next(
-            Body::Members(body),
-            vec![],
-            None,
-            vec![],
-            now,
-            &self.space.clone(),
-        )
+        self.sign_next(Body::Members(body), vec![], None, vec![], now)
     }
 
     /// Sign an Epoch entry for `audience`: a fresh key, stored (wrapped to
@@ -97,14 +89,8 @@ impl Log {
             key_check,
             audience,
         });
-        self.sign_next(
-            body,
-            self.epoch_tips(),
-            None,
-            vec![StoreOp::Insert(at, stored)],
-            now,
-            &self.space.clone(),
-        )
+        let after = self.epoch_tips();
+        self.sign_next(body, after, None, vec![StoreOp::Insert(at, stored)], now)
     }
 
     /// The Epoch entries no held epoch replaces: what a new Epoch entry
@@ -216,7 +202,6 @@ impl Log {
         put: Option<PutBody>,
         extra: Vec<StoreOp>,
         now: u64,
-        subject: &Name,
     ) -> Result<Step, HeapError> {
         let seq = self.next_seq;
         let entry = Entry {
@@ -224,6 +209,7 @@ impl Log {
             after,
             body,
         };
+        let subject = put.as_ref().map_or(&self.space, |p| &p.path);
         let content = entry.encode().map_err(|e| wire_error(subject, e))?;
         let name = log_name(&self.device, &self.space, seq);
         let packet = seal::sign(DataBuilder::new(name.clone(), &content), &*self.signer)
