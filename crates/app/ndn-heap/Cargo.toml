@@ -53,13 +53,6 @@ ndn-engine = { workspace = true }
 ndn-namespace = { workspace = true }
 tokio-util    = { workspace = true }
 
-[features]
-# Construction gates: a module under construction is compiled only with its
-# own feature, so a sibling's half-written module never breaks the build.
-# Each gate is removed when its module lands; none remains at the stage's end.
-wip-node = []
-wip-space = []
-
 [lints]
 workspace = true
 

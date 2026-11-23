@@ -19,7 +19,9 @@ use ndn_sync::{DataStore, MemoryStore};
 use proptest::prelude::*;
 
 use super::*;
-use crate::log::Alert;
+use crate::error::NextStep;
+use crate::log::{Alert, Frontier};
+use crate::space::{Changes, PutOptions};
 use crate::sync::{Host, Taken};
 use crate::test_kit::{CrashStore, Engine, Held, PowerCut, n};
 use crate::wire::{Body, Entry, log_name};
@@ -90,7 +92,7 @@ pub(crate) async fn world(devices: &[&str]) -> Vec<Dev> {
         .map(|(name, keys, _)| {
             let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
             for (ns, _, _, anchor) in &roots {
-                let mut ctx = SignedTrustContext::hierarchical(ns.clone());
+                let ctx = SignedTrustContext::hierarchical(ns.clone());
                 assert!(ctx.add_anchor(anchor.clone()));
                 validator.adopt_context(Arc::new(ctx)).unwrap();
             }
@@ -240,7 +242,11 @@ async fn start_restores_held_spaces() {
     let (node, _) = boot(&dev, cfg()).await;
     assert_eq!(node.spaces(), vec![space()], "the space is held again");
     let heap = node.space(&space()).expect("the space is open");
-    let item = heap.get(&n("/a")).await.unwrap().expect("the value is held");
+    let item = heap
+        .get(&n("/a"))
+        .await
+        .unwrap()
+        .expect("the value is held");
     assert_eq!(item.bytes, bytes("one"));
     assert_eq!(item.id, id);
     assert_eq!(heap.members(), members, "the fold is replayed");
@@ -666,9 +672,13 @@ async fn node_kill_child() {
     let heap = node.create(&space(), public()).await.unwrap();
     let mut out = std::io::stdout();
     for k in 1u64.. {
-        heap.put(&n(&format!("/p/{k}")), bytes(&k.to_string()), durable(false))
-            .await
-            .unwrap();
+        heap.put(
+            &n(&format!("/p/{k}")),
+            bytes(&k.to_string()),
+            durable(false),
+        )
+        .await
+        .unwrap();
         writeln!(out, "put {k}").unwrap();
         out.flush().unwrap();
         tokio::time::sleep(Duration::from_millis(2)).await;
@@ -706,11 +716,11 @@ fn d13(engine: Engine) {
         let mut dev = kill_dev().await;
         dev.store = match engine {
             Engine::Fjall => Arc::new(
-                ndn_sync::store::BackendStore::open_fjall(&engine.live(dir.path())).unwrap(),
+                ndn_sync::store::BackendStore::open_fjall(engine.live(dir.path())).unwrap(),
             ),
-            Engine::Redb => Arc::new(
-                ndn_sync::store::BackendStore::open_redb(&engine.live(dir.path())).unwrap(),
-            ),
+            Engine::Redb => {
+                Arc::new(ndn_sync::store::BackendStore::open_redb(engine.live(dir.path())).unwrap())
+            }
         };
         let (node, _) = boot(&dev, cfg()).await;
         let heap = node.space(&space()).expect("the space is held again");
@@ -738,4 +748,42 @@ fn d13_kill_9_loses_nothing_on_fjall() {
 #[test]
 fn d13_kill_9_loses_nothing_on_redb() {
     d13(Engine::Redb);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_revoked_while_the_node_was_off_is_withdrawn_at_start() {
+    let devs = world(&["/alice/laptop", "/alice/phone"]).await;
+    let (laptop, _) = boot(&devs[0], cfg()).await;
+    laptop.create(&space(), public()).await.unwrap();
+    let (phone, _) = boot(&devs[1], cfg()).await;
+    let theirs = phone.open(&space()).await.unwrap();
+    deliver(&devs[0], &phone).await;
+    theirs
+        .put(&n("/from-phone"), bytes("held"), PutOptions::default())
+        .await
+        .unwrap();
+    deliver(&devs[1], &laptop).await;
+    let heap = laptop.space(&space()).unwrap();
+    assert!(heap.get(&n("/from-phone")).await.unwrap().is_some());
+    laptop.close().await;
+
+    // While the laptop is off, its keyring adopts a context that revokes the
+    // phone's key.
+    let phone_key = devs[1].name.clone().append("KEY").append("1");
+    let revoking = SignedTrustContext::hierarchical(n("/alice"))
+        .with_version(2)
+        .with_revocation(phone_key);
+    devs[0]
+        .validator
+        .keyring()
+        .adopt_update(Arc::new(revoking))
+        .expect("the revoking context is adopted");
+
+    let (laptop, _) = boot(&devs[0], cfg()).await;
+    let heap = laptop.space(&space()).unwrap();
+    assert_eq!(
+        heap.get(&n("/from-phone")).await.unwrap(),
+        None,
+        "what a revoked key signed is judged again at start and withdrawn"
+    );
 }

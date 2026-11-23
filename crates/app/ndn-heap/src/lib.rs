@@ -23,7 +23,6 @@ mod fetch;
 mod fold;
 mod heard;
 mod log;
-#[cfg(feature = "wip-node")]
 mod node;
 mod pieces;
 mod register;
@@ -32,10 +31,18 @@ mod revocation;
 mod seal;
 mod serve;
 mod signal;
-#[cfg(feature = "wip-space")]
 mod space;
 mod store;
 mod sync;
 #[cfg(test)]
 mod test_kit;
 mod trust;
+
+pub use crate::error::{Cut, HeapError, NextStep, Refusal, Timestamp};
+pub use crate::fold::Readers;
+pub use crate::log::{Alert, Change, Frontier, Members};
+pub use crate::node::{Clock, Config, Node, Transport, Writer};
+pub use crate::register::{EntryId, Item};
+pub use crate::revocation::{CutBound, CutProposal};
+pub use crate::space::{Changes, Follower, Heap, MembersChange, PutOptions, Share};
+pub use crate::trust::{Adopter, Scoping};

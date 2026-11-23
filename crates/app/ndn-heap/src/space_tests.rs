@@ -14,6 +14,7 @@ use crate::log::Alert;
 use crate::node::tests::{
     boot, bytes, cfg, deliver, durable, next, private, public, solo, space, until, world,
 };
+use crate::sync::Host;
 use crate::test_kit::n;
 use crate::wire::{Body, Entry, log_name};
 
@@ -100,7 +101,9 @@ async fn members_lists_owner_first() {
             readers: Readers::Persons(vec![n("/alice"), n("/bob"), n("/zed")]),
         }
     );
-    heap.change(changed(&[], &["/amy"], &["/bob"])).await.unwrap();
+    heap.change(changed(&[], &["/amy"], &["/bob"]))
+        .await
+        .unwrap();
     assert_eq!(
         heap.members(),
         Members {
@@ -130,7 +133,10 @@ async fn change_by_a_non_owner_device_is_refused_with_use_owner_device() {
         !heap.members().writers.contains(&n("/bob")),
         "nothing was signed"
     );
-    let made = bob.create(&space(), public()).await.expect_err("not the owner's namespace");
+    let made = bob
+        .create(&space(), public())
+        .await
+        .expect_err("not the owner's namespace");
     assert_eq!(made.next(), NextStep::UseOwnerDevice);
 }
 
@@ -202,9 +208,14 @@ async fn a_follower_holds_no_write_handle_and_the_space_is_not_opened_beside_it(
     assert_eq!(follower.held(), 0);
     assert!(node.space(&space()).is_none(), "a carrier has no handle");
     let refused = node.open(&space()).await.expect_err("followed, not opened");
-    assert!(matches!(refused, HeapError::BadRequest { .. }), "{refused:?}");
+    assert!(
+        matches!(refused, HeapError::BadRequest { .. }),
+        "{refused:?}"
+    );
     follower.close().await;
-    node.open(&space()).await.expect("free to open once the carrier is closed");
+    node.open(&space())
+        .await
+        .expect("free to open once the carrier is closed");
 }
 
 // -- Sealed ------------------------------------------------------------------------
@@ -305,7 +316,17 @@ async fn an_owner_device_signs_the_epoch_a_members_entry_of_another_leaves_incom
         .store
         .get(&log_name(&devs[0].name, &space(), 3))
         .expect("the removal is the third entry");
-    phone.inner.take(&space(), removal).await;
+    let taken = phone.inner.take(&space(), removal).await;
+    assert!(
+        matches!(
+            taken,
+            crate::sync::Taken::Decided {
+                outcome: crate::log::Outcome::Applied,
+                ..
+            }
+        ),
+        "{taken:?}"
+    );
     // On arrival the phone, an owner device, repairs the epoch.
     for _ in 0..100 {
         if theirs.inner.log.lock().fold().complete() {
