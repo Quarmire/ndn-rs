@@ -11,7 +11,7 @@ use ndn_sync::DataStore;
 use super::chain::{Dev, Status};
 use super::{Log, decode_wire};
 use crate::error::Refusal;
-use crate::register::{Write, decode_refs};
+use crate::register::{Head, decode_refs};
 use crate::seal::{self, Keys};
 use crate::store::{Kind, Marker, supers_key};
 use crate::wire::{self, Body, Entry, EntryRef, Payload, PutBody, log_name, signed_digest};
@@ -94,16 +94,16 @@ impl<'a> View<'a> {
         self.opened_put(&entry, &log_name(&r.device, self.space, r.seq))
     }
 
-    /// What the applied entry `r` wrote; `None` when it is not held, not
+    /// The head the applied entry `r` makes; `None` when it is not held, not
     /// applied, or not a write. The register asks for it when an entry it
     /// superseded returns.
-    pub(super) fn write_of(&self, r: &EntryRef) -> Option<Write> {
+    pub(super) fn head_of(&self, r: &EntryRef) -> Option<Head> {
         if self.status(&r.device, r.seq).is_some() {
             return None;
         }
         let put = self.put_of(r)?;
         let person = self.devices.get(&r.device)?.person.clone();
-        Some(write_for(&put, person))
+        Some(head_for(r, &put, person))
     }
 
     /// The payload the applied entry `r` wrote.
@@ -112,13 +112,14 @@ impl<'a> View<'a> {
     }
 }
 
-/// What the register needs of a write by `person`.
-pub(super) fn write_for(put: &PutBody, person: Name) -> Write {
+/// The head the entry `r`, a write by `person`, makes.
+pub(super) fn head_for(r: &EntryRef, put: &PutBody, person: Name) -> Head {
     let (removal, size) = match &put.payload {
         Payload::Inline(bytes) => (bytes.is_empty(), bytes.len() as u64),
         Payload::Blob { size, .. } => (false, *size),
     };
-    Write {
+    Head {
+        entry: r.clone(),
         path: put.path.clone(),
         person,
         removal,

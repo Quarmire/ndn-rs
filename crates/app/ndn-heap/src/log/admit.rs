@@ -12,7 +12,7 @@ use ndn_foundation_types::Name;
 use ndn_packet::Data;
 
 use super::chain::{Keeps, RANGES_MAX, Ranges, Status};
-use super::view::{View, write_for};
+use super::view::{View, head_for};
 use super::*;
 use crate::error::Timestamp;
 use crate::register::ValueChange;
@@ -657,14 +657,14 @@ impl Log {
             devices: &self.devices,
         };
         let (namers, load) = (&|x: &EntryRef| view.namers(x), &|x: &EntryRef| {
-            view.write_of(x)
+            view.head_of(x)
         });
         let eff = if on {
             let put = view
                 .opened_put(entry, &id.name(&self.space))
                 .expect("a write that is applied is opened");
-            let write = write_for(&put, person.clone());
-            self.register.apply(id, &write, &entry.after, namers, load)
+            let head = head_for(id, &put, person.clone());
+            self.register.apply(&head, &entry.after, namers, load)
         } else {
             self.register.withdraw(id, &entry.after, namers, load)
         };
@@ -708,16 +708,16 @@ impl Log {
 
     /// Changes of the register's winners as the API says them.
     fn value_changes(&self, changes: Vec<ValueChange>, fx: &mut Effects) {
-        for ValueChange { path, was, now } in changes {
+        for ValueChange { was, now } in changes {
             match (now, was) {
-                (Some(head), _) if !head.removal => match self.shown(&path, &head) {
+                (Some(head), _) if !head.removal => match self.shown(&head) {
                     Some(Ok(item)) => fx.changes.push(Change::Put(item)),
                     Some(Err(blob)) => fx.blobs.push(blob),
                     None => {}
                 },
-                (Some(gone), _) | (None, Some(gone)) => fx
-                    .changes
-                    .push(Change::Removed(gone.item(&path, Bytes::new()))),
+                (Some(gone), _) | (None, Some(gone)) => {
+                    fx.changes.push(Change::Removed(gone.item(Bytes::new())))
+                }
                 (None, None) => {}
             }
         }

@@ -842,7 +842,7 @@ async fn an_own_put_is_signed_chained_stored_in_one_batch_and_applied() {
     );
     assert_eq!(
         entry.after,
-        vec![EntryRef::from(&a.id)],
+        vec![a.id.clone()],
         "it supersedes the head it saw"
     );
     assert_eq!(r.value("/a").as_deref(), Some("two"));

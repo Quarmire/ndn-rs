@@ -803,8 +803,8 @@ impl SpaceInner {
     fn blob_change(&self, node: &NodeInner, blob: &Blob) -> Option<Change> {
         let bytes = self.read_blob(node, blob).ok()?;
         let log = self.log.lock();
-        let (path, head) = log.register.values().find(|(_, h)| h.entry == blob.id)?;
-        Some(Change::Put(head.item(path, bytes)))
+        let head = log.register.values().find(|h| h.entry == blob.id)?;
+        Some(Change::Put(head.item(bytes)))
     }
 
     /// Tell every watcher a blob head that is whole: the queues hold the
@@ -816,7 +816,7 @@ impl SpaceInner {
             .lock()
             .register
             .values()
-            .any(|(_, h)| h.entry == blob.id);
+            .any(|h| h.entry == blob.id);
         if !current {
             return;
         }
@@ -858,10 +858,7 @@ impl SpaceInner {
         }
         let heads: HashSet<EntryId> = {
             let log = self.log.lock();
-            log.register
-                .values()
-                .map(|(_, h)| h.entry.clone())
-                .collect()
+            log.register.values().map(|h| h.entry.clone()).collect()
         };
         owed.retain(|id, _| heads.contains(id));
         owed.values().cloned().collect()
@@ -1013,7 +1010,7 @@ impl Heap {
         let bytes = inner.read_blob(&self.node, &blob)?;
         let log = inner.log.lock();
         match log.register.value(path) {
-            Some(head) if head.entry == blob.id => Ok(Some(head.item(path, bytes))),
+            Some(head) if head.entry == blob.id => Ok(Some(head.item(bytes))),
             _ => log.get(path),
         }
     }

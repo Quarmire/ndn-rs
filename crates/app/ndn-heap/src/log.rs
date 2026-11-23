@@ -528,7 +528,7 @@ impl Log {
     fn restore_register(&mut self) -> Result<(), HeapError> {
         let records = self.store.scan_under(&Kind::HEADS.listing(&self.space), 0);
         let view = View::of(self);
-        let restored = Register::restore(self.space.clone(), records, &|r| view.write_of(r))?;
+        let restored = Register::restore(self.space.clone(), records, &|r| view.head_of(r))?;
         for lost in &restored.missing {
             tracing::warn!(entry = %lost.name(&self.space), "a head the store names is not held and applied; it returns when the entry does");
         }
@@ -600,7 +600,7 @@ impl Log {
         let Some(head) = self.register.value(path) else {
             return Ok(None);
         };
-        match self.shown(path, head) {
+        match self.shown(head) {
             Some(Ok(item)) => Ok(Some(item)),
             _ => Err(HeapError::Unavailable {
                 name: head.entry.name(&self.space),
@@ -608,11 +608,11 @@ impl Log {
         }
     }
 
-    /// What the head of `path` is to the API: an inline value, or a blob head
-    /// the pieces layer assembles; `None` when its payload is not held.
-    pub(super) fn shown(&self, path: &Name, head: &Head) -> Option<Result<Item, Blob>> {
+    /// What a head is to the API: an inline value, or a blob head the pieces
+    /// layer assembles; `None` when its payload is not held.
+    pub(super) fn shown(&self, head: &Head) -> Option<Result<Item, Blob>> {
         Some(match self.view().payload_of(&head.entry)? {
-            Payload::Inline(bytes) => Ok(head.item(path, bytes)),
+            Payload::Inline(bytes) => Ok(head.item(bytes)),
             Payload::Blob { size, root } => Err(Blob {
                 id: head.entry.clone(),
                 size,
@@ -625,8 +625,8 @@ impl Log {
     /// listing, and the blob heads the pieces layer must assemble.
     pub(crate) fn items(&self) -> (Vec<Item>, Vec<Blob>) {
         let (mut items, mut blobs) = (Vec::new(), Vec::new());
-        for (path, head) in self.register.values() {
-            match self.shown(path, head) {
+        for head in self.register.values() {
+            match self.shown(head) {
                 Some(Ok(item)) => items.push(item),
                 Some(Err(blob)) => blobs.push(blob),
                 None => {}
@@ -638,7 +638,7 @@ impl Log {
     /// The winning head of `path` when its payload is a blob (assembled by
     /// the pieces layer); `None` for an inline value, a removal or no head.
     pub(crate) fn blob_head(&self, path: &Name) -> Option<Blob> {
-        self.shown(path, self.register.value(path)?)?.err()
+        self.shown(self.register.value(path)?)?.err()
     }
 
     /// The epoch key the applied entry was sealed under: `Some(None)` for a
@@ -646,7 +646,6 @@ impl Log {
     /// key is held; `None` when the entry is not held, not applied, not a
     /// write, or its key is missing.
     pub(crate) fn entry_key(&self, id: &EntryId) -> Option<Option<ContentKey>> {
-        let id = EntryRef::from(id);
         let view = self.view();
         let wire = view.wire_at(&id.device, id.seq)?;
         if signed_digest(&wire) != id.digest || view.status(&id.device, id.seq).is_some() {

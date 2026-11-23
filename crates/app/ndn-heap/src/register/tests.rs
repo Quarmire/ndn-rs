@@ -21,7 +21,7 @@ use crate::test_kit::n;
 #[derive(Clone, Debug)]
 struct Ent {
     id: EntryRef,
-    write: Write,
+    write: Head,
     after: Vec<EntryRef>,
 }
 
@@ -40,18 +40,20 @@ fn ent(
     bytes: &str,
     after: &[&Ent],
 ) -> Ent {
+    let id = EntryRef {
+        device: n(&format!("/p{person}/d{device}")),
+        seq,
+        digest: [digest; 32],
+    };
     Ent {
-        id: EntryRef {
-            device: n(&format!("/p{person}/d{device}")),
-            seq,
-            digest: [digest; 32],
-        },
-        write: Write {
+        write: Head {
+            entry: id.clone(),
             path: n(path),
             person: n(&format!("/p{person}")),
             removal: bytes.is_empty(),
             size: bytes.len() as u64,
         },
+        id,
         after: after.iter().map(|e| e.id.clone()).collect(),
     }
 }
@@ -61,7 +63,7 @@ fn ent(
 struct Replica {
     reg: Register,
     store: BTreeMap<Name, Bytes>,
-    applied: BTreeMap<EntryRef, Write>,
+    applied: BTreeMap<EntryRef, Head>,
 }
 
 impl Replica {
@@ -100,13 +102,11 @@ impl Replica {
     fn take(&mut self, e: &Ent) -> Vec<ValueChange> {
         self.applied.insert(e.id.clone(), e.write.clone());
         let applied = &self.applied;
-        let fx = self.reg.apply(
-            &e.id,
-            &e.write,
-            &e.after,
-            &Self::lookup(&self.store),
-            &|x| applied.get(x).cloned(),
-        );
+        let fx = self
+            .reg
+            .apply(&e.write, &e.after, &Self::lookup(&self.store), &|x| {
+                applied.get(x).cloned()
+            });
         self.run(fx)
     }
 
@@ -279,18 +279,20 @@ fn two_offline_writers_converge_on_the_highest_digest() {
     // The next put names both heads and ends the fork.
     let after = a.reg.after_for_put(&n("/f"));
     assert_eq!(after.len(), 2);
+    let id = EntryRef {
+        device: n("/p1/d1"),
+        seq: 3,
+        digest: [0; 32],
+    };
     let c = Ent {
-        id: EntryRef {
-            device: n("/p1/d1"),
-            seq: 3,
-            digest: [0; 32],
-        },
-        write: Write {
+        write: Head {
+            entry: id.clone(),
             path: n("/f"),
             person: n("/p1"),
             removal: false,
             size: 1,
         },
+        id,
         after,
     };
     a.take(&c);
@@ -514,18 +516,20 @@ fn memory_is_o_heads_not_o_entries() {
     let mut r = Replica::new();
     let mut last: Option<Ent> = None;
     for seq in 1..=10_000u64 {
+        let id = EntryRef {
+            device: n("/p1/d1"),
+            seq,
+            digest: Sha256::digest(seq.to_be_bytes()).into(),
+        };
         let e = Ent {
-            id: EntryRef {
-                device: n("/p1/d1"),
-                seq,
-                digest: Sha256::digest(seq.to_be_bytes()).into(),
-            },
-            write: Write {
+            write: Head {
+                entry: id.clone(),
                 path: n("/f"),
                 person: n("/p1"),
                 removal: false,
                 size: 3,
             },
+            id,
             after: last.iter().map(|l| l.id.clone()).collect(),
         };
         r.take(&e);
@@ -546,30 +550,33 @@ fn memory_is_o_heads_not_o_entries() {
 
 #[test]
 fn a_value_is_never_held_in_the_register() {
-    // Compiles only while a head is exactly a reference, a person, whether it
-    // removes, and a size: a field of bytes added to it breaks this pattern.
+    // Compiles only while a head is exactly a reference, a path, a person,
+    // whether it removes, and a size: a field of bytes added to it breaks
+    // this pattern.
     let head = Head {
         entry: EntryRef {
             device: n("/p1/d1"),
             seq: 1,
             digest: [1; 32],
         },
+        path: n("/f"),
         person: n("/p1"),
         removal: false,
         size: 4,
     };
     let Head {
         entry: _,
+        path: _,
         person: _,
         removal: _,
         size: _,
     } = head.clone();
     // The item a reader gets is built from a head and bytes the log read.
-    let item = head.item(&n("/f"), Bytes::from_static(b"data"));
+    let item = head.item(Bytes::from_static(b"data"));
     assert_eq!(item.bytes, Bytes::from_static(b"data"));
     assert_eq!(item.by, n("/p1"));
     assert_eq!(item.writer, n("/p1/d1"));
-    assert_eq!(item.id, EntryId::from(&head.entry));
+    assert_eq!(item.id, head.entry);
     assert_eq!(item.as_of, None);
 }
 
@@ -582,13 +589,11 @@ fn a_duplicate_changes_nothing_and_writes_nothing() {
     let before = (r.heads(), r.store.clone());
     for e in [&a, &b, &a] {
         let applied = &r.applied;
-        let fx = r.reg.apply(
-            &e.id,
-            &e.write,
-            &e.after,
-            &Replica::lookup(&r.store),
-            &|x| applied.get(x).cloned(),
-        );
+        let fx = r
+            .reg
+            .apply(&e.write, &e.after, &Replica::lookup(&r.store), &|x| {
+                applied.get(x).cloned()
+            });
         assert!(
             fx.writes.is_empty() && fx.changes.is_empty(),
             "{:?} again",
@@ -624,21 +629,6 @@ fn a_persisted_head_whose_entry_is_gone_is_reported_not_dropped_silently() {
         r.store.values().next().cloned().unwrap(),
     );
     assert!(Register::restore(space(), vec![moved], &|_| None).is_err());
-}
-
-#[test]
-fn an_item_converts_from_a_reference_and_back() {
-    let r = EntryRef {
-        device: n("/p1/d1"),
-        seq: 7,
-        digest: [3; 32],
-    };
-    let id = EntryId::from(&r);
-    assert_eq!(
-        (id.device.clone(), id.seq, id.digest),
-        (r.device.clone(), 7, [3; 32])
-    );
-    assert_eq!(EntryRef::from(&id), r);
 }
 
 // -- Arrival order ---------------------------------------------------------------------

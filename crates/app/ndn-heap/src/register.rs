@@ -52,12 +52,6 @@ mod tests;
 /// by (`Change`, `put`'s result, `Item::id`).
 pub use crate::wire::EntryRef as EntryId;
 
-impl From<&EntryRef> for EntryRef {
-    fn from(r: &EntryRef) -> EntryRef {
-        r.clone()
-    }
-}
-
 /// A path's value as `get` and `watch` hand it out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
@@ -77,39 +71,14 @@ pub struct Item {
     pub as_of: Option<Duration>,
 }
 
-/// What the log knows of an applied entry that the register needs: where it
-/// wrote and what to say of it. Derived by the log from the entry (a sealed
-/// one after opening it) and the validation context of its key.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Write {
-    /// The path written, relative to the space.
-    pub path: Name,
-    /// The writer's person.
-    pub person: Name,
-    /// Whether the entry removes the path (an empty inline payload).
-    pub removal: bool,
-    /// Octets of the payload (of the blob, for a larger one).
-    pub size: u64,
-}
-
-impl Write {
-    /// The head the entry `entry` makes at `self.path`.
-    fn head(&self, entry: EntryRef) -> Head {
-        Head {
-            entry,
-            person: self.person.clone(),
-            removal: self.removal,
-            size: self.size,
-        }
-    }
-}
-
 /// A head: an applied entry nothing applied supersedes. A reference and
 /// what is said of it; never the value (see the module docs).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Head {
     /// The entry; the log reads its payload from the store by this name.
     pub entry: EntryRef,
+    /// The path it wrote, relative to the space.
+    pub path: Name,
     /// The writer's person.
     pub person: Name,
     /// Whether the entry removes the path.
@@ -125,15 +94,15 @@ impl Head {
         (&self.entry.digest, &self.entry.device, self.entry.seq)
     }
 
-    /// The item this head makes at `path`, once the log has read `bytes`
-    /// (empty for a removal).
-    pub(crate) fn item(&self, path: &Name, bytes: Bytes) -> Item {
+    /// The item this head makes, once the log has read `bytes` (empty for a
+    /// removal).
+    pub(crate) fn item(&self, bytes: Bytes) -> Item {
         Item {
-            path: path.clone(),
+            path: self.path.clone(),
             bytes,
             by: self.person.clone(),
             writer: self.entry.device.clone(),
-            id: EntryId::from(&self.entry),
+            id: self.entry.clone(),
             as_of: None,
         }
     }
@@ -144,8 +113,6 @@ impl Head {
 /// means the path has no head left, `was` of `None` that it had none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ValueChange {
-    /// The path.
-    pub path: Name,
     /// The winner before.
     pub was: Option<Head>,
     /// The winner after.
@@ -187,6 +154,14 @@ pub(crate) struct Register {
 /// The winners a call changes, by path, as they were before it.
 type Touched = BTreeMap<Name, Option<Head>>;
 
+/// The entries that name an entry in their `after` (read from the store).
+type Namers<'a> = &'a dyn Fn(&EntryRef) -> Vec<EntryRef>;
+
+/// What the log knows of an applied entry: the head it makes, `None` when it
+/// is not held or not applied (derived from the entry, a sealed one after
+/// opening it, and the validation context of its key).
+type Load<'a> = &'a dyn Fn(&EntryRef) -> Option<Head>;
+
 impl Register {
     /// An empty register of `space`.
     pub(crate) fn new(space: Name) -> Register {
@@ -197,31 +172,28 @@ impl Register {
         }
     }
 
-    /// Apply an accepted entry `id` that wrote `write` and supersedes
-    /// `after`. Idempotent: an entry applied again changes and writes
-    /// nothing.
+    /// Apply an accepted entry, the head `head` makes (at `head.path`), which
+    /// supersedes `after`. Idempotent: an entry applied again changes and
+    /// writes nothing.
     ///
     /// A ref supersedes only the entry it names by digest and only at the
-    /// path `write` is at: one whose target is held at another path is
+    /// path `head` is at: one whose target is held at another path is
     /// ignored, and one naming other bytes at a name hides nothing (its
     /// record is keyed by that digest).
     ///
     /// `namers` answers from the store *including this entry's batch so far*.
     pub(crate) fn apply(
         &mut self,
-        id: &EntryRef,
-        write: &Write,
+        head: &Head,
         after: &[EntryRef],
-        namers: &dyn Fn(&EntryRef) -> Vec<EntryRef>,
-        load: &dyn Fn(&EntryRef) -> Option<Write>,
+        namers: Namers,
+        load: Load,
     ) -> Effects {
+        let id = &head.entry;
         let mut touched = Touched::new();
         let mut writes = Vec::new();
         for x in distinct(after, id) {
-            if self
-                .path_of(&x, load)
-                .is_some_and(|path| path != write.path)
-            {
+            if self.path_of(&x, load).is_some_and(|path| path != head.path) {
                 continue;
             }
             let mut named = namers(&x);
@@ -234,8 +206,8 @@ impl Register {
         }
         // An entry some applied entry at its path already names, one that
         // arrived first, is not a head.
-        if !self.at.contains_key(id) && !names_at(&namers(id), &write.path, load) {
-            self.add_head(&mut touched, write.head(id.clone()), write.path.clone());
+        if !self.at.contains_key(id) && !names_at(&namers(id), &head.path, load) {
+            self.add_head(&mut touched, head.clone());
         }
         self.finish(touched, writes)
     }
@@ -249,8 +221,8 @@ impl Register {
         &mut self,
         id: &EntryRef,
         after: &[EntryRef],
-        namers: &dyn Fn(&EntryRef) -> Vec<EntryRef>,
-        load: &dyn Fn(&EntryRef) -> Option<Write>,
+        namers: Namers,
+        load: Load,
     ) -> Effects {
         let mut touched = Touched::new();
         let mut writes = Vec::new();
@@ -269,10 +241,10 @@ impl Register {
                 StoreOp::Insert(self.supers_key(&x), encode_refs(&named))
             });
             if !self.at.contains_key(&x)
-                && let Some(w) = load(&x)
-                && !names_at(&named, &w.path, load)
+                && let Some(head) = load(&x)
+                && !names_at(&named, &head.path, load)
             {
-                self.add_head(&mut touched, w.head(x), w.path.clone());
+                self.add_head(&mut touched, head);
             }
         }
         self.finish(touched, writes)
@@ -285,7 +257,7 @@ impl Register {
     pub(crate) fn restore(
         space: Name,
         records: impl IntoIterator<Item = (Name, Bytes)>,
-        load: &dyn Fn(&EntryRef) -> Option<Write>,
+        load: Load,
     ) -> Result<Restored, Corrupt> {
         let mut register = Register::new(space);
         let mut missing = Vec::new();
@@ -300,8 +272,8 @@ impl Register {
             }
             for entry in refs {
                 match load(&entry) {
-                    Some(w) if w.path == path && !register.at.contains_key(&entry) => {
-                        register.insert(path.clone(), w.head(entry));
+                    Some(head) if head.path == path && !register.at.contains_key(&entry) => {
+                        register.insert(head);
                     }
                     Some(_) => return Err(corrupt()),
                     None => missing.push(entry),
@@ -327,12 +299,11 @@ impl Register {
         self.paths.get(path).map_or(&[], Vec::as_slice)
     }
 
-    /// Every path that has a value and its winner, in path order: the first
+    /// Every path that has a value, as its winner, in path order: the first
     /// listing of a `watch`.
-    pub(crate) fn values(&self) -> impl Iterator<Item = (&Name, &Head)> {
-        self.paths
-            .iter()
-            .filter_map(|(p, hs)| hs.first().filter(|h| !h.removal).map(|h| (p, h)))
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Head> {
+        let winners = self.paths.values().filter_map(|heads| heads.first());
+        winners.filter(|h| !h.removal)
     }
 
     /// Every path that has heads, with them, the winner first.
@@ -365,14 +336,14 @@ impl Register {
 
     /// The path the entry `x` is at, if it is a head or the log holds it
     /// applied.
-    fn path_of(&self, x: &EntryRef, load: &dyn Fn(&EntryRef) -> Option<Write>) -> Option<Name> {
-        self.at.get(x).cloned().or_else(|| load(x).map(|w| w.path))
+    fn path_of(&self, x: &EntryRef, load: Load) -> Option<Name> {
+        self.at.get(x).cloned().or_else(|| load(x).map(|h| h.path))
     }
 
-    /// Put `head` at `path` in rank order.
-    fn insert(&mut self, path: Name, head: Head) {
-        self.at.insert(head.entry.clone(), path.clone());
-        let heads = self.paths.entry(path).or_default();
+    /// Put `head` at its path in rank order.
+    fn insert(&mut self, head: Head) {
+        self.at.insert(head.entry.clone(), head.path.clone());
+        let heads = self.paths.entry(head.path.clone()).or_default();
         let at = heads.partition_point(|h| h.rank() > head.rank());
         heads.insert(at, head);
     }
@@ -384,9 +355,9 @@ impl Register {
             .or_insert_with(|| self.winner(path).cloned());
     }
 
-    fn add_head(&mut self, touched: &mut Touched, head: Head, path: Name) {
-        self.note(touched, &path);
-        self.insert(path, head);
+    fn add_head(&mut self, touched: &mut Touched, head: Head) {
+        self.note(touched, &head.path);
+        self.insert(head);
     }
 
     /// Remove `entry` from the heads if it is one.
@@ -418,7 +389,7 @@ impl Register {
             });
             let now = self.winner(&path).cloned();
             if was.as_ref().map(|h| &h.entry) != now.as_ref().map(|h| &h.entry) {
-                changes.push(ValueChange { path, was, now });
+                changes.push(ValueChange { was, now });
             }
         }
         Effects { writes, changes }
@@ -427,10 +398,10 @@ impl Register {
 
 /// Whether any of `named` (applied entries) is at `path`: only those
 /// supersede an entry there. An entry `load` cannot answer for counts.
-fn names_at(named: &[EntryRef], path: &Name, load: &dyn Fn(&EntryRef) -> Option<Write>) -> bool {
+fn names_at(named: &[EntryRef], path: &Name, load: Load) -> bool {
     named
         .iter()
-        .any(|n| load(n).is_none_or(|w| w.path == *path))
+        .any(|n| load(n).is_none_or(|h| h.path == *path))
 }
 
 /// `after` without repeats and without `id` itself.
