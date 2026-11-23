@@ -422,29 +422,27 @@ impl Group {
     pub(crate) fn probes(&self) -> Vec<(Name, u64)> {
         let host = &self.shared.host;
         let noticed = self.noticed.lock();
-        let named = noticed.iter();
-        named
-            .filter(|&(device, &high)| high > host.high(&self.space, device))
+        let unheld = noticed
+            .iter()
+            .filter(|&(d, &high)| high > host.high(&self.space, d));
+        unheld
             .map(|(device, &high)| (device.clone(), high))
             .collect()
     }
 
-    /// The sources for a packet of `device`, in the order they are tried: the
-    /// writer (unless it is this device), then the heard members the log
-    /// vouches for.
-    fn sources(&self, device: &Name) -> Vec<Source> {
+    /// The source for a packet of `device` on turn `turn`: the sources are
+    /// the writer (unless it is this device), then the heard members the log
+    /// vouches for, and each turn asks the next of them in a ring.
+    fn source(&self, device: &Name, turn: u32) -> Option<Source> {
         let host = &self.shared.host;
         let me = host.device();
-        let mut out = Vec::new();
-        if device != me {
-            out.push(Source::Writer);
-        }
-        let relays = self
-            .heard
-            .lock()
-            .relays(me, device, &[], |d| host.standing(&self.space, d));
-        out.extend(relays.into_iter().map(Source::Relay));
-        out
+        let relays = (self.heard.lock()).relays(me, device, &[], |d| host.standing(&self.space, d));
+        let writer = (device != me).then_some(Source::Writer);
+        let mut sources: Vec<Source> = (writer.into_iter())
+            .chain(relays.into_iter().map(Source::Relay))
+            .collect();
+        let pick = (turn as usize).checked_rem(sources.len())?;
+        Some(sources.swap_remove(pick))
     }
 
     /// The packet `name` (an entry or a piece) as `source` gives it: the
@@ -568,9 +566,8 @@ impl Group {
     /// log's answer: held, or still wanted.
     async fn ask_entry(self: Arc<Self>, launch: Launch) {
         let name = log_name(&launch.device, &self.space, launch.seq);
-        let sources = self.sources(&launch.device);
-        let wire = match sources.get(launch.misses as usize % sources.len().max(1)) {
-            Some(source) => self.fetch_original(source, &name).await.ok(),
+        let wire = match self.source(&launch.device, launch.misses) {
+            Some(source) => self.fetch_original(&source, &name).await.ok(),
             None => {
                 tracing::debug!(%name, "no one to ask for it: this device is the writer and no heard member vouches for the log yet");
                 None
@@ -723,14 +720,13 @@ impl Group {
                 progressed = true;
                 continue;
             }
-            let sources = self.sources(&blob.id.device);
-            let Some(source) = sources.get(turns as usize % sources.len().max(1)) else {
+            let Some(source) = self.source(&blob.id.device, turns) else {
                 return Gathered::Stuck { progressed };
             };
             let arrived = join_all(
                 absent
                     .iter()
-                    .map(|piece| self.fetch_original(source, piece)),
+                    .map(|piece| self.fetch_original(&source, piece)),
             )
             .await;
             let mut keep = Vec::new();

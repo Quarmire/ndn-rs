@@ -31,7 +31,6 @@ use futures::Stream;
 use futures::task::AtomicWaker;
 use ndn_foundation_types::Name;
 use ndn_packet::Data;
-use ndn_security::confidentiality::ContentKey;
 use ndn_sync::StoreOp;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -130,12 +129,6 @@ impl Queue {
         self.put(Slot::Change(change));
     }
 
-    /// Queue a value in pieces that is whole in the store: it is read when
-    /// the watcher gets to it.
-    fn push_blob(&self, blob: Blob) {
-        self.put(Slot::Blob(blob));
-    }
-
     fn put(&self, slot: Slot) {
         {
             let mut st = self.st.lock();
@@ -194,15 +187,6 @@ impl Changes {
     pub async fn next(&mut self) -> Option<Result<Change, HeapError>> {
         futures::StreamExt::next(self).await
     }
-
-    /// The change a slot says: a value in pieces is read now, and told only
-    /// while it is the head of its path and still whole.
-    fn resolve(&self, slot: Slot) -> Option<Change> {
-        match slot {
-            Slot::Change(change) => Some(change),
-            Slot::Blob(blob) => self.space.blob_change(&self.node, &blob),
-        }
-    }
 }
 
 impl Stream for Changes {
@@ -217,7 +201,13 @@ impl Stream for Changes {
             let Some(slot) = ready!(next) else {
                 return Poll::Ready(None);
             };
-            if let Some(change) = self.resolve(slot) {
+            // A value in pieces is read now, and told only while it is the
+            // head of its path and still whole.
+            let change = match slot {
+                Slot::Change(change) => Some(change),
+                Slot::Blob(blob) => self.space.blob_change(&self.node, &blob),
+            };
+            if let Some(change) = change {
                 return Poll::Ready(Some(Ok(change)));
             }
         }
@@ -734,17 +724,6 @@ impl SpaceInner {
         Ok(())
     }
 
-    /// The epoch key `blob`'s entry was sealed under (`None`: a plain value),
-    /// or `Unavailable` while the entry is not applied and held.
-    fn blob_key(&self, blob: &Blob) -> Result<Option<ContentKey>, HeapError> {
-        self.log
-            .lock()
-            .entry_key(&blob.id)
-            .ok_or_else(|| HeapError::Unavailable {
-                name: log_name(&blob.id.device, &self.name, blob.id.seq),
-            })
-    }
-
     /// Whether every piece of `blob` is held here and the value recorded
     /// whole (`assembled/<entry>`): one lookup, nothing read.
     fn is_whole(&self, node: &NodeInner, blob: &Blob) -> bool {
@@ -759,7 +738,8 @@ impl SpaceInner {
     /// returned.
     fn read_blob(&self, node: &NodeInner, blob: &Blob) -> Result<Bytes, HeapError> {
         let name = blob.id.name(&self.name);
-        let key = self.blob_key(blob)?;
+        let key = (self.log.lock().entry_key(&blob.id))
+            .ok_or_else(|| HeapError::Unavailable { name: name.clone() })?;
         if !self.is_whole(node, blob) {
             return Err(HeapError::Unavailable { name });
         }
@@ -818,7 +798,7 @@ impl SpaceInner {
         let mut watchers = self.watchers.lock();
         watchers.retain(|q| !q.is_closed());
         for q in watchers.iter() {
-            q.push_blob(blob.clone());
+            q.put(Slot::Blob(blob.clone()));
         }
     }
 
