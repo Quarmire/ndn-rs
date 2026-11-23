@@ -15,6 +15,25 @@ fn generic(s: &str) -> NameComponent {
     NameComponent::generic(Bytes::copy_from_slice(s.as_bytes()))
 }
 
+/// `<owner>/32=data/<rest…>`.
+fn space_name(owner: &Name, rest: &[NameComponent]) -> Name {
+    let mut comps = owner.components().to_vec();
+    comps.push(kw(b"data"));
+    comps.extend(rest.iter().cloned());
+    Name::from_components(comps)
+}
+
+/// The names of every piece of the entry named `entry` whose blob is `chunks`:
+/// its chunks in order, then its manifest nodes in heap order.
+fn piece_names<'a>(entry: &'a Name, chunks: &ChunksBody) -> impl Iterator<Item = Name> + 'a {
+    let shape = Shape::of(chunks.size);
+    let manifests: Vec<u64> = shape.manifests().collect();
+    (0..shape.chunks)
+        .map(PieceKind::Chunk)
+        .chain(manifests.into_iter().map(PieceKind::Manifest))
+        .map(move |k| piece_name(entry, k))
+}
+
 fn epoch() -> EpochId {
     EpochId {
         creator: n("/alice/laptop"),

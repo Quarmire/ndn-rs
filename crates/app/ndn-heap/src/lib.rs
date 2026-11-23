@@ -10,9 +10,6 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
-// Until the API module wires everything together, items are used only by
-// their own tests. Removed when the stage ends.
-#![allow(dead_code, unused_imports)]
 
 mod rt;
 mod wire;

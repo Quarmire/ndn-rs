@@ -21,7 +21,7 @@ use super::prim::{
 };
 use super::tlv;
 use super::types::{
-    Body, Entry, EntryRef, EpochBody, EpochId, Kind, MembersBody, Op, Payload, Prev, PutBody, Role,
+    Body, Entry, EntryRef, EpochBody, Kind, MembersBody, Op, Payload, Prev, PutBody, Role,
     SealedBody,
 };
 

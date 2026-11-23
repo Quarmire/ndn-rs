@@ -60,20 +60,6 @@ pub(crate) fn piece_name(entry: &Name, kind: PieceKind) -> Name {
     }
 }
 
-/// The names of every piece of the entry named `entry` whose blob is `chunks`:
-/// its chunks in order, then its manifest nodes in heap order.
-pub(crate) fn piece_names<'a>(
-    entry: &'a Name,
-    chunks: &ChunksBody,
-) -> impl Iterator<Item = Name> + 'a {
-    let shape = Shape::of(chunks.size);
-    let manifests: Vec<u64> = shape.manifests().collect();
-    (0..shape.chunks)
-        .map(PieceKind::Chunk)
-        .chain(manifests.into_iter().map(PieceKind::Manifest))
-        .map(move |k| piece_name(entry, k))
-}
-
 /// Parse `<E>/32=piece/seg=<i>` or `<E>/32=piece/32=manifest/seg=<k>`, `E` an
 /// entry's name.
 pub(crate) fn parse_piece_name(name: &Name) -> Option<PieceName> {
@@ -135,6 +121,7 @@ impl Shape {
     }
 
     /// Every manifest node, in heap order.
+    #[cfg(test)]
     pub(crate) fn manifests(&self) -> impl Iterator<Item = u64> + '_ {
         (1..=self.depth).flat_map(move |l| {
             let off = Self::offset(l);

@@ -20,11 +20,9 @@
 
 use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent, tlv_type};
-use ndn_tlv::{TlvReader, TlvWriter};
+use ndn_tlv::TlvWriter;
 
-use super::prim::{
-    WireError, each, once, read_array, read_epoch_id, read_name, write_epoch_id, write_name,
-};
+use super::prim::{WireError, each, once, read_epoch_id, read_name, write_epoch_id, write_name};
 use super::tlv;
 use super::types::{EntryRef, EpochId};
 
@@ -128,14 +126,6 @@ pub(crate) struct SpaceName {
     pub owner: Name,
     /// The 1 to 4 generic components after `32=data`.
     pub rest: Vec<NameComponent>,
-}
-
-/// `<owner>/32=data/<rest…>`.
-pub(crate) fn space_name(owner: &Name, rest: &[NameComponent]) -> Name {
-    let mut comps = owner.components().to_vec();
-    comps.push(kw(DATA));
-    comps.extend(rest.iter().cloned());
-    Name::from_components(comps)
 }
 
 /// Parse `<O>/32=data/<c1>[/<c2>…]`: `O` is a namespace, 1 to 4 generic
