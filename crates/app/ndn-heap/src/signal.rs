@@ -615,6 +615,14 @@ impl Node {
         self.inner.space_of(space).filter(|s| !s.follower)
     }
 
+    /// `f` over the log of `space` as a member has it open and the judge;
+    /// `None` when the space is not open here.
+    fn in_space<T>(&self, space: &Name, f: impl FnOnce(&Log, &Judge) -> T) -> Option<T> {
+        let held = self.signal_space(space)?;
+        let log = held.log.lock();
+        Some(f(&log, &self.inner.judge))
+    }
+
     /// What this node may do with signals over `space`, by the entries it
     /// holds (spec §11): its signal keys when the space is sealed, the sync
     /// group to push into and the one to listen on. A writer or a reader gets
@@ -631,9 +639,8 @@ impl Node {
     /// it is in the sealed space's audience by neither the epoch nor the
     /// owner, which may not hold its key.
     pub fn signal_scope(&self, space: &Name) -> Result<SignalScope, HeapError> {
-        let held = self.signal_space(space).ok_or_else(|| not_open(space))?;
-        let log = held.log.lock();
-        signal_scope(&log, &self.inner.judge)
+        self.in_space(space, signal_scope)
+            .unwrap_or_else(|| Err(not_open(space)))
     }
 
     /// Sign a signal run header for `scope` (spec §11): Data
@@ -647,16 +654,10 @@ impl Node {
         run_id: &[u8; RUN_ID_LEN],
         body: &[u8],
     ) -> Result<Bytes, HeapError> {
-        let held = self.signal_space(scope).ok_or_else(|| not_open(scope))?;
-        let log = held.log.lock();
-        signal_header(
-            &log,
-            &self.inner.judge,
-            &*self.inner.signer,
-            scope,
-            run_id,
-            body,
-        )
+        self.in_space(scope, |log, judge| {
+            signal_header(log, judge, &*self.inner.signer, scope, run_id, body)
+        })
+        .unwrap_or_else(|| Err(not_open(scope)))
     }
 
     /// The signer of another device's run header for `scope`, if it is a
@@ -668,11 +669,8 @@ impl Node {
     /// the trust context governing it revokes). Synchronous and offline: a
     /// transport asks it before it spends anything on the header.
     pub fn signal_sender(&self, scope: &Name, data: &Data) -> Result<SignalSender, SignalRefusal> {
-        let held = self
-            .signal_space(scope)
-            .ok_or_else(|| not_open_refusal(scope))?;
-        let log = held.log.lock();
-        signal_sender(&log, &self.inner.judge, scope, data)
+        self.in_space(scope, |log, judge| signal_sender(log, judge, scope, data))
+            .unwrap_or_else(|| Err(not_open_refusal(scope)))
     }
 
     /// Admit another device's run header for `scope` (spec §11): its signer
@@ -711,8 +709,8 @@ impl Node {
     /// exact by what is held at the call. A space not open here has no
     /// members.
     pub fn signal_member(&self, scope: &Name, key: &Name) -> bool {
-        self.signal_space(scope)
-            .is_some_and(|held| signal_member(&held.log.lock(), &self.inner.judge, scope, key))
+        self.in_space(scope, |log, judge| signal_member(log, judge, scope, key))
+            .unwrap_or(false)
     }
 
     /// A count that moves whenever a trust context revoking keys is adopted

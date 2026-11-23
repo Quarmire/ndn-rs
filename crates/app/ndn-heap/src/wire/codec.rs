@@ -205,23 +205,21 @@ impl Entry {
 
     /// The limits of the format, held when writing and when reading.
     fn validate(&self) -> Result<(), WireError> {
-        if self.prev.as_ref().is_some_and(|p| !p.consistent()) {
-            return Err(WireError::Malformed(
-                "PREV is 32 zero octets exactly when PREV_SEQ is 0 (the signed statement that \
-                 the device lost everything before); anything else is no chain link",
-            ));
-        }
+        require(
+            self.prev.as_ref().is_none_or(Prev::consistent),
+            "PREV is 32 zero octets exactly when PREV_SEQ is 0 (the signed statement that \
+             the device lost everything before); anything else is no chain link",
+        )?;
         too_many(
             self.after.len(),
             AFTER_MAX,
             "the superseded heads of an entry, or the epochs an epoch replaces",
         )?;
-        if !self.after.is_empty() && self.kind() == Kind::Members {
-            return Err(WireError::Malformed(
-                "only a write names the heads it supersedes and only an epoch the epochs it \
-                 replaces; a members entry carries none",
-            ));
-        }
+        require(
+            self.after.is_empty() || self.kind() != Kind::Members,
+            "only a write names the heads it supersedes and only an epoch the epochs it \
+             replaces; a members entry carries none",
+        )?;
         self.after
             .iter()
             .try_for_each(|r| check_device(&r.device))?;
@@ -230,11 +228,10 @@ impl Entry {
             Body::Sealed(sealed) => {
                 check_device(&sealed.epoch.creator)?;
                 too_large(sealed.sealed.len(), SEALED_MAX, "a sealed payload")?;
-                if sealed.sealed.len() < NONCE_LEN + TAG_LEN {
-                    return Err(WireError::Malformed(
-                        "a sealed payload is at least a nonce and a tag",
-                    ));
-                }
+                require(
+                    sealed.sealed.len() >= NONCE_LEN + TAG_LEN,
+                    "a sealed payload is at least a nonce and a tag",
+                )?;
             }
             Body::Members(members) => {
                 too_many(members.ops.len(), OPS_MAX, "a members entry")?;
@@ -267,37 +264,36 @@ impl Prev {
     }
 }
 
+/// Refuse with `why` unless `ok`.
+fn require(ok: bool, why: &'static str) -> Result<(), WireError> {
+    ok.then_some(()).ok_or(WireError::Malformed(why))
+}
+
 fn too_large(size: usize, max: usize, what: &'static str) -> Result<(), WireError> {
-    if size > max {
-        return Err(WireError::TooLarge { what, size, max });
-    }
-    Ok(())
+    (size <= max)
+        .then_some(())
+        .ok_or(WireError::TooLarge { what, size, max })
 }
 
 fn too_many(count: usize, max: usize, what: &'static str) -> Result<(), WireError> {
-    if count > max {
-        return Err(WireError::TooMany { what, count, max });
-    }
-    Ok(())
+    (count <= max)
+        .then_some(())
+        .ok_or(WireError::TooMany { what, count, max })
 }
 
 fn check_device(device: &Name) -> Result<(), WireError> {
-    if !is_device_name(device) {
-        return Err(WireError::Malformed(
-            "a device name has at least one component and no keyword or digest component",
-        ));
-    }
-    Ok(())
+    require(
+        is_device_name(device),
+        "a device name has at least one component and no keyword or digest component",
+    )
 }
 
 fn check_person(person: &Name) -> Result<(), WireError> {
-    if !is_namespace(person) {
-        return Err(WireError::Malformed(
-            "a person is a namespace: at least one component, none a keyword, digest or \
-             sequence number",
-        ));
-    }
-    Ok(())
+    require(
+        is_namespace(person),
+        "a person is a namespace: at least one component, none a keyword, digest or \
+         sequence number",
+    )
 }
 
 fn check_op(op: &Op) -> Result<(), WireError> {
@@ -326,16 +322,14 @@ fn component_octets(c: &NameComponent) -> usize {
 
 pub(crate) fn check_path(path: &Name) -> Result<(), WireError> {
     let comps = path.components();
-    if comps.is_empty()
-        || comps.len() > PATH_COMPONENTS_MAX
-        || comps
-            .iter()
-            .any(|c| c.typ != tlv_type::GENERIC_NAME_COMPONENT)
-    {
-        return Err(WireError::Malformed(
-            "a path is 1 to 8 generic components (no keyword, digest or typed component)",
-        ));
-    }
+    require(
+        !comps.is_empty()
+            && comps.len() <= PATH_COMPONENTS_MAX
+            && comps
+                .iter()
+                .all(|c| c.typ == tlv_type::GENERIC_NAME_COMPONENT),
+        "a path is 1 to 8 generic components (no keyword, digest or typed component)",
+    )?;
     too_large(
         comps.iter().map(component_octets).sum(),
         PATH_OCTETS_MAX,

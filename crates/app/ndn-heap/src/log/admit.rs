@@ -120,7 +120,7 @@ pub(super) fn shape(data: &Data, seq: u64) -> Option<(Entry, [u8; 32], u64)> {
 
 /// The link an entry at `seq` that states `prev` makes: the digest and seq
 /// of the entry before it. `None`: no link a chain can follow.
-fn link_of(prev: &Option<Prev>, seq: u64) -> Option<([u8; 32], u64)> {
+pub(super) fn link_of(prev: &Option<Prev>, seq: u64) -> Option<([u8; 32], u64)> {
     match (prev, seq) {
         (None, 1) => Some(([0; 32], 0)),
         (Some(p), s) if s > 1 => match p.seq {

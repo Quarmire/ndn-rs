@@ -282,38 +282,17 @@ pub(crate) fn open_chunk(
     Ok(content)
 }
 
-/// What a verified node says its children are: the digests the fetch still
-/// has to prove, by place.
-#[derive(Default)]
-struct Listed {
-    nodes: BTreeMap<u64, [u8; 32]>,
-    chunks: BTreeMap<u64, [u8; 32]>,
-}
-
-impl Listed {
-    /// Record the digests node `k` lists.
-    fn list(&mut self, shape: &Shape, k: u64, digests: Vec<[u8; 32]>) {
-        for (kid, digest) in shape.children(k).into_iter().flatten().zip(digests) {
-            match kid {
-                PieceKind::Manifest(m) => self.nodes.insert(m, digest),
-                PieceKind::Chunk(i) => self.chunks.insert(i, digest),
-            };
-        }
-    }
-}
-
 /// Plans the fetch of the pieces of one payload, each proven against the
 /// digest its parent lists, and says which to ask for next. It keeps no
 /// piece.
 pub(crate) struct Assembler {
     entry: Name,
     shape: Shape,
-    /// Pieces whose digests are known and that are not held.
-    wanted: Listed,
-    /// Nodes proven, by heap number.
-    nodes: BTreeSet<u64>,
-    /// Chunks proven, by index.
-    chunks: BTreeSet<u64>,
+    /// Pieces whose digests are known and that are not held, each with the
+    /// digest its parent lists: nodes first, then chunks, in order.
+    wanted: BTreeMap<PieceKind, [u8; 32]>,
+    /// Pieces proven.
+    proven: BTreeSet<PieceKind>,
 }
 
 /// What an offered piece came to, when it was not refused.
@@ -336,14 +315,11 @@ impl Assembler {
         if blob.size > PAYLOAD_MAX {
             return Err(PieceError::Oversize { size: blob.size });
         }
-        let mut wanted = Listed::default();
-        wanted.nodes.insert(0, blob.root);
         Ok(Assembler {
             entry,
             shape: Shape::of(blob.size),
-            wanted,
-            nodes: BTreeSet::new(),
-            chunks: BTreeSet::new(),
+            wanted: BTreeMap::from([(PieceKind::Manifest(0), blob.root)]),
+            proven: BTreeSet::new(),
         })
     }
 
@@ -354,18 +330,16 @@ impl Assembler {
     /// offered yet is named again by the next call: the fetcher keeps track
     /// of what it has in flight.
     pub(crate) fn next_wanted(&self, window: usize) -> Vec<Name> {
-        let nodes = self.wanted.nodes.keys().map(|&k| PieceKind::Manifest(k));
-        let chunks = self.wanted.chunks.keys().map(|&i| PieceKind::Chunk(i));
-        nodes
-            .chain(chunks)
+        self.wanted
+            .keys()
             .take(window)
-            .map(|kind| piece_name(&self.entry, kind))
+            .map(|&kind| piece_name(&self.entry, kind))
             .collect()
     }
 
     /// Every piece is held and proven.
     pub(crate) fn is_complete(&self) -> bool {
-        self.wanted.nodes.is_empty() && self.wanted.chunks.is_empty()
+        self.wanted.is_empty()
     }
 
     /// Offer a packet that arrived from anywhere. It is accepted only if it
@@ -389,37 +363,32 @@ impl Assembler {
         if parsed.entry != self.entry {
             return Err(foreign());
         }
-        match parsed.kind {
+        let kind = parsed.kind;
+        if self.proven.contains(&kind) {
+            return Ok(Offered::Duplicate);
+        }
+        let known = match kind {
+            PieceKind::Manifest(k) => self.shape.locate(k).is_some(),
+            PieceKind::Chunk(i) => i < self.shape.chunks,
+        };
+        if !known {
+            return Err(foreign());
+        }
+        let Some(expected) = self.wanted.get(&kind).copied() else {
+            return Ok(Offered::NotYet);
+        };
+        match kind {
             PieceKind::Manifest(k) => {
-                if self.nodes.contains(&k) {
-                    return Ok(Offered::Duplicate);
-                }
-                if self.shape.locate(k).is_none() {
-                    return Err(foreign());
-                }
-                let Some(expected) = self.wanted.nodes.get(&k).copied() else {
-                    return Ok(Offered::NotYet);
-                };
                 let digests = open_node(&self.entry, &self.shape, k, &wire, &expected)?;
-                self.wanted.nodes.remove(&k);
-                self.wanted.list(&self.shape, k, digests);
-                self.nodes.insert(k);
+                let kids = self.shape.children(k).into_iter().flatten();
+                self.wanted.extend(kids.zip(digests));
             }
             PieceKind::Chunk(i) => {
-                if self.chunks.contains(&i) {
-                    return Ok(Offered::Duplicate);
-                }
-                if i >= self.shape.chunks {
-                    return Err(foreign());
-                }
-                let Some(expected) = self.wanted.chunks.get(&i).copied() else {
-                    return Ok(Offered::NotYet);
-                };
                 open_chunk(&self.entry, &self.shape, i, &wire, &expected)?;
-                self.wanted.chunks.remove(&i);
-                self.chunks.insert(i);
             }
         }
+        self.wanted.remove(&kind);
+        self.proven.insert(kind);
         Ok(Offered::Accepted)
     }
 }
@@ -454,26 +423,29 @@ pub(crate) fn join(
         return Err(PieceError::Oversize { size: blob.size });
     }
     let shape = Shape::of(blob.size);
-    let mut wanted = Listed::default();
-    wanted.nodes.insert(0, blob.root);
+    let mut wanted = BTreeMap::from([(PieceKind::Manifest(0), blob.root)]);
     // Heap order lists a parent before its children.
-    while let Some((k, expected)) = wanted.nodes.pop_first() {
+    while let Some((&PieceKind::Manifest(k), &expected)) = wanted.iter().next() {
+        wanted.remove(&PieceKind::Manifest(k));
         let name = piece_name(entry, PieceKind::Manifest(k));
         let wire = get(&name).ok_or(PieceError::Incomplete { missing: name })?;
         let digests = open_node(entry, &shape, k, &wire, &expected)?;
-        wanted.list(&shape, k, digests);
+        wanted.extend(shape.children(k).into_iter().flatten().zip(digests));
     }
-    for &i in wanted.chunks.keys() {
-        let name = piece_name(entry, PieceKind::Chunk(i));
+    // Only chunks are left, in order.
+    for &kind in wanted.keys() {
+        let name = piece_name(entry, kind);
         if !has(&name) {
             return Err(PieceError::Incomplete { missing: name });
         }
     }
     let mut out = Vec::with_capacity(blob.size as usize);
-    for (i, expected) in wanted.chunks {
-        let name = piece_name(entry, PieceKind::Chunk(i));
+    for (kind, expected) in wanted {
+        let name = piece_name(entry, kind);
         let wire = get(&name).ok_or(PieceError::Incomplete { missing: name })?;
-        out.extend_from_slice(&open_chunk(entry, &shape, i, &wire, &expected)?);
+        if let PieceKind::Chunk(i) = kind {
+            out.extend_from_slice(&open_chunk(entry, &shape, i, &wire, &expected)?);
+        }
     }
     Ok(out)
 }

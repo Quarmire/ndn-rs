@@ -90,19 +90,17 @@ impl Heard {
         high: u64,
         vouched: impl Fn(&Name) -> bool,
     ) -> Hearing {
+        let kept = |kept| Hearing {
+            kept,
+            dropped: None,
+        };
         if high == 0 {
-            return Hearing {
-                kept: false,
-                dropped: None,
-            };
+            return kept(false);
         }
         self.tick += 1;
         self.at.insert(device.clone(), self.tick);
         if self.at.len() <= HEARD_MAX {
-            return Hearing {
-                kept: true,
-                dropped: None,
-            };
+            return kept(true);
         }
         let mut by_age: Vec<(u64, &Name)> = self.at.iter().map(|(d, t)| (*t, d)).collect();
         by_age.sort_unstable();

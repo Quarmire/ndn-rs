@@ -29,15 +29,16 @@ pub(crate) struct ChunksBody {
     pub root: [u8; 32],
 }
 
-/// A piece of a large value: a chunk of its payload, or a node of its
-/// manifest tree.
+/// A piece of a large value: a node of its manifest tree, or a chunk of its
+/// payload. The order is the order a fetch asks in: nodes (each unlocks more
+/// pieces) before chunks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum PieceKind {
-    /// Chunk `i` of the payload: `<E>/32=piece/seg=<i>`.
-    Chunk(u64),
     /// Manifest node `k`, in heap order from the root (0):
     /// `<E>/32=piece/32=manifest/seg=<k>`.
     Manifest(u64),
+    /// Chunk `i` of the payload: `<E>/32=piece/seg=<i>`.
+    Chunk(u64),
 }
 
 /// A parsed piece name.
