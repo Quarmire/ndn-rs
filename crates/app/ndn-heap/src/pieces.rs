@@ -316,8 +316,8 @@ pub(crate) struct Assembler {
     wanted: Listed,
     /// Held nodes, by heap number.
     nodes: BTreeMap<u64, Bytes>,
-    /// Held chunks, by index.
-    chunks: BTreeMap<u64, Bytes>,
+    /// Held chunks, by index: the packet and the octets it carries.
+    chunks: BTreeMap<u64, (Bytes, Bytes)>,
 }
 
 /// What an offered piece came to, when it was not refused.
@@ -419,12 +419,27 @@ impl Assembler {
                 let Some(expected) = self.wanted.chunks.get(&i).copied() else {
                     return Ok(Offered::NotYet);
                 };
-                open_chunk(&self.entry, &self.shape, i, &wire, &expected)?;
+                let content = open_chunk(&self.entry, &self.shape, i, &wire, &expected)?;
                 self.wanted.chunks.remove(&i);
-                self.chunks.insert(i, wire);
+                self.chunks.insert(i, (wire, content));
             }
         }
         Ok(Offered::Accepted)
+    }
+
+    /// The payload, once every piece is held and proven: the octets the
+    /// chunks carry, in order, joined from what was proven as it arrived (no
+    /// read of the store and no second digest). Asked for before
+    /// [`Self::take_ops`], which gives the pieces up.
+    pub(crate) fn payload(&self) -> Option<Vec<u8>> {
+        if !self.is_complete() || self.nodes.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(self.shape.size as usize);
+        for (_, content) in self.chunks.values() {
+            out.extend_from_slice(content);
+        }
+        Some(out)
     }
 
     /// Every piece as a write, once all are held, and only then: the caller
@@ -437,7 +452,7 @@ impl Assembler {
         let entry = &self.entry;
         let chunks = std::mem::take(&mut self.chunks)
             .into_iter()
-            .map(|(i, wire)| (piece_name(entry, PieceKind::Chunk(i)), wire));
+            .map(|(i, (wire, _))| (piece_name(entry, PieceKind::Chunk(i)), wire));
         let nodes = std::mem::take(&mut self.nodes)
             .into_iter()
             .map(|(k, wire)| (piece_name(entry, PieceKind::Manifest(k)), wire));

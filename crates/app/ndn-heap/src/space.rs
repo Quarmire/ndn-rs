@@ -29,6 +29,7 @@ use std::task::{Context, Poll, Waker};
 use bytes::Bytes;
 use futures::Stream;
 use ndn_foundation_types::Name;
+use ndn_security::confidentiality::ContentKey;
 use ndn_sync::DataStore;
 use parking_lot::Mutex;
 
@@ -614,15 +615,22 @@ impl SpaceInner {
         Ok(())
     }
 
+    /// The epoch key `blob`'s entry was sealed under (`None`: a plain value),
+    /// or `Unavailable` while the entry is not applied and held.
+    fn blob_key(&self, blob: &Blob) -> Result<Option<ContentKey>, HeapError> {
+        self.log
+            .lock()
+            .entry_key(&blob.id)
+            .ok_or_else(|| HeapError::Unavailable {
+                name: log_name(&blob.id.device, &self.name, blob.id.seq),
+            })
+    }
+
     /// The value in pieces of `blob`, assembled from the store and opened:
     /// outside the lock.
     fn read_blob(&self, node: &NodeInner, blob: &Blob) -> Result<Bytes, HeapError> {
         let name = log_name(&blob.id.device, &self.name, blob.id.seq);
-        let key = self
-            .log
-            .lock()
-            .entry_key(&blob.id)
-            .ok_or_else(|| HeapError::Unavailable { name: name.clone() })?;
+        let key = self.blob_key(blob)?;
         let body = ChunksBody {
             size: blob.size,
             root: blob.root,
@@ -633,14 +641,30 @@ impl SpaceInner {
                 reason: other.to_string(),
             },
         })?;
+        self.open_blob(blob, key, stored)
+    }
+
+    /// The value of `blob` from `stored`, the payload its proven pieces
+    /// carry (sealed, under `key`, when the space is private).
+    fn open_blob(
+        &self,
+        blob: &Blob,
+        key: Option<ContentKey>,
+        stored: Vec<u8>,
+    ) -> Result<Bytes, HeapError> {
         self.whole.lock().insert(blob.id.clone());
         match key {
             None => Ok(Bytes::from(stored)),
-            Some(key) => seal::open_payload(&key, &name, &stored)
-                .map(Bytes::from)
-                .ok_or_else(|| HeapError::Local {
-                    reason: format!("the sealed value of {name} does not open under its epoch key"),
-                }),
+            Some(key) => {
+                let name = log_name(&blob.id.device, &self.name, blob.id.seq);
+                seal::open_payload(&key, &name, &stored)
+                    .map(Bytes::from)
+                    .ok_or_else(|| HeapError::Local {
+                        reason: format!(
+                            "the sealed value of {name} does not open under its epoch key"
+                        ),
+                    })
+            }
         }
     }
 
@@ -651,6 +675,11 @@ impl SpaceInner {
         let Ok(bytes) = self.read_blob(node, &blob) else {
             return;
         };
+        self.tell_blob(&blob, bytes, only);
+    }
+
+    /// [`Self::emit_blob`] for the value `bytes` of `blob` already in hand.
+    fn tell_blob(&self, blob: &Blob, bytes: Bytes, only: Option<Arc<Queue>>) {
         let change = {
             let log = self.log.lock();
             let Some((path, head)) = log
@@ -668,12 +697,14 @@ impl SpaceInner {
         }
     }
 
-    /// The pieces of `id` arrived whole: write them as one batch and tell.
+    /// The pieces of `id` arrived whole: write them as one batch and tell,
+    /// with `payload` (what the proven chunks carry): nothing is read back.
     pub(crate) fn assembled(
         self: &Arc<Self>,
         node: &Arc<NodeInner>,
         id: &EntryId,
         ops: Vec<ndn_sync::StoreOp>,
+        payload: Vec<u8>,
     ) {
         node.stage.apply(ops);
         node.flusher.note_write();
@@ -682,8 +713,13 @@ impl SpaceInner {
             let found = log.items().1;
             found.into_iter().find(|b| b.id == *id)
         };
-        if let Some(blob) = blob {
-            self.emit_blob(node, blob, None);
+        let Some(blob) = blob else {
+            return;
+        };
+        if let Ok(key) = self.blob_key(&blob)
+            && let Ok(bytes) = self.open_blob(&blob, key, payload)
+        {
+            self.tell_blob(&blob, bytes, None);
         }
     }
 

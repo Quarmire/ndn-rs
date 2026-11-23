@@ -475,7 +475,7 @@ impl Host for Toyhost {
         self.st.lock().blobs_owed.clone()
     }
 
-    fn assembled(&self, _space: &Name, id: &EntryId, ops: Vec<StoreOp>) {
+    fn assembled(&self, _space: &Name, id: &EntryId, ops: Vec<StoreOp>, _payload: Vec<u8>) {
         let mut st = self.st.lock();
         st.blobs_owed.retain(|b| b.id != *id);
         st.assembled.push((id.clone(), ops));
