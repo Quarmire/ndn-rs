@@ -130,13 +130,10 @@ impl Wire {
         self.peak.load(Ordering::Relaxed)
     }
 
-    /// The Data packets the device answered with.
-    pub(crate) fn data_answers(&self) -> Vec<Data> {
-        self.answers
-            .lock()
-            .iter()
-            .filter_map(|w| Data::decode(w.clone()).ok())
-            .collect()
+    /// The Data packet the device answered with at position `at` of its
+    /// answers (a Nack is `None`).
+    pub(crate) fn answer_at(&self, at: usize) -> Option<Data> {
+        Data::decode(self.answers.lock().get(at)?.clone()).ok()
     }
 
     /// How many answers (Data or Nack) the device sent.
@@ -398,6 +395,7 @@ impl Host for Toyhost {
         }
         st.applied.push((log.device, log.seq));
         let blobs = std::mem::take(&mut st.blobs_on_take);
+        st.blobs_owed.extend(blobs.iter().cloned());
         Taken::Decided {
             outcome: Outcome::Applied,
             blobs,
@@ -449,7 +447,8 @@ impl Host for Toyhost {
     }
 
     fn vouched(&self, _space: &Name, device: &Name) -> bool {
-        self.st.lock().vouched.contains(device)
+        let st = self.st.lock();
+        st.vouched.contains(device) || st.held.get(device).is_some_and(|h| !h.is_empty())
     }
 
     fn standing(&self, _space: &Name, device: &Name) -> Option<bool> {

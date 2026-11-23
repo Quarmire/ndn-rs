@@ -23,7 +23,7 @@ use ndn_foundation_types::Name;
 use ndn_sync::{DataStore, MemoryStore, StoreOp};
 use parking_lot::{Condvar, Mutex, RwLock};
 
-mod cluster;
+pub(crate) mod cluster;
 #[cfg(test)]
 mod tests;
 

@@ -8,21 +8,38 @@
 //! `Log::admit` under the space's lock, the flush ticket, watchers, re-check);
 //! this half asks for what the log says is missing (`Host::missing`), and
 //! answers what the log says it may serve.
-//!
-//! Under construction: the module lands behind its `wip-sync` feature.
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::pin::pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::FutureExt;
+use futures::future::{Either, select};
+use ndn_app::Connection;
 use ndn_foundation_types::Name;
-use ndn_packet::Data;
-use ndn_sync::{StoreOp, SvsConfig};
+use ndn_packet::{Data, Interest};
+use ndn_sync::{
+    MultiSvs, ObservedState, ProducerVouch, StoreOp, SvsConfig, SyncHandle, SyncUpdate,
+    spawn_multi_svs,
+};
+use parking_lot::Mutex;
+use tokio::sync::{Notify, mpsc};
 
+use crate::error::HeapError;
+use crate::face_up::FaceUp;
+use crate::fetch::{self, Asks, Fetcher, Noticed, Recovered};
+use crate::heard::{HEARD_MAX, Heard};
 use crate::log::{Blob, Outcome, Want};
 use crate::register::EntryId;
+use crate::reserve::FlushSink;
+use crate::rt;
 use crate::seal::GrantRefusal;
+use crate::serve::Granting;
 use crate::trust::{Judged, Waiting};
-use crate::wire::EpochId;
+use crate::wire::{EpochId, parse_space_name, sync_group_of};
 
 /// The `tracing` target of the timeline events (level `trace`): the few
 /// seams a put crosses on its way to another device's watch, each named by
@@ -202,6 +219,382 @@ pub(crate) trait Host: Send + Sync + 'static {
         to: &[u8; 32],
         name: &Name,
     ) -> Option<Bytes>;
+}
+
+// -- Stopping --------------------------------------------------------------------------------------
+
+/// A flag tasks watch, and a way to wake them to see it.
+#[derive(Default)]
+pub(crate) struct Stop {
+    flag: AtomicBool,
+    wake: Notify,
+}
+
+impl Stop {
+    /// Stop, now and for good.
+    pub(crate) fn stop(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+        self.wake.notify_waiters();
+        self.wake.notify_one();
+    }
+
+    /// Whether it was stopped.
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    /// Return once stopped.
+    pub(crate) async fn stopped(&self) {
+        loop {
+            let woken = self.wake.notified();
+            if self.is_stopped() {
+                return;
+            }
+            woken.await;
+        }
+    }
+}
+
+// -- What the half shares ----------------------------------------------------------------------------
+
+/// What every group and the server share: the node, its tuning, its fetching
+/// and what a granter keeps.
+pub(crate) struct Shared {
+    pub(crate) host: Arc<dyn Host>,
+    pub(crate) cfg: NetConfig,
+    pub(crate) fetcher: Fetcher,
+    pub(crate) grants: Granting,
+}
+
+// -- The node's one network half ------------------------------------------------------------------------
+
+/// The network half of a node: one SVS driver over the node's sync face, one
+/// group per space joined, the fetching, serving and face-up announcement
+/// around them.
+pub(crate) struct Net {
+    pub(crate) shared: Arc<Shared>,
+    svs: Arc<MultiSvs>,
+    sync: Arc<dyn Connection>,
+    groups: Mutex<BTreeMap<Name, Arc<Group>>>,
+    owners: Mutex<BTreeSet<Name>>,
+    /// The names of the sync groups joined, what the face-up announcement
+    /// lists.
+    names: Arc<Mutex<BTreeSet<Name>>>,
+    stop: Arc<Stop>,
+    face_up: FaceUp,
+}
+
+impl Net {
+    /// Start the half for the node `host` runs: `fetch` is the node's face
+    /// for Interest and Data, `sync` its face for the groups' Sync Interests.
+    /// The one SVS driver, the packet pumps between it and `sync`, and the
+    /// announcement of a group when a link comes up are started here.
+    pub(crate) fn start(
+        host: Arc<dyn Host>,
+        cfg: NetConfig,
+        fetch: Arc<dyn Connection>,
+        sync: Arc<dyn Connection>,
+    ) -> Arc<Net> {
+        let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(256);
+        let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
+        let svs = Arc::new(spawn_multi_svs(host.device().clone(), out_tx, in_rx));
+        let stop = Arc::new(Stop::default());
+        {
+            let (sync, stop) = (Arc::clone(&sync), Arc::clone(&stop));
+            rt::spawn(async move {
+                while let Either::Left((Some(packet), _)) =
+                    select(pin!(out_rx.recv()), pin!(stop.stopped())).await
+                {
+                    if sync.send(packet).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        {
+            let (sync, stop) = (Arc::clone(&sync), Arc::clone(&stop));
+            rt::spawn(async move {
+                while let Either::Left((Some(packet), _)) =
+                    select(pin!(sync.recv()), pin!(stop.stopped())).await
+                {
+                    if Interest::decode(packet.clone()).is_ok() && in_tx.send(packet).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+        let names: Arc<Mutex<BTreeSet<Name>>> = Arc::default();
+        let face_up = FaceUp::spawn(
+            Arc::clone(&sync),
+            {
+                let names = Arc::clone(&names);
+                move || names.lock().iter().cloned().collect()
+            },
+            {
+                let svs = Arc::clone(&svs);
+                move |group| {
+                    let svs = Arc::clone(&svs);
+                    async move {
+                        tracing::trace!(target: TIMELINE, %group, "announce");
+                        svs.announce(group).await;
+                    }
+                    .boxed()
+                }
+            },
+        );
+        let shared = Arc::new(Shared {
+            fetcher: Fetcher::new(fetch, cfg.lifetime, cfg.in_flight),
+            host,
+            cfg,
+            grants: Granting::default(),
+        });
+        Arc::new(Net {
+            shared,
+            svs,
+            sync,
+            groups: Mutex::new(BTreeMap::new()),
+            owners: Mutex::new(BTreeSet::new()),
+            names,
+            stop,
+            face_up,
+        })
+    }
+
+    /// Join the sync group of `space` as a producer named by this device,
+    /// whose counter is `counter` now: the first publication is `counter + 1`,
+    /// so pass `Log::next_seq() - 1`. The sync face registers the owner's
+    /// `<O>/32=sync` once, however many of its spaces are joined. Starts the
+    /// group's notice loop and fetching; the node calls
+    /// [`Group::recover`] before its first publication.
+    ///
+    /// # Errors
+    ///
+    /// [`HeapError::BadName`] for a name that is not a space,
+    /// [`HeapError::Local`] when the face or the driver refuses.
+    pub(crate) async fn join(
+        self: &Arc<Self>,
+        space: &Name,
+        counter: u64,
+    ) -> Result<Arc<Group>, HeapError> {
+        let bad = |why: &str| HeapError::BadName {
+            name: space.clone(),
+            why: why.into(),
+        };
+        let group_name =
+            sync_group_of(space).ok_or_else(|| bad("a space is `<owner>/32=data/<path>`"))?;
+        let owner = parse_space_name(space)
+            .ok_or_else(|| bad("a space is `<owner>/32=data/<path>`"))?
+            .owner;
+        if self.owners.lock().insert(owner.clone()) {
+            let prefix = ndn_security::sync_group(&owner);
+            if let Err(e) = self.sync.register_prefix(&prefix).await {
+                self.owners.lock().remove(&owner);
+                return Err(HeapError::Local {
+                    reason: format!("cannot receive {prefix}: {e}"),
+                });
+            }
+        }
+        // The group's state vector keeps the devices heard: at most
+        // `HEARD_MAX` besides this one, a device an admitted entry vouches
+        // for never displaced by a name a Sync Interest carried.
+        let vouch = {
+            let (host, space) = (Arc::clone(&self.shared.host), space.clone());
+            ProducerVouch(Arc::new(move |device: &Name| host.vouched(&space, device)))
+        };
+        let cfg = SvsConfig {
+            local_seq: counter,
+            max_producers: HEARD_MAX,
+            vouch: Some(vouch),
+            ..self.shared.cfg.svs.clone()
+        };
+        let Some(handle) = self.svs.join(group_name.clone(), cfg).await else {
+            return Err(HeapError::Local {
+                reason: format!(
+                    "the sync driver did not join {group_name}: it is joined already, or it has stopped"
+                ),
+            });
+        };
+        let group = Arc::new(Group {
+            space: space.clone(),
+            group: group_name.clone(),
+            shared: Arc::clone(&self.shared),
+            heard: Mutex::new(Heard::default()),
+            noticed: Mutex::new(BTreeMap::new()),
+            asks: Mutex::new(Asks::default()),
+            assembling: Mutex::new(HashSet::new()),
+            asking: Mutex::new(BTreeSet::new()),
+            wake: Notify::new(),
+            progress: Notify::new(),
+            first_vector: Notify::new(),
+            heard_any: AtomicBool::new(false),
+            relist: AtomicBool::new(true),
+            stop: Stop::default(),
+            tx: handle.tx.clone(),
+            observed: handle.observed_shared(),
+        });
+        self.groups.lock().insert(space.clone(), Arc::clone(&group));
+        self.names.lock().insert(group_name);
+        rt::spawn(notices(Arc::clone(&group), handle));
+        rt::spawn(fetch::run(Arc::clone(&group)));
+        Ok(group)
+    }
+
+    /// Leave the group of `space`: its tasks end and its driver state goes.
+    pub(crate) async fn leave(&self, space: &Name) {
+        let group = self.groups.lock().remove(space);
+        if let Some(group) = group {
+            group.stop.stop();
+            self.names.lock().remove(&group.group);
+            self.svs.leave(group.group.clone()).await;
+        }
+    }
+
+    /// The group of `space`, if joined.
+    pub(crate) fn group(&self, space: &Name) -> Option<Arc<Group>> {
+        self.groups.lock().get(space).cloned()
+    }
+
+    /// Something changed what `space` wants (a person adopted, a key
+    /// arrived, a flush): look again at once.
+    pub(crate) fn nudge(&self, space: &Name) {
+        if let Some(group) = self.group(space) {
+            group.nudge();
+        }
+    }
+
+    /// Stop the driver, every group and the announcement at once. Idempotent.
+    pub(crate) fn shutdown(&self) {
+        self.stop.stop();
+        for group in self.groups.lock().values() {
+            group.stop.stop();
+        }
+        self.face_up.stop();
+        self.svs.shutdown();
+    }
+}
+
+impl Drop for Net {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+// -- One space's group ----------------------------------------------------------------------------------
+
+/// One joined sync group, and everything asked and heard in it.
+pub(crate) struct Group {
+    pub(crate) space: Name,
+    group: Name,
+    pub(crate) shared: Arc<Shared>,
+    /// The devices heard, bounded ([`Heard`]).
+    pub(crate) heard: Mutex<Heard>,
+    /// What a notice said of each device heard.
+    pub(crate) noticed: Mutex<BTreeMap<Name, Noticed>>,
+    /// The asks in flight or pausing.
+    pub(crate) asks: Mutex<Asks>,
+    /// The values whose pieces are being gathered.
+    pub(crate) assembling: Mutex<HashSet<EntryId>>,
+    /// The epochs whose key is being asked for.
+    pub(crate) asking: Mutex<BTreeSet<EpochId>>,
+    /// Look again at what is wanted.
+    pub(crate) wake: Notify,
+    /// An ask ended.
+    pub(crate) progress: Notify,
+    /// The first notice arrived.
+    pub(crate) first_vector: Notify,
+    pub(crate) heard_any: AtomicBool,
+    /// List the values owed their pieces again.
+    pub(crate) relist: AtomicBool,
+    pub(crate) stop: Stop,
+    tx: mpsc::Sender<(Name, Option<Bytes>)>,
+    observed: Option<Arc<ObservedState>>,
+}
+
+impl Group {
+    /// A notice: `update.name` says its counter in this group is
+    /// `update.high_seq`. It decides nothing: it is noted, bounded, and the
+    /// log's own wants do the rest. A device at counter 0 has written nothing
+    /// and is ignored; a name nothing vouches for never displaces one that is
+    /// vouched for; this device's own counter is the log's to alert on
+    /// ([`Host::note_counter`]).
+    pub(crate) fn on_update(&self, update: SyncUpdate) {
+        let host = &self.shared.host;
+        let (device, high) = (update.name, update.high_seq);
+        tracing::trace!(target: TIMELINE, %device, high, "sync_update");
+        self.heard_any.store(true, Ordering::Relaxed);
+        self.first_vector.notify_waiters();
+        if device == *host.device() {
+            if high > 0 {
+                host.note_counter(&self.space, &device, high);
+                self.wake.notify_one();
+            }
+            return;
+        }
+        let hearing = self
+            .heard
+            .lock()
+            .hear(device.clone(), high, |d| host.vouched(&self.space, d));
+        if let Some(dropped) = &hearing.dropped {
+            self.noticed.lock().remove(dropped);
+            self.asks.lock().forget(dropped);
+        }
+        if !hearing.kept {
+            tracing::debug!(%device, high, "not walked: it names no entry, or as many devices are heard in the group already, each vouched for by an admitted entry, and nothing held vouches for this one");
+            return;
+        }
+        self.noticed.lock().entry(device).or_default().raise(high);
+        self.wake.notify_one();
+    }
+
+    /// Look again at what is wanted, and at the values and keys owed.
+    pub(crate) fn nudge(&self) {
+        self.relist.store(true, Ordering::Relaxed);
+        self.wake.notify_one();
+    }
+
+    /// The sink that publishes this device's own entries into the group, one
+    /// call per seq in order (`reserve::Publisher::spawn`).
+    pub(crate) fn sink(&self) -> Arc<dyn FlushSink> {
+        Arc::new(Sink {
+            group: self.group.clone(),
+            tx: self.tx.clone(),
+        })
+    }
+
+    /// Whether the group's state vector holds no device but this one (or the
+    /// driver keeps no observed state): nobody to recover from or wait for.
+    pub(crate) fn no_peers(&self) -> bool {
+        let me = self.shared.host.device();
+        self.observed
+            .as_ref()
+            .is_none_or(|o| o.snapshot().iter().all(|(name, _, _)| name == me))
+    }
+}
+
+/// Publishes an own entry as one counter step of the group.
+struct Sink {
+    group: Name,
+    tx: mpsc::Sender<(Name, Option<Bytes>)>,
+}
+
+#[async_trait::async_trait]
+impl FlushSink for Sink {
+    async fn publish(&self, seq: u64) {
+        tracing::trace!(target: TIMELINE, seq, "announce");
+        if self.tx.send((self.group.clone(), None)).await.is_err() {
+            tracing::debug!(group = %self.group, seq, "not announced: the group's driver has stopped");
+        }
+    }
+}
+
+/// The notices of a group, until it is left or the driver stops.
+async fn notices(group: Arc<Group>, mut handle: SyncHandle) {
+    while let Either::Left((Some(update), _)) =
+        select(pin!(handle.recv()), pin!(group.stop.stopped())).await
+    {
+        group.on_update(update);
+    }
 }
 
 #[cfg(test)]

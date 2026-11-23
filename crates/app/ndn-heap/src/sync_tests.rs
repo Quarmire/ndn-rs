@@ -250,13 +250,18 @@ async fn a_forged_entry_fetched_directly_is_refused_and_nothing_is_applied() {
     );
     let st = r.host.st.lock();
     assert_eq!(
-        st.applied,
-        vec![(n(PHONE), 5)],
-        "the forged copy applied nothing; the genuine one applied once"
+        st.applied.first(),
+        Some(&(n(PHONE), 5)),
+        "the genuine copy of the entry the notice names applied first, once"
+    );
+    assert_eq!(
+        st.applied.iter().filter(|a| **a == (n(PHONE), 5)).count(),
+        1,
+        "the forged copy applied nothing"
     );
     assert!(
-        st.taken.len() >= 2,
-        "the forged copy was handed to the node"
+        st.taken.iter().filter(|t| **t == (n(PHONE), 5)).count() >= 2,
+        "the forged copy was handed to the node, and refused"
     );
 }
 
@@ -582,12 +587,11 @@ async fn a_bad_piece_is_never_taken_and_another_holder_is_asked() {
             }
             return Reply::Data(p.wire.clone());
         }
-        if let Some((holder, original)) = parse_held_name(name) {
-            if holder == n(TABLET) {
-                if let Some(p) = packets.iter().find(|p| p.name == original) {
-                    return Reply::Data(wrapped(name, p.wire.clone()));
-                }
-            }
+        if let Some((holder, original)) = parse_held_name(name)
+            && holder == n(TABLET)
+            && let Some(p) = packets.iter().find(|p| p.name == original)
+        {
+            return Reply::Data(wrapped(name, p.wire.clone()));
         }
         Reply::Nack(NackReason::NoRoute)
     });
@@ -666,11 +670,12 @@ async fn the_grant_pull_walks_creator_then_relays_with_backoff() {
         vec![n(PHONE), n(TABLET), n(DESKTOP)],
         "the creator first, then the members that vouch"
     );
-    let st = r.host.st.lock();
-    assert_eq!(st.arrived.len(), 1, "the key arrived once");
-    assert_eq!(st.arrived[0].0.seq, 4);
-    assert!(st.owed.is_empty());
-    drop(st);
+    {
+        let st = r.host.st.lock();
+        assert_eq!(st.arrived.len(), 1, "the key arrived once");
+        assert_eq!(st.arrived[0].0.seq, 4);
+        assert!(st.owed.is_empty());
+    }
     let rounds: Vec<tokio::time::Instant> = asks
         .iter()
         .filter(|(name, _)| parse_grant_name(name).unwrap().0 == n(PHONE))
@@ -769,5 +774,62 @@ async fn a_name_a_sync_interest_carried_is_never_asked_for_a_key() {
         granters,
         [n(PHONE)].into_iter().collect(),
         "only the epoch's creator"
+    );
+}
+
+/// Over a real forwarder and the real SVS driver: a device publishes its
+/// counter, the other hears the notice, fetches the entry it names through
+/// the forwarder from the writer's server, and takes it: one fetch, one take.
+#[tokio::test]
+async fn a_published_counter_reaches_a_peer_which_fetches_the_entry_through_the_engine() {
+    use crate::test_kit::cluster::Cluster;
+    let cluster = Cluster::new(&[LAPTOP, PHONE]).await;
+    let (laptop, phone) = (cluster.device(0), cluster.device(1));
+    let (on_laptop, on_phone) = (Toyhost::new(LAPTOP), Toyhost::new(PHONE));
+    let cfg = NetConfig {
+        svs: ndn_sync::SvsConfig::lan(),
+        ..NetConfig::default()
+    };
+    let laptop_net = Net::start(
+        Arc::clone(&on_laptop) as Arc<dyn Host>,
+        cfg.clone(),
+        laptop.node.connection(),
+        Arc::clone(&laptop.sync),
+    );
+    let phone_net = Net::start(
+        Arc::clone(&on_phone) as Arc<dyn Host>,
+        cfg,
+        phone.node.connection(),
+        Arc::clone(&phone.sync),
+    );
+    let _serving = phone
+        .node
+        .serve(phone.name.clone(), {
+            let net = Arc::clone(&phone_net);
+            move |interest, responder| crate::serve::answer(Arc::clone(&net), interest, responder)
+        })
+        .await
+        .expect("the phone serves its name");
+    laptop_net.join(&space(), 0).await.expect("laptop joins");
+    let on_the_phone = phone_net.join(&space(), 0).await.expect("phone joins");
+    on_phone
+        .st
+        .lock()
+        .served
+        .insert((n(PHONE), 1), genuine(PHONE, 1));
+    on_the_phone.sink().publish(1).await;
+    let began = std::time::Instant::now();
+    while !on_laptop.holds(PHONE, 1) {
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "the entry did not arrive within ten seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        on_laptop.st.lock().taken,
+        vec![(n(PHONE), 1)],
+        "one fetch, one take"
     );
 }

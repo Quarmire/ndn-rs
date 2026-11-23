@@ -19,7 +19,6 @@ mod wire;
 
 mod error;
 mod face_up;
-#[cfg(feature = "wip-fetch")]
 mod fetch;
 mod fold;
 mod heard;
@@ -31,13 +30,11 @@ mod register;
 mod reserve;
 mod revocation;
 mod seal;
-#[cfg(feature = "wip-serve")]
 mod serve;
 mod signal;
 #[cfg(feature = "wip-space")]
 mod space;
 mod store;
-#[cfg(feature = "wip-sync")]
 mod sync;
 #[cfg(test)]
 mod test_kit;

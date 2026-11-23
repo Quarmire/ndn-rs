@@ -70,10 +70,10 @@ impl Server {
             self.wire.answers() <= before + 1,
             "one ask, at most one answer"
         );
-        (self.wire.answers() == before + 1)
-            .then(|| self.wire.data_answers().into_iter().last())
-            .flatten()
-            .filter(|d| *d.name == *name)
+        if self.wire.answers() != before + 1 {
+            return None;
+        }
+        self.wire.answer_at(before).filter(|d| *d.name == *name)
     }
 }
 
