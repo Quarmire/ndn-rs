@@ -809,8 +809,10 @@ impl Judge {
 
     /// The validator that judges `name` about `space`: for a person's
     /// namespace the node does not hold, the view adopted for her if the
-    /// listings say so; else the node's own, which refuses it as not held.
-    fn view_for(&self, name: &Name, space: &Name, member: bool) -> Arc<Validator> {
+    /// listings say so (`member`: only as a writer or reader, not as a person
+    /// a cut keeps); else the node's own, which refuses it as not held. The
+    /// signal gate judges live data by it.
+    pub(crate) fn view_for(&self, name: &Name, space: &Name, member: bool) -> Arc<Validator> {
         self.validator
             .keyring()
             .unheld_personal_namespace(name)

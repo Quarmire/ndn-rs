@@ -617,7 +617,7 @@ async fn a_sealed_space_gives_its_audience_the_keys_of_its_epochs() {
     let key = {
         let log = alice.log.lock();
         let held = log.keys().key(&space(), &e1).unwrap();
-        ContentKey::from_bytes(<[u8; 32]>::try_from(held.expose()).unwrap())
+        ContentKey::from_bytes(*held.expose())
     };
     assert!(bob.log.lock().key_arrived(e1.clone(), key).0);
     let at_bob = bob.scope().expect("a writer with the key");
@@ -823,7 +823,7 @@ async fn the_fetch_budget_bounds_waiting_headers() {
         .iter()
         .chain([&rita])
         .map(|h| {
-            let (alice, h) = (Arc::clone(&alice), h.clone());
+            let (alice, h) = (Arc::clone(&alice), Data::decode(h.raw().clone()).unwrap());
             tokio::spawn(async move { alice.admit(&h).await })
         })
         .collect();

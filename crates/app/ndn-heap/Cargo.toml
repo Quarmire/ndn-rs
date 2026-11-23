@@ -62,7 +62,6 @@ wip-fetch = []
 wip-serve = []
 wip-node = []
 wip-space = []
-wip-signal = []
 
 [lints]
 workspace = true

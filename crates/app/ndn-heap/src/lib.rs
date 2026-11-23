@@ -33,7 +33,6 @@ mod revocation;
 mod seal;
 #[cfg(feature = "wip-serve")]
 mod serve;
-#[cfg(feature = "wip-signal")]
 mod signal;
 #[cfg(feature = "wip-space")]
 mod space;
