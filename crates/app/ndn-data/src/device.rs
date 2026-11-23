@@ -1296,15 +1296,6 @@ struct Peer {
     /// Interest carried holds nothing back for longer than those tries, and
     /// a real device that a faulty path kept from one walk still does.
     unreached: bool,
-    /// The root that answered the first notice of this device (no root of it
-    /// verified before) was no newer than the head held then, 0: a notice
-    /// means the writer moved, so that root may be an old copy the network
-    /// delayed. The head it left: the one follow-up walk that comes after
-    /// the pause ([`Inner::follow_stale_root`]) takes it and requires a
-    /// root above it, from the writer or a device answering for it; given
-    /// none, that walk does not reach the writer ([`Inner::refresh`], spec
-    /// §17.1).
-    after: Option<u64>,
 }
 
 /// Where another device's roots stand that no trust context held here
@@ -6685,27 +6676,19 @@ impl Inner {
         // §17.1).
         let key = (device.clone(), ns.clone());
         let answers = reach.as_ref().and_then(|r| r.answers);
-        let (held, owed) = {
-            let mut st = self.st.lock();
-            match st.peers.get_mut(&key) {
-                Some(p) => (
-                    (p.head > 0 || p.root.is_some()).then_some(p.head),
-                    p.after.take(),
-                ),
-                None => (None, None),
-            }
-        };
-        // The one follow-up of a first notice's root that may be an old copy
-        // ([`Peer::after`]) takes the writer's root as it comes, and counts
-        // it as no answer when it is no newer than that head; a relay's
-        // root must be above it.
-        let floor = answers.and(held);
+        let floor = answers.and_then(|_| {
+            self.st
+                .lock()
+                .peers
+                .get(&key)
+                .filter(|p| p.head > 0 || p.root.is_some())
+                .map(|p| p.head)
+        });
         let above = reach
             .as_ref()
             .filter(|r| r.index > 0)
             .map(|r| r.pass.head.load(Ordering::Relaxed))
-            .max(floor)
-            .max(owed);
+            .max(floor);
         let Some((rooted, relayed)) = self.fetch_root(root, ns, device, above, floor).await else {
             return false;
         };
@@ -6719,18 +6702,6 @@ impl Inner {
             return false;
         }
         let Rooted { data, writer, body } = rooted;
-        // The follow-up of a first notice's root that may be an old copy
-        // ([`Peer::after`]) got no root above the head: only stale copies
-        // came, so the writer is not reached, and the loop asks again.
-        let stale = owed.is_some_and(|a| body.head <= a);
-        // The first root of a device, answering its first notice, that is no
-        // newer than the head held before it (0): the writer moved, so it
-        // may be an old copy a hostile or a delayed path replayed, which
-        // must not end the notice. One more walk follows after the pause,
-        // requiring a root above it ([`Peer::after`], spec §17.1).
-        if owed.is_none() && answers.is_some() && held.is_none() && !relayed && body.head == 0 {
-            self.follow_stale_root(ns, device, body.head);
-        }
         if let Some(r) = &reach {
             r.pass.head.fetch_max(body.head, Ordering::Relaxed);
         }
@@ -6766,7 +6737,7 @@ impl Inner {
             let st = self.st.lock();
             if st.peers.get(&key).and_then(|p| p.root) == Some(digest) && !st.owes_walk(device, ns)
             {
-                return !unreached && !stale;
+                return !unreached;
             }
         }
         let head = body.head;
@@ -6819,32 +6790,7 @@ impl Inner {
             self.store
                 .insert(walked_name(device, ns), encode_walked(head, &peer.toward));
         }
-        !unreached && !stale
-    }
-
-    /// The root that answered `device`'s first notice in `ns` was no newer
-    /// than `head` (0), which a notice cannot announce: it may be an old
-    /// copy the network delayed, and the device stops announcing once its
-    /// root was asked. After the pause the loop walks it once more, the walk
-    /// requiring a root above `head` ([`Peer::after`]); once only. Which
-    /// root answers decides nothing else (invariant 1).
-    fn follow_stale_root(self: &Arc<Self>, ns: &Name, device: &Name, head: u64) {
-        self.st
-            .lock()
-            .peers
-            .entry((device.clone(), ns.clone()))
-            .or_default()
-            .after = Some(head);
-        let weak = Arc::downgrade(self);
-        let (ns, device) = (ns.clone(), device.clone());
-        rt::spawn(async move {
-            rt::sleep(retry_pause(0)).await;
-            if let Some(inner) = weak.upgrade()
-                && !inner.stopped.load(Ordering::Relaxed)
-            {
-                inner.refresh_loop(ns, device, 0, false);
-            }
-        });
+        !unreached
     }
 
     /// One pass of `device`'s refresh loop of `ns` ([`Self::refresh_loop`],

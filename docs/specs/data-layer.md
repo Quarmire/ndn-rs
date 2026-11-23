@@ -3182,24 +3182,21 @@ announced). What is owed, and until when:
   pause it falls in. A
   pass something held here asks for — a name followed, a namespace
   adopted — begins at once, whatever notices came.
-- **A first notice answered by a root of head 0 (normative).** A notice
-  says its device moved, so a root of head 0 that answers the first notice
-  of a device never walked before may be an old copy of its root, replayed
-  or delayed by a party on the path: the device would stop announcing once
-  its root was asked, and nothing would ask again. The reader takes that
-  root as any (a device that has signed nothing yet has a head-0 root, and
-  is no worse for it), and once, after the pause above, walks the device
-  again, with one ask for its root: the writer's own root above the head
-  held is walked as it comes, and so is a root a device answering for it
-  gives (§13.5) above that head. Given only a root no newer, that walk
-  does not reach the writer: the loop asks again as for a root that does
-  not come, and the walk after it takes what answers. An old copy of a
-  root of head above 0 at a first contact advances the head and is not
-  caught here: a notice names no entry to fetch (§12.1), so only a notice
-  that does closes that. Nothing is taken on trust: only roots the writer
-  signed are taken.
   Which root answered decides nothing (invariant 1): what is held and owed
   follows from the roots and entries verified, as above.
+- **A replayed first root (known limit of this walk).** A device that
+  never verified a root of another device has no floor for it, so the
+  first root that answers a notice of that device is taken as the writer's
+  answer, whichever copy it is: an old copy the network delayed or a party
+  on the path replayed (an earlier root of head 0, say) answers the notice,
+  the device stops announcing once its root was asked, and nothing asks
+  again, so its last write is held back until it writes again. Only roots
+  the writer signed are taken, so integrity is unaffected. A notice that
+  names the entry to fetch (§12.1: this one does not) closes it; a
+  follow-up ask after the first notice was tried and withdrawn, because
+  devices that sign nothing in a namespace have a head-0 root as often as a
+  replay does, and the extra asks made the walks of other cases miss their
+  bounds under loss.
 - **A group heard from no one (normative).** A first look (§15) that
   finds no device heard that writes into the
   namespace — none heard in its group, none heard in another group that
