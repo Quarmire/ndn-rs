@@ -33,7 +33,6 @@ mod node;
 mod pieces;
 #[cfg(feature = "wip-register")]
 mod register;
-#[cfg(feature = "wip-reserve")]
 mod reserve;
 #[cfg(feature = "wip-revocation")]
 mod revocation;
@@ -45,11 +44,10 @@ mod serve;
 mod signal;
 #[cfg(feature = "wip-space")]
 mod space;
-#[cfg(feature = "wip-store")]
 mod store;
 #[cfg(feature = "wip-sync")]
 mod sync;
-#[cfg(all(test, feature = "wip-test-kit"))]
+#[cfg(test)]
 mod test_kit;
 #[cfg(feature = "wip-trust")]
 mod trust;

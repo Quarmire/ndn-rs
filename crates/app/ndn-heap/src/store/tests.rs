@@ -156,7 +156,10 @@ fn the_markers_round_trip() {
 
     for record in [
         ReserveRecord { r: 0, clean: false },
-        ReserveRecord { r: 1024, clean: true },
+        ReserveRecord {
+            r: 1024,
+            clean: true,
+        },
         ReserveRecord {
             r: u64::MAX,
             clean: false,
@@ -272,12 +275,15 @@ fn own_head_comes_from_every_stored_own_entry_name_even_if_it_does_not_decode() 
     // another device's entry, an entry of a space that extends this one, a
     // stale head record.
     store.insert(
-        log_name(&device(), &space(), 900).append_component(NameComponent::keyword(
-            Bytes::from_static(b"piece"),
-        )).append_segment(0),
+        log_name(&device(), &space(), 900)
+            .append_component(NameComponent::keyword(Bytes::from_static(b"piece")))
+            .append_segment(0),
         garbage.clone(),
     );
-    store.insert(log_name(&n("/alice/phone"), &space(), 5000), garbage.clone());
+    store.insert(
+        log_name(&n("/alice/phone"), &space(), 5000),
+        garbage.clone(),
+    );
     store.insert(
         log_name(&device(), &n("/alice/32=data/notes/y"), 6000),
         garbage.clone(),

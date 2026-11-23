@@ -1,6 +1,684 @@
-//! Sequence reservation and the flusher (spec §4).
+//! Sequence reservation, the flusher and the in-order publisher (spec §4).
 //!
-//! Under construction: the module lands behind its `wip-reserve` feature.
+//! A node signs entries before they are durable: `put` returns once the
+//! entry is stored, and the disk catches up in the background. What keeps a
+//! crash from making a device sign a different entry at a seq a peer already
+//! saw is the **reservation**: per (device, space) the device keeps `R`
+//! durable, and never signs a seq above `R_durable`, the `R` that a returned
+//! flush covered. A restart that finds an unclean record resumes above `R`
+//! and says so in a signed gap statement.
+//!
+//! * [`Flusher`]: one task per node. While anything written is not yet
+//!   synced it calls [`DataStore::sync`], and every write that returned
+//!   before the call is covered by it; writes arriving meanwhile share the
+//!   next. A write is named by the [`Ticket`] taken after it returned, and a
+//!   flush that covers the ticket is the proof it is durable. A failure is
+//!   sticky.
+//! * [`Reservation`]: the arithmetic of one (device, space): `R`,
+//!   `R_durable`, whether a seq may be signed ([`Reservation::sign_gate`]),
+//!   the extension at half a block, open and clean close.
+//! * [`Publisher`]: releases each entry to the sync layer once, in seq order,
+//!   holding a structural entry (and what follows it) until the flush that
+//!   covers it returned.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Weak};
+
+use ndn_foundation_types::Name;
+use ndn_sync::DataStore;
+use parking_lot::Mutex;
+use tokio::sync::Notify;
+
+use crate::rt;
+use crate::store::{Corrupt, ReserveRecord, read_head, read_reserve, reserve_key};
 
 #[cfg(test)]
 mod tests;
+
+// -- The flusher --------------------------------------------------------------
+
+/// A position in the flusher's count of writes: durable once a flush that
+/// covers it returned. Taken ([`Flusher::note_write`]) after the write it
+/// stands for returned from the store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct Ticket(pub(crate) u64);
+
+/// Why the store could not make writes durable: the disk's own reason, with
+/// what to do. Kept by the flusher for good: nothing it holds can be
+/// promised durable any more.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DiskFailure {
+    reason: Arc<str>,
+}
+
+impl DiskFailure {
+    fn new(why: &std::io::Error) -> DiskFailure {
+        DiskFailure {
+            reason: why.to_string().into(),
+        }
+    }
+
+    /// The disk's reason, as the store gave it.
+    pub(crate) fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for DiskFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the store could not make this node's writes durable: {}. Nothing signed is lost and \
+             reads continue, but no seq past what was made durable can be signed, and no \
+             Members or Epoch change is published; free space or fix the disk, then restart the \
+             node",
+            self.reason
+        )
+    }
+}
+
+/// Why a wait for a flush ended without the flush.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FlushError {
+    /// The store failed to sync (sticky).
+    Disk(DiskFailure),
+    /// The node is closing or stopped: nothing more is flushed.
+    Stopped,
+}
+
+impl std::fmt::Display for FlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlushError::Disk(why) => why.fmt(f),
+            FlushError::Stopped => f.write_str(
+                "the node is closing or stopped, so nothing more is made durable; open the \
+                 space again on a new node",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FlushError {}
+
+#[derive(Default)]
+struct FlushState {
+    /// Tickets issued.
+    issued: u64,
+    /// Every ticket up to this is covered by a returned flush.
+    durable: u64,
+    failure: Option<DiskFailure>,
+    stopped: bool,
+}
+
+/// The node's one flusher.
+pub(crate) struct Flusher {
+    store: Arc<dyn DataStore>,
+    st: Mutex<FlushState>,
+    /// To the task: a ticket was issued, or the flusher stopped or dropped.
+    wake: Arc<Notify>,
+    /// To waiters: a flush returned, failed, or the flusher stopped.
+    done: Notify,
+}
+
+impl Flusher {
+    /// Start the flusher over `store`. The task ends when the flusher is
+    /// stopped or dropped.
+    pub(crate) fn spawn(store: Arc<dyn DataStore>) -> Arc<Flusher> {
+        let wake = Arc::new(Notify::new());
+        let flusher = Arc::new(Flusher {
+            store,
+            st: Mutex::new(FlushState::default()),
+            wake: Arc::clone(&wake),
+            done: Notify::new(),
+        });
+        rt::spawn(Self::run(Arc::downgrade(&flusher), wake));
+        flusher
+    }
+
+    async fn run(flusher: Weak<Flusher>, wake: Arc<Notify>) {
+        loop {
+            wake.notified().await;
+            let Some(flusher) = flusher.upgrade() else {
+                return;
+            };
+            if flusher.st.lock().stopped {
+                return;
+            }
+            flusher.rounds().await;
+        }
+    }
+
+    /// Flush until nothing written is unsynced, the store fails, or the
+    /// flusher stops.
+    async fn rounds(&self) {
+        loop {
+            let target = {
+                let st = self.st.lock();
+                if st.stopped || st.failure.is_some() || st.durable >= st.issued {
+                    return;
+                }
+                st.issued
+            };
+            tracing::trace!(target: "ndn_heap::timeline", target, "flush_begin");
+            let flushed = self.sync().await;
+            tracing::trace!(target: "ndn_heap::timeline", ok = flushed.is_ok(), "flush_end");
+            {
+                let mut st = self.st.lock();
+                match flushed {
+                    Ok(()) => st.durable = st.durable.max(target),
+                    Err(why) => {
+                        tracing::warn!(
+                            "the store did not make this node's writes durable ({why}): nothing \
+                             written since its last flush is promised; check the disk or \
+                             filesystem the store is on"
+                        );
+                        st.failure = Some(DiskFailure::new(&why));
+                    }
+                }
+            }
+            self.done.notify_waiters();
+        }
+    }
+
+    /// The store's barrier, on a blocking thread: a flush takes as long as
+    /// the disk does. A store whose flush returns at once is flushed inline.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn sync(&self) -> std::io::Result<()> {
+        if self.store.sync_is_immediate() {
+            return self.store.sync();
+        }
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || store.sync())
+            .await
+            .unwrap_or_else(|e| {
+                Err(std::io::Error::other(format!(
+                    "the flush did not finish ({e})"
+                )))
+            })
+    }
+
+    /// The store's barrier. A browser store commits each write durably, so
+    /// this returns at once there.
+    #[cfg(target_arch = "wasm32")]
+    async fn sync(&self) -> std::io::Result<()> {
+        self.store.sync()
+    }
+
+    /// Say that a write returned from the store, and ask for a flush: the
+    /// ticket is durable once [`Self::wait_durable`] says so. Call it after
+    /// the write returned (after the batch applied, for one made in a
+    /// batch), never before: a flush that began between would cover the
+    /// ticket without the write.
+    pub(crate) fn note_write(&self) -> Ticket {
+        let ticket = {
+            let mut st = self.st.lock();
+            st.issued += 1;
+            Ticket(st.issued)
+        };
+        self.wake.notify_one();
+        ticket
+    }
+
+    /// The newest ticket a returned flush covers.
+    pub(crate) fn durable(&self) -> Ticket {
+        Ticket(self.st.lock().durable)
+    }
+
+    /// The store's failure, once it failed.
+    pub(crate) fn failure(&self) -> Option<DiskFailure> {
+        self.st.lock().failure.clone()
+    }
+
+    /// Wait until a flush covering `ticket` returned. A ticket a flush
+    /// covered before the store failed is durable whatever happened since.
+    pub(crate) async fn wait_durable(&self, ticket: Ticket) -> Result<(), FlushError> {
+        loop {
+            let notified = self.done.notified();
+            {
+                let st = self.st.lock();
+                if st.durable >= ticket.0 {
+                    return Ok(());
+                }
+                if let Some(why) = &st.failure {
+                    return Err(FlushError::Disk(why.clone()));
+                }
+                if st.stopped {
+                    return Err(FlushError::Stopped);
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Wait for a flush covering everything written so far.
+    pub(crate) async fn flush(&self) -> Result<(), FlushError> {
+        let ticket = self.note_write();
+        self.wait_durable(ticket).await
+    }
+
+    /// Wait until the store fails; `None` if the flusher stops first. The
+    /// node raises its store-failed alert on it.
+    pub(crate) async fn failed(&self) -> Option<DiskFailure> {
+        loop {
+            let notified = self.done.notified();
+            {
+                let st = self.st.lock();
+                if let Some(why) = &st.failure {
+                    return Some(why.clone());
+                }
+                if st.stopped {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Stop at once: waiters are woken with [`FlushError::Stopped`] and no
+    /// flush is begun again. A flush under way finishes on its thread.
+    pub(crate) fn stop(&self) {
+        self.st.lock().stopped = true;
+        self.wake.notify_one();
+        self.done.notify_waiters();
+    }
+}
+
+impl Drop for Flusher {
+    fn drop(&mut self) {
+        self.wake.notify_one();
+    }
+}
+
+// -- Reservation --------------------------------------------------------------
+
+/// What [`Reservation::sign_gate`] says of a seq.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Gate {
+    /// It is covered by a durable reservation: sign.
+    Ok,
+    /// The reservation covering it is written but not durable: wait for
+    /// the ticket ([`Flusher::wait_durable`]), then ask again.
+    Wait(Ticket),
+    /// The store failed, so the reservation never will be durable: refuse
+    /// the put with the disk's reason.
+    Refused(FlushError),
+    /// The reservation was closed: the node takes no more puts.
+    Closed,
+}
+
+/// Where a space's own log resumes after [`Reservation::open`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Resume {
+    /// The seq of the first entry to sign: above the head and above `R`.
+    pub first_seq: u64,
+    /// The own head the resume point was computed from.
+    pub adopted_head: u64,
+    /// Whether the last run closed cleanly with `R` at the head (a clean
+    /// start has no hole and says nothing).
+    pub clean: bool,
+}
+
+impl Resume {
+    /// Whether seqs lie between the adopted head and the first entry: the
+    /// first entry then carries a signed gap statement.
+    pub(crate) fn has_gap(&self) -> bool {
+        self.first_seq != self.adopted_head + 1
+    }
+
+    /// The `PREV_SEQ` of the first entry: the adopted head it chains to,
+    /// when there is a gap (0 with the zero digest if nothing is held).
+    pub(crate) fn prev_seq(&self) -> Option<u64> {
+        self.has_gap().then_some(self.adopted_head)
+    }
+}
+
+/// A reservation opened, and where to resume.
+pub(crate) struct Opened {
+    /// The reservation of the (device, space).
+    pub reservation: Reservation,
+    /// Where the log resumes.
+    pub resume: Resume,
+}
+
+struct ReserveState {
+    /// The `R` written, durable or not.
+    r: u64,
+    /// The `R` a returned flush covered.
+    durable_r: u64,
+    /// The writes of `R` not yet known durable, oldest first (`R` and the
+    /// tickets both ascend).
+    pending: VecDeque<(Ticket, u64)>,
+    closed: bool,
+}
+
+/// The reservation of one (device, space): `R` is the seq up to which the
+/// device may sign once `R` is durable.
+pub(crate) struct Reservation {
+    space: Name,
+    block: u64,
+    /// The store itself, never an open batch of a stage: the flush ticket of
+    /// a write is taken after it returned, and a write kept in a batch has
+    /// not.
+    store: Arc<dyn DataStore>,
+    flusher: Arc<Flusher>,
+    st: Mutex<ReserveState>,
+}
+
+impl Reservation {
+    /// Open the reservation of `space`. `adopted_head` is the own head the
+    /// caller found (from entry names: [`crate::store::own_head_from_names`],
+    /// then recovery from peers), 0 when it holds none.
+    ///
+    /// The start is clean iff the record says so, `R` is the head record's
+    /// seq, and the names show no own entry above it. The first seq is
+    /// `max(adopted_head, R) + 1` either way: above everything a peer can
+    /// have seen. Before anything is signed the next reservation, `R` plus a
+    /// block above that point, is written and a flush requested; the first
+    /// put waits for it only if it arrives before it completes.
+    ///
+    /// An unreadable record is an error: with `R` unknown a seq a peer saw
+    /// could be signed again.
+    pub(crate) fn open(
+        store: Arc<dyn DataStore>,
+        flusher: Arc<Flusher>,
+        space: &Name,
+        block: u64,
+        adopted_head: u64,
+    ) -> Result<Opened, Corrupt> {
+        let reserve = read_reserve(&*store, space)?;
+        let head = read_head(&*store, space)?.map_or(0, |h| h.seq);
+        let recorded = reserve.map_or(0, |r| r.r);
+        let clean = reserve.is_some_and(|r| r.clean && r.r == head) && adopted_head == head;
+        let first_seq = adopted_head.max(recorded) + 1;
+        let reservation = Reservation {
+            space: space.clone(),
+            block,
+            store,
+            flusher,
+            st: Mutex::new(ReserveState {
+                r: recorded,
+                durable_r: recorded,
+                pending: VecDeque::new(),
+                closed: false,
+            }),
+        };
+        {
+            let mut st = reservation.st.lock();
+            let r = recorded.max(first_seq - 1) + block;
+            reservation.write(&mut st, r);
+        }
+        Ok(Opened {
+            reservation,
+            resume: Resume {
+                first_seq,
+                adopted_head,
+                clean,
+            },
+        })
+    }
+
+    /// Write `reserve/<S> = (r, clean 0)` and ask for its flush.
+    fn write(&self, st: &mut ReserveState, r: u64) {
+        let record = ReserveRecord { r, clean: false };
+        self.store.insert(reserve_key(&self.space), record.encode());
+        let ticket = self.flusher.note_write();
+        st.r = r;
+        st.pending.push_back((ticket, r));
+    }
+
+    /// Move to `durable_r` what a returned flush covered.
+    fn promote(&self, st: &mut ReserveState) {
+        let durable = self.flusher.durable();
+        while let Some(&(ticket, r)) = st.pending.front() {
+            if ticket > durable {
+                break;
+            }
+            st.durable_r = st.durable_r.max(r);
+            st.pending.pop_front();
+        }
+    }
+
+    /// The `R` written, durable or not.
+    pub(crate) fn reserved(&self) -> u64 {
+        self.st.lock().r
+    }
+
+    /// The `R` a returned flush covered: no seq above it is signed.
+    pub(crate) fn durable_r(&self) -> u64 {
+        let mut st = self.st.lock();
+        self.promote(&mut st);
+        st.durable_r
+    }
+
+    /// Whether `seq`, the next to sign, may be signed now. Call it before
+    /// signing. When `seq` is above `R - block/2` it writes
+    /// `reserve/<S> = (R + block, clean 0)` (straight to the store) and asks
+    /// the flusher; so the answer for a `seq` that only just came into reach
+    /// is usually [`Gate::Ok`] and the extension is flushed ahead of need.
+    /// Once the store failed nothing is written: what `R_durable` covers is
+    /// still signed, nothing above it.
+    pub(crate) fn sign_gate(&self, seq: u64) -> Gate {
+        let mut st = self.st.lock();
+        if st.closed {
+            return Gate::Closed;
+        }
+        self.promote(&mut st);
+        let failure = self.flusher.failure();
+        if failure.is_none() && seq > st.r.saturating_sub(self.block / 2) {
+            let r = st.r.max(seq) + self.block;
+            self.write(&mut st, r);
+        }
+        if seq <= st.durable_r {
+            return Gate::Ok;
+        }
+        if let Some(why) = failure {
+            return Gate::Refused(FlushError::Disk(why));
+        }
+        match st.pending.iter().find(|(_, r)| *r >= seq) {
+            Some(&(ticket, _)) => Gate::Wait(ticket),
+            // Nothing can be written to reach `seq`: the flusher stopped.
+            None => Gate::Refused(FlushError::Stopped),
+        }
+    }
+
+    /// Wait until `seq` may be signed. The error is the disk's reason (the
+    /// store failed) or that the node stopped.
+    pub(crate) async fn clear_to_sign(&self, seq: u64) -> Result<(), FlushError> {
+        loop {
+            match self.sign_gate(seq) {
+                Gate::Ok => return Ok(()),
+                Gate::Wait(ticket) => self.flusher.wait_durable(ticket).await?,
+                Gate::Refused(why) => return Err(why),
+                Gate::Closed => return Err(FlushError::Stopped),
+            }
+        }
+    }
+
+    /// Close cleanly after the node's publications were drained and flushed:
+    /// refuse further signing, write `reserve/<S> = (head, clean 1)` and wait
+    /// for the flush that makes it durable. The next open resumes at
+    /// `head + 1` with no hole. `head` is the own head seq, the one in
+    /// `head/<S>`.
+    pub(crate) async fn close_clean(&self, head: u64) -> Result<(), FlushError> {
+        let ticket = {
+            let mut st = self.st.lock();
+            st.closed = true;
+            self.store.insert(
+                reserve_key(&self.space),
+                ReserveRecord {
+                    r: head,
+                    clean: true,
+                }
+                .encode(),
+            );
+            self.flusher.note_write()
+        };
+        self.flusher.wait_durable(ticket).await
+    }
+}
+
+// -- The in-order publisher -----------------------------------------------------
+
+/// The sync side of publication: what the node plugs `SyncHandle::publish`
+/// into. Called once per seq, in seq order, one call at a time.
+#[async_trait::async_trait]
+pub(crate) trait FlushSink: Send + Sync {
+    /// Announce that the own entry at `seq` exists.
+    async fn publish(&self, seq: u64);
+}
+
+/// The publications waiting to go out, in seq order: pure state, no I/O.
+#[derive(Default)]
+pub(crate) struct InOrder {
+    /// `(seq, the ticket of the flush it waits for)`.
+    queue: VecDeque<(u64, Option<Ticket>)>,
+}
+
+impl InOrder {
+    /// Queue the publication of `seq`, to go out once a flush covering
+    /// `gate` returned (at once when `None`). Seqs ascend.
+    pub(crate) fn push(&mut self, seq: u64, gate: Option<Ticket>) {
+        debug_assert!(
+            self.queue.back().is_none_or(|(last, _)| *last < seq),
+            "publications are queued in seq order"
+        );
+        self.queue.push_back((seq, gate));
+    }
+
+    /// The seqs now free to go out, oldest first: the run from the front up
+    /// to the first whose flush `durable` does not cover. A held entry holds
+    /// back everything after it.
+    pub(crate) fn release(&mut self, durable: Ticket) -> Vec<u64> {
+        let mut out = Vec::new();
+        while let Some(&(seq, gate)) = self.queue.front() {
+            if gate.is_some_and(|ticket| ticket > durable) {
+                break;
+            }
+            out.push(seq);
+            self.queue.pop_front();
+        }
+        out
+    }
+
+    /// The ticket the front of the queue waits for; `None` when it waits for
+    /// none (or the queue is empty).
+    pub(crate) fn next_gate(&self) -> Option<Ticket> {
+        self.queue.front().and_then(|&(_, gate)| gate)
+    }
+
+    /// Whether nothing waits.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
+
+#[derive(Default)]
+struct PublisherState {
+    queue: InOrder,
+    /// Submitted and not yet handed to the sink.
+    outstanding: usize,
+    /// Why the front can never be released.
+    blocked: Option<FlushError>,
+}
+
+struct PublisherShared {
+    flusher: Arc<Flusher>,
+    st: Mutex<PublisherState>,
+    /// To the driver: something was submitted.
+    wake: Arc<Notify>,
+    /// To [`Publisher::drain`]: a publication went out, or the driver
+    /// stopped.
+    progress: Notify,
+}
+
+/// Publishes every submitted entry once, in seq order, holding an entry that
+/// waits for a flush (and every one after it) until the flush covering it
+/// returned (spec §4, rule 5).
+pub(crate) struct Publisher {
+    shared: Arc<PublisherShared>,
+}
+
+impl Publisher {
+    /// Start the publisher. Its task ends when the publisher is dropped, or
+    /// when the flusher can no longer cover a held entry.
+    pub(crate) fn spawn(flusher: Arc<Flusher>, sink: Arc<dyn FlushSink>) -> Publisher {
+        let wake = Arc::new(Notify::new());
+        let shared = Arc::new(PublisherShared {
+            flusher,
+            st: Mutex::new(PublisherState::default()),
+            wake: Arc::clone(&wake),
+            progress: Notify::new(),
+        });
+        rt::spawn(Self::drive(Arc::downgrade(&shared), wake, sink));
+        Publisher { shared }
+    }
+
+    /// Queue the publication of the own entry at `seq`: at once when `gate`
+    /// is `None`, else once a flush covering the ticket returned. Call it in
+    /// seq order, after the entry is stored.
+    pub(crate) fn submit(&self, seq: u64, gate: Option<Ticket>) {
+        {
+            let mut st = self.shared.st.lock();
+            st.queue.push(seq, gate);
+            st.outstanding += 1;
+        }
+        self.shared.wake.notify_one();
+    }
+
+    /// Wait until everything submitted so far was handed to the sink. The
+    /// error is why a held entry can never be released (the disk failed, or
+    /// the node stopped); what was submitted behind it stays unpublished.
+    pub(crate) async fn drain(&self) -> Result<(), FlushError> {
+        loop {
+            let progress = self.shared.progress.notified();
+            {
+                let st = self.shared.st.lock();
+                if st.outstanding == 0 {
+                    return Ok(());
+                }
+                if let Some(why) = &st.blocked {
+                    return Err(why.clone());
+                }
+            }
+            progress.await;
+        }
+    }
+
+    async fn drive(shared: Weak<PublisherShared>, wake: Arc<Notify>, sink: Arc<dyn FlushSink>) {
+        loop {
+            wake.notified().await;
+            loop {
+                let Some(shared) = shared.upgrade() else {
+                    return;
+                };
+                let (ready, gate) = {
+                    let mut st = shared.st.lock();
+                    let ready = st.queue.release(shared.flusher.durable());
+                    (ready, st.queue.next_gate())
+                };
+                if !ready.is_empty() {
+                    for seq in ready {
+                        sink.publish(seq).await;
+                        shared.st.lock().outstanding -= 1;
+                        shared.progress.notify_waiters();
+                    }
+                    continue;
+                }
+                let Some(ticket) = gate else {
+                    break;
+                };
+                if let Err(why) = shared.flusher.wait_durable(ticket).await {
+                    shared.st.lock().blocked = Some(why);
+                    shared.progress.notify_waiters();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Publisher {
+    fn drop(&mut self) {
+        self.shared.wake.notify_one();
+    }
+}

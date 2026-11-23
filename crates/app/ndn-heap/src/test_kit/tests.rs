@@ -5,6 +5,7 @@ use super::*;
 use crate::store::Stage;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn put(store: &dyn DataStore, name: &str, value: &'static str) {
@@ -82,7 +83,10 @@ fn a_sync_covers_only_the_writes_that_returned_before_it_started() {
         "a write that arrived while a sync was under way is not covered by it"
     );
     store.sync().unwrap();
-    assert!(store.crash().contains(&n("/during")), "the next sync covers it");
+    assert!(
+        store.crash().contains(&n("/during")),
+        "the next sync covers it"
+    );
 }
 
 #[test]
@@ -132,10 +136,7 @@ const ROLE: &str = "NDN_HEAP_KILL_CHILD";
 /// kept together by the stage as one apply.
 fn write_batch(stage: &Stage, k: u64) {
     let _batch = stage.batch();
-    stage.insert(
-        n(&format!("/e/{k}")),
-        Bytes::from(k.to_be_bytes().to_vec()),
-    );
+    stage.insert(n(&format!("/e/{k}")), Bytes::from(k.to_be_bytes().to_vec()));
     stage.insert(n("/head"), Bytes::from(k.to_be_bytes().to_vec()));
 }
 
