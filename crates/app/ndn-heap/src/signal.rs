@@ -13,9 +13,9 @@
 //!   anything is verified;
 //! - [`signal_admit`]: admit another device's run header, or say why not
 //!   ([`SignalRefusal`]);
-//! - [`signal_member`]: whether a key is a member of the space now, asked for
-//!   every packet;
-//! - [`signal_revocations`]: a count that moves when a trust context revoking
+//! - [`Node::signal_member`]: whether a key is a member of the space now, asked
+//!   for every packet;
+//! - [`Node::revocations`]: a count that moves when a trust context revoking
 //!   keys is adopted, so the chains of the runs admitted are walked again.
 //!
 //! A **member** of a space, for signals, is a key of a device whose person
@@ -294,21 +294,9 @@ fn standing_by(log: &Log, judge: &Judge, key: &Name, reads: bool) -> Result<Name
     }
 }
 
-/// Whether `key` is a member of `scope` now (spec §11): a key of a device of a
-/// person the fold of the held Members entries lists as a writer, which the
-/// trust context governing it does not revoke. Synchronous and offline: the
-/// check of every signal packet, exact by what is held at the call.
+/// [`Node::signal_member`] over one space.
 pub(crate) fn signal_member(log: &Log, judge: &Judge, scope: &Name, key: &Name) -> bool {
     scope == log.space() && member_by(log, judge, key).is_ok()
-}
-
-/// A count that moves whenever a trust context revoking keys is adopted here —
-/// the node's own, or a view adopted for a person (spec §9) replaced by a
-/// version that refuses more (spec §11). A transport that admitted run headers
-/// when it read one count and reads another now walks their chains again: a
-/// revoked issuer ends the runs it certified.
-pub(crate) fn signal_revocations(judge: &Judge) -> u64 {
-    judge.generation()
 }
 
 /// This device may use signals over the space: its creation is held and this
@@ -337,20 +325,7 @@ fn own_gate(log: &Log, judge: &Judge, reads: bool) -> Result<(), HeapError> {
 
 // -- The scope and the header ------------------------------------------------------------
 
-/// What this device may do with signals over the space `log` holds, by the
-/// entries held now (spec §11): its signal keys when the space is sealed, the
-/// sync group to push into and listen on. A writer or a reader gets it (a
-/// reader of a sealed space holds the epoch key and must be able to receive);
-/// only a writer may send ([`signal_header`]) or be admitted ([`signal_member`],
-/// [`signal_sender`], [`signal_admit`]).
-///
-/// [`HeapError::NotReady`] when the space's creation is not held here yet, or,
-/// sealed, the key of its epoch in force is not held yet (it arrives as a
-/// grant: ask again). [`HeapError::NotAllowed`] when this device is neither a
-/// writer nor a reader of the space by those entries, or the trust context
-/// governing its key revokes it. [`HeapError::Sealed`] when it is in the
-/// sealed space's audience by neither the epoch nor the owner, which may not
-/// hold its key.
+/// [`Node::signal_scope`] over the space `log` holds.
 pub(crate) fn signal_scope(log: &Log, judge: &Judge) -> Result<SignalScope, HeapError> {
     own_gate(log, judge, true)?;
     let space = log.space();
@@ -412,11 +387,7 @@ fn sealed_keys(log: &Log) -> Result<Vec<SignalKey>, HeapError> {
     Ok(keys)
 }
 
-/// Sign a signal run header (spec §11): Data
-/// `<device>/32=signal/<scope>/32=run/<run>`, its Content `body`, signed by
-/// this device's key `signer`, with no freshness period. Refused as
-/// [`signal_scope`] refuses, except that a sealed space's key need not be held
-/// to sign one. Nothing is stored or served.
+/// [`Node::signal_header`] over one space, signed by `signer`.
 pub(crate) fn signal_header(
     log: &Log,
     judge: &Judge,
@@ -443,14 +414,7 @@ pub(crate) fn signal_header(
 
 // -- Run headers -------------------------------------------------------------------------
 
-/// The signer of another device's signal run header for `scope`, if it is a
-/// member, before anything about it is verified (spec §11): its name is
-/// `<device>/32=signal/<scope>/32=run/<16 octets>`, `device` the device of the
-/// key its KeyLocator names (`Malformed` otherwise); the creation of the space
-/// is held (`NotReady` otherwise); and that key is a member by the entries held
-/// now (`NotMember` otherwise; `BadSignature` for a key the trust context
-/// governing it revokes). Synchronous and offline: a transport asks it before
-/// it spends anything on the header. Nothing is verified.
+/// [`Node::signal_sender`] over one space.
 pub(crate) fn signal_sender(
     log: &Log,
     judge: &Judge,
@@ -509,18 +473,8 @@ pub(crate) fn signal_sender(
     }
 }
 
-/// Admit another device's signal run header for `scope` (spec §11): its signer
-/// is a member ([`signal_sender`], asked first, so a stranger's header costs
-/// nothing more), and it verifies by the validator that judges the signer's
-/// person (the node's own, or the view adopted for her) by the **live** rule:
-/// its certificates valid now, a revoked key refused. The chain is walked from
-/// the certificates held first; one not held is fetched only while fewer than
-/// 2 headers of the signer's person wait for certificates, and not for a
-/// device whose last fetch brought none within 30 s (`Unverified` otherwise:
-/// ask again when the header rides again). Its signer is a member still once
-/// it verified. The header is not kept, served nor counted.
-///
-/// `log` is locked only to read, never across a fetch.
+/// [`Node::signal_admit`] over one space: `log` is locked only to read, never
+/// across a fetch.
 pub(crate) async fn signal_admit(
     gate: &SignalGate,
     log: &Mutex<Log>,
@@ -703,25 +657,31 @@ impl Node {
     }
 
     /// What this node may do with signals over `space`, by the entries it
-    /// holds (spec §11): its signal keys when the space is sealed, and the
-    /// sync group to push into and listen on. A writer or a reader gets it.
+    /// holds (spec §11): its signal keys when the space is sealed, the sync
+    /// group to push into and the one to listen on. A writer or a reader gets
+    /// it (a reader of a sealed space holds the epoch key and must be able to
+    /// receive); only a writer may send ([`Self::signal_header`]) or be
+    /// admitted ([`Self::signal_member`], [`Self::signal_sender`],
+    /// [`Self::signal_admit`]).
     ///
     /// [`HeapError::NotReady`] when the space is not open here or its creation
     /// is not held yet (retry), or, sealed, the key of its epoch in force has
-    /// not arrived. [`HeapError::NotAllowed`] when this device is neither a
-    /// writer nor a reader of the space, or its key is revoked.
-    /// [`HeapError::Sealed`] when it is outside the sealed space's audience.
+    /// not arrived (it comes as a grant: ask again). [`HeapError::NotAllowed`]
+    /// when this device is neither a writer nor a reader of the space, or the
+    /// trust context governing its key revokes it. [`HeapError::Sealed`] when
+    /// it is in the sealed space's audience by neither the epoch nor the
+    /// owner, which may not hold its key.
     pub fn signal_scope(&self, space: &Name) -> Result<SignalScope, HeapError> {
         let held = self.signal_space(space).ok_or_else(|| not_open(space))?;
         let log = held.log.lock();
         signal_scope(&log, &self.inner.judge)
     }
 
-    /// Sign a signal run header for `scope`: Data
-    /// `<device>/32=signal/<scope>/32=run/<run_id>` with Content `body`, signed
-    /// by this device's key. Only a writer sends; refused as
-    /// [`Self::signal_scope`] refuses, except that a sealed space's key need
-    /// not be held. Nothing is stored or served.
+    /// Sign a signal run header for `scope` (spec §11): Data
+    /// `<device>/32=signal/<scope>/32=run/<run_id>` with Content `body`,
+    /// signed by this device's key, with no freshness period. Only a writer
+    /// sends; refused as [`Self::signal_scope`] refuses, except that a sealed
+    /// space's key need not be held. Nothing is stored or served.
     pub fn signal_header(
         &self,
         scope: &Name,
@@ -741,8 +701,13 @@ impl Node {
     }
 
     /// The signer of another device's run header for `scope`, if it is a
-    /// member (a writer), before anything about it is verified. Synchronous
-    /// and offline.
+    /// member, before anything about it is verified (spec §11): its name is
+    /// `<device>/32=signal/<scope>/32=run/<16 octets>`, `device` the device of
+    /// the key its KeyLocator names (`Malformed` otherwise); the creation of
+    /// the space is held (`NotReady` otherwise); and that key is a member by
+    /// the entries held now (`NotMember` otherwise; `BadSignature` for a key
+    /// the trust context governing it revokes). Synchronous and offline: a
+    /// transport asks it before it spends anything on the header.
     pub fn signal_sender(&self, scope: &Name, data: &Data) -> Result<SignalSender, SignalRefusal> {
         let held = self
             .signal_space(scope)
@@ -751,10 +716,17 @@ impl Node {
         signal_sender(&log, &self.inner.judge, scope, data)
     }
 
-    /// Admit another device's run header for `scope`: its signer is a member
-    /// ([`Self::signal_sender`]) and it verifies by the live rule, fetching
-    /// the certificates of its chain within the signer's person's budget (2
-    /// waiting at a time, a 30 s back-off per device). The header is not kept.
+    /// Admit another device's run header for `scope` (spec §11): its signer
+    /// is a member ([`Self::signal_sender`], asked first, so a stranger's
+    /// header costs nothing more), and it verifies by the validator that
+    /// judges the signer's person (the node's own, or the view adopted for
+    /// her) by the **live** rule: its certificates valid now, a revoked key
+    /// refused. The chain is walked from the certificates held first; one not
+    /// held is fetched only while fewer than 2 headers of the signer's person
+    /// wait for certificates, and not for a device whose last fetch brought
+    /// none within 30 s (`Unverified` otherwise: ask again when the header
+    /// rides again). Its signer is a member still once it verified. The
+    /// header is not kept, served nor counted.
     pub async fn signal_admit(
         &self,
         scope: &Name,
@@ -773,20 +745,24 @@ impl Node {
         .await
     }
 
-    /// Whether `key` is a member (a writer's key, not revoked) of `scope` now,
-    /// by the entries held: asked for every signal packet. A space not open
-    /// here has no members.
+    /// Whether `key` is a member of `scope` now (spec §11): a key of a device
+    /// of a person the fold of the held Members entries lists as a writer
+    /// (the owner always is), which the trust context governing it does not
+    /// revoke. Synchronous and offline: the check of every signal packet,
+    /// exact by what is held at the call. A space not open here has no
+    /// members.
     pub fn signal_member(&self, scope: &Name, key: &Name) -> bool {
         self.signal_space(scope)
             .is_some_and(|held| signal_member(&held.log.lock(), &self.inner.judge, scope, key))
     }
 
     /// A count that moves whenever a trust context revoking keys is adopted
-    /// here, the node's own or a view adopted for a person: a transport that
-    /// admitted run headers under one count walks their chains again under
-    /// another.
+    /// here — the node's own, or a view adopted for a person (spec §9)
+    /// replaced by a version that refuses more (spec §11). A transport that
+    /// admitted run headers when it read one count and reads another now
+    /// walks their chains again: a revoked issuer ends the runs it certified.
     pub fn revocations(&self) -> u64 {
-        signal_revocations(&self.inner.judge)
+        self.inner.judge.generation()
     }
 }
 

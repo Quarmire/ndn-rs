@@ -451,13 +451,13 @@ async fn a_revoked_key_is_no_member_once_its_revocation_is_held() {
     let world = World::new().await;
     let (alice, _) = bob_may_write(&world).await;
     let bob = key_of("/bob/phone");
-    let before = signal_revocations(&alice.judge);
+    let before = alice.judge.generation();
     assert!(alice.member(&bob));
 
     world.revoke("/bob", 2, &bob);
     assert!(!alice.member(&bob));
     assert!(alice.member(&key_of("/bob/tablet")), "only that key");
-    assert_ne!(signal_revocations(&alice.judge), before);
+    assert_ne!(alice.judge.generation(), before);
 }
 
 /// A device that is no member (removed, revoked, never listed) uses no
