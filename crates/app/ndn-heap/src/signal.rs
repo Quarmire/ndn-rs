@@ -1,32 +1,20 @@
 //! The signal gate for ndn-surface (spec §11).
 //!
-//! A signal is ephemeral live data — presence, cursors, a drag — pushed to
-//! the members of a space and never an entry: nothing of it is stored, served
-//! or counted here. The signal transport (`ndn_surface::signal`) asks the
-//! node six things, and nothing else leaves this module:
+//! A signal is ephemeral live data — presence, cursors, a drag — pushed to the
+//! members of a space and never an entry: nothing of it is stored, served or
+//! counted here. The signal transport (`ndn_surface::signal`) asks the node
+//! six things ([`Node::signal_scope`], [`Node::signal_header`],
+//! [`Node::signal_sender`], [`Node::signal_admit`], [`Node::signal_member`],
+//! [`Node::revocations`]) and nothing else leaves this module.
 //!
-//! - [`signal_scope`]: what this device may do with signals over the space —
-//!   its signal keys when it is sealed, the sync group to push into and the
-//!   one to listen on;
-//! - [`signal_header`]: sign a run header with the device key;
-//! - [`signal_sender`]: a run header's signer if it is a member, before
-//!   anything is verified;
-//! - [`signal_admit`]: admit another device's run header, or say why not
-//!   ([`SignalRefusal`]);
-//! - [`Node::signal_member`]: whether a key is a member of the space now, asked
-//!   for every packet;
-//! - [`Node::revocations`]: a count that moves when a trust context revoking
-//!   keys is adopted, so the chains of the runs admitted are walked again.
+//! A **member** of a space, for signals, is a key of a device whose person the
+//! operation fold lists as a writer (the owner always is) and which the trust
+//! context governing that key does not revoke. The answer is read from what is
+//! held at the call, so it flips on the first call after the entry that
+//! removes a person, or the context that revokes a key, is held.
 //!
-//! A **member** of a space, for signals, is a key of a device whose person
-//! the operation fold lists as a writer (the owner always is) and which the
-//! trust context governing that key does not revoke. The answer is read from
-//! what is held at the call: the fold of the Members entries the log holds and
-//! the contexts the judge holds, so it flips on the first call after the
-//! entry that removes a person, or the context that revokes a key, is held.
-//!
-//! These are free functions over one space's [`Log`] and the node's [`Judge`]
-//! (the node wraps them as `Node::signal_*`): none holds a lock across an
+//! The logic is free functions over one space's [`Log`] and the node's
+//! [`Judge`], wrapped by the `Node` methods: none holds a lock across an
 //! `.await`, and none writes.
 
 use std::collections::HashMap;
@@ -70,13 +58,12 @@ pub const KEY_ID_LEN: usize = 8;
 /// The octets of a signal run's id: a run header's last name component.
 pub const RUN_ID_LEN: usize = wire::RUN_ID_LEN;
 
-/// Run headers of one sender namespace that may wait for certificates at once
-/// (spec §11).
-pub const SIGNAL_FETCHES_PER_NAMESPACE: usize = 2;
+/// Run headers of one sender namespace that may wait for certificates at once.
+const SIGNAL_FETCHES_PER_NAMESPACE: usize = 2;
 
 /// How long no certificate is fetched for a device's run headers again once a
-/// fetch for one of them brought none (spec §11).
-pub const SIGNAL_FETCH_BACKOFF: Duration = Duration::from_secs(30);
+/// fetch for one of them brought none.
+const SIGNAL_FETCH_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Certificates fetched for one run header at most: one chain.
 const SIGNAL_CHAIN_FETCHES: usize = 4;
@@ -256,47 +243,38 @@ pub enum SignalRefusal {
 
 // -- Membership --------------------------------------------------------------------------
 
-/// Why a key is no member of a space for signals.
-enum NotMember {
-    /// No standing writer person owns it: its device's person is unknown here
-    /// or not listed (or removed).
-    Unlisted,
-    /// The trust context governing it revokes it.
-    Revoked,
-}
-
-/// The person `key` belongs to, if the fold lists that person as a writer and
-/// the trust context governing the key does not revoke it: who may send.
-fn member_by(log: &Log, judge: &Judge, key: &Name) -> Result<Name, NotMember> {
-    standing_by(log, judge, key, false)
-}
-
 /// The person `key` belongs to, if the fold lists that person as a writer or,
 /// when `reads`, as a reader (everybody reads a public space), and the trust
-/// context governing the key does not revoke it. The context is the one `judge`
-/// judges the key's packets about the space by (spec §11): the node's own for a
-/// person it holds, else the view adopted for the person while a listing of the
-/// space names her as a writer or a reader.
-fn standing_by(log: &Log, judge: &Judge, key: &Name, reads: bool) -> Result<Name, NotMember> {
+/// context governing the key does not revoke it; else the refusal: `NotMember`
+/// (no standing person owns the key) or `BadSignature` (the context revokes
+/// it). The context is the one `judge` judges the key's packets about the space
+/// by (spec §11): the node's own for a person it holds, else the view adopted
+/// for the person while a listing of the space names her as a writer or a
+/// reader.
+fn standing(log: &Log, judge: &Judge, key: &Name, reads: bool) -> Result<Name, SignalRefusal> {
+    let not_member = || SignalRefusal::NotMember {
+        scope: log.space().clone(),
+        key: key.clone(),
+    };
     if device_of(key).is_none() {
-        return Err(NotMember::Unlisted);
+        return Err(not_member());
     }
     let view = judge.view_for(key, log.space(), true);
     let context = view.keyring().context_for(key);
     let person = context.namespace();
     let fold = log.fold();
     if person.is_empty() || !(fold.is_writer(person) || (reads && fold.is_reader(person))) {
-        return Err(NotMember::Unlisted);
+        return Err(not_member());
     }
     match context.is_revoked(key) {
-        true => Err(NotMember::Revoked),
+        true => Err(SignalRefusal::BadSignature { key: key.clone() }),
         false => Ok(person.clone()),
     }
 }
 
 /// [`Node::signal_member`] over one space.
 pub(crate) fn signal_member(log: &Log, judge: &Judge, scope: &Name, key: &Name) -> bool {
-    scope == log.space() && member_by(log, judge, key).is_ok()
+    scope == log.space() && standing(log, judge, key, false).is_ok()
 }
 
 /// This device may use signals over the space: its creation is held and this
@@ -308,13 +286,13 @@ fn own_gate(log: &Log, judge: &Judge, reads: bool) -> Result<(), HeapError> {
             why: NO_RECORD.into(),
         });
     }
-    let why = match standing_by(log, judge, log.key(), reads) {
+    let why = match standing(log, judge, log.key(), reads) {
         Ok(_) => return Ok(()),
-        Err(NotMember::Unlisted) if reads => {
-            "this device is neither a writer nor a reader of it by the entries held"
+        Err(SignalRefusal::BadSignature { .. }) => {
+            "the trust context governing this device's key revokes it"
         }
-        Err(NotMember::Unlisted) => "this device is no writer of it by the entries held",
-        Err(NotMember::Revoked) => "the trust context governing this device's key revokes it",
+        Err(_) if reads => "this device is neither a writer nor a reader of it by the entries held",
+        Err(_) => "this device is no writer of it by the entries held",
     };
     tracing::debug!(space = %log.space(), key = %log.key(), "signals refused: {why}");
     Err(HeapError::NotAllowed {
@@ -374,16 +352,14 @@ fn sealed_keys(log: &Log) -> Result<Vec<SignalKey>, HeapError> {
             ),
         });
     };
-    let mut others: Vec<SignalKey> = fold
+    let mut keys: Vec<SignalKey> = fold
         .epochs()
         .into_iter()
         .filter(|e| *e != epoch)
         .filter_map(|e| Some(SignalKey::derive(log.keys().key(space, &e)?, space, &e)))
         .collect();
-    others.sort_by(|a, b| (b.epoch.seq, &b.epoch.creator).cmp(&(a.epoch.seq, &a.epoch.creator)));
-    let mut keys = Vec::with_capacity(1 + others.len());
-    keys.push(SignalKey::derive(content, space, &epoch));
-    keys.extend(others);
+    keys.sort_by(|a, b| (b.epoch.seq, &b.epoch.creator).cmp(&(a.epoch.seq, &a.epoch.creator)));
+    keys.insert(0, SignalKey::derive(content, space, &epoch));
     Ok(keys)
 }
 
@@ -459,18 +435,11 @@ pub(crate) fn signal_sender(
             why: NO_RECORD.into(),
         });
     }
-    match member_by(log, judge, &key) {
-        Ok(person) => Ok(SignalSender {
-            namespace: person,
-            device: run.device,
-            key,
-        }),
-        Err(NotMember::Unlisted) => Err(SignalRefusal::NotMember {
-            scope: scope.clone(),
-            key,
-        }),
-        Err(NotMember::Revoked) => Err(SignalRefusal::BadSignature { key }),
-    }
+    Ok(SignalSender {
+        namespace: standing(log, judge, &key, false)?,
+        device: run.device,
+        key,
+    })
 }
 
 /// [`Node::signal_admit`] over one space: `log` is locked only to read, never
@@ -486,14 +455,8 @@ pub(crate) async fn signal_admit(
     let view = judge.view_for(&header.name, scope, true);
     gate.verify(&view, &sender, header).await?;
     // A revocation or a removal held while the chain was fetched.
-    match member_by(&log.lock(), judge, &sender.key) {
-        Ok(_) => Ok(sender),
-        Err(NotMember::Unlisted) => Err(SignalRefusal::NotMember {
-            scope: scope.clone(),
-            key: sender.key,
-        }),
-        Err(NotMember::Revoked) => Err(SignalRefusal::BadSignature { key: sender.key }),
-    }
+    standing(&log.lock(), judge, &sender.key, false)?;
+    Ok(sender)
 }
 
 // -- The certificate fetch budget --------------------------------------------------------
@@ -599,21 +562,17 @@ impl SignalGate {
         };
         let mut slot = None;
         for _ in 0..=SIGNAL_CHAIN_FETCHES {
-            let (result, missing) = view.validate_chain_cached(header).await;
-            let missing = match result {
-                ValidationResult::Valid(safe)
+            let missing = match view.validate_chain_cached(header).await {
+                (ValidationResult::Valid(safe), _)
                     if !matches!(safe.trust_path(), TrustPath::DigestSha256) =>
                 {
                     return Ok(());
                 }
-                ValidationResult::Pending => missing,
-                other => {
+                (ValidationResult::Pending, Some(missing)) => missing,
+                (other, _) => {
                     tracing::debug!(name = %header.name, %key, "signal run header refused: {other:?}");
                     return Err(SignalRefusal::BadSignature { key: key.clone() });
                 }
-            };
-            let Some(missing) = missing else {
-                return Err(SignalRefusal::BadSignature { key: key.clone() });
             };
             let Some(fetcher) = view.cert_fetcher() else {
                 return Err(unverified(format!(
