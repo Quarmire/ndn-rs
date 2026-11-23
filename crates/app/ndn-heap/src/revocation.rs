@@ -45,7 +45,7 @@ use crate::error::{HeapError, Timestamp};
 use crate::log::{Log, Standing};
 use crate::store::Kind;
 use crate::trust::Judge;
-use crate::wire::{device_of, implicit_digest, log_name};
+use crate::wire::{device_of, implicit_digest, log_name, log_prefix};
 
 /// What bounds the revocation cut a node vouches for (`propose`): its own
 /// observation, never anything the revoked key signed. At least one is given.
@@ -107,12 +107,6 @@ fn key_of(name: &Name) -> Result<Name, HeapError> {
         )));
     }
     Ok(key)
-}
-
-/// `<D>/32=log/<S>`: what every entry name of the device in the space extends.
-fn log_prefix(device: &Name, space: &Name) -> Name {
-    let entry = log_name(device, space, 0);
-    Name::from_components(entry.components()[..entry.len() - 1].iter().cloned())
 }
 
 /// The key a held packet names as its signer; `None` for a packet that does

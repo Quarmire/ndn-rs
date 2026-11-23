@@ -42,7 +42,7 @@ use tokio::sync::mpsc;
 use crate::error::{Cut, Refusal, Timestamp};
 use crate::rt::{self, Instant};
 use crate::store::Kind;
-use crate::wire::{device_of, log_name};
+use crate::wire::{device_of, log_prefix};
 
 /// The first pause before a person the host could not adopt is asked again;
 /// it doubles on each refusal, up to [`SCOPE_PAUSE_MAX`].
@@ -996,13 +996,6 @@ impl Judge {
 }
 
 // ---- the verdicts of the durable rule ----------------------------------------------------------
-
-/// The prefix a revocation cut's range names for `device`'s log of `space`:
-/// an entry's name without its seq.
-fn log_prefix(device: &Name, space: &Name) -> Name {
-    let entry = log_name(device, space, 0);
-    Name::from_components(entry.components()[..entry.len() - 1].iter().cloned())
-}
 
 /// What `ctx`'s revocation of `key` keeps of `device`'s log of `space`: the
 /// highest seq its cut accepts there. A revocation with no cut for that log

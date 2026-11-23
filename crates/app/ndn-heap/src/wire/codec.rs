@@ -16,8 +16,8 @@ use ndn_tlv::TlvWriter;
 use super::names::{is_device_name, is_namespace};
 use super::pieces::{FANOUT, PAYLOAD_MAX};
 use super::prim::{
-    WireError, each, once, only, read_array, read_digest, read_epoch_id, read_name, read_nni,
-    write_epoch_id, write_name, write_nni,
+    WireError, each, fields, once, only, read_array, read_digest, read_epoch_id, read_name,
+    read_nni, write_epoch_id, write_name, write_nni,
 };
 use super::tlv;
 use super::types::{
@@ -129,22 +129,18 @@ impl Entry {
         let mut after = Vec::new();
         let (mut path, mut inline, mut blob) = (None, None, None);
         let (mut sealed, mut members, mut epoch) = (None, None, None);
-        each(value, |t, v| {
-            match t {
-                tlv::KIND => once(&mut kind, read_nni(&v)?, "KIND")?,
-                tlv::PREV => once(&mut prev, read_digest(&v)?, "PREV")?,
-                tlv::PREV_SEQ => once(&mut prev_seq, read_nni(&v)?, "PREV_SEQ")?,
-                tlv::ENTRY_REF => after.push(read_ref(v)?),
-                tlv::PATH => once(&mut path, read_name(v)?, "PATH")?,
-                tlv::INLINE => once(&mut inline, v, "INLINE")?,
-                tlv::BLOB => once(&mut blob, read_blob(v)?, "BLOB")?,
-                tlv::SEALED => once(&mut sealed, read_sealed(v)?, "SEALED")?,
-                tlv::MEMBERS => once(&mut members, read_members(v)?, "MEMBERS")?,
-                tlv::EPOCH_BODY => once(&mut epoch, read_epoch_body(v)?, "EPOCH_BODY")?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        })?;
+        fields!(value, |v| {
+            tlv::KIND => once(&mut kind, read_nni(&v)?, "KIND")?,
+            tlv::PREV => once(&mut prev, read_digest(&v)?, "PREV")?,
+            tlv::PREV_SEQ => once(&mut prev_seq, read_nni(&v)?, "PREV_SEQ")?,
+            tlv::ENTRY_REF => after.push(read_ref(v)?),
+            tlv::PATH => once(&mut path, read_name(v)?, "PATH")?,
+            tlv::INLINE => once(&mut inline, v, "INLINE")?,
+            tlv::BLOB => once(&mut blob, read_blob(v)?, "BLOB")?,
+            tlv::SEALED => once(&mut sealed, read_sealed(v)?, "SEALED")?,
+            tlv::MEMBERS => once(&mut members, read_members(v)?, "MEMBERS")?,
+            tlv::EPOCH_BODY => once(&mut epoch, read_epoch_body(v)?, "EPOCH_BODY")?,
+        });
 
         let plain = path.is_some() || inline.is_some() || blob.is_some();
         let named = [plain, sealed.is_some(), members.is_some(), epoch.is_some()];
@@ -176,16 +172,11 @@ impl Entry {
                 body: body_what,
             });
         }
-        let prev = match (prev, prev_seq) {
-            (Some(digest), seq) => Some(Prev { digest, seq }),
-            (None, None) => None,
-            (None, Some(_)) => {
-                return Err(WireError::Malformed(
-                    "PREV_SEQ without PREV states a gap from nothing; discard the entry",
-                ));
-            }
+        let entry = Entry {
+            prev: link(prev, prev_seq)?,
+            after,
+            body,
         };
-        let entry = Entry { prev, after, body };
         entry.validate()?;
         Ok(entry)
     }
@@ -208,22 +199,13 @@ impl Entry {
             Ok(true)
         })
         .ok()?;
-        let prev = match (prev, prev_seq) {
-            (Some(digest), seq) => Some(Prev { digest, seq }),
-            (None, None) => None,
-            (None, Some(_)) => return None,
-        };
-        let consistent = prev
-            .as_ref()
-            .is_none_or(|p| (p.digest == ZERO_DIGEST) == (p.seq == Some(0)));
-        consistent.then_some(prev)
+        let prev = link(prev, prev_seq).ok()?;
+        prev.as_ref().is_none_or(Prev::consistent).then_some(prev)
     }
 
     /// The limits of the format, held when writing and when reading.
     fn validate(&self) -> Result<(), WireError> {
-        if let Some(prev) = &self.prev
-            && (prev.digest == ZERO_DIGEST) != (prev.seq == Some(0))
-        {
+        if self.prev.as_ref().is_some_and(|p| !p.consistent()) {
             return Err(WireError::Malformed(
                 "PREV is 32 zero octets exactly when PREV_SEQ is 0 (the signed statement that \
                  the device lost everything before); anything else is no chain link",
@@ -240,7 +222,9 @@ impl Entry {
                  replaces; a members entry carries none",
             ));
         }
-        self.after.iter().try_for_each(check_ref)?;
+        self.after
+            .iter()
+            .try_for_each(|r| check_device(&r.device))?;
         match &self.body {
             Body::Put(put) => check_put(put)?,
             Body::Sealed(sealed) => {
@@ -258,12 +242,28 @@ impl Entry {
             }
             Body::Epoch(epoch) => {
                 too_many(epoch.audience.len(), AUDIENCE_MAX, "an epoch's audience")?;
-                for person in &epoch.audience {
-                    check_person(person)?;
-                }
+                epoch.audience.iter().try_for_each(check_person)?;
             }
         }
         Ok(())
+    }
+}
+
+/// The chain link `PREV` and `PREV_SEQ` state together.
+fn link(digest: Option<[u8; 32]>, seq: Option<u64>) -> Result<Option<Prev>, WireError> {
+    match (digest, seq) {
+        (Some(digest), seq) => Ok(Some(Prev { digest, seq })),
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(WireError::Malformed(
+            "PREV_SEQ without PREV states a gap from nothing; discard the entry",
+        )),
+    }
+}
+
+impl Prev {
+    /// `PREV` is 32 zero octets exactly when `PREV_SEQ` is 0.
+    fn consistent(&self) -> bool {
+        (self.digest == ZERO_DIGEST) == (self.seq == Some(0))
     }
 }
 
@@ -300,10 +300,6 @@ fn check_person(person: &Name) -> Result<(), WireError> {
     Ok(())
 }
 
-fn check_ref(r: &EntryRef) -> Result<(), WireError> {
-    check_device(&r.device)
-}
-
 fn check_op(op: &Op) -> Result<(), WireError> {
     match op {
         Op::Add { who, epoch, .. } => {
@@ -312,7 +308,7 @@ fn check_op(op: &Op) -> Result<(), WireError> {
         }
         Op::Remove { tips, .. } => {
             too_many(tips.len(), TIPS_MAX, "a removal's tips")?;
-            tips.iter().try_for_each(check_ref)
+            tips.iter().try_for_each(|r| check_device(&r.device))
         }
     }
 }
@@ -418,15 +414,11 @@ pub(crate) fn encode_sealed_plain(put: &PutBody) -> Result<Bytes, WireError> {
 pub(crate) fn decode_sealed_plain(plain: &[u8]) -> Result<PutBody, WireError> {
     too_large(plain.len(), ENTRY_MAX, "a sealed plaintext")?;
     let (mut path, mut inline, mut blob) = (None, None, None);
-    each(Bytes::copy_from_slice(plain), |t, v| {
-        match t {
-            tlv::PATH => once(&mut path, read_name(v)?, "PATH")?,
-            tlv::INLINE => once(&mut inline, v, "INLINE")?,
-            tlv::BLOB => once(&mut blob, read_blob(v)?, "BLOB")?,
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
+    fields!(Bytes::copy_from_slice(plain), |v| {
+        tlv::PATH => once(&mut path, read_name(v)?, "PATH")?,
+        tlv::INLINE => once(&mut inline, v, "INLINE")?,
+        tlv::BLOB => once(&mut blob, read_blob(v)?, "BLOB")?,
+    });
     let put = put_of(path, inline, blob)?;
     check_put(&put)?;
     Ok(put)
@@ -442,25 +434,21 @@ pub(crate) fn write_ref(w: &mut TlvWriter, r: &EntryRef) {
 
 pub(crate) fn read_ref(value: Bytes) -> Result<EntryRef, WireError> {
     let (mut device, mut seq, mut digest) = (None, None, None);
-    each(value, |t, v| {
-        match t {
-            tlv_type::NAME => once(&mut device, read_name(v)?, "an entry reference's device")?,
-            tlv::SEQ => once(&mut seq, read_nni(&v)?, "an entry reference's seq")?,
-            tlv::DIGEST => once(&mut digest, read_digest(&v)?, "an entry reference's digest")?,
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
-    match (device, seq, digest) {
-        (Some(device), Some(seq), Some(digest)) => Ok(EntryRef {
-            device,
-            seq,
-            digest,
-        }),
-        _ => Err(WireError::Missing(
+    fields!(value, |v| {
+        tlv_type::NAME => once(&mut device, read_name(v)?, "an entry reference's device")?,
+        tlv::SEQ => once(&mut seq, read_nni(&v)?, "an entry reference's seq")?,
+        tlv::DIGEST => once(&mut digest, read_digest(&v)?, "an entry reference's digest")?,
+    });
+    let (Some(device), Some(seq), Some(digest)) = (device, seq, digest) else {
+        return Err(WireError::Missing(
             "a device, a seq or a digest of an entry reference",
-        )),
-    }
+        ));
+    };
+    Ok(EntryRef {
+        device,
+        seq,
+        digest,
+    })
 }
 
 fn write_op(w: &mut TlvWriter, op: &Op) {
@@ -489,27 +477,23 @@ fn write_op(w: &mut TlvWriter, op: &Op) {
 
 fn read_add(value: Bytes) -> Result<Op, WireError> {
     let (mut id, mut who, mut role, mut epoch) = (None, None, None, None);
-    each(value, |t, v| {
-        match t {
-            tlv::ID => once(&mut id, read_array::<16>(&v, "an id is 16 octets")?, "ID")?,
-            tlv_type::NAME => once(&mut who, read_name(v)?, "an addition's person")?,
-            tlv::ROLE => once(&mut role, read_role(&v)?, "ROLE")?,
-            tlv::EPOCH_ID => once(&mut epoch, read_epoch_id(v)?, "an addition's epoch")?,
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
-    match (id, who, role) {
-        (Some(id), Some(who), Some(role)) => Ok(Op::Add {
-            id,
-            who,
-            role,
-            epoch,
-        }),
-        _ => Err(WireError::Missing(
+    fields!(value, |v| {
+        tlv::ID => once(&mut id, read_array::<16>(&v, "an id is 16 octets")?, "ID")?,
+        tlv_type::NAME => once(&mut who, read_name(v)?, "an addition's person")?,
+        tlv::ROLE => once(&mut role, read_role(&v)?, "ROLE")?,
+        tlv::EPOCH_ID => once(&mut epoch, read_epoch_id(v)?, "an addition's epoch")?,
+    });
+    let (Some(id), Some(who), Some(role)) = (id, who, role) else {
+        return Err(WireError::Missing(
             "an ID, a person or a ROLE of an addition",
-        )),
-    }
+        ));
+    };
+    Ok(Op::Add {
+        id,
+        who,
+        role,
+        epoch,
+    })
 }
 
 fn read_role(v: &[u8]) -> Result<Role, WireError> {
@@ -520,17 +504,21 @@ fn read_role(v: &[u8]) -> Result<Role, WireError> {
     }
 }
 
+fn read_flag(v: &[u8]) -> Result<bool, WireError> {
+    match read_nni(v)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(WireError::Malformed("ANYONE is 0 or 1")),
+    }
+}
+
 fn read_remove(value: Bytes) -> Result<Op, WireError> {
     let mut id = None;
     let mut tips = Vec::new();
-    each(value, |t, v| {
-        match t {
-            tlv::ID => once(&mut id, read_array::<16>(&v, "an id is 16 octets")?, "ID")?,
-            tlv::ENTRY_REF => tips.push(read_ref(v)?),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
+    fields!(value, |v| {
+        tlv::ID => once(&mut id, read_array::<16>(&v, "an id is 16 octets")?, "ID")?,
+        tlv::ENTRY_REF => tips.push(read_ref(v)?),
+    });
     Ok(Op::Remove {
         id: id.ok_or(WireError::Missing("the ID of a removal"))?,
         tips,
@@ -540,99 +528,68 @@ fn read_remove(value: Bytes) -> Result<Op, WireError> {
 fn read_members(value: Bytes) -> Result<MembersBody, WireError> {
     let mut create = None;
     let mut ops = Vec::new();
-    each(value, |t, v| {
-        match t {
-            tlv::CREATE => once(&mut create, read_create(v)?, "CREATE")?,
-            tlv::ADD => ops.push(read_add(v)?),
-            tlv::REMOVE => ops.push(read_remove(v)?),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
+    fields!(value, |v| {
+        tlv::CREATE => once(&mut create, read_create(v)?, "CREATE")?,
+        tlv::ADD => ops.push(read_add(v)?),
+        tlv::REMOVE => ops.push(read_remove(v)?),
+    });
     Ok(MembersBody { create, ops })
 }
 
 fn read_create(value: Bytes) -> Result<bool, WireError> {
     let mut anyone = None;
-    each(value, |t, v| {
-        if t != tlv::ANYONE {
-            return Ok(false);
-        }
-        let flag = match read_nni(&v)? {
-            0 => false,
-            1 => true,
-            _ => return Err(WireError::Malformed("ANYONE is 0 or 1")),
-        };
-        once(&mut anyone, flag, "ANYONE")?;
-        Ok(true)
-    })?;
+    fields!(value, |v| {
+        tlv::ANYONE => once(&mut anyone, read_flag(&v)?, "ANYONE")?,
+    });
     anyone.ok_or(WireError::Missing("ANYONE of CREATE"))
 }
 
 fn read_blob(value: Bytes) -> Result<(u64, [u8; 32]), WireError> {
     let (mut size, mut root) = (None, None);
-    each(value, |t, v| {
-        match t {
-            tlv::SIZE => once(&mut size, read_nni(&v)?, "SIZE")?,
-            tlv::ROOT => once(&mut root, read_digest(&v)?, "ROOT")?,
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
-    match (size, root) {
-        (Some(size), Some(root)) => Ok((size, root)),
-        _ => Err(WireError::Missing("the SIZE or the ROOT of a blob")),
-    }
+    fields!(value, |v| {
+        tlv::SIZE => once(&mut size, read_nni(&v)?, "SIZE")?,
+        tlv::ROOT => once(&mut root, read_digest(&v)?, "ROOT")?,
+    });
+    let (Some(size), Some(root)) = (size, root) else {
+        return Err(WireError::Missing("the SIZE or the ROOT of a blob"));
+    };
+    Ok((size, root))
 }
 
 fn read_sealed(value: Bytes) -> Result<SealedBody, WireError> {
     let (mut epoch, mut sealed) = (None, None);
-    each(value, |t, v| {
-        match t {
-            tlv::EPOCH_ID => once(&mut epoch, read_epoch_id(v)?, "a sealed body's epoch")?,
-            tlv::CIPHERTEXT => once(&mut sealed, v, "CIPHERTEXT")?,
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
-    match (epoch, sealed) {
-        (Some(epoch), Some(sealed)) => Ok(SealedBody { epoch, sealed }),
-        _ => Err(WireError::Missing(
+    fields!(value, |v| {
+        tlv::EPOCH_ID => once(&mut epoch, read_epoch_id(v)?, "a sealed body's epoch")?,
+        tlv::CIPHERTEXT => once(&mut sealed, v, "CIPHERTEXT")?,
+    });
+    let (Some(epoch), Some(sealed)) = (epoch, sealed) else {
+        return Err(WireError::Missing(
             "the EPOCH_ID or the CIPHERTEXT of a sealed body",
-        )),
-    }
+        ));
+    };
+    Ok(SealedBody { epoch, sealed })
 }
 
 fn read_epoch_body(value: Bytes) -> Result<EpochBody, WireError> {
     let (mut key_check, mut audience) = (None, None);
-    each(value, |t, v| {
-        match t {
-            tlv::KEY_CHECK => once(&mut key_check, read_digest(&v)?, "KEY_CHECK")?,
-            tlv::AUDIENCE => once(&mut audience, read_audience(v)?, "AUDIENCE")?,
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
-    match (key_check, audience) {
-        (Some(key_check), Some(audience)) => Ok(EpochBody {
-            key_check,
-            audience,
-        }),
-        _ => Err(WireError::Missing(
+    fields!(value, |v| {
+        tlv::KEY_CHECK => once(&mut key_check, read_digest(&v)?, "KEY_CHECK")?,
+        tlv::AUDIENCE => once(&mut audience, read_audience(v)?, "AUDIENCE")?,
+    });
+    let (Some(key_check), Some(audience)) = (key_check, audience) else {
+        return Err(WireError::Missing(
             "the KEY_CHECK or the AUDIENCE of an epoch",
-        )),
-    }
+        ));
+    };
+    Ok(EpochBody {
+        key_check,
+        audience,
+    })
 }
 
 fn read_audience(value: Bytes) -> Result<Vec<Name>, WireError> {
     let mut persons = Vec::new();
-    each(value, |t, v| {
-        if t != tlv_type::NAME {
-            return Ok(false);
-        }
-        persons.push(read_name(v)?);
-        Ok(true)
-    })?;
+    fields!(value, |v| { tlv_type::NAME => persons.push(read_name(v)?) });
     Ok(persons)
 }
 
@@ -661,27 +618,21 @@ impl Grant {
     pub(crate) fn decode(content: Bytes) -> Result<Grant, WireError> {
         let value = only(content, tlv::GRANT, "a grant packet carries one GRANT")?;
         let (mut ephemeral, mut ciphertext) = (None, None);
-        each(value, |t, v| {
-            match t {
-                tlv::EPHEMERAL_KEY => once(
-                    &mut ephemeral,
-                    read_array::<32>(&v, "an ephemeral key is 32 octets")?,
-                    "EPHEMERAL_KEY",
-                )?,
-                tlv::CIPHERTEXT => once(&mut ciphertext, v, "CIPHERTEXT")?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        })?;
-        match (ephemeral, ciphertext) {
-            (Some(ephemeral), Some(ciphertext)) => Ok(Grant {
-                ephemeral,
-                ciphertext,
-            }),
-            _ => Err(WireError::Missing(
+        fields!(value, |v| {
+            tlv::EPHEMERAL_KEY => {
+                once(&mut ephemeral, read_array(&v, "an ephemeral key is 32 octets")?, "EPHEMERAL_KEY")?
+            },
+            tlv::CIPHERTEXT => once(&mut ciphertext, v, "CIPHERTEXT")?,
+        });
+        let (Some(ephemeral), Some(ciphertext)) = (ephemeral, ciphertext) else {
+            return Err(WireError::Missing(
                 "the EPHEMERAL_KEY or the CIPHERTEXT of a grant",
-            )),
-        }
+            ));
+        };
+        Ok(Grant {
+            ephemeral,
+            ciphertext,
+        })
     }
 }
 
@@ -714,13 +665,7 @@ pub(crate) fn encode_manifest(digests: &[[u8; 32]]) -> Bytes {
 /// Decode a manifest node's Content: 1 to [`FANOUT`] digests.
 pub(crate) fn decode_manifest(content: Bytes) -> Result<Vec<[u8; 32]>, WireError> {
     let mut out = Vec::new();
-    each(content, |t, v| {
-        if t != tlv::DIGEST {
-            return Ok(false);
-        }
-        out.push(read_digest(&v)?);
-        Ok(true)
-    })?;
+    fields!(content, |v| { tlv::DIGEST => out.push(read_digest(&v)?) });
     if out.is_empty() {
         return Err(WireError::Missing("a digest of a manifest node"));
     }

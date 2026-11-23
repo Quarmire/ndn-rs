@@ -19,7 +19,8 @@ pub(crate) use codec::*;
 pub(crate) use digest::*;
 pub(crate) use names::*;
 pub(crate) use pieces::*;
-pub(crate) use prim::{WireError, each, once, read_name};
+pub(crate) use prim::{WireError, each, fields, once, read_name};
+pub use types::EntryRef;
 pub(crate) use types::*;
 
 #[cfg(test)]

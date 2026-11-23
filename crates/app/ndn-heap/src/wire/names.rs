@@ -22,7 +22,7 @@ use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent, tlv_type};
 use ndn_tlv::TlvWriter;
 
-use super::prim::{WireError, each, once, read_epoch_id, read_name, write_epoch_id, write_name};
+use super::prim::{WireError, fields, once, read_epoch_id, read_name, write_epoch_id, write_name};
 use super::tlv;
 use super::types::{EntryRef, EpochId};
 
@@ -158,13 +158,18 @@ pub(crate) fn sync_group_of(space: &Name) -> Option<Name> {
     Some(Name::from_components(comps))
 }
 
-/// An entry's name: `<device>/32=log/<space>/seq=<seq>`.
-pub(crate) fn log_name(device: &Name, space: &Name, seq: u64) -> Name {
+/// `<device>/32=log/<space>`: what every entry name of the device in the
+/// space extends.
+pub(crate) fn log_prefix(device: &Name, space: &Name) -> Name {
     let mut comps = device.components().to_vec();
     comps.push(kw(LOG));
     comps.extend(space.components().iter().cloned());
-    comps.push(NameComponent::sequence_num(seq));
     Name::from_components(comps)
+}
+
+/// An entry's name: `<device>/32=log/<space>/seq=<seq>`.
+pub(crate) fn log_name(device: &Name, space: &Name, seq: u64) -> Name {
+    log_prefix(device, space).append_component(NameComponent::sequence_num(seq))
 }
 
 /// A parsed entry name.
@@ -204,31 +209,33 @@ impl EntryRef {
     }
 }
 
-/// `<device>/32=seal`: the prefix of every [`seal_key_name`] of `device`, what
-/// a device's seal key packet is asked for by when its key is not known yet.
-pub(crate) fn seal_key_prefix(device: &Name) -> Name {
-    device.clone().append_component(kw(SEAL))
+/// `<device>/32=<word>/<opaque>`: a name whose last component is one opaque
+/// generic value (a seal key, a grant ask, a held name).
+fn keyed(device: &Name, word: &'static [u8], opaque: Bytes) -> Name {
+    (device.clone().append_component(kw(word))).append_component(NameComponent::generic(opaque))
+}
+
+/// The device and the opaque value of a [`keyed`] name; `None` for any other.
+fn parse_keyed<'a>(name: &'a Name, word: &[u8]) -> Option<(Name, &'a Bytes)> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| is_kw(c, word))?;
+    let [opaque] = &comps[at + 1..] else {
+        return None;
+    };
+    (is_device_comps(&comps[..at]) && opaque.typ == tlv_type::GENERIC_NAME_COMPONENT)
+        .then(|| (name_of(&comps[..at]), &opaque.value))
 }
 
 /// A device's seal key's name: `<device>/32=seal/<public key>`, the last
 /// component the 32 octets of its X25519 public key.
 pub(crate) fn seal_key_name(device: &Name, public: &[u8; 32]) -> Name {
-    seal_key_prefix(device).append_component(NameComponent::generic(Bytes::copy_from_slice(public)))
+    keyed(device, SEAL, Bytes::copy_from_slice(public))
 }
 
 /// Parse `<device>/32=seal/<public key>`.
 pub(crate) fn parse_seal_key_name(name: &Name) -> Option<(Name, [u8; 32])> {
-    let comps = name.components();
-    let at = comps.iter().position(|c| is_kw(c, SEAL))?;
-    if !is_device_comps(&comps[..at]) || at + 2 != comps.len() {
-        return None;
-    }
-    let last = &comps[at + 1];
-    if last.typ != tlv_type::GENERIC_NAME_COMPONENT {
-        return None;
-    }
-    let public = <[u8; 32]>::try_from(last.value.as_ref()).ok()?;
-    Some((name_of(&comps[..at]), public))
+    let (device, public) = parse_keyed(name, SEAL)?;
+    Some((device, public.as_ref().try_into().ok()?))
 }
 
 /// What a grant answers: the key of one epoch of a space, for the holder of
@@ -262,14 +269,10 @@ impl GrantAsk {
     pub(crate) fn decode(content: Bytes) -> Result<GrantAsk, WireError> {
         let value = super::prim::only(content, tlv::GRANT_ASK, "a grant ask is one GRANT_ASK TLV")?;
         let (mut names, mut epoch) = (Vec::new(), None);
-        each(value, |t, v| {
-            match t {
-                tlv_type::NAME => names.push(read_name(v)?),
-                tlv::EPOCH_ID => once(&mut epoch, read_epoch_id(v)?, "a grant ask's epoch")?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        })?;
+        fields!(value, |v| {
+            tlv_type::NAME => names.push(read_name(v)?),
+            tlv::EPOCH_ID => once(&mut epoch, read_epoch_id(v)?, "a grant ask's epoch")?,
+        });
         let (Ok([seal_key, space]), Some(epoch)) = (<[Name; 2]>::try_from(names), epoch) else {
             return Err(WireError::Malformed(
                 "a grant ask has a seal key name, a space name and an epoch",
@@ -291,51 +294,28 @@ impl GrantAsk {
 
 /// A grant's name: `<granter>/32=grant/<GrantAsk TLV>`.
 pub(crate) fn grant_name(granter: &Name, ask: &GrantAsk) -> Name {
-    granter
-        .clone()
-        .append_component(kw(GRANT))
-        .append_component(NameComponent::generic(ask.encode()))
+    keyed(granter, GRANT, ask.encode())
 }
 
 /// Parse `<granter>/32=grant/<GrantAsk TLV>`. Only the canonical encoding
 /// parses, so one ask has one name.
 pub(crate) fn parse_grant_name(name: &Name) -> Option<(Name, GrantAsk)> {
-    let comps = name.components();
-    let at = comps.iter().position(|c| is_kw(c, GRANT))?;
-    if !is_device_comps(&comps[..at])
-        || at + 2 != comps.len()
-        || comps[at + 1].typ != tlv_type::GENERIC_NAME_COMPONENT
-    {
-        return None;
-    }
-    let ask = GrantAsk::decode(comps[at + 1].value.clone()).ok()?;
-    (ask.encode() == comps[at + 1].value).then(|| (name_of(&comps[..at]), ask))
-}
-
-/// `<holder>/32=held`: the prefix of every [`held_name`] of `holder`.
-pub(crate) fn held_prefix(holder: &Name) -> Name {
-    holder.clone().append_component(kw(HELD))
+    let (granter, value) = parse_keyed(name, GRANT)?;
+    let ask = GrantAsk::decode(value.clone()).ok()?;
+    (ask.encode() == *value).then_some((granter, ask))
 }
 
 /// The name that asks holder `holder` for a packet it keeps of another
 /// device, `original` (an entry or a piece): `<holder>/32=held/<Name TLV>`.
 /// It routes to the holder by its own name.
 pub(crate) fn held_name(holder: &Name, original: &Name) -> Name {
-    held_prefix(holder).append_component(NameComponent::generic(original.encode_to_tlv()))
+    keyed(holder, HELD, original.encode_to_tlv())
 }
 
 /// Parse `<holder>/32=held/<Name TLV>`.
 pub(crate) fn parse_held_name(name: &Name) -> Option<(Name, Name)> {
-    let comps = name.components();
-    let at = comps.iter().position(|c| is_kw(c, HELD))?;
-    if !is_device_comps(&comps[..at])
-        || at + 2 != comps.len()
-        || comps[at + 1].typ != tlv_type::GENERIC_NAME_COMPONENT
-    {
-        return None;
-    }
-    let original = Name::decode_from_tlv(comps[at + 1].value.clone()).ok()?;
-    Some((name_of(&comps[..at]), original))
+    let (holder, value) = parse_keyed(name, HELD)?;
+    Some((holder, Name::decode_from_tlv(value.clone()).ok()?))
 }
 
 /// The asks and fetches a device serves, by the keyword right after its own

@@ -65,7 +65,7 @@ impl<'a> View<'a> {
     pub(super) fn namers(&self, x: &EntryRef) -> Vec<EntryRef> {
         self.store
             .get(&supers_key(self.space, &x.device, x.seq, &x.digest))
-            .and_then(|record| decode_refs(&record))
+            .and_then(|record| decode_refs(&record).ok())
             .unwrap_or_default()
     }
 

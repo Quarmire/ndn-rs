@@ -55,7 +55,7 @@ pub(crate) struct Prev {
 /// A reference to one entry: who wrote it, at which seq, and the
 /// signed-region digest of its bytes.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct EntryRef {
+pub struct EntryRef {
     /// The writing device.
     pub device: Name,
     /// Its seq in the (device, space) log.

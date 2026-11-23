@@ -42,61 +42,19 @@ use ndn_tlv::TlvWriter;
 
 use crate::store::{Corrupt, heads_key, supers_key};
 use crate::wire::{
-    AFTER_MAX, EntryRef, each, once, read_name, read_ref, tlv, write_path, write_ref,
+    AFTER_MAX, EntryRef, WireError, fields, once, read_name, read_ref, tlv, write_path, write_ref,
 };
 
 #[cfg(test)]
 mod tests;
 
-/// Which entry wrote a value: `EntryRef` under the name readers know it
+/// Which entry wrote a value: the [`EntryRef`] under the name readers know it
 /// by (`Change`, `put`'s result, `Item::id`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct EntryId {
-    /// The writing device.
-    pub device: Name,
-    /// Its seq in the (device, space) log.
-    pub seq: u64,
-    /// The signed-region digest of the entry.
-    pub digest: [u8; 32],
-}
+pub use crate::wire::EntryRef as EntryId;
 
-impl From<&EntryRef> for EntryId {
-    fn from(r: &EntryRef) -> EntryId {
-        EntryId {
-            device: r.device.clone(),
-            seq: r.seq,
-            digest: r.digest,
-        }
-    }
-}
-
-impl From<EntryRef> for EntryId {
-    fn from(r: EntryRef) -> EntryId {
-        EntryId {
-            device: r.device,
-            seq: r.seq,
-            digest: r.digest,
-        }
-    }
-}
-
-impl From<&EntryId> for EntryRef {
-    fn from(id: &EntryId) -> EntryRef {
-        EntryRef {
-            device: id.device.clone(),
-            seq: id.seq,
-            digest: id.digest,
-        }
-    }
-}
-
-impl From<EntryId> for EntryRef {
-    fn from(id: EntryId) -> EntryRef {
-        EntryRef {
-            device: id.device,
-            seq: id.seq,
-            digest: id.digest,
-        }
+impl From<&EntryRef> for EntryRef {
+    fn from(r: &EntryRef) -> EntryRef {
+        r.clone()
     }
 }
 
@@ -132,6 +90,18 @@ pub(crate) struct Write {
     pub removal: bool,
     /// Octets of the payload (of the blob, for a larger one).
     pub size: u64,
+}
+
+impl Write {
+    /// The head the entry `entry` makes at `self.path`.
+    fn head(&self, entry: EntryRef) -> Head {
+        Head {
+            entry,
+            person: self.person.clone(),
+            removal: self.removal,
+            size: self.size,
+        }
+    }
 }
 
 /// A head: an applied entry nothing applied supersedes. A reference and
@@ -265,16 +235,7 @@ impl Register {
         // An entry some applied entry at its path already names, one that
         // arrived first, is not a head.
         if !self.at.contains_key(id) && !names_at(&namers(id), &write.path, load) {
-            self.add_head(
-                &mut touched,
-                Head {
-                    entry: id.clone(),
-                    person: write.person.clone(),
-                    removal: write.removal,
-                    size: write.size,
-                },
-                write.path.clone(),
-            );
+            self.add_head(&mut touched, write.head(id.clone()), write.path.clone());
         }
         self.finish(touched, writes)
     }
@@ -311,16 +272,7 @@ impl Register {
                 && let Some(w) = load(&x)
                 && !names_at(&named, &w.path, load)
             {
-                self.add_head(
-                    &mut touched,
-                    Head {
-                        entry: x,
-                        person: w.person,
-                        removal: w.removal,
-                        size: w.size,
-                    },
-                    w.path,
-                );
+                self.add_head(&mut touched, w.head(x), w.path.clone());
             }
         }
         self.finish(touched, writes)
@@ -342,22 +294,14 @@ impl Register {
                 key: key.clone(),
                 what: "heads record",
             };
-            let (path, refs) = decode_heads_record(&value).ok_or_else(corrupt)?;
+            let (path, refs) = decode_heads_record(&value).map_err(|_| corrupt())?;
             if refs.is_empty() || key != heads_key(&register.space, &path_tlv(&path)) {
                 return Err(corrupt());
             }
             for entry in refs {
                 match load(&entry) {
                     Some(w) if w.path == path && !register.at.contains_key(&entry) => {
-                        register.insert(
-                            path.clone(),
-                            Head {
-                                entry,
-                                person: w.person,
-                                removal: w.removal,
-                                size: w.size,
-                            },
-                        );
+                        register.insert(path.clone(), w.head(entry));
                     }
                     Some(_) => return Err(corrupt()),
                     None => missing.push(entry),
@@ -508,33 +452,24 @@ fn path_tlv(path: &Name) -> Bytes {
 
 /// A `heads/` record: the path TLV, then one `ENTRY_REF` per head.
 fn heads_record(path_tlv: &[u8], heads: &[Head]) -> Bytes {
-    let mut w = TlvWriter::new();
-    for h in heads {
-        write_ref(&mut w, &h.entry);
-    }
     let mut out = path_tlv.to_vec();
-    out.extend_from_slice(&w.finish());
+    out.extend_from_slice(&encode_refs(heads.iter().map(|h| &h.entry)));
     Bytes::from(out)
 }
 
 /// The path and heads a `heads/` record says; `None` when it is not one.
-fn decode_heads_record(value: &Bytes) -> Option<(Name, Vec<EntryRef>)> {
+fn decode_heads_record(value: &Bytes) -> Result<(Name, Vec<EntryRef>), WireError> {
     let (mut path, mut refs) = (None, Vec::new());
-    each(value.clone(), |t, v| {
-        match t {
-            tlv::PATH => once(&mut path, read_name(v)?, "a path")?,
-            tlv::ENTRY_REF => refs.push(read_ref(v)?),
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })
-    .ok()?;
-    Some((path?, refs))
+    fields!(value.clone(), |v| {
+        tlv::PATH => once(&mut path, read_name(v)?, "a path")?,
+        tlv::ENTRY_REF => refs.push(read_ref(v)?),
+    });
+    Ok((path.ok_or(WireError::Missing("a path"))?, refs))
 }
 
 /// A `supers/` record: one `ENTRY_REF` per applied entry that names the key's
 /// entry in its `after`.
-pub(crate) fn encode_refs(refs: &[EntryRef]) -> Bytes {
+pub(crate) fn encode_refs<'a>(refs: impl IntoIterator<Item = &'a EntryRef>) -> Bytes {
     let mut w = TlvWriter::new();
     for r in refs {
         write_ref(&mut w, r);
@@ -543,15 +478,8 @@ pub(crate) fn encode_refs(refs: &[EntryRef]) -> Bytes {
 }
 
 /// The entries a `supers/` record lists; `None` when it is not one.
-pub(crate) fn decode_refs(record: &[u8]) -> Option<Vec<EntryRef>> {
+pub(crate) fn decode_refs(record: &[u8]) -> Result<Vec<EntryRef>, WireError> {
     let mut refs = Vec::new();
-    each(Bytes::copy_from_slice(record), |t, v| {
-        if t != tlv::ENTRY_REF {
-            return Ok(false);
-        }
-        refs.push(read_ref(v)?);
-        Ok(true)
-    })
-    .ok()?;
-    Some(refs)
+    fields!(Bytes::copy_from_slice(record), |v| { tlv::ENTRY_REF => refs.push(read_ref(v)?) });
+    Ok(refs)
 }

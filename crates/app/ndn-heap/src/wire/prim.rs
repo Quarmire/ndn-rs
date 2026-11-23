@@ -9,6 +9,22 @@ use super::names::is_device_name;
 use super::tlv;
 use super::types::EpochId;
 
+/// Read the TLVs of a record: each arm names a TLV-TYPE and stores what it
+/// reads (through `v`, the value), and a type no arm names is [`each`]'s to
+/// skip (even) or refuse (odd).
+macro_rules! fields {
+    ($value:expr, |$v:ident| { $($typ:pat => $arm:expr),+ $(,)? }) => {
+        $crate::wire::each($value, |t, $v| {
+            match t {
+                $($typ => { $arm; })+
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?
+    };
+}
+pub(crate) use fields;
+
 /// Why bytes are not a record of the layer (or a record cannot be written).
 /// Every refusal says what is wrong and what to do about it.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -181,14 +197,10 @@ pub(crate) fn write_epoch_id(w: &mut TlvWriter, e: &EpochId) {
 /// Read the value of an `EPOCH_ID`.
 pub(crate) fn read_epoch_id(value: Bytes) -> Result<EpochId, WireError> {
     let (mut creator, mut seq) = (None, None);
-    each(value, |t, v| {
-        match t {
-            tlv_type::NAME => once(&mut creator, read_name(v)?, "an epoch id's creator")?,
-            tlv::SEQ => once(&mut seq, read_nni(&v)?, "an epoch id's seq")?,
-            _ => return Ok(false),
-        }
-        Ok(true)
-    })?;
+    fields!(value, |v| {
+        tlv_type::NAME => once(&mut creator, read_name(v)?, "an epoch id's creator")?,
+        tlv::SEQ => once(&mut seq, read_nni(&v)?, "an epoch id's seq")?,
+    });
     match (creator, seq) {
         (Some(creator), Some(seq)) if is_device_name(&creator) => Ok(EpochId { creator, seq }),
         _ => Err(WireError::Malformed(

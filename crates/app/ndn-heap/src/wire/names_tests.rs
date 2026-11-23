@@ -150,7 +150,7 @@ fn seal_key_grant_and_held_names_round_trip_and_refuse_what_they_are_not() {
     let seal = seal_key_name(&device, &[7; 32]);
     assert_eq!(parse_seal_key_name(&seal), Some((device.clone(), [7; 32])));
     assert_eq!(seal.components().len(), device.len() + 2);
-    assert!(seal.has_prefix(&seal_key_prefix(&device)));
+    assert!(seal.has_prefix(&device.clone().append_component(kw(b"seal"))));
     for bad in [
         "/alice/laptop/32=seal",
         "/alice/laptop/32=seal/short",
