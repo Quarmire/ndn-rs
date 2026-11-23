@@ -995,6 +995,7 @@ impl Inner {
                 writer: writer.clone(),
                 digest,
                 signed,
+                kind: crate::layer::RecordKind::Introduction,
             },
         );
         let Some(folder) = record.subject() else {

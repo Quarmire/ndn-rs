@@ -413,3 +413,75 @@ async fn a_folder_watch_is_told_its_members_and_a_change_keeps_whom_it_does_not_
     assert_eq!(dev.inner.st.lock().head, head);
     dev.shutdown();
 }
+
+/// A members record of `c` at revision `revision`.
+fn members(c: &Name, revision: u64) -> Record {
+    Record::Members(MembersBody {
+        collection: c.clone(),
+        folder: false,
+        revision,
+        rule: Rule::Log,
+        writers: vec![n("/bob")],
+        readers: Vec::new(),
+        cuts: Vec::new(),
+        epoch: None,
+        key_check: None,
+        since: None,
+        parent: None,
+    })
+}
+
+/// Whether a key of the owner's namespace signing two members records at
+/// one name is told to the watch of the collection (by name and kind only):
+/// a stolen admin key's work is not a log line.
+#[tokio::test]
+async fn two_members_records_at_one_name_are_told_to_the_watch() {
+    let dev = device().await;
+    let mut changes = dev.watch(&plan(), &Frontier::new()).await.unwrap();
+    drain(&mut changes).await;
+    let first = super::test_kit::made("/alice/phone", &plan(), 9, members(&plan(), 2));
+    let second = super::test_kit::made("/alice/phone", &plan(), 9, members(&plan(), 3));
+    assert_eq!(first.name, second.name);
+    assert_ne!(
+        wire::signed_digest(&first.packet),
+        wire::signed_digest(&second.packet)
+    );
+    give(&dev, &first);
+    give(&dev, &second);
+    let seen = drain(&mut changes).await;
+    let told: Vec<&Change> = seen
+        .iter()
+        .filter(|c| matches!(c, Change::Equivocation { .. }))
+        .collect();
+    assert_eq!(told.len(), 1, "told once, for its collection: {seen:?}");
+    assert_eq!(told[0].collection(), &plan());
+    dev.shutdown();
+}
+
+/// The same for two members records at one seq under two names (two
+/// collections): told for each, the other's by name and kind only.
+#[tokio::test]
+async fn members_records_of_two_collections_at_one_seq_are_told_for_each() {
+    let dev = device().await;
+    let mut changes = dev.watch(&trip(), &Frontier::new()).await.unwrap();
+    drain(&mut changes).await;
+    give(
+        &dev,
+        &super::test_kit::made("/alice/phone", &plan(), 9, members(&plan(), 2)),
+    );
+    give(
+        &dev,
+        &super::test_kit::made("/alice/phone", &budget(), 9, members(&budget(), 2)),
+    );
+    let seen = drain(&mut changes).await;
+    let mut told: Vec<Name> = seen
+        .iter()
+        .filter(|c| matches!(c, Change::Equivocation { .. }))
+        .map(|c| c.collection().clone())
+        .collect();
+    told.sort();
+    let mut want = vec![budget(), plan()];
+    want.sort();
+    assert_eq!(told, want, "{seen:?}");
+    dev.shutdown();
+}

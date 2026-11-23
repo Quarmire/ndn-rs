@@ -78,7 +78,9 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::collection::{self, Accepted, Child, Cut, Epoch, Members, Resolve, Rule, Summary};
 use crate::error::{DataError, Refusal};
-use crate::layer::{Age, Answer, Change, Changes, DataLayer, Equivocal, Got, PutOptions, State};
+use crate::layer::{
+    Age, Answer, Change, Changes, DataLayer, Equivocal, Got, PutOptions, RecordKind, State,
+};
 use crate::merge::{self, MergeState, NoOps, Op, Ops, Past};
 use crate::pieces::{self, Shape};
 use crate::rt::{self, Instant};
@@ -1135,7 +1137,71 @@ enum Held {
         writer: Writer,
         digest: [u8; 32],
         signed: [u8; 32],
+        /// Which kind of record, as a watch is told of it.
+        kind: RecordKind,
     },
+}
+
+/// One entry of an equivocation, as a watch is told of it ([`Equivocal`]).
+enum Side {
+    Version(Version),
+    /// A members or introduction record: by name, id and kind only.
+    Record {
+        name: Name,
+        id: VersionId,
+        kind: RecordKind,
+        /// The collection it is about, if any.
+        subject: Option<Name>,
+    },
+}
+
+impl Side {
+    /// The collection the entry is about.
+    fn collection(&self) -> Option<&Name> {
+        match self {
+            Side::Version(v) => Some(&v.collection),
+            Side::Record { subject, .. } => subject.as_ref(),
+        }
+    }
+
+    /// The entry as told to a watcher of collection `c`: a version whole when
+    /// it is of `c`, else by name and id; a record by name, id and kind.
+    fn told(&self, c: &Name) -> Equivocal {
+        match self {
+            Side::Version(v) => Equivocal::of(v, c),
+            Side::Record { name, id, kind, .. } => Equivocal::Record {
+                name: name.clone(),
+                id: id.clone(),
+                kind: *kind,
+            },
+        }
+    }
+
+    /// The equivocation of `first` and `second`, told once for each
+    /// collection either is about (under `target`, if given).
+    fn changes(first: &Side, second: &Side, target: Option<&Name>) -> Vec<(Name, Change)> {
+        let mut collections: Vec<&Name> = Vec::new();
+        for c in [first.collection(), second.collection()]
+            .into_iter()
+            .flatten()
+        {
+            if !collections.contains(&c) {
+                collections.push(c);
+            }
+        }
+        collections
+            .into_iter()
+            .filter(|c| target.is_none_or(|t| c.has_prefix(t)))
+            .map(|c| {
+                let change = Change::Equivocation {
+                    collection: c.clone(),
+                    first: first.told(c),
+                    second: second.told(c),
+                };
+                (c.clone(), change)
+            })
+            .collect()
+    }
 }
 
 /// A log entry refused by the trust context governing its name, kept
@@ -3352,28 +3418,65 @@ impl St {
         }
         names.push(name.clone());
         tracing::warn!(%first, second = %name, "two log entries of one key at one seq: equivocation");
-        if let Record::Version(body) = record
-            && let Some(first) = self.held_version(&first)
-        {
-            let open = body.sealed.is_none();
-            let digest = wire::implicit_digest(wire);
-            let second = version_of(name, writer, seq, body.clone(), digest, open);
-            let mut told = vec![body.collection.clone()];
-            if first.collection != body.collection {
-                told.push(first.collection.clone());
-            }
+        // A version is told whole to its own collection's watchers; a record
+        // by name and kind only, to the watchers of the collection it is about.
+        let second = match record {
+            Record::Version(body) => Side::Version(version_of(
+                name,
+                writer,
+                seq,
+                body.clone(),
+                wire::implicit_digest(wire),
+                body.sealed.is_none(),
+            )),
+            Record::Members(body) => Side::Record {
+                name: name.clone(),
+                id: VersionId {
+                    writer: writer.clone(),
+                    seq: Seq(seq),
+                },
+                kind: RecordKind::Members,
+                subject: Some(body.collection.clone()),
+            },
+            Record::Intro(body) => Side::Record {
+                name: name.clone(),
+                id: VersionId {
+                    writer: writer.clone(),
+                    seq: Seq(seq),
+                },
+                kind: RecordKind::Introduction,
+                subject: body.subject(),
+            },
+        };
+        if let Some(first) = self.side_held(&first) {
             // Each collection's watchers see its own version whole and the
             // other collection's by name and id only.
-            for c in told {
-                let change = Change::Equivocation {
-                    collection: c.clone(),
-                    first: Equivocal::of(&first, &c),
-                    second: Equivocal::of(&second, &c),
-                };
+            for (c, change) in Side::changes(&first, &second, None) {
                 self.tell(&c, &change);
             }
         }
         true
+    }
+
+    /// The entry held at `name` as a watch is told of it: a version, or a
+    /// record by name and kind.
+    fn side_held(&self, name: &Name) -> Option<Side> {
+        if let Some(v) = self.held_version(name) {
+            return Some(Side::Version(v));
+        }
+        let Held::Record { writer, kind, .. } = self.held.get(name)? else {
+            return None;
+        };
+        let log = parse_log_name(name)?;
+        Some(Side::Record {
+            name: name.clone(),
+            id: VersionId {
+                writer: writer.clone(),
+                seq: Seq(log.seq),
+            },
+            kind: *kind,
+            subject: log.subject,
+        })
     }
 
     /// The equivocation evidence held of collections under `target`
@@ -3389,43 +3492,38 @@ impl St {
             let Some((first, rest)) = names.split_first() else {
                 continue;
             };
-            let Some(first) = self.held_version(first) else {
+            let Some(first) = self.side_held(first) else {
                 continue;
             };
-            for second in rest.iter().filter_map(|n| self.held_version(n)) {
-                let mut told = vec![first.collection.clone()];
-                if second.collection != first.collection {
-                    told.push(second.collection.clone());
-                }
-                for c in told.into_iter().filter(|c| c.has_prefix(target)) {
-                    out.push(Change::Equivocation {
-                        first: Equivocal::of(&first, &c),
-                        second: Equivocal::of(&second, &c),
-                        collection: c,
-                    });
-                }
+            for second in rest.iter().filter_map(|n| self.side_held(n)) {
+                out.extend(
+                    Side::changes(&first, &second, Some(target))
+                        .into_iter()
+                        .map(|(_, change)| change),
+                );
             }
         }
-        // Two packets at one name: one collection, both whole.
+        // Two packets at one name: one collection. Versions both whole;
+        // records by name and kind, the same on both sides.
         let mut names: Vec<&Name> = self.twins.keys().collect();
         names.sort();
         for name in names {
-            let Some(first) = self.held_version(name) else {
+            let Some(first) = self.side_held(name) else {
                 continue;
             };
-            if !first.collection.has_prefix(target) {
-                continue;
-            }
-            let second = match self.reload(name, self.twins[name].clone()) {
-                Some(Ok(hv)) => hv.version,
-                Some(Err(lk)) => lk.version(),
-                None => continue,
+            let second = match &first {
+                Side::Version(_) => match self.reload(name, self.twins[name].clone()) {
+                    Some(Ok(hv)) => Side::Version(hv.version),
+                    Some(Err(lk)) => Side::Version(lk.version()),
+                    None => continue,
+                },
+                Side::Record { .. } => self.side_held(name).expect("held"),
             };
-            out.push(Change::Equivocation {
-                collection: first.collection.clone(),
-                first: Equivocal::Here(Box::new(first)),
-                second: Equivocal::Here(Box::new(second)),
-            });
+            out.extend(
+                Side::changes(&first, &second, Some(target))
+                    .into_iter()
+                    .map(|(_, change)| change),
+            );
         }
         out
     }
@@ -7581,6 +7679,29 @@ impl Inner {
             }
             return;
         }
+        if let Some(Held::Record { signed, .. }) = st.held.get(&name) {
+            // A members or introduction record the key signed twice at one
+            // name is evidence against that key as two versions are: the second
+            // is kept beside the first, and told to a watch of the record's
+            // collection by name and kind only (not what either carries).
+            // Another signature value over what the key signed is no second
+            // record.
+            if matches!(record, Record::Members(_) | Record::Intro(_))
+                && wire::signed_digest(&wire).is_some_and(|second| second != *signed)
+            {
+                if !st.twins.contains_key(&name) {
+                    self.store.insert(equivocal_name(&name), wire.clone());
+                    st.twins.insert(name.clone(), wire.clone());
+                }
+                tracing::warn!(%name, "two records of one key at one name: equivocation");
+                if let Some(side) = st.side_held(&name) {
+                    for (c, change) in Side::changes(&side, &side, None) {
+                        st.tell(&c, &change);
+                    }
+                }
+            }
+            return;
+        }
         if st.held.contains_key(&name) {
             return;
         }
@@ -7635,6 +7756,10 @@ impl Inner {
                     writer,
                     digest,
                     signed,
+                    kind: match record {
+                        Record::Members(_) => RecordKind::Members,
+                        _ => RecordKind::Introduction,
+                    },
                 },
             );
             return;
@@ -7647,6 +7772,7 @@ impl Inner {
                         writer: writer.clone(),
                         digest,
                         signed,
+                        kind: RecordKind::Members,
                     },
                 );
                 let c = body.collection.clone();

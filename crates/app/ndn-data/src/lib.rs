@@ -84,8 +84,8 @@ pub use intro::{
     JoinedFolder, Offer, Role,
 };
 pub use layer::{
-    Age, Answer, Change, Changes, DataLayer, Equivocal, Got, PutOptions, Share, ShareChange,
-    Sharing, State, Value,
+    Age, Answer, Change, Changes, DataLayer, Equivocal, Got, PutOptions, RecordKind, Share,
+    ShareChange, Sharing, State, Value,
 };
 pub use ndn_foundation_types::{Hash, Name};
 pub use signal::{SignalKey, SignalRefusal, SignalScope, SignalSender};

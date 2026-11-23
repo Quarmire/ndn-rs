@@ -214,7 +214,8 @@ pub enum Change {
     },
 }
 
-/// One of the two versions of an [`Change::Equivocation`].
+/// One of the two entries of a [`Change::Equivocation`]: a version, or a
+/// record.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Equivocal {
     /// A version of the collection the change is told for, whole.
@@ -227,6 +228,29 @@ pub enum Equivocal {
         /// `(writer, seq)`: the change's other version's too.
         id: VersionId,
     },
+    /// A record, not a version: by its name, id and kind only, whichever
+    /// collection it is about (a members record decides who writes and
+    /// reads, an introduction record what a joiner was shown: a key signing
+    /// two of them at one seq is evidence against that key, and nothing of
+    /// what they carry is told).
+    Record {
+        /// The record's own name (its log entry).
+        name: Name,
+        /// `(writer, seq)`.
+        id: VersionId,
+        /// What kind of record it is.
+        kind: RecordKind,
+    },
+}
+
+/// The kind of a log entry that is a record, not a version
+/// ([`Equivocal::Record`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RecordKind {
+    /// A members record (spec §6).
+    Members,
+    /// An introduction's offer or use mark (spec §19).
+    Introduction,
 }
 
 impl Equivocal {
@@ -243,19 +267,19 @@ impl Equivocal {
         }
     }
 
-    /// The version's own name.
+    /// The entry's own name.
     pub fn name(&self) -> &Name {
         match self {
             Equivocal::Here(v) => &v.name,
-            Equivocal::Elsewhere { name, .. } => name,
+            Equivocal::Elsewhere { name, .. } | Equivocal::Record { name, .. } => name,
         }
     }
 
-    /// The version's id.
+    /// The entry's id.
     pub fn id(&self) -> &VersionId {
         match self {
             Equivocal::Here(v) => &v.id,
-            Equivocal::Elsewhere { id, .. } => id,
+            Equivocal::Elsewhere { id, .. } | Equivocal::Record { id, .. } => id,
         }
     }
 }
