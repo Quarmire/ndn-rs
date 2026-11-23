@@ -48,6 +48,10 @@ proptest = { workspace = true }
 ndn-cert = { workspace = true }
 # The cluster of nodes the API tests and the benchmark run over one forwarder.
 ndn-engine = { workspace = true }
+# `sync_group::carry` runs a namespace's sync group on the cluster's engine;
+# the devices' faces end with their cancellation token.
+ndn-namespace = { workspace = true }
+tokio-util    = { workspace = true }
 
 [features]
 # Construction gates: a module under construction is compiled only with its

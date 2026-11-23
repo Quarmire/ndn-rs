@@ -25,6 +25,8 @@ use parking_lot::{Condvar, Mutex, RwLock};
 
 #[cfg(test)]
 mod tests;
+#[cfg(feature = "wip-test-kit")]
+mod cluster;
 
 /// A name from its URI. Panics on a malformed one: a test's typo.
 pub(crate) fn n(uri: &str) -> Name {
