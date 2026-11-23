@@ -526,3 +526,31 @@ async fn a_1_mib_payload_reaches_the_peer_in_pieces() {
     let read = theirs.get(&n("/big")).await.unwrap().expect("held");
     assert_eq!(&read.bytes[..], &payload[..]);
 }
+
+/// A value in pieces written into a private space before a device of the owner opens the space is
+/// read whole by that device once the epoch key has been granted to it: the entry arrives closed
+/// (its payload kind is sealed), the key opens it, and the pieces it declares are then asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sealed_value_in_pieces_reaches_a_device_that_opens_the_space_after_the_write() {
+    let m = mesh(&["/alice/laptop", "/alice/phone"]).await;
+    let (laptop, phone) = (m.boot(0, fast()).await, m.boot(1, fast()).await);
+    let heap = laptop.create(&space(), private(&[])).await.unwrap();
+    let payload: Vec<u8> = (0..1u32 << 18)
+        .map(|i| (i.wrapping_mul(7) % 251) as u8)
+        .collect();
+    heap.put(
+        &n("/big"),
+        Bytes::from(payload.clone()),
+        PutOptions::default(),
+    )
+    .await
+    .unwrap();
+    let theirs = phone.open(&space()).await.unwrap();
+    eventually("the phone reads the whole value", || async {
+        matches!(
+            theirs.get(&n("/big")).await,
+            Ok(Some(item)) if item.bytes[..] == payload[..]
+        )
+    })
+    .await;
+}

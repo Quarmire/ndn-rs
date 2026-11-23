@@ -388,20 +388,24 @@ impl SpaceInner {
     }
 
     /// What follows a routed call once the lock is let go: blobs whose
-    /// pieces are all held to tell, the epoch to repair, the fetch to wake.
+    /// pieces are all held to tell, the epoch to repair, the fetch to wake (also when a value
+    /// became owed its pieces: a key that opens a closed entry makes it a head whose pieces
+    /// nothing else asks for).
     pub(crate) fn finish(self: &Arc<Self>, node: &Arc<NodeInner>, routed: Routed) {
+        let mut nudge = routed.nudge;
         for blob in routed.blobs {
             // One still to gather is told when its last piece is held.
             if self.is_whole(node, &blob) {
                 self.tell_blob(&blob);
             } else {
                 self.owed.lock().insert(blob.id.clone(), blob);
+                nudge = true;
             }
         }
         if routed.repair {
             self.spawn_repair(node);
         }
-        if routed.nudge {
+        if nudge {
             node.nudge(&self.name);
         }
     }
