@@ -787,3 +787,30 @@ async fn a_key_revoked_while_the_node_was_off_is_withdrawn_at_start() {
         "what a revoked key signed is judged again at start and withdrawn"
     );
 }
+
+/// The scan for values in pieces runs after every entry taken: a head it has
+/// settled is not read from the store again, or a space of many heads would
+/// hold its lock for a store read per head on every entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rescan_for_values_in_pieces_reads_no_head_it_has_settled() {
+    let mut dev = solo().await;
+    let held = Arc::new(Held::default());
+    dev.store = Arc::clone(&held) as Arc<dyn DataStore>;
+    let (node, _) = boot(&dev, cfg()).await;
+    let heap = node.create(&space(), public()).await.unwrap();
+    for i in 0..40 {
+        heap.put(&n(&format!("/path/{i}")), bytes("v"), durable(false))
+            .await
+            .unwrap();
+    }
+    let inner = node.inner.space_of(&space()).unwrap();
+    assert!(inner.unassembled(&node.inner).is_empty());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let before = held.gets();
+    assert!(inner.unassembled(&node.inner).is_empty());
+    assert_eq!(
+        held.gets(),
+        before,
+        "the second scan read the entries of heads the first had settled"
+    );
+}

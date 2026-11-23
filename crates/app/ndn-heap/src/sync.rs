@@ -174,11 +174,11 @@ pub(crate) trait Host: Send + Sync + 'static {
     /// are not all held: what is fetched at open and asked again while owed.
     fn blobs(&self, space: &Name) -> Vec<Blob>;
 
-    /// All the pieces of entry `id` arrived and proved: write them as one
+    /// All the pieces of `blob`'s entry arrived and proved: write them as one
     /// batch and make the value readable. `payload` is the (sealed, if
     /// sealed) value the proven chunks carry, so that telling the watchers
     /// reads nothing back from the store.
-    fn assembled(&self, space: &Name, id: &EntryId, ops: Vec<StoreOp>, payload: Vec<u8>);
+    fn assembled(&self, space: &Name, blob: &Blob, ops: Vec<StoreOp>, payload: Vec<u8>);
 
     // -- grants, reader side ----------------------------------------------------
 

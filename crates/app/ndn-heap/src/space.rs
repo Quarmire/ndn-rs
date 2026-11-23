@@ -223,8 +223,11 @@ pub(crate) struct SpaceInner {
     pub(crate) closing: AtomicBool,
     /// Own structural entries not yet covered by a flush: not served.
     held_back: Mutex<Vec<(u64, Ticket)>>,
-    /// Entries of this space whose pieces are known to be whole here.
+    /// Entries of this space whose value is in hand here: inline, or in
+    /// pieces that are whole. What [`Self::unassembled`] need not read again.
     whole: Mutex<HashSet<EntryId>>,
+    /// Held for the length of one [`Self::unassembled`] scan.
+    scan: Mutex<()>,
     /// Alerts that stay true (evidence of rollback, of equivocation): a
     /// watcher that begins later is told them after the heads.
     standing: Mutex<Vec<Alert>>,
@@ -235,6 +238,10 @@ pub(crate) struct SpaceInner {
 
 /// The most standing alerts a space keeps for watchers that begin later.
 const STANDING_MAX: usize = 32;
+
+/// How many heads' entries one scan for values in pieces reads while it holds
+/// the space's lock; the lock is let go between batches.
+const HEADS_PER_READ: usize = 256;
 
 /// The most refused entries a space remembers having told.
 const REFUSED_MAX: usize = 256;
@@ -289,6 +296,7 @@ impl SpaceInner {
             closing: AtomicBool::new(false),
             held_back: Mutex::new(Vec::new()),
             whole: Mutex::new(HashSet::new()),
+            scan: Mutex::new(()),
             standing: Mutex::new(Vec::new()),
             refused: Mutex::new(VecDeque::new()),
         }
@@ -682,11 +690,11 @@ impl SpaceInner {
     fn tell_blob(&self, blob: &Blob, bytes: Bytes, only: Option<Arc<Queue>>) {
         let change = {
             let log = self.log.lock();
-            let Some((path, head)) = log
-                .register()
-                .values()
-                .find(|(_, h)| EntryId::from(&h.entry) == blob.id)
-            else {
+            let Some((path, head)) = log.register().values().find(|(_, h)| {
+                h.entry.seq == blob.id.seq
+                    && h.entry.digest == blob.id.digest
+                    && h.entry.device == blob.id.device
+            }) else {
                 return;
             };
             Change::Put(head.item(path, bytes))
@@ -697,40 +705,57 @@ impl SpaceInner {
         }
     }
 
-    /// The pieces of `id` arrived whole: write them as one batch and tell,
+    /// The pieces of `blob` arrived whole: write them as one batch and tell,
     /// with `payload` (what the proven chunks carry): nothing is read back.
     pub(crate) fn assembled(
         self: &Arc<Self>,
         node: &Arc<NodeInner>,
-        id: &EntryId,
+        blob: &Blob,
         ops: Vec<ndn_sync::StoreOp>,
         payload: Vec<u8>,
     ) {
         node.stage.apply(ops);
         node.flusher.note_write();
-        let blob = {
-            let log = self.log.lock();
-            let found = log.items().1;
-            found.into_iter().find(|b| b.id == *id)
-        };
-        let Some(blob) = blob else {
-            return;
-        };
-        if let Ok(key) = self.blob_key(&blob)
-            && let Ok(bytes) = self.open_blob(&blob, key, payload)
+        if let Ok(key) = self.blob_key(blob)
+            && let Ok(bytes) = self.open_blob(blob, key, payload)
         {
-            self.tell_blob(&blob, bytes, None);
+            self.tell_blob(blob, bytes, None);
         }
     }
 
-    /// The blob heads whose pieces are not all held here.
+    /// The blob heads whose pieces are not all held here. A head found
+    /// inline or whole is remembered ([`Self::whole`]), so a later scan reads
+    /// the entries of the heads it has not seen and no others: the scan runs
+    /// after every entry taken, and one that read every head's entry from
+    /// the store would hold the space's lock for as long as the space is
+    /// large. The reads are made in batches, the lock let go between them,
+    /// and one scan runs at a time: a second begun meanwhile would read the
+    /// heads the first is about to settle.
     pub(crate) fn unassembled(&self, node: &NodeInner) -> Vec<Blob> {
-        let heads = self.log.lock().items().1;
-        heads
-            .into_iter()
-            .filter(|b| !self.whole.lock().contains(&b.id))
-            .filter(|b| self.read_blob(node, b).is_err())
-            .collect()
+        let _scan = self.scan.lock();
+        let pending = {
+            let log = self.log.lock();
+            let mut seen = self.whole.lock();
+            // Superseded heads leave the set only when it outgrows the heads.
+            if seen.len() > 2 * log.register().head_count() + HEADS_PER_READ {
+                seen.clear();
+            }
+            log.unsettled_heads(&seen)
+        };
+        let mut owed = Vec::new();
+        for batch in pending.chunks(HEADS_PER_READ) {
+            let kinds = self.log.lock().payload_kinds(batch);
+            let mut inline = Vec::new();
+            for (id, kind) in batch.iter().zip(kinds) {
+                match kind {
+                    Some(None) => inline.push(id.clone()),
+                    Some(Some(blob)) if self.read_blob(node, &blob).is_err() => owed.push(blob),
+                    Some(Some(_)) | None => {}
+                }
+            }
+            self.whole.lock().extend(inline);
+        }
+        owed
     }
 
     /// Say a blob this node wrote is whole (its pieces went in its batch).

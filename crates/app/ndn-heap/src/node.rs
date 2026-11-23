@@ -1157,9 +1157,9 @@ impl Host for NodeInner {
             .map_or_else(Vec::new, |s| s.unassembled(self))
     }
 
-    fn assembled(&self, space: &Name, id: &EntryId, ops: Vec<StoreOp>, payload: Vec<u8>) {
+    fn assembled(&self, space: &Name, blob: &Blob, ops: Vec<StoreOp>, payload: Vec<u8>) {
         if let Some(held) = self.space_of(space) {
-            held.assembled(&self.arc(), id, ops, payload);
+            held.assembled(&self.arc(), blob, ops, payload);
         }
     }
 

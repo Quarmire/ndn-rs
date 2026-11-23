@@ -688,7 +688,7 @@ impl Group {
                 break;
             }
             if let Some((payload, ops)) = assembler.payload().zip(assembler.take_ops()) {
-                host.assembled(&self.space, &blob.id, ops, payload);
+                host.assembled(&self.space, &blob, ops, payload);
                 break;
             }
             let wanted = assembler.next_wanted(self.shared.cfg.window.max(1));

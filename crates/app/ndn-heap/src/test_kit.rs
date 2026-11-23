@@ -229,12 +229,13 @@ impl DataStore for CrashStore {
 }
 
 /// A memory store whose `sync` waits while it is held, and that counts its
-/// batches and syncs.
+/// batches, gets and syncs.
 #[derive(Default)]
 pub(crate) struct Held {
     inner: MemoryStore,
     gate: Gate,
     batches: AtomicUsize,
+    gets: AtomicUsize,
     syncs: AtomicUsize,
 }
 
@@ -249,6 +250,11 @@ impl Held {
         self.batches.load(Ordering::SeqCst)
     }
 
+    /// Calls of `get`.
+    pub(crate) fn gets(&self) -> usize {
+        self.gets.load(Ordering::SeqCst)
+    }
+
     /// Calls of `sync` that began.
     pub(crate) fn syncs_started(&self) -> usize {
         self.syncs.load(Ordering::SeqCst)
@@ -261,6 +267,7 @@ impl DataStore for Held {
     }
 
     fn get(&self, name: &Name) -> Option<Bytes> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
         self.inner.get(name)
     }
 

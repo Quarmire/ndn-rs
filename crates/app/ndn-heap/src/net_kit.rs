@@ -475,10 +475,10 @@ impl Host for Toyhost {
         self.st.lock().blobs_owed.clone()
     }
 
-    fn assembled(&self, _space: &Name, id: &EntryId, ops: Vec<StoreOp>, _payload: Vec<u8>) {
+    fn assembled(&self, _space: &Name, blob: &Blob, ops: Vec<StoreOp>, _payload: Vec<u8>) {
         let mut st = self.st.lock();
-        st.blobs_owed.retain(|b| b.id != *id);
-        st.assembled.push((id.clone(), ops));
+        st.blobs_owed.retain(|b| b.id != blob.id);
+        st.assembled.push((blob.id.clone(), ops));
     }
 
     fn owed_keys(&self, _space: &Name) -> Vec<EpochId> {

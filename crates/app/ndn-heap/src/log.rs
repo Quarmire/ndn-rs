@@ -736,6 +736,41 @@ impl Log {
         (items, blobs)
     }
 
+    /// The entries of the winning heads that are not in `seen`: references
+    /// only, nothing is read from the store (what each carries is
+    /// [`Self::payload_kinds`], read in batches by the caller).
+    pub(crate) fn unsettled_heads(
+        &self,
+        seen: &std::collections::HashSet<EntryId>,
+    ) -> Vec<EntryId> {
+        self.register
+            .values()
+            .map(|(_, head)| EntryId::from(&head.entry))
+            .filter(|id| !seen.contains(id))
+            .collect()
+    }
+
+    /// What each of the entries `heads` carries, in order: `Some(None)` an
+    /// inline value, `Some(Some(blob))` a value in pieces, `None` when the
+    /// entry is not readable now (not held, or not applied).
+    pub(crate) fn payload_kinds(&self, heads: &[EntryId]) -> Vec<Option<Option<Blob>>> {
+        let view = self.view();
+        heads
+            .iter()
+            .map(|id| {
+                view.payload_of(&EntryRef::from(id))
+                    .map(|payload| match payload {
+                        Payload::Inline(_) => None,
+                        Payload::Blob { size, root } => Some(Blob {
+                            id: id.clone(),
+                            size,
+                            root,
+                        }),
+                    })
+            })
+            .collect()
+    }
+
     /// The winning head of `path` when its payload is a blob (assembled by
     /// the pieces layer); `None` for an inline value, a removal or no head.
     pub(crate) fn blob_head(&self, path: &Name) -> Option<Blob> {
