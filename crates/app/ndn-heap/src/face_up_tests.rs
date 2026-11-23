@@ -184,7 +184,11 @@ async fn a_flapping_link_announces_a_group_at_most_once_a_second() {
     assert_eq!(rig.told(), 1, "within the second of the first route: one");
     pass(Duration::from_secs(3)).await;
     let times = rig.times();
-    assert_eq!(times.len(), 2, "two announcements for the flapping: {times:?}");
+    assert_eq!(
+        times.len(),
+        2,
+        "two announcements for the flapping: {times:?}"
+    );
     assert_eq!(times[0], Duration::ZERO);
     assert_eq!(
         times[1], EVERY,
@@ -240,9 +244,7 @@ async fn a_subscriber_that_missed_routes_announces_every_group_joined() {
 
 /// 300 groups joined.
 fn many() -> Vec<Name> {
-    (0..300)
-        .map(|i| n(&format!("/g{i}/32=sync/s")))
-        .collect()
+    (0..300).map(|i| n(&format!("/g{i}/32=sync/s"))).collect()
 }
 
 /// What `trigger` (a batch of routes that covers every group) sends: at most
@@ -268,7 +270,10 @@ async fn capped_then_all_told(rig: Rig, trigger: impl FnOnce(&Rig)) {
     assert_eq!(distinct.len(), 300, "each group once");
     let times = rig.times();
     for at in &times {
-        let within = times.iter().filter(|t| *t >= at && **t < *at + EVERY).count();
+        let within = times
+            .iter()
+            .filter(|t| *t >= at && **t < *at + EVERY)
+            .count();
         assert!(
             within <= TOTAL_PER_SECOND,
             "{within} announcements within a second from {at:?}, at most {TOTAL_PER_SECOND} expected"
@@ -310,7 +315,11 @@ async fn a_stopped_face_up_announces_nothing_more() {
     pass(Duration::from_millis(10)).await;
     rig.up("/alice");
     pass(Duration::from_millis(10)).await;
-    assert_eq!(rig.told(), 1, "the second one waits for the end of the second");
+    assert_eq!(
+        rig.told(),
+        1,
+        "the second one waits for the end of the second"
+    );
     rig.face_up.stop();
     pass(Duration::from_secs(5)).await;
     assert_eq!(rig.told(), 1, "the waiting announcement was never made");
@@ -324,18 +333,130 @@ async fn a_stopped_face_up_announces_nothing_more() {
 #[tokio::test(start_paused = true)]
 async fn a_connection_that_tells_no_routes_announces_nothing() {
     let told: Arc<Mutex<usize>> = Arc::default();
-    let face_up = FaceUp::spawn(
-        Arc::new(Mute) as Arc<dyn Connection>,
-        || vec![n(NOTES)],
-        {
+    let face_up = FaceUp::spawn(Arc::new(Mute) as Arc<dyn Connection>, || vec![n(NOTES)], {
+        let told = Arc::clone(&told);
+        move |_| {
             let told = Arc::clone(&told);
-            move |_| {
-                let told = Arc::clone(&told);
-                async move { *told.lock() += 1 }.boxed()
-            }
-        },
-    );
+            async move { *told.lock() += 1 }.boxed()
+        }
+    });
     pass(Duration::from_secs(5)).await;
     assert_eq!(*told.lock(), 0);
     drop(face_up);
+}
+
+/// The gate alone, over instants the case chooses.
+mod gate {
+    use super::*;
+
+    fn notes() -> Name {
+        n(NOTES)
+    }
+
+    /// The first route up is announced at once; the ones after it within the
+    /// second wait for its end, once, whatever their number; a route after
+    /// that second is announced at once again.
+    #[test]
+    fn the_first_is_at_once_a_later_one_waits_for_the_end_of_the_second() {
+        let mut gate = Gate::default();
+        let t0 = Instant::now();
+        assert_eq!(gate.ask(t0, &notes()), Verdict::Now);
+        assert_eq!(
+            gate.ask(t0 + Duration::from_millis(100), &notes()),
+            Verdict::After(Duration::from_millis(900)),
+            "the end of the second since the last"
+        );
+        for ms in [200, 300, 800] {
+            assert_eq!(
+                gate.ask(t0 + Duration::from_millis(ms), &notes()),
+                Verdict::Waiting,
+                "{ms} ms: the waiting announcement tells it too"
+            );
+        }
+        assert_eq!(
+            gate.due(t0 + Duration::from_secs(1), &notes()),
+            None,
+            "announced"
+        );
+        assert_eq!(
+            gate.due(t0 + Duration::from_secs(1), &notes()),
+            Some(EVERY),
+            "once: the group's second began again with that announcement"
+        );
+        assert_eq!(
+            gate.ask(t0 + Duration::from_millis(1500), &notes()),
+            Verdict::After(Duration::from_millis(500)),
+            "the second restarts from the announcement that waited"
+        );
+        assert_eq!(gate.due(t0 + Duration::from_millis(2000), &notes()), None);
+        assert_eq!(
+            gate.ask(t0 + Duration::from_millis(3100), &notes()),
+            Verdict::Now,
+            "a route after a quiet second"
+        );
+    }
+
+    /// Each group has its second.
+    #[test]
+    fn groups_are_gated_apart() {
+        let mut gate = Gate::default();
+        let t0 = Instant::now();
+        assert_eq!(gate.ask(t0, &notes()), Verdict::Now);
+        assert_eq!(gate.ask(t0, &n(DOCS)), Verdict::Now);
+        assert!(matches!(gate.ask(t0, &notes()), Verdict::After(_)));
+        assert!(matches!(gate.ask(t0, &n(DOCS)), Verdict::After(_)));
+    }
+
+    /// However many groups a batch covers, no second has more than
+    /// [`TOTAL_PER_SECOND`] announcements, and every group is announced by
+    /// the end: the deferred ones wait for room, none are dropped.
+    #[test]
+    fn the_total_of_a_second_is_capped_and_every_group_still_announced() {
+        let mut gate = Gate::default();
+        let t0 = Instant::now();
+        let groups = many();
+        let mut announced: Vec<(Duration, Name)> = Vec::new();
+        let mut waits: Vec<(Duration, Name)> = Vec::new();
+        for g in &groups {
+            match gate.ask(t0, g) {
+                Verdict::Now => announced.push((Duration::ZERO, g.clone())),
+                Verdict::After(w) => waits.push((w, g.clone())),
+                Verdict::Waiting => panic!("{g}: no group is waiting yet"),
+            }
+        }
+        assert_eq!(announced.len(), TOTAL_PER_SECOND, "the first second's room");
+        assert_eq!(waits.len(), 300 - TOTAL_PER_SECOND);
+        // Each waiter wakes at its time and asks again, in the order of the
+        // wakes (the order they were deferred in), until told to announce.
+        let mut queue: std::collections::BinaryHeap<std::cmp::Reverse<(Duration, usize, Name)>> =
+            waits
+                .into_iter()
+                .enumerate()
+                .map(|(i, (w, g))| std::cmp::Reverse((w, i, g)))
+                .collect();
+        while let Some(std::cmp::Reverse((at, i, g))) = queue.pop() {
+            match gate.due(t0 + at, &g) {
+                None => announced.push((at, g)),
+                Some(again) => queue.push(std::cmp::Reverse((at + again, i, g))),
+            }
+        }
+        assert_eq!(announced.len(), 300, "none dropped");
+        let distinct: BTreeSet<&Name> = announced.iter().map(|(_, g)| g).collect();
+        assert_eq!(distinct.len(), 300, "each once");
+        for (at, _) in &announced {
+            let within = announced
+                .iter()
+                .filter(|(t, _)| *t >= *at && *t < *at + EVERY)
+                .count();
+            assert!(
+                within <= TOTAL_PER_SECOND,
+                "{within} announcements within a second from {at:?}, at most {TOTAL_PER_SECOND} expected"
+            );
+        }
+        let last = announced.iter().map(|(t, _)| *t).max().unwrap();
+        assert!(
+            last <= Duration::from_secs((300 / TOTAL_PER_SECOND) as u64 + 1),
+            "all announced by {last:?}: well within the group's period of half a minute"
+        );
+    }
 }

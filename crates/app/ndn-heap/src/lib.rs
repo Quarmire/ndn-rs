@@ -18,7 +18,6 @@ mod rt;
 mod wire;
 
 mod error;
-#[cfg(feature = "wip-face-up")]
 mod face_up;
 #[cfg(feature = "wip-fetch")]
 mod fetch;
