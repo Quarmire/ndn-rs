@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::future::{Either, join_all, select};
+use futures::future::{join_all, select};
 use ndn_app::{AppError, Connection, Consumer};
 use ndn_foundation_types::Name;
 use ndn_packet::encode::InterestBuilder;
@@ -605,7 +605,7 @@ impl Group {
                 // close, a restart over the same store) takes nothing: what
                 // it wrote now would be unknown to the log that opens the
                 // store next.
-                Ok(_) if self.stop.is_stopped() => None,
+                Ok(_) if self.stop.is_cancelled() => None,
                 Ok(wire) => {
                     // A cut names its bytes: others are not handed to the
                     // log, and the next source is asked.
@@ -693,7 +693,7 @@ impl Group {
         // that proved nothing (the pause grows with them).
         let (mut turns, mut idle) = (0u32, 0u32);
         loop {
-            if self.stop.is_stopped() {
+            if self.stop.is_cancelled() {
                 break;
             }
             let turn = self.shared.fetcher.assembly_turn().await;
@@ -736,7 +736,7 @@ impl Group {
         };
         let mut progressed = false;
         loop {
-            if self.stop.is_stopped() {
+            if self.stop.is_cancelled() {
                 return Gathered::Refused;
             }
             if assembler.is_complete() {
@@ -800,7 +800,7 @@ impl Group {
         };
         let mut misses = 0u32;
         'rounds: loop {
-            if self.stop.is_stopped() || !host.owed_keys(&self.space).contains(&epoch) {
+            if self.stop.is_cancelled() || !host.owed_keys(&self.space).contains(&epoch) {
                 break;
             }
             let granters = self
@@ -929,26 +929,26 @@ enum OwnState {
 /// The pump of one group: look at what the log wants whenever woken, and when
 /// an ask pauses, when its pause ends.
 pub(crate) async fn run(group: Arc<Group>) {
-    loop {
-        if group.stop.is_stopped() {
-            return;
-        }
+    while !group.stop.is_cancelled() {
         group.note_own();
         let mut wait = group.pump();
         if group.observes() {
             wait = Some(wait.map_or(OWN_POLL * 20, |w| w.min(OWN_POLL * 20)));
         }
-        let woken = pin!(group.wake.notified());
         let timer = pin!(async {
             match wait {
                 Some(d) => rt::sleep(d).await,
                 None => futures::future::pending().await,
             }
         });
-        let stopped = pin!(group.stop.stopped());
-        match select(woken, select(timer, stopped)).await {
-            Either::Left(_) | Either::Right((Either::Left(_), _)) => {}
-            Either::Right((Either::Right(_), _)) => return,
+        let woken = pin!(group.wake.notified());
+        if group
+            .stop
+            .run_until_cancelled(select(woken, timer))
+            .await
+            .is_none()
+        {
+            return;
         }
     }
 }

@@ -10,13 +10,11 @@
 //! answers what the log says it may serve.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::FutureExt;
-use futures::future::{Either, select};
 use ndn_app::Connection;
 use ndn_foundation_types::Name;
 use ndn_packet::Interest;
@@ -25,6 +23,7 @@ use ndn_sync::{
 };
 use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::HeapError;
 use crate::face_up::FaceUp;
@@ -73,40 +72,6 @@ pub(crate) type HostRef = Arc<crate::node::NodeInner>;
 #[cfg(test)]
 pub(crate) type HostRef = Arc<dyn net_kit::Host>;
 
-// -- Stopping --------------------------------------------------------------------------------------
-
-/// A flag tasks watch, and a way to wake them to see it.
-#[derive(Default)]
-pub(crate) struct Stop {
-    flag: AtomicBool,
-    wake: Notify,
-}
-
-impl Stop {
-    /// Stop, now and for good.
-    pub(crate) fn stop(&self) {
-        self.flag.store(true, Ordering::Relaxed);
-        self.wake.notify_waiters();
-        self.wake.notify_one();
-    }
-
-    /// Whether it was stopped.
-    pub(crate) fn is_stopped(&self) -> bool {
-        self.flag.load(Ordering::Relaxed)
-    }
-
-    /// Return once stopped.
-    pub(crate) async fn stopped(&self) {
-        loop {
-            let woken = self.wake.notified();
-            if self.is_stopped() {
-                return;
-            }
-            woken.await;
-        }
-    }
-}
-
 // -- What the half shares ----------------------------------------------------------------------------
 
 /// What every group and the server share: the node, its tuning, its fetching
@@ -132,7 +97,7 @@ pub(crate) struct Net {
     /// The names of the sync groups joined, what the face-up announcement
     /// lists.
     names: Arc<Mutex<BTreeSet<Name>>>,
-    stop: Arc<Stop>,
+    stop: CancellationToken,
     face_up: FaceUp,
 }
 
@@ -150,13 +115,11 @@ impl Net {
         let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
         let svs = Arc::new(spawn_multi_svs(host.device().clone(), out_tx, in_rx));
-        let stop = Arc::new(Stop::default());
+        let stop = CancellationToken::new();
         {
-            let (sync, stop) = (Arc::clone(&sync), Arc::clone(&stop));
+            let (sync, stop) = (Arc::clone(&sync), stop.clone());
             rt::spawn(async move {
-                while let Either::Left((Some(packet), _)) =
-                    select(pin!(out_rx.recv()), pin!(stop.stopped())).await
-                {
+                while let Some(Some(packet)) = stop.run_until_cancelled(out_rx.recv()).await {
                     if sync.send(packet).await.is_err() {
                         break;
                     }
@@ -164,11 +127,9 @@ impl Net {
             });
         }
         {
-            let (sync, stop) = (Arc::clone(&sync), Arc::clone(&stop));
+            let (sync, stop) = (Arc::clone(&sync), stop.clone());
             rt::spawn(async move {
-                while let Either::Left((Some(packet), _)) =
-                    select(pin!(sync.recv()), pin!(stop.stopped())).await
-                {
+                while let Some(Some(packet)) = stop.run_until_cancelled(sync.recv()).await {
                     if Interest::decode(packet.clone()).is_ok() && in_tx.send(packet).await.is_err()
                     {
                         break;
@@ -284,7 +245,7 @@ impl Net {
             heard_any: AtomicBool::new(false),
             relist: AtomicBool::new(true),
             own_seen: AtomicU64::new(0),
-            stop: Stop::default(),
+            stop: self.stop.child_token(),
             svs: Arc::clone(&self.svs),
             observed: handle.observed_shared(),
         });
@@ -299,7 +260,7 @@ impl Net {
     pub(crate) async fn leave(&self, space: &Name) {
         let group = self.groups.lock().remove(space);
         if let Some(group) = group {
-            group.stop.stop();
+            group.stop.cancel();
             self.names.lock().remove(&group.group);
             self.svs.leave(group.group.clone()).await;
         }
@@ -320,10 +281,7 @@ impl Net {
 
     /// Stop the driver, every group and the announcement at once. Idempotent.
     pub(crate) fn shutdown(&self) {
-        self.stop.stop();
-        for group in self.groups.lock().values() {
-            group.stop.stop();
-        }
+        self.stop.cancel();
         self.face_up.stop();
         self.svs.shutdown();
     }
@@ -361,7 +319,7 @@ pub(crate) struct Group {
     pub(crate) heard_any: AtomicBool,
     /// List the values owed their pieces again.
     pub(crate) relist: AtomicBool,
-    pub(crate) stop: Stop,
+    pub(crate) stop: CancellationToken,
     svs: Arc<MultiSvs>,
     observed: Option<Arc<ObservedState>>,
     /// The highest counter of this device's own name the group's carriage
@@ -493,9 +451,7 @@ impl FlushSink for Sink {
 
 /// The notices of a group, until it is left or the driver stops.
 async fn notices(group: Arc<Group>, mut handle: SyncHandle) {
-    while let Either::Left((Some(update), _)) =
-        select(pin!(handle.recv()), pin!(group.stop.stopped())).await
-    {
+    while let Some(Some(update)) = group.stop.run_until_cancelled(handle.recv()).await {
         group.on_update(update);
     }
 }

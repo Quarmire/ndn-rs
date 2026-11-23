@@ -27,6 +27,8 @@ zeroize      = "1"
 getrandom    = { workspace = true }
 tracing      = { workspace = true }
 web-time     = { workspace = true }
+# Tasks end with a cancellation token (`Net`, `Group`).
+tokio-util   = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ndn-packet = { workspace = true, features = ["std"] }
@@ -51,7 +53,6 @@ ndn-engine = { workspace = true }
 # `sync_group::carry` runs a namespace's sync group on the cluster's engine;
 # the devices' faces end with their cancellation token.
 ndn-namespace = { workspace = true }
-tokio-util    = { workspace = true }
 
 [lints]
 workspace = true
