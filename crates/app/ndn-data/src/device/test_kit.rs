@@ -109,12 +109,19 @@ pub(super) struct Made {
 /// Entry `seq` of `device` about `c` carrying `record`, signed (unchecked)
 /// by the device's key.
 pub(super) fn made(device: &str, c: &Name, seq: u64, record: Record) -> Made {
+    made_with(device, c, seq, record, 0)
+}
+
+/// [`made`] with the signature value `value × 64`: another packet that
+/// signed the same thing (what a malleable signature leaves: the signed
+/// region, hence [`wire::signed_digest`], is the same).
+pub(super) fn made_with(device: &str, c: &Name, seq: u64, record: Record, value: u8) -> Made {
     let name = log_name(&n(device), Some(c), seq);
     let key = key(device);
     let packet = DataBuilder::new(name.clone(), &wire::encode_record(&record)).sign_sync(
         ndn_packet::SignatureType::SignatureEd25519,
         Some(&key),
-        |_| Bytes::from_static(&[0; 64]),
+        |_| Bytes::from(vec![value; 64]),
     );
     Made {
         name,

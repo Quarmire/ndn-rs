@@ -79,7 +79,7 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use crate::collection::{self, Accepted, Child, Cut, Epoch, Members, Resolve, Rule, Summary};
 use crate::error::{DataError, Refusal};
 use crate::layer::{Age, Answer, Change, Changes, DataLayer, Equivocal, Got, PutOptions, State};
-use crate::merge::{self, MergeState, Op, Past};
+use crate::merge::{self, MergeState, NoOps, Op, Ops, Past};
 use crate::pieces::{self, Shape};
 use crate::rt::{self, Instant};
 use crate::seal::{self, Keys};
@@ -273,8 +273,12 @@ struct HeldVersion {
     /// pieces).
     op: Bytes,
     wire: Bytes,
-    /// The implicit digest of `wire`: the version's content address.
+    /// The implicit digest of `wire`: the version's content address, what a
+    /// child names it by.
     digest: [u8; 32],
+    /// The digest of what its key signed ([`wire::signed_digest`]): the same
+    /// on every copy of the packet, the register's tie-break.
+    signed: [u8; 32],
     /// Whether its payload came sealed.
     sealed: bool,
     /// The epoch its payload is sealed in.
@@ -299,8 +303,10 @@ impl HeldVersion {
         epoch: Option<Epoch>,
         chunks: Option<ChunksBody>,
     ) -> Self {
+        let signed = wire::signed_digest(&wire).unwrap_or(version.digest);
         HeldVersion {
             digest: version.digest,
+            signed,
             version,
             op,
             wire,
@@ -321,11 +327,27 @@ impl HeldVersion {
             op: Bytes::new(),
             wire: self.wire.clone(),
             digest: self.digest,
+            signed: self.signed,
             sealed: self.sealed,
             epoch: self.epoch.clone(),
             chunks: self.chunks,
             opened: false,
         })
+    }
+
+    /// This version opened, `op` its operation read from its pieces.
+    fn with_op(&self, op: Bytes) -> Self {
+        HeldVersion {
+            version: self.version.clone(),
+            op,
+            wire: self.wire.clone(),
+            digest: self.digest,
+            signed: self.signed,
+            sealed: self.sealed,
+            epoch: self.epoch.clone(),
+            chunks: self.chunks,
+            opened: true,
+        }
     }
 }
 
@@ -660,6 +682,23 @@ struct Coll {
     /// rebuilt, so an arrival costs no scan of every waiting version's
     /// pieces.
     unwhole: BTreeSet<VersionId>,
+    /// Per version, the other packets of its name this device has seen
+    /// beside the one it holds, and whether each signed the same thing (a
+    /// copy in another signature value: ECDSA's `S` and `n - S`) or another
+    /// ([`Wire`]): what a child naming the version by a packet this device
+    /// does not hold is judged by.
+    wires: HashMap<VersionId, Vec<Wire>>,
+    /// The packets pending versions name as parents that this device holds
+    /// another packet of (parent, implicit digest of the packet named): asked
+    /// for by full name ([`St::wanted_wires`]) until one verifies.
+    wants: BTreeSet<(VersionId, [u8; 32])>,
+}
+
+/// Another packet seen at the name of a version held: its implicit digest,
+/// and whether it signed what the held one did.
+struct Wire {
+    digest: [u8; 32],
+    same: bool,
 }
 
 /// What an own version carries, before it is signed.
@@ -701,6 +740,7 @@ impl Coll {
             locked: &self.locked,
             revoked: &self.revoked,
             admitted: &self.versions,
+            wires: &self.wires,
         }
     }
 
@@ -814,6 +854,10 @@ const READMIT_TRIES: u32 = 8;
 /// The first pause before a re-admitted entry is asked for again; each
 /// next pause doubles it.
 const READMIT_PAUSE: Duration = Duration::from_millis(500);
+/// How many other packets of one version's name are remembered
+/// ([`Coll::wires`]): its signature value has two malleable forms, and a
+/// signer that randomizes makes a new one each time it signs.
+const WIRES_MAX: usize = 8;
 /// How far beyond the last seq this device wrote an entry under its own
 /// name, signed by a copy of its key, is still taken — as every other
 /// reader takes it, evidence of the copy, never this device's own; one
@@ -1436,6 +1480,12 @@ struct St {
     /// Of those, how many fetches of each missed in a row: it is asked again
     /// after [`retry_pause`] of that, while it is still wanted (spec §17.1).
     piece_misses: HashMap<Name, u32>,
+    /// The packets of parents pending versions name that are being asked for
+    /// by full name, or waiting to be asked for again ([`St::wanted_wires`]):
+    /// (the parent's log entry name, the packet's implicit digest).
+    wiring: BTreeSet<(Name, [u8; 32])>,
+    /// Of those, how many asks of each missed in a row ([`retry_pause`]).
+    wire_misses: HashMap<(Name, [u8; 32]), u32>,
     /// The first log entry taken here at each seq of each key, of any
     /// collection and any kind: a key's log is one sequence (spec §4).
     seqs: HashMap<(Writer, u64), Name>,
@@ -1649,6 +1699,8 @@ struct Waits<'a> {
     revoked: &'a HashMap<Writer, Cut>,
     /// The versions admitted here.
     admitted: &'a BTreeMap<VersionId, Arc<HeldVersion>>,
+    /// The other packets seen at the names of versions held ([`Coll::wires`]).
+    wires: &'a HashMap<VersionId, Vec<Wire>>,
 }
 
 impl Waits<'_> {
@@ -1668,16 +1720,48 @@ impl Waits<'_> {
             && !self.admitted.contains_key(id)
     }
 
-    /// The implicit digest of the packet held here at `id`: admitted, or
-    /// held sealed and locked.
-    fn digest_of(&self, id: &VersionId) -> Option<[u8; 32]> {
-        self.admitted.get(id).map(|hv| hv.digest).or_else(|| {
+    /// Whether the packet `digest` (the implicit digest a child names its
+    /// parent `id` by) is what is held here at `id`: admitted, or held
+    /// sealed and locked.
+    fn names(&self, id: &VersionId, digest: &[u8; 32]) -> Packet {
+        let held = self.admitted.get(id).map(|hv| hv.digest).or_else(|| {
             self.locked
                 .iter()
                 .find(|l| l.writer == id.writer && l.seq == id.seq.0)
                 .map(|l| wire::implicit_digest(&l.wire))
-        })
+        });
+        let Some(held) = held else {
+            return Packet::NotHeld;
+        };
+        if held == *digest {
+            return Packet::Held;
+        }
+        match self
+            .wires
+            .get(id)
+            .and_then(|w| w.iter().find(|w| w.digest == *digest))
+        {
+            Some(w) if w.same => Packet::Held,
+            Some(_) => Packet::Another,
+            None => Packet::Unknown,
+        }
     }
+}
+
+/// Whether the packet a child names its parent by is the one held there
+/// ([`Waits::names`]).
+enum Packet {
+    /// No packet is held at the parent's name yet.
+    NotHeld,
+    /// The packet held, or another copy of it in another signature value:
+    /// the same signed version.
+    Held,
+    /// A packet that signed another thing at the parent's name, held as
+    /// evidence ([`Wire::same`]): its key signed two entries there.
+    Another,
+    /// Not seen here: another packet is held, and this one may be a copy of
+    /// it (asked for by its full name, [`St::wanted_wires`]) or nothing.
+    Unknown,
 }
 
 /// The seq of `y` that a version naming `(y, t)` among its parents needs
@@ -1818,14 +1902,42 @@ struct Signed {
 }
 
 /// Apply `held`, an own version, to `state` over `past`: the register's
-/// write.
-fn apply_own(state: &mut (dyn MergeState + 'static), held: &HeldVersion, past: &PastOf<'_>) {
+/// write. `ops` reads the operations of the versions applied before it.
+fn apply_own(
+    state: &mut (dyn MergeState + 'static),
+    held: &HeldVersion,
+    past: &PastOf<'_>,
+    ops: &dyn Ops,
+) {
     state.apply(&Op {
         id: &held.version.id,
-        digest: &held.digest,
+        signed: &held.signed,
         past,
         bytes: &held.op,
+        ops,
     });
+}
+
+/// The operations of the versions held in a collection, for the register
+/// to read the head that wins once the winner is superseded: an operation
+/// in memory, or one in pieces read from `store`.
+struct OpsOf<'a> {
+    versions: &'a BTreeMap<VersionId, Arc<HeldVersion>>,
+    store: &'a dyn DataStore,
+    keys: &'a Keys,
+}
+
+impl Ops for OpsOf<'_> {
+    fn op_of(&self, id: &VersionId) -> Option<Bytes> {
+        let hv = self.versions.get(id)?;
+        if hv.opened {
+            return Some(hv.op.clone());
+        }
+        match open_held(self.store, self.keys, hv) {
+            Opening::Opened(op) => Some(op),
+            _ => None,
+        }
+    }
 }
 
 /// What opening a version in pieces found.
@@ -1846,15 +1958,21 @@ enum Opening {
 /// manifest, and unsealed under its epoch's key from `keys` (looked for
 /// first: it costs no read of the pieces).
 fn open_held(store: &dyn DataStore, keys: &Keys, hv: &HeldVersion) -> Opening {
-    let Some(chunks) = hv.chunks else {
-        return Opening::Missing;
-    };
     let key = match &hv.epoch {
         Some(e) => match keys.key(&hv.version.collection, e) {
             Some(key) => Some(key),
             None => return Opening::NoKey,
         },
         None => None,
+    };
+    open_with(store, key.as_ref(), hv)
+}
+
+/// [`open_held`] with the key of its epoch in hand (`None`: it is not
+/// sealed).
+fn open_with(store: &dyn DataStore, key: Option<&ContentKey>, hv: &HeldVersion) -> Opening {
+    let Some(chunks) = hv.chunks else {
+        return Opening::Missing;
     };
     let name = &hv.version.name;
     if !piece_names(name, &chunks).all(|p| store.contains(&p)) {
@@ -1864,7 +1982,7 @@ fn open_held(store: &dyn DataStore, keys: &Keys, hv: &HeldVersion) -> Opening {
         return Opening::Missing;
     };
     let op = match key {
-        Some(key) => match seal::open_payload(&key, name, &payload) {
+        Some(key) => match seal::open_payload(key, name, &payload) {
             Some((_, op)) => op,
             None => return Opening::Bad,
         },
@@ -1874,6 +1992,34 @@ fn open_held(store: &dyn DataStore, keys: &Keys, hv: &HeldVersion) -> Opening {
         },
     };
     Opening::Opened(op)
+}
+
+/// A pending register version in pieces to open without holding the device's
+/// lock ([`St::open_jobs`]): reading and unsealing a payload of up to
+/// [`wire::PAYLOAD_MAX`] octets is work no other reader of the device waits
+/// behind.
+struct OpenJob {
+    collection: Name,
+    held: Arc<HeldVersion>,
+    /// The key of its epoch; `None` when it is not sealed.
+    key: Option<ContentKey>,
+}
+
+/// What each job opens to, outside the lock: the version's id, the digest of
+/// the packet that was opened (it is installed only over that packet), and
+/// the operation.
+fn open_jobs(store: &dyn DataStore, jobs: &[OpenJob]) -> Vec<(Name, VersionId, [u8; 32], Bytes)> {
+    jobs.iter()
+        .filter_map(|job| match open_with(store, job.key.as_ref(), &job.held) {
+            Opening::Opened(op) => Some((
+                job.collection.clone(),
+                job.held.version.id.clone(),
+                job.held.digest,
+                op,
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The folder a collection is in: its name but the last component.
@@ -1914,7 +2060,23 @@ struct Run<'a> {
     /// Pending versions in pieces found not whole ([`Coll::unwhole`]): not
     /// looked for again until their pieces arrive.
     unwhole: &'a mut BTreeSet<VersionId>,
+    /// The other packets seen at the names of versions held ([`Coll::wires`]).
+    wires: &'a HashMap<VersionId, Vec<Wire>>,
+    /// The packets pending versions name as parents that are not held
+    /// ([`Coll::wants`]).
+    wants: &'a mut BTreeSet<(VersionId, [u8; 32])>,
     out: Vec<Ran>,
+}
+
+/// What [`Run::parents_hold`] found of a version's parents.
+enum Hold {
+    /// Every parent that applies is held as the packet the version names.
+    Yes,
+    /// A parent that applies is not held yet.
+    Waits,
+    /// A parent is held as another packet than the one named: that packet
+    /// (parent, implicit digest) is asked for by its full name.
+    Wire(VersionId, [u8; 32]),
 }
 
 impl Run<'_> {
@@ -1927,6 +2089,7 @@ impl Run<'_> {
             locked: self.locked,
             revoked: self.revoked,
             admitted: self.versions,
+            wires: self.wires,
         }
     }
 
@@ -1966,6 +2129,16 @@ impl Run<'_> {
                 break;
             }
         }
+        // Only a packet a pending version still names is wanted.
+        let (versions, pending) = (&*self.versions, &*self.pending);
+        self.wants.retain(|(parent, digest)| {
+            pending.iter().filter_map(|p| versions.get(p)).any(|hv| {
+                hv.version
+                    .parents
+                    .tips()
+                    .any(|(y, t, d)| *y == parent.writer && t == parent.seq && d == Some(digest))
+            })
+        });
         self.out
     }
 
@@ -1999,17 +2172,24 @@ impl Run<'_> {
     }
 
     /// Whether each parent of `id` is held here as the very packet it names
-    /// (spec §5): `Ok(false)` while a parent that applies is not held yet.
-    /// A parent that never applies is no tip (it waits for what applies
-    /// below it). Refused for good when a parent carries no digest, or names
-    /// another packet than the one held at its writer and seq: every reader
-    /// holding the same packets decides alike, whatever order they arrived
-    /// in.
-    fn parents_hold(&self, id: &VersionId) -> Result<bool, Refusal> {
+    /// (spec §5): [`Hold::Waits`] while a parent that applies is not held
+    /// yet. A parent that never applies is no tip (it waits for what applies
+    /// below it). Refused for good when a parent carries no digest, or when
+    /// the packet it names is known to have signed another thing than the
+    /// one held at its writer and seq (the key signed two entries there: an
+    /// equivocation), whatever order the packets arrived in. A child naming
+    /// a packet that is not the one held is not refused for that alone: an
+    /// ECDSA signature value is malleable, so a relay may hand this reader
+    /// another copy of a parent than the one its writer signed. The packet
+    /// the child names is asked for by its full name ([`Hold::Wire`]); a
+    /// copy that signed the same thing is the same version, and one that
+    /// signed another is the evidence. No clock decides it.
+    fn parents_hold(&self, id: &VersionId) -> Result<Hold, Refusal> {
         let Some(hv) = self.versions.get(id) else {
-            return Ok(false);
+            return Ok(Hold::Waits);
         };
         let w = self.waits();
+        let mut asks = None;
         for (y, t, digest) in hv.version.parents.tips() {
             let parent = VersionId {
                 writer: y.clone(),
@@ -2026,21 +2206,24 @@ impl Run<'_> {
             if needed(&w, y, t.0) != t.0 {
                 continue;
             }
-            match w.digest_of(&parent) {
-                None => return Ok(false),
-                Some(held) if held != *digest => {
+            match w.names(&parent, digest) {
+                Packet::NotHeld => return Ok(Hold::Waits),
+                Packet::Held => {}
+                Packet::Another => {
                     return Err(Refusal::Parent {
                         parent,
-                        why: "the packet held there has another digest (its writer named a \
-                              packet that does not exist, or that key signed two packets at one \
-                              seq)"
+                        why: "the packet it names is not the one held there: that key signed two \
+                              different entries at one seq"
                             .into(),
                     });
                 }
-                Some(_) => {}
+                Packet::Unknown => asks = asks.or(Some((parent, *digest))),
             }
         }
-        Ok(true)
+        Ok(match asks {
+            Some((parent, digest)) => Hold::Wire(parent, digest),
+            None => Hold::Yes,
+        })
     }
 
     fn refuse(&mut self, id: &VersionId, why: Refusal) {
@@ -2056,7 +2239,10 @@ impl Run<'_> {
     }
 
     /// Open `id` if its payload is in pieces held whole. Whether it is
-    /// opened (`None`: not yet); refused when it does not open.
+    /// opened (`None`: not yet); refused when it does not open. A version
+    /// opened outside the lock ([`Inner::open_pieces`]) is open already; this
+    /// reads the pieces itself only where no such step ran (a state read
+    /// anew, a start).
     fn whole(&mut self, id: &VersionId) -> Option<bool> {
         let hv = self.versions.get(id)?;
         if hv.opened {
@@ -2064,16 +2250,7 @@ impl Run<'_> {
         }
         match open_held(self.store, self.keys, hv) {
             Opening::Opened(op) => {
-                let opened = HeldVersion {
-                    version: hv.version.clone(),
-                    op,
-                    wire: hv.wire.clone(),
-                    digest: hv.digest,
-                    sealed: hv.sealed,
-                    epoch: hv.epoch.clone(),
-                    chunks: hv.chunks,
-                    opened: true,
-                };
+                let opened = hv.with_op(op);
                 self.versions.insert(id.clone(), Arc::new(opened));
                 Some(true)
             }
@@ -2107,8 +2284,12 @@ impl Run<'_> {
         }
         let hv = Arc::clone(&self.versions[id]);
         match self.parents_hold(id) {
-            Ok(true) => {}
-            Ok(false) => return false,
+            Ok(Hold::Yes) => {}
+            Ok(Hold::Waits) => return false,
+            Ok(Hold::Wire(parent, digest)) => {
+                self.wants.insert((parent, digest));
+                return false;
+            }
             Err(why) => {
                 tracing::debug!(?id, %why, "refused");
                 self.refuse(id, why);
@@ -2125,13 +2306,20 @@ impl Run<'_> {
                 locked: self.locked,
                 revoked: self.revoked,
                 admitted: self.versions,
+                wires: self.wires,
             };
             let past = PastOf::new(&hv.version, waits);
+            let ops = OpsOf {
+                versions: self.versions,
+                store: self.store,
+                keys: self.keys,
+            };
             self.state.as_deref_mut().expect("a merge run").apply(&Op {
                 id,
-                digest: &hv.digest,
+                signed: &hv.signed,
                 past: &past,
                 bytes: &hv.op,
+                ops: &ops,
             });
         }
         self.pending.remove(id);
@@ -3063,6 +3251,8 @@ impl St {
             revoked,
             outsiders,
             unwhole,
+            wires,
+            wants,
             ..
         } = coll;
         let Some(members) = members.as_ref() else {
@@ -3100,6 +3290,8 @@ impl St {
                 pending,
                 outsiders,
                 unwhole,
+                wires,
+                wants,
                 out: Vec::new(),
             }
             .run();
@@ -3296,6 +3488,150 @@ impl St {
             },
         );
         false
+    }
+
+    /// Note another packet of the version held at `name`, with implicit
+    /// digest `digest`: it signed what the held one did (`same`: a copy in
+    /// another signature value) or another thing. A pending version that
+    /// names the version by it is judged again ([`Run::parents_hold`]).
+    fn note_wire(&mut self, name: &Name, digest: [u8; 32], same: bool) {
+        let Some(c) = parse_log_name(name).and_then(|l| l.subject) else {
+            return;
+        };
+        let held = self.held.get(name);
+        let Some(coll) = self.colls.get_mut(&c) else {
+            return;
+        };
+        let found = match held {
+            Some(Held::Version(id)) => coll.versions.get(id).map(|hv| (id.clone(), hv.digest)),
+            Some(Held::Locked) => coll.locked.iter().find(|l| l.name == *name).map(|l| {
+                let id = VersionId {
+                    writer: l.writer.clone(),
+                    seq: Seq(l.seq),
+                };
+                (id, wire::implicit_digest(&l.wire))
+            }),
+            _ => None,
+        };
+        let Some((id, held)) = found else {
+            return;
+        };
+        let wires = coll.wires.entry(id.clone()).or_default();
+        if held == digest || wires.iter().any(|w| w.digest == digest) || wires.len() >= WIRES_MAX {
+            return;
+        }
+        wires.push(Wire { digest, same });
+        if coll.wants.contains(&(id, digest)) {
+            self.apply_ready(&c, &BTreeSet::new());
+        }
+    }
+
+    /// The packets pending versions of `c` name as parents that this device
+    /// holds another packet of, not asked for already: (the parent's log
+    /// entry name, the implicit digest of the packet named). Each is asked
+    /// for by its full name ([`Inner::spawn_wires`]): if it signed what the
+    /// one held did, it is the same version; if another thing, the child is
+    /// refused.
+    fn wanted_wires(&mut self, only: Option<&Name>) -> Vec<(Name, [u8; 32])> {
+        let mut asks = Vec::new();
+        for (c, coll) in &self.colls {
+            if only.is_some_and(|only| only != c) {
+                continue;
+            }
+            for (parent, digest) in &coll.wants {
+                let Some(device) = device_of(parent.writer.key()) else {
+                    continue;
+                };
+                let ask = (log_name(&device, Some(c), parent.seq.0), *digest);
+                if !self.wiring.contains(&ask) {
+                    asks.push(ask);
+                }
+            }
+        }
+        self.wiring.extend(asks.iter().cloned());
+        asks
+    }
+
+    /// Whether a pending version still names the packet `digest` as its
+    /// parent at the log entry `name`, which is not the one held
+    /// ([`Coll::wants`]).
+    fn wants_wire(&self, name: &Name, digest: &[u8; 32]) -> bool {
+        let Some(log) = parse_log_name(name) else {
+            return false;
+        };
+        log.subject
+            .and_then(|c| self.colls.get(&c))
+            .is_some_and(|coll| {
+                coll.wants.iter().any(|(parent, d)| {
+                    d == digest
+                        && parent.seq.0 == log.seq
+                        && device_of(parent.writer.key()).as_ref() == Some(&log.device)
+                })
+            })
+    }
+
+    /// The pending register versions in pieces, under `under` (a collection,
+    /// or a folder's), to open now: only `version` if given; each with the key
+    /// of its epoch, `granted` (an epoch's key about to be held) or held
+    /// already. A version whose key is not held is left out. The caller
+    /// reads the pieces and unseals them without the lock ([`open_jobs`]),
+    /// then installs what opened ([`Self::install_opened`]).
+    fn open_jobs(
+        &self,
+        under: &Name,
+        version: Option<&Name>,
+        granted: Option<(&Epoch, &ContentKey)>,
+    ) -> Vec<OpenJob> {
+        let mut jobs = Vec::new();
+        for (c, coll) in self.colls.iter().filter(|(c, _)| c.has_prefix(under)) {
+            if coll.state.is_none() {
+                continue;
+            }
+            for hv in coll.pending.iter().filter_map(|id| coll.versions.get(id)) {
+                if hv.opened
+                    || hv.chunks.is_none()
+                    || version.is_some_and(|v| hv.version.name != *v)
+                {
+                    continue;
+                }
+                let key = match &hv.epoch {
+                    None => None,
+                    Some(e) => match granted {
+                        Some((ge, key)) if ge == e => Some(key.clone()),
+                        _ => match self.keys.key(c, e) {
+                            Some(key) => Some(key),
+                            None => continue,
+                        },
+                    },
+                };
+                jobs.push(OpenJob {
+                    collection: c.clone(),
+                    held: Arc::clone(hv),
+                    key,
+                });
+            }
+        }
+        jobs
+    }
+
+    /// Install the operation `op` read outside the lock from the pieces of
+    /// the packet `digest` of version `id` of `c`, if that packet is still
+    /// the pending one.
+    fn install_opened(&mut self, c: &Name, id: &VersionId, digest: [u8; 32], op: Bytes) {
+        let Some(coll) = self.colls.get_mut(c) else {
+            return;
+        };
+        if !coll.pending.contains(id) {
+            return;
+        }
+        if let Some(hv) = coll
+            .versions
+            .get(id)
+            .filter(|hv| !hv.opened && hv.digest == digest)
+        {
+            let opened = hv.with_op(op);
+            coll.versions.insert(id.clone(), Arc::new(opened));
+        }
     }
 
     /// The digest of what the key signed in the entry held at `name` ([`wire::signed_digest`]),
@@ -3603,6 +3939,8 @@ impl Device {
                 walked: BTreeSet::new(),
                 unfound: BTreeSet::new(),
                 piece_misses: HashMap::new(),
+                wiring: BTreeSet::new(),
+                wire_misses: HashMap::new(),
                 seqs: HashMap::new(),
                 equivocal: HashMap::new(),
                 brought: HashMap::new(),
@@ -6993,7 +7331,7 @@ impl Inner {
                 tracing::debug!(record = %name, "a removal cut's manifest not held whole before its record is taken; asked again");
             }
         }
-        let (chase, wanted, withdrawn) = {
+        let (chase, wanted, wires, withdrawn) = {
             let mut st = self.st.lock();
             let members = matches!(record, Record::Members(_));
             let key = key_name_of(writer.key());
@@ -7017,6 +7355,9 @@ impl Inner {
                 Some(c) => st.wanted_pieces(c),
                 None => Vec::new(),
             };
+            // A version naming its parent by a packet other than the one held
+            // waits for that packet: asked for by its full name.
+            let wires = st.wanted_wires(parsed.subject.as_ref());
             // A group's record decides who reads the collections sealed to
             // it: their keys may be asked for now.
             let mut chase = Vec::new();
@@ -7046,7 +7387,7 @@ impl Inner {
             }
             chase.sort();
             chase.dedup();
-            (chase, wanted, (wake && withdrawn).then_some(key))
+            (chase, wanted, wires, (wake && withdrawn).then_some(key))
         };
         for c in chase {
             self.chase_keys(&c);
@@ -7054,6 +7395,7 @@ impl Inner {
         for (v, chunks) in wanted {
             self.spawn_pieces(v, chunks);
         }
+        self.spawn_wires(wires);
         // Its key verifies again: what was withdrawn of it for its chain
         // may verify too (a new certificate of the key).
         if let Some(key) = withdrawn {
@@ -7132,6 +7474,16 @@ impl Inner {
         record: Record,
         mine: bool,
     ) {
+        // Another packet of a version held: a copy in another signature value
+        // of what its key signed (the same version), or the other thing the
+        // key signed there. A version naming its parent by it is judged anew.
+        if matches!(record, Record::Version(_))
+            && matches!(st.held.get(&name), Some(Held::Version(_) | Held::Locked))
+            && let Some(signed) = wire::signed_digest(&wire)
+        {
+            let same = st.held_signed(&name) == Some(signed);
+            st.note_wire(&name, wire::implicit_digest(&wire), same);
+        }
         if let Some(Held::Version(id)) = st.held.get(&name) {
             let seq = id.seq.0;
             if let Record::Version(body) = &record
@@ -9669,7 +10021,7 @@ impl Inner {
         )?;
         let empty = Coll::default();
         let past = PastOf::new(&signed.held.version, empty.waits(c));
-        apply_own(&mut *temp, &signed.held, &past);
+        apply_own(&mut *temp, &signed.held, &past, &NoOps);
         Ok((signed, temp))
     }
 
@@ -9873,6 +10225,9 @@ impl Inner {
             return Ok(());
         };
         let c = &signed.c;
+        let St {
+            colls, store, keys, ..
+        } = st;
         let Coll {
             members,
             state,
@@ -9881,8 +10236,9 @@ impl Inner {
             locked,
             revoked,
             versions,
+            wires,
             ..
-        } = st.colls.get_mut(c).expect("members known");
+        } = colls.get_mut(c).expect("members known");
         let Some(state) = state.as_deref_mut() else {
             return Err(DataError::RuleUnknown {
                 collection: c.clone(),
@@ -9898,11 +10254,18 @@ impl Inner {
             locked,
             revoked,
             admitted: versions,
+            wires,
+        };
+        let ops = OpsOf {
+            versions,
+            store: &**store,
+            keys,
         };
         apply_own(
             state,
             &signed.held,
             &PastOf::new(&signed.held.version, waits),
+            &ops,
         );
         Ok(())
     }
@@ -10788,10 +11151,14 @@ impl Inner {
             let Some(content) = data.content().cloned() else {
                 continue;
             };
-            let mut st = self.st.lock();
-            let Some(key) = open_grant(&st.keys.recipient, &name, content) else {
+            let Some(key) = open_grant(&self.st.lock().keys.recipient, &name, content) else {
                 continue;
             };
+            // Versions in pieces sealed in this epoch that wait for its key
+            // are read and unsealed here, not under the lock; a key that is
+            // not the epoch's opens none.
+            self.open_pieces(c, None, Some((e, &key)));
+            let mut st = self.st.lock();
             if !st.take_key(c, e, key) {
                 tracing::debug!(%granter, collection = %c, epoch = ?e, "refused: a granted key that does not match its epoch's key check");
                 continue;
@@ -10923,7 +11290,15 @@ impl Inner {
                 Ok(Got::State(State {
                     collection: c.clone(),
                     at,
-                    value: state.value(),
+                    value: state.value().map_err(|winner| DataError::NotReady {
+                        name: c.clone(),
+                        why: format!(
+                            "the version that wins here ({winner:?}) carries its value in \
+                             pieces this device's store no longer holds, so it cannot read the \
+                             value now; get {c} again after the group next delivers that \
+                             version's pieces"
+                        ),
+                    })?,
                 }))
             }
             Rule::Log => {
@@ -11381,15 +11756,62 @@ impl Inner {
     /// on what may have changed since: a descent, a key, a start).
     fn fetch_wanted(self: &Arc<Self>, retry: bool) {
         self.fetch_wanted_bytes();
-        let wanted: Vec<(Name, ChunksBody)> = {
+        let (wanted, wires): (Vec<(Name, ChunksBody)>, _) = {
             let mut st = self.st.lock();
             if retry {
                 st.unfound.clear();
             }
-            st.colls.keys().flat_map(|c| st.wanted_pieces(c)).collect()
+            let wanted = st.colls.keys().flat_map(|c| st.wanted_pieces(c)).collect();
+            (wanted, st.wanted_wires(None))
         };
         for (v, chunks) in wanted {
             self.spawn_pieces(v, chunks);
+        }
+        self.spawn_wires(wires);
+    }
+
+    /// Ask, in the background, for the packets pending versions name as
+    /// parents that this device holds another packet of ([`St::wanted_wires`]),
+    /// each by its full name, from the parent's writer and the devices
+    /// answering for it. One that verifies is taken, which notes it beside
+    /// the one held ([`St::note_wire`]): the same version if it signed the
+    /// same thing, and the evidence against the child if another. One not to
+    /// be had is asked for again after [`retry_pause`] while a pending version
+    /// still names it (spec §17.1).
+    fn spawn_wires(self: &Arc<Self>, asks: Vec<(Name, [u8; 32])>) {
+        for ask in asks {
+            let inner = Arc::clone(self);
+            rt::spawn(async move {
+                let (name, digest) = ask.clone();
+                if let Some(data) = inner.fetch_entry(&name, Some(digest)).await
+                    && let Err(why) = inner.take_data(&name, data).await
+                {
+                    tracing::debug!(%name, %why, "the packet a version names its parent by is refused");
+                }
+                let pause = {
+                    let mut st = inner.st.lock();
+                    if st.wants_wire(&name, &digest) {
+                        let misses = st.wire_misses.entry(ask.clone()).or_insert(0);
+                        let pause = retry_pause(*misses);
+                        *misses = misses.saturating_add(1);
+                        Some(pause)
+                    } else {
+                        st.wiring.remove(&ask);
+                        st.wire_misses.remove(&ask);
+                        None
+                    }
+                };
+                inner.progress.notify_waiters();
+                if let Some(pause) = pause {
+                    rt::sleep(pause).await;
+                    let asks = {
+                        let mut st = inner.st.lock();
+                        st.wiring.remove(&ask);
+                        st.wanted_wires(None)
+                    };
+                    inner.spawn_wires(asks);
+                }
+            });
         }
     }
 
@@ -11408,6 +11830,10 @@ impl Inner {
                 Some(c) => inner.walk_pieces(&v, c, chunks, false).await.is_some(),
                 None => false,
             };
+            // Read and unsealed here, not under the lock ([`Self::open_pieces`]).
+            if whole && let Some(c) = &c {
+                inner.open_pieces(c, Some(&v), None);
+            }
             let retry = {
                 let mut st = inner.st.lock();
                 st.fetching.remove(&v);
@@ -11433,6 +11859,30 @@ impl Inner {
             }
             inner.progress.notify_waiters();
         });
+    }
+
+    /// Open the pending register versions in pieces under `under` that are
+    /// whole in the store (only `version`, if given): the pieces are read,
+    /// checked and unsealed without the device's lock, the one thing a payload
+    /// of up to [`wire::PAYLOAD_MAX`] octets costs here; the lock is held only
+    /// to pick them and to put each result in place. The state applies them
+    /// on its next run. `granted`: the key of an epoch about to be held.
+    fn open_pieces(
+        &self,
+        under: &Name,
+        version: Option<&Name>,
+        granted: Option<(&Epoch, &ContentKey)>,
+    ) {
+        let jobs = self.st.lock().open_jobs(under, version, granted);
+        if jobs.is_empty() {
+            return;
+        }
+        let opened = open_jobs(&*self.store, &jobs);
+        drop(jobs);
+        let mut st = self.st.lock();
+        for (c, id, digest, op) in opened {
+            st.install_opened(&c, &id, digest, op);
+        }
     }
 
     /// Ask again, after `pause`, for the pieces of the register version `v`

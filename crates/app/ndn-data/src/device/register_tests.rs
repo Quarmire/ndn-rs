@@ -30,12 +30,12 @@ async fn register_device() -> Device {
     dev
 }
 
-/// Version `seq` of `device` in `c`, made over nothing, carrying `bytes`
-/// as the register's write.
-fn write(device: &str, c: &Name, seq: u64, bytes: &[u8]) -> Made {
-    let body = VersionBody {
+/// The body of a version of `c` over `parents`, carrying `bytes` as the
+/// register's write.
+fn body(c: &Name, parents: Parents, bytes: &[u8]) -> VersionBody {
+    VersionBody {
         collection: c.clone(),
-        parents: Parents::new(),
+        parents,
         type_id: options().type_id,
         seal: Seal { any_of: Vec::new() },
         keep: Keep::Forever,
@@ -45,8 +45,36 @@ fn write(device: &str, c: &Name, seq: u64, bytes: &[u8]) -> Made {
         op: Bytes::copy_from_slice(bytes),
         sealed: None,
         chunks: None,
-    };
-    made(device, c, seq, Record::Version(body))
+    }
+}
+
+/// Version `seq` of `device` in `c`, made over nothing, carrying `bytes`
+/// as the register's write.
+fn write(device: &str, c: &Name, seq: u64, bytes: &[u8]) -> Made {
+    made(
+        device,
+        c,
+        seq,
+        Record::Version(body(c, Parents::new(), bytes)),
+    )
+}
+
+/// `/alice/phone`'s first write of `bytes` as two packets: the one it
+/// signed and a copy in another signature value of the same thing (what an
+/// ECDSA signature's `S` and `n - S` are): one signed region, two wires.
+fn two_wires(c: &Name, bytes: &[u8]) -> (Made, Made) {
+    let record = Record::Version(body(c, Parents::new(), bytes));
+    let (original, copy) = (
+        made_with("/alice/phone", c, 1, record.clone(), 0),
+        made_with("/alice/phone", c, 1, record, 1),
+    );
+    assert_eq!(
+        wire::signed_digest(&original.packet),
+        wire::signed_digest(&copy.packet),
+        "one signed region"
+    );
+    assert_ne!(original.packet, copy.packet, "two wires");
+    (original, copy)
 }
 
 /// The register's value as `get` reads it.
@@ -64,13 +92,13 @@ fn by_zeros(bytes: &[u8]) -> Bytes {
 }
 
 #[tokio::test]
-async fn two_offline_writers_converge_on_the_highest_digest() {
+async fn two_offline_writers_converge_on_the_highest_signed_digest() {
     let c = notes();
     let (phone, tablet) = (
         write("/alice/phone", &c, 1, b"from the phone"),
         write("/alice/tablet", &c, 1, b"from the tablet"),
     );
-    let digest = |m: &Made| wire::implicit_digest(&m.packet);
+    let digest = |m: &Made| wire::signed_digest(&m.packet).unwrap();
     let (dp, dt) = (digest(&phone), digest(&tablet));
     let expected = winner([
         (&dp, by_zeros(b"from the phone")),
@@ -87,6 +115,124 @@ async fn two_offline_writers_converge_on_the_highest_digest() {
 
     assert_eq!(value(&first, &c).await, expected);
     assert_eq!(value(&second, &c).await, expected);
+}
+
+/// The tie-break is on what the writer signed, so a copy of a version in
+/// another signature value (ECDSA's `S` and `n - S`, which a relay can swap)
+/// never changes which head wins: readers holding either wire agree.
+#[tokio::test]
+async fn readers_holding_either_wire_of_a_head_read_one_winner() {
+    let c = notes();
+    let (original, copy) = two_wires(&c, b"from the phone");
+    let (d_original, d_copy) = (
+        wire::implicit_digest(&original.packet),
+        wire::implicit_digest(&copy.packet),
+    );
+    // A concurrent head whose packet digest lies between the two wires':
+    // by full-wire digests it beats one wire of the phone's version and
+    // loses to the other.
+    let tablet = (0u32..)
+        .map(|i| {
+            write(
+                "/alice/tablet",
+                &c,
+                1,
+                format!("from the tablet {i}").as_bytes(),
+            )
+        })
+        .find(|t| {
+            let d = wire::implicit_digest(&t.packet);
+            (d < d_original) != (d < d_copy)
+        })
+        .unwrap();
+
+    let (first, second) = (register_device().await, register_device().await);
+    give(&first, &original);
+    give(&first, &tablet);
+    give(&second, &copy);
+    give(&second, &tablet);
+
+    assert_eq!(
+        value(&first, &c).await,
+        value(&second, &c).await,
+        "the two wires of one signed version are one head: both readers pick the same winner"
+    );
+}
+
+/// A version made over the packet its writer signed applies on a reader that
+/// holds a copy of that parent in another signature value: the parent is
+/// the same signed version, and the exact packet the child names is asked
+/// for by its full name ([`St::wanted_wires`]).
+#[tokio::test]
+async fn a_version_over_the_original_applies_beside_a_copy_of_its_parent() {
+    let c = notes();
+    let (original, copy) = two_wires(&c, b"first");
+    let over: Parents = [(
+        id("/alice/phone", 1),
+        Some(wire::implicit_digest(&original.packet)),
+    )]
+    .into_iter()
+    .collect();
+    let child = made(
+        "/alice/phone",
+        &c,
+        2,
+        Record::Version(body(&c, over, b"second")),
+    );
+    let dev = register_device().await;
+    give(&dev, &copy);
+    give(&dev, &child);
+    assert!(
+        refusal(&dev, &child.name).is_none(),
+        "not refused for good: the copy it differs from may be the same signed version: {:?}",
+        refusal(&dev, &child.name)
+    );
+    assert!(
+        !counts(&dev, &c, &id("/alice/phone", 2)),
+        "it waits for the packet it names"
+    );
+
+    // That packet, as fetched by its exact name.
+    give(&dev, &original);
+    assert!(
+        counts(&dev, &c, &id("/alice/phone", 2)),
+        "the packet it names is the parent signed: the child applies"
+    );
+    assert_eq!(value(&dev, &c).await, by_zeros(b"second"));
+}
+
+/// A child naming another signed packet at its parent's seq is refused for
+/// good once that packet is held: the key signed two things there.
+#[tokio::test]
+async fn a_version_over_another_signed_packet_than_the_parent_held_is_refused() {
+    let c = notes();
+    let (held, _) = two_wires(&c, b"first");
+    let other = write("/alice/phone", &c, 1, b"signed twice");
+    let over: Parents = [(
+        id("/alice/phone", 1),
+        Some(wire::implicit_digest(&other.packet)),
+    )]
+    .into_iter()
+    .collect();
+    let child = made(
+        "/alice/phone",
+        &c,
+        2,
+        Record::Version(body(&c, over, b"second")),
+    );
+    let dev = register_device().await;
+    give(&dev, &held);
+    give(&dev, &child);
+    assert!(
+        refusal(&dev, &child.name).is_none(),
+        "nothing shows yet that the packet it names is another signed thing"
+    );
+    give(&dev, &other);
+    assert!(
+        matches!(refusal(&dev, &child.name), Some(Refusal::Parent { .. })),
+        "the key signed two things at (phone, 1): {:?}",
+        refusal(&dev, &child.name)
+    );
 }
 
 #[tokio::test]
@@ -212,7 +358,7 @@ async fn a_large_value_reaches_a_second_device_in_pieces(size: usize, sealed: bo
     let expected = by_zeros(&bytes);
     let read = |dev: &Device| {
         let st = dev.inner.st.lock();
-        st.colls[&c].state.as_ref().unwrap().value()
+        st.colls[&c].state.as_ref().unwrap().value().unwrap()
     };
     // Held, but not applied: its pieces are not here yet.
     {
@@ -230,6 +376,17 @@ async fn a_large_value_reaches_a_second_device_in_pieces(size: usize, sealed: bo
             .inner
             .store
             .insert(p.clone(), laptop.inner.store.get(&p).unwrap());
+    }
+    // Read and unsealed outside the device's lock; applied on the state's
+    // next run, not by that step.
+    phone.inner.open_pieces(&c, Some(&name), None);
+    {
+        let st = phone.inner.st.lock();
+        assert!(
+            st.colls[&c].versions[&id].opened,
+            "its pieces were assembled and opened without the lock"
+        );
+        assert!(!st.colls[&c].at().contains(&id), "not applied by that step");
     }
     phone.inner.st.lock().pieces_arrived(&c, &name);
     assert!(phone.inner.st.lock().colls[&c].at().contains(&id));

@@ -320,6 +320,7 @@ async fn a_refused_edit_leaves_the_merge_state_as_it_was() {
             .as_ref()
             .unwrap()
             .value()
+            .unwrap()
     };
     let (before, head) = (value(&dev), dev.inner.st.lock().head);
     // More than a version carries.
