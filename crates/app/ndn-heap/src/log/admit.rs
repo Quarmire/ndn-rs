@@ -20,56 +20,11 @@ use crate::error::Timestamp;
 use crate::register::ValueChange;
 use crate::wire::{Prev, parse_log_name, signed_digest_of};
 
-/// The facts an entry is judged by.
-pub(super) struct Subject<'a> {
-    pub device: &'a Name,
-    pub person: &'a Name,
-    pub key: &'a Name,
-    pub seq: u64,
-    pub digest: [u8; 32],
-    pub name: &'a Name,
-}
-
-impl<'a> Subject<'a> {
-    /// The facts of the entry that arrived.
-    fn new(a: &'a Arrival<'_>) -> Subject<'a> {
-        Subject {
-            device: &a.id.device,
-            person: &a.v.person,
-            key: &a.v.key,
-            seq: a.id.seq,
-            digest: a.id.digest,
-            name: &a.name,
-        }
-    }
-}
-
-/// What [`Log::assess`] says of an entry.
-pub(super) enum Verdict {
-    /// Apply it; a write comes with its path and payload (opened if sealed).
-    Apply(Option<PutBody>),
-    /// Sealed in an epoch whose key is not held.
-    Closed,
-    /// Its writer's cut is not whole yet.
-    Waiting,
-    /// Refused.
-    Refuse(Refusal),
-}
-
-/// An entry to put into the fold or the register.
-pub(super) struct Applying {
-    pub id: EntryRef,
-    pub person: Name,
-    pub entry: Entry,
-    pub put: Option<PutBody>,
-}
-
-/// What admission is given about the entry that arrived: its ref and name,
-/// its bytes, the verified signer, the time, and whether only an unsigned
-/// counter asked for it.
+/// What admission is given about the entry that arrived: its ref, its bytes,
+/// the verified signer, the time, and whether only an unsigned counter asked
+/// for it.
 struct Arrival<'a> {
     id: EntryRef,
-    name: Name,
     wire: &'a Bytes,
     data: &'a Data,
     v: &'a Verified,
@@ -77,18 +32,17 @@ struct Arrival<'a> {
     probe: bool,
 }
 
-/// A new entry to store.
+/// A new entry to store. `verdict`: `Ok` with the entry when it is applied,
+/// else the status it is held under.
 pub(super) struct Fresh<'a> {
     pub id: &'a EntryRef,
     pub wire: &'a Bytes,
     pub person: &'a Name,
     pub key_digest: [u8; 32],
-    /// The chain link the entry states (`PREV`, the seq it names); `None`
-    /// when the entry cannot be read, so it states nothing.
-    pub link: Option<([u8; 32], u64)>,
-    /// `None`: applied.
-    pub status: Option<Status>,
-    pub applying: Option<Applying>,
+    /// The chain link the entry states (`PREV`, the seq it names); zeros when
+    /// the entry cannot be read, so it states nothing.
+    pub link: ([u8; 32], u64),
+    pub verdict: Result<&'a Entry, Status>,
 }
 
 /// An entry held, as the store has it.
@@ -110,6 +64,23 @@ pub(super) enum Rejudge {
     Verified,
     /// Refused outright, by the judge or the host.
     Refused(Refusal),
+}
+
+/// Whether a status counts the entry as admitted: applied, or closed for want
+/// of a key.
+fn admitted(status: Option<&Status>) -> bool {
+    matches!(status, None | Some(Status::Closed))
+}
+
+impl From<Status> for Outcome {
+    fn from(status: Status) -> Outcome {
+        match status {
+            Status::Closed => Outcome::Closed,
+            Status::Waiting => Outcome::Waiting,
+            Status::Unreadable => Outcome::Unreadable,
+            Status::Refused(why) => Outcome::Refused(why),
+        }
+    }
 }
 
 /// The entry in a packet, and the link it states to the one before: the
@@ -173,8 +144,7 @@ impl Log {
         probe: bool,
     ) -> Outcome {
         // 1. The name parses, names this space, and its device is the key's.
-        let name = (*data.name).clone();
-        let id = match parse_log_name(&name) {
+        let id = match parse_log_name(&data.name) {
             Some(p) if p.space == self.space && p.device == v.device && p.seq > 0 => EntryRef {
                 device: p.device,
                 seq: p.seq,
@@ -184,7 +154,6 @@ impl Log {
         };
         let a = Arrival {
             id,
-            name,
             wire,
             data,
             v,
@@ -214,7 +183,8 @@ impl Log {
         });
         let outcome = self.take(&a, fx);
         if let Some(old) = displaced {
-            self.store.insert(Kind::EQUIVOCAL.of(&a.name), old);
+            self.store
+                .insert(Kind::EQUIVOCAL.of(&a.id.name(&self.space)), old);
             self.equivocated(&a, seq, fx);
         }
         outcome
@@ -247,9 +217,8 @@ impl Log {
         matches!(
             self.view().status(&a.id.device, a.id.seq),
             Some(Status::Refused(Refusal::OutsideCut(_)) | Status::Waiting)
-        ) && shape(a.data, a.id.seq).is_some_and(|(entry, _, _)| {
-            matches!(self.assess(&Subject::new(a), &entry), Verdict::Apply(_))
-        })
+        ) && shape(a.data, a.id.seq)
+            .is_some_and(|(entry, _, _)| self.assess(&a.id, &a.v.person, &a.v.key, &entry).is_ok())
     }
 
     /// Another copy of an entry held: nothing new, unless what it was refused
@@ -278,7 +247,7 @@ impl Log {
     /// agrees whichever came first.
     fn second_packet(&mut self, a: &Arrival<'_>, fx: &mut Effects) -> Outcome {
         let (id, v) = (&a.id, a.v);
-        let at = Kind::EQUIVOCAL.of(&a.name);
+        let at = Kind::EQUIVOCAL.of(&id.name(&self.space));
         if let Some(held) = self.store.get(&at) {
             return if signed_digest(&held) == id.digest {
                 Outcome::Duplicate
@@ -290,24 +259,12 @@ impl Log {
         self.equivocated(a, id.seq, fx);
         // What the entry first held here said is absent is no longer taken as
         // said: its writer signed two.
-        let retracted = self
-            .devices
-            .get_mut(&id.device)
-            .is_some_and(|dev| dev.retract_gap(id.seq));
-        if retracted {
-            self.write_ledger(&id.device);
-        }
+        self.count_gap(&id.device, id.seq, 0, false);
         if let Some((entry, _, _)) = shape(a.data, id.seq)
             && matches!(entry.body, Body::Members(_) | Body::Epoch(_))
-            && let Verdict::Apply(put) = self.assess(&Subject::new(a), &entry)
+            && self.assess(id, &v.person, &v.key, &entry).is_ok()
         {
-            let applying = Applying {
-                id: id.clone(),
-                person: v.person.clone(),
-                entry,
-                put,
-            };
-            self.apply_entry(&applying, fx);
+            self.set_applied(id, &v.person, &entry, true, fx);
         }
         Outcome::Evidence
     }
@@ -325,17 +282,8 @@ impl Log {
 
     /// Plan 3.5 steps 3 to 8 for an entry at a fresh name.
     fn take(&mut self, a: &Arrival<'_>, fx: &mut Effects) -> Outcome {
-        let (id, v, now) = (&a.id, a.v, a.now);
+        let (id, v) = (&a.id, a.v);
         let shaped = shape(a.data, id.seq);
-        let fresh = |status: Option<Status>, link, applying| Fresh {
-            id,
-            wire: a.wire,
-            person: &v.person,
-            key_digest: v.key_digest,
-            link,
-            status,
-            applying,
-        };
 
         // 7. An own-name entry is adopted only if this device's key signed it,
         // and then once it chains to what is held ([`Log::assess`]: until it
@@ -370,59 +318,53 @@ impl Log {
             return Outcome::Refused(Refusal::Fragmented);
         }
 
-        let Some((entry, prev, prev_seq)) = shaped else {
-            tracing::warn!(name = %a.name, "an entry that verifies and cannot be read is recorded as refused");
-            self.store_fresh(fresh(Some(Status::Unreadable), stated, None), now, fx);
-            return Outcome::Unreadable;
-        };
-        let link = Some((prev, prev_seq));
-
         // 6. The chain: the entry at `PREV_SEQ` must be the one `PREV` names.
         // 3 to 5: carrier, membership, sealing.
-        let verdict = if let Some(conflict) = self.chain_conflict(id, &prev, prev_seq) {
-            self.equivocated(a, conflict, fx);
-            Verdict::Refuse(Refusal::Chain)
-        } else {
-            self.assess(&Subject::new(a), &entry)
-        };
-        let (status, outcome, applying) = match verdict {
-            Verdict::Apply(put) => {
-                let applying = Applying {
-                    id: id.clone(),
-                    person: v.person.clone(),
-                    entry,
-                    put,
-                };
-                (None, Outcome::Applied, Some(applying))
+        let verdict = match &shaped {
+            None => {
+                tracing::warn!(name = %id.name(&self.space), "an entry that verifies and cannot be read is recorded as refused");
+                Err(Status::Unreadable)
             }
-            Verdict::Closed => (Some(Status::Closed), Outcome::Closed, None),
-            Verdict::Waiting => (Some(Status::Waiting), Outcome::Waiting, None),
-            Verdict::Refuse(why) => {
-                // A probe of a device nothing vouches for keeps one refused
-                // entry here, the first: it is the one a later membership
-                // change takes back. Its other counters are probed and
-                // answered, and neither stored nor told, so what a stranger
-                // advertises grows neither the store nor the host's alerts.
-                // An entry the log asked for (a hole, a cut's tip) is stored.
-                if a.probe
-                    && matches!(why, Refusal::NotMember)
-                    && self
-                        .devices
-                        .get(&id.device)
-                        .is_some_and(|d| d.held.count() > 0)
-                    && !self.vouches(&id.device)
-                {
-                    return Outcome::Refused(why);
+            Some((entry, prev, prev_seq)) => match self.chain_conflict(id, prev, *prev_seq) {
+                Some(conflict) => {
+                    self.equivocated(a, conflict, fx);
+                    Err(Status::Refused(Refusal::Chain))
                 }
-                refuse_alert(id, &why, fx);
-                (
-                    Some(Status::Refused(why.clone())),
-                    Outcome::Refused(why),
-                    None,
-                )
-            }
+                None => self.assess(id, &v.person, &v.key, entry).map(|()| entry),
+            },
         };
-        self.store_fresh(fresh(status, link, applying), now, fx);
+        if let Err(Status::Refused(why)) = &verdict {
+            // A probe of a device nothing vouches for keeps one refused
+            // entry here, the first: it is the one a later membership
+            // change takes back. Its other counters are probed and
+            // answered, and neither stored nor told, so what a stranger
+            // advertises grows neither the store nor the host's alerts.
+            // An entry the log asked for (a hole, a cut's tip) is stored.
+            if a.probe
+                && matches!(why, Refusal::NotMember)
+                && self
+                    .devices
+                    .get(&id.device)
+                    .is_some_and(|d| d.held.count() > 0)
+                && !self.vouches(&id.device)
+            {
+                return Outcome::Refused(why.clone());
+            }
+            refuse_alert(id, why, fx);
+        }
+        let outcome = match &verdict {
+            Ok(_) => Outcome::Applied,
+            Err(status) => status.clone().into(),
+        };
+        let fresh = Fresh {
+            id,
+            wire: a.wire,
+            person: &v.person,
+            key_digest: v.key_digest,
+            link: stated.unwrap_or_default(),
+            verdict,
+        };
+        self.store_fresh(fresh, a.now, fx);
         outcome
     }
 
@@ -477,75 +419,78 @@ impl Log {
     }
 
     /// The decision about an entry from what is held: plan 3.5 steps 3 to 5.
-    /// Pure; made again by [`Log::reassess`] whenever the facts change.
-    pub(super) fn assess(&self, s: &Subject<'_>, entry: &Entry) -> Verdict {
+    /// `Ok`: apply it; `Err`: hold it under that status. Pure; made again by
+    /// [`Log::reassess`] whenever the facts change.
+    fn assess(
+        &self,
+        id: &EntryRef,
+        person: &Name,
+        key: &Name,
+        entry: &Entry,
+    ) -> Result<(), Status> {
+        let refuse = |why| Err(Status::Refused(why));
         // 2. An own entry is adopted once it chains to an own entry held
         // (what this device signed, in order); until then it waits for it.
-        if *s.device == self.device
-            && let Some((prev, prev_seq)) = link_of(&entry.prev, s.seq)
+        if id.device == self.device
+            && let Some((prev, prev_seq)) = link_of(&entry.prev, id.seq)
             && !self.own_chains(prev_seq, &prev)
         {
-            return Verdict::Waiting;
+            return Err(Status::Waiting);
         }
         let structural = matches!(entry.body, Body::Members(_) | Body::Epoch(_));
         // 3. Only an owner device carries Members and Epoch entries.
-        if structural && !(wire::owns(&self.space, s.key) && s.person == self.fold.owner()) {
-            return Verdict::Refuse(Refusal::NotMember);
+        if structural && !(wire::owns(&self.space, key) && person == self.fold.owner()) {
+            return refuse(Refusal::NotMember);
         }
         // 4. The signer's person writes, or was removed and the entry is
         // inside the cut.
-        if !self.fold.is_writer(s.person)
-            && let Some(forced) = self.cutting(s)
-        {
-            return forced;
+        if !self.fold.is_writer(person) {
+            self.cutting(id, person)?;
         }
         // 5. Sealing.
         let create = self.fold.create();
         match &entry.body {
-            Body::Put(put) => match create {
-                Some(false) => Verdict::Refuse(Refusal::Unsealed),
-                _ => Verdict::Apply(Some(put.clone())),
-            },
+            Body::Put(_) if create == Some(false) => refuse(Refusal::Unsealed),
+            Body::Sealed(_) if create == Some(true) => refuse(Refusal::Sealed),
             Body::Sealed(sealed) => {
-                if create == Some(true) {
-                    return Verdict::Refuse(Refusal::Sealed);
-                }
                 if self.keys.key(&self.space, &sealed.epoch).is_none() {
-                    return Verdict::Closed;
+                    return Err(Status::Closed);
                 }
-                match self.view().opened_put(entry, s.name) {
-                    Some(put) => Verdict::Apply(Some(put)),
-                    None => Verdict::Refuse(Refusal::BadSignature),
-                }
+                let opened = self.view().opened_put(entry, &id.name(&self.space));
+                opened
+                    .map(drop)
+                    .ok_or(Status::Refused(Refusal::BadSignature))
             }
-            Body::Members(_) | Body::Epoch(_) => Verdict::Apply(None),
+            Body::Put(_) | Body::Members(_) | Body::Epoch(_) => Ok(()),
         }
     }
 
-    /// What a removed writer's cut forces on the entry: `None` when the cut
-    /// keeps it.
-    fn cutting(&self, s: &Subject<'_>) -> Option<Verdict> {
+    /// What a removed writer's cut says of the entry: `Ok` when the cut keeps
+    /// it.
+    fn cutting(&self, id: &EntryRef, person: &Name) -> Result<(), Status> {
         let has_tip = self
             .fold
-            .removal_tips(s.person)
+            .removal_tips(person)
             .iter()
-            .any(|t| t.device == *s.device);
+            .any(|t| t.device == id.device);
         if !has_tip {
-            return Some(Verdict::Refuse(Refusal::NotMember));
+            return Err(Status::Refused(Refusal::NotMember));
         }
-        let Some(kept) = self.kept.get(s.device) else {
-            return Some(Verdict::Waiting);
+        let Some(kept) = self.kept.get(&id.device) else {
+            return Err(Status::Waiting);
         };
-        match kept.keeps(&self.store, s.device, &self.space, s.seq, &s.digest) {
-            Keeps::Yes => None,
-            Keeps::Waiting => Some(Verdict::Waiting),
-            Keeps::No => Some(Verdict::Refuse(Refusal::OutsideCut(Cut {
-                device: s.device.clone(),
+        match kept.keeps(&self.store, &id.device, &self.space, id.seq, &id.digest) {
+            Keeps::Yes => Ok(()),
+            Keeps::Waiting => Err(Status::Waiting),
+            Keeps::No => Err(Status::Refused(Refusal::OutsideCut(Cut {
+                device: id.device.clone(),
                 keeps_to: kept.keeps_to(),
             }))),
         }
     }
+}
 
+impl Log {
     // -- Storing -------------------------------------------------------------------
 
     /// Store a new entry: the packet at its name, its marker, the device's
@@ -555,7 +500,7 @@ impl Log {
         let (device, seq) = (&f.id.device, f.id.seq);
         let name = f.id.name(&self.space);
         self.store.insert(name.clone(), f.wire.clone());
-        let (prev, prev_seq) = f.link.unwrap_or(([0; 32], 0));
+        let (prev, prev_seq) = f.link;
         let marker = Marker {
             signed_digest: f.id.digest,
             key_digest: f.key_digest,
@@ -570,10 +515,6 @@ impl Log {
             .or_insert_with(|| Dev::new(f.person.clone()));
         dev.person = f.person.clone();
         dev.held.insert(seq);
-        if matches!(f.status, None | Some(Status::Closed)) && f.link.is_some() && prev_seq + 1 < seq
-        {
-            dev.state_gap(seq, prev_seq);
-        }
         dev.high = dev.high.max(seq);
         let link = Link {
             seq,
@@ -582,16 +523,20 @@ impl Log {
         if dev.tip.is_none_or(|t| t.seq < seq) {
             dev.tip = Some(link);
         }
+        let status = f.verdict.as_ref().err();
+        if admitted(status) {
+            self.count_gap(device, seq, prev_seq, true);
+        }
         self.write_ledger(device);
-        self.set_status(device, seq, None, f.status.as_ref());
+        self.set_status(device, seq, None, status);
         if *device == self.device {
             self.own_head = self.own_head.max(seq);
-            if f.status.is_none() {
+            if status.is_none() {
                 self.adopt_own(link);
             }
         }
-        if let Some(applying) = &f.applying {
-            self.apply_entry(applying, fx);
+        if let Ok(entry) = f.verdict {
+            self.set_applied(f.id, f.person, entry, true, fx);
         }
         self.advance_cut(device, fx);
     }
@@ -602,9 +547,9 @@ impl Log {
         let Some(kept) = self.kept.get_mut(device) else {
             return;
         };
-        let before = (kept.ranges.clone(), kept.frontier.clone());
+        let before = kept.clone();
         kept.advance(&self.store, device, &self.space);
-        if (kept.ranges.clone(), kept.frontier.clone()) == before {
+        if *kept == before {
             return;
         }
         fx.wants.extend(frontier_wants(device, kept));
@@ -618,35 +563,24 @@ impl Log {
         }
     }
 
-    /// An entry's gap statement counts while the entry is admitted (applied,
-    /// or closed for want of a key) and its name is not equivocal: what a
-    /// refused or equivocating entry says is absent is not taken as said.
-    /// `was` and `now` are its status before and after a change.
-    fn count_gap(
-        &mut self,
-        device: &Name,
-        seq: u64,
-        marker: &Marker,
-        was: Option<&Status>,
-        now: Option<&Status>,
-    ) {
-        let admitted = |s: Option<&Status>| matches!(s, None | Some(Status::Closed));
-        if admitted(was) == admitted(now) {
-            return;
-        }
-        let name = log_name(device, &self.space, seq);
-        let equivocal = self.store.get(&Kind::EQUIVOCAL.of(&name)).is_some();
+    /// An entry's gap statement counts while the entry is admitted and its
+    /// name is not equivocal: what a refused or equivocating entry says is
+    /// absent is not taken as said. `counts`: it is admitted now (else it
+    /// stopped counting); `prev_seq` is the link it states.
+    pub(super) fn count_gap(&mut self, device: &Name, seq: u64, prev_seq: u64, counts: bool) {
+        let equivocal = || {
+            let name = log_name(device, &self.space, seq);
+            self.store.get(&Kind::EQUIVOCAL.of(&name)).is_some()
+        };
+        let add = counts && prev_seq + 1 < seq && !equivocal();
         let Some(dev) = self.devices.get_mut(device) else {
             return;
         };
-        let changed = if admitted(now) {
-            let gap = marker.prev_seq + 1 < seq;
-            if gap && !equivocal {
-                dev.state_gap(seq, marker.prev_seq);
-            }
-            gap && !equivocal
+        let changed = if add {
+            dev.state_gap(seq, prev_seq);
+            true
         } else {
-            dev.retract_gap(seq)
+            !counts && dev.retract_gap(seq)
         };
         if changed {
             self.write_ledger(device);
@@ -655,16 +589,11 @@ impl Log {
 
     /// Replace the status record of an entry (`old` is what it is now).
     fn set_status(&mut self, device: &Name, seq: u64, old: Option<&Status>, new: Option<&Status>) {
-        if old == Some(&Status::Closed) {
-            self.closed = self.closed.saturating_sub(1);
-        }
-        if new == Some(&Status::Closed) {
-            self.closed += 1;
-        }
-        let counts = |s: Option<&Status>| s.is_some_and(|s| *s != Status::Closed);
+        let closed = |s| u64::from(s == Some(&Status::Closed));
+        self.closed = (self.closed + closed(new)).saturating_sub(closed(old));
+        let counts = |s| u64::from(!admitted(s));
         if let Some(dev) = self.devices.get_mut(device) {
-            dev.nonvouching =
-                (dev.nonvouching + u64::from(counts(new))).saturating_sub(u64::from(counts(old)));
+            dev.nonvouching = (dev.nonvouching + counts(new)).saturating_sub(counts(old));
         }
         let key = Kind::STATUS.seq(&self.space, device, seq);
         match new {
@@ -689,34 +618,53 @@ impl Log {
         }
     }
 
-    /// Put an accepted entry into the fold or the register.
-    pub(super) fn apply_entry(&mut self, a: &Applying, fx: &mut Effects) {
-        match &a.entry.body {
+    /// Put an accepted entry into the fold or the register (`on`), or take it
+    /// out again: what it superseded returns.
+    fn set_applied(
+        &mut self,
+        id: &EntryRef,
+        person: &Name,
+        entry: &Entry,
+        on: bool,
+        fx: &mut Effects,
+    ) {
+        match &entry.body {
             Body::Put(_) | Body::Sealed(_) => {
-                let put = a.put.as_ref().expect("a write that is applied is opened");
-                let changes = self.register_step(a, Some(put));
-                self.value_changes(changes, Some((&a.id, put)), fx);
+                let changes = self.register_step(id, person, entry, on);
+                self.value_changes(changes, fx);
             }
             Body::Members(body) => {
                 let before = self.fold_view();
-                self.fold.apply_members(&a.id, body);
-                self.structural(&a.id, true);
+                if on {
+                    self.fold.apply_members(id, body);
+                } else {
+                    self.fold.withdraw_members(id);
+                }
+                self.structural(id, on);
                 self.fold_changed(before, fx);
             }
             Body::Epoch(body) => {
-                self.fold
-                    .apply_epoch(EpochId::from(&a.id), body, &a.entry.after);
-                self.structural(&a.id, true);
+                if on {
+                    self.fold.apply_epoch(EpochId::from(id), body, &entry.after);
+                } else {
+                    self.fold.withdraw_epoch(&EpochId::from(id));
+                }
+                self.structural(id, on);
                 self.queue.push(Scope::Closed);
                 fx.membership = true;
             }
         }
     }
 
-    /// The register takes in (`put`: the write the entry made) or gives back
-    /// (`None`) an entry, and the writes it makes go in the batch. The
-    /// changes of the winners are returned.
-    fn register_step(&mut self, a: &Applying, put: Option<&PutBody>) -> Vec<ValueChange> {
+    /// The register takes in (`on`) or gives back an entry, and the writes it
+    /// makes go in the batch. The changes of the winners are returned.
+    fn register_step(
+        &mut self,
+        id: &EntryRef,
+        person: &Name,
+        entry: &Entry,
+        on: bool,
+    ) -> Vec<ValueChange> {
         let view = View {
             store: &self.store,
             space: &self.space,
@@ -726,13 +674,14 @@ impl Log {
         let (namers, load) = (&|x: &EntryRef| view.namers(x), &|x: &EntryRef| {
             view.write_of(x)
         });
-        let eff = match put {
-            Some(put) => {
-                let write = write_for(put, a.person.clone());
-                self.register
-                    .apply(&a.id, &write, &a.entry.after, namers, load)
-            }
-            None => self.register.withdraw(&a.id, &a.entry.after, namers, load),
+        let eff = if on {
+            let put = view
+                .opened_put(entry, &id.name(&self.space))
+                .expect("a write that is applied is opened");
+            let write = write_for(&put, person.clone());
+            self.register.apply(id, &write, &entry.after, namers, load)
+        } else {
+            self.register.withdraw(id, &entry.after, namers, load)
         };
         self.store.apply(eff.writes);
         eff.changes
@@ -750,29 +699,13 @@ impl Log {
 
     /// An applied entry is refused after the fact: out of the fold or the
     /// register (what it superseded returns), and told to the host.
-    fn unapply(&mut self, a: &Applying, why: &Status, fx: &mut Effects) {
-        let why = self.withdrawn_why(why, &a.id.device);
+    fn unapply(&mut self, l: &Loaded, why: &Status, fx: &mut Effects) {
+        let why = self.withdrawn_why(why, &l.id.device);
         fx.changes.push(Change::Withdrawn {
-            id: EntryId::from(&a.id),
+            id: l.id.clone(),
             why,
         });
-        match &a.entry.body {
-            Body::Put(_) | Body::Sealed(_) => {
-                let changes = self.register_step(a, None);
-                self.value_changes(changes, None, fx);
-            }
-            Body::Members(_) => {
-                let before = self.fold_view();
-                self.fold.withdraw_members(&a.id);
-                self.structural(&a.id, false);
-                self.fold_changed(before, fx);
-            }
-            Body::Epoch(_) => {
-                self.fold.withdraw_epoch(&EpochId::from(&a.id));
-                self.structural(&a.id, false);
-                fx.membership = true;
-            }
-        }
+        self.set_applied(&l.id, &l.person, &l.entry, false, fx);
     }
 
     fn withdrawn_why(&self, status: &Status, device: &Name) -> Refusal {
@@ -789,30 +722,19 @@ impl Log {
     }
 
     /// Changes of the register's winners as the API says them.
-    fn value_changes(
-        &self,
-        changes: Vec<ValueChange>,
-        fresh: Option<(&EntryRef, &PutBody)>,
-        fx: &mut Effects,
-    ) {
+    fn value_changes(&self, changes: Vec<ValueChange>, fx: &mut Effects) {
         for vc in changes {
             match (vc.now, vc.was) {
                 (Some(head), _) if head.removal => fx
                     .changes
                     .push(Change::Removed(head.item(&vc.path, Bytes::new()))),
-                (Some(head), _) => {
-                    let payload = match fresh {
-                        Some((id, put)) if *id == head.entry => Some(put.payload.clone()),
-                        _ => self.view().payload_of(&head.entry),
-                    };
-                    match payload {
-                        Some(Payload::Inline(bytes)) => {
-                            fx.changes.push(Change::Put(head.item(&vc.path, bytes)));
-                        }
-                        Some(blob) => fx.blobs.extend(Blob::of(EntryId::from(&head.entry), &blob)),
-                        None => {}
+                (Some(head), _) => match self.view().payload_of(&head.entry) {
+                    Some(Payload::Inline(bytes)) => {
+                        fx.changes.push(Change::Put(head.item(&vc.path, bytes)));
                     }
-                }
+                    Some(blob) => fx.blobs.extend(Blob::of(head.entry.clone(), &blob)),
+                    None => {}
+                },
                 (None, Some(was)) => fx
                     .changes
                     .push(Change::Removed(was.item(&vc.path, Bytes::new()))),
@@ -956,15 +878,14 @@ impl Log {
         let Some(l) = self.load_entry(device, seq) else {
             return;
         };
-        let name = l.id.name(&self.space);
         let new = match how {
-            Rejudge::Refused(why) => Status::Refused(match why {
+            Rejudge::Refused(why) => Some(Status::Refused(match why {
                 Refusal::BadSignature => Refusal::Untrusted {
                     why: "it did not verify when judged again with what this device holds now"
                         .into(),
                 },
                 why => why,
-            }),
+            })),
             Rejudge::Held | Rejudge::Verified => {
                 let held_for_trust =
                     matches!(l.status, Some(Status::Refused(Refusal::Untrusted { .. })));
@@ -973,55 +894,29 @@ impl Log {
                 {
                     return;
                 }
-                let subject = Subject {
-                    device,
-                    person: &l.person,
-                    key: &l.key,
-                    seq,
-                    digest: l.id.digest,
-                    name: &name,
-                };
-                match self.assess(&subject, &l.entry) {
-                    Verdict::Apply(put) => {
-                        if l.status.is_some() {
-                            self.set_status(device, seq, l.status.as_ref(), None);
-                            self.count_gap(device, seq, &l.marker, l.status.as_ref(), None);
-                            if *device == self.device {
-                                self.adopt_own(Link {
-                                    seq,
-                                    digest: l.id.digest,
-                                });
-                            }
-                            let applying = Applying {
-                                id: l.id,
-                                person: l.person,
-                                entry: l.entry,
-                                put,
-                            };
-                            self.apply_entry(&applying, fx);
-                        }
-                        return;
-                    }
-                    Verdict::Closed => Status::Closed,
-                    Verdict::Waiting => Status::Waiting,
-                    Verdict::Refuse(why) => Status::Refused(why),
-                }
+                self.assess(&l.id, &l.person, &l.key, &l.entry).err()
             }
         };
-        if l.status.as_ref().is_some_and(|s| s.code() == new.code()) {
+        if l.status.as_ref().map(Status::code) == new.as_ref().map(Status::code) {
             return;
         }
-        self.set_status(device, seq, l.status.as_ref(), Some(&new));
-        self.count_gap(device, seq, &l.marker, l.status.as_ref(), Some(&new));
-        if l.status.is_none() {
-            let put = self.view().opened_put(&l.entry, &name);
-            let applying = Applying {
-                id: l.id,
-                person: l.person,
-                entry: l.entry,
-                put,
-            };
-            self.unapply(&applying, &new, fx);
+        self.set_status(device, seq, l.status.as_ref(), new.as_ref());
+        if admitted(l.status.as_ref()) != admitted(new.as_ref()) {
+            let counts = admitted(new.as_ref());
+            self.count_gap(device, seq, l.marker.prev_seq, counts);
+        }
+        match (&l.status, &new) {
+            (Some(_), None) => {
+                if *device == self.device {
+                    self.adopt_own(Link {
+                        seq,
+                        digest: l.id.digest,
+                    });
+                }
+                self.set_applied(&l.id, &l.person, &l.entry, true, fx);
+            }
+            (None, Some(new)) => self.unapply(&l, new, fx),
+            _ => {}
         }
     }
 
@@ -1043,11 +938,9 @@ impl Log {
 /// An alert for a refusal the host should see.
 fn refuse_alert(id: &EntryRef, why: &Refusal, fx: &mut Effects) {
     fx.alerts.push(match why {
-        Refusal::OutsideCut(_) => Alert::OutsideCut {
-            id: EntryId::from(id),
-        },
+        Refusal::OutsideCut(_) => Alert::OutsideCut { id: id.clone() },
         _ => Alert::Refused {
-            id: EntryId::from(id),
+            id: id.clone(),
             why: why.clone(),
             next: why.next(),
         },

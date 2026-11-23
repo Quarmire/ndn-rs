@@ -6,7 +6,7 @@ use ndn_packet::encode::DataBuilder;
 use ndn_security::confidentiality::ContentKey;
 use ndn_sync::StoreOp;
 
-use super::admit::{Applying, Fresh, link_of};
+use super::admit::{Fresh, link_of};
 use super::chain::Status;
 use super::*;
 use crate::wire::{
@@ -37,7 +37,7 @@ impl Log {
             payload,
         };
         let body = match epoch {
-            None => Body::Put(put.clone()),
+            None => Body::Put(put),
             Some(epoch) => {
                 let name = log_name(&self.device, &self.space, self.next_seq);
                 let key = self
@@ -52,7 +52,7 @@ impl Log {
             }
         };
         let after = self.register.after_for_put(path);
-        self.sign_next(body, after, Some(put), extra, now)
+        self.sign_next(Some(path), body, after, extra, now)
     }
 
     /// Sign a Members entry (the space's creation, additions, removals). Only
@@ -62,7 +62,7 @@ impl Log {
         if let Some(ticket) = self.gate()? {
             return Ok(Step::Wait(ticket));
         }
-        self.sign_next(Body::Members(body), vec![], None, vec![], now)
+        self.sign_next(None, Body::Members(body), vec![], vec![], now)
     }
 
     /// Sign an Epoch entry for `audience`: a fresh key, stored (wrapped to
@@ -90,7 +90,7 @@ impl Log {
             audience,
         });
         let after = self.epoch_tips();
-        self.sign_next(body, after, None, vec![StoreOp::Insert(at, stored)], now)
+        self.sign_next(None, body, after, vec![StoreOp::Insert(at, stored)], now)
     }
 
     /// The Epoch entries no held epoch replaces: what a new Epoch entry
@@ -197,9 +197,9 @@ impl Log {
     /// with it in one batch, apply it.
     fn sign_next(
         &mut self,
+        subject: Option<&Name>,
         body: Body,
         after: Vec<EntryRef>,
-        put: Option<PutBody>,
         extra: Vec<StoreOp>,
         now: u64,
     ) -> Result<Step, HeapError> {
@@ -209,7 +209,7 @@ impl Log {
             after,
             body,
         };
-        let subject = put.as_ref().map_or(&self.space, |p| &p.path);
+        let subject = subject.unwrap_or(&self.space);
         let content = entry.encode().map_err(|e| wire_error(subject, e))?;
         let name = log_name(&self.device, &self.space, seq);
         let packet = seal::sign(DataBuilder::new(name.clone(), &content), &*self.signer)
@@ -227,32 +227,22 @@ impl Log {
                 resumed: seq,
             });
         }
-        let link = link_of(&entry.prev, seq);
+        let link = link_of(&entry.prev, seq).unwrap_or_default();
         self.store.apply(extra);
         let person = self.person.clone();
-        let applying = Applying {
-            id: id.clone(),
-            person: person.clone(),
-            entry,
-            put,
+        let fresh = Fresh {
+            id: &id,
+            wire: &packet,
+            person: &person,
+            key_digest: self.key_digest,
+            link,
+            verdict: Ok(&entry),
         };
-        self.store_fresh(
-            Fresh {
-                id: &id,
-                wire: &packet,
-                person: &person,
-                key_digest: self.key_digest,
-                link,
-                status: None::<Status>,
-                applying: Some(applying),
-            },
-            now,
-            &mut fx,
-        );
+        self.store_fresh(fresh, now, &mut fx);
         self.next_seq = seq.saturating_add(1);
         fx.publish = Some(Publish { seq, structural });
         self.settle(&mut fx);
-        Ok(Step::Done(EntryId::from(&id), fx))
+        Ok(Step::Done(id, fx))
     }
 
     /// What a removal of `person` binds: per device of the person this device
