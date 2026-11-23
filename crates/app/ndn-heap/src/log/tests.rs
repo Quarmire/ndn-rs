@@ -1537,3 +1537,42 @@ async fn an_old_image_adopts_what_the_previous_run_could_have_signed_and_resumes
         }
     )));
 }
+
+#[tokio::test]
+async fn a_refused_entry_does_not_vouch_for_its_device_and_an_applied_or_closed_one_does() {
+    let dave = dev("/dave/phone", "/dave", 6);
+    let erin = dev("/erin/phone", "/erin", 7);
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    // A stranger under a trusted namespace: refused, held, no voucher.
+    let refused = r.admit(&Chain::new(&dave).put("/a", "x"));
+    assert_eq!(refused.outcome, Outcome::Refused(Refusal::NotMember));
+    // Bytes that verify and do not decode.
+    assert_eq!(
+        r.admit(&sign_raw(&erin, 1, b"\xff\xfejunk")).outcome,
+        Outcome::Unreadable
+    );
+    for d in [&dave, &erin] {
+        assert!(r.log.holds(&d.name), "held");
+        assert!(!r.log.vouches(&d.name), "{} is not vouched for", d.name);
+    }
+    assert!(!r.log.vouches(&bob().name), "nothing of Bob's is held");
+    r.applied(&Chain::new(&bob()).put("/a", "one"));
+    assert!(r.log.vouches(&bob().name));
+    r.flusher.flush().await.unwrap();
+    let again = open_on(&r.crash(), &carol());
+    assert!(again.log.vouches(&bob().name) && again.log.vouches(&phone().name));
+    assert!(!again.log.vouches(&dave.name) && !again.log.vouches(&erin.name));
+
+    // Held closed (sealed, no key yet) is admitted: it vouches.
+    let s = sealed_space();
+    let mut r = rig(&carol());
+    r.applied(&s.created);
+    r.applied(&s.epoch_entry);
+    assert_eq!(
+        r.admit(&sealed_put(&s, "/secret", "hush")).outcome,
+        Outcome::Closed
+    );
+    assert!(r.log.vouches(&bob().name));
+}
