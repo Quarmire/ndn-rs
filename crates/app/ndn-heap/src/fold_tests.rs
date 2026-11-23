@@ -114,6 +114,7 @@ struct Snapshot {
     audiences: Vec<(EpochId, BTreeSet<Name>)>,
     in_force: Option<EpochId>,
     complete: bool,
+    removed_writers: Vec<(Name, Vec<EntryRef>)>,
 }
 
 fn snapshot(f: &Fold) -> Snapshot {
@@ -135,6 +136,7 @@ fn snapshot(f: &Fold) -> Snapshot {
         audiences: pool.iter().map(|e| (e.clone(), f.audience(e))).collect(),
         in_force: f.in_force(),
         complete: f.complete(),
+        removed_writers: f.removed_writers(),
     }
 }
 
@@ -432,6 +434,47 @@ fn removal_tips_are_the_union_over_every_removed_writer_add_of_that_person() {
     assert_eq!(f.removal_tips(&person(0)), want);
     assert_eq!(f.removal_tips(&person(1)), vec![t3]);
     assert!(f.removal_tips(&person(2)).is_empty());
+}
+
+#[test]
+fn removed_writers_lists_each_person_removed_and_not_readmitted() {
+    let (t1, t2, t3) = (carrier(1, 4, 1), carrier(2, 6, 2), carrier(1, 9, 3));
+    let mut f = Fold::new(owner());
+    f.apply_members(
+        &carrier(0, 1, 1),
+        &members(vec![
+            add(1, person(0), Role::Writer),
+            add(2, person(0), Role::Writer),
+            add(3, person(1), Role::Writer),
+            add(4, person(2), Role::Writer),
+            add(5, person(3), Role::Reader),
+            add(6, owner(), Role::Writer),
+        ]),
+    );
+    f.apply_members(
+        &carrier(0, 2, 2),
+        &members(vec![
+            remove(1, vec![t1.clone()]),
+            remove(2, vec![t2.clone()]),
+            remove(3, vec![t3.clone()]),
+            remove(5, vec![t3.clone()]),
+            remove(6, vec![t3.clone()]),
+        ]),
+    );
+    // Person 1 is admitted again under a fresh id; person 0 is not. Persons
+    // who were only readers, and the owner, are never listed.
+    f.apply_members(
+        &carrier(0, 3, 3),
+        &members(vec![add(7, person(1), Role::Writer)]),
+    );
+    let mut tips = vec![t1, t2];
+    tips.sort();
+    assert_eq!(f.removed_writers(), vec![(person(0), tips.clone())]);
+    f.apply_members(&carrier(0, 4, 4), &members(vec![remove(7, vec![])]));
+    assert_eq!(
+        f.removed_writers(),
+        vec![(person(0), tips), (person(1), vec![t3]),]
+    );
 }
 
 #[test]
