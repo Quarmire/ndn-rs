@@ -85,11 +85,23 @@ pub(super) struct Fresh<'a> {
 
 /// An entry held, as the store has it.
 struct Loaded {
+    id: EntryRef,
     marker: Marker,
     status: Option<Status>,
     entry: Entry,
     key: Name,
     person: Name,
+}
+
+/// How a held entry is judged again ([`Log::reassess`]).
+pub(super) enum Rejudge {
+    /// By what is held now: a change of facts.
+    Held,
+    /// By what is held now, for another copy the judge verified: what was
+    /// refused for trust is judged too.
+    Verified,
+    /// Refused outright, by the judge or the host.
+    Refused(Refusal),
 }
 
 /// The entry in a packet, and the link it states to the one before: the
@@ -271,7 +283,7 @@ impl Log {
             .status(&id.device, id.seq)
             .is_some_and(|s| s.can_change())
         {
-            self.reassess(&id.device, id.seq, true, fx);
+            self.reassess(&id.device, id.seq, Rejudge::Verified, fx);
         }
         Outcome::Duplicate
     }
@@ -970,7 +982,7 @@ impl Log {
         while let Some(scope) = self.queue.pop() {
             for (device, seqs) in self.candidates(&scope) {
                 for seq in seqs.seqs() {
-                    self.reassess(&device, seq, false, fx);
+                    self.reassess(&device, seq, Rejudge::Held, fx);
                 }
             }
         }
@@ -1011,6 +1023,11 @@ impl Log {
         let key = data.sig_info()?.key_locator_name()?;
         let (entry, _, _) = shape(&data, seq)?;
         Some(Loaded {
+            id: EntryRef {
+                device: device.clone(),
+                seq,
+                digest: marker.signed_digest,
+            },
             marker,
             status: view.status(device, seq),
             entry,
@@ -1019,64 +1036,63 @@ impl Log {
         })
     }
 
-    /// Judge a held entry again, and move it between applied, held and refused
-    /// as the new verdict says.
-    pub(super) fn reassess(
-        &mut self,
-        device: &Name,
-        seq: u64,
-        verified_again: bool,
-        fx: &mut Effects,
-    ) {
+    /// Judge a held entry again, and move it between applied, held and
+    /// refused as the new verdict says (or as `how` says outright).
+    pub(super) fn reassess(&mut self, device: &Name, seq: u64, how: Rejudge, fx: &mut Effects) {
         let Some(l) = self.load_entry(device, seq) else {
             return;
         };
-        let held_for_trust = matches!(l.status, Some(Status::Refused(Refusal::Untrusted { .. })));
-        if l.status.as_ref().is_some_and(|s| !s.can_change()) || (held_for_trust && !verified_again)
-        {
-            return;
-        }
-        let name = log_name(device, &self.space, seq);
-        let id = EntryRef {
-            device: device.clone(),
-            seq,
-            digest: l.marker.signed_digest,
-        };
-        let verdict = self.assess(
-            &Subject {
-                device,
-                person: &l.person,
-                key: &l.key,
-                seq,
-                digest: id.digest,
-                name: &name,
-            },
-            &l.entry,
-        );
-        let new = match verdict {
-            Verdict::Apply(put) => {
-                if l.status.is_some() {
-                    self.set_status(device, seq, l.status.as_ref(), None);
-                    self.count_gap(device, seq, &l.marker, l.status.as_ref(), None);
-                    if *device == self.device {
-                        self.adopt_own(Link {
-                            seq,
-                            digest: id.digest,
-                        });
-                    }
-                    let applying = Applying {
-                        id,
-                        person: l.person,
-                        entry: l.entry,
-                        put,
-                    };
-                    self.apply_entry(&applying, fx);
+        let name = l.id.name(&self.space);
+        let new = match how {
+            Rejudge::Refused(why) => Status::Refused(match why {
+                Refusal::BadSignature => Refusal::Untrusted {
+                    why: "it did not verify when judged again with what this device holds now"
+                        .into(),
+                },
+                why => why,
+            }),
+            Rejudge::Held | Rejudge::Verified => {
+                let held_for_trust =
+                    matches!(l.status, Some(Status::Refused(Refusal::Untrusted { .. })));
+                if l.status.as_ref().is_some_and(|s| !s.can_change())
+                    || (held_for_trust && matches!(how, Rejudge::Held))
+                {
+                    return;
                 }
-                return;
+                let subject = Subject {
+                    device,
+                    person: &l.person,
+                    key: &l.key,
+                    seq,
+                    digest: l.id.digest,
+                    name: &name,
+                };
+                match self.assess(&subject, &l.entry) {
+                    Verdict::Apply(put) => {
+                        if l.status.is_some() {
+                            self.set_status(device, seq, l.status.as_ref(), None);
+                            self.count_gap(device, seq, &l.marker, l.status.as_ref(), None);
+                            if *device == self.device {
+                                self.adopt_own(Link {
+                                    seq,
+                                    digest: l.id.digest,
+                                });
+                            }
+                            let applying = Applying {
+                                id: l.id,
+                                person: l.person,
+                                entry: l.entry,
+                                put,
+                            };
+                            self.apply_entry(&applying, fx);
+                        }
+                        return;
+                    }
+                    Verdict::Closed => Status::Closed,
+                    Verdict::Waiting => Status::Waiting,
+                    Verdict::Refuse(why) => Status::Refused(why),
+                }
             }
-            Verdict::Closed => Status::Closed,
-            Verdict::Waiting => Status::Waiting,
-            Verdict::Refuse(why) => Status::Refused(why),
         };
         if l.status.as_ref() == Some(&new) {
             return;
@@ -1086,7 +1102,7 @@ impl Log {
         if l.status.is_none() {
             let put = self.view().opened_put(&l.entry, &name);
             let applying = Applying {
-                id,
+                id: l.id,
                 person: l.person,
                 entry: l.entry,
                 put,
@@ -1106,34 +1122,7 @@ impl Log {
         let stage = Arc::clone(&self.store);
         let _batch = stage.batch();
         let mut fx = Effects::default();
-        if let Some(l) = self.load_entry(device, seq) {
-            let new = Status::Refused(match why {
-                Refusal::BadSignature => Refusal::Untrusted {
-                    why: "it did not verify when judged again with what this device holds now"
-                        .into(),
-                },
-                why => why,
-            });
-            if l.status.as_ref() != Some(&new) {
-                self.set_status(device, seq, l.status.as_ref(), Some(&new));
-                self.count_gap(device, seq, &l.marker, l.status.as_ref(), Some(&new));
-                if l.status.is_none() {
-                    let name = log_name(device, &self.space, seq);
-                    let put = self.view().opened_put(&l.entry, &name);
-                    let applying = Applying {
-                        id: EntryRef {
-                            device: device.clone(),
-                            seq,
-                            digest: l.marker.signed_digest,
-                        },
-                        person: l.person,
-                        entry: l.entry,
-                        put,
-                    };
-                    self.unapply(&applying, &new, &mut fx);
-                }
-            }
-        }
+        self.reassess(device, seq, Rejudge::Refused(why), &mut fx);
         self.settle(&mut fx);
         fx
     }
