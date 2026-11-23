@@ -80,11 +80,6 @@ pub(crate) fn space_key(space: &Name) -> Name {
     under(kind("space"), space)
 }
 
-/// That the device was told it joined a space: `joined/<S>`.
-pub(crate) fn joined_key(space: &Name) -> Name {
-    under(kind("joined"), space)
-}
-
 /// `<kind>/<S>/<device>/<seq 8>`: a record per entry of a device, listed by
 /// [`seq_prefix`].
 fn seq_key(label: &str, space: &Name, device: &Name, seq: u64) -> Name {
@@ -130,16 +125,6 @@ pub(crate) fn parse_structural_key(space: &Name, key: &Name) -> Option<(Name, u6
 /// `supers/<S>/<device>/<seq 8>` (`ENTRY_REF*`).
 pub(crate) fn supers_key(space: &Name, device: &Name, seq: u64) -> Name {
     seq_key("supers", space, device, seq)
-}
-
-/// Every [`supers_key`] of `space` has this prefix.
-pub(crate) fn supers_prefix(space: &Name) -> Name {
-    seq_prefix("supers", space)
-}
-
-/// The device and seq of a [`supers_key`] of `space`.
-pub(crate) fn parse_supers_key(space: &Name, key: &Name) -> Option<(Name, u64)> {
-    parse_seq_key("supers", space, key)
 }
 
 /// The epoch key this device made, wrapped to its seal key:
@@ -410,11 +395,6 @@ impl ReserveRecord {
     }
 }
 
-/// The write of a [`ReserveRecord`], to put in a batch.
-pub(crate) fn reserve_op(space: &Name, record: ReserveRecord) -> StoreOp {
-    StoreOp::Insert(reserve_key(space), record.encode())
-}
-
 /// The write of a [`Head`], to put in a batch.
 pub(crate) fn head_op(space: &Name, head: Head) -> StoreOp {
     StoreOp::Insert(head_key(space), head.encode())
@@ -453,11 +433,13 @@ pub(crate) fn read_head(store: &dyn DataStore, space: &Name) -> Result<Option<He
 }
 
 /// Write the reservation record of `space` straight to the store.
+#[cfg(test)]
 pub(crate) fn write_reserve(store: &dyn DataStore, space: &Name, record: ReserveRecord) {
     store.insert(reserve_key(space), record.encode());
 }
 
 /// Write the head record of `space` straight to the store.
+#[cfg(test)]
 pub(crate) fn write_head(store: &dyn DataStore, space: &Name, head: Head) {
     store.insert(head_key(space), head.encode());
 }
@@ -562,6 +544,7 @@ pub(crate) struct ChainWalk {
     pub end: ChainEnd,
 }
 
+#[cfg(test)]
 impl ChainWalk {
     /// Whether the chain reaches its first entry.
     pub(crate) fn is_complete(&self) -> bool {

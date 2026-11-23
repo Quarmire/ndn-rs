@@ -209,7 +209,6 @@ fn keys_live_under_the_local_prefix_and_never_confuse_a_space_with_one_that_exte
         head_key(&s),
         reserve_key(&s),
         space_key(&s),
-        joined_key(&s),
         structural_key(&s, &device(), 1),
         heads_key(&s, b"path"),
         supers_key(&s, &device(), 1),
@@ -225,13 +224,12 @@ fn keys_live_under_the_local_prefix_and_never_confuse_a_space_with_one_that_exte
         head_key(&s),
         reserve_key(&s),
         space_key(&s),
-        joined_key(&s),
         equivocal_key(&entry),
     ]
     .into();
     kinds.sort();
     kinds.dedup();
-    assert_eq!(kinds.len(), 6, "every kind has its own key");
+    assert_eq!(kinds.len(), 5, "every kind has its own key");
 
     // A space is a prefix of the spaces that extend it: what a scan of one
     // space's keys must never return from another's.
@@ -239,7 +237,6 @@ fn keys_live_under_the_local_prefix_and_never_confuse_a_space_with_one_that_exte
     assert!(structural_key(&s, &device(), 5).has_prefix(&mine));
     assert!(!structural_key(&deeper, &device(), 5).has_prefix(&mine));
     assert!(!heads_key(&deeper, b"path").has_prefix(&heads_prefix(&s)));
-    assert!(!supers_key(&deeper, &device(), 5).has_prefix(&supers_prefix(&s)));
     assert!(!epoch_key(&deeper, &device(), 5).has_prefix(&epoch_prefix(&s)));
 
     // The seq orders numerically, and the key parses back.
