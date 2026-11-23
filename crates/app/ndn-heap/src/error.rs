@@ -62,15 +62,23 @@ pub struct Cut {
 }
 
 /// Why an entry was refused. A refused entry is never served as data.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
     /// Its device was cut and the cut does not keep it, whatever date or seq
     /// it claims.
+    #[error(
+        "its device {} was cut (removed by the space's owner, or its key revoked by its \
+         namespace's trust context) and the cut keeps only the chain of its entries up to seq \
+         {}, which this entry is not on, whatever date or seq it claims; ask the owner (who \
+         may write the member back in, or re-admit this exact entry of a revoked key)",
+        .0.device, .0.keeps_to
+    )]
     OutsideCut(Cut),
     /// Its key's role needs a cut for Data and no certificate of the key is
     /// valid by this device's clock: the newest ended at `not_after`, and
     /// the clock reads `now`. Only this device's clock refuses it, so it is
     /// not kept as refused: it is judged again when fetched again.
+    #[error("{}", ndn_security::TrustError::lapse_text(.not_after.0, .now.0))]
     Lapsed {
         /// The last NotAfter of the key's certificates, by its CA's clock.
         not_after: Timestamp,
@@ -78,19 +86,37 @@ pub enum Refusal {
         now: Timestamp,
     },
     /// Its signer is not a writer of the space, by the members entries.
+    #[error("its key is not a writer of the space by the members entries; ask the owner to add it")]
     NotMember,
     /// It does not verify: wrong signature, or bytes that do not match its
     /// name (a poisoned cache).
+    #[error(
+        "it does not verify (signature, name or sealed payload); try again later, for it may \
+         verify when fetched from another holder"
+    )]
     BadSignature,
     /// It is not sealed, and the members entries seal the space: its writer
     /// wrote it before hearing the entry that sealed the space.
+    #[error(
+        "it is not sealed, and the space is sealed: its writer wrote it before hearing the \
+         entry that sealed the space; nothing to do here, its writer writes it again, sealed"
+    )]
     Unsealed,
     /// It is sealed, and the space is public: the mirror of
     /// [`Refusal::Unsealed`].
+    #[error(
+        "it is sealed, and the space is public: its writer wrote it before hearing the entry \
+         that opened the space; nothing to do here, its writer writes it again, unsealed"
+    )]
     Sealed,
     /// Its key is marked suspected on this device (it may be in a thief's
     /// hands): no new entry of it is taken while the mark stands; the
     /// entries held from before stay.
+    #[error(
+        "its key {key} is marked suspected on this device since {since} (it may be in a \
+         thief's hands), so no new entry of it is taken; ask the owner to finish the key's \
+         revocation (a cut bounded by when it was lost), or unsuspect the key if it is safe"
+    )]
     Suspected {
         /// The key, `<id>/KEY/<k>`.
         key: Name,
@@ -101,6 +127,12 @@ pub enum Refusal {
     /// held now, refuses it for a reason no cut can excuse: a key above its
     /// signer is revoked, or the chain is no longer authorized. It is taken
     /// back only if its key's chain verifies again.
+    #[error(
+        "the trust context held now no longer lets its signer's certificate chain sign it \
+         ({why}), which no cut excuses; it is taken back only once its key has a certificate \
+         from an issuer still trusted: ask the owner of the namespace to certify the writer \
+         again"
+    )]
     Untrusted {
         /// The validator's verdict.
         why: String,
@@ -108,11 +140,22 @@ pub enum Refusal {
     /// Its `PREV` link names other bytes than the entry held at that seq
     /// (its writer named an entry that does not exist, or its key signed
     /// two at one seq): it does not extend the chain this device holds.
+    #[error(
+        "its PREV link names other bytes than the entry held at that seq, so it does not \
+         extend the chain this device holds; nothing to do here, it never applies and nothing \
+         waits for it: its writer writes again over the state it holds"
+    )]
     Chain,
     /// The writer's entries are already held in as many separate runs, or
     /// gap statements, as this device keeps for one device
     /// (the log's cap on fragmentation), and this one would start
     /// another. It is not stored.
+    #[error(
+        "its writer's entries are already held in as many separate runs (or gap statements) \
+         as this device keeps for one device, and this one starts another; it is not stored \
+         and is asked for again once the runs between are filled; if the writer signs with \
+         gaps on purpose, ask the owner to remove it"
+    )]
     Fragmented,
 }
 
@@ -128,68 +171,6 @@ impl Refusal {
             | Refusal::Fragmented => NextStep::AskOwner,
             Refusal::BadSignature => NextStep::RetryLater,
             Refusal::Unsealed | Refusal::Sealed | Refusal::Chain => NextStep::None,
-        }
-    }
-}
-
-impl fmt::Display for Refusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Refusal::OutsideCut(cut) => write!(
-                f,
-                "its device {} was cut (removed by the space's owner, or its key revoked by \
-                 its namespace's trust context) and the cut keeps only the chain of its \
-                 entries up to seq {}, which this entry is not on, whatever date or seq it \
-                 claims; ask the owner (who may write the member back in, or re-admit this \
-                 exact entry of a revoked key)",
-                cut.device, cut.keeps_to
-            ),
-            Refusal::Lapsed { not_after, now } => {
-                f.write_str(&ndn_security::TrustError::lapse_text(not_after.0, now.0))
-            }
-            Refusal::NotMember => f.write_str(
-                "its key is not a writer of the space by the members entries; ask the owner to \
-                 add it",
-            ),
-            Refusal::BadSignature => f.write_str(
-                "it does not verify (signature, name or sealed payload); try again later, for \
-                 it may verify when fetched from another holder",
-            ),
-            Refusal::Unsealed => f.write_str(
-                "it is not sealed, and the space is sealed: its writer wrote it before hearing \
-                 the entry that sealed the space; nothing to do here, its writer writes it \
-                 again, sealed",
-            ),
-            Refusal::Sealed => f.write_str(
-                "it is sealed, and the space is public: its writer wrote it before hearing the \
-                 entry that opened the space; nothing to do here, its writer writes it again, \
-                 unsealed",
-            ),
-            Refusal::Suspected { key, since } => write!(
-                f,
-                "its key {key} is marked suspected on this device since {since} (it may be in \
-                 a thief's hands), so no new entry of it is taken; ask the owner to finish \
-                 the key's revocation (a cut bounded by when it was lost), or unsuspect the \
-                 key if it is safe",
-            ),
-            Refusal::Untrusted { why } => write!(
-                f,
-                "the trust context held now no longer lets its signer's certificate chain sign \
-                 it ({why}), which no cut excuses; it is taken back only once its key has a \
-                 certificate from an issuer still trusted: ask the owner of the namespace to \
-                 certify the writer again",
-            ),
-            Refusal::Chain => f.write_str(
-                "its PREV link names other bytes than the entry held at that seq, so it does \
-                 not extend the chain this device holds; nothing to do here, it never applies \
-                 and nothing waits for it: its writer writes again over the state it holds",
-            ),
-            Refusal::Fragmented => f.write_str(
-                "its writer's entries are already held in as many separate runs (or gap \
-                 statements) as this device keeps for one device, and this one starts another; \
-                 it is not stored and is asked for again once the runs between are filled; if \
-                 the writer signs with gaps on purpose, ask the owner to remove it",
-            ),
         }
     }
 }
