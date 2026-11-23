@@ -43,13 +43,13 @@ use crate::revocation::{self, CutBound, CutProposal, Suspicion};
 use crate::rt;
 use crate::seal::{self, GrantRefusal, Granter, Keys};
 use crate::serve;
-use crate::space::{Follower, Heap, Share, SpaceInner, check_audience, new_id};
+use crate::space::{Follower, Heap, Share, SpaceInner, check_audience};
 use crate::store::Kind;
 use crate::sync::{HostRef, Net, NetConfig, Taken};
 use crate::trust::{Adopter, Adoption, Judge, Judged};
 use crate::wire::{
-    EpochId, MembersBody, Op, Role, device_of, is_device_name, is_namespace, log_name,
-    parse_log_name, parse_seal_key_name, parse_space_name,
+    EpochId, device_of, is_device_name, is_namespace, log_name, parse_log_name,
+    parse_seal_key_name, parse_space_name,
 };
 
 #[cfg(test)]
@@ -164,7 +164,7 @@ pub struct Node {
 pub(crate) struct NodeInner {
     me: Weak<NodeInner>,
     pub(crate) device: Name,
-    ns: Name,
+    pub(crate) ns: Name,
     pub(crate) writer: Writer,
     pub(crate) signer: Arc<dyn Signer>,
     keys: Arc<SecurityManager>,
@@ -362,7 +362,7 @@ impl Node {
         }
         let attached = inner.hold(space, false).await?;
         let heap = Heap::new(Arc::clone(&attached), Arc::clone(inner));
-        match inner.sign_creation(&attached, &share).await {
+        match attached.sign_creation(inner, &share).await {
             Ok(()) => Ok(heap),
             Err(e) => {
                 inner.leave_locked(space).await;
@@ -787,70 +787,6 @@ impl NodeInner {
             held.closing.store(true, Ordering::Relaxed);
             held.close_watchers();
         }
-    }
-
-    /// Sign the creation of a new space: its Members entries, then its first
-    /// epoch when it is private. Returns after the covering flush.
-    async fn sign_creation(
-        self: &Arc<Self>,
-        space: &Arc<SpaceInner>,
-        share: &Share,
-    ) -> Result<(), HeapError> {
-        let owner = self.ns.clone();
-        let mut ops = Vec::new();
-        let mut added = std::collections::BTreeSet::new();
-        let readers: &[Name] = match &share.readers {
-            Readers::Anyone => &[],
-            Readers::Persons(persons) => persons,
-        };
-        for (who, role) in share
-            .writers
-            .iter()
-            .map(|w| (w, Role::Writer))
-            .chain(readers.iter().map(|r| (r, Role::Reader)))
-        {
-            if *who != owner && added.insert((who.clone(), role as u8)) {
-                ops.push(Op::Add {
-                    id: new_id(),
-                    who: who.clone(),
-                    role,
-                    epoch: None,
-                });
-            }
-        }
-        let anyone = matches!(share.readers, Readers::Anyone);
-        let mut chunks: Vec<Vec<Op>> = ops
-            .chunks(crate::wire::OPS_MAX)
-            .map(<[Op]>::to_vec)
-            .collect();
-        if chunks.is_empty() {
-            chunks.push(Vec::new());
-        }
-        let mut last = None;
-        for (i, ops) in chunks.into_iter().enumerate() {
-            let create = (i == 0).then_some(anyone);
-            let now = self.now();
-            last = Some(
-                space
-                    .sign_with(self, |log| {
-                        log.sign_members(
-                            MembersBody {
-                                create,
-                                ops: ops.clone(),
-                            },
-                            now,
-                        )
-                    })
-                    .await?,
-            );
-        }
-        if let Some(epoch) = space.repair_epoch(self).await? {
-            last = Some(epoch);
-        }
-        if let Some((_, ticket)) = last {
-            self.flusher.wait_durable(ticket).await?;
-        }
-        Ok(())
     }
 
     // -- What the judge says later ----------------------------------------------

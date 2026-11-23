@@ -47,8 +47,8 @@ use crate::store::Kind;
 use crate::sync::{Group, TIMELINE};
 use crate::trust::Listing;
 use crate::wire::{
-    AUDIENCE_MAX, ChunksBody, INLINE_MAX, MembersBody, Op, PAYLOAD_MAX, Payload, Role, log_name,
-    parse_log_name, signed_digest_of,
+    AUDIENCE_MAX, ChunksBody, EpochId, INLINE_MAX, MembersBody, Op, PAYLOAD_MAX, Payload, Role,
+    log_name, parse_log_name, signed_digest_of,
 };
 
 #[cfg(test)]
@@ -561,6 +561,53 @@ impl SpaceInner {
         .await
     }
 
+    /// Sign `ops` as Members entries, as many as the entry limits need (the
+    /// first carries `create`, and one is signed for it even with no
+    /// operations), then the epoch the new members owe. The entry signed
+    /// last: its id and flush ticket.
+    async fn sign_members(
+        self: &Arc<Self>,
+        node: &Arc<NodeInner>,
+        mut create: Option<bool>,
+        ops: Vec<Op>,
+    ) -> Result<Option<(EntryId, Ticket)>, HeapError> {
+        let mut batches = crate::log::pack_ops(ops);
+        if create.is_some() && batches.is_empty() {
+            batches.push(Vec::new());
+        }
+        let mut last = None;
+        for ops in batches {
+            let (create, now) = (create.take(), node.now());
+            let body = |log: &mut Log| {
+                let members = MembersBody {
+                    create,
+                    ops: ops.clone(),
+                };
+                log.sign_members(members, now)
+            };
+            last = Some(self.sign_with(node, body).await?);
+        }
+        Ok(self.repair_epoch(node).await?.or(last))
+    }
+
+    /// Sign the creation of a new space: its Members entries, then its first
+    /// epoch when it is private. Returns after the covering flush.
+    pub(crate) async fn sign_creation(
+        self: &Arc<Self>,
+        node: &Arc<NodeInner>,
+        share: &Share,
+    ) -> Result<(), HeapError> {
+        let (anyone, readers) = match &share.readers {
+            Readers::Anyone => (true, &[][..]),
+            Readers::Persons(persons) => (false, &persons[..]),
+        };
+        let ops = adds(&share.writers, readers, None, |who, _| *who == node.ns);
+        if let Some((_, ticket)) = self.sign_members(node, Some(anyone), ops).await? {
+            node.flusher.wait_durable(ticket).await?;
+        }
+        Ok(())
+    }
+
     /// Before a removal binds what this device holds of the removed persons'
     /// devices, give entries it has heard of and not yet fetched
     /// `Config.first_look` to arrive: what it never held is left outside the
@@ -1061,10 +1108,9 @@ impl Heap {
         let (inner, node) = (&self.inner, &self.node);
         inner.log.lock().owner_only()?;
         inner.look_for_removed(node, &c.remove).await;
-        let batches = {
+        let ops = {
             let log = inner.log.lock();
             let fold = log.fold();
-            let in_force = fold.in_force();
             if let Readers::Persons(current) = fold.readers() {
                 let mut after: BTreeSet<Name> = current.into_iter().collect();
                 for person in &c.remove {
@@ -1075,55 +1121,18 @@ impl Heap {
                 check_audience(after.len())?;
             }
             let mut ops: Vec<Op> = c.remove.iter().flat_map(|p| log.remove_ops(p)).collect();
-            let mut added = BTreeSet::new();
-            for (who, role, standing) in c
-                .add_writers
-                .iter()
-                .map(|w| (w, Role::Writer, fold.is_writer(w)))
-                .chain(
-                    c.add_readers
-                        .iter()
-                        .map(|r| (r, Role::Reader, fold.is_reader(r))),
-                )
-            {
-                if !standing && added.insert((who.clone(), role as u8)) {
-                    ops.push(Op::Add {
-                        id: new_id(),
-                        who: who.clone(),
-                        role,
-                        // A reader reads the history of the epoch in force
-                        // (spec §6.6): the Add names it.
-                        epoch: if role == Role::Reader {
-                            in_force.clone()
-                        } else {
-                            None
-                        },
-                    });
-                }
-            }
-            crate::log::pack_ops(ops)
+            ops.extend(adds(
+                &c.add_writers,
+                &c.add_readers,
+                fold.in_force(),
+                |who, role| match role {
+                    Role::Writer => fold.is_writer(who),
+                    Role::Reader => fold.is_reader(who),
+                },
+            ));
+            ops
         };
-        let mut last = None;
-        for ops in batches {
-            let now = node.now();
-            last = Some(
-                inner
-                    .sign_with(node, |log| {
-                        log.sign_members(
-                            MembersBody {
-                                create: None,
-                                ops: ops.clone(),
-                            },
-                            now,
-                        )
-                    })
-                    .await?,
-            );
-        }
-        if let Some(epoch) = inner.repair_epoch(node).await? {
-            last = Some(epoch);
-        }
-        let Some((id, ticket)) = last else {
+        let Some((id, ticket)) = inner.sign_members(node, None, ops).await? else {
             return Err(HeapError::BadRequest {
                 why: "the change lists nobody to add or remove and the epoch is whole: nothing to \
                       sign"
@@ -1140,6 +1149,30 @@ pub(crate) fn new_id() -> [u8; 16] {
     let mut id = [0u8; 16];
     getrandom::getrandom(&mut id).expect("the operating system provides randomness");
     id
+}
+
+/// The Adds of `writers` and `readers` that `standing` does not say already
+/// stand, each once. A reader's Add names `epoch`, the one in force: the
+/// reader reads its history (spec §6.6).
+fn adds(
+    writers: &[Name],
+    readers: &[Name],
+    epoch: Option<EpochId>,
+    standing: impl Fn(&Name, Role) -> bool,
+) -> Vec<Op> {
+    let mut added = BTreeSet::new();
+    writers
+        .iter()
+        .map(|w| (w, Role::Writer))
+        .chain(readers.iter().map(|r| (r, Role::Reader)))
+        .filter(|&(who, role)| !standing(who, role) && added.insert((who, role as u8)))
+        .map(|(who, role)| Op::Add {
+            id: new_id(),
+            who: who.clone(),
+            role,
+            epoch: epoch.clone().filter(|_| role == Role::Reader),
+        })
+        .collect()
 }
 
 // -- The carrier -------------------------------------------------------------------
