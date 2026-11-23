@@ -412,85 +412,34 @@ pub(crate) enum GrantRefusal {
     AskerKeyRevoked,
 }
 
-/// The facts a granter decides on: the owner-signed Epoch entries it holds,
-/// the membership fold, and its keys. Implemented over the fold and the
-/// keys by the node; a test view in the tests.
-pub(crate) trait GrantView {
-    /// Whether a held owner-signed Epoch entry names `epoch`.
-    fn names_epoch(&self, epoch: &EpochId) -> bool;
-    /// Whether the audience of `epoch` contains `person`.
-    fn in_audience(&self, epoch: &EpochId, person: &Name) -> bool;
-    /// Whether `person` is a reader of the space now.
-    fn reads_now(&self, person: &Name) -> bool;
-    /// Whether this device holds the key of `epoch`.
-    fn holds_key(&self, epoch: &EpochId) -> bool;
-    /// Whether the asker's key, when the ask is judged with it, is revoked.
-    fn asker_key_revoked(&self) -> bool;
-}
-
-/// Whether the key of `epoch` may be granted to a device of `asker`'s
-/// person: **all five** of (1) a held owner-signed Epoch entry names the
-/// epoch, (2) its audience contains the person, (3) the person reads the
-/// space now, (4) this device holds the key, (5) the key of the asking
-/// device is not revoked. Forward only: a removed reader fails (3) for every
-/// later ask, a revoked device key fails (5). Pure; first failure named.
-pub(crate) fn may_grant<V: GrantView + ?Sized>(
-    view: &V,
+/// Whether the key of `epoch` of `space` may be granted to a device of
+/// `asker`'s person: **all five** of (1) a held owner-signed Epoch entry of
+/// `fold` names the epoch (the log applies no other), (2) its audience
+/// contains the person, (3) the person reads the space now, (4) this device
+/// holds the key, (5) the key of the asking device is not `revoked` (by a
+/// trust context held here; `false` before the seal key packet is judged).
+/// Forward only: a removed reader fails (3) for every later ask, a revoked
+/// device key fails (5). Pure; first failure named.
+pub(crate) fn may_grant(
+    fold: &Fold,
+    keys: &Keys,
+    space: &Name,
     epoch: &EpochId,
     asker: &Name,
+    revoked: bool,
 ) -> Result<(), GrantRefusal> {
-    if !view.names_epoch(epoch) {
-        return Err(GrantRefusal::EpochNotNamed);
-    }
-    if !view.in_audience(epoch, asker) {
-        return Err(GrantRefusal::NotInAudience);
-    }
-    if !view.reads_now(asker) {
-        return Err(GrantRefusal::NotReaderNow);
-    }
-    if !view.holds_key(epoch) {
-        return Err(GrantRefusal::KeyNotHeld);
-    }
-    if view.asker_key_revoked() {
-        return Err(GrantRefusal::AskerKeyRevoked);
-    }
-    Ok(())
-}
-
-/// The [`GrantView`] a granter has: the membership fold of the space (whose
-/// Epoch entries it holds, owner-signed: the log applies no other) and the
-/// keys of this device.
-pub(crate) struct Granter<'a> {
-    /// The space's membership fold.
-    pub fold: &'a Fold,
-    /// This device's keys.
-    pub keys: &'a Keys,
-    /// The space.
-    pub space: &'a Name,
-    /// Whether the key that signed the asker's seal key packet is revoked by
-    /// a trust context held here; `false` before the packet is judged.
-    pub revoked: bool,
-}
-
-impl GrantView for Granter<'_> {
-    fn names_epoch(&self, epoch: &EpochId) -> bool {
-        self.fold.epoch_body(epoch).is_some()
-    }
-
-    fn in_audience(&self, epoch: &EpochId, person: &Name) -> bool {
-        self.fold.audience(epoch).contains(person)
-    }
-
-    fn reads_now(&self, person: &Name) -> bool {
-        self.fold.is_reader(person)
-    }
-
-    fn holds_key(&self, epoch: &EpochId) -> bool {
-        self.keys.key(self.space, epoch).is_some()
-    }
-
-    fn asker_key_revoked(&self) -> bool {
-        self.revoked
+    if fold.epoch_body(epoch).is_none() {
+        Err(GrantRefusal::EpochNotNamed)
+    } else if !fold.audience(epoch).contains(asker) {
+        Err(GrantRefusal::NotInAudience)
+    } else if !fold.is_reader(asker) {
+        Err(GrantRefusal::NotReaderNow)
+    } else if keys.key(space, epoch).is_none() {
+        Err(GrantRefusal::KeyNotHeld)
+    } else if revoked {
+        Err(GrantRefusal::AskerKeyRevoked)
+    } else {
+        Ok(())
     }
 }
 
@@ -598,100 +547,59 @@ mod tests {
         assert_eq!(open_payload(&ContentKey::generate(), &name, &stored), None);
     }
 
-    /// A view with each of the five facts a grant needs switchable.
-    struct View {
-        names: bool,
-        audience: bool,
-        reads: bool,
-        holds: bool,
-        revoked: bool,
-    }
-
-    impl GrantView for View {
-        fn names_epoch(&self, _: &EpochId) -> bool {
-            self.names
-        }
-        fn in_audience(&self, _: &EpochId, _: &Name) -> bool {
-            self.audience
-        }
-        fn reads_now(&self, _: &Name) -> bool {
-            self.reads
-        }
-        fn holds_key(&self, _: &EpochId) -> bool {
-            self.holds
-        }
-        fn asker_key_revoked(&self) -> bool {
-            self.revoked
-        }
-    }
-
     #[test]
     fn may_grant_refuses_each_condition_and_names_which() {
-        let e = epoch("/alice/laptop", 1);
-        let asker = n("/bob");
-        let all = View {
-            names: true,
-            audience: true,
-            reads: true,
-            holds: true,
-            revoked: false,
+        let (mut fold, held, space, e, _) = sealed_space();
+        // `/p/3` reads, but the epoch was not made for it; `/p/2` is removed.
+        fold.apply_members(
+            &EntryRef {
+                device: n("/o/d0"),
+                seq: 3,
+                digest: [3; 32],
+            },
+            &MembersBody {
+                create: None,
+                ops: vec![
+                    Op::Add {
+                        id: [3; 16],
+                        who: n("/p/3"),
+                        role: Role::Reader,
+                        epoch: None,
+                    },
+                    Op::Remove {
+                        id: [2; 16],
+                        tips: vec![],
+                    },
+                ],
+            },
+        );
+        let (kept, late, removed) = (n("/p/1"), n("/p/3"), n("/p/2"));
+        let unknown = epoch("/o/d0", 9);
+        let ask = |keys: &Keys, e: &EpochId, asker: &Name, revoked| {
+            may_grant(&fold, keys, &space, e, asker, revoked)
         };
-        assert_eq!(may_grant(&all, &e, &asker), Ok(()));
+        assert_eq!(ask(&held, &e, &kept, false), Ok(()));
         let refusals = [
             (
-                View {
-                    names: false,
-                    ..all
-                },
+                ask(&held, &unknown, &kept, false),
                 GrantRefusal::EpochNotNamed,
             ),
-            (
-                View {
-                    audience: false,
-                    ..all
-                },
-                GrantRefusal::NotInAudience,
-            ),
-            (
-                View {
-                    reads: false,
-                    ..all
-                },
-                GrantRefusal::NotReaderNow,
-            ),
-            (
-                View {
-                    holds: false,
-                    ..all
-                },
-                GrantRefusal::KeyNotHeld,
-            ),
-            (
-                View {
-                    revoked: true,
-                    ..all
-                },
-                GrantRefusal::AskerKeyRevoked,
-            ),
+            (ask(&held, &e, &late, false), GrantRefusal::NotInAudience),
+            (ask(&held, &e, &removed, false), GrantRefusal::NotReaderNow),
+            (ask(&keys(), &e, &kept, false), GrantRefusal::KeyNotHeld),
+            (ask(&held, &e, &kept, true), GrantRefusal::AskerKeyRevoked),
         ];
         let mut said = BTreeSet::new();
-        for (view, refusal) in refusals {
-            assert_eq!(may_grant(&view, &e, &asker), Err(refusal));
+        for (got, refusal) in refusals {
+            assert_eq!(got, Err(refusal));
             assert!(
                 said.insert(refusal.to_string()),
                 "each says which: {refusal}"
             );
         }
         // Every condition is checked in the plan's order.
-        let none = View {
-            names: false,
-            audience: false,
-            reads: false,
-            holds: false,
-            revoked: true,
-        };
         assert_eq!(
-            may_grant(&none, &e, &asker),
+            ask(&keys(), &unknown, &late, true),
             Err(GrantRefusal::EpochNotNamed)
         );
     }
@@ -907,19 +815,11 @@ mod tests {
     fn a_removed_reader_is_refused_every_later_grant() {
         let (mut fold, granter, space, e, key) = sealed_space();
         let (kept, removed) = (n("/p/1"), n("/p/2"));
-        fn view<'a>(fold: &'a Fold, keys: &'a Keys, space: &'a Name) -> Granter<'a> {
-            Granter {
-                fold,
-                keys,
-                space,
-                revoked: false,
-            }
-        }
-        assert_eq!(may_grant(&view(&fold, &granter, &space), &e, &kept), Ok(()));
-        assert_eq!(
-            may_grant(&view(&fold, &granter, &space), &e, &removed),
-            Ok(())
-        );
+        let ask = |fold: &Fold, keys: &Keys, e: &EpochId, asker: &Name| {
+            may_grant(fold, keys, &space, e, asker, false)
+        };
+        assert_eq!(ask(&fold, &granter, &e, &kept), Ok(()));
+        assert_eq!(ask(&fold, &granter, &e, &removed), Ok(()));
         assert_eq!(
             granter.key(&space, &e).unwrap().expose(),
             key.expose(),
@@ -941,15 +841,11 @@ mod tests {
             },
         );
         assert_eq!(
-            may_grant(&view(&fold, &granter, &space), &e, &removed),
+            ask(&fold, &granter, &e, &removed),
             Err(GrantRefusal::NotReaderNow),
             "still in the old epoch's audience, but no longer a reader"
         );
-        assert_eq!(
-            may_grant(&view(&fold, &granter, &space), &e, &kept),
-            Ok(()),
-            "others are served"
-        );
+        assert_eq!(ask(&fold, &granter, &e, &kept), Ok(()), "others are served");
 
         // The owner repairs: a new epoch, for the readers that remain. The
         // removed reader is in neither condition for it.
@@ -964,25 +860,19 @@ mod tests {
         );
         let mut holding = keys();
         holding.hold(&space, next.clone(), ContentKey::generate());
-        let later = Granter {
-            fold: &fold,
-            keys: &holding,
-            space: &space,
-            revoked: false,
-        };
         assert_eq!(
-            may_grant(&later, &next, &removed),
+            ask(&fold, &holding, &next, &removed),
             Err(GrantRefusal::NotInAudience),
             "the new epoch is not for the removed reader"
         );
-        assert_eq!(may_grant(&later, &next, &kept), Ok(()));
+        assert_eq!(ask(&fold, &holding, &next, &kept), Ok(()));
         assert_eq!(
-            may_grant(&later, &e, &kept),
+            ask(&fold, &holding, &e, &kept),
             Err(GrantRefusal::KeyNotHeld),
             "the condition that fails is named"
         );
         assert_eq!(
-            may_grant(&later, &epoch("/o/d0", 9), &kept),
+            ask(&fold, &holding, &epoch("/o/d0", 9), &kept),
             Err(GrantRefusal::EpochNotNamed)
         );
     }
