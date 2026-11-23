@@ -940,7 +940,7 @@ async fn the_fetch_budget_bounds_waiting_headers() {
             Err(SignalRefusal::Unverified { .. })
         ));
     }
-    let slots = alice.gate.fetches.lock().waiting.len();
+    let slots = alice.gate.waiting.len();
     assert_eq!(slots, 0, "every place is given back");
 }
 

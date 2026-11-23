@@ -23,7 +23,7 @@
 //! device owns. Every ask that is not answered is Nacked, never left to time
 //! out.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -33,6 +33,7 @@ use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, NackReason};
 use parking_lot::Mutex;
 
+use crate::limit::Counts;
 use crate::rt;
 use crate::seal::seal_key_matches;
 use crate::sync::{HostRef, Net, Shared};
@@ -56,27 +57,28 @@ const GRANTS_PER_ASKER: usize = 32;
 const SEAL_LEARNING_MAX: usize = 64;
 const SEAL_LEARNING_PER_ASKER: usize = 2;
 
-/// A map that keeps the last `cap` entries put in it, for one generation of
-/// the judge (`NodeInner::generation`): an entry put or asked for under another
-/// generation is not there, and putting under a new one drops the rest. What
-/// a revocation may have changed is judged again, not served from here.
+/// A map that keeps the last [`GRANTS_KEPT`] entries put in it, for one
+/// generation of the judge (`NodeInner::generation`): an entry put or asked
+/// for under another generation is not there, and putting under a new one
+/// drops the rest. What a revocation may have changed is judged again, not
+/// served from here.
 struct Kept<V> {
-    cap: usize,
     generation: u64,
     order: VecDeque<Name>,
     map: HashMap<Name, V>,
 }
 
-impl<V: Clone> Kept<V> {
-    fn new(cap: usize) -> Self {
+impl<V> Default for Kept<V> {
+    fn default() -> Self {
         Kept {
-            cap,
             generation: 0,
             order: VecDeque::new(),
             map: HashMap::new(),
         }
     }
+}
 
+impl<V: Clone> Kept<V> {
     fn get(&self, generation: u64, key: &Name) -> Option<V> {
         if self.generation != generation {
             return None;
@@ -92,10 +94,10 @@ impl<V: Clone> Kept<V> {
         }
         if self.map.insert(key.clone(), value).is_none() {
             self.order.push_back(key);
-            while self.order.len() > self.cap {
-                if let Some(old) = self.order.pop_front() {
-                    self.map.remove(&old);
-                }
+            if self.order.len() > GRANTS_KEPT
+                && let Some(old) = self.order.pop_front()
+            {
+                self.map.remove(&old);
             }
         }
     }
@@ -104,55 +106,12 @@ impl<V: Clone> Kept<V> {
 /// What a granter keeps: the grants it answered, the seal keys it verified,
 /// the ones it is still learning and how many asks of each asker it is
 /// working on.
+#[derive(Default)]
 pub(crate) struct Granting {
     grants: Mutex<Kept<Bytes>>,
     seal_keys: Mutex<Kept<Name>>,
     learning: Mutex<BTreeSet<Name>>,
-    asks: Mutex<BTreeMap<Name, usize>>,
-}
-
-impl Default for Granting {
-    fn default() -> Self {
-        Granting {
-            grants: Mutex::new(Kept::new(GRANTS_KEPT)),
-            seal_keys: Mutex::new(Kept::new(GRANTS_KEPT)),
-            learning: Mutex::new(BTreeSet::new()),
-            asks: Mutex::new(BTreeMap::new()),
-        }
-    }
-}
-
-/// One grant ask of an asker being worked on; given back when dropped.
-struct Slot<'a> {
-    asks: &'a Mutex<BTreeMap<Name, usize>>,
-    asker: Name,
-}
-
-impl Drop for Slot<'_> {
-    fn drop(&mut self) {
-        let mut asks = self.asks.lock();
-        if let Some(n) = asks.get_mut(&self.asker) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                asks.remove(&self.asker);
-            }
-        }
-    }
-}
-
-impl Granting {
-    fn slot(&self, asker: &Name) -> Option<Slot<'_>> {
-        let mut asks = self.asks.lock();
-        let n = asks.entry(asker.clone()).or_default();
-        if *n >= GRANTS_PER_ASKER {
-            return None;
-        }
-        *n += 1;
-        Some(Slot {
-            asks: &self.asks,
-            asker: asker.clone(),
-        })
-    }
+    asks: Counts,
 }
 
 /// Answer one Interest for this device. Spawn it per Interest: a grant fetches
@@ -165,9 +124,7 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
     let packet = match served_kind(&name).filter(|_| !is_local(&name)) {
         Some(Served::Log) => packet(host, &name, Some(&me)),
         Some(Served::Held) => held_packet(host, &me, &name),
-        Some(Served::Seal) => parse_seal_key_name(&name)
-            .filter(|(device, _)| *device == me)
-            .and_then(|_| host.seal_key_packet(&name)),
+        Some(Served::Seal) => host.seal_key_packet(&name),
         Some(Served::Grant) => {
             if let Some((_, ask)) = parse_grant_name(&name).filter(|(g, _)| *g == me) {
                 rt::spawn(async move {
@@ -245,7 +202,7 @@ async fn grant(shared: &Arc<Shared>, name: &Name, ask: GrantAsk) -> Option<Bytes
     if let Some(kept) = shared.grants.grants.lock().get(generation, name) {
         return Some(kept);
     }
-    let Some(_slot) = shared.grants.slot(&asker) else {
+    let Some(_slot) = shared.grants.asks.take(&asker, GRANTS_PER_ASKER) else {
         tracing::debug!(%asker, "grant not answered: the asker has as many grant asks in progress here as it may ({GRANTS_PER_ASKER}); its next round asks again once they end");
         return None;
     };

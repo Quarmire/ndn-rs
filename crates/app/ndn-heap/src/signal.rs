@@ -36,6 +36,7 @@ use sha2::Sha256;
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::error::HeapError;
+use crate::limit::{Counts, Place};
 use crate::log::Log;
 use crate::node::Node;
 use crate::rt::Instant;
@@ -460,84 +461,54 @@ pub(crate) async fn signal_admit(
 /// run headers wait for.
 #[derive(Default)]
 pub(crate) struct SignalGate {
-    fetches: Mutex<Fetches>,
-}
-
-#[derive(Default)]
-struct Fetches {
     /// Run headers waiting for certificates, per sender namespace.
-    waiting: HashMap<Name, usize>,
+    waiting: Counts,
     /// Devices no certificate is fetched for until then.
-    backoff: HashMap<Name, Instant>,
-}
-
-/// A sender namespace's place among the headers waiting for certificates,
-/// given back when dropped.
-struct FetchSlot<'a> {
-    gate: &'a SignalGate,
-    namespace: Name,
-}
-
-impl Drop for FetchSlot<'_> {
-    fn drop(&mut self) {
-        let mut f = self.gate.fetches.lock();
-        if let Some(n) = f.waiting.get_mut(&self.namespace) {
-            *n -= 1;
-            if *n == 0 {
-                f.waiting.remove(&self.namespace);
-            }
-        }
-    }
+    backoff: Mutex<HashMap<Name, Instant>>,
 }
 
 impl SignalGate {
     /// A place for `sender`'s header among those waiting for certificates:
     /// refused while its device backs off, or while its namespace has
     /// [`SIGNAL_FETCHES_PER_NAMESPACE`] waiting.
-    fn fetch_slot(&self, sender: &SignalSender) -> Result<FetchSlot<'_>, SignalRefusal> {
-        let mut f = self.fetches.lock();
-        let now = Instant::now();
-        if let Some(until) = f.backoff.get(&sender.device).copied() {
-            if now < until {
-                return Err(SignalRefusal::Unverified {
-                    key: sender.key.clone(),
-                    why: format!(
-                        "a certificate a header of {} needed could not be had a moment ago, and \
-                         none is fetched for that device for {} s after",
-                        sender.device,
-                        SIGNAL_FETCH_BACKOFF.as_secs()
-                    ),
-                });
-            }
-            f.backoff.remove(&sender.device);
+    fn fetch_slot(&self, sender: &SignalSender) -> Result<Place<'_>, SignalRefusal> {
+        let unverified = |why: String| SignalRefusal::Unverified {
+            key: sender.key.clone(),
+            why,
+        };
+        let backing_off = self
+            .backoff
+            .lock()
+            .get(&sender.device)
+            .is_some_and(|&until| Instant::now() < until);
+        if backing_off {
+            return Err(unverified(format!(
+                "a certificate a header of {} needed could not be had a moment ago, and none is \
+                 fetched for that device for {} s after",
+                sender.device,
+                SIGNAL_FETCH_BACKOFF.as_secs()
+            )));
         }
-        let waiting = f.waiting.entry(sender.namespace.clone()).or_default();
-        if *waiting >= SIGNAL_FETCHES_PER_NAMESPACE {
-            return Err(SignalRefusal::Unverified {
-                key: sender.key.clone(),
-                why: format!(
-                    "{SIGNAL_FETCHES_PER_NAMESPACE} run headers of {} wait for certificates here \
-                     already",
+        self.waiting
+            .take(&sender.namespace, SIGNAL_FETCHES_PER_NAMESPACE)
+            .ok_or_else(|| {
+                unverified(format!(
+                    "{SIGNAL_FETCHES_PER_NAMESPACE} run headers of {} wait for certificates \
+                     here already",
                     sender.namespace
-                ),
-            });
-        }
-        *waiting += 1;
-        Ok(FetchSlot {
-            gate: self,
-            namespace: sender.namespace.clone(),
-        })
+                ))
+            })
     }
 
     /// A fetch for a header of `device` brought no certificate: none is
     /// fetched for it for [`SIGNAL_FETCH_BACKOFF`].
     fn backoff(&self, device: &Name) {
-        let mut f = self.fetches.lock();
+        let mut backoff = self.backoff.lock();
         let now = Instant::now();
-        if f.backoff.len() >= SIGNAL_BACKOFF_PRUNE_AT {
-            f.backoff.retain(|_, until| now < *until);
+        if backoff.len() >= SIGNAL_BACKOFF_PRUNE_AT {
+            backoff.retain(|_, until| now < *until);
         }
-        f.backoff.insert(device.clone(), now + SIGNAL_FETCH_BACKOFF);
+        backoff.insert(device.clone(), now + SIGNAL_FETCH_BACKOFF);
     }
 
     /// Verify `sender`'s run header by `view`, the live rule (see
