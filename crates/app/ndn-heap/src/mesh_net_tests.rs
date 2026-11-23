@@ -203,13 +203,44 @@ async fn a_removed_reader_is_refused_every_later_grant() {
             assert_eq!(
                 alice
                     .inner
-                    .may_grant(&space(), epoch, &m.devs[2].name)
+                    .may_grant(&space(), epoch, &m.devs[2].name, None)
                     .expect_err("refused"),
                 GrantRefusal::NotReaderNow
             );
         }
     }
     assert!(!has(&theirs, "/after", "new epoch").await);
+}
+
+/// A reader's device whose key is revoked is refused the grant, though its
+/// person is still a reader and the epoch names it: the decision names the
+/// key, which the granter knows once the seal key packet is judged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_device_with_a_revoked_key_is_refused_every_grant() {
+    let m = mesh(&["/alice/laptop", "/bob/phone"]).await;
+    let alice = m.boot(0, fast()).await;
+    let heap = alice.create(&space(), private(&["/bob"])).await.unwrap();
+    let epoch = heap.inner.log.lock().fold().in_force().expect("an epoch");
+    let (phone, key) = (
+        m.devs[1].name.clone(),
+        m.devs[1].name.clone().append("KEY").append("1"),
+    );
+    assert_eq!(
+        alice.inner.may_grant(&space(), &epoch, &phone, Some(&key)),
+        Ok(())
+    );
+    let revoking = ndn_security::SignedTrustContext::hierarchical(n("/bob"))
+        .with_version(2)
+        .with_revocation(key.clone());
+    m.devs[0]
+        .validator
+        .keyring()
+        .adopt_update(Arc::new(revoking))
+        .expect("adopted");
+    assert_eq!(
+        alice.inner.may_grant(&space(), &epoch, &phone, Some(&key)),
+        Err(GrantRefusal::AskerKeyRevoked)
+    );
 }
 
 /// Two owner devices each remove a different reader at the same time; each
@@ -277,6 +308,59 @@ async fn a_reader_added_by_an_add_reads_the_history_of_that_epoch() {
         has(&theirs, "/history", "written before bob").await
     })
     .await;
+}
+
+/// A reader added by an Add holds the epoch's key like one the epoch names:
+/// removed again, they read what was written in that epoch and nothing after,
+/// though the epoch's own audience never changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_added_by_an_add_and_removed_reads_nothing_written_after() {
+    let m = mesh(&["/alice/laptop", "/bob/laptop"]).await;
+    let alice = m.boot(0, fast()).await;
+    let heap = alice.create(&space(), private(&[])).await.unwrap();
+    heap.put(&n("/history"), bytes("before bob"), durable(true))
+        .await
+        .unwrap();
+    heap.change(MembersChange {
+        add_readers: vec![n("/bob")],
+        ..MembersChange::default()
+    })
+    .await
+    .unwrap();
+    let bob = m.boot(1, fast()).await;
+    let theirs = bob.open(&space()).await.unwrap();
+    eventually("bob reads what was written before he was added", || async {
+        has(&theirs, "/history", "before bob").await
+    })
+    .await;
+    heap.change(MembersChange {
+        remove: vec![n("/bob")],
+        ..MembersChange::default()
+    })
+    .await
+    .unwrap();
+    let id = heap
+        .put(&n("/after"), bytes("after bob"), durable(true))
+        .await
+        .unwrap();
+    let Body::Sealed(sealed) = entry_of(&m.devs[0].store, &m.devs[0].name, id.seq).body else {
+        panic!("the put is sealed");
+    };
+    // Whatever bob's device asks for, it is never given the key the put is
+    // sealed in.
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            theirs
+                .inner
+                .log
+                .lock()
+                .keys()
+                .key(&space(), &sealed.epoch)
+                .is_none(),
+            "a removed reader holds only the keys it was granted before"
+        );
+    }
 }
 
 /// A carrier holds the entries and cannot learn the path: the path and the
@@ -347,7 +431,7 @@ async fn an_unsealed_entry_in_a_sealed_space_is_refused() {
         &*signer,
     )
     .unwrap();
-    let taken = alice.inner.take(&space(), wire).await;
+    let taken = alice.inner.take(&space(), wire, false).await;
     assert!(
         matches!(
             taken,

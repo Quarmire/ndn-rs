@@ -87,18 +87,30 @@ fn names(v: &[Name]) -> Vec<Name> {
     v.to_vec()
 }
 
+/// The `after` of an Epoch entry that replaces `epochs`.
+fn refs(epochs: &[EpochId]) -> Vec<EntryRef> {
+    epochs
+        .iter()
+        .map(|e| EntryRef {
+            device: e.creator.clone(),
+            seq: e.seq,
+            digest: [0; 32],
+        })
+        .collect()
+}
+
 // ---- the property test ----------------------------------------------------
 
 #[derive(Clone, Debug)]
 enum Event {
     Members(EntryRef, MembersBody),
-    Epoch(EpochId, EpochBody),
+    Epoch(EpochId, EpochBody, Vec<EpochId>),
 }
 
 fn apply(fold: &mut Fold, event: &Event) {
     match event {
         Event::Members(carrier, body) => fold.apply_members(carrier, body),
-        Event::Epoch(id, body) => fold.apply_epoch(id.clone(), body),
+        Event::Epoch(id, body, replaces) => fold.apply_epoch(id.clone(), body, &refs(replaces)),
     }
 }
 
@@ -107,11 +119,12 @@ fn apply(fold: &mut Fold, event: &Event) {
 struct Snapshot {
     writers: Vec<Name>,
     readers: Readers,
-    persons: Vec<Name>,
     anyone: Option<bool>,
     epochs: Vec<EpochId>,
     tips: Vec<(Name, Vec<EntryRef>)>,
     audiences: Vec<(EpochId, BTreeSet<Name>)>,
+    holders: Vec<(EpochId, BTreeSet<Name>)>,
+    epoch_tips: Vec<EpochId>,
     in_force: Option<EpochId>,
     complete: bool,
     removed_writers: Vec<(Name, Vec<EntryRef>)>,
@@ -129,11 +142,12 @@ fn snapshot(f: &Fold) -> Snapshot {
     Snapshot {
         writers: f.writers(),
         readers: f.readers(),
-        persons: f.persons(),
         anyone: f.create(),
         epochs: f.epochs(),
         tips: who.iter().map(|p| (p.clone(), f.removal_tips(p))).collect(),
         audiences: pool.iter().map(|e| (e.clone(), f.audience(e))).collect(),
+        holders: pool.iter().map(|e| (e.clone(), f.holders(e))).collect(),
+        epoch_tips: f.epoch_tips(),
         in_force: f.in_force(),
         complete: f.complete(),
         removed_writers: f.removed_writers(),
@@ -177,7 +191,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
 #[derive(Clone, Debug)]
 enum Content {
     Members(Option<bool>, Vec<Op>),
-    Epoch(EpochId, Vec<Name>),
+    Epoch(EpochId, Vec<Name>, Vec<EpochId>),
 }
 
 fn arb_content() -> impl Strategy<Value = Content> {
@@ -187,8 +201,8 @@ fn arb_content() -> impl Strategy<Value = Content> {
             vec(arb_op(), 0..4)
         )
             .prop_map(|(create, ops)| Content::Members(create, ops)),
-        1 => (arb_epoch_id(), vec(arb_who(), 0..5))
-            .prop_map(|(e, audience)| Content::Epoch(e, audience)),
+        1 => (arb_epoch_id(), vec(arb_who(), 0..5), vec(arb_epoch_id(), 0..3))
+            .prop_map(|(e, audience, replaces)| Content::Epoch(e, audience, replaces)),
     ]
 }
 
@@ -204,7 +218,9 @@ fn arb_history() -> impl Strategy<Value = (Vec<Event>, Vec<Event>)> {
                     carrier((n % usize::from(DEVICES)) as u8, n as u64 + 1, n as u8 + 1),
                     MembersBody { create, ops },
                 ),
-                Content::Epoch(e, audience) => Event::Epoch(e, epoch_body(audience)),
+                Content::Epoch(e, audience, replaces) => {
+                    Event::Epoch(e, epoch_body(audience), replaces)
+                }
             })
             .collect();
         let mut all = events.clone();
@@ -258,6 +274,71 @@ proptest! {
         prop_assert!(f.withdraw_members(&gone));
         prop_assert_eq!(snapshot(&fold_of(&without)), snapshot(&f));
         prop_assert!(!f.withdraw_members(&gone));
+    }
+
+    #[test]
+    fn withdrawing_an_epoch_equals_never_having_seen_it(
+        (events, shuffled) in arb_history(),
+        pick in any::<Index>(),
+    ) {
+        let ids: Vec<&EpochId> = events
+            .iter()
+            .filter_map(|e| match e { Event::Epoch(id, ..) => Some(id), Event::Members(..) => None })
+            .collect();
+        prop_assume!(!ids.is_empty());
+        let gone = ids[pick.index(ids.len())].clone();
+        let without: Vec<Event> = events
+            .iter()
+            .filter(|e| !matches!(e, Event::Epoch(id, ..) if *id == gone))
+            .cloned()
+            .collect();
+        let mut f = fold_of(&shuffled);
+        prop_assert!(f.withdraw_epoch(&gone));
+        prop_assert_eq!(snapshot(&fold_of(&without)), snapshot(&f));
+        prop_assert!(!f.withdraw_epoch(&gone));
+    }
+
+    /// An epoch's key is held by everyone it was ever given to, so only an
+    /// epoch no removed reader holds may stay in force.
+    #[test]
+    fn holders_never_shrink_and_bound_the_epoch_in_force((events, _) in arb_history()) {
+        let f = fold_of(&events);
+        let readers: BTreeSet<Name> = match f.readers() {
+            Readers::Persons(p) => p.into_iter().collect(),
+            Readers::Anyone => BTreeSet::new(),
+        };
+        for c in 0..EPOCH_CREATORS {
+            for s in 1..=EPOCH_SEQS {
+                let e = eid(c, s);
+                prop_assert!(f.audience(&e).is_subset(&f.holders(&e)));
+            }
+        }
+        if let Some(e) = f.in_force() {
+            prop_assert!(f.holders(&e).is_subset(&readers));
+            prop_assert!(f.epoch_tips().contains(&e), "no replaced epoch is in force");
+            prop_assert_eq!(f.complete(), f.holders(&e) == readers);
+        }
+        // No Remove, and no withdrawal of a Remove, ever takes a holder away.
+        let kept: Vec<Event> = events
+            .iter()
+            .map(|e| match e {
+                Event::Members(c, b) => Event::Members(
+                    c.clone(),
+                    MembersBody {
+                        create: b.create,
+                        ops: b.ops.iter().filter(|o| matches!(o, Op::Add { .. })).cloned().collect(),
+                    },
+                ),
+                other => other.clone(),
+            })
+            .collect();
+        let bare = fold_of(&kept);
+        for c in 0..EPOCH_CREATORS {
+            for s in 1..=EPOCH_SEQS {
+                let e = eid(c, s);
+                prop_assert_eq!(f.holders(&e), bare.holders(&e));
+            }
+        }
     }
 }
 
@@ -485,14 +566,18 @@ fn in_force_picks_the_greatest_epoch_whose_audience_is_within_readers() {
         &members(vec![add(1, person(0), Role::Reader)]),
     );
     let (e1, e2, e3) = (eid(0, 1), eid(0, 2), eid(1, 1));
-    f.apply_epoch(e1.clone(), &epoch_body(vec![owner()]));
+    f.apply_epoch(e1.clone(), &epoch_body(vec![owner()]), &[]);
     assert_eq!(f.in_force(), Some(e1.clone()));
     assert!(!f.complete(), "person 0 reads but is not in the audience");
-    f.apply_epoch(e2.clone(), &epoch_body(vec![owner(), person(0)]));
+    f.apply_epoch(e2.clone(), &epoch_body(vec![owner(), person(0)]), &[]);
     assert_eq!(f.in_force(), Some(e2.clone()));
     assert!(f.complete());
     // An epoch naming someone who is no reader is never in force.
-    f.apply_epoch(e3.clone(), &epoch_body(vec![owner(), person(0), person(1)]));
+    f.apply_epoch(
+        e3.clone(),
+        &epoch_body(vec![owner(), person(0), person(1)]),
+        &[],
+    );
     assert_eq!(f.in_force(), Some(e2.clone()));
     // Ordered by creator name first, then seq.
     f.apply_members(
@@ -513,12 +598,12 @@ fn a_removed_reader_leaves_no_epoch_in_force_until_the_owner_repairs() {
         &carrier(0, 1, 1),
         &members(vec![add(1, person(0), Role::Reader)]),
     );
-    f.apply_epoch(eid(0, 1), &epoch_body(vec![owner(), person(0)]));
+    f.apply_epoch(eid(0, 1), &epoch_body(vec![owner(), person(0)]), &[]);
     assert!(f.complete());
     f.apply_members(&carrier(0, 2, 2), &members(vec![remove(1, vec![])]));
     assert_eq!(f.in_force(), None);
     assert!(!f.complete());
-    f.apply_epoch(eid(0, 2), &epoch_body(names(&[owner()])));
+    f.apply_epoch(eid(0, 2), &epoch_body(names(&[owner()])), &[]);
     assert_eq!(f.in_force(), Some(eid(0, 2)));
     assert!(f.complete());
 }
@@ -527,7 +612,7 @@ fn a_removed_reader_leaves_no_epoch_in_force_until_the_owner_repairs() {
 fn audience_adds_the_readers_granted_the_epoch_and_drops_the_removed() {
     let e = eid(0, 1);
     let mut f = Fold::new(owner());
-    f.apply_epoch(e.clone(), &epoch_body(vec![owner()]));
+    f.apply_epoch(e.clone(), &epoch_body(vec![owner()]), &[]);
     f.apply_members(
         &carrier(0, 1, 1),
         &members(vec![
@@ -544,6 +629,69 @@ fn audience_adds_the_readers_granted_the_epoch_and_drops_the_removed() {
 }
 
 #[test]
+fn a_reader_added_to_an_epoch_and_removed_leaves_it_out_of_force() {
+    // Alice's epoch names only her; Bob is added to it, then removed: the epoch
+    // is again for exactly the readers, but Bob still holds its key.
+    let e = eid(0, 1);
+    let mut f = Fold::new(owner());
+    f.apply_epoch(e.clone(), &epoch_body(vec![owner()]), &[]);
+    f.apply_members(
+        &carrier(0, 1, 1),
+        &members(vec![reader_in(1, person(0), e.clone())]),
+    );
+    assert_eq!(f.in_force(), Some(e.clone()));
+    assert!(f.complete());
+    f.apply_members(&carrier(0, 2, 2), &members(vec![remove(1, vec![])]));
+    assert_eq!(
+        f.in_force(),
+        None,
+        "the removed reader holds the epoch's key"
+    );
+    assert!(!f.complete());
+    // The owner's repair is a fresh epoch, which Bob was never admitted to.
+    f.apply_epoch(eid(0, 2), &epoch_body(names(&[owner()])), &[]);
+    assert_eq!(f.in_force(), Some(eid(0, 2)));
+    assert!(f.complete());
+}
+
+#[test]
+fn holders_keep_every_reader_ever_named_to_an_epoch_and_the_audience_only_the_standing() {
+    let e = eid(0, 1);
+    let mut f = Fold::new(owner());
+    f.apply_epoch(e.clone(), &epoch_body(vec![owner()]), &[]);
+    f.apply_members(
+        &carrier(0, 1, 1),
+        &members(vec![reader_in(1, person(0), e.clone())]),
+    );
+    f.apply_members(&carrier(0, 2, 2), &members(vec![remove(1, vec![])]));
+    let holders: BTreeSet<Name> = [owner(), person(0)].into_iter().collect();
+    assert_eq!(f.holders(&e), holders);
+    assert_eq!(f.audience(&e), [owner()].into_iter().collect());
+}
+
+#[test]
+fn an_epoch_a_held_epoch_replaces_is_never_in_force_whatever_their_order() {
+    // The creator that sorts last made the old epoch, so by order alone it
+    // would beat the rotation the other owner device signed after it.
+    let (old, new) = (eid(1, 1), eid(0, 5));
+    let mut f = Fold::new(owner());
+    f.apply_epoch(old.clone(), &epoch_body(vec![owner()]), &[]);
+    assert_eq!(f.in_force(), Some(old.clone()));
+    f.apply_epoch(
+        new.clone(),
+        &epoch_body(vec![owner()]),
+        &refs(std::slice::from_ref(&old)),
+    );
+    assert_eq!(f.in_force(), Some(new.clone()));
+    assert_eq!(f.epoch_tips(), vec![new.clone()]);
+    assert!(f.complete());
+    // The replacing entry withdrawn (its signer's key revoked): never signed.
+    assert!(f.withdraw_epoch(&new));
+    assert_eq!(f.in_force(), Some(old.clone()));
+    assert_eq!(f.epoch_tips(), vec![old]);
+}
+
+#[test]
 fn equivocating_epoch_bodies_resolve_to_one_regardless_of_order() {
     let e = eid(0, 1);
     let a = EpochBody {
@@ -555,11 +703,11 @@ fn equivocating_epoch_bodies_resolve_to_one_regardless_of_order() {
         audience: vec![owner(), person(0)],
     };
     let mut ab = Fold::new(owner());
-    ab.apply_epoch(e.clone(), &a);
-    ab.apply_epoch(e.clone(), &b);
+    ab.apply_epoch(e.clone(), &a, &[]);
+    ab.apply_epoch(e.clone(), &b, &[]);
     let mut ba = Fold::new(owner());
-    ba.apply_epoch(e.clone(), &b);
-    ba.apply_epoch(e.clone(), &a);
+    ba.apply_epoch(e.clone(), &b, &[]);
+    ba.apply_epoch(e.clone(), &a, &[]);
     assert_eq!(ab.epoch_body(&e), ba.epoch_body(&e));
     assert_eq!(ab.audience(&e), ba.audience(&e));
 }
@@ -567,8 +715,8 @@ fn equivocating_epoch_bodies_resolve_to_one_regardless_of_order() {
 #[test]
 fn withdrawing_an_epoch_takes_it_out_of_force() {
     let mut f = Fold::new(owner());
-    f.apply_epoch(eid(0, 1), &epoch_body(vec![owner()]));
-    f.apply_epoch(eid(0, 2), &epoch_body(vec![owner()]));
+    f.apply_epoch(eid(0, 1), &epoch_body(vec![owner()]), &[]);
+    f.apply_epoch(eid(0, 2), &epoch_body(vec![owner()]), &[]);
     assert_eq!(f.in_force(), Some(eid(0, 2)));
     assert!(f.withdraw_epoch(&eid(0, 2)));
     assert_eq!(f.in_force(), Some(eid(0, 1)));
@@ -594,7 +742,7 @@ fn concurrent_removals_leave_a_complete_epoch_after_each_owner_device_repairs() 
     let mut d1 = Fold::new(owner());
     for f in [&mut d0, &mut d1] {
         f.apply_members(&setup_c, &setup);
-        f.apply_epoch(eid(0, 1), &epoch_body(everyone.clone()));
+        f.apply_epoch(eid(0, 1), &epoch_body(everyone.clone()), &[]);
         assert!(f.complete());
     }
     d0.apply_members(&rm1_c, &rm1);
@@ -607,7 +755,7 @@ fn concurrent_removals_leave_a_complete_epoch_after_each_owner_device_repairs() 
         };
         let e = eid(creator, seq);
         let body = epoch_body(audience);
-        f.apply_epoch(e.clone(), &body);
+        f.apply_epoch(e.clone(), &body, &[]);
         assert!(f.complete());
         (e, body)
     };
@@ -615,16 +763,16 @@ fn concurrent_removals_leave_a_complete_epoch_after_each_owner_device_repairs() 
     let (e1, b1) = repair(&mut d1, 1, 2);
     // They merge: the union of removals leaves neither repair within the readers.
     d0.apply_members(&rm2_c, &rm2);
-    d0.apply_epoch(e1.clone(), &b1);
+    d0.apply_epoch(e1.clone(), &b1, &[]);
     d1.apply_members(&rm1_c, &rm1);
-    d1.apply_epoch(e0.clone(), &b0);
+    d1.apply_epoch(e0.clone(), &b0, &[]);
     assert_eq!(snapshot(&d0), snapshot(&d1));
     assert!(!d0.complete());
     // Each owner device repairs again against the merged state.
     let (e0, b0) = repair(&mut d0, 0, 3);
     let (e1, b1) = repair(&mut d1, 1, 3);
-    d0.apply_epoch(e1.clone(), &b1);
-    d1.apply_epoch(e0, &b0);
+    d0.apply_epoch(e1.clone(), &b1, &[]);
+    d1.apply_epoch(e0, &b0, &[]);
     assert_eq!(snapshot(&d0), snapshot(&d1));
     assert!(d0.complete());
     assert_eq!(d0.in_force(), Some(e1));

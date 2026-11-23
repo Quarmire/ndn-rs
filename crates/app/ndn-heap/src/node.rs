@@ -675,12 +675,9 @@ impl NodeInner {
     /// The log of `space` from the store, and whether the last run left it
     /// without a clean close.
     fn open_log(&self, space: &Name) -> Result<(Log, bool), HeapError> {
-        let adopted = store::own_head_from_names(&*self.stage, &self.device, space);
         let reserve = store::read_reserve(&*self.raw, space).map_err(|e| local(e.to_string()))?;
         let head = store::read_head(&*self.raw, space).map_err(|e| local(e.to_string()))?;
         let head_seq = head.map_or(0, |h| h.seq);
-        let clean = reserve.is_some_and(|r| r.clean && r.r == head_seq)
-            && adopted.as_ref().map_or(0, |h| h.seq) == head_seq;
         let recipient =
             seal::recipient_key(&self.keys, &self.device).map_err(|e| local(e.to_string()))?;
         let log = Log::open(
@@ -696,6 +693,8 @@ impl NodeInner {
             Arc::clone(&self.stage),
             Arc::clone(&self.flusher),
         )?;
+        // Read before the open above, which writes the next reservation.
+        let clean = reserve.is_some_and(|r| r.clean && r.r == head_seq) && log.head() == head_seq;
         Ok((log, !clean))
     }
 
@@ -724,7 +723,8 @@ impl NodeInner {
     }
 
     /// Join the group of an opened space at its head and take it into the
-    /// node; recover own entries from peers after an unclean start.
+    /// node; with peers known, wait for them to show what they hold of this
+    /// device before anything is signed.
     async fn join(self: &Arc<Self>, held: Held) -> Result<Arc<SpaceInner>, HeapError> {
         let Held {
             log,
@@ -733,7 +733,7 @@ impl NodeInner {
         } = held;
         let net = self.net().ok_or_else(|| local("the node is stopped"))?;
         let space = log.space().clone();
-        let counter = if follower { 0 } else { log.next_seq() - 1 };
+        let counter = if follower { 0 } else { log.head() };
         let group = net.join(&space, counter).await?;
         let publisher = Publisher::spawn(Arc::clone(&self.flusher), group.sink());
         let inner = Arc::new(SpaceInner::new(
@@ -744,25 +744,23 @@ impl NodeInner {
             follower,
         ));
         self.spaces.write().insert(space, Arc::clone(&inner));
-        if unclean && !follower {
-            // Peers known (an entry of another device is held): wait for
-            // them before the first publication. Otherwise nothing is waited
-            // for; what peers heard later hold of this device's is still
-            // fetched and handed to the log.
-            let peers = {
-                let log = inner.log.lock();
-                log.fold().persons().iter().any(|person| {
-                    log.held_names(person)
-                        .iter()
-                        .any(|n| parse_log_name(n).is_some_and(|l| l.device != self.device))
-                })
-            };
+        if !follower {
+            // Peers known (an admitted entry of another device is held): wait
+            // for their vector, and for the entries it shows of this device,
+            // before the first publication. Clean or not: an old image closed
+            // cleanly looks complete, and the peers hold what it signed since.
+            // The wait ends on the first vector and on the own entries
+            // fetched (or asked for in vain); `settle` is only the longest it
+            // waits for a vector, liveness and not a rule. Otherwise nothing
+            // is waited for; what peers heard later hold of this device's is
+            // still fetched and handed to the log.
+            let peers = inner.log.lock().has_peers();
             if peers {
                 // The fetching goes on in the group when the wait ends: a
                 // start never waits for a network without bound.
                 let bound = self.config.settle + self.config.lifetime * 3;
                 let _ = rt::timeout(bound, group.recover(self.config.settle)).await;
-            } else {
+            } else if unclean {
                 let group = Arc::clone(&group);
                 let settle = self.config.settle;
                 rt::spawn(async move {
@@ -774,6 +772,7 @@ impl NodeInner {
         if !blobs.is_empty() {
             self.nudge(&inner.name);
         }
+        inner.repair_if_owed(self);
         Ok(inner)
     }
 
@@ -976,6 +975,7 @@ impl NodeInner {
                 held.finish(self, routed);
             }
             self.nudge(&space);
+            held.repair_if_owed(self);
         }
     }
 
@@ -999,6 +999,9 @@ impl NodeInner {
                 } else {
                     for space in spaces {
                         self.nudge(&space);
+                        if let Some(held) = self.space_of(&space) {
+                            held.repair_if_owed(self);
+                        }
                     }
                 }
             }
@@ -1040,7 +1043,7 @@ impl Host for NodeInner {
         &self.device
     }
 
-    async fn take(&self, space: &Name, wire: Bytes) -> Taken {
+    async fn take(&self, space: &Name, wire: Bytes, probe: bool) -> Taken {
         let refused = |why| Taken::Decided {
             outcome: Outcome::Refused(why),
             blobs: Vec::new(),
@@ -1078,7 +1081,11 @@ impl Host for NodeInner {
             if self.stopped.load(Ordering::SeqCst) {
                 return Taken::Pending(crate::trust::Waiting::Chain);
             }
-            let admitted = log.admit(&wire, &data, &verified, self.now());
+            let admitted = if probe {
+                log.admit_probed(&wire, &data, &verified, self.now())
+            } else {
+                log.admit(&wire, &data, &verified, self.now())
+            };
             let wrote = !matches!(admitted.outcome, Outcome::Duplicate);
             let blobs = admitted.effects.blobs.clone();
             let routed = held.route(self, &log, admitted.effects, wrote);
@@ -1114,13 +1121,13 @@ impl Host for NodeInner {
         self.space_of(space).map_or(0, |s| s.log.lock().head())
     }
 
-    fn note_counter(&self, space: &Name, device: &Name, seen: u64) {
+    fn note_own_counter(&self, space: &Name, seen: u64) {
         let Some(held) = self.space_of(space) else {
             return;
         };
         let routed = {
             let mut log = held.log.lock();
-            let fx = log.note_counter(device, seen);
+            let fx = log.note_own_counter(seen);
             held.route(self, &log, fx, false)
         };
         held.finish(&self.arc(), routed);
@@ -1139,10 +1146,15 @@ impl Host for NodeInner {
 
     fn served(&self, space: &Name, device: &Name, seq: u64) -> Option<Bytes> {
         let held = self.space_of(space)?;
+        // Whether an own entry may be served is decided under the log's lock:
+        // a Members or Epoch entry is recorded as held back by the signing
+        // call that stores it, still under that lock, so no Interest can find
+        // it stored and not yet held back.
+        let log = held.log.lock();
         if *device == self.device && !held.servable(self, seq) {
             return None;
         }
-        held.log.lock().served(device, seq)
+        log.served(device, seq)
     }
 
     fn served_piece(&self, space: &Name, device: &Name, seq: u64, piece: &Name) -> Option<Bytes> {
@@ -1163,9 +1175,21 @@ impl Host for NodeInner {
             .map_or_else(Vec::new, |s| s.unassembled(self))
     }
 
-    fn assembled(&self, space: &Name, blob: &Blob, ops: Vec<StoreOp>, payload: Vec<u8>) {
+    fn held_piece(&self, space: &Name, name: &Name) -> Option<Bytes> {
+        self.space_of(space)?;
+        self.stage.get(name)
+    }
+
+    fn keep_pieces(&self, space: &Name, ops: Vec<StoreOp>) {
+        if self.space_of(space).is_some() {
+            self.stage.apply(ops);
+            self.flusher.note_write();
+        }
+    }
+
+    fn assembled(&self, space: &Name, blob: &Blob) {
         if let Some(held) = self.space_of(space) {
-            held.assembled(&self.arc(), blob, ops, payload);
+            held.assembled(&self.arc(), blob);
         }
     }
 
@@ -1214,7 +1238,17 @@ impl Host for NodeInner {
         taken
     }
 
-    fn may_grant(&self, space: &Name, epoch: &EpochId, asker: &Name) -> Result<(), GrantRefusal> {
+    fn generation(&self) -> u64 {
+        self.judge.generation()
+    }
+
+    fn may_grant(
+        &self,
+        space: &Name,
+        epoch: &EpochId,
+        asker: &Name,
+        asker_key: Option<&Name>,
+    ) -> Result<(), GrantRefusal> {
         let held = self.space_of(space).ok_or(GrantRefusal::EpochNotNamed)?;
         let person = self.person_of(asker);
         {
@@ -1224,13 +1258,16 @@ impl Host for NodeInner {
                     fold: log.fold(),
                     keys: log.keys(),
                     space,
+                    revoked: asker_key.is_some_and(|k| self.judge.key_revoked(k, space)),
                 },
                 epoch,
                 &person,
             )?;
-        }
-        if epoch.creator == self.device && !held.servable(self, epoch.seq) {
-            return Err(GrantRefusal::EpochNotNamed);
+            // Under the lock: the entry is held back there, in the same stretch
+            // that stores it, so no grant can slip in between.
+            if epoch.creator == self.device && !held.servable(self, epoch.seq) {
+                return Err(GrantRefusal::EpochNotNamed);
+            }
         }
         Ok(())
     }
@@ -1240,10 +1277,11 @@ impl Host for NodeInner {
         space: &Name,
         epoch: &EpochId,
         asker: &Name,
+        asker_key: &Name,
         to: &[u8; 32],
         name: &Name,
     ) -> Option<Bytes> {
-        self.may_grant(space, epoch, asker).ok()?;
+        self.may_grant(space, epoch, asker, Some(asker_key)).ok()?;
         let held = self.space_of(space)?;
         let key = held.log.lock().keys().key(space, epoch)?.clone();
         let packet = seal::grant_packet(to, &key, name, &*self.signer).ok()?;

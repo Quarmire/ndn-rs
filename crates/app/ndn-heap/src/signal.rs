@@ -788,17 +788,6 @@ impl Node {
     pub fn revocations(&self) -> u64 {
         signal_revocations(&self.inner.judge)
     }
-
-    /// This device's signature over `header`, by the key the node signs
-    /// entries with.
-    pub fn sign(&self, header: &[u8]) -> Result<Bytes, HeapError> {
-        self.inner
-            .signer
-            .sign_sync(header)
-            .map_err(|e| HeapError::Local {
-                reason: format!("the device key cannot sign: {e}"),
-            })
-    }
 }
 
 /// Why nothing about `space` is decided: this node has not opened it.

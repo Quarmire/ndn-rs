@@ -268,9 +268,9 @@ fn refusal(r: Result<CutProposal, HeapError>) -> String {
 
 // -- What a cut keeps ----------------------------------------------------------------
 
-/// Held verified, applied or still sealed, of this key only: a seq only a
-/// notice named is not held, an entry another key of the device signed is not
-/// the key's, and an entry refused for what it carries is neither kept nor
+/// Held verified, applied or still sealed, of this key only: a seq nothing
+/// holds is not kept, an entry another key of the device signed is not the
+/// key's, and an entry refused for what it carries is neither kept nor
 /// listed.
 #[tokio::test]
 async fn a_cut_keeps_exactly_what_the_device_holds_verified() {
@@ -283,7 +283,7 @@ async fn a_cut_keeps_exactly_what_the_device_holds_verified() {
     applied(&mut a, &in_notes.put("/a", "1"), 1_000);
     applied(&mut a, &in_notes.put("/b", "2"), 1_000);
     applied(&mut a, &in_notes.put_at(4, "/c", "4"), 1_000);
-    a.note_high(&bob().name, 6);
+    // Seq 3 is a hole: nothing is held there, so a cut cannot keep it.
     // A second key of the same device signed seq 5.
     in_notes.dev = bob_k2();
     let by_k2 = in_notes.put_at(5, "/d", "5");

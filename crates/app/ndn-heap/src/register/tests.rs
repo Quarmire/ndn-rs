@@ -91,7 +91,7 @@ impl Replica {
     fn lookup(store: &BTreeMap<Name, Bytes>) -> impl Fn(&EntryRef) -> Vec<EntryRef> + '_ {
         |x| {
             store
-                .get(&supers_key(&space(), &x.device, x.seq))
+                .get(&supers_key(&space(), &x.device, x.seq, &x.digest))
                 .map(|b| decode_refs(b).expect("the register's own record decodes"))
                 .unwrap_or_default()
         }
@@ -99,9 +99,14 @@ impl Replica {
 
     fn take(&mut self, e: &Ent) -> Vec<ValueChange> {
         self.applied.insert(e.id.clone(), e.write.clone());
-        let fx = self
-            .reg
-            .apply(&e.id, &e.write, &e.after, &Self::lookup(&self.store));
+        let applied = &self.applied;
+        let fx = self.reg.apply(
+            &e.id,
+            &e.write,
+            &e.after,
+            &Self::lookup(&self.store),
+            &|x| applied.get(x).cloned(),
+        );
         self.run(fx)
     }
 
@@ -165,9 +170,17 @@ impl Replica {
 }
 
 /// The heads of every path by the definition: the applied entries no applied
-/// entry's `after` names.
+/// entry at their path names in its `after`.
 fn expected_heads(applied: &[&Ent]) -> BTreeMap<Name, BTreeSet<EntryRef>> {
-    let named: BTreeSet<&EntryRef> = applied.iter().flat_map(|e| &e.after).collect();
+    let named: BTreeSet<&EntryRef> = applied
+        .iter()
+        .flat_map(|e| {
+            let at = &e.write.path;
+            e.after
+                .iter()
+                .filter(move |x| applied.iter().any(|t| t.id == **x && t.write.path == *at))
+        })
+        .collect();
     let mut out: BTreeMap<Name, BTreeSet<EntryRef>> = BTreeMap::new();
     for e in applied.iter().filter(|e| !named.contains(&e.id)) {
         out.entry(e.write.path.clone())
@@ -426,6 +439,76 @@ fn a_withdrawn_namer_gives_a_late_arriving_superseded_entry_its_place_back() {
     assert_eq!(r.heads(), r.persisted());
 }
 
+/// An entry whose `after` also names `target` under a digest that is not the
+/// one `target` has: what a writer can sign about an entry it has not seen.
+fn naming_wrongly(mut by: Ent, target: &Ent) -> Ent {
+    by.after.push(EntryRef {
+        digest: [target.id.digest[0] ^ 0xff; 32],
+        ..target.id.clone()
+    });
+    by
+}
+
+#[test]
+fn an_after_ref_with_a_wrong_digest_hides_nobody() {
+    // Review H2: A names (B, seq 1, a digest B's entry does not have). B's
+    // real entry is still a head, whichever arrives first, and withdrawing A's
+    // entry leaves exactly what never applying it would.
+    let b1 = ent(2, 1, 1, 7, "/f", "b", &[]);
+    let a1 = naming_wrongly(ent(1, 1, 1, 1, "/f", "a", &[]), &b1);
+    let both = BTreeSet::from([a1.id.clone(), b1.id.clone()]);
+    let (mut named_first, mut named_last) = (Replica::new(), Replica::new());
+    named_first.take_all([&a1, &b1]);
+    named_last.take_all([&b1, &a1]);
+    for r in [&named_first, &named_last] {
+        assert_eq!(
+            r.heads()[&n("/f")],
+            both,
+            "B's entry is no one's superseded"
+        );
+        assert_eq!(r.heads(), r.persisted());
+    }
+    for r in [&mut named_first, &mut named_last] {
+        r.refuse(&a1);
+        assert_eq!(r.heads()[&n("/f")], BTreeSet::from([b1.id.clone()]));
+        assert_eq!(r.value("/f"), Some(b1.id.clone()));
+        assert!(
+            r.store
+                .keys()
+                .all(|k| k.has_prefix(&heads_prefix(&space()))),
+            "the refused namer's `supers/` record is gone"
+        );
+    }
+}
+
+#[test]
+fn an_after_ref_to_another_paths_entry_hides_nothing() {
+    // Review H2, second half: an entry at /g that names the right digest of a
+    // head at /f supersedes nothing there.
+    let x = ent(2, 1, 1, 5, "/f", "x", &[]);
+    let across = ent(1, 1, 1, 1, "/g", "n", &[&x]);
+    let expected = BTreeMap::from([
+        (n("/f"), BTreeSet::from([x.id.clone()])),
+        (n("/g"), BTreeSet::from([across.id.clone()])),
+    ]);
+    let (mut head_first, mut namer_first) = (Replica::new(), Replica::new());
+    head_first.take_all([&x, &across]);
+    namer_first.take_all([&across, &x]);
+    for r in [&head_first, &namer_first] {
+        assert_eq!(r.heads(), expected);
+        assert_eq!(r.heads(), r.persisted());
+    }
+    // A real successor at /f, withdrawn, gives x back: the entry at /g is
+    // not holding it under.
+    for r in [&mut head_first, &mut namer_first] {
+        let m = ent(3, 1, 1, 9, "/f", "m", &[&x]);
+        r.take(&m);
+        assert_eq!(r.value("/f"), Some(m.id.clone()));
+        r.refuse(&m);
+        assert_eq!(r.heads(), expected);
+    }
+}
+
 #[test]
 fn memory_is_o_heads_not_o_entries() {
     let mut r = Replica::new();
@@ -498,9 +581,14 @@ fn a_duplicate_changes_nothing_and_writes_nothing() {
     r.take_all([&a, &b]);
     let before = (r.heads(), r.store.clone());
     for e in [&a, &b, &a] {
-        let fx = r
-            .reg
-            .apply(&e.id, &e.write, &e.after, &Replica::lookup(&r.store));
+        let applied = &r.applied;
+        let fx = r.reg.apply(
+            &e.id,
+            &e.write,
+            &e.after,
+            &Replica::lookup(&r.store),
+            &|x| applied.get(x).cloned(),
+        );
         assert!(
             fx.writes.is_empty() && fx.changes.is_empty(),
             "{:?} again",

@@ -64,10 +64,11 @@ impl<'a> View<'a> {
             .collect()
     }
 
-    /// The entries that name `x` in their `after` (applied ones).
+    /// The entries that name `x`, digest included, in their `after` (applied
+    /// ones): a ref to other bytes at `x`'s name is another record.
     pub(super) fn namers(&self, x: &EntryRef) -> Vec<EntryRef> {
         self.store
-            .get(&supers_key(self.space, &x.device, x.seq))
+            .get(&supers_key(self.space, &x.device, x.seq, &x.digest))
             .and_then(|record| decode_refs(&record))
             .unwrap_or_default()
     }

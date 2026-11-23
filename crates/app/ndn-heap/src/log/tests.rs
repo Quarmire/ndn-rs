@@ -1015,16 +1015,18 @@ async fn a_clean_open_states_no_gap() {
 }
 
 #[tokio::test]
-async fn a_devices_own_head_after_restart_comes_from_every_stored_own_entry_name_even_if_one_does_not_decode()
- {
+async fn a_devices_own_head_after_restart_comes_from_its_ledger_even_if_an_entry_does_not_decode() {
     let me = laptop();
-    let store = Arc::new(CrashStore::new());
-    // The entry at seq 5 is under this device's name and is not a packet
-    // at all; seq 3 is a real one.
+    let mut first = rig(&me);
+    // The entry at seq 5 verifies and is not an entry (stored, recorded as
+    // unreadable); seq 3 is a real one.
     let three = sign_raw(&me, 3, b"anything");
-    store.insert(three.name(), three.wire.clone());
-    store.insert(log_name(&me.name, &space(), 5), Bytes::from_static(b"torn"));
-    let mut r = open_on(&store, &me);
+    let five = sign_raw(&me, 5, b"torn");
+    first.admit(&three);
+    first.admit(&five);
+    first.flusher.flush().await.unwrap();
+
+    let mut r = open_on(&first.crash(), &me);
     assert_eq!(r.log.head(), 5);
     let s = r.members(members(Some(true), vec![])).await;
     assert!(
@@ -1038,18 +1040,51 @@ async fn a_devices_own_head_after_restart_comes_from_every_stored_own_entry_name
             .unwrap();
         Entry::decode(Data::decode(wire).unwrap().content().unwrap()).unwrap()
     };
+    // The first run reserved BLOCK: the entry resumes above it, over a gap
+    // statement that chains to the highest own entry held (5).
     assert_eq!(
         entry.prev,
         Some(Prev {
-            digest: signed_digest(&Bytes::from_static(b"torn")),
-            seq: None
+            digest: signed_digest(&five.wire),
+            seq: Some(5)
         })
     );
-    assert_eq!(s.id.seq, 6);
+    assert_eq!(s.id.seq, BLOCK + 1);
 }
 
 #[tokio::test]
-async fn an_own_entry_above_r_durable_raises_rolledback_and_is_not_applied() {
+async fn a_device_that_cannot_read_its_own_ledger_does_not_open_the_space() {
+    let me = laptop();
+    let store = Arc::new(CrashStore::new());
+    store.insert(
+        crate::store::ledger_key(&space(), &me.name),
+        Bytes::from_static(b"\xff"),
+    );
+    let raw = Arc::clone(&store) as Arc<dyn DataStore>;
+    let opened = Log::open(
+        Params {
+            space: space(),
+            device: me.name.clone(),
+            person: me.person.clone(),
+            signer: Arc::clone(&me.signer) as Arc<dyn Signer>,
+            keys: Keys::new(RecipientKey::generate()),
+            block: BLOCK,
+        },
+        Arc::clone(&raw),
+        Stage::new(Arc::clone(&raw)),
+        Flusher::spawn(raw),
+    );
+    let why = opened
+        .err()
+        .expect("an unreadable ledger is not taken for an empty one");
+    assert!(
+        why.to_string().contains("ledger record"),
+        "the refusal says what cannot be read: {why}"
+    );
+}
+
+#[tokio::test]
+async fn an_own_entry_above_r_durable_that_chains_to_nothing_held_raises_rolledback_and_waits() {
     let me = laptop();
     let image = Arc::new(CrashStore::new());
     write_reserve(
@@ -1063,7 +1098,8 @@ async fn an_own_entry_above_r_durable_raises_rolledback_and_is_not_applied() {
     let mut r = open_on(&image, &me);
     r.members(members(Some(true), vec![])).await;
     let durable = BLOCK;
-    // A copy of this device's key signed seq 500.
+    // A copy of this device's key signed seq 500, over an entry this device
+    // does not hold.
     let copy = sign_entry(
         &me,
         500,
@@ -1080,14 +1116,17 @@ async fn an_own_entry_above_r_durable_raises_rolledback_and_is_not_applied() {
         },
     );
     let a = r.admit(&copy);
-    assert_eq!(a.outcome, Outcome::Evidence);
+    assert_eq!(a.outcome, Outcome::Waiting);
     assert!(has_alert(
         &a,
         |al| matches!(al, Alert::RolledBack { reserved, seen: 500 } if *reserved == durable)
     ));
     assert_eq!(r.value("/stolen"), None);
     assert!(r.log.next_seq() > 500, "resumes above it");
-    assert!(r.store.contains(&copy.name()), "kept as evidence");
+    assert!(
+        r.store.contains(&copy.name()),
+        "held: it waits for what it chains to, and is applied only then"
+    );
 }
 
 #[tokio::test]
@@ -1096,7 +1135,7 @@ async fn an_unbacked_counter_does_not_raise_the_head() {
     let mut r = rig(&me);
     r.members(members(Some(true), vec![])).await;
     let head = r.log.head();
-    let fx = r.log.note_counter(&me.name, 9_999);
+    let fx = r.log.note_own_counter(9_999);
     assert!(fx.alerts.contains(&Alert::UnbackedCounter {
         device: me.name.clone(),
         seen: 9_999
@@ -1104,6 +1143,83 @@ async fn an_unbacked_counter_does_not_raise_the_head() {
     assert_eq!(r.log.head(), head);
     let next = r.put("/a", "x").await;
     assert_eq!(next.id.seq, head + 1);
+}
+
+#[tokio::test]
+async fn an_own_counter_above_the_reservation_wants_only_what_was_reserved() {
+    let me = laptop();
+    let image = Arc::new(CrashStore::new());
+    write_reserve(
+        &*image,
+        &space(),
+        ReserveRecord {
+            r: BLOCK,
+            clean: false,
+        },
+    );
+    let mut r = open_on(&image, &me);
+    r.log.note_own_counter(9_999);
+    let wanted: Vec<(u64, u64)> = r
+        .log
+        .missing()
+        .into_iter()
+        .filter(|w| w.device == me.name)
+        .map(|w| (w.first, w.last))
+        .collect();
+    assert_eq!(
+        wanted,
+        vec![(1, BLOCK)],
+        "an unsigned counter is believed as far as this device could have signed"
+    );
+    assert_eq!(r.log.high(&me.name), BLOCK);
+}
+
+#[tokio::test]
+async fn only_a_device_an_admitted_entry_vouches_for_is_a_peer() {
+    let mut r = rig(&carol());
+    assert!(!r.log.has_peers());
+    assert_eq!(
+        r.admit(&Chain::new(&bob()).put("/a", "1")).outcome,
+        Outcome::Refused(Refusal::NotMember)
+    );
+    assert!(!r.log.has_peers(), "a refused entry vouches for nothing");
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    assert!(r.log.has_peers());
+}
+
+#[tokio::test]
+async fn a_strangers_refused_entries_are_stored_once_and_alert_once() {
+    let mut r = rig(&carol());
+    let mut stranger = Chain::new(&bob());
+    let packets: Vec<Packet> = (1..=5)
+        .map(|i| stranger.put("/a", &i.to_string()))
+        .collect();
+    let mut alerts = 0;
+    for p in &packets[2..] {
+        let data = Data::decode(p.wire.clone()).unwrap();
+        let a = r.log.admit_probed(&p.wire, &data, &verified(&p.dev), NOW);
+        assert_eq!(a.outcome, Outcome::Refused(Refusal::NotMember));
+        alerts += a
+            .effects
+            .alerts
+            .iter()
+            .filter(|al| matches!(al, Alert::Refused { .. }))
+            .count();
+    }
+    let stored = packets
+        .iter()
+        .filter(|p| r.store.contains(&p.name()))
+        .count();
+    assert_eq!(
+        stored, 1,
+        "one refused entry per stranger, not one per counter"
+    );
+    assert_eq!(alerts, 1, "and one alert");
+    assert!(
+        r.log.missing().iter().all(|w| w.device != bob().name),
+        "the holes below a stranger's entry are not wanted"
+    );
 }
 
 #[tokio::test]
@@ -1138,14 +1254,16 @@ async fn recovery_adopts_only_own_entries_that_verify_chain_and_lie_within_r_dur
     let mut lost = open_on(&image, &me);
     lost.flusher.flush().await.unwrap();
     assert!(lost.log.reservation().durable_r() >= 3);
-    // 3 chains to 2, which is not held: not adopted, nothing stored.
+    // 3 chains to 2, which is not held: it is held, waiting, and not applied.
     let a = lost.admit(&p3);
-    assert_eq!(a.outcome, Outcome::Refused(Refusal::Chain));
-    assert!(!lost.store.contains(&p3.name()));
-    // 1 is the device's first entry; 2 and 3 chain to what was adopted.
-    for p in [&p1, &p2, &p3] {
+    assert_eq!(a.outcome, Outcome::Waiting);
+    assert_eq!(lost.value("/a"), None);
+    // 1 is the device's first entry; 2 chains to it, and 3, which waited,
+    // is applied with it.
+    for p in [&p1, &p2] {
         assert_eq!(lost.admit(p).outcome, Outcome::Applied);
     }
+    assert_eq!(lost.admit(&p3).outcome, Outcome::Duplicate);
     assert_eq!(lost.log.head(), 3);
     assert_eq!(lost.value("/a").as_deref(), Some("2"));
     // What a copy of the device would sign with another key of the device is
@@ -1182,13 +1300,12 @@ async fn recovery_adopts_only_own_entries_that_verify_chain_and_lie_within_r_dur
 // -- Catch-up bookkeeping --------------------------------------------------------------
 
 #[tokio::test]
-async fn a_replayed_stale_notice_state_never_lowers_what_is_wanted() {
+async fn what_is_wanted_is_the_holes_below_the_highest_entry_held_and_shrinks_only_by_holding() {
     let mut r = rig(&carol());
     let mut owner = Chain::new(&phone());
     r.applied(&creation(&mut owner));
     let mut b = Chain::new(&bob());
     let ps: Vec<Packet> = (1..=3).map(|i| b.put("/a", &i.to_string())).collect();
-    r.log.note_high(&bob().name, 10);
     r.applied(&ps[0]);
     r.applied(&ps[2]);
     let wanted = |r: &Rig| {
@@ -1199,14 +1316,13 @@ async fn a_replayed_stale_notice_state_never_lowers_what_is_wanted() {
             .map(|w| (w.first, w.last))
             .collect::<Vec<_>>()
     };
-    assert_eq!(wanted(&r), vec![(2, 2), (4, 10)]);
-    // A replayed older vector.
-    r.log.note_high(&bob().name, 3);
-    assert_eq!(wanted(&r), vec![(2, 2), (4, 10)]);
-    assert_eq!(r.log.high(&bob().name), 10);
+    // The hole below the entry held is real; nothing above it is wanted
+    // until an entry there is held (a counter is unsigned, `Log::high`).
+    assert_eq!(wanted(&r), vec![(2, 2)]);
+    assert_eq!(r.log.high(&bob().name), 3);
     assert_eq!(r.log.held_prefix(&bob().name), 1);
     r.applied(&ps[1]);
-    assert_eq!(wanted(&r), vec![(4, 10)]);
+    assert!(wanted(&r).is_empty());
     assert_eq!(r.log.held_prefix(&bob().name), 3);
 }
 
@@ -1299,6 +1415,63 @@ async fn a_withdrawn_entry_is_taken_back_only_when_offered_again_and_verified() 
     assert_eq!(r.value("/a"), None);
     assert_eq!(r.admit(&p1).outcome, Outcome::Duplicate);
     assert_eq!(r.value("/a").as_deref(), Some("one"));
+}
+
+#[tokio::test]
+async fn an_entry_withdrawn_for_a_cause_that_may_pass_is_taken_back_when_it_verifies_again() {
+    // Review L3: the judge's `BadSignature` for a missing certificate or a
+    // failing key store is not final; stored as final, no later copy could
+    // re-assess it.
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let p1 = Chain::new(&bob()).put("/a", "one");
+    r.applied(&p1);
+    r.log.withdraw(&bob().name, 1, Refusal::BadSignature);
+    assert_eq!(r.value("/a"), None);
+    assert_eq!(r.admit(&p1).outcome, Outcome::Duplicate);
+    assert_eq!(r.value("/a").as_deref(), Some("one"));
+}
+
+#[tokio::test]
+async fn an_entry_that_names_another_writers_entry_wrongly_or_at_another_path_hides_nothing() {
+    // Review H2: a writer cannot hide what another writer writes by naming
+    // it in `after`, with a digest it does not have or from another path.
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let wrong = EntryRef {
+        device: bob().name,
+        seq: 1,
+        digest: [9; 32],
+    };
+    r.applied(&owner.put_after("/a", "owner", vec![wrong]));
+    let mut b = Chain::new(&bob());
+    let p1 = b.put("/a", "bob");
+    r.applied(&p1);
+    let heads = |r: &Rig, path: &str| -> Vec<EntryRef> {
+        r.log
+            .register()
+            .heads_of(&n(path))
+            .iter()
+            .map(|h| h.entry.clone())
+            .collect()
+    };
+    assert!(
+        heads(&r, "/a").contains(&p1.entry_ref()),
+        "bob's entry is a head"
+    );
+    // The right digest, from an entry at another path.
+    r.applied(&owner.put_after("/c", "elsewhere", vec![p1.entry_ref()]));
+    assert!(
+        heads(&r, "/a").contains(&p1.entry_ref()),
+        "still a head at /a"
+    );
+    assert_eq!(heads(&r, "/c").len(), 1);
+    // Withdrawing the entries that named it leaves it as it was.
+    r.log.withdraw(&phone().name, 2, Refusal::NotMember);
+    r.log.withdraw(&phone().name, 3, Refusal::NotMember);
+    assert_eq!(heads(&r, "/a"), vec![p1.entry_ref()]);
 }
 
 /// Counts the reads of markers a store answers.
@@ -1488,10 +1661,12 @@ async fn a_device_of_another_person_under_the_owners_name_does_not_sign_members_
 }
 
 #[tokio::test]
-async fn an_old_image_adopts_what_the_previous_run_could_have_signed_and_resumes_above_the_rest() {
-    // d12 at unit level: the image's R is BLOCK; peers hold seq 1..=12 of
-    // this device. What this run's own extension covers (9..=16) is not what
-    // an earlier run signed.
+async fn an_old_image_applies_every_own_entry_that_chains_and_resumes_above_them() {
+    // d12 at unit level (review M2): the image's R is BLOCK; peers hold seq
+    // 1..=12 of this device. What this run's own extension covers (9..=16)
+    // is not what an earlier run signed: the entries above BLOCK raise
+    // `RolledBack` and are applied all the same, as every peer applied them,
+    // so this device and its peers agree on the value.
     let me = laptop();
     let mut source = rig(&me);
     source.members(members(Some(true), vec![])).await;
@@ -1521,29 +1696,45 @@ async fn an_old_image_adopts_what_the_previous_run_could_have_signed_and_resumes
     );
     let mut old = open_on(&image, &me);
     old.flusher.flush().await.unwrap();
-    for seq in 1..=12 {
+    // The entries above BLOCK come out of order: one that does not chain yet
+    // is held, waiting; it is applied when its predecessor is, and nothing
+    // asks for it again.
+    let early = old.admit(&packet(11));
+    assert_eq!(early.outcome, Outcome::Waiting);
+    assert!(has_alert(&early, |al| matches!(
+        al,
+        Alert::RolledBack { reserved, seen: 11 } if *reserved == BLOCK
+    )));
+    assert!(old.log.next_seq() > 11, "never signs over a seq it saw");
+    for seq in (1..=12).filter(|s| *s != 11) {
         let a = old.admit(&packet(seq));
-        if seq <= BLOCK {
-            assert_eq!(a.outcome, Outcome::Applied, "seq {seq}");
-        } else {
-            assert_eq!(a.outcome, Outcome::Evidence, "seq {seq}");
-            assert!(has_alert(&a, |al| matches!(
+        assert_eq!(a.outcome, Outcome::Applied, "seq {seq}");
+        assert_eq!(
+            has_alert(&a, |al| matches!(
                 al,
                 Alert::RolledBack { reserved, seen } if *reserved == BLOCK && *seen == seq
-            )));
-        }
+            )),
+            seq > BLOCK,
+            "seq {seq}"
+        );
     }
+    assert_eq!(old.admit(&packet(11)).outcome, Outcome::Duplicate);
     assert_eq!(old.log.head(), 12);
+    assert_eq!(
+        old.value("/a"),
+        Some("10".into()),
+        "the value the peers hold"
+    );
     assert_eq!(old.log.next_seq(), 13, "above everything a peer holds");
     let s = old.members(members(None, vec![])).await;
     assert_eq!(s.id.seq, 13);
-    assert!(s.effects.alerts.iter().any(|a| matches!(
-        a,
-        Alert::GapSigned {
-            after: 8,
-            resumed: 13
-        }
-    )));
+    assert!(
+        !s.effects
+            .alerts
+            .iter()
+            .any(|a| matches!(a, Alert::GapSigned { .. })),
+        "what chains is held: no gap to state"
+    );
 }
 
 #[tokio::test]
@@ -1583,4 +1774,290 @@ async fn a_refused_entry_does_not_vouch_for_its_device_and_an_applied_or_closed_
         Outcome::Closed
     );
     assert!(r.log.vouches(&bob().name));
+}
+
+#[tokio::test]
+async fn a_member_signing_the_largest_seq_does_not_panic_the_log() {
+    // Review L8: seq arithmetic on a seq the signer chose.
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let mut b = Chain::new(&bob());
+    let one = b.put("/a", "one");
+    let top = sign_entry(
+        &bob(),
+        u64::MAX,
+        &Entry {
+            prev: Some(Prev {
+                digest: one.digest,
+                seq: Some(1),
+            }),
+            after: vec![],
+            body: Body::Put(PutBody {
+                path: n("/a"),
+                payload: Payload::Inline(Bytes::from_static(b"top")),
+            }),
+        },
+    );
+    // The top first, then lower ones: the ranges held end at u64::MAX.
+    r.applied(&top);
+    r.applied(&one);
+    r.applied(&b.put("/b", "two"));
+    assert!(r.log.holds(&bob().name));
+}
+
+#[tokio::test]
+async fn a_device_that_sees_its_own_entry_at_the_largest_seq_signs_no_more() {
+    let me = laptop();
+    let mut r = rig(&me);
+    r.members(members(Some(true), vec![])).await;
+    let top = sign_entry(
+        &me,
+        u64::MAX,
+        &Entry {
+            prev: Some(Prev {
+                digest: [0; 32],
+                seq: Some(0),
+            }),
+            after: vec![],
+            body: Body::Put(PutBody {
+                path: n("/a"),
+                payload: Payload::Inline(Bytes::from_static(b"top")),
+            }),
+        },
+    );
+    r.applied(&top);
+    let put = r.log.put(
+        &n("/a"),
+        Payload::Inline(Bytes::from_static(b"more")),
+        vec![],
+        NOW,
+    );
+    assert!(
+        matches!(put, Err(HeapError::Local { .. })),
+        "no seq is left above one that is held, and none is signed over: {:?}",
+        put.map(|_| ())
+    );
+}
+
+#[tokio::test]
+async fn a_removal_binds_the_highest_applied_entry_never_a_refused_fork_above_it() {
+    // Review L4: the tip is what the owner holds and applied.
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let mut b = Chain::new(&bob());
+    let (p1, p2) = (b.put("/a", "1"), b.put("/a", "2"));
+    r.applied(&p1);
+    r.applied(&p2);
+    // Bob's key signed another entry at seq 3 that names bytes other than p2
+    // at seq 2: held, refused, never applied.
+    let fork = sign_entry(
+        &bob(),
+        3,
+        &Entry {
+            prev: Some(Prev {
+                digest: [9; 32],
+                seq: None,
+            }),
+            after: vec![],
+            body: Body::Put(PutBody {
+                path: n("/a"),
+                payload: Payload::Inline(Bytes::from_static(b"fork")),
+            }),
+        },
+    );
+    assert_eq!(r.admit(&fork).outcome, Outcome::Refused(Refusal::Chain));
+    assert!(r.log.holds(&bob().name));
+    assert_eq!(r.log.removal_tips(&n("/bob")), vec![p2.entry_ref()]);
+}
+
+#[tokio::test]
+async fn only_the_writer_remove_of_a_removal_carries_tips() {
+    // Review L4: the fold ignores the tips of a reader Add's Remove.
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    r.applied(&owner.members(members(None, vec![add(2, "/bob", Role::Reader)])));
+    let p1 = Chain::new(&bob()).put("/a", "1");
+    r.applied(&p1);
+    let ops = r.log.remove_ops(&n("/bob"));
+    assert_eq!(ops.len(), 2, "one per standing Add");
+    for op in ops {
+        let Op::Remove { id, tips } = op else {
+            panic!("a removal is made of Removes")
+        };
+        match id[0] {
+            1 => assert_eq!(tips, vec![p1.entry_ref()], "the writer Add"),
+            2 => assert!(tips.is_empty(), "the reader Add"),
+            other => panic!("an Add nobody made: {other}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_removal_of_a_person_with_many_devices_fits_entries_and_loses_no_tip() {
+    // Review L4: past about 25 devices the Remove outgrew an entry (and
+    // beyond 64 its tips were cut off silently).
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let long = "x".repeat(70);
+    let mut want = std::collections::BTreeSet::new();
+    for i in 0..70u8 {
+        let d = dev(&format!("/bob/{long}{i}"), "/bob", 10 + i);
+        let p = Chain::new(&d).put("/a", "x");
+        r.applied(&p);
+        want.insert(p.entry_ref());
+    }
+    let mut got = std::collections::BTreeSet::new();
+    let batches = pack_ops(r.log.remove_ops(&n("/bob")));
+    assert!(batches.len() > 1, "the removal does not fit one entry");
+    for batch in batches {
+        for op in &batch {
+            if let Op::Remove { tips, .. } = op {
+                got.extend(tips.iter().cloned());
+            }
+        }
+        let entry = Entry {
+            prev: Some(Prev {
+                digest: [1; 32],
+                seq: Some(u64::MAX),
+            }),
+            after: vec![],
+            body: Body::Members(MembersBody {
+                create: None,
+                ops: batch,
+            }),
+        };
+        entry.encode().expect("each batch fits an entry");
+    }
+    assert_eq!(got, want, "every device's tip is bound");
+}
+
+/// A packet of `dev` at `seq` that states a gap: its `PREV` names `prev` at
+/// `prev_seq`.
+fn gap_entry(dev: &Dev, seq: u64, prev: [u8; 32], prev_seq: u64, bytes: &str) -> Packet {
+    sign_entry(
+        dev,
+        seq,
+        &Entry {
+            prev: Some(Prev {
+                digest: prev,
+                seq: Some(prev_seq),
+            }),
+            after: vec![],
+            body: Body::Put(PutBody {
+                path: n("/a"),
+                payload: Payload::Inline(Bytes::from(bytes.to_owned())),
+            }),
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_refused_entrys_gap_statement_declares_nothing_absent() {
+    // Review L5: voids come from entries that were admitted.
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let mut b = Chain::new(&bob());
+    r.applied(&b.put("/a", "1"));
+    r.applied(&b.put("/a", "2"));
+    // A fork: it names other bytes than the entry held at seq 2, and says
+    // seqs 3..=99 are absent.
+    let fork = gap_entry(&bob(), 100, [9; 32], 2, "fork");
+    assert_eq!(r.admit(&fork).outcome, Outcome::Refused(Refusal::Chain));
+    assert_eq!(
+        r.log.voids(&bob().name),
+        vec![],
+        "nothing was declared void"
+    );
+}
+
+#[tokio::test]
+async fn the_gap_statement_of_an_entry_found_equivocal_is_retracted() {
+    // Review L5: a writer whose fork came first must not make a reader skip
+    // its real entries for good.
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let mut b = Chain::new(&bob());
+    let mut last = None;
+    for i in 0..10 {
+        let p = b.put("/a", &i.to_string());
+        r.applied(&p);
+        last = Some(p);
+    }
+    let last = last.unwrap();
+    let first = gap_entry(&bob(), 100, last.digest, 10, "one");
+    r.applied(&first);
+    assert_eq!(r.log.voids(&bob().name), vec![(11, 99)]);
+    let second = gap_entry(&bob(), 100, last.digest, 10, "two");
+    assert_eq!(r.admit(&second).outcome, Outcome::Evidence);
+    assert_eq!(
+        r.log.voids(&bob().name),
+        vec![],
+        "what an equivocating writer said is absent is not taken as said"
+    );
+    let wants = r.log.missing();
+    assert!(
+        wants
+            .iter()
+            .any(|w| w.device == bob().name && (w.first, w.last) == (11, 99)),
+        "its entries below the equivocal one are asked for again: {wants:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_entry_that_does_not_decode_keeps_the_link_it_states() {
+    // Review L6: a cut walking through it must find a real prev.
+    use ndn_tlv::TlvWriter;
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let mut content = TlvWriter::new();
+    content.write_nested(wire::tlv::ENTRY, |w| {
+        w.write_tlv(wire::tlv::KIND, &[7]); // no such kind: the body fails
+        w.write_tlv(wire::tlv::PREV, &[7; 32]);
+        w.write_tlv(wire::tlv::PREV_SEQ, &[3]);
+        w.write_tlv(wire::tlv::INLINE, b"x");
+    });
+    let p = sign_raw(&bob(), 5, &content.finish());
+    assert_eq!(r.admit(&p).outcome, Outcome::Unreadable);
+    let marker = Marker::decode(&r.store.get(&verified_key(&p.name())).unwrap()).unwrap();
+    assert_eq!((marker.prev, marker.prev_seq), ([7; 32], 3));
+}
+
+#[tokio::test]
+async fn a_member_cannot_make_the_ledger_grow_without_bound_by_fragmenting_its_runs() {
+    // Review L9: the ledger record is rewritten with every entry, so what a
+    // device keeps of one writer's runs is capped.
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let (mut prev, mut prev_seq) = ([0; 32], 0);
+    for k in 1..=chain::RANGES_MAX as u64 {
+        let p = gap_entry(&bob(), 2 * k, prev, prev_seq, "x");
+        r.applied(&p);
+        (prev, prev_seq) = (p.digest, 2 * k);
+    }
+    let one_more = gap_entry(
+        &bob(),
+        2 * chain::RANGES_MAX as u64 + 2,
+        prev,
+        prev_seq,
+        "x",
+    );
+    assert_eq!(
+        r.admit(&one_more).outcome,
+        Outcome::Refused(Refusal::Fragmented)
+    );
+    assert!(
+        r.store.get(&one_more.name()).is_none(),
+        "an entry that is refused for it is not stored"
+    );
+    // An entry that extends the last run starts no fragment.
+    let top = 2 * chain::RANGES_MAX as u64;
+    r.applied(&gap_entry(&bob(), top + 1, prev, top, "x"));
 }

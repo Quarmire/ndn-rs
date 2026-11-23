@@ -23,7 +23,7 @@ use crate::error::NextStep;
 use crate::log::{Alert, Frontier};
 use crate::space::{Changes, MembersChange, PutOptions};
 use crate::sync::{Host, Taken};
-use crate::test_kit::{CrashStore, Engine, Held, PowerCut, n};
+use crate::test_kit::{CrashStore, Engine, Held, Metered, PowerCut, n};
 use crate::wire::{Entry, log_name};
 
 // -- The world the cases run in ----------------------------------------------------
@@ -57,11 +57,19 @@ pub(crate) struct Dev {
 }
 
 /// The devices of one world: each namespace has a root key; each device's key
-/// is certified by it.
+/// is certified by it. A device's namespace is the first component of its name.
 pub(crate) async fn world(devices: &[&str]) -> Vec<Dev> {
+    world_of(devices, |name| {
+        Name::from_components(name.components()[..1].iter().cloned())
+    })
+    .await
+}
+
+/// [`world`] with the namespace of each device given by `ns_of`.
+pub(crate) async fn world_of(devices: &[&str], ns_of: impl Fn(&Name) -> Name) -> Vec<Dev> {
     let mut roots: Vec<(Name, SecurityManager, Name, Certificate)> = Vec::new();
     for d in devices {
-        let ns = Name::from_components(n(d).components()[..1].iter().cloned());
+        let ns = ns_of(&n(d));
         if roots.iter().any(|(r, ..)| *r == ns) {
             continue;
         }
@@ -75,7 +83,7 @@ pub(crate) async fn world(devices: &[&str]) -> Vec<Dev> {
     let mut made = Vec::new();
     for d in devices {
         let name = n(d);
-        let ns = Name::from_components(name.components()[..1].iter().cloned());
+        let ns = ns_of(&name);
         let (_, root, root_key, _) = roots.iter().find(|(r, ..)| *r == ns).unwrap();
         let keys = Arc::new(SecurityManager::new());
         let key = keys
@@ -217,7 +225,7 @@ pub(crate) async fn deliver(from: &Dev, to: &Node) -> usize {
         let Some(wire) = from.store.get(&log_name(&from.name, &space(), seq)) else {
             break;
         };
-        match to.inner.take(&space(), wire).await {
+        match to.inner.take(&space(), wire, false).await {
             Taken::Decided { .. } => taken += 1,
             Taken::Pending(w) => panic!("entry {seq} of {} is pending: {w}", from.name),
         }
@@ -535,7 +543,7 @@ async fn an_unbacked_counter_does_not_raise_the_head() {
         .await
         .unwrap();
     let mut changes = heap.watch(&Frontier::new()).await.unwrap();
-    node.inner.note_counter(&space(), &dev.name, first.seq + 40);
+    node.inner.note_own_counter(&space(), first.seq + 40);
     let seen = until(&mut changes, |c| match c {
         Change::Alert(Alert::UnbackedCounter { device, seen }) => Some((device.clone(), *seen)),
         _ => None,
@@ -813,4 +821,91 @@ async fn a_rescan_for_values_in_pieces_reads_no_head_it_has_settled() {
         before,
         "the second scan read the entries of heads the first had settled"
     );
+}
+
+/// Opening a space reads the small records it replays and no payload: not the
+/// entries it signed, not their pieces. A device with gigabytes of its own
+/// blobs must not need them in memory to start (review M5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_a_space_reads_no_payload_and_no_piece() {
+    let mut dev = solo().await;
+    let metered = Arc::new(Metered::new(Arc::new(MemoryStore::new())));
+    dev.store = Arc::clone(&metered) as Arc<dyn DataStore>;
+    let (node, _) = boot(&dev, cfg()).await;
+    let heap = node.create(&space(), public()).await.unwrap();
+    let payload = 200_000;
+    for i in 0..5 {
+        let value = Bytes::from(vec![i as u8; payload]);
+        heap.put(&n(&format!("/blob/{i}")), value, durable(true))
+            .await
+            .unwrap();
+    }
+    node.close().await;
+
+    metered.reset();
+    let (node, _) = boot(&dev, cfg()).await;
+    let read = metered.octets_read();
+    assert!(
+        read < payload,
+        "the reopen read {read} octets from the store (5 values of {payload} octets are stored in pieces): \
+         it must read the records it replays and no entry or piece"
+    );
+    node.close().await;
+}
+
+/// An Interest that arrives while a Members entry is being signed (the entry
+/// stored, the lock still held) must not be answered with it before a flush
+/// covers it: whether it may be served is decided under the log's lock, where
+/// the entry is recorded as held back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interest_during_signing_cannot_get_a_structural_entry_before_its_flush() {
+    let mut dev = solo().await;
+    let held = Arc::new(Held::default());
+    dev.store = Arc::clone(&held) as Arc<dyn DataStore>;
+    let (node, _) = boot(&dev, cfg()).await;
+    node.create(&space(), public()).await.unwrap();
+    let inner = node.inner.space_of(&space()).unwrap();
+    let holding = held.hold();
+
+    let body = crate::wire::MembersBody {
+        create: None,
+        ops: vec![crate::wire::Op::Add {
+            id: [9; 16],
+            who: n("/alice/tablet"),
+            role: crate::wire::Role::Writer,
+            epoch: None,
+        }],
+    };
+    let (asked, routed, seq) = {
+        let mut log = inner.log.lock();
+        let signed = match log.sign_members(body, node.inner.now()).unwrap() {
+            crate::log::Step::Done(signed) => signed,
+            crate::log::Step::Wait(_) => panic!("the reservation covers the next seq"),
+        };
+        let seq = signed.id.seq;
+        let (asking, device) = (Arc::clone(&node.inner), dev.name.clone());
+        let (began_tx, began_rx) = std::sync::mpsc::channel();
+        let asker = std::thread::spawn(move || {
+            began_tx.send(()).unwrap();
+            asking.served(&space(), &device, seq)
+        });
+        began_rx.recv().unwrap();
+        // Give the asker the time to take what it can before the lock.
+        std::thread::sleep(Duration::from_millis(200));
+        let routed = inner.route(&node.inner, &log, signed.effects, true);
+        (asker, routed, seq)
+    };
+    inner.finish(&node.inner, routed);
+
+    assert!(
+        asked.join().unwrap().is_none(),
+        "a Members entry was served before the flush that covers it"
+    );
+    drop(holding);
+    node.flush().await.unwrap();
+    assert!(
+        node.inner.served(&space(), &dev.name, seq).is_some(),
+        "once the flush covering it returned, it is served"
+    );
+    node.close().await;
 }

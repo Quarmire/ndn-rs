@@ -260,8 +260,21 @@ pub(crate) fn forged(device: &str, seq: u64) -> Bytes {
 pub(crate) struct Toy {
     held: BTreeMap<Name, BTreeSet<u64>>,
     voids: BTreeMap<Name, BTreeSet<u64>>,
-    high: BTreeMap<Name, u64>,
+    /// The highest counter heard of this device's own name.
+    pub own_heard: u64,
     pub head: u64,
+    /// The seq this device reserved: what it could have signed.
+    pub reserved: u64,
+    /// Exact wants of a removed writer's cut: `(device, seq, signed digest)`,
+    /// listed while the seq is not held.
+    pub exact: Vec<(Name, u64, [u8; 32])>,
+    /// Seqs the log answers `Duplicate` for without holding them.
+    pub stuck: BTreeSet<(Name, u64)>,
+    /// How many packets other than an exact want's were handed to `take`.
+    pub evidence: usize,
+    /// What `take` was handed as a probe (fetched only because a counter
+    /// named it), in order, as `(device, seq)`.
+    pub probed: Vec<(Name, u64)>,
     /// The devices the toy vouches for.
     pub vouched: BTreeSet<Name>,
     /// The devices that stand as relays, and whether first.
@@ -277,7 +290,11 @@ pub(crate) struct Toy {
     /// Blobs listed as owed.
     pub blobs_owed: Vec<Blob>,
     /// Assemblies handed over.
-    pub assembled: Vec<(EntryId, Vec<StoreOp>)>,
+    pub assembled: Vec<EntryId>,
+    /// The pieces the host was told to keep, by name.
+    pub stored: BTreeMap<Name, Bytes>,
+    /// How many batches of pieces it was handed.
+    pub keeps: usize,
     /// The epochs whose key is owed.
     pub owed: Vec<EpochId>,
     /// The grants `key_arrived` was handed: `(epoch, name)`.
@@ -295,8 +312,12 @@ pub(crate) struct Toy {
     /// The validity the toy gives a device packet: the device it is of, or
     /// refused.
     pub device_packets_valid: bool,
-    /// How many times `may_grant` was asked.
+    /// How many times `may_grant` was asked before the asker's key was known.
     pub grant_asks: usize,
+    /// The generation of the judge the toy reports.
+    pub generation: u64,
+    /// The keys the toy says are revoked.
+    pub revoked_keys: BTreeSet<Name>,
 }
 
 /// The toy host.
@@ -336,13 +357,29 @@ impl Toyhost {
     }
 }
 
+/// The highest seq of `device` the toy log asks for without a probe: the
+/// highest it holds, and for this device its own counter as far as it
+/// reserved (as `Log::high`).
+fn walked(st: &Toy, me: &Name, device: &Name) -> u64 {
+    let held = st
+        .held
+        .get(device)
+        .and_then(|h| h.last().copied())
+        .unwrap_or(0);
+    if device == me {
+        held.max(st.own_heard.min(st.reserved))
+    } else {
+        held
+    }
+}
+
 #[async_trait::async_trait]
 impl Host for Toyhost {
     fn device(&self) -> &Name {
         &self.device
     }
 
-    async fn take(&self, _space: &Name, wire: Bytes) -> Taken {
+    async fn take(&self, _space: &Name, wire: Bytes, probe: bool) -> Taken {
         let Ok(data) = Data::decode(wire) else {
             return Taken::Decided {
                 outcome: Outcome::Refused(Refusal::BadSignature),
@@ -357,6 +394,28 @@ impl Host for Toyhost {
         };
         let mut st = self.st.lock();
         st.taken.push((log.device.clone(), log.seq));
+        if probe {
+            st.probed.push((log.device.clone(), log.seq));
+        }
+        let digest = crate::wire::signed_digest_of(&data);
+        let exact = st
+            .exact
+            .iter()
+            .find(|(d, s, _)| *d == log.device && *s == log.seq)
+            .map(|(_, _, want)| *want);
+        if exact.is_some_and(|want| want != digest) {
+            st.evidence += 1;
+            return Taken::Decided {
+                outcome: Outcome::Evidence,
+                blobs: Vec::new(),
+            };
+        }
+        if st.stuck.contains(&(log.device.clone(), log.seq)) {
+            return Taken::Decided {
+                outcome: Outcome::Duplicate,
+                blobs: Vec::new(),
+            };
+        }
         let body = data.content().cloned().unwrap_or_default();
         match body.first() {
             Some(b'g') | Some(b'v') => {}
@@ -397,7 +456,14 @@ impl Host for Toyhost {
     fn missing(&self, _space: &Name) -> Vec<Want> {
         let st = self.st.lock();
         let mut out = Vec::new();
-        for (device, high) in &st.high {
+        let devices: BTreeSet<Name> = st
+            .held
+            .keys()
+            .cloned()
+            .chain(std::iter::once(self.device.clone()))
+            .collect();
+        for device in &devices {
+            let high = &walked(&st, &self.device, device);
             let held = st.held.get(device);
             let void = st.voids.get(device);
             let mut run: Option<u64> = None;
@@ -420,22 +486,31 @@ impl Host for Toyhost {
                 }
             }
         }
+        for (device, seq, digest) in &st.exact {
+            if !st.held.get(device).is_some_and(|h| h.contains(seq)) {
+                out.push(Want {
+                    device: device.clone(),
+                    first: *seq,
+                    last: *seq,
+                    digest: Some(*digest),
+                });
+            }
+        }
         out
     }
 
     fn high(&self, _space: &Name, device: &Name) -> u64 {
-        self.st.lock().high.get(device).copied().unwrap_or(0)
+        walked(&self.st.lock(), &self.device, device)
     }
 
     fn head(&self, _space: &Name) -> u64 {
         self.st.lock().head
     }
 
-    fn note_counter(&self, _space: &Name, device: &Name, seen: u64) {
+    fn note_own_counter(&self, _space: &Name, seen: u64) {
         let mut st = self.st.lock();
-        st.counters.push((device.clone(), seen));
-        let high = st.high.entry(device.clone()).or_default();
-        *high = (*high).max(seen);
+        st.counters.push((self.device.clone(), seen));
+        st.own_heard = st.own_heard.max(seen);
     }
 
     fn vouched(&self, _space: &Name, device: &Name) -> bool {
@@ -467,10 +542,24 @@ impl Host for Toyhost {
         self.st.lock().blobs_owed.clone()
     }
 
-    fn assembled(&self, _space: &Name, blob: &Blob, ops: Vec<StoreOp>, _payload: Vec<u8>) {
+    fn held_piece(&self, _space: &Name, name: &Name) -> Option<Bytes> {
+        self.st.lock().stored.get(name).cloned()
+    }
+
+    fn keep_pieces(&self, _space: &Name, ops: Vec<StoreOp>) {
+        let mut st = self.st.lock();
+        st.keeps += 1;
+        for op in ops {
+            if let StoreOp::Insert(name, wire) = op {
+                st.stored.insert(name, wire);
+            }
+        }
+    }
+
+    fn assembled(&self, _space: &Name, blob: &Blob) {
         let mut st = self.st.lock();
         st.blobs_owed.retain(|b| b.id != blob.id);
-        st.assembled.push((blob.id.clone(), ops));
+        st.assembled.push(blob.id.clone());
     }
 
     fn owed_keys(&self, _space: &Name) -> Vec<EpochId> {
@@ -503,13 +592,24 @@ impl Host for Toyhost {
         ok
     }
 
+    fn generation(&self) -> u64 {
+        self.st.lock().generation
+    }
+
     fn may_grant(
         &self,
         _space: &Name,
         _epoch: &EpochId,
         _asker: &Name,
+        key: Option<&Name>,
     ) -> Result<(), GrantRefusal> {
         let mut st = self.st.lock();
+        if let Some(key) = key {
+            return match st.revoked_keys.contains(key) {
+                true => Err(GrantRefusal::AskerKeyRevoked),
+                false => Ok(()),
+            };
+        }
         st.grant_asks += 1;
         match st.grant_says.len() {
             0 => Ok(()),
@@ -523,6 +623,7 @@ impl Host for Toyhost {
         _space: &Name,
         _epoch: &EpochId,
         _asker: &Name,
+        _key: &Name,
         _to: &[u8; 32],
         name: &Name,
     ) -> Option<Bytes> {

@@ -30,8 +30,9 @@ use bytes::Bytes;
 use futures::Stream;
 use ndn_foundation_types::Name;
 use ndn_security::confidentiality::ContentKey;
-use ndn_sync::DataStore;
+use ndn_sync::{DataStore, StoreOp};
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 
 use crate::error::{HeapError, Refusal};
 use crate::fold::Readers;
@@ -42,11 +43,12 @@ use crate::register::{EntryId, Item};
 use crate::reserve::{FlushError, Publisher, Ticket};
 use crate::rt;
 use crate::seal;
+use crate::store;
 use crate::sync::{Group, TIMELINE};
 use crate::trust::Listing;
 use crate::wire::{
     AUDIENCE_MAX, ChunksBody, INLINE_MAX, MembersBody, Op, PAYLOAD_MAX, Payload, Role, log_name,
-    owns, parse_log_name, signed_digest_of,
+    parse_log_name, signed_digest_of,
 };
 
 #[cfg(test)]
@@ -87,11 +89,21 @@ pub struct PutOptions {
 
 // -- Watching ----------------------------------------------------------------------
 
+/// One place in a watcher's queue: a change, or a value in pieces that is
+/// read from the store when the watcher reaches it. The queue holds the
+/// reference (an entry's id, a size, a digest), never the value: a space of
+/// many 64 MiB values costs a watcher that reads slowly a few hundred octets
+/// each, not the values.
+enum Slot {
+    Change(Change),
+    Blob(Blob),
+}
+
 struct QueueState {
     /// What the watch listed as it began.
-    listed: VecDeque<Change>,
+    listed: VecDeque<Slot>,
     /// Live changes, at most the queue's capacity.
-    live: VecDeque<Change>,
+    live: VecDeque<Slot>,
     /// Changes dropped since the watcher last read.
     missed: u64,
     closed: bool,
@@ -105,7 +117,7 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
-    fn new(listed: VecDeque<Change>, cap: usize) -> Arc<Queue> {
+    fn new(listed: VecDeque<Slot>, cap: usize) -> Arc<Queue> {
         Arc::new(Queue {
             st: Mutex::new(QueueState {
                 listed,
@@ -119,6 +131,16 @@ impl Queue {
     }
 
     pub(crate) fn push(&self, change: Change) {
+        self.put(Slot::Change(change));
+    }
+
+    /// Queue a value in pieces that is whole in the store: it is read when
+    /// the watcher gets to it.
+    fn push_blob(&self, blob: Blob) {
+        self.put(Slot::Blob(blob));
+    }
+
+    fn put(&self, slot: Slot) {
         let waker = {
             let mut st = self.st.lock();
             if st.closed {
@@ -127,7 +149,7 @@ impl Queue {
             if st.missed > 0 || st.live.len() >= self.cap {
                 st.missed += 1;
             } else {
-                st.live.push_back(change);
+                st.live.push_back(slot);
             }
             st.waker.take()
         };
@@ -151,14 +173,14 @@ impl Queue {
         self.st.lock().closed
     }
 
-    fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<Change>> {
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<Option<Slot>> {
         let mut st = self.st.lock();
-        if let Some(change) = st.listed.pop_front().or_else(|| st.live.pop_front()) {
-            return Poll::Ready(Some(change));
+        if let Some(slot) = st.listed.pop_front().or_else(|| st.live.pop_front()) {
+            return Poll::Ready(Some(slot));
         }
         if st.missed > 0 {
             let missed = std::mem::take(&mut st.missed);
-            return Poll::Ready(Some(Change::Lagged { missed }));
+            return Poll::Ready(Some(Slot::Change(Change::Lagged { missed })));
         }
         if st.closed {
             return Poll::Ready(None);
@@ -169,18 +191,33 @@ impl Queue {
 }
 
 /// What a watch yields: every head the space held when it began, then the
-/// changes as they happen. Ends when the node stops.
+/// changes as they happen. Ends when the node stops. A value in pieces is
+/// read from the store as the watch reaches it, one at a time.
 pub struct Changes {
     queue: Arc<Queue>,
+    space: Arc<SpaceInner>,
+    node: Arc<NodeInner>,
 }
 
 impl Changes {
     /// The next change; `None` once the node has stopped and the queue is
     /// read.
     pub async fn next(&mut self) -> Option<Result<Change, HeapError>> {
-        futures::future::poll_fn(|cx| self.queue.poll(cx))
-            .await
-            .map(Ok)
+        loop {
+            let slot = futures::future::poll_fn(|cx| self.queue.poll(cx)).await?;
+            if let Some(change) = self.resolve(slot) {
+                return Some(Ok(change));
+            }
+        }
+    }
+
+    /// The change a slot says: a value in pieces is read now, and told only
+    /// while it is the head of its path and still whole.
+    fn resolve(&self, slot: Slot) -> Option<Change> {
+        match slot {
+            Slot::Change(change) => Some(change),
+            Slot::Blob(blob) => self.space.blob_change(&self.node, &blob),
+        }
     }
 }
 
@@ -188,7 +225,17 @@ impl Stream for Changes {
     type Item = Result<Change, HeapError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.queue.poll(cx).map(|change| change.map(Ok))
+        loop {
+            match self.queue.poll(cx) {
+                Poll::Ready(Some(slot)) => {
+                    if let Some(change) = self.resolve(slot) {
+                        return Poll::Ready(Some(Ok(change)));
+                    }
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 
@@ -267,6 +314,15 @@ fn flush_error(e: FlushError) -> HeapError {
     HeapError::Local {
         reason: e.to_string(),
     }
+}
+
+/// The digest of a set of revoked keys: what an epoch signed accounts for.
+fn revocations_digest(revoked: &BTreeSet<Name>) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    for key in revoked {
+        hash.update(key.encode_to_tlv());
+    }
+    hash.finalize().into()
 }
 
 /// A path is the codec's: 1 to 8 generic components within its octet limit
@@ -374,8 +430,8 @@ impl SpaceInner {
             node.judge.note(&self.name, &Self::listing(log));
             repair = !self.follower
                 && log.sealed()
-                && !log.fold().complete()
-                && owns(&self.name, log.key());
+                && log.owner_only().is_ok()
+                && (!log.fold().complete() || self.revocation_owed(node, log));
         }
         Routed {
             ticket,
@@ -386,24 +442,21 @@ impl SpaceInner {
         }
     }
 
-    /// What follows a routed call once the lock is let go: blobs to read and
-    /// tell, keys to suspect everywhere, the epoch to repair, the fetch to
-    /// wake.
+    /// What follows a routed call once the lock is let go: blobs whose
+    /// pieces are all held to tell, keys to suspect everywhere, the epoch to
+    /// repair, the fetch to wake.
     pub(crate) fn finish(self: &Arc<Self>, node: &Arc<NodeInner>, routed: Routed) {
         for blob in routed.blobs {
-            let (space, node) = (Arc::clone(self), Arc::clone(node));
-            rt::spawn(async move { space.emit_blob(&node, blob, None) });
+            // One still to gather is told when its last piece is held.
+            if self.is_whole(node, &blob) {
+                self.tell_blob(&blob);
+            }
         }
         for key in routed.suspect {
             node.suspect_everywhere(&key);
         }
         if routed.repair {
-            let (space, node) = (Arc::clone(self), Arc::clone(node));
-            rt::spawn(async move {
-                if let Err(e) = space.repair_epoch(&node).await {
-                    tracing::warn!(space = %space.name, "the epoch is not repaired: {e}");
-                }
-            });
+            self.spawn_repair(node);
         }
         if routed.nudge {
             node.nudge(&self.name);
@@ -458,9 +511,58 @@ impl SpaceInner {
         Ok(signed)
     }
 
+    /// The revocations held here of keys under the namespace of a person the
+    /// space reads for: the lost devices that may hold an epoch key.
+    fn reader_revocations(&self, node: &NodeInner, log: &Log) -> BTreeSet<Name> {
+        let Readers::Persons(readers) = log.fold().readers() else {
+            return BTreeSet::new();
+        };
+        readers
+            .iter()
+            .flat_map(|person| node.judge.revoked_under(person, &self.name))
+            .collect()
+    }
+
+    /// Whether this owner device owes the sealed space an epoch because a key
+    /// of a reader's device is revoked (spec §6.6): a revocation changes no
+    /// member, but the lost device holds the key in force and would open every
+    /// later write. Owed while the revocations held are not those the last
+    /// epoch this device signed accounted for (`revoked/<S>`).
+    fn revocation_owed(&self, node: &NodeInner, log: &Log) -> bool {
+        if self.follower
+            || !log.sealed()
+            || log.fold().create() != Some(false)
+            || log.owner_only().is_err()
+        {
+            return false;
+        }
+        let revoked = self.reader_revocations(node, log);
+        !revoked.is_empty()
+            && node.stage.get(&store::revoked_key(&self.name)).as_deref()
+                != Some(&revocations_digest(&revoked)[..])
+    }
+
+    /// Spawn the epoch a revocation of a reader's device key owes, if any.
+    pub(crate) fn repair_if_owed(self: &Arc<Self>, node: &Arc<NodeInner>) {
+        if self.revocation_owed(node, &self.log.lock()) {
+            self.spawn_repair(node);
+        }
+    }
+
+    fn spawn_repair(self: &Arc<Self>, node: &Arc<NodeInner>) {
+        let (space, node) = (Arc::clone(self), Arc::clone(node));
+        rt::spawn(async move {
+            if let Err(e) = space.repair_epoch(&node).await {
+                tracing::warn!(space = %space.name, "the epoch is not repaired: {e}");
+            }
+        });
+    }
+
     /// Sign a new Epoch for exactly the readers when the space is sealed and
-    /// the epoch in force is not for them (spec §3.3, rule 7): an owner
-    /// device owes it after every change of members, whoever signed it.
+    /// the epoch in force is not for them (spec §3.3, rule 7), or when a key of
+    /// a reader's device is revoked and no epoch signed here accounts for it:
+    /// an owner device owes it after every change of members, whoever signed
+    /// it.
     pub(crate) async fn repair_epoch(
         self: &Arc<Self>,
         node: &Arc<NodeInner>,
@@ -468,13 +570,25 @@ impl SpaceInner {
         let now = node.now();
         self.attempt(node, &mut |log| {
             let fold = log.fold();
-            if fold.create() != Some(false) || fold.complete() || !owns(&self.name, log.key()) {
+            let owed = self.revocation_owed(node, log);
+            if fold.create() != Some(false)
+                || (fold.complete() && !owed)
+                || log.owner_only().is_err()
+            {
                 return Ok(None);
             }
             let Readers::Persons(audience) = fold.readers() else {
                 return Ok(None);
             };
-            log.sign_epoch(audience, now).map(Some)
+            let accounted = revocations_digest(&self.reader_revocations(node, log));
+            let step = log.sign_epoch(audience, now)?;
+            if matches!(step, Step::Done(_)) {
+                node.stage.insert(
+                    store::revoked_key(&self.name),
+                    Bytes::copy_from_slice(&accounted),
+                );
+            }
+            Ok(Some(step))
         })
         .await
     }
@@ -491,7 +605,9 @@ impl SpaceInner {
         loop {
             let owed = self.log.lock().missing().into_iter().any(|want| {
                 want.digest.is_none() && removed.contains(&node.person_of(&want.device))
-            });
+            }) || self
+                .group
+                .heard_unheld(|device| removed.contains(&node.person_of(device)));
             if !owed || rt::Instant::now() >= deadline {
                 return;
             }
@@ -634,20 +750,42 @@ impl SpaceInner {
             })
     }
 
-    /// The value in pieces of `blob`, assembled from the store and opened:
-    /// outside the lock.
+    /// Whether every piece of `blob` is held here and the value recorded
+    /// whole (`assembled/<entry>`): one lookup, nothing read.
+    fn is_whole(&self, node: &NodeInner, blob: &Blob) -> bool {
+        let entry = log_name(&blob.id.device, &self.name, blob.id.seq);
+        node.stage.contains(&store::assembled_key(&entry))
+    }
+
+    /// The value in pieces of `blob`, joined from the store and opened:
+    /// outside the lock. A value not recorded whole is not read at all, so
+    /// nothing of the size its entry declares (up to 64 MiB) is allocated for
+    /// one that cannot be returned.
     fn read_blob(&self, node: &NodeInner, blob: &Blob) -> Result<Bytes, HeapError> {
         let name = log_name(&blob.id.device, &self.name, blob.id.seq);
         let key = self.blob_key(blob)?;
+        if !self.is_whole(node, blob) {
+            return Err(HeapError::Unavailable { name });
+        }
         let body = ChunksBody {
             size: blob.size,
             root: blob.root,
         };
-        let stored = pieces::read(&*node.stage, &name, &body).map_err(|e| match e {
-            pieces::PieceError::Incomplete { .. } => HeapError::Unavailable { name: name.clone() },
-            other => HeapError::Local {
-                reason: other.to_string(),
-            },
+        let stored = pieces::read(&*node.stage, &name, &body).map_err(|e| {
+            // The store lost or damaged a piece it recorded whole: the value
+            // is gathered again, from what the store still holds and the peers.
+            node.stage.remove(&store::assembled_key(&name));
+            node.flusher.note_write();
+            self.whole.lock().remove(&blob.id);
+            node.nudge(&self.name);
+            match e {
+                pieces::PieceError::Incomplete { .. } => {
+                    HeapError::Unavailable { name: name.clone() }
+                }
+                other => HeapError::Local {
+                    reason: other.to_string(),
+                },
+            }
         })?;
         self.open_blob(blob, key, stored)
     }
@@ -676,51 +814,47 @@ impl SpaceInner {
         }
     }
 
-    /// Tell watchers (or `only`) a blob head that is whole: when its pieces
-    /// are not all held it waits for [`Self::assembled`]. Nothing is told for
-    /// a head that something newer superseded.
-    pub(crate) fn emit_blob(&self, node: &NodeInner, blob: Blob, only: Option<Arc<Queue>>) {
-        let Ok(bytes) = self.read_blob(node, &blob) else {
+    /// The change that puts the value of `blob`, if it is still the head of
+    /// its path and whole: read now, by the watcher that reaches it.
+    fn blob_change(&self, node: &NodeInner, blob: &Blob) -> Option<Change> {
+        let bytes = self.read_blob(node, blob).ok()?;
+        let log = self.log.lock();
+        let (path, head) = log
+            .register()
+            .values()
+            .find(|(_, h)| EntryId::from(&h.entry) == blob.id)?;
+        Some(Change::Put(head.item(path, bytes)))
+    }
+
+    /// Tell every watcher a blob head that is whole: the queues hold the
+    /// reference and each watcher reads the value when it gets to it. Nothing
+    /// is told for a head that something newer superseded.
+    fn tell_blob(&self, blob: &Blob) {
+        let current = self
+            .log
+            .lock()
+            .register()
+            .values()
+            .any(|(_, h)| EntryId::from(&h.entry) == blob.id);
+        if !current {
             return;
-        };
-        self.tell_blob(&blob, bytes, only);
-    }
-
-    /// [`Self::emit_blob`] for the value `bytes` of `blob` already in hand.
-    fn tell_blob(&self, blob: &Blob, bytes: Bytes, only: Option<Arc<Queue>>) {
-        let change = {
-            let log = self.log.lock();
-            let Some((path, head)) = log.register().values().find(|(_, h)| {
-                h.entry.seq == blob.id.seq
-                    && h.entry.digest == blob.id.digest
-                    && h.entry.device == blob.id.device
-            }) else {
-                return;
-            };
-            Change::Put(head.item(path, bytes))
-        };
-        match only {
-            Some(queue) => queue.push(change),
-            None => self.tell(change),
+        }
+        let mut watchers = self.watchers.lock();
+        watchers.retain(|q| !q.is_closed());
+        for q in watchers.iter() {
+            q.push_blob(blob.clone());
         }
     }
 
-    /// The pieces of `blob` arrived whole: write them as one batch and tell,
-    /// with `payload` (what the proven chunks carry): nothing is read back.
-    pub(crate) fn assembled(
-        self: &Arc<Self>,
-        node: &Arc<NodeInner>,
-        blob: &Blob,
-        ops: Vec<ndn_sync::StoreOp>,
-        payload: Vec<u8>,
-    ) {
-        node.stage.apply(ops);
+    /// The last piece of `blob` is held: record the value whole (after its
+    /// pieces, in write order) and tell.
+    pub(crate) fn assembled(self: &Arc<Self>, node: &Arc<NodeInner>, blob: &Blob) {
+        let entry = log_name(&blob.id.device, &self.name, blob.id.seq);
+        node.stage
+            .insert(store::assembled_key(&entry), Bytes::from_static(&[1]));
         node.flusher.note_write();
-        if let Ok(key) = self.blob_key(blob)
-            && let Ok(bytes) = self.open_blob(blob, key, payload)
-        {
-            self.tell_blob(blob, bytes, None);
-        }
+        self.whole.lock().insert(blob.id.clone());
+        self.tell_blob(blob);
     }
 
     /// The blob heads whose pieces are not all held here. A head found
@@ -745,15 +879,16 @@ impl SpaceInner {
         let mut owed = Vec::new();
         for batch in pending.chunks(HEADS_PER_READ) {
             let kinds = self.log.lock().payload_kinds(batch);
-            let mut inline = Vec::new();
+            let mut settled = Vec::new();
             for (id, kind) in batch.iter().zip(kinds) {
                 match kind {
-                    Some(None) => inline.push(id.clone()),
-                    Some(Some(blob)) if self.read_blob(node, &blob).is_err() => owed.push(blob),
-                    Some(Some(_)) | None => {}
+                    Some(None) => settled.push(id.clone()),
+                    Some(Some(blob)) if self.is_whole(node, &blob) => settled.push(id.clone()),
+                    Some(Some(blob)) => owed.push(blob),
+                    None => {}
                 }
             }
-            self.whole.lock().extend(inline);
+            self.whole.lock().extend(settled);
         }
         owed
     }
@@ -816,7 +951,9 @@ impl Heap {
         } else {
             self.put_blob(path, bytes).await?
         };
-        let durable = opts.durable.unwrap_or_else(|| self.inner.group.no_peers());
+        let durable = opts
+            .durable
+            .unwrap_or_else(|| !self.inner.log.lock().has_peers());
         if durable {
             self.node
                 .flusher
@@ -874,7 +1011,14 @@ impl Heap {
                     if log.next_seq() != seq || log.judge_own()? != epoch {
                         return Ok(None);
                     }
-                    log.put(path, blob.clone(), cut.ops(), now).map(Some)
+                    // The pieces and the mark that the value is whole go in
+                    // the entry's own batch.
+                    let mut ops = cut.ops();
+                    ops.push(StoreOp::Insert(
+                        store::assembled_key(&name),
+                        Bytes::from_static(&[1]),
+                    ));
+                    log.put(path, blob.clone(), ops, now).map(Some)
                 })
                 .await?;
             if let Some((id, ticket)) = signed {
@@ -916,42 +1060,51 @@ impl Heap {
     /// already cover, then the changes as they happen.
     pub async fn watch(&self, since: &Frontier) -> Result<Changes, HeapError> {
         let inner = &self.inner;
-        let (queue, blobs) = {
+        let queue = {
             let log = inner.log.lock();
             inner.check_reader(&log)?;
             let (items, blobs) = log.items();
-            let mut listed: VecDeque<Change> = items
+            let mut listed: VecDeque<Slot> = items
                 .into_iter()
                 .filter(|item| item.id.seq > since.get(&item.id.device))
-                .map(Change::Put)
+                .map(|item| Slot::Change(Change::Put(item)))
                 .collect();
-            listed.extend(inner.standing.lock().iter().cloned().map(Change::Alert));
+            // A value in pieces is a reference here: it is read from the
+            // store when the watch reaches it, and skipped then if its
+            // pieces are not all held (it is told when its last is).
+            listed.extend(
+                blobs
+                    .into_iter()
+                    .filter(|blob| blob.id.seq > since.get(&blob.id.device))
+                    .map(Slot::Blob),
+            );
+            listed.extend(
+                inner
+                    .standing
+                    .lock()
+                    .iter()
+                    .cloned()
+                    .map(|a| Slot::Change(Change::Alert(a))),
+            );
             listed.extend(
                 inner
                     .refused
                     .lock()
                     .iter()
-                    .map(|(_, a)| Change::Alert(a.clone())),
+                    .map(|(_, a)| Slot::Change(Change::Alert(a.clone()))),
             );
             let queue = Queue::new(listed, self.node.config.watch_queue);
             inner.watchers.lock().push(Arc::clone(&queue));
-            (queue, blobs)
+            queue
         };
         if let Some(why) = self.node.failure() {
             queue.push(Change::Alert(Alert::StoreFailed { why }));
         }
-        for blob in blobs {
-            if blob.id.seq <= since.get(&blob.id.device) {
-                continue;
-            }
-            let (space, node, queue) = (
-                Arc::clone(&self.inner),
-                Arc::clone(&self.node),
-                Arc::clone(&queue),
-            );
-            rt::spawn(async move { space.emit_blob(&node, blob, Some(queue)) });
-        }
-        Ok(Changes { queue })
+        Ok(Changes {
+            queue,
+            space: Arc::clone(&self.inner),
+            node: Arc::clone(&self.node),
+        })
     }
 
     /// Who the space lists, the owner first.
@@ -974,11 +1127,7 @@ impl Heap {
     /// signed: members and epochs are not served before it.
     pub async fn change(&self, c: MembersChange) -> Result<EntryId, HeapError> {
         let (inner, node) = (&self.inner, &self.node);
-        if !owns(&inner.name, node.writer.key()) {
-            return Err(HeapError::NotOwner {
-                space: inner.name.clone(),
-            });
-        }
+        inner.log.lock().owner_only()?;
         inner.look_for_removed(node, &c.remove).await;
         let batches = {
             let log = inner.log.lock();
@@ -1020,9 +1169,7 @@ impl Heap {
                     });
                 }
             }
-            ops.chunks(crate::wire::OPS_MAX)
-                .map(<[Op]>::to_vec)
-                .collect::<Vec<_>>()
+            crate::log::pack_ops(ops)
         };
         let mut last = None;
         for ops in batches {

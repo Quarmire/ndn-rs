@@ -11,7 +11,7 @@ use std::time::Duration;
 use ndn_app::EngineAppExt;
 use ndn_engine::{EngineBuilder, ForwarderEngine};
 use ndn_foundation_types::Name;
-use ndn_sync::DataStore;
+use ndn_sync::{DataStore, SyncUpdate};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -201,6 +201,13 @@ async fn d10_a_crash_between_put_and_flush_with_the_peer_reachable_returns_the_e
         has(&heap, "/a", "unflushed").await
     })
     .await;
+    // The counter the laptop joined with is an entry's seq, not the end of
+    // what it reserved: the phone, which holds all it signed, wants nothing
+    // of it.
+    eventually("the phone wants nothing of the laptop", || async {
+        theirs.ready()
+    })
+    .await;
     let id = heap
         .put(&n("/c"), bytes("next"), PutOptions::default())
         .await
@@ -325,6 +332,12 @@ async fn d12_a_restored_old_image_with_peers_online_raises_rolledback_and_reuses
         || async { again.inner.head(&space()) >= top },
     )
     .await;
+    // What this device signed before the image was taken is applied here as
+    // it is at the phone: both read the same value at /a.
+    eventually("the laptop applies its own newest entry", || async {
+        has(&heap, "/a", "v29").await
+    })
+    .await;
     let mut changes = heap.watch(&Frontier::new()).await.unwrap();
     let (reserved, seen) = until(&mut changes, |c| match c {
         Change::Alert(Alert::RolledBack { reserved, seen }) => Some((*reserved, *seen)),
@@ -339,6 +352,103 @@ async fn d12_a_restored_old_image_with_peers_online_raises_rolledback_and_reuses
     assert!(
         id.seq > top,
         "nothing the phone holds of the laptop is signed over again ({} vs {top})",
+        id.seq
+    );
+    // The counter the laptop announces is the seq it signed: the phone, which
+    // holds up to `top`, asks for the new entry and shows it.
+    eventually("the phone sees the laptop's new entry", || async {
+        has(&theirs, "/z", "after").await
+    })
+    .await;
+}
+
+/// Sync Interests are unsigned: a counter for a device the log vouches for
+/// names an entry the reader may probe, not a range it must walk. The heap
+/// stays ready, with nothing wanted (M4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_counter_for_a_vouched_device_leaves_the_heap_ready() {
+    let m = mesh(&["/alice/laptop", "/alice/phone"]).await;
+    let (laptop, phone) = (m.boot(0, fast()).await, m.boot(1, fast()).await);
+    let heap = laptop.create(&space(), public()).await.unwrap();
+    let theirs = phone.open(&space()).await.unwrap();
+    eventually("the phone sees the creation", || async { theirs.ready() }).await;
+    theirs
+        .put(&n("/b"), bytes("phone"), durable(true))
+        .await
+        .unwrap();
+    eventually("the laptop holds the phone's entry", || async {
+        has(&heap, "/b", "phone").await
+    })
+    .await;
+    heap.inner.group.on_update(SyncUpdate {
+        publisher: m.devs[1].name.to_string(),
+        name: m.devs[1].name.clone(),
+        low_seq: 1,
+        high_seq: 1_000_000,
+        mapping: None,
+        serving_party: None,
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        heap.ready() && heap.inner.log.lock().missing().is_empty(),
+        "a counter nothing signed leaves nothing wanted"
+    );
+}
+
+/// An old image that was closed cleanly looks complete, and the device's
+/// peers hold what it signed since. With peers known the device waits for its
+/// own counter before its first put, so it signs above what they hold instead
+/// of over it (the wait is bounded by `Config::settle`, liveness only).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d13_a_clean_old_image_restored_with_peers_online_signs_above_what_they_hold() {
+    let mut m = mesh(&["/alice/laptop", "/alice/phone"]).await;
+    let crash = Arc::new(CrashStore::new());
+    m.devs[0].store = Arc::clone(&crash) as Arc<dyn DataStore>;
+    let (laptop, phone) = (m.boot(0, fast()).await, m.boot(1, fast()).await);
+    let heap = laptop.create(&space(), public()).await.unwrap();
+    let theirs = phone.open(&space()).await.unwrap();
+    eventually("the phone sees the creation", || async { theirs.ready() }).await;
+    theirs
+        .put(&n("/b"), bytes("phone"), durable(true))
+        .await
+        .unwrap();
+    eventually("the laptop holds the phone's entry", || async {
+        has(&heap, "/b", "phone").await
+    })
+    .await;
+    drop(heap);
+    laptop.close().await;
+    // A backup taken after a clean close.
+    let old = crash.crash();
+    // The laptop runs on and signs.
+    let laptop = m.boot(0, fast()).await;
+    let heap = laptop.space(&space()).unwrap();
+    let mut top = 0;
+    for i in 0..5 {
+        top = heap
+            .put(&n("/a"), bytes(&format!("v{i}")), durable(true))
+            .await
+            .unwrap()
+            .seq;
+    }
+    eventually("the phone holds the newest", || async {
+        has(&theirs, "/a", "v4").await
+    })
+    .await;
+    drop(heap);
+    laptop.close().await;
+    m.kill(0);
+
+    // The old, clean image is put back with the phone online.
+    let again = m.boot_on(0, Arc::new(old), fast()).await;
+    let heap = again.space(&space()).unwrap();
+    let id = heap
+        .put(&n("/z"), bytes("after"), PutOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        id.seq > top,
+        "the first put signed seq {} where the phone holds the laptop's entries up to {top}",
         id.seq
     );
 }

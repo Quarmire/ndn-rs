@@ -1,6 +1,7 @@
 //! Invariants of a payload in pieces: it round-trips, a piece is its own
-//! proof, a sealed payload shows only its size, the pieces of a payload land
-//! in one batch and only when all of them are held.
+//! proof, a sealed payload shows only its size, the pieces of a payload are
+//! written as they are proved, and a payload is read only when all of them
+//! are held.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -40,7 +41,8 @@ fn holders(pieces: &Pieces) -> BTreeMap<Name, Bytes> {
 
 /// Drive an assembler the way a fetcher does: ask for what the plan wants,
 /// from `held`, until it is complete.
-fn fetch(asm: &mut Assembler, held: &BTreeMap<Name, Bytes>, window: usize) {
+fn fetch(asm: &mut Assembler, held: &BTreeMap<Name, Bytes>, window: usize) -> Vec<StoreOp> {
+    let mut kept = Vec::new();
     while !asm.is_complete() {
         let wanted = asm.next_wanted(window);
         assert!(
@@ -49,9 +51,11 @@ fn fetch(asm: &mut Assembler, held: &BTreeMap<Name, Bytes>, window: usize) {
         );
         for name in wanted {
             let wire = held.get(&name).expect("a holder has every piece").clone();
-            assert_eq!(asm.offer(wire), Ok(Offered::Accepted), "{name}");
+            assert_eq!(asm.offer(wire.clone()), Ok(Offered::Accepted), "{name}");
+            kept.extend(keep_op(wire));
         }
     }
+    kept
 }
 
 #[test]
@@ -71,8 +75,7 @@ fn a_1_mib_payload_round_trips_through_pieces() {
 
     let held = holders(&pieces);
     let mut asm = Assembler::new(e.clone(), pieces.blob()).unwrap();
-    fetch(&mut asm, &held, 32);
-    let ops = asm.take_ops().expect("complete");
+    let ops = fetch(&mut asm, &held, 32);
 
     let store = MemoryStore::new();
     store.apply(ops);
@@ -108,7 +111,13 @@ fn a_payload_splits_into_pieces_its_manifest_lists_and_reassembles() {
         }
         assert_eq!(out, payload, "size {size}");
         assert_eq!(
-            join(&v, &pieces.blob(), |name| by_name.get(name).cloned()).unwrap(),
+            join(
+                &v,
+                &pieces.blob(),
+                |name| by_name.get(name).cloned(),
+                |name| by_name.contains_key(name),
+            )
+            .unwrap(),
             payload,
             "size {size}"
         );
@@ -204,13 +213,19 @@ fn a_sealed_payload_shows_only_its_size() {
 
     // The reader joins the sealed bytes whole, and opens them whole.
     let held = holders(&a);
-    let joined = join(&e, &a.blob(), |name| held.get(name).cloned()).unwrap();
+    let joined = join(
+        &e,
+        &a.blob(),
+        |name| held.get(name).cloned(),
+        |name| held.contains_key(name),
+    )
+    .unwrap();
     assert_eq!(joined, sealed_a.to_vec());
     assert_eq!(open_payload(&key, &e, &joined).unwrap(), secret_a);
 }
 
 #[test]
-fn pieces_are_written_in_one_batch() {
+fn pieces_are_written_in_one_batch_by_the_writer_and_kept_as_the_reader_proves_them() {
     let e = entry();
     let held = payload_held(&e);
     let pieces = split(&e, &payload(4096 * 200 + 1)).unwrap();
@@ -224,30 +239,33 @@ fn pieces_are_written_in_one_batch() {
     stage.apply(ops);
     assert_eq!(backing.batches(), 1);
 
-    // The reader side: nothing is written while an assembly is incomplete;
-    // all of it is, in one apply, when it completes.
+    // The reader side: what a round proved is written at once, one apply per
+    // round, and the assembler keeps none of it: the store holds the pieces
+    // while the assembly is still incomplete.
     let backing = Arc::new(Held::default());
     let stage = Stage::new(backing.clone());
     let mut asm = Assembler::new(e.clone(), pieces.blob()).unwrap();
+    let mut rounds = 0;
     while !asm.is_complete() {
-        assert!(
-            asm.take_ops().is_none(),
-            "an incomplete assembly hands nothing over"
-        );
+        let mut proved = Vec::new();
         for name in asm.next_wanted(8) {
             asm.offer(held[&name].clone()).unwrap();
+            proved.extend(keep_op(held[&name].clone()));
         }
-        assert_eq!(backing.batches(), 0);
+        let kept = proved.len();
+        stage.apply(proved);
+        rounds += 1;
+        assert_eq!(backing.batches(), rounds, "one batch per round");
+        assert!(
+            backing.scan_under(&e, 0).len() >= kept,
+            "the pieces a round proved are in the store before the next round"
+        );
     }
-    let ops = asm.take_ops().expect("complete");
-    assert_eq!(ops.len(), total);
-    stage.apply(ops);
-    assert_eq!(backing.batches(), 1);
+    assert_eq!(backing.scan_under(&e, 0).len(), total);
     assert_eq!(
         read(&*backing, &e, &pieces.blob()).unwrap(),
         payload(4096 * 200 + 1)
     );
-    assert!(asm.take_ops().is_none(), "the pieces are handed over once");
 }
 
 /// The pieces of the 200-chunk test payload, by name.
@@ -282,13 +300,61 @@ fn a_blob_head_is_unavailable_until_assembled() {
         })
     );
 
-    // The assembler agrees: incomplete hands nothing over.
-    let mut asm = Assembler::new(e.clone(), blob).unwrap();
+    // The assembler agrees: the plan is not complete.
+    let asm = Assembler::new(e.clone(), blob).unwrap();
     assert!(!asm.is_complete());
-    assert!(asm.take_ops().is_none());
 
     store.insert(missing.clone(), held[&missing].clone());
     assert_eq!(read(&store, &e, &blob).unwrap(), payload(4096 * 5));
+}
+
+/// [`join`] over `held`, counting the reads of chunks.
+fn read_with(
+    entry: &Name,
+    blob: &ChunksBody,
+    held: &BTreeMap<Name, Bytes>,
+    chunk_reads: &std::cell::Cell<usize>,
+) -> Result<Vec<u8>, PieceError> {
+    join(
+        entry,
+        blob,
+        |name| {
+            if matches!(
+                parse_piece_name(name).map(|p| p.kind),
+                Some(PieceKind::Chunk(_))
+            ) {
+                chunk_reads.set(chunk_reads.get() + 1);
+            }
+            held.get(name).cloned()
+        },
+        |name| held.contains_key(name),
+    )
+}
+
+/// A payload with a piece missing is not read: no chunk is read, so nothing
+/// of the size the entry declares (up to 64 MiB) is allocated for a value
+/// that cannot be returned.
+#[test]
+fn a_payload_with_a_piece_missing_reads_no_chunk() {
+    let e = entry();
+    let pieces = split(&e, &payload(CHUNK * 40)).unwrap();
+    let mut held = holders(&pieces);
+    let missing = piece_name(&e, PieceKind::Chunk(39));
+    held.remove(&missing);
+
+    let chunk_reads = std::cell::Cell::new(0);
+    let result = read_with(&e, &pieces.blob(), &held, &chunk_reads);
+    assert_eq!(
+        result,
+        Err(PieceError::Incomplete { missing }),
+        "the first piece that is not held is named"
+    );
+    assert_eq!(
+        chunk_reads.get(),
+        0,
+        "{} chunks were read before the missing one was noticed",
+        chunk_reads.get()
+    );
 }
 
 #[test]
@@ -376,7 +442,6 @@ fn a_tampered_piece_is_refused_alone() {
         }
     }
     assert_eq!(asm.next_wanted(8), vec![c2.clone()]);
-    assert!(asm.take_ops().is_none());
     assert_eq!(asm.offer(held[&c2].clone()), Ok(Offered::Accepted));
     assert!(asm.is_complete());
 
@@ -445,7 +510,7 @@ fn a_payload_over_payload_max_is_refused() {
         })
     );
     assert!(matches!(
-        join(&e, &blob, |_| None),
+        join(&e, &blob, |_| None, |_| false),
         Err(PieceError::Oversize { .. })
     ));
     // The most there is, is taken: only its pieces are missing.
@@ -455,7 +520,7 @@ fn a_payload_over_payload_max_is_refused() {
     };
     assert!(Assembler::new(e.clone(), blob).is_ok());
     assert!(matches!(
-        join(&e, &blob, |_| None),
+        join(&e, &blob, |_| None, |_| false),
         Err(PieceError::Incomplete { .. })
     ));
 }
@@ -471,6 +536,7 @@ proptest! {
         let pieces = split(&e, &payload(CHUNK * 131 - 7)).unwrap();
         prop_assert_eq!(pieces.packets.len(), 134);
         let mut asm = Assembler::new(e.clone(), pieces.blob()).unwrap();
+        let mut kept = Vec::new();
 
         // Pieces arrive in the drawn order; one whose parent is not held
         // yet is not lost, it is offered again when it can be proven.
@@ -481,7 +547,10 @@ proptest! {
             for p in waiting {
                 let listed = asm.next_wanted(usize::MAX).contains(&p.name);
                 match asm.offer(p.wire.clone()) {
-                    Ok(Offered::Accepted) => prop_assert!(listed),
+                    Ok(Offered::Accepted) => {
+                        prop_assert!(listed);
+                        kept.extend(keep_op(p.wire.clone()));
+                    }
                     Ok(Offered::NotYet) => {
                         prop_assert!(!listed);
                         next.push(p);
@@ -494,7 +563,7 @@ proptest! {
         }
         prop_assert!(asm.is_complete());
 
-        let mut ops = asm.take_ops().expect("complete");
+        let mut ops = kept;
         let mut want = pieces.ops();
         let key = |op: &StoreOp| match op {
             StoreOp::Insert(name, _) | StoreOp::Remove(name) => name.clone(),

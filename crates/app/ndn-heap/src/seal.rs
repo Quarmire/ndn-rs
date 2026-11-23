@@ -382,7 +382,7 @@ impl Keys {
 
 // ---- the granter's decision --------------------------------------------------------------------
 
-/// Why a grant is not answered (spec §6): the first of the four conditions
+/// Why a grant is not answered (spec §6): the first of the five conditions
 /// that does not hold. A refused ask gets no answer and its granter
 /// fetches nothing for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -412,6 +412,13 @@ pub(crate) enum GrantRefusal {
          the epoch's creator or another reader device"
     )]
     KeyNotHeld,
+    /// The key of the asking device is revoked.
+    #[error(
+        "the asking device's key is revoked by a trust context held here: a revoked device is \
+         granted no key, whatever its person may read; the owner of the person's namespace \
+         enrolls the device with a new key"
+    )]
+    AskerKeyRevoked,
 }
 
 /// The facts a granter decides on: the owner-signed Epoch entries it holds,
@@ -426,13 +433,16 @@ pub(crate) trait GrantView {
     fn reads_now(&self, person: &Name) -> bool;
     /// Whether this device holds the key of `epoch`.
     fn holds_key(&self, epoch: &EpochId) -> bool;
+    /// Whether the asker's key, when the ask is judged with it, is revoked.
+    fn asker_key_revoked(&self) -> bool;
 }
 
 /// Whether the key of `epoch` may be granted to a device of `asker`'s
-/// person: **all four** of (1) a held owner-signed Epoch entry names the
+/// person: **all five** of (1) a held owner-signed Epoch entry names the
 /// epoch, (2) its audience contains the person, (3) the person reads the
-/// space now, (4) this device holds the key. Forward only: a removed reader
-/// fails (3) for every later ask. Pure; first failure named.
+/// space now, (4) this device holds the key, (5) the key of the asking
+/// device is not revoked. Forward only: a removed reader fails (3) for every
+/// later ask, a revoked device key fails (5). Pure; first failure named.
 pub(crate) fn may_grant<V: GrantView + ?Sized>(
     view: &V,
     epoch: &EpochId,
@@ -450,6 +460,9 @@ pub(crate) fn may_grant<V: GrantView + ?Sized>(
     if !view.holds_key(epoch) {
         return Err(GrantRefusal::KeyNotHeld);
     }
+    if view.asker_key_revoked() {
+        return Err(GrantRefusal::AskerKeyRevoked);
+    }
     Ok(())
 }
 
@@ -463,6 +476,9 @@ pub(crate) struct Granter<'a> {
     pub keys: &'a Keys,
     /// The space.
     pub space: &'a Name,
+    /// Whether the key that signed the asker's seal key packet is revoked by
+    /// a trust context held here; `false` before the packet is judged.
+    pub revoked: bool,
 }
 
 impl GrantView for Granter<'_> {
@@ -480,6 +496,10 @@ impl GrantView for Granter<'_> {
 
     fn holds_key(&self, epoch: &EpochId) -> bool {
         self.keys.key(self.space, epoch).is_some()
+    }
+
+    fn asker_key_revoked(&self) -> bool {
+        self.revoked
     }
 }
 
@@ -587,12 +607,13 @@ mod tests {
         assert_eq!(open_payload(&ContentKey::generate(), &name, &stored), None);
     }
 
-    /// A view with each of the four facts a grant needs switchable.
+    /// A view with each of the five facts a grant needs switchable.
     struct View {
         names: bool,
         audience: bool,
         reads: bool,
         holds: bool,
+        revoked: bool,
     }
 
     impl GrantView for View {
@@ -608,10 +629,13 @@ mod tests {
         fn holds_key(&self, _: &EpochId) -> bool {
             self.holds
         }
+        fn asker_key_revoked(&self) -> bool {
+            self.revoked
+        }
     }
 
     #[test]
-    fn may_grant_refuses_each_of_the_four_conditions_and_names_which() {
+    fn may_grant_refuses_each_condition_and_names_which() {
         let e = epoch("/alice/laptop", 1);
         let asker = n("/bob");
         let all = View {
@@ -619,6 +643,7 @@ mod tests {
             audience: true,
             reads: true,
             holds: true,
+            revoked: false,
         };
         assert_eq!(may_grant(&all, &e, &asker), Ok(()));
         let refusals = [
@@ -650,6 +675,13 @@ mod tests {
                 },
                 GrantRefusal::KeyNotHeld,
             ),
+            (
+                View {
+                    revoked: true,
+                    ..all
+                },
+                GrantRefusal::AskerKeyRevoked,
+            ),
         ];
         let mut said = BTreeSet::new();
         for (view, refusal) in refusals {
@@ -665,6 +697,7 @@ mod tests {
             audience: false,
             reads: false,
             holds: false,
+            revoked: true,
         };
         assert_eq!(
             may_grant(&none, &e, &asker),
@@ -872,6 +905,7 @@ mod tests {
                 key_check: key_check(&key, &space, &e),
                 audience: vec![n("/o"), n("/p/1"), n("/p/2")],
             },
+            &[],
         );
         let mut granter = keys();
         granter.hold(&space, e.clone(), key.clone());
@@ -883,7 +917,12 @@ mod tests {
         let (mut fold, granter, space, e, key) = sealed_space();
         let (kept, removed) = (n("/p/1"), n("/p/2"));
         fn view<'a>(fold: &'a Fold, keys: &'a Keys, space: &'a Name) -> Granter<'a> {
-            Granter { fold, keys, space }
+            Granter {
+                fold,
+                keys,
+                space,
+                revoked: false,
+            }
         }
         assert_eq!(may_grant(&view(&fold, &granter, &space), &e, &kept), Ok(()));
         assert_eq!(
@@ -930,6 +969,7 @@ mod tests {
                 key_check: [0; 32],
                 audience: vec![n("/o"), n("/p/1")],
             },
+            &[],
         );
         let mut holding = keys();
         holding.hold(&space, next.clone(), ContentKey::generate());
@@ -937,6 +977,7 @@ mod tests {
             fold: &fold,
             keys: &holding,
             space: &space,
+            revoked: false,
         };
         assert_eq!(
             may_grant(&later, &next, &removed),

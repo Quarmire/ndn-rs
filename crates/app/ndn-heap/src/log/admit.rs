@@ -14,11 +14,11 @@ use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::Data;
 
-use super::chain::{Keeps, Ranges, Status};
+use super::chain::{Keeps, RANGES_MAX, Ranges, Status};
 use super::view::{View, write_for};
 use super::*;
 use crate::register::ValueChange;
-use crate::wire::{parse_log_name, signed_digest_of};
+use crate::wire::{Prev, parse_log_name, signed_digest_of};
 
 /// The facts an entry is judged by.
 pub(super) struct Subject<'a> {
@@ -57,6 +57,17 @@ enum Cutting {
     Outside(Refusal),
 }
 
+/// What `take` is given about the entry that arrived: its name, bytes, the
+/// verified signer, the time, and whether only an unsigned counter asked for it.
+struct Arrival<'a> {
+    id: &'a EntryRef,
+    wire: &'a Bytes,
+    data: &'a Data,
+    v: &'a Verified,
+    now: u64,
+    probe: bool,
+}
+
 /// A new entry to store.
 pub(super) struct Fresh<'a> {
     pub id: &'a EntryRef,
@@ -84,16 +95,27 @@ struct Loaded {
 /// digest and the seq of that entry (0 and zeros: none, or lost).
 pub(super) fn shape(data: &Data, seq: u64) -> Option<(Entry, [u8; 32], u64)> {
     let entry = Entry::decode(data.content()?).ok()?;
-    let (digest, prev_seq) = match (&entry.prev, seq) {
-        (None, 1) => ([0; 32], 0),
-        (Some(p), s) if s > 1 => match p.seq {
-            None => (p.digest, s - 1),
-            Some(ps) if ps < s => (p.digest, ps),
-            _ => return None,
-        },
-        _ => return None,
-    };
+    let (digest, prev_seq) = link_of(&entry.prev, seq)?;
     Some((entry, digest, prev_seq))
+}
+
+/// The link an entry at `seq` that states `prev` makes: the digest and seq
+/// of the entry before it. `None`: no link a chain can follow.
+fn link_of(prev: &Option<Prev>, seq: u64) -> Option<([u8; 32], u64)> {
+    match (prev, seq) {
+        (None, 1) => Some(([0; 32], 0)),
+        (Some(p), s) if s > 1 => match p.seq {
+            None => Some((p.digest, s - 1)),
+            Some(ps) if ps < s => Some((p.digest, ps)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The link a packet states even when its body cannot be read.
+fn stated_link(data: &Data, seq: u64) -> Option<([u8; 32], u64)> {
+    link_of(&Entry::decode_prev(data.content()?)?, seq)
 }
 
 impl Log {
@@ -107,10 +129,36 @@ impl Log {
         verified: &Verified,
         now: u64,
     ) -> Admitted {
+        self.admit_as(wire, data, verified, now, false)
+    }
+
+    /// [`Self::admit`] for an entry fetched only because an unsigned counter
+    /// named it (a probe, not something the log wants). If its signer is no
+    /// member and nothing of that device is vouched for, it is stored and
+    /// told only when it is the first this log holds of the device: what a
+    /// stranger advertises grows neither the store nor the host's alerts.
+    pub(crate) fn admit_probed(
+        &mut self,
+        wire: &Bytes,
+        data: &Data,
+        verified: &Verified,
+        now: u64,
+    ) -> Admitted {
+        self.admit_as(wire, data, verified, now, true)
+    }
+
+    fn admit_as(
+        &mut self,
+        wire: &Bytes,
+        data: &Data,
+        verified: &Verified,
+        now: u64,
+        probe: bool,
+    ) -> Admitted {
         let stage = Arc::clone(&self.store);
         let _batch = stage.batch();
         let mut fx = Effects::default();
-        let outcome = self.admit_in(wire, data, verified, now, &mut fx);
+        let outcome = self.admit_in(wire, data, verified, now, &mut fx, probe);
         self.settle(&mut fx);
         Admitted {
             outcome,
@@ -125,6 +173,7 @@ impl Log {
         v: &Verified,
         now: u64,
         fx: &mut Effects,
+        probe: bool,
     ) -> Outcome {
         // 1. The name parses, names this space, and its device is the key's.
         let name = (*data.name).clone();
@@ -157,7 +206,15 @@ impl Log {
         if let Some(why) = self.suspicion(v) {
             return Outcome::Refused(why);
         }
-        let outcome = self.take(&id, wire, data, v, now, fx);
+        let arrival = Arrival {
+            id: &id,
+            wire,
+            data,
+            v,
+            now,
+            probe,
+        };
+        let outcome = self.take(arrival, fx);
         if let Some(old) = displaced {
             self.store.insert(store::equivocal_key(&name), old);
             fx.alerts.push(Alert::Equivocation {
@@ -246,6 +303,15 @@ impl Log {
             seq: id.seq,
         });
         self.mark_suspect(&v.key, now, fx);
+        // What the entry first held here said is absent is no longer taken as
+        // said: its writer signed two.
+        let retracted = self
+            .devices
+            .get_mut(&id.device)
+            .is_some_and(|dev| dev.retract_gap(id.seq));
+        if retracted {
+            self.write_ledger(&id.device);
+        }
         if let Some((entry, _, _)) = shape(data, id.seq)
             && matches!(entry.body, Body::Members(_) | Body::Epoch(_))
         {
@@ -270,16 +336,27 @@ impl Log {
         Outcome::Evidence
     }
 
+    /// Whether taking the entry `id`, which states `link`, would make its
+    /// device's runs or gap statements more than [`RANGES_MAX`].
+    fn fragments(&self, id: &EntryRef, link: Option<([u8; 32], u64)>) -> bool {
+        let Some(dev) = self.devices.get(&id.device) else {
+            return false;
+        };
+        let states_gap = link.is_some_and(|(_, prev_seq)| prev_seq + 1 < id.seq);
+        (dev.held.runs() >= RANGES_MAX && dev.held.grows_by(id.seq, id.seq))
+            || (states_gap && dev.gaps.len() >= RANGES_MAX)
+    }
+
     /// Plan 3.5 steps 3 to 8 for an entry at a fresh name.
-    fn take(
-        &mut self,
-        id: &EntryRef,
-        wire: &Bytes,
-        data: &Data,
-        v: &Verified,
-        now: u64,
-        fx: &mut Effects,
-    ) -> Outcome {
+    fn take(&mut self, arrival: Arrival<'_>, fx: &mut Effects) -> Outcome {
+        let Arrival {
+            id,
+            wire,
+            data,
+            v,
+            now,
+            probe,
+        } = arrival;
         let name = id.name(&self.space);
         let shaped = shape(data, id.seq);
         let fresh = |status: Option<Status>, link, applying| Fresh {
@@ -292,38 +369,42 @@ impl Log {
             applying,
         };
 
-        // 7. An own-name entry: above what this device reserved it is
-        // evidence of a key copy or an old image; below, it is adopted only
-        // if this device's key signed it and it chains to what is held.
+        // 7. An own-name entry is adopted only if this device's key signed it,
+        // and then once it chains to what is held ([`Log::assess`]: until it
+        // does it waits, held, and the entries below it are asked for).
+        // Above what an earlier run could have reserved it is a restored old
+        // image or a key copy: told as `RolledBack`, and applied all the
+        // same, as every peer applied it, so this device and its peers
+        // agree; this device resumes above it.
         if id.device == self.device {
-            // What an earlier run could have signed: the durable `R` it left,
-            // not the extension this run wrote at open.
+            if v.key != self.key {
+                return Outcome::Refused(Refusal::BadSignature);
+            }
+            // The durable `R` an earlier run left, not the extension this
+            // run wrote at open.
             let reserved = self.floor_r;
             if id.seq > reserved {
-                let link = shaped.as_ref().map(|(_, d, s)| (*d, *s));
-                let status = Some(Status::Refused(Refusal::AboveReservation { reserved }));
-                self.store_fresh(fresh(status, link, None), now, fx);
                 fx.alerts.push(Alert::RolledBack {
                     reserved,
                     seen: id.seq,
                 });
-                self.next_seq = self.next_seq.max(id.seq + 1);
-                return Outcome::Evidence;
             }
-            if v.key != self.key {
-                return Outcome::Refused(Refusal::BadSignature);
-            }
-            if let Some((_, prev, prev_seq)) = &shaped
-                && !self.own_chains(*prev_seq, prev)
-            {
-                return Outcome::Refused(Refusal::Chain);
-            }
-            self.next_seq = self.next_seq.max(id.seq + 1);
+            self.next_seq = self.next_seq.max(id.seq.saturating_add(1));
+        }
+
+        // The ledger is written with every entry, so a device keeps only so
+        // many separate runs and gap statements of another's.
+        let stated = shaped
+            .as_ref()
+            .map(|(_, digest, prev_seq)| (*digest, *prev_seq))
+            .or_else(|| stated_link(data, id.seq));
+        if id.device != self.device && self.fragments(id, stated) {
+            return Outcome::Refused(Refusal::Fragmented);
         }
 
         let Some((entry, prev, prev_seq)) = shaped else {
             tracing::warn!(%name, "an entry that verifies and cannot be read is recorded as refused");
-            self.store_fresh(fresh(Some(Status::Unreadable), None, None), now, fx);
+            self.store_fresh(fresh(Some(Status::Unreadable), stated, None), now, fx);
             return Outcome::Unreadable;
         };
         let link = Some((prev, prev_seq));
@@ -374,6 +455,22 @@ impl Log {
                 Outcome::Waiting
             }
             Verdict::Refuse(why) => {
+                // A probe of a device nothing vouches for keeps one refused
+                // entry here, the first: it is the one a later membership
+                // change takes back. Its other counters are probed and
+                // answered, and neither stored nor told, so what a stranger
+                // advertises grows neither the store nor the host's alerts.
+                // An entry the log asked for (a hole, a cut's tip) is stored.
+                if probe
+                    && matches!(why, Refusal::NotMember)
+                    && self
+                        .devices
+                        .get(&id.device)
+                        .is_some_and(|d| d.held.count() > 0)
+                    && !self.vouches(&id.device)
+                {
+                    return Outcome::Refused(why);
+                }
                 self.store_fresh(
                     fresh(Some(Status::Refused(why.clone())), link, None),
                     now,
@@ -386,14 +483,42 @@ impl Log {
     }
 
     /// Whether an own entry chaining to `(prev, prev_seq)` extends what this
-    /// device holds of itself.
+    /// device holds of itself: the entry it names is held as those bytes and
+    /// was admitted (not refused, not waiting for its own predecessor).
     fn own_chains(&self, prev_seq: u64, prev: &[u8; 32]) -> bool {
+        let view = self.view();
         match prev_seq {
             0 => true,
-            seq => self
-                .view()
-                .marker(&self.device, seq)
-                .is_some_and(|m| m.signed_digest == *prev),
+            seq => {
+                view.marker(&self.device, seq)
+                    .is_some_and(|m| m.signed_digest == *prev)
+                    && matches!(
+                        view.status(&self.device, seq),
+                        None | Some(Status::Closed | Status::Unreadable)
+                    )
+            }
+        }
+    }
+
+    /// An own entry is applied: the next one chains to it and the head record
+    /// says it; own entries that waited for it may chain now.
+    fn adopt_own(&mut self, link: Link) {
+        if self.own_tip.is_none_or(|t| t.seq < link.seq) {
+            self.own_tip = Some(link);
+            self.store.apply(vec![store::head_op(
+                &self.space,
+                store::Head {
+                    seq: link.seq,
+                    digest: link.digest,
+                },
+            )]);
+        }
+        if self
+            .devices
+            .get(&self.device)
+            .is_some_and(|d| d.nonvouching > 0)
+        {
+            self.queue.push(Scope::Waiting(self.device.clone()));
         }
     }
 
@@ -423,6 +548,14 @@ impl Log {
     /// The decision about an entry from what is held: plan 3.5 steps 3 to 5.
     /// Pure; made again by [`Log::reassess`] whenever the facts change.
     pub(super) fn assess(&self, s: &Subject<'_>, entry: &Entry) -> Verdict {
+        // 2. An own entry is adopted once it chains to an own entry held
+        // (what this device signed, in order); until then it waits for it.
+        if *s.device == self.device
+            && let Some((prev, prev_seq)) = link_of(&entry.prev, s.seq)
+            && !self.own_chains(prev_seq, &prev)
+        {
+            return Verdict::Waiting;
+        }
         let structural = matches!(entry.body, Body::Members(_) | Body::Epoch(_));
         // 3. Only an owner device carries Members and Epoch entries.
         if structural && !(wire::owns(&self.space, s.key) && s.person == self.fold.owner()) {
@@ -508,8 +641,9 @@ impl Log {
             .or_insert_with(|| Dev::new(f.person.clone()));
         dev.person = f.person.clone();
         dev.held.insert(seq);
-        if f.link.is_some() && prev_seq + 1 < seq {
-            dev.voids.insert_range(prev_seq + 1, seq - 1);
+        if matches!(f.status, None | Some(Status::Closed)) && f.link.is_some() && prev_seq + 1 < seq
+        {
+            dev.state_gap(seq, prev_seq);
         }
         dev.high = dev.high.max(seq);
         let link = Link {
@@ -523,15 +657,8 @@ impl Log {
         self.set_status(device, seq, None, f.status.as_ref());
         if *device == self.device {
             self.own_head = self.own_head.max(seq);
-            if f.status.is_none() && self.own_tip.is_none_or(|t| t.seq < seq) {
-                self.own_tip = Some(link);
-                self.store.apply(vec![store::head_op(
-                    &self.space,
-                    store::Head {
-                        seq,
-                        digest: f.id.digest,
-                    },
-                )]);
+            if f.status.is_none() {
+                self.adopt_own(link);
             }
         }
         if let Some(applying) = &f.applying {
@@ -561,6 +688,41 @@ impl Log {
         if let Some(dev) = self.devices.get(device) {
             self.store
                 .insert(store::ledger_key(&self.space, device), dev.record());
+        }
+    }
+
+    /// An entry's gap statement counts while the entry is admitted (applied,
+    /// or closed for want of a key) and its name is not equivocal: what a
+    /// refused or equivocating entry says is absent is not taken as said.
+    /// `was` and `now` are its status before and after a change.
+    fn count_gap(
+        &mut self,
+        device: &Name,
+        seq: u64,
+        marker: &Marker,
+        was: Option<&Status>,
+        now: Option<&Status>,
+    ) {
+        let admitted = |s: Option<&Status>| matches!(s, None | Some(Status::Closed));
+        if admitted(was) == admitted(now) {
+            return;
+        }
+        let name = log_name(device, &self.space, seq);
+        let equivocal = self.store.get(&store::equivocal_key(&name)).is_some();
+        let Some(dev) = self.devices.get_mut(device) else {
+            return;
+        };
+        let changed = if admitted(now) {
+            let gap = marker.prev_seq + 1 < seq;
+            if gap && !equivocal {
+                dev.state_gap(seq, marker.prev_seq);
+            }
+            gap && !equivocal
+        } else {
+            dev.retract_gap(seq)
+        };
+        if changed {
+            self.write_ledger(device);
         }
     }
 
@@ -610,9 +772,11 @@ impl Log {
                     keys: &self.keys,
                     devices: &self.devices,
                 };
-                let eff = self
-                    .register
-                    .apply(&a.id, &write, &a.entry.after, &|x| view.namers(x));
+                let eff =
+                    self.register
+                        .apply(&a.id, &write, &a.entry.after, &|x| view.namers(x), &|x| {
+                            view.write_of(x)
+                        });
                 self.store.apply(eff.writes);
                 self.value_changes(eff.changes, Some((&a.id, put)), fx);
             }
@@ -629,6 +793,7 @@ impl Log {
                         seq: a.id.seq,
                     },
                     body,
+                    &a.entry.after,
                 );
                 self.mark_structural(&a.id);
                 self.queue.push(Scope::Closed);
@@ -910,6 +1075,13 @@ impl Log {
             Verdict::Apply(put) => {
                 if l.status.is_some() {
                     self.set_status(device, seq, l.status.as_ref(), None);
+                    self.count_gap(device, seq, &l.marker, l.status.as_ref(), None);
+                    if *device == self.device {
+                        self.adopt_own(Link {
+                            seq,
+                            digest: id.digest,
+                        });
+                    }
                     let applying = Applying {
                         id,
                         person: l.person,
@@ -928,6 +1100,7 @@ impl Log {
             return;
         }
         self.set_status(device, seq, l.status.as_ref(), Some(&new));
+        self.count_gap(device, seq, &l.marker, l.status.as_ref(), Some(&new));
         if l.status.is_none() {
             let put = self.view().opened_put(&l.entry, &name);
             let applying = Applying {
@@ -943,14 +1116,25 @@ impl Log {
     /// The host (or the judge, after a change of trust) says an entry is
     /// refused for `why`: it leaves the register or the fold, and stays
     /// refused until it is offered again and verifies.
+    ///
+    /// A cause that may pass (`BadSignature`: a certificate not found, a key
+    /// store that failed) is kept as `Untrusted`, which a later copy that
+    /// verifies re-assesses; kept as itself it would be final.
     pub(crate) fn withdraw(&mut self, device: &Name, seq: u64, why: Refusal) -> Effects {
         let stage = Arc::clone(&self.store);
         let _batch = stage.batch();
         let mut fx = Effects::default();
         if let Some(l) = self.load_entry(device, seq) {
-            let new = Status::Refused(why);
+            let new = Status::Refused(match why {
+                Refusal::BadSignature => Refusal::Untrusted {
+                    why: "it did not verify when judged again with what this device holds now"
+                        .into(),
+                },
+                why => why,
+            });
             if l.status.as_ref() != Some(&new) {
                 self.set_status(device, seq, l.status.as_ref(), Some(&new));
+                self.count_gap(device, seq, &l.marker, l.status.as_ref(), Some(&new));
                 if l.status.is_none() {
                     let name = log_name(device, &self.space, seq);
                     let put = self.view().opened_put(&l.entry, &name);

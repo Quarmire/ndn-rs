@@ -24,7 +24,7 @@ use ndn_sync::{DataStore, StoreOp};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
-use crate::wire::{log_name, parse_log_name};
+use crate::wire::log_name;
 
 #[cfg(test)]
 mod tests;
@@ -65,6 +65,13 @@ pub(crate) fn verified_key(entry: &Name) -> Name {
     under(kind("verified"), entry)
 }
 
+/// That every piece of an entry's value in pieces is held and proved:
+/// `assembled/<entry name>` (one octet), written after the last piece, and
+/// in the batch of the entry for a value this device wrote.
+pub(crate) fn assembled_key(entry: &Name) -> Name {
+    under(kind("assembled"), entry)
+}
+
 /// The device's own head in a space: `head/<S>` ([`Head`]).
 pub(crate) fn head_key(space: &Name) -> Name {
     under(kind("head"), space)
@@ -78,6 +85,12 @@ pub(crate) fn reserve_key(space: &Name) -> Name {
 /// That the device created or opened a space: `space/<S>` (one octet).
 pub(crate) fn space_key(space: &Name) -> Name {
     under(kind("space"), space)
+}
+
+/// The revocations of the readers' devices the last epoch this device signed
+/// accounted for: `revoked/<S>` (a 32-octet digest, spec §6.6).
+pub(crate) fn revoked_key(space: &Name) -> Name {
+    under(kind("revoked"), space)
 }
 
 /// `<kind>/<S>/<device>/<seq 8>`: a record per entry of a device, listed by
@@ -121,10 +134,13 @@ pub(crate) fn parse_structural_key(space: &Name, key: &Name) -> Option<(Name, u6
     parse_seq_key("structural", space, key)
 }
 
-/// The entries that name the entry `<device>/<seq>` in their `after`:
-/// `supers/<S>/<device>/<seq 8>` (`ENTRY_REF*`).
-pub(crate) fn supers_key(space: &Name, device: &Name, seq: u64) -> Name {
+/// The entries that name the entry `<device>/<seq>` with signed-region digest
+/// `digest` in their `after`: `supers/<S>/<device>/<seq 8>/<digest>`
+/// (`ENTRY_REF*`). The digest is in the key so that a ref naming another
+/// packet at the same name hides nothing.
+pub(crate) fn supers_key(space: &Name, device: &Name, seq: u64, digest: &[u8; 32]) -> Name {
     seq_key("supers", space, device, seq)
+        .append_component(NameComponent::generic(Bytes::copy_from_slice(digest)))
 }
 
 /// The epoch key this device made, wrapped to its seal key:
@@ -445,56 +461,6 @@ pub(crate) fn write_head(store: &dyn DataStore, space: &Name, head: Head) {
 }
 
 // -- Own head and chains ---------------------------------------------------------
-
-/// The newest own entry the store holds in a space, by name alone.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OwnHead {
-    /// Its seq.
-    pub seq: u64,
-    /// Its name.
-    pub name: Name,
-    /// The packet stored there, undecoded.
-    pub wire: Bytes,
-}
-
-/// `<D>/32=log/<S>`: what every entry name of the device in the space
-/// extends.
-fn log_prefix(device: &Name, space: &Name) -> Name {
-    let entry = log_name(device, space, 0);
-    Name::from_components(entry.components()[..entry.len() - 1].iter().cloned())
-}
-
-/// The highest seq among the own entries stored in `space`, found from the
-/// names of every one (`<D>/32=log/<S>/seq=<n>`) before and regardless of
-/// whether any decodes: a head taken from the entries read as packets would
-/// miss one that does not decode, and a device that signed again at its seq
-/// would equivocate. Pieces of an entry, other devices' entries and the
-/// entries of a space that extends this one move nothing. The scan reads
-/// every own entry once, at open.
-pub(crate) fn own_head_from_names(
-    store: &dyn DataStore,
-    device: &Name,
-    space: &Name,
-) -> Option<OwnHead> {
-    let mut head: Option<OwnHead> = None;
-    for (name, wire) in store.scan_under(&log_prefix(device, space), 0) {
-        let Some(parsed) = parse_log_name(&name) else {
-            continue;
-        };
-        if parsed.seq == 0 || parsed.device != *device || parsed.space != *space {
-            continue;
-        }
-        if head.as_ref().is_some_and(|h| h.seq >= parsed.seq) {
-            continue;
-        }
-        head = Some(OwnHead {
-            seq: parsed.seq,
-            name,
-            wire,
-        });
-    }
-    head
-}
 
 /// One entry of a chain: its seq and signed-region digest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

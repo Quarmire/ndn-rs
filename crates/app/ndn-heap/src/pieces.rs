@@ -12,16 +12,19 @@
 //! whatever bytes it is given and [`join`] returns them, so a holder of the
 //! pieces learns the payload's size and nothing else.
 //!
-//! Nothing here is stored until it is all held. An [`Assembler`] collects the
-//! verified pieces of one payload in memory (the payload's size once, no
-//! copy of it besides) and hands them over together
-//! ([`Assembler::take_ops`]); the caller writes them as one
-//! [`DataStore::apply`](ndn_sync::DataStore::apply), so a kill leaves all of
-//! a payload's pieces or none. The assembler holds no lock and does no I/O:
-//! the fetcher asks for what [`Assembler::next_wanted`] names and offers what
-//! arrives, and decides nothing else.
+//! A piece is stored as soon as it is proven, one batch of what a round of
+//! the fetch brought; nothing is held in memory but the digests a proven node
+//! listed and which places were proven (an [`Assembler`] is a plan, not a
+//! buffer: its size follows the number of chunks, never the payload's). A
+//! piece in the store proves nothing by being there: a payload is read only
+//! through its tree, from the root digest its entry carries, and an entry's
+//! value is whole once the caller says so with its `assembled/` marker, which
+//! it writes after the last piece. The assembler holds no lock and does no
+//! I/O: the fetcher asks for what [`Assembler::next_wanted`] names and offers
+//! what arrives (or what the store already holds, to resume), and decides
+//! nothing else.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
@@ -299,23 +302,24 @@ impl Listed {
     }
 }
 
-/// Collects the pieces of one payload, each proven against the digest its
-/// parent lists before it is kept, and says which to ask for next.
+/// Plans the fetch of the pieces of one payload, each proven against the
+/// digest its parent lists, and says which to ask for next. It keeps no
+/// piece.
 pub(crate) struct Assembler {
     entry: Name,
     shape: Shape,
     /// Pieces whose digests are known and that are not held.
     wanted: Listed,
-    /// Held nodes, by heap number.
-    nodes: BTreeMap<u64, Bytes>,
-    /// Held chunks, by index: the packet and the octets it carries.
-    chunks: BTreeMap<u64, (Bytes, Bytes)>,
+    /// Nodes proven, by heap number.
+    nodes: BTreeSet<u64>,
+    /// Chunks proven, by index.
+    chunks: BTreeSet<u64>,
 }
 
 /// What an offered piece came to, when it was not refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Offered {
-    /// Proven and kept.
+    /// Proven: the caller keeps it.
     Accepted,
     /// Already held.
     Duplicate,
@@ -338,8 +342,8 @@ impl Assembler {
             entry,
             shape: Shape::of(blob.size),
             wanted,
-            nodes: BTreeMap::new(),
-            chunks: BTreeMap::new(),
+            nodes: BTreeSet::new(),
+            chunks: BTreeSet::new(),
         })
     }
 
@@ -364,10 +368,10 @@ impl Assembler {
         self.wanted.nodes.is_empty() && self.wanted.chunks.is_empty()
     }
 
-    /// Offer a packet that arrived from anywhere. It is kept only if it is
-    /// the piece its name says and the digest its parent lists names exactly
-    /// its bytes; a bad copy changes nothing, and the same piece is still
-    /// wanted.
+    /// Offer a packet that arrived from anywhere. It is accepted only if it
+    /// is the piece its name says and the digest its parent lists names
+    /// exactly its bytes ([`Offered::Accepted`]: the caller stores `wire`);
+    /// a bad copy changes nothing, and the same piece is still wanted.
     ///
     /// # Errors
     ///
@@ -387,7 +391,7 @@ impl Assembler {
         }
         match parsed.kind {
             PieceKind::Manifest(k) => {
-                if self.nodes.contains_key(&k) {
+                if self.nodes.contains(&k) {
                     return Ok(Offered::Duplicate);
                 }
                 if self.shape.locate(k).is_none() {
@@ -399,10 +403,10 @@ impl Assembler {
                 let digests = open_node(&self.entry, &self.shape, k, &wire, &expected)?;
                 self.wanted.nodes.remove(&k);
                 self.wanted.list(&self.shape, k, digests);
-                self.nodes.insert(k, wire);
+                self.nodes.insert(k);
             }
             PieceKind::Chunk(i) => {
-                if self.chunks.contains_key(&i) {
+                if self.chunks.contains(&i) {
                     return Ok(Offered::Duplicate);
                 }
                 if i >= self.shape.chunks {
@@ -411,66 +415,40 @@ impl Assembler {
                 let Some(expected) = self.wanted.chunks.get(&i).copied() else {
                     return Ok(Offered::NotYet);
                 };
-                let content = open_chunk(&self.entry, &self.shape, i, &wire, &expected)?;
+                open_chunk(&self.entry, &self.shape, i, &wire, &expected)?;
                 self.wanted.chunks.remove(&i);
-                self.chunks.insert(i, (wire, content));
+                self.chunks.insert(i);
             }
         }
         Ok(Offered::Accepted)
     }
+}
 
-    /// The payload, once every piece is held and proven: the octets the
-    /// chunks carry, in order, joined from what was proven as it arrived (no
-    /// read of the store and no second digest). Asked for before
-    /// [`Self::take_ops`], which gives the pieces up.
-    pub(crate) fn payload(&self) -> Option<Vec<u8>> {
-        if !self.is_complete() || self.nodes.is_empty() {
-            return None;
-        }
-        let mut out = Vec::with_capacity(self.shape.size as usize);
-        for (_, content) in self.chunks.values() {
-            out.extend_from_slice(content);
-        }
-        Some(out)
-    }
-
-    /// Every piece as a write, once all are held, and only then: the caller
-    /// applies them as ONE batch. The assembler gives them up once; it holds
-    /// nothing after.
-    pub(crate) fn take_ops(&mut self) -> Option<Vec<StoreOp>> {
-        if !self.is_complete() || self.nodes.is_empty() {
-            return None;
-        }
-        let entry = &self.entry;
-        let chunks = std::mem::take(&mut self.chunks)
-            .into_iter()
-            .map(|(i, (wire, _))| (piece_name(entry, PieceKind::Chunk(i)), wire));
-        let nodes = std::mem::take(&mut self.nodes)
-            .into_iter()
-            .map(|(k, wire)| (piece_name(entry, PieceKind::Manifest(k)), wire));
-        Some(
-            chunks
-                .chain(nodes)
-                .map(|(name, wire)| StoreOp::Insert(name, wire))
-                .collect(),
-        )
-    }
+/// The write that keeps an accepted piece, at the name its packet carries.
+pub(crate) fn keep_op(wire: Bytes) -> Option<StoreOp> {
+    let name = (*Data::decode(wire.clone()).ok()?.name).clone();
+    Some(StoreOp::Insert(name, wire))
 }
 
 /// The payload of the entry named `entry` from its pieces as `get` finds
 /// them, every node and chunk checked against the digest its parent lists
 /// and the root against `blob.root`. A sealed payload comes back sealed.
 ///
+/// The chunks are read only once `has` says every one is held, so a value
+/// with a piece missing costs the nodes read and nothing of its size (up to
+/// [`PAYLOAD_MAX`]); the output is allocated once.
+///
 /// # Errors
 ///
-/// [`PieceError::Incomplete`] names the first piece `get` does not find (the
-/// value is not available yet, never short); [`PieceError::Wrong`] a stored
-/// piece that is not the listed one (the store is damaged: drop it and
-/// fetch it again).
+/// [`PieceError::Incomplete`] names the first piece `get` (a node) or `has`
+/// (a chunk) does not find (the value is not available yet, never short);
+/// [`PieceError::Wrong`] a stored piece that is not the listed one (the
+/// store is damaged: drop it and fetch it again).
 pub(crate) fn join(
     entry: &Name,
     blob: &ChunksBody,
     get: impl Fn(&Name) -> Option<Bytes>,
+    has: impl Fn(&Name) -> bool,
 ) -> Result<Vec<u8>, PieceError> {
     if blob.size > PAYLOAD_MAX {
         return Err(PieceError::Oversize { size: blob.size });
@@ -484,6 +462,12 @@ pub(crate) fn join(
         let wire = get(&name).ok_or(PieceError::Incomplete { missing: name })?;
         let digests = open_node(entry, &shape, k, &wire, &expected)?;
         wanted.list(&shape, k, digests);
+    }
+    for &i in wanted.chunks.keys() {
+        let name = piece_name(entry, PieceKind::Chunk(i));
+        if !has(&name) {
+            return Err(PieceError::Incomplete { missing: name });
+        }
     }
     let mut out = Vec::with_capacity(blob.size as usize);
     for (i, expected) in wanted.chunks {
@@ -500,5 +484,10 @@ pub(crate) fn read(
     entry: &Name,
     blob: &ChunksBody,
 ) -> Result<Vec<u8>, PieceError> {
-    join(entry, blob, |name| store.get(name))
+    join(
+        entry,
+        blob,
+        |name| store.get(name),
+        |name| store.contains(name),
+    )
 }

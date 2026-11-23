@@ -335,7 +335,7 @@ fn an_entry_whose_kind_and_body_disagree_is_refused() {
 }
 
 #[test]
-fn only_a_put_names_what_it_supersedes() {
+fn only_a_put_or_an_epoch_names_what_it_supersedes() {
     for entry in every_kind() {
         let wire = edit(&entry, &[], &|mut list| {
             let mut r = TlvWriter::new();
@@ -348,16 +348,26 @@ fn only_a_put_names_what_it_supersedes() {
             list.push((t, v));
             list
         });
-        let has_after = !entry.after.is_empty();
         let decoded = Entry::decode(&wire);
-        match (entry.kind(), has_after) {
-            (Kind::Put, _) => assert_eq!(decoded.unwrap().after.len(), entry.after.len() + 1),
-            _ => assert!(decoded.is_err(), "{entry:?}"),
+        match entry.kind() {
+            Kind::Put | Kind::Epoch => {
+                assert_eq!(decoded.unwrap().after.len(), entry.after.len() + 1)
+            }
+            Kind::Members => assert!(decoded.is_err(), "{entry:?}"),
         }
     }
     let mut e = every_kind()[5].clone();
     e.after = vec![eref(1)];
     assert!(e.encode().is_err(), "a Members entry supersedes nothing");
+    let mut e = every_kind()
+        .into_iter()
+        .find(|e| e.kind() == Kind::Epoch)
+        .expect("an epoch among the kinds");
+    e.after = vec![eref(1)];
+    let wire = e
+        .encode()
+        .expect("an Epoch entry names the epochs it replaces");
+    assert_eq!(Entry::decode(&wire).unwrap(), e);
 }
 
 /// A device name of about a hundred octets, five components.

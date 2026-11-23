@@ -14,17 +14,21 @@
 //! The register is sans-IO and reads no store. It is handed an already
 //! accepted entry's facts and returns the writes the log makes in the
 //! entry's batch (`heads/<S>/<sha256 of the path TLV>` and
-//! `supers/<S>/<device>/<seq 8>` records) together with the changes of
-//! what each path's winner is. What it must ask the store it asks through
+//! `supers/<S>/<device>/<seq 8>/<digest>` records) together with the changes
+//! of what each path's winner is. What it must ask the store it asks through
 //! closures:
 //!
-//! - `namers(x)`: the entries that name `x` in their `after`, read from
-//!   `supers/<S>/<x.device>/<x.seq>` ([`decode_refs`]). That record lists
-//!   *applied* namers only, and lists namers of entries not held yet: an
-//!   entry whose `after` names one that arrives later makes it no head.
+//! - `namers(x)`: the entries that name `x` (its signed-region digest
+//!   included) in their `after`, read from the `supers/` record of `x`'s
+//!   name and digest ([`decode_refs`]). That record lists *applied* namers
+//!   only, and lists namers of entries not held yet: an entry whose `after`
+//!   names one that arrives later makes it no head. A ref across paths (a
+//!   namer and a target at different paths) supersedes nothing: it is not
+//!   recorded when the target is known, and ignored when the target arrives.
 //! - `load(x)`: what the applied entry `x` wrote ([`Write`]), `None` when
-//!   `x` is not held or not applied. Used when a withdrawal gives the
-//!   entries a refused one superseded their place back, and by [`restore`].
+//!   `x` is not held or not applied. Used to tell which path `x` is at, when
+//!   a withdrawal gives the entries a refused one superseded their place
+//!   back, and by [`restore`].
 //!
 //! [`restore`]: Register::restore
 
@@ -227,6 +231,11 @@ impl Register {
     /// `after`. Idempotent: an entry applied again changes and writes
     /// nothing.
     ///
+    /// A ref supersedes only the entry it names by digest and only at the
+    /// path `write` is at: one whose target is held at another path is
+    /// ignored, and one naming other bytes at a name hides nothing (its
+    /// record is keyed by that digest).
+    ///
     /// `namers` answers from the store *including this entry's batch so far*.
     pub(crate) fn apply(
         &mut self,
@@ -234,10 +243,17 @@ impl Register {
         write: &Write,
         after: &[EntryRef],
         namers: &dyn Fn(&EntryRef) -> Vec<EntryRef>,
+        load: &dyn Fn(&EntryRef) -> Option<Write>,
     ) -> Effects {
         let mut touched = Touched::new();
         let mut writes = Vec::new();
         for x in distinct(after, id) {
+            if self
+                .path_of(&x, load)
+                .is_some_and(|path| path != write.path)
+            {
+                continue;
+            }
             let mut named = namers(&x);
             if !named.contains(id) {
                 named.push(id.clone());
@@ -246,9 +262,9 @@ impl Register {
             }
             self.take_head(&mut touched, &x);
         }
-        // An entry some applied entry already names, one that arrived first,
-        // is not a head.
-        if !self.at.contains_key(id) && namers(id).is_empty() {
+        // An entry some applied entry at its path already names, one that
+        // arrived first, is not a head.
+        if !self.at.contains_key(id) && !names_at(&namers(id), &write.path, load) {
             self.add_head(
                 &mut touched,
                 Head {
@@ -265,9 +281,9 @@ impl Register {
 
     /// An applied entry `id` (which superseded `after`) is refused and no
     /// longer applied: call this after the log has marked it so. Its place
-    /// is taken by the entries of `after` that no other applied entry names;
-    /// those the log holds and applied come back as heads (`load`), those it
-    /// does not hold come back when they arrive.
+    /// is taken by the entries of `after` that no other applied entry names
+    /// at their path; those the log holds and applied come back as heads
+    /// (`load`), those it does not hold come back when they arrive.
     pub(crate) fn withdraw(
         &mut self,
         id: &EntryRef,
@@ -281,16 +297,19 @@ impl Register {
         for x in distinct(after, id) {
             let all = namers(&x);
             let named: Vec<EntryRef> = all.iter().filter(|r| *r != id).cloned().collect();
-            if named.len() != all.len() {
-                writes.push(if named.is_empty() {
-                    StoreOp::Remove(self.supers_key(&x))
-                } else {
-                    StoreOp::Insert(self.supers_key(&x), encode_refs(&named))
-                });
+            // `id` never named `x` here (the ref was across paths): nothing
+            // of it to undo.
+            if named.len() == all.len() {
+                continue;
             }
-            if named.is_empty()
-                && !self.at.contains_key(&x)
+            writes.push(if named.is_empty() {
+                StoreOp::Remove(self.supers_key(&x))
+            } else {
+                StoreOp::Insert(self.supers_key(&x), encode_refs(&named))
+            });
+            if !self.at.contains_key(&x)
                 && let Some(w) = load(&x)
+                && !names_at(&named, &w.path, load)
             {
                 self.add_head(
                     &mut touched,
@@ -396,7 +415,13 @@ impl Register {
     }
 
     fn supers_key(&self, x: &EntryRef) -> Name {
-        supers_key(&self.space, &x.device, x.seq)
+        supers_key(&self.space, &x.device, x.seq, &x.digest)
+    }
+
+    /// The path the entry `x` is at, if it is a head or the log holds it
+    /// applied.
+    fn path_of(&self, x: &EntryRef, load: &dyn Fn(&EntryRef) -> Option<Write>) -> Option<Name> {
+        self.at.get(x).cloned().or_else(|| load(x).map(|w| w.path))
     }
 
     /// Put `head` at `path` in rank order.
@@ -453,6 +478,14 @@ impl Register {
         }
         Effects { writes, changes }
     }
+}
+
+/// Whether any of `named` (applied entries) is at `path`: only those
+/// supersede an entry there. An entry `load` cannot answer for counts.
+fn names_at(named: &[EntryRef], path: &Name, load: &dyn Fn(&EntryRef) -> Option<Write>) -> bool {
+    named
+        .iter()
+        .any(|n| load(n).is_none_or(|w| w.path == *path))
 }
 
 /// `after` without repeats and without `id` itself.

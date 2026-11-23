@@ -23,11 +23,11 @@
 //! it, so a cold open of 100,000 entries reads one `ledger/` record per
 //! device. An entry's state is its `status/` record (absent = applied).
 //!
-//! 1. **Open** ([`Log::open`]): `reserve/`, `head/`; the own head from EVERY
-//!    stored own entry name ([`store::own_head_from_names`]) before and
-//!    regardless of decoding; `structural/` replay rebuilds the [`Fold`];
-//!    `epoch/` keys into [`Keys`]; `heads/` into the [`Register`]; `ledger/`
-//!    and `kept/`; `suspected/`.
+//! 1. **Open** ([`Log::open`]): `reserve/`, `head/`; the own head from the
+//!    own device's `ledger/` record ([`Log::stored_head`]: it lists every
+//!    stored own entry, decoding or not, and is one read); `structural/`
+//!    replay rebuilds the [`Fold`]; `epoch/` keys into [`Keys`]; `heads/`
+//!    into the [`Register`]; `ledger/` and `kept/`; `suspected/`.
 //! 2. **Own write** ([`Log::put`], [`Log::sign_members`], [`Log::sign_epoch`],
 //!    plan "Own put"): the seq is the next above the head, gated by
 //!    [`Reservation::sign_gate`] (the node waits for [`Step::Wait`] outside
@@ -60,9 +60,10 @@
 //!    changed are judged again from the store; an applied one now refused
 //!    leaves the register (the entries it superseded return) and is reported
 //!    as [`Change::Withdrawn`].
-//! 6. **Catch-up** ([`Log::held_prefix`], [`Log::missing`], [`Log::note_high`]):
-//!    a notice only raises `high`; what is wanted never shrinks except by
-//!    holding it.
+//! 6. **Catch-up** ([`Log::held_prefix`], [`Log::missing`], [`Log::high`]):
+//!    the holes below the highest seq held are wanted; a counter heard wants
+//!    nothing (unsigned), except this device's own within what it reserved;
+//!    what is wanted never shrinks except by holding it.
 //!
 //! The node validates with the judge and calls these; this module is the
 //! only writer of everything it keeps.
@@ -83,9 +84,9 @@ use crate::register::{EntryId, Item, Register};
 use crate::reserve::{Flusher, Gate, Reservation, Ticket};
 use crate::seal::{self, Keys};
 use crate::store::{
-    self, Link, Marker, Stage, epoch_prefix, heads_prefix, kept_prefix, ledger_prefix,
-    parse_epoch_key, parse_kept_key, parse_ledger_key, parse_structural_key, parse_suspected_key,
-    status_prefix, structural_prefix, suspected_prefix,
+    self, Corrupt, Link, Marker, Stage, epoch_prefix, heads_prefix, kept_prefix, ledger_key,
+    ledger_prefix, parse_epoch_key, parse_kept_key, parse_ledger_key, parse_structural_key,
+    parse_suspected_key, status_prefix, structural_prefix, suspected_prefix,
 };
 use crate::trust::Verified;
 use crate::wire::{
@@ -102,6 +103,7 @@ mod view;
 mod tests;
 
 use chain::{Dev, Kept, Status};
+pub(crate) use own::pack_ops;
 pub(crate) use view::Standing;
 use view::View;
 
@@ -194,8 +196,7 @@ pub(crate) enum Outcome {
     Waiting,
     /// Already held (another copy of the same signed bytes).
     Duplicate,
-    /// Evidence, not applied: a second packet at one name, or an entry of this
-    /// device's own name above what it reserved.
+    /// Evidence, not applied: a second packet at one name.
     Evidence,
     /// It verifies and does not decode: recorded, never fetched again.
     Unreadable,
@@ -393,6 +394,9 @@ pub(crate) struct Log {
     /// The durable `R` the previous run left (read before this run's
     /// extension): the highest seq an earlier run could have signed.
     floor_r: u64,
+    /// The highest counter heard of this device's own name: unsigned, so
+    /// believed only as far as `floor_r` ([`Self::high`]).
+    own_heard: u64,
     /// The entry the next own entry chains to: the newest own entry applied.
     own_tip: Option<Link>,
     devices: BTreeMap<Name, Dev>,
@@ -428,18 +432,12 @@ impl Log {
             })?
             .owner;
         let local = |why: String| HeapError::Local { reason: why };
-        let head = store::own_head_from_names(&*stage, &device, &space);
+        let head = Self::stored_head(&*stage, &space, &device)?;
         let floor_r = store::read_reserve(&*stage, &space)
             .map_err(|e| local(e.to_string()))?
             .map_or(0, |r| r.r);
-        let opened = Reservation::open(
-            raw,
-            flusher,
-            &space,
-            block,
-            head.as_ref().map_or(0, |h| h.seq),
-        )
-        .map_err(|e| local(e.to_string()))?;
+        let opened = Reservation::open(raw, flusher, &space, block, head)
+            .map_err(|e| local(e.to_string()))?;
         let key_digest = signer
             .public_key()
             .map(|k| public_key_digest(&k))
@@ -456,8 +454,9 @@ impl Log {
             register: Register::new(space.clone()),
             reservation: Arc::new(opened.reservation),
             next_seq: opened.resume.first_seq,
-            own_head: head.as_ref().map_or(0, |h| h.seq),
+            own_head: head,
             floor_r,
+            own_heard: 0,
             own_tip: None,
             devices: BTreeMap::new(),
             kept: BTreeMap::new(),
@@ -477,7 +476,7 @@ impl Log {
         log.restore_register()?;
         log.restore_cuts();
         log.restore_suspected();
-        log.restore_own_tip(head.map(|h| (h.seq, h.wire)));
+        log.restore_own_tip(head);
         Ok(log)
     }
 
@@ -540,6 +539,7 @@ impl Log {
                             seq,
                         },
                         body,
+                        &entry.after,
                     ),
                     _ => {}
                 }
@@ -604,32 +604,38 @@ impl Log {
         }
     }
 
-    /// The own tip: the newest own entry that is not rollback evidence.
-    fn restore_own_tip(&mut self, head: Option<(u64, Bytes)>) {
-        let Some((head_seq, head_wire)) = head else {
-            return;
-        };
-        let mut seq = head_seq;
-        loop {
-            let digest = match self.view().marker(&self.device, seq) {
-                Some(m) => Some(m.signed_digest),
-                None if seq == head_seq => Some(signed_digest(&head_wire)),
-                None => None,
-            };
-            let evidence = matches!(
-                self.view().status(&self.device, seq),
-                Some(Status::Refused(Refusal::AboveReservation { .. }))
-            );
-            if let (Some(digest), false) = (digest, evidence) {
-                self.own_tip = Some(Link { seq, digest });
-                return;
-            }
-            let held = self.devices.get(&self.device).map(|d| &d.held);
-            match held.and_then(|h| h.below(seq)) {
-                Some(lower) => seq = lower,
-                None => return,
-            }
+    /// The own tip: the newest own entry held.
+    fn restore_own_tip(&mut self, head: u64) {
+        if let Some(marker) = (head > 0)
+            .then(|| self.view().marker(&self.device, head))
+            .flatten()
+        {
+            self.own_tip = Some(Link {
+                seq: head,
+                digest: marker.signed_digest,
+            });
         }
+    }
+
+    /// The highest own seq the store holds in `space`, from the own
+    /// device's `ledger/` record, which lists every own entry stored (it is
+    /// written in the batch that stores the entry, whether the entry decodes
+    /// or not): one read, where listing the entries would read every own
+    /// entry and piece. A record that cannot be read is an error: a device
+    /// that cannot tell what it signed could sign a seq a peer saw again.
+    fn stored_head(store: &dyn DataStore, space: &Name, device: &Name) -> Result<u64, HeapError> {
+        let key = ledger_key(space, device);
+        let Some(record) = store.get(&key) else {
+            return Ok(0);
+        };
+        let dev = Dev::from_record(&record).ok_or_else(|| HeapError::Local {
+            reason: Corrupt {
+                key,
+                what: "ledger record",
+            }
+            .to_string(),
+        })?;
+        Ok(dev.high)
     }
 
     // -- Reads --------------------------------------------------------------------
@@ -866,30 +872,42 @@ impl Log {
             .is_some_and(|d| d.held.count() > d.nonvouching)
     }
 
-    /// The highest seq heard of `device` (a notice) or held.
+    /// Whether a device other than this one is vouched for: an admitted
+    /// entry of it is held. What the group's unsigned vector says of who is
+    /// there decides nothing.
+    pub(crate) fn has_peers(&self) -> bool {
+        self.devices
+            .keys()
+            .any(|device| *device != self.device && self.vouches(device))
+    }
+
+    /// The highest seq of `device` that is asked for without a probe: the
+    /// highest seq held of it, and for this device also the counter heard of
+    /// it as far as an earlier run could have signed (`R`, read at open). A
+    /// counter is unsigned, so it is believed no further; what lies above is
+    /// probed once, alone, and becomes a want only when the entry named
+    /// there is held and verified.
     pub(crate) fn high(&self, device: &Name) -> u64 {
-        self.devices.get(device).map_or(0, |d| d.high)
+        let held = self.devices.get(device).map_or(0, |d| d.high);
+        if *device == self.device {
+            held.max(self.own_heard.min(self.floor_r))
+        } else {
+            held
+        }
     }
 
-    /// Say a notice named `device` at `seen`. Raises what is wanted; never
-    /// lowers it, and raises no head: a counter is not an entry.
-    pub(crate) fn note_high(&mut self, device: &Name, seen: u64) {
-        let dev = self
-            .devices
-            .entry(device.clone())
-            .or_insert_with(|| Dev::new(Name::root()));
-        dev.high = dev.high.max(seen);
-    }
-
-    /// A counter heard of `device`. For this device's own name above what it
-    /// holds it is [`Alert::UnbackedCounter`]: the head stays where fetched,
-    /// verified entries put it (D17).
-    pub(crate) fn note_counter(&mut self, device: &Name, seen: u64) -> Effects {
-        self.note_high(device, seen);
+    /// A counter heard of this device's own name (peers hold entries this
+    /// device lost). Above what it holds it is [`Alert::UnbackedCounter`]:
+    /// the head stays where fetched, verified entries put it (D17).
+    pub(crate) fn note_own_counter(&mut self, seen: u64) -> Effects {
+        self.own_heard = self.own_heard.max(seen);
+        self.devices
+            .entry(self.device.clone())
+            .or_insert_with(|| Dev::new(self.person.clone()));
         let mut fx = Effects::default();
-        if *device == self.device && seen > self.own_head {
+        if seen > self.own_head {
             fx.alerts.push(Alert::UnbackedCounter {
-                device: device.clone(),
+                device: self.device.clone(),
                 seen,
             });
         }
@@ -904,13 +922,23 @@ impl Log {
             .map_or(0, |d| d.held.prefix_with(&d.voids))
     }
 
-    /// Everything wanted: the holes below each device's highest heard seq, and
-    /// the exact entries a removal cut names that are not held. The node
-    /// windows what it asks at a time.
+    /// Everything wanted: the holes below the highest seq held of each device
+    /// it walks ([`Self::high`]), and the exact entries a removal cut names
+    /// that are not held. A device is walked once an admitted entry of it is
+    /// held (it vouches), or when it is this device or a removed one: a
+    /// stranger's refused entry opens no walk below itself. A counter heard
+    /// wants nothing here; the fetch probes the entry it names
+    /// ([`Self::high`]). The node windows what it asks at a time.
     pub(crate) fn missing(&self) -> Vec<Want> {
         let mut out = Vec::new();
         for (device, dev) in &self.devices {
-            for (first, last) in dev.held.gaps(dev.high, &dev.voids) {
+            let walked = *device == self.device
+                || dev.held.count() > dev.nonvouching
+                || self.kept.contains_key(device);
+            if !walked {
+                continue;
+            }
+            for (first, last) in dev.held.gaps(self.high(device), &dev.voids) {
                 out.push(Want {
                     device: device.clone(),
                     first,

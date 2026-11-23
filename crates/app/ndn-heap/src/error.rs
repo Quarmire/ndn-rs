@@ -108,16 +108,15 @@ pub enum Refusal {
         /// The validator's verdict.
         why: String,
     },
-    /// It is under this device's own name at a seq above the last one this
-    /// device reserved: a copy of its key signed it.
-    AboveReservation {
-        /// The highest seq this device reserved.
-        reserved: u64,
-    },
     /// Its `PREV` link names other bytes than the entry held at that seq
     /// (its writer named an entry that does not exist, or its key signed
     /// two at one seq): it does not extend the chain this device holds.
     Chain,
+    /// The writer's entries are already held in as many separate runs, or
+    /// gap statements, as this device keeps for one device
+    /// (the log's cap on fragmentation), and this one would start
+    /// another. It is not stored.
+    Fragmented,
 }
 
 impl Refusal {
@@ -129,7 +128,7 @@ impl Refusal {
             | Refusal::NotMember
             | Refusal::Suspected { .. }
             | Refusal::Untrusted { .. }
-            | Refusal::AboveReservation { .. } => NextStep::AskOwner,
+            | Refusal::Fragmented => NextStep::AskOwner,
             Refusal::BadSignature | Refusal::Rollback => NextStep::RetryLater,
             Refusal::Unsealed | Refusal::Sealed | Refusal::Chain => NextStep::None,
         }
@@ -187,16 +186,16 @@ impl fmt::Display for Refusal {
                  certificate from an issuer still trusted: ask the owner of the namespace to \
                  certify the writer again",
             ),
-            Refusal::AboveReservation { reserved } => write!(
-                f,
-                "it is under this device's own name at a seq above the last one this device \
-                 reserved ({reserved}): a copy of this device's key signed it; mark the key \
-                 suspected and ask the owner to revoke it with a cut",
-            ),
             Refusal::Chain => f.write_str(
                 "its PREV link names other bytes than the entry held at that seq, so it does \
                  not extend the chain this device holds; nothing to do here, it never applies \
                  and nothing waits for it: its writer writes again over the state it holds",
+            ),
+            Refusal::Fragmented => f.write_str(
+                "its writer's entries are already held in as many separate runs (or gap \
+                 statements) as this device keeps for one device, and this one starts another; \
+                 it is not stored and is asked for again once the runs between are filled; if \
+                 the writer signs with gaps on purpose, ask the owner to remove it",
             ),
         }
     }
@@ -354,8 +353,8 @@ mod tests {
             Refusal::Untrusted {
                 why: "the issuer is revoked".into(),
             },
-            Refusal::AboveReservation { reserved: 41 },
             Refusal::Chain,
+            Refusal::Fragmented,
         ]
     }
 
@@ -370,8 +369,8 @@ mod tests {
             Refusal::Sealed => 6,
             Refusal::Suspected { .. } => 7,
             Refusal::Untrusted { .. } => 8,
-            Refusal::AboveReservation { .. } => 9,
             Refusal::Chain => 10,
+            Refusal::Fragmented => 12,
         }
     }
 
@@ -441,13 +440,10 @@ mod tests {
         let class = |r: Refusal| r.next();
         assert_eq!(class(Refusal::OutsideCut(cut())), NextStep::AskOwner);
         assert_eq!(class(Refusal::NotMember), NextStep::AskOwner);
-        assert_eq!(
-            class(Refusal::AboveReservation { reserved: 1 }),
-            NextStep::AskOwner
-        );
         assert_eq!(class(Refusal::BadSignature), NextStep::RetryLater);
         assert_eq!(class(Refusal::Rollback), NextStep::RetryLater);
         assert_eq!(class(Refusal::Chain), NextStep::None);
+        assert_eq!(class(Refusal::Fragmented), NextStep::AskOwner);
         assert_eq!(class(Refusal::Unsealed), NextStep::None);
         assert_eq!(class(Refusal::Sealed), NextStep::None);
 
@@ -568,8 +564,7 @@ mod tests {
                     Refusal::OutsideCut(_)
                     | Refusal::Lapsed { .. }
                     | Refusal::NotMember
-                    | Refusal::Suspected { .. }
-                    | Refusal::AboveReservation { .. } => Code::NotMember,
+                    | Refusal::Suspected { .. } => Code::NotMember,
                     Refusal::BadSignature | Refusal::Rollback => Code::RetryLater,
                     _ => Code::Refused,
                 },
@@ -648,11 +643,10 @@ mod tests {
                 Refusal::OutsideCut(_)
                 | Refusal::Lapsed { .. }
                 | Refusal::NotMember
-                | Refusal::Suspected { .. }
-                | Refusal::AboveReservation { .. } => {
+                | Refusal::Suspected { .. } => {
                     assert_eq!((code, next), (Code::NotMember, Next::AskOwner), "{why:?}");
                 }
-                Refusal::Untrusted { .. } => {
+                Refusal::Untrusted { .. } | Refusal::Fragmented => {
                     assert_eq!((code, next), (Code::Refused, Next::AskOwner), "{why:?}");
                 }
                 Refusal::Unsealed | Refusal::Sealed | Refusal::Chain => {

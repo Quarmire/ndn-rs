@@ -12,7 +12,7 @@ use ndn_app::{Connection, Node};
 use ndn_foundation_types::Name;
 use ndn_packet::NackReason;
 use ndn_packet::encode::DataBuilder;
-use ndn_sync::{StoreOp, SyncUpdate};
+use ndn_sync::SyncUpdate;
 
 use super::net_kit::*;
 use super::*;
@@ -165,6 +165,11 @@ async fn a_gap_in_the_notice_is_backfilled_in_a_window() {
     );
     assert_eq!(asked.len(), 100, "each entry once: {}", asked.len());
     assert_eq!(r.host.held_count(PHONE), 100, "every entry arrived");
+    assert_eq!(
+        r.host.st.lock().probed,
+        vec![(n(PHONE), 100)],
+        "only the entry the counter names is a probe; the holes below it are the log's wants"
+    );
     assert!(
         r.wire.peak() <= 32,
         "at most the window in flight: {}",
@@ -338,6 +343,157 @@ async fn a_notice_names_nothing_it_decides() {
     );
 }
 
+/// A Sync Interest is unsigned: a forged counter for a device the log
+/// vouches for names an entry and nothing else. It is asked for alone, a
+/// bounded number of times; what lies below it is not asked, nothing is
+/// wanted of the log, and the log is told nothing (M4).
+#[tokio::test(start_paused = true)]
+async fn a_forged_counter_for_a_vouched_device_costs_a_bounded_number_of_asks() {
+    let r = rig().await;
+    r.host.hold(PHONE, 2);
+    r.host.st.lock().vouched.insert(n(PHONE));
+    r.wire.script(|_| Reply::Silent);
+    r.group.on_update(notice(PHONE, 1_000_000));
+    pass(200).await;
+    let asked: Vec<u64> = r
+        .wire
+        .names()
+        .iter()
+        .filter_map(|name| direct(name).map(|(_, s)| s))
+        .collect();
+    assert!(
+        asked.iter().all(|s| *s == 1_000_000),
+        "only the entry the counter names is asked for, never what lies below it: {} asks, \
+         lowest {:?}",
+        asked.len(),
+        asked.iter().min()
+    );
+    assert!(asked.len() <= 40, "{} asks", asked.len());
+    assert!(
+        r.host.missing(&space()).is_empty(),
+        "an unsigned counter leaves nothing wanted, so the heap stays ready"
+    );
+    assert!(
+        r.host.st.lock().counters.is_empty(),
+        "the log is told nothing"
+    );
+}
+
+/// The counter of this device's own name is as unsigned: the entries within
+/// what it reserved are fetched back, and above that one probe at the
+/// counter and nothing between (M4).
+#[tokio::test(start_paused = true)]
+async fn a_forged_own_counter_asks_for_the_reserved_range_and_one_probe() {
+    let r = rig().await;
+    r.host.hold(LAPTOP, 10);
+    {
+        let mut st = r.host.st.lock();
+        st.head = 10;
+        st.reserved = 20;
+        st.vouched.insert(n(TABLET));
+        st.standing.insert(n(TABLET), true);
+    }
+    r.wire.script(|_| Reply::Nack(NackReason::NoRoute));
+    r.group.on_update(notice(TABLET, 1));
+    r.group.on_update(notice(LAPTOP, 1_000_000));
+    pass(200).await;
+    let own: Vec<u64> = r
+        .wire
+        .names()
+        .iter()
+        .filter_map(relayed)
+        .filter(|(_, d, _)| *d == n(LAPTOP))
+        .map(|(_, _, s)| s)
+        .collect();
+    assert!(
+        own.iter().all(|s| (11..=20).contains(s) || *s == 1_000_000),
+        "own entries are asked for within the reservation, and the counter once alone: {:?}",
+        own.iter().filter(|s| !(11..=20).contains(*s)).max()
+    );
+    assert!(own.contains(&1_000_000), "the counter itself is probed");
+    assert!(own.iter().filter(|s| **s == 1_000_000).count() <= 8);
+}
+
+/// A removed writer that serves other bytes at the seq its cut keeps does
+/// not end the ask: the bytes are not the cut's, so they are not even handed
+/// to the log, and the next ask goes to a relay (L2).
+#[tokio::test(start_paused = true)]
+async fn a_removed_writers_junk_at_its_cut_frontier_moves_the_ask_to_a_relay() {
+    let r = rig().await;
+    let good = genuine(PHONE, 5);
+    {
+        let mut st = r.host.st.lock();
+        st.exact
+            .push((n(PHONE), 5, crate::wire::signed_digest(&good)));
+        st.vouched.insert(n(TABLET));
+        st.standing.insert(n(TABLET), true);
+    }
+    let relayed_good = good.clone();
+    r.wire.script(move |name| {
+        if direct(name) == Some((n(PHONE), 5)) {
+            return Reply::Data(entry(PHONE, 5, b"g-other bytes"));
+        }
+        match relayed(name) {
+            Some((h, d, 5)) if h == n(TABLET) && d == n(PHONE) => {
+                Reply::Data(wrapped(name, relayed_good.clone()))
+            }
+            _ => Reply::Nack(NackReason::NoRoute),
+        }
+    });
+    r.group.on_update(notice(TABLET, 1));
+    pass(1).await;
+    r.group.nudge();
+    pass(30).await;
+    assert!(
+        r.host.holds(PHONE, 5),
+        "the cut's bytes came from the relay after the writer's junk"
+    );
+    assert_eq!(
+        r.host.st.lock().evidence,
+        0,
+        "the junk never reached the log"
+    );
+}
+
+/// An answer the log calls a duplicate while it still wants that very entry
+/// resolved nothing: it counts as a miss, so the next ask goes to another
+/// source (L2).
+#[tokio::test(start_paused = true)]
+async fn a_duplicate_of_what_is_still_wanted_counts_as_a_miss() {
+    let r = rig().await;
+    let good = genuine(PHONE, 5);
+    {
+        let mut st = r.host.st.lock();
+        st.exact
+            .push((n(PHONE), 5, crate::wire::signed_digest(&good)));
+        st.stuck.insert((n(PHONE), 5));
+        st.vouched.insert(n(TABLET));
+        st.standing.insert(n(TABLET), true);
+    }
+    r.wire.script(move |name| {
+        if direct(name) == Some((n(PHONE), 5)) {
+            return Reply::Data(genuine(PHONE, 5));
+        }
+        match relayed(name) {
+            Some((h, d, 5)) if h == n(TABLET) && d == n(PHONE) => {
+                Reply::Data(wrapped(name, genuine(PHONE, 5)))
+            }
+            _ => Reply::Nack(NackReason::NoRoute),
+        }
+    });
+    r.group.on_update(notice(TABLET, 1));
+    pass(1).await;
+    r.group.nudge();
+    pass(30).await;
+    assert!(
+        r.wire
+            .names()
+            .iter()
+            .any(|name| relayed(name) == Some((n(TABLET), n(PHONE), 5))),
+        "a duplicate of a wanted entry is a miss: the relay was asked"
+    );
+}
+
 /// A notice that is replayed, stale or lower never makes the reader stop
 /// asking for the newer entry it already heard of; what is wanted shrinks
 /// only by holding it.
@@ -427,7 +583,8 @@ async fn a_notice_naming_this_device_is_fetched_from_relays_never_from_itself() 
 }
 
 /// Own entries are fetched back at most four reservation blocks above the
-/// head: a counter far above (forged, or a long run) costs 4 × block asks.
+/// head, and the entry the counter names is probed first: once that is held,
+/// the holes below it cost 4 × block asks.
 #[tokio::test(start_paused = true)]
 async fn recovery_fetches_own_entries_at_most_four_blocks_above_the_head() {
     let cfg = NetConfig {
@@ -464,14 +621,21 @@ async fn recovery_fetches_own_entries_at_most_four_blocks_above_the_head() {
         .filter(|(d, _)| *d == n(LAPTOP))
         .map(|(_, s)| s)
         .collect();
-    assert_eq!(asked.len(), 400, "{} asks", asked.len());
+    let mut within_bound: Vec<u64> = asked.iter().copied().filter(|s| *s != 5010).collect();
+    within_bound.sort_unstable();
     assert_eq!(
-        asked.iter().max(),
-        Some(&410),
-        "no seq above head + 4 blocks"
+        asked.iter().filter(|s| **s == 5010).count(),
+        1,
+        "the counter's own entry is probed once, and held when it answers"
     );
-    assert_eq!(asked.iter().min(), Some(&11));
-    assert_eq!(r.host.held_count(LAPTOP), 410);
+    assert_eq!(within_bound.len(), 400, "{} asks", within_bound.len());
+    assert_eq!(
+        within_bound.last(),
+        Some(&410),
+        "once it is held, nothing above head + 4 blocks is asked"
+    );
+    assert_eq!(within_bound.first(), Some(&11));
+    assert_eq!(r.host.held_count(LAPTOP), 411);
 }
 
 /// A restart waits up to `settle` for the first group vector, then goes on
@@ -532,20 +696,57 @@ async fn a_value_in_pieces_is_assembled_and_handed_over_once() {
     r.group.on_update(notice(PHONE, 1));
     pass(10).await;
     let st = r.host.st.lock();
-    assert_eq!(st.assembled.len(), 1, "handed over once");
-    let (got, ops) = &st.assembled[0];
-    assert_eq!(got, &id);
-    let mut names: Vec<Name> = ops
-        .iter()
-        .map(|op| match op {
-            StoreOp::Insert(name, _) => name.clone(),
-            other => panic!("only inserts: {other:?}"),
-        })
-        .collect();
+    assert_eq!(st.assembled, vec![id], "recorded whole once");
+    let mut names: Vec<Name> = st.stored.keys().cloned().collect();
     names.sort();
     let mut expected: Vec<Name> = cut.packets.iter().map(|p| p.name.clone()).collect();
     expected.sort();
-    assert_eq!(names, expected, "every piece, in one batch");
+    assert_eq!(names, expected, "every piece was kept, by name");
+    assert!(
+        st.keeps >= 1 && st.keeps <= expected.len(),
+        "a round of proved pieces is one batch, not one write per piece: {} batches",
+        st.keeps
+    );
+}
+
+/// A space may owe many values in pieces, each up to 64 MiB: only
+/// `ASSEMBLIES_MAX` are gathered at once on the node, and every one is
+/// gathered in its turn.
+#[tokio::test(start_paused = true)]
+async fn only_a_few_values_are_gathered_at_once_and_every_one_in_turn() {
+    let r = rig().await;
+    r.wire.delay(Duration::from_millis(200));
+    let mut owed = Vec::new();
+    let mut packets = Vec::new();
+    for seq in 1..=12u64 {
+        let entry_name = log_name(&n(PHONE), &space(), seq);
+        let cut = pieces::split(&entry_name, &vec![seq as u8; 1000]).unwrap();
+        owed.push(Blob {
+            id: EntryId {
+                device: n(PHONE),
+                seq,
+                digest: [seq as u8; 32],
+            },
+            size: cut.size,
+            root: cut.root,
+        });
+        packets.extend(cut.packets);
+    }
+    r.host.st.lock().blobs_owed = owed;
+    r.wire
+        .script(move |name| match packets.iter().find(|p| p.name == *name) {
+            Some(p) => Reply::Data(p.wire.clone()),
+            None => Reply::Nack(NackReason::NoRoute),
+        });
+    r.group.on_update(notice(PHONE, 1));
+    pass(20).await;
+    let st = r.host.st.lock();
+    assert_eq!(st.assembled.len(), 12, "every value is gathered in turn");
+    assert!(
+        r.wire.peak() <= 4,
+        "{} pieces were asked at once for 12 values of one piece each: at most 4 values gather at once",
+        r.wire.peak()
+    );
 }
 
 /// A copy of a piece that is not the one its parent lists is never taken;
@@ -598,18 +799,11 @@ async fn a_bad_piece_is_never_taken_and_another_holder_is_asked() {
     r.group.on_update(notice(PHONE, 1));
     pass(60).await;
     let st = r.host.st.lock();
-    assert_eq!(st.assembled.len(), 1, "assembled from the second holder");
-    let stored: Bytes = st.assembled[0]
-        .1
-        .iter()
-        .find_map(|op| match op {
-            StoreOp::Insert(name, wire) if *name == cut.packets[1].name => Some(wire.clone()),
-            _ => None,
-        })
-        .expect("the piece is in the batch");
+    assert_eq!(st.assembled, vec![id], "assembled from the second holder");
     assert_eq!(
-        stored, cut.packets[1].wire,
-        "the genuine copy, not the bad one"
+        st.stored.get(&cut.packets[1].name),
+        Some(&cut.packets[1].wire),
+        "the genuine copy is kept, not the bad one"
     );
 }
 

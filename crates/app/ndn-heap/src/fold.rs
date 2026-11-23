@@ -114,6 +114,20 @@ impl Facts {
     }
 }
 
+/// One Epoch entry: its body and the epochs it declared replaced.
+#[derive(Debug)]
+struct Epoch {
+    body: EpochBody,
+    /// Sorted, without duplicates.
+    replaces: Vec<EpochId>,
+}
+
+impl Epoch {
+    fn rank(&self) -> (&[u8; 32], &[Name], &[EpochId]) {
+        (&self.body.key_check, &self.body.audience, &self.replaces)
+    }
+}
+
 /// A space's membership, folded from its Members and Epoch entries.
 #[derive(Debug)]
 pub struct Fold {
@@ -121,7 +135,7 @@ pub struct Fold {
     /// Every Members entry applied, so one can be withdrawn.
     carriers: BTreeMap<EntryRef, MembersBody>,
     facts: Facts,
-    epochs: BTreeMap<EpochId, EpochBody>,
+    epochs: BTreeMap<EpochId, Epoch>,
 }
 
 impl Fold {
@@ -152,17 +166,31 @@ impl Fold {
         self.carriers.insert(carrier.clone(), body.clone());
     }
 
-    /// Takes in the Epoch entry that made `id`. Idempotent and commutative:
-    /// an owner device that signed two bodies for one id (equivocation, which
-    /// the log reports) leaves the least of them by `(key_check, audience)`.
-    pub fn apply_epoch(&mut self, id: EpochId, body: &EpochBody) {
+    /// Takes in the Epoch entry that made `id`; its `after` names the epochs
+    /// it replaces. Idempotent and commutative: an owner device that signed
+    /// two bodies for one id (equivocation, which the log reports) leaves the
+    /// least of them by `(key_check, audience, replaces)`.
+    pub fn apply_epoch(&mut self, id: EpochId, body: &EpochBody, after: &[EntryRef]) {
+        let mut replaces: Vec<EpochId> = after
+            .iter()
+            .map(|r| EpochId {
+                creator: r.device.clone(),
+                seq: r.seq,
+            })
+            .collect();
+        replaces.sort();
+        replaces.dedup();
+        let new = Epoch {
+            body: body.clone(),
+            replaces,
+        };
         match self.epochs.get_mut(&id) {
             None => {
-                self.epochs.insert(id, body.clone());
+                self.epochs.insert(id, new);
             }
             Some(held) => {
-                if (&body.key_check, &body.audience) < (&held.key_check, &held.audience) {
-                    *held = body.clone();
+                if new.rank() < held.rank() {
+                    *held = new;
                 }
             }
         }
@@ -239,19 +267,6 @@ impl Fold {
         set
     }
 
-    /// Every person the fold lists as a writer or a reader, the owner first
-    /// and the rest sorted.
-    pub fn persons(&self) -> Vec<Name> {
-        let rest = self
-            .facts
-            .adds
-            .iter()
-            .filter(|(id, a)| self.stands(id, a))
-            .map(|(_, a)| a.who.clone())
-            .collect();
-        self.owner_first(rest)
-    }
-
     /// Whether `person` may write.
     pub fn is_writer(&self, person: &Name) -> bool {
         *person == self.owner || self.standing(Role::Writer).any(|a| a.who == *person)
@@ -302,10 +317,10 @@ impl Fold {
             .collect()
     }
 
-    /// The ids of the Adds naming `person` that still stand, in either role:
-    /// what a removal of the person names. Sorted by id; never any for the
-    /// owner (a Remove of an Add naming the owner is ignored).
-    pub fn standing_ids(&self, person: &Name) -> Vec<[u8; 16]> {
+    /// The Adds naming `person` that still stand, in either role, as (id,
+    /// role): what a removal of the person names. Sorted by id; never any for
+    /// the owner (a Remove of an Add naming the owner is ignored).
+    pub fn standing_adds(&self, person: &Name) -> Vec<([u8; 16], Role)> {
         if *person == self.owner {
             return Vec::new();
         }
@@ -313,7 +328,7 @@ impl Fold {
             .adds
             .iter()
             .filter(|(id, a)| a.who == *person && self.stands(id, a))
-            .map(|(id, _)| *id)
+            .map(|(id, a)| (*id, a.role))
             .collect()
     }
 
@@ -324,19 +339,15 @@ impl Fold {
 
     /// The held Epoch body for `id`.
     pub fn epoch_body(&self, id: &EpochId) -> Option<&EpochBody> {
-        self.epochs.get(id)
+        self.epochs.get(id).map(|e| &e.body)
     }
 
-    /// Who is to hold epoch `e`'s key: its audience and the standing readers
-    /// admitted to its history. A reader removed since is not in it; a person
-    /// the epoch names who is no longer a reader still is, which is what keeps
-    /// the epoch out of force.
+    /// Who is to be given epoch `e`'s key now: its audience and the standing
+    /// readers admitted to its history. A reader removed since is not in it
+    /// (grants are forward only); a person the epoch names who is no longer a
+    /// reader still is. Grant condition 2 reads this set.
     pub fn audience(&self, e: &EpochId) -> BTreeSet<Name> {
-        let mut set: BTreeSet<Name> = self
-            .epochs
-            .get(e)
-            .map(|b| b.audience.iter().cloned().collect())
-            .unwrap_or_default();
+        let mut set = self.named(e);
         set.extend(
             self.standing(Role::Reader)
                 .filter(|a| a.epoch.as_ref() == Some(e))
@@ -345,18 +356,53 @@ impl Fold {
         set
     }
 
-    /// The epoch writers seal in: the greatest `(creator, seq)` whose audience
-    /// is within the readers. `None` if there is none or the space is public.
+    /// Who holds, or ever was admitted to hold, epoch `e`'s key: its audience
+    /// and every reader any Add ever named to it, removed or not. A removal
+    /// takes a person out of [`Fold::audience`] but not out of what that
+    /// person already holds, so this set decides whether the epoch may stay in
+    /// force.
+    pub fn holders(&self, e: &EpochId) -> BTreeSet<Name> {
+        let mut set = self.named(e);
+        set.extend(
+            self.facts
+                .adds
+                .values()
+                .filter(|a| a.role == Role::Reader && a.epoch.as_ref() == Some(e))
+                .map(|a| a.who.clone()),
+        );
+        set
+    }
+
+    /// The persons the Epoch entry itself names.
+    fn named(&self, e: &EpochId) -> BTreeSet<Name> {
+        self.epochs
+            .get(e)
+            .map(|b| b.body.audience.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The epochs no held Epoch entry replaces, ascending.
+    pub fn epoch_tips(&self) -> Vec<EpochId> {
+        let replaced: BTreeSet<&EpochId> = self.epochs.values().flat_map(|e| &e.replaces).collect();
+        self.epochs
+            .keys()
+            .filter(|e| !replaced.contains(e))
+            .cloned()
+            .collect()
+    }
+
+    /// The epoch writers seal in: the greatest `(creator, seq)` that no held
+    /// Epoch entry replaces and whose holders are all readers. `None` if there
+    /// is none or the space is public.
     pub fn in_force(&self) -> Option<EpochId> {
         if self.anyone() {
             return None;
         }
         let readers = self.reader_set();
-        self.epochs
-            .keys()
+        self.epoch_tips()
+            .into_iter()
             .rev()
-            .find(|e| self.audience(e).is_subset(&readers))
-            .cloned()
+            .find(|e| self.holders(e).is_subset(&readers))
     }
 
     /// Whether the epoch in force is for exactly the readers. When it is not,
@@ -367,7 +413,7 @@ impl Fold {
             return true;
         }
         self.in_force()
-            .is_some_and(|e| self.audience(&e) == self.reader_set())
+            .is_some_and(|e| self.holders(&e) == self.reader_set())
     }
 }
 

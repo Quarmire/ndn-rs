@@ -1,33 +1,38 @@
 //! Direct fetch of the entry a notice names, catch-up, pieces, and the
 //! reader's half of the grant pull (spec §7).
 //!
-//! **Level-triggered.** A notice only raises what the log says it wants
-//! ([`Host::note_counter`]); this half asks for whatever [`Host::missing`]
-//! lists and stops asking only when the log holds it. A replayed, stale or
-//! lower notice therefore never ends an ask, and a device that comes back
-//! asks only for what changed.
+//! **Level-triggered.** This half asks for whatever [`Host::missing`] lists
+//! and stops asking only when the log holds it. A replayed, stale or lower
+//! notice therefore never ends an ask, and a device that comes back asks only
+//! for what changed.
 //!
-//! **The hot path.** The entry a notice names is `<D>/32=log/<S>/seq=<high>`:
-//! it is asked for directly, first and alone while nothing at or above it is
-//! held (its own gap statement may declare everything below it absent), and
-//! only then is the rest asked for in a window ([`NetConfig::window`]), in
-//! seq order, minus what a gap statement declared void. A device nothing
-//! vouches for yet (no admitted entry of it is held) costs one ask at the
-//! counter it named, at most [`FETCH_TRIES`] times: a name a Sync Interest
-//! carried is walked toward itself and no further, and the log is told of its
-//! counter only once an entry of it has been admitted.
+//! **A notice is a probe, not a want.** The counters of a Sync Interest are
+//! unsigned: they raise nothing the log wants. The entry a counter names,
+//! `<D>/32=log/<S>/seq=<high>`, is asked for directly and alone while the log
+//! holds nothing at or above it (and, for this device, asks nothing up to it
+//! within its reservation): its own gap statement may declare everything
+//! below it absent, and only once it is held and verified are the holes below
+//! it wanted, asked for in a window ([`NetConfig::window`]), in seq order,
+//! minus what a gap statement declared void. A counter nothing signs
+//! therefore costs [`FETCH_TRIES`] asks and then one ask a minute
+//! ([`probe_pause`]), and wants nothing of the log.
 //!
 //! **Sources.** The writer first, then the heard members vouched for
 //! ([`Heard::relays`]) through `<H>/32=held/<name>`, one after another as the
 //! asks miss. A miss decides nothing: the ask is made again after a capped
 //! backoff ([`retry_pause`]) for as long as the log wants the entry, which is
-//! how a forged copy, a lost packet and a silent writer all end.
+//! how a forged copy, a lost packet and a silent writer all end. An answer
+//! that resolved nothing (a packet the log already knew while it still wants
+//! the entry, evidence, or for an entry a removal cut names, other bytes than
+//! the cut's) is a miss too.
 //!
-//! **Own entries.** A counter naming this device above its own head is
-//! fetched back the same way, from heard members only (never from itself) and
-//! at most four reservation blocks above the head.
+//! **Own entries.** The entries this device lost are fetched back the same
+//! way, from heard members only (never from itself): those within what it
+//! reserved as its own counter names them, and above that the one entry the
+//! counter names, probed; once that is held, the holes below it, at most four
+//! reservation blocks above the head.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,10 +47,12 @@ use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
 use crate::log::{Blob, Outcome};
-use crate::pieces::{Assembler, Offered};
+use crate::pieces::{self, Assembler, Offered};
 use crate::rt::{self, Instant};
 use crate::sync::{Group, TIMELINE, Taken};
-use crate::wire::{ChunksBody, EpochId, GrantAsk, grant_name, held_name, log_name, seal_key_name};
+use crate::wire::{
+    ChunksBody, EpochId, GrantAsk, grant_name, held_name, log_name, seal_key_name, signed_digest,
+};
 
 /// The pause before asking again for something after `misses` asks for it
 /// missed in a row: this long, doubled each time, at most [`REFRESH_PAUSE_MAX`].
@@ -63,9 +70,22 @@ const REFRESH_TRIES: u32 = 16;
 const REFRESH_IDLE: Duration = Duration::from_secs(64);
 
 /// The most asks one thing is asked for in a row where asking again is
-/// optional (a name nothing vouches for, a seal key learned in the
-/// background): each of at most `1 + REEXPRESS_MAX` Interests.
+/// optional (a seal key learned in the background, the first asks of an
+/// entry a counter names): each of at most `1 + REEXPRESS_MAX` Interests.
 pub(crate) const FETCH_TRIES: u32 = 3;
+
+/// The pause before an entry that only an unsigned counter names is asked for
+/// again: [`retry_pause`] for the first [`FETCH_TRIES`] misses, then
+/// [`REFRESH_IDLE`]. The counter decides nothing, so the probe is never given
+/// up (an honest writer away for a while still comes, after a minute at the
+/// latest), and costs a forger one ask a minute.
+fn probe_pause(misses: u32) -> Duration {
+    if misses >= FETCH_TRIES {
+        REFRESH_IDLE
+    } else {
+        retry_pause(misses)
+    }
+}
 
 /// The most times an Interest is expressed again under a fresh nonce within
 /// its lifetime when nothing answers it.
@@ -158,11 +178,27 @@ pub(crate) enum Miss {
     Gone,
 }
 
+/// The most values whose pieces the node gathers at once.
+pub(crate) const ASSEMBLIES_MAX: usize = 4;
+
+/// How a turn of an assembly ended.
+enum Gathered {
+    /// Every piece is held and the value is recorded whole.
+    Whole,
+    /// The value cannot be gathered (a size no entry may declare), or the
+    /// group stopped: no turn comes again.
+    Refused,
+    /// A round brought nothing, or nobody is known to ask; whether any
+    /// piece was proved in the turn.
+    Stuck { progressed: bool },
+}
+
 /// The node's Interests: its slots, its round-trip estimate, its face.
 pub(crate) struct Fetcher {
     conn: Arc<dyn Connection>,
     lifetime: Duration,
     slots: Semaphore,
+    assemblies: Semaphore,
     rtt: Mutex<Rtt>,
 }
 
@@ -174,6 +210,7 @@ impl Fetcher {
             conn,
             lifetime,
             slots: Semaphore::new(in_flight.max(1)),
+            assemblies: Semaphore::new(ASSEMBLIES_MAX),
             rtt: Mutex::new(Rtt::default()),
         }
     }
@@ -194,6 +231,17 @@ impl Fetcher {
                 Err(Miss::Again)
             }
         }
+    }
+
+    /// A turn at gathering the pieces of one value: at most
+    /// [`ASSEMBLIES_MAX`] are held at once on the node, so what is in
+    /// flight for pieces never grows with the values owed. Waits for as long
+    /// as it takes: a value waiting has nothing in memory.
+    async fn assembly_turn(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.assemblies
+            .acquire()
+            .await
+            .expect("the assembly semaphore is never closed")
     }
 
     /// One ask within one Interest lifetime: an Interest nothing answered
@@ -288,14 +336,12 @@ pub(crate) enum Source {
     Relay(Name),
 }
 
-/// What a notice made of a device: the counter it named, how far the log was
-/// told, and how far an ask of a device nothing vouches for has been
-/// answered.
+/// What a notice made of a device: the counter it named. Unsigned: it wants
+/// nothing of the log, and the entry it names is probed while the log holds
+/// nothing at or above it.
 #[derive(Default)]
 pub(crate) struct Noticed {
     pub(crate) high: u64,
-    told: u64,
-    probed: u64,
 }
 
 impl Noticed {
@@ -332,19 +378,10 @@ impl Asks {
 
     /// Whether `key` is to be asked for now, and after how many misses; when
     /// it pauses, `next` is lowered to the time to look again.
-    fn due(
-        &self,
-        key: &(Name, u64),
-        now: Instant,
-        tries: Option<u32>,
-        next: &mut Option<Duration>,
-    ) -> Option<u32> {
+    fn due(&self, key: &(Name, u64), now: Instant, next: &mut Option<Duration>) -> Option<u32> {
         let Some(ask) = self.by.get(key) else {
             return Some(0);
         };
-        if tries.is_some_and(|t| ask.misses >= t) {
-            return None;
-        }
         match ask.phase {
             Phase::Flying => None,
             Phase::Pause(until) if until <= now => Some(ask.misses),
@@ -377,8 +414,12 @@ struct Launch {
     device: Name,
     seq: u64,
     misses: u32,
-    /// An ask of a device nothing vouches for, at the counter it named.
+    /// An ask of the entry a counter named that the log neither holds nor
+    /// asks for: paced after [`FETCH_TRIES`] misses, never given up.
     probe: bool,
+    /// The signed digest the bytes must have (a removal cut names its
+    /// entries by it): other bytes are not handed to the log.
+    digest: Option<[u8; 32]>,
 }
 
 /// What a restarting device's wait for its own entries came to.
@@ -448,8 +489,9 @@ impl Group {
     }
 
     /// Plan the asks of one pass and make them; when to look again if an ask
-    /// is pausing. Tells the log the counters of the devices it vouches for,
-    /// asks what it wants, lists the pieces and epoch keys owed.
+    /// is pausing. Asks what the log wants, probes the entry each counter
+    /// names that the log neither holds nor asks for, lists the pieces and
+    /// epoch keys owed.
     pub(crate) fn pump(self: &Arc<Self>) -> Option<Duration> {
         let host = &self.shared.host;
         let space = &self.space;
@@ -457,30 +499,25 @@ impl Group {
         let window = self.shared.cfg.window.max(1);
         let now = Instant::now();
 
-        // The counters a notice named: the log hears them of devices it
-        // vouches for; the rest are asked for at the counter alone.
-        let mut probes: Vec<(Name, u64)> = Vec::new();
-        {
-            let mut noticed = self.noticed.lock();
-            for (device, notice) in noticed.iter_mut() {
-                if host.vouched(space, device) {
-                    if notice.told < notice.high {
-                        host.note_counter(space, device, notice.high);
-                        notice.told = notice.high;
-                    }
-                } else if notice.probed < notice.high {
-                    probes.push((device.clone(), notice.high));
-                }
-            }
-        }
+        // What a notice named is unsigned: it wants nothing of the log. The
+        // entry it names, when the log holds nothing at or above it and asks
+        // for nothing up to it, is asked for alone; once it is held and
+        // verified, the holes below it are the log's to want.
+        let probes: Vec<(Name, u64)> = self
+            .noticed
+            .lock()
+            .iter()
+            .filter(|(device, notice)| notice.high > host.high(space, device))
+            .map(|(device, notice)| (device.clone(), notice.high))
+            .collect();
 
         let mut per: BTreeMap<Name, Vec<(u64, u64)>> = BTreeMap::new();
-        let mut exact: BTreeSet<(Name, u64)> = BTreeSet::new();
+        let mut exact: BTreeMap<(Name, u64), [u8; 32]> = BTreeMap::new();
         let wants = host.missing(space);
         for want in &wants {
             match want.digest {
-                Some(_) => {
-                    exact.insert((want.device.clone(), want.first));
+                Some(digest) => {
+                    exact.insert((want.device.clone(), want.first), digest);
                 }
                 None => per
                     .entry(want.device.clone())
@@ -501,65 +538,52 @@ impl Group {
             asks.by.retain(|(d, s), a| {
                 matches!(a.phase, Phase::Flying)
                     || per.get(d).is_some_and(|rs| within(rs, *s))
-                    || exact.contains(&(d.clone(), *s))
+                    || exact.contains_key(&(d.clone(), *s))
                     || probes.iter().any(|(pd, ph)| pd == d && ph == s)
             });
             for (device, ranges) in &per {
                 let mut budget = window.saturating_sub(asks.flying(device));
-                let high = host.high(space, device);
-                // The entry at `high` is asked first and alone while it is not
-                // held: its own gap statement may declare the seqs below it
-                // absent. Holes below a held entry are real. Not for this
-                // device's own name: the counter heard there may be its own
-                // announcement echoed back (above what was ever signed), so
-                // its own entries are asked for from the head up.
-                let (top, lower) = match ranges.last() {
-                    Some(&(_, last)) if last == high && *device != me => {
-                        (Some(last), &ranges[..ranges.len() - 1])
-                    }
-                    _ => (None, &ranges[..]),
-                };
-                let seqs = top
-                    .into_iter()
-                    .chain(lower.iter().flat_map(|&(a, b)| a..=b));
-                for seq in seqs {
+                for seq in ranges.iter().flat_map(|&(a, b)| a..=b) {
                     if budget == 0 {
                         break;
                     }
                     let key = (device.clone(), seq);
-                    if let Some(misses) = asks.due(&key, now, None, &mut next) {
+                    if let Some(misses) = asks.due(&key, now, &mut next) {
                         asks.launch(key, misses);
                         launches.push(Launch {
                             device: device.clone(),
                             seq,
                             misses,
                             probe: false,
+                            digest: None,
                         });
                         budget -= 1;
                     }
                 }
             }
-            for (device, seq) in &exact {
+            for ((device, seq), digest) in &exact {
                 let key = (device.clone(), *seq);
-                if let Some(misses) = asks.due(&key, now, None, &mut next) {
+                if let Some(misses) = asks.due(&key, now, &mut next) {
                     asks.launch(key, misses);
                     launches.push(Launch {
                         device: device.clone(),
                         seq: *seq,
                         misses,
                         probe: false,
+                        digest: Some(*digest),
                     });
                 }
             }
             for (device, seq) in &probes {
                 let key = (device.clone(), *seq);
-                if let Some(misses) = asks.due(&key, now, Some(FETCH_TRIES), &mut next) {
+                if let Some(misses) = asks.due(&key, now, &mut next) {
                     asks.launch(key, misses);
                     launches.push(Launch {
                         device: device.clone(),
                         seq: *seq,
                         misses,
                         probe: true,
+                        digest: None,
                     });
                 }
             }
@@ -601,10 +625,20 @@ impl Group {
                 // store next.
                 Ok(_) if self.stop.is_stopped() => None,
                 Ok(wire) => {
-                    tracing::trace!(target: TIMELINE, %name, "verify_begin");
-                    let taken = host.take(&self.space, wire).await;
-                    tracing::trace!(target: TIMELINE, %name, "verify_end");
-                    Some(taken)
+                    // A cut names its bytes: others are not handed to the
+                    // log, and the next source is asked.
+                    if launch
+                        .digest
+                        .is_some_and(|want| signed_digest(&wire) != want)
+                    {
+                        tracing::debug!(%name, "not the bytes the cut keeps: the next source is asked");
+                        None
+                    } else {
+                        tracing::trace!(target: TIMELINE, %name, "verify_begin");
+                        let taken = host.take(&self.space, wire, launch.probe).await;
+                        tracing::trace!(target: TIMELINE, %name, "verify_end");
+                        Some(taken)
+                    }
                 }
                 Err(_) => None,
             },
@@ -612,10 +646,18 @@ impl Group {
         let mut resolved = false;
         match taken {
             Some(Taken::Decided { outcome, blobs }) => {
-                if let Outcome::Refused(why) = &outcome {
-                    tracing::debug!(%name, "refused: {why}");
-                } else {
-                    resolved = true;
+                match &outcome {
+                    Outcome::Refused(why) => tracing::debug!(%name, "refused: {why}"),
+                    // Held now: the next pass sees what is still wanted.
+                    Outcome::Applied | Outcome::Closed | Outcome::Waiting | Outcome::Unreadable => {
+                        resolved = true
+                    }
+                    // Not newly held: if the log still wants this entry, this
+                    // answer resolved nothing, and the next ask goes to
+                    // another source.
+                    Outcome::Duplicate | Outcome::Evidence => {
+                        tracing::debug!(%name, "already held, or kept as evidence: {outcome:?}");
+                    }
                 }
                 if !blobs.is_empty() {
                     self.assemble(blobs);
@@ -639,14 +681,13 @@ impl Group {
                 ask.phase = Phase::Pause(now + REFRESH_PAUSE);
             } else {
                 ask.misses = launch.misses + 1;
-                ask.phase = Phase::Pause(now + retry_pause(launch.misses));
+                let pause = if launch.probe {
+                    probe_pause(launch.misses)
+                } else {
+                    retry_pause(launch.misses)
+                };
+                ask.phase = Phase::Pause(now + pause);
             }
-        }
-        if resolved
-            && launch.probe
-            && let Some(notice) = self.noticed.lock().get_mut(&launch.device)
-        {
-            notice.probed = notice.probed.max(launch.seq);
         }
         self.progress.notify_waiters();
         self.wake.notify_one();
@@ -655,7 +696,9 @@ impl Group {
     // -- Pieces ---------------------------------------------------------------------------------
 
     /// Fetch the pieces of the entries `blobs` name, one task each, unless one
-    /// is under way for them already.
+    /// is under way for them already. At most [`ASSEMBLIES_MAX`] values
+    /// gather at once on the node (a value is up to 64 MiB, a space may owe
+    /// thousands): the others wait for a turn.
     pub(crate) fn assemble(self: &Arc<Self>, blobs: Vec<Blob>) {
         for blob in blobs {
             if self.assembling.lock().insert(blob.id.clone()) {
@@ -665,71 +708,106 @@ impl Group {
     }
 
     /// Gather every piece of one value, each proved by the digest its parent
-    /// lists, from the writer and then the heard members, and hand them to
-    /// the node once, whole. Asked again while the node lists the value as
-    /// owed.
+    /// lists, from the writer and then the heard members, storing the pieces
+    /// as they are proved and the value whole when the last is held. A turn
+    /// ends when the value is whole or a round brought nothing: the next turn
+    /// is waited for after a pause, so a value whose holders are away never
+    /// keeps the others from theirs. Asked again while the node lists the
+    /// value as owed.
     async fn assemble_one(self: Arc<Self>, blob: Blob) {
         let host = &self.shared.host;
-        let entry = log_name(&blob.id.device, &self.space, blob.id.seq);
-        let assembler = Assembler::new(
-            entry.clone(),
-            ChunksBody {
-                size: blob.size,
-                root: blob.root,
-            },
-        );
-        let mut assembler = match assembler {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(%entry, "pieces not fetched: {e}");
-                self.assembling.lock().remove(&blob.id);
-                return;
-            }
-        };
-        let mut misses = 0u32;
+        // Turns taken (each is asked of the next source) and turns in a row
+        // that proved nothing (the pause grows with them).
+        let (mut turns, mut idle) = (0u32, 0u32);
         loop {
             if self.stop.is_stopped() {
                 break;
             }
-            if let Some((payload, ops)) = assembler.payload().zip(assembler.take_ops()) {
-                host.assembled(&self.space, &blob, ops, payload);
-                break;
-            }
-            let wanted = assembler.next_wanted(self.shared.cfg.window.max(1));
-            if wanted.is_empty() {
-                break;
-            }
-            let sources = self.sources(&blob.id.device);
-            let Some(source) = sources.get(misses as usize % sources.len().max(1)) else {
-                rt::sleep(retry_pause(misses)).await;
-                misses += 1;
-                continue;
-            };
-            let arrived = join_all(
-                wanted
-                    .iter()
-                    .map(|piece| self.fetch_original(source, piece)),
-            )
-            .await;
-            let mut progress = false;
-            for got in arrived.into_iter().flatten() {
-                match assembler.offer(got) {
-                    Ok(Offered::Accepted) => progress = true,
-                    Ok(Offered::Duplicate | Offered::NotYet) => {}
-                    Err(e) => tracing::debug!(%entry, "a copy of a piece was not taken: {e}"),
+            let turn = self.shared.fetcher.assembly_turn().await;
+            let gathered = self.gather(&blob, turns).await;
+            drop(turn);
+            match gathered {
+                Gathered::Whole | Gathered::Refused => break,
+                Gathered::Stuck { progressed } => {
+                    turns += 1;
+                    idle = if progressed { 0 } else { idle + 1 };
                 }
             }
-            if progress {
-                misses = 0;
-                continue;
-            }
-            rt::sleep(retry_pause(misses)).await;
-            misses += 1;
+            rt::sleep(retry_pause(idle)).await;
             if !host.blobs(&self.space).iter().any(|b| b.id == blob.id) {
                 break;
             }
         }
         self.assembling.lock().remove(&blob.id);
+    }
+
+    /// One turn of an assembly: ask for the pieces the plan names, in
+    /// rounds, keeping each round's proved pieces in one batch. A piece the
+    /// store holds already (an assembly an earlier run began) counts once it
+    /// proves; nothing but the plan is held here.
+    async fn gather(&self, blob: &Blob, turns: u32) -> Gathered {
+        let host = &self.shared.host;
+        let entry = log_name(&blob.id.device, &self.space, blob.id.seq);
+        let mut assembler = match Assembler::new(
+            entry.clone(),
+            ChunksBody {
+                size: blob.size,
+                root: blob.root,
+            },
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(%entry, "pieces not fetched: {e}");
+                return Gathered::Refused;
+            }
+        };
+        let mut progressed = false;
+        loop {
+            if self.stop.is_stopped() {
+                return Gathered::Refused;
+            }
+            if assembler.is_complete() {
+                host.assembled(&self.space, blob);
+                return Gathered::Whole;
+            }
+            let (mut held, mut absent) = (false, Vec::new());
+            for piece in assembler.next_wanted(self.shared.cfg.window.max(1)) {
+                match host
+                    .held_piece(&self.space, &piece)
+                    .map(|wire| assembler.offer(wire))
+                {
+                    Some(Ok(Offered::Accepted)) => held = true,
+                    _ => absent.push(piece),
+                }
+            }
+            if held {
+                progressed = true;
+                continue;
+            }
+            let sources = self.sources(&blob.id.device);
+            let Some(source) = sources.get(turns as usize % sources.len().max(1)) else {
+                return Gathered::Stuck { progressed };
+            };
+            let arrived = join_all(
+                absent
+                    .iter()
+                    .map(|piece| self.fetch_original(source, piece)),
+            )
+            .await;
+            let mut keep = Vec::new();
+            for got in arrived.into_iter().flatten() {
+                match assembler.offer(got.clone()) {
+                    Ok(Offered::Accepted) => keep.extend(pieces::keep_op(got)),
+                    Ok(Offered::Duplicate | Offered::NotYet) => {}
+                    Err(e) => tracing::debug!(%entry, "a copy of a piece was not taken: {e}"),
+                }
+            }
+            if keep.is_empty() {
+                return Gathered::Stuck { progressed };
+            }
+            progressed = true;
+            host.keep_pieces(&self.space, keep);
+        }
     }
 
     // -- The grant pull, reader side ------------------------------------------------------------
@@ -835,17 +913,31 @@ impl Group {
         }
     }
 
-    /// Where the own entries stand: none wanted, some wanted that can still
-    /// be asked for, or every one asked for in vain.
+    /// The counter a notice named of `device`, when it is above everything
+    /// the log asks for without proof ([`Host::high`]): the one entry that is
+    /// probed alone, until it is held.
+    fn unconfirmed(&self, device: &Name) -> Option<u64> {
+        let named = self.noticed.lock().get(device).map_or(0, |n| n.high);
+        (named > self.shared.host.high(&self.space, device)).then_some(named)
+    }
+
+    /// Where the own entries stand: none wanted, some wanted (or the entry
+    /// the own counter names, not yet probed in vain) that can still be asked
+    /// for, or every one asked for in vain.
     fn own_state(&self) -> OwnState {
         let host = &self.shared.host;
-        let ranges = self.own_wants(&host.missing(&self.space));
-        if ranges.is_empty() {
+        let me = host.device();
+        let mut seqs: Vec<u64> = self
+            .own_wants(&host.missing(&self.space))
+            .iter()
+            .flat_map(|&(a, b)| a..=b)
+            .collect();
+        seqs.extend(self.unconfirmed(me));
+        if seqs.is_empty() {
             return OwnState::Done;
         }
-        let me = host.device();
         let asks = self.asks.lock();
-        for seq in ranges.iter().flat_map(|&(a, b)| a..=b) {
+        for seq in seqs {
             match asks.by.get(&(me.clone(), seq)) {
                 Some(ask) if ask.misses >= FETCH_TRIES => {}
                 _ => return OwnState::Owed,

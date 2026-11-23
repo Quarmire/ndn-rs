@@ -821,6 +821,28 @@ impl Judge {
             .unwrap_or_else(|| Arc::clone(&self.validator))
     }
 
+    /// Whether the trust context that governs `key` for `space` revokes it
+    /// (or the key's device, by a revocation naming a name above it).
+    pub(crate) fn key_revoked(&self, key: &Name, space: &Name) -> bool {
+        self.view_for(key, space, true)
+            .keyring()
+            .context_for(key)
+            .is_revoked(key)
+    }
+
+    /// The revocations of the context that governs `person` for `space` that
+    /// name a key under her namespace: what a reader's lost devices are.
+    pub(crate) fn revoked_under(&self, person: &Name, space: &Name) -> Vec<Name> {
+        self.view_for(person, space, true)
+            .keyring()
+            .context_for(person)
+            .revocations()
+            .iter()
+            .filter(|r| r.has_prefix(person))
+            .cloned()
+            .collect()
+    }
+
     // -- adoption --
 
     /// The listing of `space` is now `listing` (an empty one when no fold

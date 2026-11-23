@@ -14,8 +14,10 @@
 //! * `<G>/32=grant/<ask>`: the key of an epoch, **only** when the node says
 //!   the asker may have it ([`Host::may_grant`]); anything else is not
 //!   answered and this device fetches nothing for it. Then the asker's seal key
-//!   packet is fetched and judged (once per key: kept while verified), and the
-//!   answer is signed by this device with the key wrapped to that seal key.
+//!   packet is fetched and judged (once per key: kept while verified and while
+//!   the judge's generation is the one it was verified in), the node decides
+//!   again with the key that signed it (a revoked key is granted nothing), and
+//!   the answer is signed by this device with the key wrapped to that seal key.
 //!
 //! Names under `/localhost` are never served, and neither is a name another
 //! device owns. Every ask that is not answered is Nacked, never left to time
@@ -54,9 +56,13 @@ const GRANTS_PER_ASKER: usize = 32;
 const SEAL_LEARNING_MAX: usize = 64;
 const SEAL_LEARNING_PER_ASKER: usize = 2;
 
-/// A map that keeps the last `cap` entries put in it.
+/// A map that keeps the last `cap` entries put in it, for one generation of
+/// the judge (`Host::generation`): an entry put or asked for under another
+/// generation is not there, and putting under a new one drops the rest. What
+/// a revocation may have changed is judged again, not served from here.
 struct Kept<V> {
     cap: usize,
+    generation: u64,
     order: VecDeque<Name>,
     map: HashMap<Name, V>,
 }
@@ -65,16 +71,25 @@ impl<V: Clone> Kept<V> {
     fn new(cap: usize) -> Self {
         Kept {
             cap,
+            generation: 0,
             order: VecDeque::new(),
             map: HashMap::new(),
         }
     }
 
-    fn get(&self, key: &Name) -> Option<V> {
+    fn get(&self, generation: u64, key: &Name) -> Option<V> {
+        if self.generation != generation {
+            return None;
+        }
         self.map.get(key).cloned()
     }
 
-    fn insert(&mut self, key: Name, value: V) {
+    fn insert(&mut self, generation: u64, key: Name, value: V) {
+        if self.generation != generation {
+            self.generation = generation;
+            self.order.clear();
+            self.map.clear();
+        }
         if self.map.insert(key.clone(), value).is_none() {
             self.order.push_back(key);
             while self.order.len() > self.cap {
@@ -91,7 +106,7 @@ impl<V: Clone> Kept<V> {
 /// working on.
 pub(crate) struct Granting {
     grants: Mutex<Kept<Bytes>>,
-    seal_keys: Mutex<Kept<()>>,
+    seal_keys: Mutex<Kept<Name>>,
     learning: Mutex<BTreeSet<Name>>,
     asks: Mutex<BTreeMap<Name, usize>>,
 }
@@ -228,64 +243,83 @@ fn held_packet(host: &dyn Host, me: &Name, name: &Name) -> Option<Bytes> {
 }
 
 /// Answer a grant ask (spec §6.5): the node decides first, before anything is
-/// fetched; then the asker's seal key is fetched and judged, and the key
-/// wrapped to it. One name, one packet while it is kept.
+/// fetched; then the asker's seal key is fetched and judged, the node decides
+/// again with the key that signed it, and the key is wrapped to the seal key.
+/// One name, one packet while it is kept: kept only for the judge's
+/// generation it was made in (a revocation ends what was kept before it).
 async fn grant(shared: &Arc<Shared>, name: &Name, ask: GrantAsk) -> Option<Bytes> {
     let host = &shared.host;
     let (asker, public) = parse_seal_key_name(&ask.seal_key)?;
-    if let Err(why) = host.may_grant(&ask.space, &ask.epoch, &asker) {
+    if let Err(why) = host.may_grant(&ask.space, &ask.epoch, &asker, None) {
         tracing::debug!(%asker, epoch = ?ask.epoch, "grant refused: {why}");
         return None;
     }
-    if let Some(kept) = shared.grants.grants.lock().get(name) {
+    let generation = host.generation();
+    if let Some(kept) = shared.grants.grants.lock().get(generation, name) {
         return Some(kept);
     }
     let Some(_slot) = shared.grants.slot(&asker) else {
         tracing::debug!(%asker, "grant not answered: the asker has as many grant asks in progress here as it may ({GRANTS_PER_ASKER}); its next round asks again once they end");
         return None;
     };
-    if shared.grants.seal_keys.lock().get(&ask.seal_key).is_none() {
-        let verified = match shared.fetcher.once(ask.seal_key.clone()).await {
-            Ok(data) => seal_key_verified(shared, &data, &ask, &asker, &public).await,
-            Err(_) => false,
-        };
-        if !verified {
-            tracing::debug!(%asker, "grant not answered: its seal key did not come, or did not verify as its own; asked again in the background");
-            learn_seal_key(shared, ask, asker, public);
-            return None;
+    let kept = shared
+        .grants
+        .seal_keys
+        .lock()
+        .get(generation, &ask.seal_key);
+    let key = match kept {
+        Some(key) => key,
+        None => {
+            let verified = match shared.fetcher.once(ask.seal_key.clone()).await {
+                Ok(data) => seal_key_verified(shared, &data, &ask, &asker, &public).await,
+                Err(_) => None,
+            };
+            let Some(key) = verified else {
+                tracing::debug!(%asker, "grant not answered: its seal key did not come, or did not verify as its own; asked again in the background");
+                learn_seal_key(shared, ask, asker, public);
+                return None;
+            };
+            shared
+                .grants
+                .seal_keys
+                .lock()
+                .insert(generation, ask.seal_key.clone(), key.clone());
+            key
         }
-        shared
-            .grants
-            .seal_keys
-            .lock()
-            .insert(ask.seal_key.clone(), ());
+    };
+    if let Err(why) = host.may_grant(&ask.space, &ask.epoch, &asker, Some(&key)) {
+        tracing::debug!(%asker, %key, epoch = ?ask.epoch, "grant refused: {why}");
+        return None;
     }
-    let wire = host.grant_packet(&ask.space, &ask.epoch, &asker, &public, name)?;
+    let wire = host.grant_packet(&ask.space, &ask.epoch, &asker, &key, &public, name)?;
     shared
         .grants
         .grants
         .lock()
-        .insert(name.clone(), wire.clone());
+        .insert(generation, name.clone(), wire.clone());
     Some(wire)
 }
 
-/// Whether `data` is `asker`'s seal key packet for `public`, judged as signed
-/// by the asker's device.
+/// The key that signed `data` if it is `asker`'s seal key packet for `public`,
+/// judged as signed by the asker's device.
 async fn seal_key_verified(
     shared: &Shared,
     data: &Data,
     ask: &GrantAsk,
     asker: &Name,
     public: &[u8; 32],
-) -> bool {
-    seal_key_matches(data, asker, public)
-        && matches!(
-            shared
-                .host
-                .validate_device_packet(&ask.space, data, asker)
-                .await,
-            Judged::Valid(_)
-        )
+) -> Option<Name> {
+    if !seal_key_matches(data, asker, public) {
+        return None;
+    }
+    match shared
+        .host
+        .validate_device_packet(&ask.space, data, asker)
+        .await
+    {
+        Judged::Valid(v) => Some(v.key),
+        _ => None,
+    }
 }
 
 /// Ask again, in the background, for the seal key a grant's ask in place did
@@ -308,16 +342,17 @@ fn learn_seal_key(shared: &Arc<Shared>, ask: GrantAsk, asker: Name, public: [u8;
     }
     let shared = Arc::clone(shared);
     rt::spawn(async move {
+        let generation = shared.host.generation();
         let got = match shared.fetcher.owed(ask.seal_key.clone()).await {
             Some(data) => seal_key_verified(&shared, &data, &ask, &asker, &public).await,
-            None => false,
+            None => None,
         };
-        if got {
+        if let Some(key) = got {
             shared
                 .grants
                 .seal_keys
                 .lock()
-                .insert(ask.seal_key.clone(), ());
+                .insert(generation, ask.seal_key.clone(), key);
         }
         shared.grants.learning.lock().remove(&ask.seal_key);
     });

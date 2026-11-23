@@ -1,11 +1,10 @@
 //! The store layer's invariants: batches reach the engine as one write, the
-//! records round trip, keys never collide, the own head comes from names,
+//! records round trip, keys never collide,
 //! and a chain walk reads markers only.
 
 use super::*;
 use crate::test_kit::{Held, n};
 use crate::wire::log_name;
-use ndn_foundation_types::NameComponent;
 use ndn_sync::MemoryStore;
 
 fn bytes(s: &'static str) -> Bytes {
@@ -211,7 +210,7 @@ fn keys_live_under_the_local_prefix_and_never_confuse_a_space_with_one_that_exte
         space_key(&s),
         structural_key(&s, &device(), 1),
         heads_key(&s, b"path"),
-        supers_key(&s, &device(), 1),
+        supers_key(&s, &device(), 1, &[0; 32]),
         epoch_key(&s, &device(), 1),
         equivocal_key(&entry),
         suspected_key(&n("/alice/laptop/KEY/1")),
@@ -255,49 +254,6 @@ fn keys_live_under_the_local_prefix_and_never_confuse_a_space_with_one_that_exte
 
     assert_ne!(heads_key(&s, b"a"), heads_key(&s, b"b"));
     assert_eq!(heads_key(&s, b"a"), heads_key(&s, b"a"));
-}
-
-#[test]
-fn own_head_comes_from_every_stored_own_entry_name_even_if_it_does_not_decode() {
-    let store = MemoryStore::new();
-    assert_eq!(own_head_from_names(&store, &device(), &space()), None);
-
-    let garbage = Bytes::from_static(b"\xff\xff not a Data packet");
-    // Every own entry, none of which decodes; 9 < 10 and 255 < 256 only
-    // numerically, never by the order of the bytes of a name.
-    for seq in [3, 7, 9, 10, 255, 256] {
-        store.insert(log_name(&device(), &space(), seq), garbage.clone());
-    }
-    // What is not an own entry of this space moves nothing: a piece of one,
-    // another device's entry, an entry of a space that extends this one, a
-    // stale head record.
-    store.insert(
-        log_name(&device(), &space(), 900)
-            .append_component(NameComponent::keyword(Bytes::from_static(b"piece")))
-            .append_segment(0),
-        garbage.clone(),
-    );
-    store.insert(
-        log_name(&n("/alice/phone"), &space(), 5000),
-        garbage.clone(),
-    );
-    store.insert(
-        log_name(&device(), &n("/alice/32=data/notes/y"), 6000),
-        garbage.clone(),
-    );
-    write_head(
-        &store,
-        &space(),
-        Head {
-            seq: 3,
-            digest: [0; 32],
-        },
-    );
-
-    let head = own_head_from_names(&store, &device(), &space()).unwrap();
-    assert_eq!(head.seq, 256);
-    assert_eq!(head.name, log_name(&device(), &space(), 256));
-    assert_eq!(head.wire, garbage, "the bytes are handed back undecoded");
 }
 
 /// A marker at `seq` of `device` in the space: its digest is `[seq; 32]`,

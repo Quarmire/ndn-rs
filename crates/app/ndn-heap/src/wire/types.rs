@@ -22,8 +22,9 @@ pub(crate) struct Entry {
     /// The link to the writer's previous entry in this space. Absent only at
     /// seq 1.
     pub prev: Option<Prev>,
-    /// Put only: the heads of the entry's path this write supersedes
-    /// (at most [`AFTER_MAX`](super::AFTER_MAX)).
+    /// Put: the heads of the entry's path this write supersedes. Epoch: the
+    /// epochs this one replaces. Members: none. At most
+    /// [`AFTER_MAX`](super::AFTER_MAX).
     pub after: Vec<EntryRef>,
     /// What the entry says.
     pub body: Body,

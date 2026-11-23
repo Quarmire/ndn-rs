@@ -294,6 +294,97 @@ async fn a_writer_never_seals_in_an_outgrown_epoch() {
         .unwrap();
 }
 
+/// A reader added by `change` holds the key of the epoch in force; removing
+/// them again leaves that epoch's audience as it was, but the key is out, so
+/// a new epoch is signed and nothing after the removal is sealed in the old.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_added_by_change_and_removed_again_cannot_open_the_next_put() {
+    let dev = solo().await;
+    let (node, _) = boot(&dev, cfg()).await;
+    let heap = node.create(&space(), private(&[])).await.unwrap();
+    let first = heap.inner.log.lock().fold().in_force().expect("an epoch");
+    heap.change(changed(&[], &["/bob"], &[])).await.unwrap();
+    assert_eq!(
+        heap.inner.log.lock().fold().in_force(),
+        Some(first.clone()),
+        "an added reader needs no new epoch: it is granted the one in force"
+    );
+    heap.change(changed(&[], &[], &["/bob"])).await.unwrap();
+    let now = heap.inner.log.lock().fold().in_force().expect("an epoch");
+    assert_ne!(now, first, "bob holds the old key: a new epoch is signed");
+    let id = heap
+        .put(&n("/after"), bytes("not for bob"), PutOptions::default())
+        .await
+        .unwrap();
+    let Body::Sealed(sealed) = entry_body(&dev, id.seq).body else {
+        panic!("the put is sealed");
+    };
+    assert_eq!(sealed.epoch, now, "sealed in the epoch bob never held");
+}
+
+/// A reader's device whose key is revoked holds the epoch key, and its person
+/// still reads, so no member changed: an owner device signs a new epoch that
+/// replaces the old one, once; a restart owes nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_once() {
+    let devs = world(&["/alice/laptop", "/bob/phone"]).await;
+    let (node, _) = boot(&devs[0], cfg()).await;
+    let heap = node.create(&space(), private(&["/bob"])).await.unwrap();
+    let in_force = |heap: &Heap| heap.inner.log.lock().fold().in_force();
+    let first = in_force(&heap).expect("an epoch");
+    let revoking = ndn_security::SignedTrustContext::hierarchical(n("/bob"))
+        .with_version(2)
+        .with_revocation(devs[1].name.clone().append("KEY").append("1"));
+    devs[0]
+        .validator
+        .keyring()
+        .adopt_update(Arc::new(revoking))
+        .expect("adopted");
+    let mut second = None;
+    for _ in 0..100 {
+        if let Some(e) = in_force(&heap)
+            && e != first
+        {
+            second = Some(e);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let second = second.expect("an owner device signs a new epoch for the revocation");
+    {
+        let log = heap.inner.log.lock();
+        let fold = log.fold();
+        assert!(fold.complete());
+        assert_eq!(
+            fold.epoch_tips(),
+            vec![second.clone()],
+            "it replaces the old"
+        );
+        assert_eq!(fold.epochs().len(), 2);
+    }
+    let id = heap
+        .put(
+            &n("/after"),
+            bytes("not for the thief"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let Body::Sealed(sealed) = entry_body(&devs[0], id.seq).body else {
+        panic!("the put is sealed");
+    };
+    assert_eq!(
+        sealed.epoch, second,
+        "sealed in the epoch the thief never held"
+    );
+    // A restart owes nothing: the revocation is accounted for.
+    node.close().await;
+    let (node, _) = boot(&devs[0], cfg()).await;
+    let heap = node.open(&space()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(heap.inner.log.lock().fold().epochs().len(), 2);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_owner_device_signs_the_epoch_a_members_entry_of_another_leaves_incomplete() {
     let devs = world(&["/alice/laptop", "/alice/phone"]).await;
@@ -315,7 +406,7 @@ async fn an_owner_device_signs_the_epoch_a_members_entry_of_another_leaves_incom
         .store
         .get(&log_name(&devs[0].name, &space(), 3))
         .expect("the removal is the third entry");
-    let taken = phone.inner.take(&space(), removal).await;
+    let taken = phone.inner.take(&space(), removal, false).await;
     assert!(
         matches!(
             taken,
@@ -512,7 +603,7 @@ async fn a_refusal_the_judge_or_the_mark_makes_is_alerted_once_and_replayed() {
         .get(&log_name(&devs[0].name, &space(), id.seq))
         .unwrap();
     for _ in 0..2 {
-        bob.inner.take(&space(), wire.clone()).await;
+        bob.inner.take(&space(), wire.clone(), false).await;
     }
     let alert = until(&mut changes, |c| match c {
         Change::Alert(a @ Alert::Refused { .. }) => Some(a.clone()),
@@ -564,4 +655,153 @@ async fn a_device_whose_key_is_revoked_here_is_refused_by_name() {
         .await
         .expect_err("a revoked key signs nothing");
     assert!(matches!(refused, HeapError::Refused { .. }), "{refused:?}");
+}
+
+/// A device whose name lies under the owner's but of another person
+/// (`/alice/kid/phone`, of `/alice/kid`) is not an owner device: `change` says
+/// so at once instead of waiting `first_look` for entries of the persons it
+/// would remove, and no epoch repair is started for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_of_another_person_under_the_owners_name_is_refused_at_once_and_repairs_nothing() {
+    let devs = crate::node::tests::world_of(&["/alice/laptop", "/alice/kid/phone"], |name| {
+        if name.has_prefix(&n("/alice/kid")) {
+            n("/alice/kid")
+        } else {
+            Name::from_components(name.components()[..1].iter().cloned())
+        }
+    })
+    .await;
+    let (laptop, _) = boot(&devs[0], cfg()).await;
+    laptop.create(&space(), private(&["/bob"])).await.unwrap();
+    let mut config = cfg();
+    config.first_look = Duration::from_secs(5);
+    let (kid, _) = boot(&devs[1], config).await;
+    let heap = kid.open(&space()).await.unwrap();
+    // Only the creation arrives: the space seals and no epoch is held.
+    let creation = devs[0]
+        .store
+        .get(&log_name(&devs[0].name, &space(), 1))
+        .unwrap();
+    assert!(matches!(
+        kid.inner.take(&space(), creation, false).await,
+        crate::sync::Taken::Decided { .. }
+    ));
+    // The owner's next entry is heard of and not here: a removal of the
+    // owner's person would wait for it.
+    kid.inner
+        .space_of(&space())
+        .unwrap()
+        .group
+        .on_update(ndn_sync::SyncUpdate {
+            publisher: devs[0].name.to_string(),
+            name: devs[0].name.clone(),
+            low_seq: 1,
+            high_seq: 2,
+            mapping: None,
+            serving_party: None,
+        });
+
+    let began = std::time::Instant::now();
+    let refused = heap
+        .change(changed(&[], &[], &["/alice"]))
+        .await
+        .expect_err("a device of another person is not an owner device");
+    assert!(matches!(refused, HeapError::NotOwner { .. }), "{refused:?}");
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "the refusal came after {:?}: it must not wait for first_look",
+        began.elapsed()
+    );
+
+    let inner = kid.inner.space_of(&space()).unwrap();
+    let log = inner.log.lock();
+    assert!(log.sealed() && !log.fold().complete());
+    let routed = inner.route(
+        &kid.inner,
+        &log,
+        crate::log::Effects {
+            membership: true,
+            ..Default::default()
+        },
+        false,
+    );
+    assert!(
+        !routed.repair,
+        "an epoch repair was started for a device that cannot sign one"
+    );
+}
+
+/// A watcher's queue holds a reference to a value in pieces, not the value: a
+/// watch over many large values reads none of them until the watcher reaches
+/// it, and reads one at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watch_reads_a_value_in_pieces_only_when_it_reaches_it() {
+    let mut dev = solo().await;
+    let metered = Arc::new(crate::test_kit::Metered::new(Arc::new(
+        ndn_sync::MemoryStore::new(),
+    )));
+    dev.store = Arc::clone(&metered) as Arc<dyn DataStore>;
+    let (node, _) = boot(&dev, cfg()).await;
+    let heap = node.create(&space(), public()).await.unwrap();
+    let payload = 100_000;
+    for i in 0..6u8 {
+        heap.put(
+            &n(&format!("/big/{i}")),
+            Bytes::from(vec![i; payload]),
+            durable(false),
+        )
+        .await
+        .unwrap();
+    }
+    metered.reset();
+    let mut changes = heap.watch(&Frontier::new()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        metered.octets_read() < payload,
+        "the watch read {} octets of 6 values of {payload} before the watcher asked for one",
+        metered.octets_read()
+    );
+    let first = next(&mut changes).await;
+    assert!(matches!(&first, Change::Put(item) if item.bytes.len() == payload));
+    assert!(
+        metered.octets_read() < 2 * payload,
+        "one value was asked for and {} octets were read",
+        metered.octets_read()
+    );
+}
+
+/// The store lost a piece of a value it recorded whole: the value is
+/// `Unavailable`, not an error and not a short value, nothing is allocated for
+/// it again, and the record is dropped so that it is gathered anew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_value_whose_piece_the_store_lost_is_unavailable_and_gathered_again() {
+    let dev = solo().await;
+    let (node, _) = boot(&dev, cfg()).await;
+    let heap = node.create(&space(), public()).await.unwrap();
+    let id = heap
+        .put(&n("/big"), Bytes::from(vec![7u8; 50_000]), durable(false))
+        .await
+        .unwrap();
+    assert_eq!(
+        heap.get(&n("/big")).await.unwrap().unwrap().bytes.len(),
+        50_000
+    );
+    let entry = log_name(&id.device, &space(), id.seq);
+    let marker = crate::store::assembled_key(&entry);
+    assert!(
+        dev.store.contains(&marker),
+        "the writer records its value whole"
+    );
+
+    let chunk = crate::wire::piece_name(&entry, crate::wire::PieceKind::Chunk(3));
+    assert!(dev.store.contains(&chunk));
+    dev.store.remove(&chunk);
+    let lost = heap.get(&n("/big")).await.unwrap_err();
+    assert!(matches!(lost, HeapError::Unavailable { .. }), "{lost:?}");
+    assert!(
+        !dev.store.contains(&marker),
+        "the record that the value was whole is dropped with the piece"
+    );
+    let again = heap.get(&n("/big")).await.unwrap_err();
+    assert!(matches!(again, HeapError::Unavailable { .. }), "{again:?}");
 }

@@ -9,7 +9,6 @@ use std::time::Duration;
 use ndn_app::EngineAppExt;
 use ndn_engine::EngineBuilder;
 use ndn_packet::Data;
-use ndn_security::{Ed25519Verifier, VerifyOutcome};
 use tokio_util::sync::CancellationToken;
 
 use crate::HeapError;
@@ -113,19 +112,6 @@ async fn a_members_header_is_admitted_at_a_peer_node_and_a_removed_writers_is_no
     );
     assert_eq!(alice.signal_sender(&space(), &header).unwrap().key, bob_key);
     assert!(alice.signal_member(&space(), &bob_key));
-
-    // The node's own signature over bytes verifies by its public key.
-    let signature = alice.sign(b"header octets").unwrap();
-    let public = devs[0]
-        .keys
-        .get_signer_sync(alice.writer().key())
-        .unwrap()
-        .public_key()
-        .unwrap();
-    assert_eq!(
-        Ed25519Verifier.verify_sync(b"header octets", &signature, &public),
-        VerifyOutcome::Valid
-    );
 
     // The owner removes Bob: from the first call after it, his header is a
     // stranger's, and at his own node the gate refuses.

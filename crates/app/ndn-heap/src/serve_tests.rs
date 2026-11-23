@@ -322,3 +322,64 @@ async fn a_seal_key_that_is_not_the_askers_gets_no_grant() {
     });
     assert!(s.ask(&name).await.is_none(), "the judge refuses the packet");
 }
+
+/// An asker whose key is revoked is granted nothing, though its person reads:
+/// the node says no once the key that signed its seal key packet is known.
+#[tokio::test(start_paused = true)]
+async fn an_asker_with_a_revoked_key_gets_no_grant() {
+    let s = serving(ME).await;
+    let (ask, name) = grant_ask(TABLET, [9; 32]);
+    let packet = seal_packet(TABLET, [9; 32]);
+    let seal = ask.seal_key.clone();
+    s.wire.script(move |n| {
+        if *n == seal {
+            Reply::Data(packet.clone())
+        } else {
+            Reply::Nack(NackReason::NoRoute)
+        }
+    });
+    s.host
+        .st
+        .lock()
+        .revoked_keys
+        .insert(n(TABLET).append("KEY").append("1"));
+    assert!(s.ask(&name).await.is_none(), "the key is revoked");
+}
+
+/// What was verified and answered before a revocation is not served after it:
+/// the kept seal key and the kept grant are for the generation of the judge
+/// they were made in.
+#[tokio::test(start_paused = true)]
+async fn a_kept_seal_key_and_grant_are_not_served_after_the_judge_moves() {
+    let s = serving(ME).await;
+    let (ask, name) = grant_ask(TABLET, [9; 32]);
+    let packet = seal_packet(TABLET, [9; 32]);
+    let seal = ask.seal_key.clone();
+    s.wire.script(move |n| {
+        if *n == seal {
+            Reply::Data(packet.clone())
+        } else {
+            Reply::Nack(NackReason::NoRoute)
+        }
+    });
+    assert!(
+        s.ask(&name).await.is_some(),
+        "granted while the key is good"
+    );
+    assert_eq!(s.wire.count(&ask.seal_key), 1);
+    {
+        // The tablet is stolen and its key revoked: the judge moves on and
+        // refuses what the key signed.
+        let mut st = s.host.st.lock();
+        st.generation += 1;
+        st.device_packets_valid = false;
+    }
+    assert!(
+        s.ask(&name).await.is_none(),
+        "neither the kept grant nor the kept seal key answers for a revoked key"
+    );
+    assert!(
+        s.wire.count(&ask.seal_key) > 1,
+        "its seal key is fetched and judged again, not taken from what was kept"
+    );
+}

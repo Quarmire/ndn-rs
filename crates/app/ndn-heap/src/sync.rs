@@ -114,11 +114,12 @@ pub(crate) trait Host: Send + Sync + 'static {
     // -- admission --------------------------------------------------------------
 
     /// Take a packet fetched as an entry of `space`: decode it, judge it
-    /// (`Judge::validate`), admit it (`Log::admit`) under the space's lock
-    /// with everything that follows (flush ticket, publication routing,
-    /// watchers, re-check of what it changed). Nothing is applied for a
-    /// packet that does not verify.
-    async fn take(&self, space: &Name, wire: Bytes) -> Taken;
+    /// (`Judge::validate`), admit it (`Log::admit`, or `Log::admit_probed`
+    /// when `probe`: it was fetched only because an unsigned counter named
+    /// it) under the space's lock with everything that follows (flush
+    /// ticket, publication routing, watchers, re-check of what it changed).
+    /// Nothing is applied for a packet that does not verify.
+    async fn take(&self, space: &Name, wire: Bytes, probe: bool) -> Taken;
 
     // -- what the log wants and knows --------------------------------------------
 
@@ -126,18 +127,22 @@ pub(crate) trait Host: Send + Sync + 'static {
     /// holding, so a replayed notice never ends an ask.
     fn missing(&self, space: &Name) -> Vec<Want>;
 
-    /// The highest seq heard of `device` in `space` (`Log::high`).
+    /// The highest seq of `device` in `space` that is asked for without a
+    /// probe (`Log::high`): what is held of it, and for this device also its
+    /// own counter within what it reserved. A counter above it names an
+    /// entry that is probed alone until it is held.
     fn high(&self, space: &Name, device: &Name) -> u64;
 
     /// This device's own head in `space` (`Log::head`).
     fn head(&self, space: &Name) -> u64;
 
-    /// A notice or vector named `device` at `seen` in `space`
-    /// (`Log::note_counter`): it raises what is wanted and nothing else. For
-    /// this device's own name above its head the node raises
-    /// `Alert::UnbackedCounter`; the head moves only when a verified entry
-    /// is taken (D17).
-    fn note_counter(&self, space: &Name, device: &Name, seen: u64);
+    /// A counter was heard of this device's own name in `space`
+    /// (`Log::note_own_counter`): above its head the node raises
+    /// `Alert::UnbackedCounter`, and the log wants the entries within what
+    /// this device reserved; the head moves only when a verified entry is
+    /// taken (D17). A counter of another device is not told to the log: it
+    /// is unsigned, and the entry it names is probed ([`Self::high`]).
+    fn note_own_counter(&self, space: &Name, seen: u64);
 
     /// Whether an admitted entry of `device` is held in `space`: what keeps
     /// a device among the devices heard whatever a Sync Interest names.
@@ -170,11 +175,18 @@ pub(crate) trait Host: Send + Sync + 'static {
     /// are not all held: what is fetched at open and asked again while owed.
     fn blobs(&self, space: &Name) -> Vec<Blob>;
 
-    /// All the pieces of `blob`'s entry arrived and proved: write them as one
-    /// batch and make the value readable. `payload` is the (sealed, if
-    /// sealed) value the proven chunks carry, so that telling the watchers
-    /// reads nothing back from the store.
-    fn assembled(&self, space: &Name, blob: &Blob, ops: Vec<StoreOp>, payload: Vec<u8>);
+    /// The copy of the piece `name` of an entry of `space` that the store
+    /// holds, if any: what an assembly begun in an earlier run resumes from
+    /// (it is proven again before it counts).
+    fn held_piece(&self, space: &Name, name: &Name) -> Option<Bytes>;
+
+    /// Pieces of an entry of `space` that arrived and proved: write them as
+    /// one batch, now. Nothing says the value is whole yet.
+    fn keep_pieces(&self, space: &Name, ops: Vec<StoreOp>);
+
+    /// Every piece of `blob`'s entry is held and proved: record the value as
+    /// whole (its `assembled/` marker) and tell the watchers.
+    fn assembled(&self, space: &Name, blob: &Blob);
 
     // -- grants, reader side ----------------------------------------------------
 
@@ -200,20 +212,35 @@ pub(crate) trait Host: Send + Sync + 'static {
 
     // -- grants, granter side ---------------------------------------------------
 
+    /// A counter that moves whenever a verdict given before may have changed
+    /// for the worse (`Judge::generation`): what a granter's kept seal keys and
+    /// grants are valid for.
+    fn generation(&self) -> u64;
+
     /// Whether the key of `epoch` of `space` may be granted to a device
-    /// `asker`: all four conditions of `seal::may_grant` for the asker's
-    /// person, and an epoch this device made only once its entry is durable.
-    fn may_grant(&self, space: &Name, epoch: &EpochId, asker: &Name) -> Result<(), GrantRefusal>;
+    /// `asker`: all five conditions of `seal::may_grant` for the asker's
+    /// person and device key, and an epoch this device made only once its entry
+    /// is durable. `key` is the key that signed the asker's seal key packet
+    /// once that is judged (`None` before: the condition on it is not
+    /// checked).
+    fn may_grant(
+        &self,
+        space: &Name,
+        epoch: &EpochId,
+        asker: &Name,
+        key: Option<&Name>,
+    ) -> Result<(), GrantRefusal>;
 
     /// The grant packet named `name`, wrapping the key of `epoch` to the seal
-    /// key `to` of device `asker` and signed by this device: decided again
-    /// as [`Self::may_grant`]. `None` when it is refused now or cannot be
-    /// signed.
+    /// key `to` of device `asker` (whose seal key packet `key` signed) and
+    /// signed by this device: decided again as [`Self::may_grant`]. `None`
+    /// when it is refused now or cannot be signed.
     fn grant_packet(
         &self,
         space: &Name,
         epoch: &EpochId,
         asker: &Name,
+        key: &Name,
         to: &[u8; 32],
         name: &Name,
     ) -> Option<Bytes>;
@@ -360,8 +387,10 @@ impl Net {
     }
 
     /// Join the sync group of `space` as a producer named by this device,
-    /// whose counter is `counter` now: the first publication is `counter + 1`,
-    /// so pass `Log::next_seq() - 1`. The sync face registers the owner's
+    /// whose counter is `counter` now: pass the own head, `Log::head()`, the
+    /// highest seq of an entry this device holds. A publication sets the
+    /// counter to the seq of its entry ([`Group::sink`]), so a seq that was
+    /// never signed is never announced. The sync face registers the owner's
     /// `<O>/32=sync` once, however many of its spaces are joined. Starts the
     /// group's notice loop and fetching; the node calls
     /// [`Group::recover`] before its first publication.
@@ -429,7 +458,7 @@ impl Net {
             relist: AtomicBool::new(true),
             own_seen: AtomicU64::new(0),
             stop: Stop::default(),
-            tx: handle.tx.clone(),
+            svs: Arc::clone(&self.svs),
             observed: handle.observed_shared(),
         });
         self.groups.lock().insert(space.clone(), Arc::clone(&group));
@@ -506,7 +535,7 @@ pub(crate) struct Group {
     /// List the values owed their pieces again.
     pub(crate) relist: AtomicBool,
     pub(crate) stop: Stop,
-    tx: mpsc::Sender<(Name, Option<Bytes>)>,
+    svs: Arc<MultiSvs>,
     observed: Option<Arc<ObservedState>>,
     /// The highest counter of this device's own name the group's carriage
     /// showed, as far as the log was told.
@@ -519,21 +548,33 @@ pub(crate) struct Group {
 /// that this device lost) is read from the observed state.
 impl Group {
     /// Read the counter of this device's own name the group carries and, when
-    /// it rose, tell the log ([`Host::note_counter`]: an alert if above the
-    /// head, and the entries wanted) and wake the pump. Whether it rose.
+    /// it rose, take it ([`Self::own_counter`]). Whether it rose.
     pub(crate) fn note_own(&self) -> bool {
         let Some(observed) = &self.observed else {
             return false;
         };
-        let host = &self.shared.host;
-        let me = host.device();
+        let me = self.shared.host.device();
         let Some(seen) = observed.seq_for(me).filter(|s| *s > 0) else {
             return false;
         };
+        self.own_counter(seen)
+    }
+
+    /// The counter of this device's own name rose to `seen`: the log hears
+    /// it ([`Host::note_own_counter`]: an alert if above the head, the
+    /// entries within its reservation wanted), the fetch notes it to probe
+    /// the entry it names, and the pump wakes. Whether it rose.
+    fn own_counter(&self, seen: u64) -> bool {
         if self.own_seen.fetch_max(seen, Ordering::Relaxed) >= seen {
             return false;
         }
-        host.note_counter(&self.space, me, seen);
+        let host = &self.shared.host;
+        self.noticed
+            .lock()
+            .entry(host.device().clone())
+            .or_default()
+            .raise(seen);
+        host.note_own_counter(&self.space, seen);
         self.heard_any.store(true, Ordering::Relaxed);
         self.first_vector.notify_waiters();
         self.wake.notify_one();
@@ -548,10 +589,10 @@ impl Group {
 impl Group {
     /// A notice: `update.name` says its counter in this group is
     /// `update.high_seq`. It decides nothing: it is noted, bounded, and the
-    /// log's own wants do the rest. A device at counter 0 has written nothing
-    /// and is ignored; a name nothing vouches for never displaces one that is
-    /// vouched for; this device's own counter is the log's to alert on
-    /// ([`Host::note_counter`]).
+    /// fetch probes the entry it names. A device at counter 0 has written
+    /// nothing and is ignored; a name nothing vouches for never displaces one
+    /// that is vouched for; this device's own counter is the log's to alert
+    /// on ([`Host::note_own_counter`]).
     pub(crate) fn on_update(&self, update: SyncUpdate) {
         let host = &self.shared.host;
         let (device, high) = (update.name, update.high_seq);
@@ -561,8 +602,7 @@ impl Group {
         self.first_vector.notify_waiters();
         if device == *host.device() {
             if high > 0 {
-                host.note_counter(&self.space, &device, high);
-                self.wake.notify_one();
+                self.own_counter(high);
             }
             return;
         }
@@ -582,6 +622,16 @@ impl Group {
         self.wake.notify_one();
     }
 
+    /// Whether a notice named an entry of a device `of` selects that the log
+    /// neither holds nor asks for: heard of, and not yet fetched.
+    pub(crate) fn heard_unheld(&self, of: impl Fn(&Name) -> bool) -> bool {
+        let host = &self.shared.host;
+        self.noticed
+            .lock()
+            .iter()
+            .any(|(device, notice)| of(device) && notice.high > host.high(&self.space, device))
+    }
+
     /// Look again at what is wanted, and at the values and keys owed.
     pub(crate) fn nudge(&self) {
         self.relist.store(true, Ordering::Relaxed);
@@ -589,37 +639,28 @@ impl Group {
     }
 
     /// The sink that publishes this device's own entries into the group, one
-    /// call per seq in order (`reserve::Publisher::spawn`).
+    /// call per seq in order (`reserve::Publisher::spawn`): the counter the
+    /// group advertises is then the seq of the entry, never a count of
+    /// publications.
     pub(crate) fn sink(&self) -> Arc<dyn FlushSink> {
         Arc::new(Sink {
             group: self.group.clone(),
-            tx: self.tx.clone(),
+            svs: Arc::clone(&self.svs),
         })
-    }
-
-    /// Whether the group's state vector holds no device but this one (or the
-    /// driver keeps no observed state): nobody to recover from or wait for.
-    pub(crate) fn no_peers(&self) -> bool {
-        let me = self.shared.host.device();
-        self.observed
-            .as_ref()
-            .is_none_or(|o| o.snapshot().iter().all(|(name, _, _)| name == me))
     }
 }
 
-/// Publishes an own entry as one counter step of the group.
+/// Publishes an own entry into the group: the counter becomes its seq.
 struct Sink {
     group: Name,
-    tx: mpsc::Sender<(Name, Option<Bytes>)>,
+    svs: Arc<MultiSvs>,
 }
 
 #[async_trait::async_trait]
 impl FlushSink for Sink {
     async fn publish(&self, seq: u64) {
         tracing::trace!(target: TIMELINE, seq, "announce");
-        if self.tx.send((self.group.clone(), None)).await.is_err() {
-            tracing::debug!(group = %self.group, seq, "not announced: the group's driver has stopped");
-        }
+        self.svs.publish_at(self.group.clone(), seq).await;
     }
 }
 

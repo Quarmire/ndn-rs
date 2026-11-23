@@ -512,3 +512,53 @@ async fn a_structural_entry_is_never_released_when_its_flush_fails() {
     );
     assert_eq!(sink.seen(), Vec::<u64>::new());
 }
+
+/// A space left and opened again in one process: the store answers with the
+/// `R` the first reservation wrote, which no flush has covered yet. The
+/// reopened reservation says Ok only for what the image a power cut leaves
+/// covers.
+#[tokio::test]
+async fn a_reopen_in_the_same_process_trusts_only_an_r_a_flush_covered() {
+    let store = Arc::new(CrashStore::new());
+    let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
+    let first = open_on(&store, &flusher, 0).reservation;
+    first.clear_to_sign(1).await.unwrap();
+    let holding = store.hold();
+    // Past half a block: R + block is written, and the flush is held.
+    first.sign_gate(BLOCK / 2 + 1);
+    assert_eq!(record(&*store).r, 2 * BLOCK);
+    assert_eq!(record(&store.crash()).r, BLOCK, "the disk holds one block");
+    drop(first);
+
+    let again = open_on(&store, &flusher, BLOCK / 2 + 1).reservation;
+    for seq in BLOCK + 1..=2 * BLOCK {
+        assert!(
+            !matches!(again.sign_gate(seq), Gate::Ok),
+            "seq {seq} may be signed, but a power cut leaves R = {}",
+            record(&store.crash()).r
+        );
+    }
+    assert_eq!(again.durable_r(), 0);
+
+    drop(holding);
+    flusher.flush().await.unwrap();
+    assert!(again.durable_r() >= 2 * BLOCK, "a covering flush returned");
+    assert!(matches!(again.sign_gate(2 * BLOCK), Gate::Ok));
+}
+
+#[tokio::test]
+async fn a_head_at_the_largest_seq_does_not_overflow_the_reservation() {
+    // Review L8: `max(head, R) + 1` and `R + block` on a seq a peer chose.
+    let store = Arc::new(CrashStore::new());
+    let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
+    let opened = open_on(&store, &flusher, u64::MAX);
+    assert_eq!(
+        opened.resume.first_seq,
+        u64::MAX,
+        "there is no seq above it"
+    );
+    assert!(matches!(
+        opened.reservation.sign_gate(u64::MAX),
+        Gate::Ok | Gate::Wait(_)
+    ));
+}

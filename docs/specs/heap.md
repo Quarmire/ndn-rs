@@ -92,7 +92,8 @@ Every implementation MUST hold all of these.
    loss, a crash and a restart included: a device MUST NOT sign at a seq above
    its durable reservation and MUST resume above everything it may have
    published (§4). A node never takes a lower head than it holds, and an own
-   head after a restart is read from the names of every stored own entry (§4.3).
+   head after a restart is read from the own device's `ledger/` record, which
+   lists every stored own entry (§4.1, §4.3).
 4. **Completeness is relative.** "I have everything" always means "everything
    on the chain up to this tip".
 5. **Stale, never wrong.** Failures degrade to older verified data, and the
@@ -352,8 +353,9 @@ is 1, `EPOCH_BODY` is 2. A decoder refuses an entry whose `KIND` disagrees with
 its body (`KindMismatch`), a `KIND` above 2 (`UnknownKind`), an entry with no
 `KIND` and an entry with no body. Exactly one body is present: two bodies, or
 both `INLINE` and `BLOB`, refuse the entry. `ENTRY_REF` appears only in a Put
-(it lists the heads that the write supersedes, §3.5): in a Members or Epoch
-entry it refuses the entry. One path per Put entry. A **removal** is a Put with
+(it lists the heads that the write supersedes, §3.5) and in an Epoch (the
+epochs it replaces, §3.5): in a Members entry it refuses the entry. One path
+per Put entry. A **removal** is a Put with
 an `INLINE` of zero octets.
 
 ### 3.3 The TLVs
@@ -372,7 +374,7 @@ class.
 | `KIND` | 0x0603 | `ENTRY` | NNI 0, 1 or 2 | exactly one |
 | `PREV` | 0x0605 | `ENTRY` | 32 octets: the signed-region digest of the previous entry (§3.6) | at most one; absent exactly at seq 1 |
 | `PREV_SEQ` | 0x0607 | `ENTRY` | NNI: the previous entry's seq (§3.6) | at most one; only with `PREV`; present iff the previous entry's seq is not `seq − 1` |
-| `ENTRY_REF` | 0x0609 | `ENTRY`, `REMOVE` | `Name` (a device name), `SEQ`, `DIGEST` | in `ENTRY`: 0 to 8, Put only; in `REMOVE`: 0 to 64 |
+| `ENTRY_REF` | 0x0609 | `ENTRY`, `REMOVE` | `Name` (a device name), `SEQ`, `DIGEST` | in `ENTRY`: 0 to 8, Put (heads superseded) or Epoch (epochs replaced) only; in `REMOVE`: 0 to 64 |
 | `SEQ` | 0x060B | `ENTRY_REF`, `EPOCH_ID` | NNI: a seq | exactly one per container |
 | `DIGEST` | 0x060D | `ENTRY_REF`; manifest node | 32 octets: a signed-region digest (in an `ENTRY_REF`); an implicit digest (in a manifest node, §8) | exactly one in an `ENTRY_REF` |
 | `PATH` | 0x060F | `ENTRY` (plain Put); sealed plaintext (§6.4) | the components of a path, each TLV directly | exactly one; 1 to 8 GenericNameComponents, ≤ 200 octets in all (each component counted with its TLV header) |
@@ -451,7 +453,10 @@ A `REMOVE` is `{ ID, ENTRY_REF* }`.
 
 **Epoch.** `EPOCH_BODY { KEY_CHECK, AUDIENCE { Name* } }`: the check of the
 epoch key (§6.2) and up to 256 persons the epoch is for. Its `EpochId` is
-`(the device that signed the entry, the entry's seq)`.
+`(the device that signed the entry, the entry's seq)`. The entry's
+`ENTRY_REF*` (at most 8) name the epochs it **replaces**: the owner device lists
+the epochs no held epoch replaces when it signs (§5.3 rules 6–8); a reader of
+the entry takes only each reference's `(device, seq)` as an `EpochId`.
 
 ### 3.6 The chain
 
@@ -478,7 +483,13 @@ entry inside `(p, seq)` that exists and verifies is a valid **orphan**, kept
 and applied (invariant 9). A device makes it after an unclean start (§4.5) and
 after losing its log. Because a gap is declared, a reader never asks for the
 seqs inside it (§7); an undeclared hole costs misses until a later entry
-declares it.
+declares it. A gap statement **counts** only while its entry is admitted
+(applied, or closed for want of a key) and its name is not equivocal: the
+gap of a refused entry, of an entry whose chain forks (`Chain`), or of an
+entry found equivocal (§3.7) declares nothing, and when an entry stops
+counting what only it declared absent is asked for again. *Threat (fixed,
+review L5):* a writer whose fork arrived first made a reader skip its real
+entries inside the fork's gap for good.
 
 A node keeps for each verified entry a **marker** `verified/<entry name>` (§4.3)
 holding the entry's signed-region digest, `PREV`, and the absolute seq of the
@@ -537,20 +548,28 @@ only through these steps in order. Each refusal says why and what to do
    (it waits, it is not refused). `Lapsed` is not recorded as refused (§1.4).
    A key suspected here, while its person is a writer, is refused (`Suspected`,
    §3.7).
-3. **Own name.** An entry under this node's own device name: above the
-   reservation the store held when this node opened the space (`R_durable` at
-   open: the extensions this run wrote do not count) it is **rollback
-   evidence**: it is stored, marked refused (`AboveReservation`), not applied,
-   `Alert::RolledBack { reserved, seen }` is raised and the next seq to sign
-   moves above it (§4.8); at or below it, it is taken only if this device's
-   current key signed it (otherwise `BadSignature`) and it chains to what is
-   held of this device's own log (otherwise `Chain`): this is how an own entry
-   recovered from a peer is adopted.
+3. **Own name.** An entry under this node's own device name is taken only if
+   this device's current key signed it (otherwise `BadSignature`, not
+   stored). It is applied once it **chains to what is applied of this device's
+   own log** (its `PREV` names the entry held at `PREV_SEQ`, which was
+   admitted; a `PREV_SEQ` of 0 chains), and until then it is **held, waiting**
+   (§4.3 status 2): not applied, not asked for again, judged again whenever an
+   own entry is applied, so own entries that come back out of order are applied
+   in order. Above the reservation the store held when this node opened the
+   space (`R_durable` at open: the extensions this run wrote do not count) it
+   is a restored old image or a copy of the key: `Alert::RolledBack { reserved,
+   seen }` is raised and the next seq to sign moves above it (§4.8), and it is
+   applied all the same when it chains, as every peer applied it, so this
+   device and its peers read the same value. *Threat:* before this an own
+   entry above the reservation was refused for good on the device that signed
+   it while its peers applied it, and the two diverged.
 4. **Decoding.** The content decodes (§3.4) and its chain link is well formed
    (§3.6). An entry that verifies but does not decode is **refused for what it
-   carries**: it is stored, its marker is written (zero `PREV`, previous seq 0)
-   and a status record says so, so a chain walk through it completes, nobody
-   fetches it again, and it is never applied.
+   carries**: it is stored, its marker is written with the chain link it
+   states (`PREV` / `PREV_SEQ` are read even when the body fails; zero and 0
+   only if it states none that can be read) and a status record says so, so a
+   chain walk through it follows its real link, completes, nobody fetches it
+   again, and it is never applied.
 5. **Chain.** A fork (§3.7) refuses the entry (`Chain`) and raises the alert.
    Entries inside a declared gap are valid orphans and are kept and applied.
 6. **Carrier.** A `Members` or `Epoch` entry MUST be signed by a key whose
@@ -577,14 +596,24 @@ only through these steps in order. Each refusal says why and what to do
 9. **Apply.** The register and the fold take it, and everything is written as
    one batch (§4.4).
 
-The decision of steps 6 to 8 is a pure function of what is held (the fold, the
-keys, the cuts), so it is made again by the same function whenever any of them
-changes, and an entry never depends on the order things arrived in. A verdict
-that depends on what is held can change (`NotMember`, `OutsideCut`, `Unsealed`,
-`Sealed`, `Untrusted`, closed, waiting); one about the entry itself cannot
-(`BadSignature`, `Chain`, `AboveReservation`, not readable). A second copy of
-an entry already held (the same signed bytes) is a duplicate and writes nothing,
-but is judged again if its verdict can change.
+The decision of steps 3 and 6 to 8 is a pure function of what is held (the
+fold, the keys, the cuts, this device's own log), so it is made again by the
+same function whenever any of them changes, and an entry never depends on the
+order things arrived in. A verdict that depends on what is held can change
+(`NotMember`, `OutsideCut`, `Unsealed`, `Sealed`, `Untrusted`, closed,
+waiting); one about the entry itself cannot (`BadSignature`, `Chain`, not
+readable). A second copy of an entry already held (the same signed bytes) is a
+duplicate and writes nothing, but is judged again if its verdict can change.
+
+**Fragmentation is capped.** The `ledger/` record of a device is rewritten with
+every entry of it, so a node keeps at most 1,024 separate runs of held seqs and
+1,024 counting gap statements (§3.6) of one other device. An entry that would
+start a 1,025th run or state a 1,025th gap is **not stored** and is refused
+`Fragmented` (next step: ask the owner: a writer that signs with gaps on
+purpose is removed); one that extends a run is taken. An honest device stays
+far below this (one gap per unclean start). *Threat:* before the cap a member
+that alternated gap statements fragmented its runs and made a node write
+O(N²) octets for N entries.
 
 **Chain ancestry (cuts as tips).** A removal names, per device `D` of the removed
 person, tips `(D, s, d)`. The set *kept* for `D` is the set of seqs reachable
@@ -619,9 +648,8 @@ offered again and verifies.
 - **What a relay learns.** Without sealing, everything. With sealing: the
   writer, seq, chain links, the digests the entry supersedes, the epoch id and
   the size of the ciphertext — **not the path** (§6.7).
-- **A forged `after`.** `after` is honoured literally, across paths too: a
-  writer that names another path's head in its `after` hides that head, which
-  gives it no more power than a removal it could write at that path (§10).
+- **A forged `after`.** A ref that names a digest the entry at that name does
+  not have, or an entry of another path, supersedes nothing (§10.1, §10.8).
 - **Unknown critical TLV.** A newer writer's critical field refuses the entry
   at an old reader rather than being misread; the entry is not applied, and
   the reader is told to upgrade.
@@ -660,11 +688,14 @@ path carries no flush.
   returned `sync` covered (or that the store held at open). The device signs no
   seq above `R_durable`; always `own head ≤ R_durable ≤ R`.
 - **Own head:** the highest seq of the device's own entries in the space held
-  in the store, read from the **names** of every stored own entry
-  (`<D>/32=log/<S>/seq=<n>`) before and regardless of whether any decodes (a
-  head taken from decoded packets would miss an entry that does not decode, and
-  the device would sign again at its seq). Pieces of an entry, other devices'
-  entries and entries of a space that extends this one move nothing.
+  in the store, read from the own device's `ledger/` record (§4.3), which is
+  written in the batch of every entry taken, decoding or not (a head taken from
+  decoded packets would miss an entry that does not decode, and the device
+  would sign again at its seq). It is one read at open: no entry and no piece
+  is listed or read to find it, so a device with gigabytes of its own values
+  starts in memory proportional to its devices and ranges (threat note M5).
+  Pieces of an entry, other devices' entries and entries of a space that
+  extend this one move nothing.
 - **Structural entry:** a `Members` or `Epoch` entry.
 
 ### 4.2 The rules
@@ -675,7 +706,15 @@ path carries no flush.
    applied (the store write returned).
 3. A device MUST flush before serving or announcing a `Members` or `Epoch`
    entry, and before it signs under a reservation extension: a seq above
-   `R_durable` waits for the flush that covers the extension.
+   `R_durable` waits for the flush that covers the extension. Whether an own
+   entry may be served, and whether its epoch key may be granted, is decided
+   under the space's lock, where the signing call that stores the entry also
+   records it as held back: an Interest that arrives meanwhile cannot find it
+   stored and not yet held back. The owner checks of `change` and of the epoch
+   repair apply the same rule admission does (the name is under the owner's
+   **and** the key is vouched for as the owner's person), so a device of
+   another person under the owner's name is refused at once with `NotOwner`
+   and starts no repair.
 4. `put` returns when the entry is signed, stored and applied; with `durable`
    it returns after the flush that covers it (§4.7).
 5. After an unclean start that leaves a hole (the first seq is not `own head +
@@ -704,19 +743,21 @@ big-endian, so keys order numerically. Other names are appended as components.
 | Key under `/localhost/ndn-heap/` | Value | Written |
 |---|---|---|
 | `verified/<entry name>` | the **marker**, 112 octets: signed-region digest 32 ‖ key digest 32 ‖ `PREV` 32 (zero when none) ‖ previous seq 8 (absolute; 0 with a zero `PREV`) ‖ `at` 8 (first-seen time, `Config.clock` in milliseconds; display and cut bounds only) | with the entry |
+| `assembled/<entry name>` | 1 octet: every piece of the entry's value in pieces is held and proved (§8.5); a value not marked is not read | after the last piece arrives; in the entry's batch for a value this device wrote |
 | `head/<S>` | own `seq` 8 ‖ its signed-region digest 32 (40 octets) | with every own entry |
 | `reserve/<S>` | `R` 8 (big-endian) ‖ clean 1 (0 or 1): 9 octets | at open, at each extension, at clean close |
+| `revoked/<S>` | 32 octets: the digest of the revocations of the readers' devices (§5.3 rule 8) that the last `Epoch` entry this device signed accounted for | after each Epoch entry this device signs |
 | `space/<S>` | 1 octet: 1 a space this node is a member of, 2 a space it only follows (§10) | when the space is created, opened or followed |
 | `structural/<S as TLV component>/<device as TLV component>/<seq 8>` | empty | with a `Members` or `Epoch` entry (start replays only these) |
 | `heads/<S as TLV component>/<SHA-256 of the PATH TLV>` | the `PATH` TLV ‖ `ENTRY_REF`* | with the apply |
-| `supers/<S as TLV component>/<device as TLV component>/<seq 8>` | `ENTRY_REF`* of the entries that name `<device>/<seq>` in their `after` | with the apply |
+| `supers/<S as TLV component>/<device as TLV component>/<seq 8>/<digest 32>` | `ENTRY_REF`* of the applied entries that name the entry `<device>/<seq>` of that signed-region digest in their `after` (not recorded for a target held at another path than the namer's) | with the apply |
 | `epoch/<S as TLV component>/<creator as TLV component>/<seq 8>` | the epoch key wrapped to this device's own seal key: a `GRANT` TLV (§6.5), the wrap's AAD the `Name` TLV of this very store key | in the batch of the Epoch entry, ahead of it |
 | `equivocal/<entry name>` | the second packet | on equivocation |
 | `suspected/<key name>` | `since` 8 octets, big-endian, ms (`Config.clock`) | when a key is suspected; one record per key, read by every space's log |
 | `scoped/<person>` | the adopted trust context of a person (§9.4) | on adoption |
-| `ledger/<S as TLV component>/<device as TLV component>` | what the node holds of one device: the length (2 octets) and the `Name` TLV of its person ‖ the seqs held ‖ the seqs its entries declared void; each set is a count (4 octets) then `(low 8, high 8)` ranges, ascending, disjoint, non-adjacent | with every entry taken |
+| `ledger/<S as TLV component>/<device as TLV component>` | what the node holds of one device: the length (2 octets) and the `Name` TLV of its person ‖ the seqs held as a count (4 octets) then `(low 8, high 8)` ranges, ascending, disjoint, non-adjacent ‖ the **counting gap statements** (§3.6) as a count (4 octets) then `(seq 8, prev seq 8)`, ascending; the seqs declared void are derived from them. At most 1,024 ranges and 1,024 gap statements (§3.8) | with every entry taken, and when a gap statement stops or starts counting |
 | `kept/<S as TLV component>/<device as TLV component>` | what the removal cut keeps of one device (§3.8): count 4 ‖ tips `(seq 8 ‖ digest 32)`*, count 4 ‖ frontier `(seq 8 ‖ digest 32)`*, then the seqs reached as ranges | when a removal is applied and as its chain is walked |
-| `status/<S as TLV component>/<device as TLV component>/<seq 8>` | why a held entry is not applied, one octet then its datum: 1 closed, 2 waiting, 3 not readable, 4 `NotMember`, 5 `OutsideCut` (keeps-to seq 8), 6 `Unsealed`, 7 `Sealed`, 8 `Untrusted` (the reason, UTF-8), 9 `AboveReservation` (reserved 8), 10 `Chain`, 11 any other (read back as `BadSignature`); absent for an applied entry | with the entry |
+| `status/<S as TLV component>/<device as TLV component>/<seq 8>` | why a held entry is not applied, one octet then its datum: 1 closed, 2 waiting, 3 not readable, 4 `NotMember`, 5 `OutsideCut` (keeps-to seq 8), 6 `Unsealed`, 7 `Sealed`, 8 `Untrusted` (the reason, UTF-8), 10 `Chain`, 11 any other (read back as `BadSignature`); absent for an applied entry | with the entry |
 
 A record the store holds that cannot be read (wrong length, a clean flag other
 than 0 or 1) is **never taken for an absent one**: a node that cannot tell what
@@ -738,7 +779,8 @@ survives a kill and a power loss, or none: the persistent backends do) and one
 that cannot applies it one write at a time in order; a state left by a
 prefix of a batch MUST be one a restart accepts, and a record that is not an
 entry (a marker, a head, a structural record) has meaning only with its entry:
-the **entry's name** is the authority for the own head. A store that returns
+the **ledger**, written in the entry's batch, is the authority for the own head
+(it lists the entry whether or not it decodes). A store that returns
 from `apply` having kept only some of it, or reports a batch durable before it
 is, defeats the barrier as a disk that lies does (§4.10).
 
@@ -757,15 +799,22 @@ entry's key check (§6.2); otherwise it is dropped.
    flusher for a flush; a seq above `R_durable` waits for it, and only a disk
    that stalls makes a put wait. `Config.reserve_block` is 1,024 by default.
 2. **Open.** To open a space the node reads `reserve/<S>` and `head/<S>` and
-   the own head from the names (§4.1), recovering from peers first when the
-   start is unclean and peers are known (§4.8). The start is **clean** iff the
-   record says clean, `R` equals the seq of the `head/<S>` record, **and** the
-   own head from the names equals that seq. The first seq to sign is **always**
+   the own head from the own device's `ledger/` record (§4.1: one read; an
+   own record that cannot be read refuses the open), recovering from peers
+   first when the start is unclean and peers are known (§4.8). The start is
+   **clean** iff the record says clean, `R` equals the seq of the `head/<S>`
+   record, **and** the own head from the ledger equals that seq. The first seq
+   to sign is **always**
    `max(own head, R) + 1`. Before anything is signed the node writes
    `reserve/<S> = (max(R, first seq − 1) + reserve_block, clean 0)`, clean
    start included, and asks for its flush; the first put waits for that flush
    only if it arrives before it completes. One flush at open covers every open
-   space.
+   space. The `R` the store answers with is durable only if every write made
+   before it was read is: a node that left the space and opens it again in the
+   same process reads the first run's `R` before any flush covered it. It
+   counts as `R_durable` only when the flush that covers the writes so far has
+   returned; until then nothing is signed under it (a seq the gate says Ok for
+   is covered by the image a power cut leaves).
 3. **A clean start has no hole:** it resumes at `head + 1`. A start whose `R`
    is above the head leaves a **hole** `(head, first seq)`, and the first entry
    signed after it carries the **signed gap statement**: `PREV` the
@@ -813,9 +862,10 @@ entry's key check (§6.2); otherwise it is dropped.
   when its seq is above `R_durable`.
 - **`PutOptions { durable: Option<bool> }`.** With `durable` true, `put` returns
   after the flush covering the entry. The default is `durable = structural ||
-  no_peers`, where `no_peers` holds when the space's observed sync state
-  holds no name other than this device's (or the driver keeps no observed
-  state). A structural change (`change`, `create`) always returns after the
+  no_peers`, where `no_peers` holds when no device other than this one is
+  vouched for (an admitted entry of it is held in the log): the group's
+  unsigned vector decides nothing, so a forged name cannot flip it. A
+  structural change (`change`, `create`) always returns after the
   flush that covers it; the entry is then free for the publisher to release
   (§4.6).
 - **`Node::flush()`** waits for a flush covering everything written so far and
@@ -830,7 +880,8 @@ An unbacked counter never raises a head. A state vector names no sender and its
 validator is insecure by default, so a forged `(D, 2⁴⁰)` could push a device's
 seq up; counters only decide **what to fetch**.
 
-1. **At an unclean start** (the last run did not close cleanly, §4.5) the node
+1. **At every start with peers known** (an admitted entry of another device is
+   held: clean or not, §4.5; an old image closed cleanly looks complete) the node
    waits up to `Config.settle` (1 s by default) for the first vector of the
    group, and then until the own-name entries it wants are fetched or each has
    been asked for in vain `FETCH_TRIES` (3) times. It fetches `head + 1 …` from
@@ -874,10 +925,11 @@ since the last completed flush; a peer "held" an entry if it fetched it.
 | `put` with `durable` true, power cut after it returned | the entry is in the durable image | nothing acknowledged is lost |
 | Members or Epoch entry, power cut before its flush | the entry is gone, and was never served or announced | nothing a peer saw is lost |
 | Reservation flush fails (disk) | — | puts past `R_durable` refused with the disk's reason; `StoreFailed`; reads continue |
-| Restored old image, peers online | the first vector shows this device's counter above its head | `RolledBack` raised; the entries above are stored, not applied; seq jumps above them; nothing re-signed |
-| Restored old image that says **clean**, a put before the first vector | no wait is made on a clean start | may sign a seq a peer holds: equivocation, detected at the first vector (§4.10) |
+| Restored old image, peers online | the first vector shows this device's counter above its head | `RolledBack` raised; the own entries above that chain are applied; seq jumps above them; nothing re-signed |
+| Restored old image that says **clean**, peers known | the node waits for the first vector (bounded by `settle`, liveness only) | `RolledBack`, seq jumps above what peers hold; nothing re-signed |
+| Same, **no peer known** in the image | no wait is made | may sign a seq a peer holds: equivocation, detected at the first vector (§4.10) |
 | Cloned or restored, no peer, later meets a peer | — | equivocation, attributable; key suspected; re-enrol the device (§4.10) |
-| Own-name entry above `R_durable` seen | — | rule 8: evidence of a copy or rollback |
+| Own-name entry above `R_durable` seen | — | rule 8: `RolledBack`; applied when it chains |
 | `Node::close` | `reserve = (head, clean 1)` | next start clean; no hole, no gap statement |
 | Single device, no peers | — | no re-sign; the window is lost unless `durable`, which defaults on |
 | Removed device's entries recovered | — | count only inside the removal cut (§3.8); outside never |
@@ -899,8 +951,14 @@ Residuals are stated plainly; the layer does not hide them.
   handled as a compromise of the key: "this device's key signed two things at
   one seq; it was restored or copied; re-enrol it". Restoring a device from a
   backup is unsupported; enrol anew. A backup taken at a clean close and
-  restored carries `clean`, for which no wait for a peer vector is made; the
-  first vector the device hears still raises `RolledBack`.
+  restored carries `clean`; with peers known (an admitted entry of another
+  device held) the node still waits for their first vector and for the own
+  entries it shows before its first publication (§4.8, rule 1), and then
+  raises `RolledBack` and signs above. The wait ends on that signed data; its
+  timeout (`Config.settle`) is liveness only, never a rule. **Residual:** with
+  **no peer known** at that start (none held in the image) nothing is waited
+  for, and the device may sign a seq a peer holds (equivocation, attributable,
+  §3.7).
 - **History forever.** No entry is dropped (invariant 7); the log grows. The
   cost is accepted; there is no compaction.
 - **A disk that lies about a flush** (a write cache without power-loss
@@ -961,9 +1019,10 @@ The fold keeps four sets and the entries that carry them:
    names `ID`, in any entry. A `REMOVE` of an `ID` whose `ADD` is not held yet
    stands: the `ADD` is removed when it arrives. (A removal that needs more than
    64 tips repeats its `ID` in further `REMOVE` operations.)
-3. **`epochs`**: `EpochId → EpochBody`. If an owner device signed two bodies for
-   one id (equivocation, which the log reports), the fold keeps the **least** by
-   `(KEY_CHECK, AUDIENCE)`.
+3. **`epochs`**: `EpochId → (EpochBody, replaces)`, where `replaces` is the
+   epoch ids the entry's `ENTRY_REF*` name. If an owner device signed two
+   packets for one id (equivocation, which the log reports), the fold keeps the
+   **least** by `(KEY_CHECK, AUDIENCE, replaces)`.
 4. **`create`**: the `CREATE` of the carrier of lowest rank (and, for one
    carrier, the lower `ANYONE`). Until a `CREATE` is known the fold reports
    none; the log then neither accepts nor refuses a write for the space's
@@ -991,21 +1050,42 @@ equivocating packets are two carriers.
 4. **Removal tips.** `removal_tips(P)` is the union of the tips of every
    removed writer `ADD` whose person is `P`, sorted; never any for the owner.
    (A reader's removal carries no tips that count.)
-5. **Audience.** `audience(E)` is the persons the epoch's `EPOCH_BODY` lists
-   **plus** every standing reader whose `ADD` names `E`. A person the epoch lists
-   who is no longer a reader stays in it: this is what keeps the epoch out of
-   force.
-6. **In force.** `in_force()` is the epoch with the greatest `(creator name,
-   seq)` (NDN canonical order of the creator, then the seq) among the known
-   epochs whose `audience(E)` is a subset of `readers()` (the owner counted
-   among them); none if there is none, and none for a public space. `complete()`
-   holds iff `audience(in_force)` equals `readers()` exactly; a public space is
-   always complete.
+5. **Audience and holders.** Two sets are kept per epoch `E`, because removing a
+   person takes back a promise and not a key.
+   - `audience(E)` is whom `E`'s key is **to be given** now: the persons the
+     epoch's `EPOCH_BODY` lists **plus** every **standing** reader whose `ADD`
+     names `E`. A person the epoch lists who is no longer a reader stays in it.
+     Grant condition 2 (§6.5) reads this set.
+   - `holders(E)` is who **holds, or was admitted to hold**, `E`'s key: the
+     persons the epoch's `EPOCH_BODY` lists **plus** every reader any `ADD` ever
+     named to `E`, **removed or not**. A removal never shrinks it. (A reader
+     added by `change` is written with `EPOCH_ID` = the epoch in force, is
+     granted its key at once, and keeps it when removed: its removal leaves
+     `audience(E)` as it was and `holders(E)` as it grew.)
+6. **In force.** An epoch is **replaced** when a held `Epoch` entry names it in
+   its `ENTRY_REF*` (§3.5, §6.3). `in_force()` is the epoch with the greatest
+   `(creator name, seq)` (NDN canonical order of the creator, then the seq)
+   among the known epochs that no held epoch replaces and whose `holders(E)` is
+   a subset of `readers()` (the owner counted among them); none if there is
+   none, and none for a public space. `complete()` holds iff `holders(in_force)`
+   equals `readers()` exactly; a public space is always complete.
 7. **Repair.** Owner devices MUST sign a new `Epoch` entry, whose audience is
-   `readers()`, whenever a sealed space is **not** `complete()` (§6.3). A writer
+   `readers()` and whose `ENTRY_REF*` are the epochs no held epoch replaces
+   (the **tips**, at most 8, the greatest ids), whenever a sealed space is
+   **not** `complete()` (§6.3), and whenever a key of a reader's device is
+   revoked and no epoch the device signed accounts for it (rule 8). A writer
    MUST NOT seal in any epoch but `in_force()` (§6.4). Concurrent owner devices
    may sign duplicates: all have equal audience, `in_force` picks the greatest
    id, and nothing is lost.
+8. **Revocation of a reader's device key.** A revocation changes no member, so
+   the fold alone cannot tell that the key in force is out of hand. An owner
+   device therefore keeps, per space, the digest of the revocations (of keys
+   under the namespace of a person `readers()` lists) that its last `Epoch`
+   entry accounted for (`revoked/<S>`, §4.3), and signs a new epoch (rule 7)
+   whenever the revocations it holds now are not those: at start, and whenever
+   a trust context or person is adopted. The new epoch **replaces** the epoch
+   in force, so it is the one in force whatever the order of the creators'
+   names. Two owner devices may each sign one; a restart signs none more.
 
 ### 5.4 Queries
 
@@ -1018,7 +1098,8 @@ equivocating packets are two carriers.
 | `persons()` | every person a standing `ADD` lists, owner first |
 | `removal_tips(P)` | rule 4 |
 | `standing_ids(P)` | the `ID`s of the standing `ADD`s that name `P`, in either role, sorted; none for the owner: what a removal of `P` names |
-| `audience(E)` | rule 5 |
+| `audience(E)`, `holders(E)` | rule 5 |
+| `epoch_tips()` | the epochs no held epoch replaces, ascending (rule 6) |
 | `in_force()`, `complete()` | rule 6 |
 | `create()` | whether the space is public, once a `CREATE` is known |
 
@@ -1129,7 +1210,11 @@ flush. An owner device makes one:
 - at the creation of a sealed space (`create`): audience the owner and the
   listed readers; none for a public space;
 - whenever a change leaves the space not `complete()`, and whenever it learns
-  from received entries that it is not (§5.3 rule 7).
+  from received entries that it is not (§5.3 rule 7);
+- whenever a key of a reader's device is revoked and no epoch it signed accounts
+  for it (§5.3 rule 8).
+
+The entry's `ENTRY_REF*` are the epochs no held epoch replaces (§5.3 rule 7).
 
 The ceremony is, in this order: allocate the seq the entry will have (under the
 reservation, §4.5); generate the key; hold it; compute the key check; wrap it to
@@ -1178,23 +1263,31 @@ otherwise it is dropped. It unwraps with its recipient key and the grant's name
 as AAD.
 
 **Granter side.** A device `G` answers `<G>/32=grant/<GrantAsk>` **only when all
-four hold**, checked in this order:
+five hold**, checked in this order:
 
 1. a held owner-signed `Epoch` entry names `E` (`EpochNotNamed`);
 2. `audience(E)` contains the asker's **person** — the person of the device
    `D` of the seal key name in the ask (`NotInAudience`);
 3. `readers()` contains that person **now** (`NotReaderNow`): a removed
    reader fails here for every later ask;
-4. `G` holds the epoch's key (`KeyNotHeld`).
+4. `G` holds the epoch's key (`KeyNotHeld`);
+5. the key that signed the asker's seal key packet is **not revoked** by a trust
+   context `G` holds (`AskerKeyRevoked`): known only once the packet is judged,
+   so it is checked after the fetch.
 
-Anything else gets **no answer**, and `G` fetches nothing for it. Only then does
-`G` fetch the seal key packet named by the ask — `<D>/32=seal/<pk>` — and
-verify it (§6.2: signed by a key of `D`, the Content equal to `pk`, one run per
-seal key, kept once verified); the four conditions are checked **again** after
-the fetch, since the records may have moved. It answers with the key wrapped to
-`pk` (§6.2) under the **grant's own name** as AAD, signed by its device key.
-One name has one packet while it is kept; a granter keeps its last 4,096 grants
-and the last 4,096 seal keys it verified. It works on at most 32 asks of one
+Anything else gets **no answer**, and `G` fetches nothing for it. Conditions 1–4
+are decided first, before anything is fetched. Then `G` fetches the seal key
+packet named by the ask — `<D>/32=seal/<pk>` — and verifies it (§6.2: signed by
+a key of `D`, the Content equal to `pk`, one run per seal key, kept once
+verified); all five conditions are checked **again** after the fetch, with the
+key that signed it, since the records may have moved. It answers with the key
+wrapped to `pk` (§6.2) under the **grant's own name** as AAD, signed by its
+device key. One name has one packet while it is kept; a granter keeps its last
+4,096 grants and the last 4,096 seal keys it verified (with the key that signed
+each), **for one generation of its judge**: a counter that moves whenever a
+revoking context is adopted or a person's newer version refuses more
+(`Judge::generation`). What was kept under another generation is not served;
+the packet is fetched and judged again. It works on at most 32 asks of one
 asker device at a time; a seal key that does not come in place is asked for in
 the background (at most 3 asks, at most 2 runs per asker device and 64 in all),
 and the asker's next round is answered from the key then kept. An epoch that
@@ -1207,12 +1300,18 @@ left to time out.
 
 Said plainly (invariant 9): a **removed reader is refused every later grant**
 (condition 3), and the new epoch that its removal forces has a key that did not
-exist before; **what it already opened it keeps**, and a key it was already
-granted still opens what it sealed. A reader added by an `ADD` that names the
+exist before; a **device whose key is revoked is refused every later grant**
+(condition 5), whatever its person may read, and the epoch the revocation forces
+(§5.3 rule 8) has a key it was never given. **What a removed reader or a revoked
+device already opened it keeps**, and a key it was already granted still opens
+what it sealed. A reader added by an `ADD` that names the
 current epoch reads that epoch's history; an epoch that ended before a reader
 was listed stays **closed** to it. To open an earlier epoch to a reader the
 owner adds it with that epoch's `EPOCH_ID`; the reader still joins the epoch in
-force through the new `Epoch` entry the addition requires (§5.3 rule 7).
+force through the new `Epoch` entry the addition requires (§5.3 rule 7). The
+same reader, once removed, makes that epoch **outgrown** though its audience did
+not change: the epoch stays in the readers' history and leaves force (§5.3
+rule 5).
 
 ### 6.7 What a relay sees, and threat notes
 
@@ -1229,8 +1328,18 @@ inside the sealed body.
   of the asker's device signed, and only to a person the records admit; the key
   that arrives is checked against the owner-signed check.
 - **Stolen epoch key.** An epoch key a thief holds opens what it was sealed in;
-  revoking the device rotates the epoch for what follows (§5.3 rule 7), it does
-  not recall (invariant 9).
+  revoking the device's key rotates the epoch for what follows (§5.3 rules 7–8),
+  it does not recall (invariant 9). Between the theft and the revocation the
+  thief reads what is written, and nothing here narrows that window.
+- **A reader added after the creation, then removed.** The reader holds the key
+  of the epoch it was added to, though that epoch's body never listed it. An
+  epoch stays out of force while anyone who ever held its key is no reader
+  (`holders`, §5.3 rule 5), so a new epoch is signed and the removed reader
+  does not read what follows.
+- **A kept answer outliving a revocation.** A granter's kept seal keys and
+  grants are valid only for the judge's generation they were made in (§6.5): a
+  revocation clears them, so a revoked device is judged again, never served from
+  what was kept before.
 - **A forged ask.** An ask names no sender; a stranger's ask costs the granter
   no fetch (conditions 1–4 are checked first).
 
@@ -1257,8 +1366,12 @@ own routes carry the Sync Interests (§7.9).
 - **Counter = seq.** A producer's counter in a space is its own seq there, so
   the vector entry `(D, n)` names exactly `<D>/32=log/<S>/seq=<n>`. Every own
   entry results in exactly one publication of the group, in seq order (§4.6).
-  The counter at join is the highest seq the node may have used, `next seq − 1`
-  (above a hole that a crash left, §4.5); a **follower** (§10) joins with counter
+  The counter at join is the own head (`Log::head()`): a publication sets the
+  counter to its entry's seq (`MultiSvs::publish_at`), so a seq that was never
+  signed (a hole a crash left, §4.5; a rollback's jump) is announced only with
+  the entry that declares it, and readers ask nothing in `(head, R]` (M1)
+  (above a hole that a crash left, §4.5, the hole is declared by the next
+  entry's gap statement); a **follower** (§10) joins with counter
   0 and publishes nothing. A peer asking for the entry at a counter above a hole
   gets no answer until a later entry declares the hole (§3.6); the asks pause and
   grow (§7.4).
@@ -1280,15 +1393,17 @@ An update `(D, high)` of a group is handled so:
    heard when every other is vouched for), else the one heard longest ago: a
    name a Sync Interest carried never displaces a device that signed data held
    here. A dropped name is walked no further.
-4. The log is told of the counter (`note_counter`: it raises the highest seq
-   wanted of the device, and raises **no head**) only for a device an admitted
-   entry vouches for. A device nothing vouches for yet costs **one ask**, of the
-   entry at the counter it named, at most `FETCH_TRIES` (3) times; the log hears
-   its counter only once an entry of it has been admitted.
+4. The log is told nothing of another device's counter (M4): the entry the
+   counter names is **probed** when the log neither holds it nor asks for it,
+   alone, `FETCH_TRIES` (3) asks and then one a minute; the holes below it are
+   wanted once it is held and verified. This device's own counter is told
+   (`note_own_counter`: `UnbackedCounter` above the head, and the entries within
+   `R` wanted). A device nothing vouches for yet costs the same one probe; the
+   log hears its entry only once admitted.
 
-A notice only **raises what is wanted**; it never lowers it, and nothing it says
-is believed: a forged vector entry changes no state, and a replayed old one
-never ends an ask (§7.4).
+A notice only **names an entry to probe**; nothing it says is believed: a
+forged vector entry changes no wants and no state, and a replayed old one never
+ends an ask (§7.4).
 
 ### 7.3 The hot path: one notice, one fetch
 
@@ -1324,10 +1439,15 @@ The log says what is **wanted** of the space, and the fetch asks for it until
 the log holds it; nothing else ends an ask. This is *level-triggered*: a notice,
 a restart, a lost packet or a refusal changes nothing about what is owed.
 
-- **The holes.** For each device, every seq from 1 up to the highest heard that
-  is neither held nor **void** (declared absent by a held gap statement, §3.6).
-  Entries inside a declared void are **never asked for**; an undeclared hole
-  costs misses until a later entry declares it, bounded by `reserve_block`.
+- **The holes.** For each device walked (an admitted entry of it is held, or it
+  is this device, or a removed one), every seq from 1 up to the highest *held*
+  that is neither held nor **void** (declared absent by a held gap statement,
+  §3.6). A heard counter adds nothing here (it is unsigned): the entry it names
+  is probed alone (§7.3), and only once it is held and verified are the holes
+  below it wanted. Entries inside a declared void are **never asked for**; an
+  undeclared hole costs misses until a later entry declares it, bounded by
+  `reserve_block`. For this device the heard counter is also believed up to
+  `R` (what an earlier run could have signed), `(head, min(seen, R)]`.
   The prefix a device is held to is the largest `n` with every seq of `1..n`
   held or void.
 - **The exact entries** a removal cut names that are not held, by their
@@ -1351,7 +1471,11 @@ a restart, a lost packet or a refusal changes nothing about what is owed.
   from 16 misses in a row, 64 s: a source away for long costs one ask a minute,
   until the entry comes or is no longer wanted. A refused packet (a forged copy,
   an entry whose judgement is pending) is not held, so it stays wanted and is
-  asked again the same way; a genuine copy from another source ends it.
+  asked again the same way; a genuine copy from another source ends it. An
+  answer that resolved nothing counts as a miss too (L2): a packet the log
+  already knew while it still wants the entry, or evidence; and for an exact
+  entry a removal cut names, other bytes than the cut's signed digest are not
+  handed to the log at all, so the next source is asked.
 
 Pieces of a value not yet whole (§8), epoch keys that are owed (§7.8) and the
 certificates and cut manifests a judgement waits for are owed the same way.
@@ -1450,9 +1574,17 @@ nothing a node does; the `put_watch` example records them (§13.8).
 ### 7.12 Threat notes
 
 - **Forged notices.** A stranger can name any device at any counter. It costs a
-  list of at most 64 names per group, vouched-for devices never displaced, and
-  one device's asks (three, at the counter it named) for a name nothing vouches
-  for; it raises no head and ends no ask (D17, §4.8).
+  list of at most 64 names per group, vouched-for devices never displaced, and,
+  per device, one entry probed alone: `FETCH_TRIES` (3) asks, then one ask a
+  minute (liveness: an honest writer away still comes). It raises no head, no
+  want and no head of `ready()` (a counter wants nothing of the log: M4), ends
+  no ask (D17, §4.8), and cannot flip `put`'s `durable` default (`no_peers` is
+  decided by vouched devices in the log, not by the unsigned vector).
+- **Strangers' entries (L7).** A device certified in a held context that is no
+  member has at most one refused entry stored and one alert per device: a
+  probe of it (`Host::take(.., probe = true)`) is neither stored nor told when
+  that device already holds one and nothing of it is vouched for. Its holes are
+  not walked. An entry the log asked for is stored as before.
 - **A stranger never answers for another or grants.** Only devices vouched for by
   an admitted entry are asked as relays or granters.
 - **A poisoned cache** or a forged relay: the inner packet fails verification or
@@ -1502,8 +1634,8 @@ sealed space the entry is `SEALED`, whose plaintext holds the path and the
 ### 8.4 Writing
 
 A writer cuts the payload (sealed first, if sealed) for the entry name of the seq
-it is about to sign, and writes **all the pieces in the one batch of the entry**
-(§4.4), the pieces ahead of the entry's records. Because the seq and the epoch
+it is about to sign, and writes **all the pieces and the `assembled/<entry
+name>` record in the one batch of the entry** (§4.4), the pieces ahead of the entry's records. Because the seq and the epoch
 are fixed before the work is done, a writer that finds either moved before it
 signs does the work again. A value over `PAYLOAD_MAX` is refused (`TooLarge`,
 limit `PAYLOAD_MAX`).
@@ -1520,24 +1652,35 @@ A reader gathers the pieces of one value with these rules:
    place in the tree holds and a chunk has as many octets as its place holds. A
    copy that is not the listed one is dropped alone and the piece is still
    wanted; a piece that is no piece of this payload is ignored.
-3. **Nothing is stored until every piece is held and proved.** Then all are
-   written as one batch (a kill leaves all of a value's pieces or none) and the
-   value becomes readable. While it gathers, a reader holds the proved pieces of
-   one value in memory once (at most 64 MiB) and, once all are held, one joined
-   copy of the payload that it hands to the watchers: nothing is read back from
-   the store to tell them.
+3. **A proved piece is stored at once**, in one batch with the others its round
+   proved (a piece is only ever read through the tree, from the digest the
+   entry carries, so a stored piece of an unfinished value proves nothing and
+   harms nothing). When the last piece is held the node writes
+   `assembled/<entry name>` and the value becomes readable; the marker follows
+   the pieces in write order, and a value written by this device carries the
+   marker in its entry's batch (§8.4). A restart resumes an unfinished value
+   from the pieces the store holds, each proved again before it counts. At most
+   4 values gather at once (`ASSEMBLIES_MAX`); a turn ends when the value is
+   whole or a round brought nothing, and the next turn is waited for after a
+   pause, so a value whose holders are away never keeps the others from
+   theirs.
 
 Pieces still owed are asked for again while the node lists the value as owed
 (§7.4) and the entry is still wanted.
 
 ### 8.6 Reading a blob head
 
-`get` of a path whose head is a blob answers the item only when the pieces are
-assembled and the root, every node and every chunk verified and, if sealed, the
-value opened; otherwise `Unavailable` (`RetryLater`) and a background fetch of
-the missing pieces. A value that is sealed and does not open under the epoch key
-it names is a local failure, not an empty value. A change to a watcher
-(`Change::Put`) for a blob is emitted when it is whole. Pieces are served with
+`get` of a path whose head is a blob answers the item only when the value is
+recorded whole (`assembled/<entry name>`, §4.3) and the root, every node and
+every chunk verify as it is read and, if sealed, the value opens; otherwise
+`Unavailable` (`RetryLater`) and a background fetch of the missing pieces. A
+value that is not recorded whole is not read: nothing is allocated for it. If
+the store lost or damaged a piece it recorded whole, the record is dropped and
+the value is gathered again. A value that is sealed and does not open under the
+epoch key it names is a local failure, not an empty value. A change to a
+watcher (`Change::Put`) for a blob is emitted when it is whole; the watcher's
+queue holds a reference and the value is read when the watcher reaches it, and
+skipped if its entry is no longer the head of its path. Pieces are served with
 their entry (§7.6).
 
 ### 8.7 Threat notes
@@ -1547,8 +1690,15 @@ their entry (§7.6).
 - **A writer that signs an entry whose root the pieces do not match** leaves the
   value `Unavailable`; nothing else of the space is held back.
 - **What holders of a sealed value's pieces see** is its ciphertext's size.
-- **Memory.** A reader gathers at most `PAYLOAD_MAX` per value, one value per
-  entry at a time; an entry that claims more is refused.
+- **Memory.** Nothing of a payload is held in memory but what is being read
+  out: an assembly keeps the digests its proved nodes listed (about 40 octets
+  per chunk, so under 1 MiB for a 64 MiB value), never a piece; at most
+  `ASSEMBLIES_MAX` (4) values gather at once on the node and the others wait
+  for a turn with nothing in memory; a value is allocated, once, when it is
+  read, and only after every piece is known to be held; a watcher's queue holds
+  a reference to a value, never the value (§10.4). An entry that claims more
+  than `PAYLOAD_MAX` is refused. A device with many large values of its own
+  starts reading no entry and no piece (§4.5).
 
 ## 9. Trust, revocation and suspicion
 
@@ -1755,6 +1905,15 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
 
 ### 9.9 Threat notes
 
+- **A revocation cut lists entries by implicit digest (residual, L10).** The
+  manifest format belongs to the trust context (`ndn-security`
+  `cut_manifest`): it binds `<prefix>/seq=<n>` to the *implicit* (full-wire)
+  digest, so a relay's high-S copy of an ECDSA writer's entry falls outside the
+  cut although it is the same signed object. Listing signed-region digests
+  alongside needs a manifest format change and a validator rule, which is the
+  tip carrier of the trust stage, not an interim here; until then the owner
+  re-admits such an entry by its full name (§9.5, `ndn-fwd readmit`). Removal
+  cuts (§9.6) are tips of signed-region digests and are not affected.
 - **Writes between theft and revocation.** What the owner's node first verified
   before the loss time it states stays accepted (a residual); later entries are
   left out of the cut, listed, and refused everywhere; once the key is suspected,
@@ -1808,7 +1967,8 @@ only make the order total (§1.5).
   its digest.
 - **`after`.** A Put lists the current heads of its own path, the 8 of highest
   rank when there are more; the rest remain heads until a later Put names them.
-  A reader honours `after` literally, wherever it points (§10.8).
+  A reader honours a ref only for the entry it names by digest and only at the
+  Put's own path (§10.8).
 - **A function of the set of applied entries.** Arrival order, duplicates and a
   restart change no head. An entry that an applied entry already names when it
   arrives is never a head. An entry withdrawn (§3.8) leaves what never having
@@ -1822,8 +1982,7 @@ only make the order total (§1.5).
 - **What the host is told.** Whenever the head that decides a path changes, a
   watcher is told it: `Change::Put` with the new item, or `Change::Removed` with
   an item of empty value when the deciding head is a removal or the path has
-  none left (§10.4). One entry can change several paths, since `after` may name
-  an entry of another.
+  none left (§10.4).
 
 ### 10.2 The node
 
@@ -1860,7 +2019,6 @@ impl Node {
                               -> Result<SignalSender, SignalRefusal>;
     pub fn signal_member(&self, scope: &Name, key: &Name) -> bool;
     pub fn revocations(&self) -> u64;
-    pub fn sign(&self, header: &[u8]) -> Result<Bytes, HeapError>;
 }
 ```
 
@@ -1871,9 +2029,11 @@ The crate exports exactly these, the types they use (`Transport`, `Config`,
 `CutProposal`, `RUN_ID_LEN`, `SignalScope`, `SignalKey`, `SignalSender`,
 `SignalRefusal`) and the host's trust seam (`Adopter`, `Scoping`, §9.4). The
 signal methods are the gate of §11 (`revocations` is its count of revocations;
-each answers `NotReady` for a space not open here as a member); `sign` is this
-device key's signature over the octets given, for the signal transport: it
-signs no entry and stores nothing.
+each answers `NotReady` for a space not open here as a member). The node
+offers no raw signing: nothing signs octets a caller names with the device key
+(a signature over bytes of the host's choosing would be an oracle for any
+protocol that frames them like an entry); a run header is signed by
+`signal_header` under a name this gate defines.
 
 **`Config`** tunes a node; each field's default is what the spec's numbers are:
 
@@ -2079,9 +2239,12 @@ this order:
 
 1. **What is held.** Every head that has a value and whose entry is above
    `since` (`id.seq > since.get(id.device)`), as `Change::Put`, in path order.
-   A removed path is not listed. A value in pieces is told when it is whole
-   here (it may therefore come after later changes). The first listing is
-   never lagged and does not count against `watch_queue`.
+   A removed path is not listed. A value in pieces is queued by reference after
+   the inline heads and read from the store when the watcher reaches it: it is
+   told only if it is still the head of its path and whole here (it may
+   therefore come after later changes; a watcher that reads slowly holds a few
+   hundred octets per value, never the value). The first listing is never
+   lagged and does not count against `watch_queue`.
 2. **The standing alerts.** `Equivocation` and `RolledBack` that were raised in
    this space (at most 32), then the `Refused` alerts told of the last 256
    refused entries (§10.6), then `StoreFailed` if the store has failed.
@@ -2130,7 +2293,7 @@ Every error says why in its message and what to do in `HeapError::next()`, and
 | `Local { reason }` | the store, the keys, a closing node | `FixLocal` |
 
 `Refusal` is the verdict on an entry (§3.8): `OutsideCut`, `Lapsed`, `NotMember`,
-`Suspected`, `Untrusted` and `AboveReservation` say `AskOwner`; `BadSignature`
+`Suspected`, `Untrusted` and `Fragmented` say `AskOwner`; `BadSignature`
 and `Rollback` say `RetryLater` (another holder's copy may verify); `Unsealed`,
 `Sealed` and `Chain` say `None` (final, and its writer writes again).
 `Refusal::Rollback` is produced by no path of this crate (it is kept for hosts
@@ -2154,7 +2317,7 @@ watch for as long as it runs.
 | `Equivocation { device, seq }` | one key signed two things at one name, or forked its chain (§3.7), for an entry of any kind | treats the key as copied or compromised; the node has already suspected it (§9.8); the host unsuspects it only when it knows the key is safe; for a `Members` or `Epoch` entry it uses an owner device and tells the owner; revokes with a cut (§9.5) |
 | `OutsideCut { id }` | an entry is refused as outside a removed person's removal cut (§3.8 step 7); a refusal by the judge of a revoked key's cut or of a bad signature is no alert of this kind: the entry is not taken and is asked for again, and `refused_by_revocation` lists what a revocation refused | shows it; nothing re-admits an entry outside a removal cut, and the owner re-admits a revoked key's entries by name and digest (§9.5) |
 | `Refused { id, why, next }` | an entry that verified is refused for the chain, the carrier, the membership or the seal (§3.8 steps 5 to 8); and, **once per entry**, an entry the judge refused as `Lapsed` or `Untrusted` or that a suspected key signed (`Suspected`) (§9.2, §9.3, §3.7) | shows `why` and does `next`; nothing the layer needs |
-| `RolledBack { reserved, seen }` | an entry under this device's own name lies above the reservation the store held when the node opened the space (§3.8 step 3, §4.8) | marks the key suspected on this node, asks the owner to revoke it with a cut and enrols the device again: a restored image or a copy of the key signs; the entries above are stored, not applied |
+| `RolledBack { reserved, seen }` | an entry under this device's own name lies above the reservation the store held when the node opened the space (§3.8 step 3, §4.8) | marks the key suspected on this node, asks the owner to revoke it with a cut and enrols the device again: a restored image or a copy of the key signs; the entries above are applied when they chain |
 | `GapSigned { after, resumed }` | the first entry after an unclean start stated the gap it skipped (§4.5) | informs; nothing is lost beyond the entries no peer held (§4.9) |
 | `UnbackedCounter { device, seen }` | a peer's counter for this device's own name lies above its head with no entry behind it (§4.8) | informs, and watches for `RolledBack`: nothing was applied or signed because of it |
 | `StoreFailed { why }` | the store could not make writes durable (§4.6) | stops offering writes, shows the disk's reason, repairs the disk and restarts the node; reads continue and nothing signed is retracted |
@@ -2193,16 +2356,21 @@ decided show what they decided before.
 
 ### 10.8 Threat notes
 
-- **Cross-path `after`.** `put` lists only the heads of the path it writes, but
-  the wire lets a Put name any entry of the space in its `after`, and every node
-  honours it literally (§3.9). A writer can therefore make another path's head
-  stop being a head by naming it from a Put at a different path: that path
-  shows what the head superseded, or nothing. It has no more power than the
-  removal that writer could write at that path, since authority is the space's:
-  a writer may write or remove any path of it (§1.7, no per-path access control).
-  If that entry is later withdrawn (§3.8), the head it hid is a head again.
-  A host MUST NOT rely on a path's value being untouched by what the other
-  writers of the space write elsewhere.
+- **A forged `after`.** `put` lists only the heads of the path it writes, but
+  the wire lets a Put name any entry of the space in its `after`, with any
+  digest. A reader supersedes only what the ref names **exactly**: an entry
+  of the named device and seq whose signed-region digest is the ref's (the
+  `supers/` record is keyed by that digest), and only an entry **at the Put's
+  own path** (a ref whose target is held at another path is ignored; one whose
+  target arrives later is ignored when it does). So a writer cannot hide
+  another writer's entry, present or future, by naming its (device, seq) with
+  a wrong digest, nor a head of another path by naming it. *Threat (fixed,
+  review H2):* before this, `supers/` was keyed by (device, seq) alone and a
+  writer could name the next eight seqs of another device under any digest:
+  their real entries never became heads at any reader, including that device
+  itself, and withdrawing the forged entry did not repair it. A host still
+  MUST NOT rely on a path's value being untouched by what the other writers of
+  the space write at that path (§1.7, no per-path access control).
 - **A slow or hostile watcher** is bounded by `watch_queue`: it lags, it does not
   grow without bound and does not slow any other (§10.4).
 - **`Item.by` is the namespace of the held context governing the writer's
@@ -2338,12 +2506,12 @@ are zeroed when dropped and never shown by `Debug`.
 | Honest work outside the cut | Refused and listed with its full name and digest; the owner re-admits it by exact name and digest, and every node holding it then applies it. | §9.5 |
 | Certificate renewed, or expired | The key's entries verify alike under the old and the new certificate; the log continues. A key whose certificate lapsed without renewal is the exception, for every role the context lists in DataRequiresCut: refused (`Lapsed`, not kept) until its renewal or its cut. | §9.3 |
 | Device key replaced by a new enrolment | Its entries stay accepted until the owner ends it with a cut bounded at the replacement. | §9.5 |
-| Copy of the device's own key writes under its name | An own-name entry above `R_durable` is rollback evidence: stored, not applied, `RolledBack` raised, the next seq above it; the head moves only for what was fetched, verified and chains, and never for a counter. | §3.8, §4.8 |
+| Copy of the device's own key writes under its name | An own-name entry above `R_durable` raises `RolledBack` and the next seq goes above it; it is applied once it chains to this device's own log (and waits, held, until then), so the device and its peers agree; the head moves only for what was fetched, verified and chains, and never for a counter. | §3.8, §4.8 |
 | Power loss | The device loses at most the entries since its last completed flush that no peer held; it never signs a different entry at a seq a peer holds, because it resumes above its durable reservation and says so in a signed gap statement; entries a peer held return from the peer. | §4 |
 | Process killed (no power loss) | Every write that returned is kept; the restarted device resumes above `R` and signs the hole it left. | §4.9 |
 | Disk flush fails | Signing past `R_durable` and every Members or Epoch change are refused with the disk's reason; nothing signed is retracted; reads continue; `StoreFailed` is raised. | §4.6 |
 | Disk acknowledges a flush it did not make | Residual: a power loss can then make an honest device equivocate, and readers report it as any equivocation. | §4.10, §3.7 |
-| Restored or cloned device | Detected at the first peer vector (`RolledBack`): the entries above are stored, not applied, and nothing is re-signed; with no peer reachable it can sign a seq a peer holds: equivocation, attributable (residual). | §4.8, §4.10 |
+| Restored or cloned device | Detected at the first peer vector (`RolledBack`): the own entries above the reservation that chain are applied, as every peer applied them, and nothing is re-signed; with no peer reachable it can sign a seq a peer holds: equivocation, attributable (residual). | §4.8, §4.10 |
 | Member removed mid-edit | Entries inside the removal cut merge; later ones are refused, and a reader that applied one before the cut arrived withdraws it and says so. | §3.8, §5 |
 | Holder withholds, or rolls back | A relay's answer is the original, verified; an older or replayed notice never ends an ask; another source is asked. | §7.4 |
 | Writer equivocates | Both packets are kept and reported (`Alert::Equivocation`), at one name or as a fork of the chain, for every entry kind; the key is suspected. | §3.7 |
@@ -2394,7 +2562,7 @@ has is said so.
 | c1 | Two devices' offline writes to one path are distinct entries that converge on every device to one value, the head of highest digest, and are never reported as equivocation | `two_offline_writers_converge_on_the_highest_digest`, `concurrent_versions_give_one_winner_in_any_order`, `register_state_is_independent_of_arrival_order`, `d9_a_crash_between_put_and_flush_never_re_signs_a_seq_a_peer_saw` |
 | c2 | Removing a person is a chain cut: the entries inside it stay, a later one by her is refused at every reader whatever date it claims | `a_removed_writers_entry_inside_the_cut_is_kept_and_outside_it_refused`, `an_entry_by_a_removed_person_after_the_tip_never_counts_in_any_arrival_order`, `an_owners_removal_binds_what_it_holds_and_the_cut_survives_a_restart` |
 | c3 | Revoking a stolen key is a cut: what others had seen from it stays, nothing the thief signs later is accepted, whatever date it claims; a device whose own key is revoked here signs nothing | `a_cut_keeps_exactly_what_the_device_holds_verified`, `a_thiefs_entry_first_verified_after_the_loss_is_left_out`, `a_revoked_key_is_outside_its_cut`, `a_device_whose_key_is_revoked_here_is_refused_by_name` |
-| c4 | Seal audiences are persons (devices and groups are not audiences here): a reader opens what its person may read, and a person outside the audience cannot; a writer outside the audience is told so; a relay sees no path | `a_writer_in_a_private_space_seals_and_a_reader_outside_the_audience_gets_sealed`, `a_writer_outside_the_audience_is_told_so_not_to_retry`, `an_audience_member_waiting_for_its_key_is_told_to_retry_not_sealed`, `may_grant_refuses_each_of_the_four_conditions_and_names_which`, `a_non_reader_gets_no_answer_and_the_granter_fetches_nothing`, `a_relay_sees_no_path` |
+| c4 | Seal audiences are persons (devices and groups are not audiences here): a reader opens what its person may read, and a person outside the audience cannot; a writer outside the audience is told so; a relay sees no path | `a_writer_in_a_private_space_seals_and_a_reader_outside_the_audience_gets_sealed`, `a_writer_outside_the_audience_is_told_so_not_to_retry`, `an_audience_member_waiting_for_its_key_is_told_to_retry_not_sealed`, `may_grant_refuses_each_condition_and_names_which`, `a_non_reader_gets_no_answer_and_the_granter_fetches_nothing`, `a_relay_sees_no_path` |
 | c8 | A device back after a long absence fetches only what changed and reports exactly the changed paths, in far fewer round trips than one per entry | `a_returning_device_fetches_only_what_changed` (in `sync_tests` and over a forwarder in `mesh_net_tests`), `a_gap_in_the_notice_is_backfilled_in_a_window`, `a_cold_open_reads_one_marker_per_device_not_one_per_entry` |
 | c9 | A space replicates exactly its members' logs: every member's entry reaches the others, and a non-member's entry under the same path reaches no one | `an_entry_before_the_members_entry_that_admits_its_writer_waits_for_it`, `a_listed_writers_own_device_packets_verify_and_nothing_else_of_hers_does`, `a_person_no_listing_names_has_nothing_judged`, `a_non_writer_put_is_refused_not_allowed` |
 | k1 | No validity depends on a reader's clock: a key whose certificate lapsed is refused until the owner ends it, and after the cut a reader a year ahead still accepts what was signed before the lapse | `a_key_lapsed_by_this_clock_is_lapsed` (the cut half: suite only) |
@@ -2436,7 +2604,7 @@ dropped, a start from the image), `image`, `restore` and `block_flush`.
 | d9 | A crash between a put and its flush never makes the device sign a different entry at a seq a peer saw | `d9_a_crash_between_put_and_flush_never_re_signs_a_seq_a_peer_saw`, `no_two_entries_at_one_seq_for_random_crash_points`, `never_signs_above_r_durable` |
 | d10 | The same with the peer reachable: the entries the peer held come back whole, adopted, with no hole for them | `d10_a_crash_between_put_and_flush_with_the_peer_reachable_returns_the_entries_whole`, `recovery_adopts_only_own_entries_that_verify_chain_and_lie_within_r_durable` |
 | d11 | With no peer, the hole is signed and readers do not wait for it | `d11_with_no_peer_the_hole_is_signed_and_readers_do_not_wait`, `the_first_entry_after_an_unclean_open_states_the_gap`, `a_void_declared_by_a_gap_statement_is_never_asked` |
-| d12 | A restored old image with peers online raises `RolledBack`: the entries above are stored, not applied, and nothing is re-signed | `d12_a_restored_old_image_with_peers_online_raises_rolledback_and_reuses_nothing`, `an_own_entry_above_r_durable_raises_rolledback_and_is_not_applied`, `an_old_image_adopts_what_the_previous_run_could_have_signed_and_resumes_above_the_rest` |
+| d12 | A restored old image with peers online raises `RolledBack`, applies the own entries above the reservation that chain (so this device and its peers read the same value), and signs above them: nothing is re-signed | `d12_a_restored_old_image_with_peers_online_raises_rolledback_and_reuses_nothing`, `an_old_image_applies_every_own_entry_that_chains_and_resumes_above_them`, `an_own_entry_above_r_durable_that_chains_to_nothing_held_raises_rolledback_and_waits`, `recovery_adopts_only_own_entries_that_verify_chain_and_lie_within_r_durable` |
 | d13 | A killed process loses nothing that returned | `d13_kill_9_loses_nothing_on_fjall`, `d13_kill_9_loses_nothing_on_redb`, `kill_9_loses_nothing_on_fjall`, `kill_9_loses_nothing_on_redb` |
 | d14 | A failed reservation flush refuses puts past `R_durable` with the disk's reason, raises `StoreFailed`, and reads continue | `d14_a_failed_reservation_flush_refuses_puts_past_r_with_the_disks_reason_and_reads_continue`, `a_failed_flush_is_sticky_and_refuses_signing_past_r_durable_with_the_disks_reason_and_reads_continue` |
 | d15 | A durable put survives a power cut | `d15_a_durable_put_survives_crash`, `a_power_cut_keeps_what_a_returned_flush_covered_on_fjall`, `a_power_cut_keeps_what_a_returned_flush_covered_on_redb` |
@@ -2452,6 +2620,9 @@ dropped, a start from the image), `image`, `restore` and `block_flush`.
 | q4 | A cold device joining a space whose writer crashed twice fetches every entry and asks for no seq inside a declared gap beyond the miss bound | `a_void_declared_by_a_gap_statement_is_never_asked`, `a_gap_in_the_notice_is_backfilled_in_a_window` |
 | q5 | Two owner devices remove two readers at once: after the repair writers seal in one complete epoch and neither removed reader opens later entries | `concurrent_removals_leave_a_complete_epoch_after_each_owner_device_repairs`, `concurrent_removals_end_with_one_complete_epoch`, `a_writer_never_seals_in_an_outgrown_epoch` |
 | q6 | A new device of an admitted person gets the epoch key by grant and reads that epoch's history; a removed person's new device is refused | `a_new_device_of_an_admitted_person_gets_the_key_by_a_grant`, `a_reader_added_by_an_add_reads_the_history_of_that_epoch`, `a_removed_reader_is_refused_every_later_grant` |
+| q7 | A reader added after the creation and removed again leaves its epoch out of force though the epoch's audience never changed: a new epoch is signed and the removed reader opens nothing written after | `a_reader_added_to_an_epoch_and_removed_leaves_it_out_of_force`, `holders_keep_every_reader_ever_named_to_an_epoch_and_the_audience_only_the_standing`, `holders_never_shrink_and_bound_the_epoch_in_force`, `a_reader_added_by_change_and_removed_again_cannot_open_the_next_put`, `a_reader_added_by_an_add_and_removed_reads_nothing_written_after` |
+| q8 | An epoch a held epoch replaces is never in force, whatever the order of the creators' names, and returns when the replacing entry is withdrawn | `an_epoch_a_held_epoch_replaces_is_never_in_force_whatever_their_order`, `withdrawing_an_epoch_equals_never_having_seen_it`, `only_a_put_or_an_epoch_names_what_it_supersedes` |
+| q9 | A reader's device whose key is revoked is granted no key and the epoch it held goes out of force: an owner device signs one new epoch that replaces it, a restart none more; a granter's kept seal key and grant never outlive a revocation | `may_grant_refuses_each_condition_and_names_which`, `an_asker_with_a_revoked_key_gets_no_grant`, `a_reader_device_with_a_revoked_key_is_refused_every_grant`, `a_kept_seal_key_and_grant_are_not_served_after_the_judge_moves`, `revoking_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_once` |
 
 ### 13.4 Signals (with the signal transport, one provider)
 
@@ -2640,16 +2811,16 @@ Each property of §1.6 is held by one module and shown by named tests (the
 | 2 | Other bytes at a kept seq are refused | `log/chain.rs` | `other_bytes_at_a_kept_seq_are_refused` |
 | 3 | Membership converges; removal wins | `fold.rs` | `fold_state_is_independent_of_arrival_order`, `removal_beats_an_add_of_the_same_id`, `a_fresh_id_readmits`, `concurrent_removals_leave_a_complete_epoch_after_each_owner_device_repairs` |
 | 4 | A late removal or revocation withdraws what was applied | `log/admit.rs`, `node.rs` | `a_late_cut_withdraws_what_it_does_not_keep`, `withdrawing_a_head_restores_the_entry_it_superseded` (log, register), `a_context_the_keyring_adopts_is_announced` |
-| 5 | A writer never seals in an outgrown epoch | `fold.rs`, `log/own.rs` | `a_writer_never_seals_in_an_outgrown_epoch`, `a_removed_reader_leaves_no_epoch_in_force_until_the_owner_repairs` |
-| 6 | An epoch key goes only to whom the records admit, and is checked | `seal.rs`, `serve.rs` | `may_grant_refuses_each_of_the_four_conditions_and_names_which`, `a_key_that_fails_the_key_check_is_dropped`, `a_non_reader_gets_no_answer_and_the_granter_fetches_nothing`, `a_removed_reader_is_refused_every_later_grant` |
+| 5 | A writer never seals in an outgrown epoch: one a removed reader holds, or a revoked reader device may hold | `fold.rs`, `log/own.rs`, `space.rs` | `a_writer_never_seals_in_an_outgrown_epoch`, `a_removed_reader_leaves_no_epoch_in_force_until_the_owner_repairs`, `a_reader_added_to_an_epoch_and_removed_leaves_it_out_of_force`, `a_reader_added_by_change_and_removed_again_cannot_open_the_next_put`, `revoking_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_once` |
+| 6 | An epoch key goes only to whom the records admit, and is checked | `seal.rs`, `serve.rs` | `may_grant_refuses_each_condition_and_names_which`, `a_key_that_fails_the_key_check_is_dropped`, `a_non_reader_gets_no_answer_and_the_granter_fetches_nothing`, `a_removed_reader_is_refused_every_later_grant`, `an_asker_with_a_revoked_key_gets_no_grant`, `a_kept_seal_key_and_grant_are_not_served_after_the_judge_moves` |
 | 7 | An unsealed entry in a sealed space is refused | `log/admit.rs` | `an_unsealed_entry_in_a_sealed_space_is_refused`, `a_sealed_entry_in_a_public_space_is_refused` |
 | 8 | Digests are signed-region digests | `wire/digest.rs`, `log/admit.rs` | `a_reencoded_copy_has_the_same_signed_digest`, `a_relays_high_s_copy_changes_nothing` |
-| 9 | The head survives restart; a replayed lower one changes nothing | `store.rs`, `reserve.rs`, `log.rs` | `a_devices_own_head_after_restart_comes_from_every_stored_own_entry_name_even_if_one_does_not_decode`, `an_own_entry_above_r_durable_raises_rolledback_and_is_not_applied`, `d9_a_crash_between_put_and_flush_never_re_signs_a_seq_a_peer_saw`, `no_two_entries_at_one_seq_for_random_crash_points` |
+| 9 | The head survives restart; a replayed lower one changes nothing | `store.rs`, `reserve.rs`, `log.rs` | `a_devices_own_head_after_restart_comes_from_its_ledger_even_if_an_entry_does_not_decode`, `a_device_that_cannot_read_its_own_ledger_does_not_open_the_space`, `a_reopen_in_the_same_process_trusts_only_an_r_a_flush_covered`, `an_own_entry_above_r_durable_raises_rolledback_and_is_not_applied`, `d9_a_crash_between_put_and_flush_never_re_signs_a_seq_a_peer_saw`, `no_two_entries_at_one_seq_for_random_crash_points` |
 | 10 | No decision accepts anything because of a clock | `trust.rs` | `a_key_lapsed_by_this_clock_is_lapsed` |
 | 11 | A notice is bounded and decides nothing | `heard.rs`, `sync.rs` | `heard_never_displaces_a_vouched_device`, `a_sync_interest_naming_many_devices_leaves_the_list_bounded`, `a_vector_naming_a_device_at_counter_zero_is_ignored`, `a_notice_names_nothing_it_decides` |
 | 12 | A miss decides nothing; ask again while owed | `fetch.rs` | `a_forged_entry_is_asked_again_with_growing_pauses`, `a_replayed_stale_notice_never_stops_the_fetch_of_a_newer_entry` |
 | 13 | A space replicates exactly its members' logs | `log/admit.rs`, `node.rs` | `a_members_entry_from_a_device_outside_the_owner_namespace_is_refused`, `an_entry_before_the_members_entry_that_admits_its_writer_waits_for_it`, `follow_stores_and_serves_but_publishes_no_vector_entry_and_reads_nothing_sealed` |
-| 14 | A big payload verifies piece by piece; a sealed one shows only its size | `pieces.rs`, `wire/pieces.rs` | `a_piece_from_a_stranger_verifies_by_digest_alone`, `a_sealed_payload_shows_only_its_size`, `pieces_are_written_in_one_batch` |
+| 14 | A big payload verifies piece by piece; a sealed one shows only its size; memory does not grow with the blobs held | `pieces.rs`, `wire/pieces.rs`, `fetch.rs`, `space.rs` | `a_piece_from_a_stranger_verifies_by_digest_alone`, `a_sealed_payload_shows_only_its_size`, `pieces_are_written_in_one_batch_by_the_writer_and_kept_as_the_reader_proves_them`, `a_payload_with_a_piece_missing_reads_no_chunk`, `only_a_few_values_are_gathered_at_once_and_every_one_in_turn`, `opening_a_space_reads_no_payload_and_no_piece`, `a_watch_reads_a_value_in_pieces_only_when_it_reaches_it`, `a_value_whose_piece_the_store_lost_is_unavailable_and_gathered_again` |
 | 15 | Errors say why and what to do; `put` never waits on the network | `error.rs`, `space.rs` | `every_refusal_names_a_next_step`, `a_put_never_waits_on_the_network` |
 
 ## 15. TLV registry

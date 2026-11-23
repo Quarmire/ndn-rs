@@ -11,7 +11,9 @@ use ndn_sync::StoreOp;
 use super::admit::{Applying, Fresh};
 use super::chain::Status;
 use super::*;
-use crate::wire::{AFTER_MAX, MembersBody, Op, Prev, SealedBody, TIPS_MAX, WireError};
+use crate::wire::{
+    AFTER_MAX, Body, Entry, EntryRef, MembersBody, Op, Prev, Role, SealedBody, WireError,
+};
 
 impl Log {
     /// Sign, store and apply an own write of `payload` at `path`. `extra` are
@@ -109,7 +111,7 @@ impl Log {
         });
         self.sign_next(
             body,
-            vec![],
+            self.epoch_tips(),
             None,
             vec![StoreOp::Insert(at, stored)],
             now,
@@ -117,7 +119,36 @@ impl Log {
         )
     }
 
-    fn owner_only(&self) -> Result<(), HeapError> {
+    /// The Epoch entries no held epoch replaces: what a new Epoch entry
+    /// replaces, so that it is the one in force whatever the order of their
+    /// creators' names. The greatest [`AFTER_MAX`] when there are more.
+    fn epoch_tips(&self) -> Vec<EntryRef> {
+        let mut refs = Vec::new();
+        for id in self.fold.epoch_tips().into_iter().rev().take(AFTER_MAX) {
+            let named = self.fold.epoch_body(&id);
+            let digest = self
+                .view()
+                .wires_at(&id.creator, id.seq)
+                .iter()
+                .filter_map(decode_wire)
+                .find(|(entry, _)| matches!(&entry.body, Body::Epoch(b) if Some(b) == named))
+                .map(|(_, digest)| digest);
+            if let Some(digest) = digest {
+                refs.push(EntryRef {
+                    device: id.creator,
+                    seq: id.seq,
+                    digest,
+                });
+            }
+        }
+        refs
+    }
+
+    /// Whether this device is an owner device: its name is under the space's
+    /// owner's and its key is vouched for as the owner's person (the rule
+    /// admission applies to Members and Epoch entries). The refusal says what
+    /// to do.
+    pub(crate) fn owner_only(&self) -> Result<(), HeapError> {
         if wire::owns(&self.space, &self.key) && self.person == *self.fold.owner() {
             Ok(())
         } else {
@@ -170,6 +201,15 @@ impl Log {
 
     /// `Ok(None)`: the next seq may be signed now; `Some(ticket)`: wait for it.
     fn gate(&self) -> Result<Option<Ticket>, HeapError> {
+        if self.next_seq <= self.own_head {
+            return Err(HeapError::Local {
+                reason: format!(
+                    "this device holds an entry of its own at seq {}, the last seq there is, so \
+                     it can sign no more in this space; use another device or another space",
+                    self.own_head
+                ),
+            });
+        }
         match self.reservation.sign_gate(self.next_seq) {
             Gate::Ok => Ok(None),
             Gate::Wait(ticket) => Ok(Some(ticket)),
@@ -190,7 +230,7 @@ impl Log {
                 digest: [0; 32],
                 seq: Some(0),
             }),
-            Some(tip) if tip.seq + 1 == seq => Some(Prev {
+            Some(tip) if tip.seq.checked_add(1) == Some(seq) => Some(Prev {
                 digest: tip.digest,
                 seq: None,
             }),
@@ -269,7 +309,7 @@ impl Log {
             now,
             &mut fx,
         );
-        self.next_seq = seq + 1;
+        self.next_seq = seq.saturating_add(1);
         fx.publish = Some(Publish { seq, structural });
         self.settle(&mut fx);
         Ok(Step::Done(Signed {
@@ -279,39 +319,113 @@ impl Log {
     }
 
     /// What a removal of `person` binds: per device of the person this device
-    /// knows, the highest verified seq it holds and its signed digest. What
-    /// it never held is outside the cut. The node decides how long it looked
-    /// for more before asking (`Config.first_look`).
+    /// knows, the highest entry it holds that passed admission (applied, or
+    /// closed for want of its epoch's key) and its signed digest. A refused
+    /// fork above it is no tip: the honest history below would wait for it
+    /// for good. What it never held is outside the cut. The node decides how
+    /// long it looked for more before asking (`Config.first_look`).
     pub(crate) fn removal_tips(&self, person: &Name) -> Vec<EntryRef> {
-        let mut tips: Vec<EntryRef> = self
-            .devices
+        let view = self.view();
+        self.devices
             .iter()
             .filter(|(_, d)| d.person == *person)
             .filter_map(|(device, d)| {
-                d.tip.map(|t| EntryRef {
-                    device: device.clone(),
-                    seq: t.seq,
-                    digest: t.digest,
-                })
-            })
-            .collect();
-        tips.truncate(TIPS_MAX);
-        tips
-    }
-
-    /// The operations that remove `person` from every role: a `Remove` of
-    /// each Add of the person that stands, bound by [`Log::removal_tips`].
-    pub(crate) fn remove_ops(&self, person: &Name) -> Vec<Op> {
-        let tips = self.removal_tips(person);
-        self.fold
-            .standing_ids(person)
-            .into_iter()
-            .map(|id| Op::Remove {
-                id,
-                tips: tips.clone(),
+                let mut at = d.held.max();
+                while let Some(seq) = at {
+                    if matches!(view.status(device, seq), None | Some(Status::Closed)) {
+                        return Some(EntryRef {
+                            device: device.clone(),
+                            seq,
+                            digest: view.marker(device, seq)?.signed_digest,
+                        });
+                    }
+                    at = d.held.below(seq);
+                }
+                None
             })
             .collect()
     }
+
+    /// The operations that remove `person` from every role: a `Remove` of
+    /// each Add of the person that stands. Only a writer Add's Remove binds
+    /// [`Log::removal_tips`] (the fold reads no tips of a reader's); they
+    /// are spread over as many Removes of the Add as an entry holds, which
+    /// the fold unites.
+    pub(crate) fn remove_ops(&self, person: &Name) -> Vec<Op> {
+        let tips = self.removal_tips(person);
+        self.fold
+            .standing_adds(person)
+            .into_iter()
+            .flat_map(|(id, role)| match role {
+                Role::Writer => remove_with_tips(id, &tips),
+                Role::Reader => vec![Op::Remove {
+                    id,
+                    tips: Vec::new(),
+                }],
+            })
+            .collect()
+    }
+}
+
+/// Whether a Members entry with `ops` can be signed: what the format and the
+/// packet allow, with the longest chain link an entry states.
+fn fits(ops: &[Op]) -> bool {
+    Entry {
+        prev: Some(Prev {
+            digest: [1; 32],
+            seq: Some(u64::MAX),
+        }),
+        after: Vec::new(),
+        body: Body::Members(MembersBody {
+            create: None,
+            ops: ops.to_vec(),
+        }),
+    }
+    .encode()
+    .is_ok()
+}
+
+/// `Remove`s of `id` that together bind `tips`, each of which fits an entry.
+fn remove_with_tips(id: [u8; 16], tips: &[EntryRef]) -> Vec<Op> {
+    let mut out = Vec::new();
+    let mut run: Vec<EntryRef> = Vec::new();
+    for tip in tips {
+        run.push(tip.clone());
+        if run.len() > 1
+            && !fits(&[Op::Remove {
+                id,
+                tips: run.clone(),
+            }])
+        {
+            let last = run.pop().expect("just pushed");
+            out.push(Op::Remove {
+                id,
+                tips: std::mem::take(&mut run),
+            });
+            run.push(last);
+        }
+    }
+    out.push(Op::Remove { id, tips: run });
+    out
+}
+
+/// `ops` as the bodies of as few Members entries as the entry limits allow:
+/// no more operations than one carries, and no more octets than a packet.
+pub(crate) fn pack_ops(ops: Vec<Op>) -> Vec<Vec<Op>> {
+    let mut out = Vec::new();
+    let mut batch: Vec<Op> = Vec::new();
+    for op in ops {
+        batch.push(op);
+        if batch.len() > 1 && !fits(&batch) {
+            let op = batch.pop().expect("just pushed");
+            out.push(std::mem::take(&mut batch));
+            batch.push(op);
+        }
+    }
+    if !batch.is_empty() {
+        out.push(batch);
+    }
+    out
 }
 
 /// A wire limit as the API says it.

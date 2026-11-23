@@ -219,6 +219,13 @@ impl Flusher {
         Ticket(self.st.lock().durable)
     }
 
+    /// The ticket that covers every write made so far, when a returned flush
+    /// does not cover them all yet; `None` when everything written is durable.
+    pub(crate) fn unflushed(&self) -> Option<Ticket> {
+        let st = self.st.lock();
+        (st.issued > st.durable).then_some(Ticket(st.issued))
+    }
+
     /// The store's failure, once it failed.
     pub(crate) fn failure(&self) -> Option<DiskFailure> {
         self.st.lock().failure.clone()
@@ -362,8 +369,8 @@ pub(crate) struct Reservation {
 
 impl Reservation {
     /// Open the reservation of `space`. `adopted_head` is the own head the
-    /// caller found (from entry names: [`crate::store::own_head_from_names`],
-    /// then recovery from peers), 0 when it holds none.
+    /// caller found (the newest own entry the store holds, then recovery
+    /// from peers), 0 when it holds none.
     ///
     /// The start is clean iff the record says so, `R` is the head record's
     /// seq, and the names show no own entry above it. The first seq is
@@ -371,6 +378,12 @@ impl Reservation {
     /// have seen. Before anything is signed the next reservation, `R` plus a
     /// block above that point, is written and a flush requested; the first
     /// put waits for it only if it arrives before it completes.
+    ///
+    /// The `R` the store answers with is durable only if every write made
+    /// before it was read is: in a process that left the space and opens it
+    /// again, the store lists the first run's `R` before any flush covered it.
+    /// Such an `R` becomes durable when the flush covering the writes so far
+    /// returns, and till then nothing is signed under it.
     ///
     /// An unreadable record is an error: with `R` unknown a seq a peer saw
     /// could be signed again.
@@ -384,8 +397,10 @@ impl Reservation {
         let reserve = read_reserve(&*store, space)?;
         let head = read_head(&*store, space)?.map_or(0, |h| h.seq);
         let recorded = reserve.map_or(0, |r| r.r);
+        let uncovered = flusher.unflushed();
         let clean = reserve.is_some_and(|r| r.clean && r.r == head) && adopted_head == head;
-        let first_seq = adopted_head.max(recorded) + 1;
+        let above = adopted_head.max(recorded);
+        let first_seq = above.saturating_add(1);
         let reservation = Reservation {
             space: space.clone(),
             block,
@@ -393,14 +408,17 @@ impl Reservation {
             flusher,
             st: Mutex::new(ReserveState {
                 r: recorded,
-                durable_r: recorded,
-                pending: VecDeque::new(),
+                durable_r: if uncovered.is_some() { 0 } else { recorded },
+                pending: uncovered
+                    .map(|ticket| (ticket, recorded))
+                    .into_iter()
+                    .collect(),
                 closed: false,
             }),
         };
         {
             let mut st = reservation.st.lock();
-            let r = recorded.max(first_seq - 1) + block;
+            let r = above.saturating_add(block);
             reservation.write(&mut st, r);
         }
         Ok(Opened {
@@ -463,7 +481,7 @@ impl Reservation {
         self.promote(&mut st);
         let failure = self.flusher.failure();
         if failure.is_none() && seq > st.r.saturating_sub(self.block / 2) {
-            let r = st.r.max(seq) + self.block;
+            let r = st.r.max(seq).saturating_add(self.block);
             self.write(&mut st, r);
         }
         if seq <= st.durable_r {

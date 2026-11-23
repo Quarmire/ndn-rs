@@ -190,6 +190,35 @@ impl Entry {
         Ok(entry)
     }
 
+    /// The chain link the Content of a log packet states, read without its
+    /// body: what a packet that verifies and does not [`decode`](Self::decode)
+    /// still says of the entry before it. `None` when the `ENTRY` itself or
+    /// its link cannot be read (PREV that is no digest, a repeated PREV, a
+    /// PREV_SEQ without PREV, zero digest and `PREV_SEQ` that disagree);
+    /// `Some(None)` when it states none.
+    pub(crate) fn decode_prev(content: &[u8]) -> Option<Option<Prev>> {
+        let value = only(Bytes::copy_from_slice(content), tlv::ENTRY, "an entry").ok()?;
+        let (mut prev, mut prev_seq) = (None, None);
+        each(value, |t, v| {
+            match t {
+                tlv::PREV => once(&mut prev, read_digest(&v)?, "PREV")?,
+                tlv::PREV_SEQ => once(&mut prev_seq, read_nni(&v)?, "PREV_SEQ")?,
+                _ => {}
+            }
+            Ok(true)
+        })
+        .ok()?;
+        let prev = match (prev, prev_seq) {
+            (Some(digest), seq) => Some(Prev { digest, seq }),
+            (None, None) => None,
+            (None, Some(_)) => return None,
+        };
+        let consistent = prev
+            .as_ref()
+            .is_none_or(|p| (p.digest == ZERO_DIGEST) == (p.seq == Some(0)));
+        consistent.then_some(prev)
+    }
+
     /// The limits of the format, held when writing and when reading.
     fn validate(&self) -> Result<(), WireError> {
         if let Some(prev) = &self.prev
@@ -203,12 +232,12 @@ impl Entry {
         too_many(
             self.after.len(),
             AFTER_MAX,
-            "the superseded heads of an entry",
+            "the superseded heads of an entry, or the epochs an epoch replaces",
         )?;
-        if !self.after.is_empty() && self.kind() != Kind::Put {
+        if !self.after.is_empty() && self.kind() == Kind::Members {
             return Err(WireError::Malformed(
-                "only a write names the heads it supersedes; a members or epoch entry carries \
-                 none",
+                "only a write names the heads it supersedes and only an epoch the epochs it \
+                 replaces; a members entry carries none",
             ));
         }
         self.after.iter().try_for_each(check_ref)?;

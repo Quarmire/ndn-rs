@@ -4,6 +4,8 @@
 //! Memory is O(devices + ranges + removed devices): no entry and no marker
 //! is held. A marker is read from the store when a decision needs it.
 
+use std::collections::BTreeMap;
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use ndn_foundation_types::Name;
 use ndn_sync::DataStore;
@@ -12,6 +14,12 @@ use crate::error::{Cut, Refusal};
 use crate::store::{ChainEnd, Link, Marker, verified_key, walk_chain};
 use crate::wire::log_name;
 
+/// The most separate runs of held seqs, and the most gap statements, this
+/// device keeps for one device: the `ledger/` record is rewritten with every
+/// entry and so must not grow without bound. A device signing with gaps
+/// (one per unclean start) reaches it after as many restarts.
+pub(super) const RANGES_MAX: usize = 1024;
+
 /// A set of seqs as sorted, disjoint, non-adjacent inclusive ranges.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Ranges(Vec<(u64, u64)>);
@@ -19,7 +27,7 @@ pub(super) struct Ranges(Vec<(u64, u64)>);
 impl Ranges {
     pub(super) fn insert(&mut self, seq: u64) {
         match self.0.last_mut() {
-            Some((_, hi)) if *hi + 1 == seq => *hi = seq,
+            Some((_, hi)) if hi.checked_add(1) == Some(seq) => *hi = seq,
             Some((_, hi)) if *hi >= seq => self.insert_range(seq, seq),
             _ => self.0.push((seq, seq)),
         }
@@ -29,21 +37,43 @@ impl Ranges {
         if lo > hi {
             return;
         }
-        self.0.push((lo, hi));
-        self.0.sort_unstable();
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.0.len());
-        for &(a, b) in &self.0 {
+        let mut all = std::mem::take(&mut self.0);
+        all.push((lo, hi));
+        *self = Ranges::merged(all);
+    }
+
+    /// The set of the runs `all`, in any order, overlapping or touching.
+    fn merged(mut all: Vec<(u64, u64)>) -> Ranges {
+        all.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(all.len());
+        for (a, b) in all {
             match merged.last_mut() {
                 Some((_, hi)) if a <= hi.saturating_add(1) => *hi = (*hi).max(b),
                 _ => merged.push((a, b)),
             }
         }
-        self.0 = merged;
+        Ranges(merged)
     }
 
     /// How many seqs the set holds.
     pub(super) fn count(&self) -> u64 {
-        self.0.iter().map(|&(lo, hi)| hi - lo + 1).sum()
+        self.0.iter().fold(0u64, |n, &(lo, hi)| {
+            n.saturating_add((hi - lo).saturating_add(1))
+        })
+    }
+
+    /// How many separate runs the set has.
+    pub(super) fn runs(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether inserting `lo..=hi` would make another run: no run touches or
+    /// overlaps it.
+    pub(super) fn grows_by(&self, lo: u64, hi: u64) -> bool {
+        let at = self.0.partition_point(|&(_, h)| h.saturating_add(1) < lo);
+        self.0
+            .get(at)
+            .is_none_or(|&(l, _)| l > hi.saturating_add(1))
     }
 
     pub(super) fn contains(&self, seq: u64) -> bool {
@@ -77,20 +107,19 @@ impl Ranges {
         Some(lo.max(seq + 1))
     }
 
+    /// The union of this set and `also`.
+    fn union(&self, also: &Ranges) -> Ranges {
+        Ranges::merged(self.0.iter().chain(&also.0).copied().collect())
+    }
+
     /// [`Self::prefix`] of the union with `also`.
     pub(super) fn prefix_with(&self, also: &Ranges) -> u64 {
-        let mut all = self.clone();
-        for &(a, b) in &also.0 {
-            all.insert_range(a, b);
-        }
-        all.prefix()
+        self.union(also).prefix()
     }
+
     /// The seqs of `1..=upto` in neither this set nor `also`, as ranges.
     pub(super) fn gaps(&self, upto: u64, also: &Ranges) -> Vec<(u64, u64)> {
-        let mut all = self.clone();
-        for &(a, b) in &also.0 {
-            all.insert_range(a, b);
-        }
+        let all = self.union(also);
         let mut out = Vec::new();
         let mut next = 1;
         for &(lo, hi) in &all.0 {
@@ -170,10 +199,15 @@ pub(super) struct Dev {
     pub person: Name,
     /// The seqs with a marker: every verified entry, applied or not.
     pub held: Ranges,
-    /// The seqs its entries declared absent: `(PREV_SEQ, seq)` of a gap
-    /// statement.
+    /// The gap statements that count: seq of the admitted, non-equivocal
+    /// entry that stated one → the `PREV_SEQ` it named. What it declares
+    /// absent is `(PREV_SEQ + 1, seq - 1)`.
+    pub gaps: BTreeMap<u64, u64>,
+    /// The seqs the counting gap statements declared absent (derived from
+    /// `gaps`).
     pub voids: Ranges,
-    /// The highest seq heard of it (a notice) or held. Never lowered.
+    /// The highest seq held of it. Never lowered; a counter heard raises
+    /// nothing here.
     pub high: u64,
     /// The highest held seq and its signed digest; read from its marker.
     pub tip: Option<Link>,
@@ -187,11 +221,30 @@ impl Dev {
         Dev {
             person,
             held: Ranges::default(),
+            gaps: BTreeMap::new(),
             voids: Ranges::default(),
             high: 0,
             tip: None,
             nonvouching: 0,
         }
+    }
+
+    /// The entry at `seq` stated a gap after `prev_seq` and counts: the seqs
+    /// between are absent.
+    pub(super) fn state_gap(&mut self, seq: u64, prev_seq: u64) {
+        self.gaps.insert(seq, prev_seq);
+        self.voids.insert_range(prev_seq + 1, seq - 1);
+    }
+
+    /// The entry at `seq` no longer counts (it was refused, or found
+    /// equivocal): what only it declared absent is wanted again. Whether it
+    /// had stated a gap.
+    pub(super) fn retract_gap(&mut self, seq: u64) -> bool {
+        if self.gaps.remove(&seq).is_none() {
+            return false;
+        }
+        self.voids = gap_ranges(&self.gaps);
+        true
     }
 
     /// The `ledger/<S>/<device>` record.
@@ -201,7 +254,11 @@ impl Dev {
         out.put_u16(person.len() as u16);
         out.put_slice(&person);
         self.held.put(&mut out);
-        self.voids.put(&mut out);
+        out.put_u32(self.gaps.len() as u32);
+        for (&seq, &prev_seq) in &self.gaps {
+            out.put_u64(seq);
+            out.put_u64(prev_seq);
+        }
         out.freeze()
     }
 
@@ -218,17 +275,37 @@ impl Dev {
         }
         let person = Name::decode_from_tlv(input.split_to(len)).ok()?;
         let held = Ranges::take(&mut input)?;
-        let voids = Ranges::take(&mut input)?;
+        let n = take_u32(&mut input)? as usize;
+        if input.remaining() < n.checked_mul(16)? {
+            return None;
+        }
+        let mut gaps = BTreeMap::new();
+        for _ in 0..n {
+            let (seq, prev_seq) = (input.get_u64(), input.get_u64());
+            if prev_seq.checked_add(1)? >= seq || gaps.insert(seq, prev_seq).is_some() {
+                return None;
+            }
+        }
         let high = held.max().unwrap_or(0);
         Some(Dev {
             person,
             held,
-            voids,
+            voids: gap_ranges(&gaps),
+            gaps,
             high,
             tip: None,
             nonvouching: 0,
         })
     }
+}
+
+/// The seqs declared absent by `gaps` (seq → `PREV_SEQ`).
+fn gap_ranges(gaps: &BTreeMap<u64, u64>) -> Ranges {
+    Ranges::merged(
+        gaps.iter()
+            .map(|(&seq, &prev)| (prev + 1, seq - 1))
+            .collect(),
+    )
 }
 
 /// Why a held entry is not applied: the `status/` record. An applied entry
@@ -265,10 +342,6 @@ impl Status {
                 out.put_u8(8);
                 out.put_slice(why.as_bytes());
             }
-            Status::Refused(Refusal::AboveReservation { reserved }) => {
-                out.put_u8(9);
-                out.put_u64(*reserved);
-            }
             Status::Refused(Refusal::Chain) => out.put_u8(10),
             // The rest are never kept as a status (Lapsed and Suspected are
             // not recorded, Rollback is not an entry's); they read back as
@@ -294,9 +367,6 @@ impl Status {
             7 => Status::Refused(Refusal::Sealed),
             8 => Status::Refused(Refusal::Untrusted {
                 why: String::from_utf8_lossy(rest).into_owned(),
-            }),
-            9 => Status::Refused(Refusal::AboveReservation {
-                reserved: be(rest)?,
             }),
             10 => Status::Refused(Refusal::Chain),
             11 => Status::Refused(Refusal::BadSignature),

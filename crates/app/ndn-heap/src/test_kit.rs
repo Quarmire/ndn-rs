@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -292,6 +293,82 @@ impl DataStore for Held {
         self.syncs.fetch_add(1, Ordering::SeqCst);
         self.gate.pass();
         Ok(())
+    }
+}
+
+/// A store that counts the octets its reads hand out (`get`, `find_under`
+/// and every value a `scan_under` lists): what a case measures to show that
+/// a step reads no more than it needs.
+pub(crate) struct Metered {
+    inner: Arc<dyn DataStore>,
+    octets: AtomicUsize,
+}
+
+impl Metered {
+    /// A counting view of `inner`.
+    pub(crate) fn new(inner: Arc<dyn DataStore>) -> Metered {
+        Metered {
+            inner,
+            octets: AtomicUsize::new(0),
+        }
+    }
+
+    /// Octets of values read since the last [`Self::reset`].
+    pub(crate) fn octets_read(&self) -> usize {
+        self.octets.load(Ordering::SeqCst)
+    }
+
+    /// Start counting again from nothing.
+    pub(crate) fn reset(&self) {
+        self.octets.store(0, Ordering::SeqCst);
+    }
+
+    fn count(&self, wire: &Bytes) {
+        self.octets.fetch_add(wire.len(), Ordering::SeqCst);
+    }
+}
+
+impl DataStore for Metered {
+    fn insert(&self, name: Name, wire: Bytes) {
+        self.inner.insert(name, wire);
+    }
+
+    fn get(&self, name: &Name) -> Option<Bytes> {
+        let found = self.inner.get(name);
+        found.iter().for_each(|wire| self.count(wire));
+        found
+    }
+
+    fn contains(&self, name: &Name) -> bool {
+        self.inner.contains(name)
+    }
+
+    fn find_under(&self, prefix: &Name) -> Option<Bytes> {
+        let found = self.inner.find_under(prefix);
+        found.iter().for_each(|wire| self.count(wire));
+        found
+    }
+
+    fn scan_under(&self, prefix: &Name, limit: usize) -> Vec<(Name, Bytes)> {
+        let found = self.inner.scan_under(prefix, limit);
+        found.iter().for_each(|(_, wire)| self.count(wire));
+        found
+    }
+
+    fn remove(&self, name: &Name) {
+        self.inner.remove(name);
+    }
+
+    fn apply(&self, ops: Vec<StoreOp>) {
+        self.inner.apply(ops);
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.inner.sync()
+    }
+
+    fn sync_is_immediate(&self) -> bool {
+        self.inner.sync_is_immediate()
     }
 }
 
