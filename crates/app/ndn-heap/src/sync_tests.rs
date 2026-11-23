@@ -41,7 +41,7 @@ struct Rig {
     group: Arc<Group>,
 }
 
-async fn rig_with(cfg: NetConfig) -> Rig {
+async fn rig_with(cfg: Config) -> Rig {
     let host = Toyhost::new(LAPTOP);
     let wire = Wire::new();
     let node = Node::from_connection(Arc::clone(&wire) as Arc<dyn Connection>);
@@ -63,7 +63,7 @@ async fn rig_with(cfg: NetConfig) -> Rig {
 }
 
 async fn rig() -> Rig {
-    rig_with(NetConfig::default()).await
+    rig_with(Config::default()).await
 }
 
 /// A notice: `device` says its counter is `high`.
@@ -587,9 +587,9 @@ async fn a_notice_naming_this_device_is_fetched_from_relays_never_from_itself() 
 /// the holes below it cost 4 × block asks.
 #[tokio::test(start_paused = true)]
 async fn recovery_fetches_own_entries_at_most_four_blocks_above_the_head() {
-    let cfg = NetConfig {
+    let cfg = Config {
         reserve_block: 100,
-        ..NetConfig::default()
+        ..Config::default()
     };
     let r = rig_with(cfg).await;
     r.host.hold(LAPTOP, 10);
@@ -979,9 +979,9 @@ async fn a_published_counter_reaches_a_peer_which_fetches_the_entry_through_the_
     let cluster = Cluster::new(&[LAPTOP, PHONE]).await;
     let (laptop, phone) = (cluster.device(0), cluster.device(1));
     let (on_laptop, on_phone) = (Toyhost::new(LAPTOP), Toyhost::new(PHONE));
-    let cfg = NetConfig {
+    let cfg = Config {
         svs: ndn_sync::SvsConfig::lan(),
-        ..NetConfig::default()
+        ..Config::default()
     };
     let laptop_net = Net::start(
         Arc::clone(&on_laptop) as Arc<dyn Host>,
@@ -1035,9 +1035,9 @@ async fn a_published_counter_reaches_a_peer_which_fetches_the_entry_through_the_
 async fn a_peers_counter_for_this_device_is_read_from_the_observed_state() {
     use crate::test_kit::cluster::Cluster;
     let mut cluster = Cluster::new(&[LAPTOP, PHONE]).await;
-    let cfg = NetConfig {
+    let cfg = Config {
         svs: ndn_sync::SvsConfig::lan(),
-        ..NetConfig::default()
+        ..Config::default()
     };
     let on_phone = Toyhost::new(PHONE);
     let phone_net = Net::start(

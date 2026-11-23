@@ -13,9 +13,10 @@ use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, NackReason};
 
 use super::*;
+use crate::node::Config;
 use crate::seal::GrantRefusal;
+use crate::sync::Net;
 use crate::sync::net_kit::*;
-use crate::sync::{Net, NetConfig};
 use crate::test_kit::n;
 use crate::wire::{
     EpochId, GrantAsk, PieceKind, encode_seal_key, grant_name, held_name, log_name, piece_name,
@@ -39,7 +40,7 @@ async fn serving(prefix: &str) -> Server {
     let node = Node::from_connection(Arc::clone(&wire) as Arc<dyn Connection>);
     let net = Net::start(
         Arc::clone(&host) as Arc<dyn Host>,
-        NetConfig::default(),
+        Config::default(),
         node.connection(),
         Face::new() as Arc<dyn Connection>,
     );

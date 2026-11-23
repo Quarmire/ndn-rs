@@ -160,27 +160,23 @@ impl Granting {
 pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Responder) {
     let shared = Arc::clone(&net.shared);
     let name = (*interest.name).clone();
-    let host = Arc::clone(&shared.host);
+    let host = &shared.host;
     let me = host.device().clone();
-    if is_local(&name) {
-        return reply(&name, responder, None).await;
-    }
-    let packet = match served_kind(&name) {
-        Some(Served::Log) => log_packet(&host, &me, &name),
-        Some(Served::Held) => held_packet(&host, &me, &name),
+    let packet = match served_kind(&name).filter(|_| !is_local(&name)) {
+        Some(Served::Log) => packet(host, &name, Some(&me)),
+        Some(Served::Held) => held_packet(host, &me, &name),
         Some(Served::Seal) => parse_seal_key_name(&name)
             .filter(|(device, _)| *device == me)
             .and_then(|_| host.seal_key_packet(&name)),
         Some(Served::Grant) => {
-            let Some((granter, ask)) = parse_grant_name(&name).filter(|(g, _)| *g == me) else {
-                return reply(&name, responder, None).await;
-            };
-            let _ = granter;
-            rt::spawn(async move {
-                let wire = grant(&shared, &name, ask).await;
-                reply(&name, responder, wire).await;
-            });
-            return;
+            if let Some((_, ask)) = parse_grant_name(&name).filter(|(g, _)| *g == me) {
+                rt::spawn(async move {
+                    let wire = grant(&shared, &name, ask).await;
+                    reply(&name, responder, wire).await;
+                });
+                return;
+            }
+            None
         }
         None => None,
     };
@@ -205,21 +201,19 @@ async fn reply(name: &Name, responder: Responder, packet: Option<Bytes>) {
     }
 }
 
-/// An entry of this device, or a piece under one, as the node serves it.
-fn log_packet(host: &HostRef, me: &Name, name: &Name) -> Option<Bytes> {
-    if let Some(log) = parse_log_name(name) {
-        return if log.device == *me {
-            host.served(&log.space, &log.device, log.seq)
-        } else {
-            None
-        };
+/// The entry `name` names, or a piece under one, as the node serves it; with
+/// `only`, an entry of that device alone.
+fn packet(host: &HostRef, name: &Name, only: Option<&Name>) -> Option<Bytes> {
+    let (log, piece) = match parse_log_name(name) {
+        Some(log) => (log, None),
+        None => (parse_log_name(&parse_piece_name(name)?.entry)?, Some(name)),
+    };
+    if only.is_some_and(|device| log.device != *device) {
+        return None;
     }
-    let piece = parse_piece_name(name)?;
-    let log = parse_log_name(&piece.entry)?;
-    if log.device == *me {
-        host.served_piece(&log.space, &log.device, log.seq, name)
-    } else {
-        None
+    match piece {
+        None => host.served(&log.space, &log.device, log.seq),
+        Some(piece) => host.served_piece(&log.space, &log.device, log.seq, piece),
     }
 }
 
@@ -231,14 +225,7 @@ fn held_packet(host: &HostRef, me: &Name, name: &Name) -> Option<Bytes> {
     if holder != *me {
         return None;
     }
-    let wire = match parse_log_name(&original) {
-        Some(log) => host.served(&log.space, &log.device, log.seq)?,
-        None => {
-            let piece = parse_piece_name(&original)?;
-            let log = parse_log_name(&piece.entry)?;
-            host.served_piece(&log.space, &log.device, log.seq, &original)?
-        }
-    };
+    let wire = packet(host, &original, None)?;
     Some(DataBuilder::new(name.clone(), &wire).sign_digest_sha256())
 }
 

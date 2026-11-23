@@ -45,7 +45,7 @@ use crate::seal::{self, GrantRefusal, Granter, Keys};
 use crate::serve;
 use crate::space::{Follower, Heap, Share, SpaceInner, check_audience};
 use crate::store::Kind;
-use crate::sync::{HostRef, Net, NetConfig, Taken};
+use crate::sync::{HostRef, Net, Taken};
 use crate::trust::{Adopter, Adoption, Judge, Judged};
 use crate::wire::{
     EpochId, device_of, is_device_name, is_namespace, log_name, parse_log_name,
@@ -246,13 +246,6 @@ impl Node {
             config.adopter.clone(),
         );
         let adoptions = judge.adoptions();
-        let net_config = NetConfig {
-            svs: config.svs.clone(),
-            lifetime: config.lifetime,
-            window: config.window,
-            in_flight: config.in_flight.max(config.window).max(1),
-            reserve_block: config.reserve_block,
-        };
         let inner = Arc::new_cyclic(|me| NodeInner {
             me: me.clone(),
             device: device.clone(),
@@ -280,7 +273,7 @@ impl Node {
         };
         let net = Net::start(
             Arc::clone(&inner) as HostRef,
-            net_config,
+            inner.config.clone(),
             transport.node.connection(),
             transport.sync,
         );

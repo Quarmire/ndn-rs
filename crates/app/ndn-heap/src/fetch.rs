@@ -12,7 +12,7 @@
 //! holds nothing at or above it (and, for this device, asks nothing up to it
 //! within its reservation): its own gap statement may declare everything
 //! below it absent, and only once it is held and verified are the holes below
-//! it wanted, asked for in a window ([`NetConfig::window`]), in seq order,
+//! it wanted, asked for in a window ([`Config::window`]), in seq order,
 //! minus what a gap statement declared void. A counter nothing signs
 //! therefore costs [`FETCH_TRIES`] asks and then one ask a minute
 //! ([`probe_pause`]), and wants nothing of the log.
@@ -351,14 +351,11 @@ impl Noticed {
     }
 }
 
-enum Phase {
-    Flying,
-    Pause(Instant),
-}
-
+/// One ask: how many asks of it missed in a row, and when it may be made
+/// again (`None`: one is in flight).
 struct Ask {
     misses: u32,
-    phase: Phase,
+    until: Option<Instant>,
 }
 
 /// Every ask that is in flight or pausing, by `(device, seq)`. Entries are
@@ -372,35 +369,48 @@ impl Asks {
     fn flying(&self, device: &Name) -> usize {
         self.by
             .iter()
-            .filter(|((d, _), a)| d == device && matches!(a.phase, Phase::Flying))
+            .filter(|((d, _), a)| d == device && a.until.is_none())
             .count()
     }
 
-    /// Whether `key` is to be asked for now, and after how many misses; when
-    /// it pauses, `next` is lowered to the time to look again.
-    fn due(&self, key: &(Name, u64), now: Instant, next: &mut Option<Duration>) -> Option<u32> {
-        let Some(ask) = self.by.get(key) else {
-            return Some(0);
-        };
-        match ask.phase {
-            Phase::Flying => None,
-            Phase::Pause(until) if until <= now => Some(ask.misses),
-            Phase::Pause(until) => {
-                let left = until - now;
+    /// The ask of `(device, seq)` if it is due now, entered as in flight;
+    /// when it pauses, `next` is lowered to the time to look again.
+    fn begin(
+        &mut self,
+        device: &Name,
+        seq: u64,
+        probe: bool,
+        digest: Option<[u8; 32]>,
+        now: Instant,
+        next: &mut Option<Duration>,
+    ) -> Option<Launch> {
+        let key = (device.clone(), seq);
+        let misses = match self.by.get(&key) {
+            None => 0,
+            Some(Ask { until: None, .. }) => return None,
+            Some(Ask {
+                until: Some(until), ..
+            }) if *until > now => {
+                let left = *until - now;
                 *next = Some(next.map_or(left, |n| n.min(left)));
-                None
+                return None;
             }
-        }
-    }
-
-    fn launch(&mut self, key: (Name, u64), misses: u32) {
+            Some(ask) => ask.misses,
+        };
         self.by.insert(
             key,
             Ask {
                 misses,
-                phase: Phase::Flying,
+                until: None,
             },
         );
+        Some(Launch {
+            device: device.clone(),
+            seq,
+            misses,
+            probe,
+            digest,
+        })
     }
 
     /// Forget every ask of `device`.
@@ -536,7 +546,7 @@ impl Group {
         {
             let mut asks = self.asks.lock();
             asks.by.retain(|(d, s), a| {
-                matches!(a.phase, Phase::Flying)
+                a.until.is_none()
                     || per.get(d).is_some_and(|rs| within(rs, *s))
                     || exact.contains_key(&(d.clone(), *s))
                     || probes.iter().any(|(pd, ph)| pd == d && ph == s)
@@ -547,45 +557,17 @@ impl Group {
                     if budget == 0 {
                         break;
                     }
-                    let key = (device.clone(), seq);
-                    if let Some(misses) = asks.due(&key, now, &mut next) {
-                        asks.launch(key, misses);
-                        launches.push(Launch {
-                            device: device.clone(),
-                            seq,
-                            misses,
-                            probe: false,
-                            digest: None,
-                        });
+                    if let Some(l) = asks.begin(device, seq, false, None, now, &mut next) {
+                        launches.push(l);
                         budget -= 1;
                     }
                 }
             }
             for ((device, seq), digest) in &exact {
-                let key = (device.clone(), *seq);
-                if let Some(misses) = asks.due(&key, now, &mut next) {
-                    asks.launch(key, misses);
-                    launches.push(Launch {
-                        device: device.clone(),
-                        seq: *seq,
-                        misses,
-                        probe: false,
-                        digest: Some(*digest),
-                    });
-                }
+                launches.extend(asks.begin(device, *seq, false, Some(*digest), now, &mut next));
             }
             for (device, seq) in &probes {
-                let key = (device.clone(), *seq);
-                if let Some(misses) = asks.due(&key, now, &mut next) {
-                    asks.launch(key, misses);
-                    launches.push(Launch {
-                        device: device.clone(),
-                        seq: *seq,
-                        misses,
-                        probe: true,
-                        digest: None,
-                    });
-                }
+                launches.extend(asks.begin(device, *seq, true, None, now, &mut next));
             }
         }
         for launch in launches {
@@ -668,27 +650,18 @@ impl Group {
             }
             None => {}
         }
-        {
-            let now = Instant::now();
-            let mut asks = self.asks.lock();
-            let key = (launch.device.clone(), launch.seq);
-            let ask = asks.by.entry(key).or_insert(Ask {
-                misses: 0,
-                phase: Phase::Flying,
-            });
-            if resolved {
-                ask.misses = 0;
-                ask.phase = Phase::Pause(now + REFRESH_PAUSE);
-            } else {
-                ask.misses = launch.misses + 1;
-                let pause = if launch.probe {
-                    probe_pause(launch.misses)
-                } else {
-                    retry_pause(launch.misses)
-                };
-                ask.phase = Phase::Pause(now + pause);
-            }
-        }
+        let (misses, pause) = match resolved {
+            true => (0, REFRESH_PAUSE),
+            false if launch.probe => (launch.misses + 1, probe_pause(launch.misses)),
+            false => (launch.misses + 1, retry_pause(launch.misses)),
+        };
+        self.asks.lock().by.insert(
+            (launch.device, launch.seq),
+            Ask {
+                misses,
+                until: Some(Instant::now() + pause),
+            },
+        );
         self.progress.notify_waiters();
         self.wake.notify_one();
     }

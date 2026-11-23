@@ -13,7 +13,6 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
 
 use bytes::Bytes;
 use futures::FutureExt;
@@ -32,6 +31,7 @@ use crate::face_up::FaceUp;
 use crate::fetch::{self, Asks, Fetcher, Noticed};
 use crate::heard::{HEARD_MAX, Heard};
 use crate::log::{Blob, Outcome};
+use crate::node::Config;
 use crate::register::EntryId;
 use crate::reserve::FlushSink;
 use crate::rt;
@@ -47,36 +47,6 @@ use crate::wire::{EpochId, parse_space_name, sync_group_of};
 /// `verify_end` (this half) and `watch_send` (the node). Disabled, each
 /// costs the callsite check and nothing else; none changes what a node does.
 pub(crate) const TIMELINE: &str = "ndn_heap::timeline";
-
-/// What the network half is tuned by; the node derives it from its `Config`.
-#[derive(Clone, Debug)]
-pub(crate) struct NetConfig {
-    /// The SVS group configuration every group starts from (`local_seq`,
-    /// `max_producers` and `vouch` are set per group).
-    pub svs: SvsConfig,
-    /// How long one Interest lives (default 2 s).
-    pub lifetime: Duration,
-    /// The most entries of one device asked for at once (default 32).
-    pub window: usize,
-    /// The most asks of every kind in flight at once on the node (default
-    /// 256).
-    pub in_flight: usize,
-    /// `Config.reserve_block`: own entries are fetched back at most four
-    /// blocks above the head.
-    pub reserve_block: u64,
-}
-
-impl Default for NetConfig {
-    fn default() -> Self {
-        NetConfig {
-            svs: SvsConfig::default(),
-            lifetime: Duration::from_secs(2),
-            window: 32,
-            in_flight: 256,
-            reserve_block: 1024,
-        }
-    }
-}
 
 /// What the node made of a packet it was handed to take.
 #[derive(Debug)]
@@ -143,7 +113,7 @@ impl Stop {
 /// and what a granter keeps.
 pub(crate) struct Shared {
     pub(crate) host: HostRef,
-    pub(crate) cfg: NetConfig,
+    pub(crate) cfg: Config,
     pub(crate) fetcher: Fetcher,
     pub(crate) grants: Granting,
 }
@@ -173,7 +143,7 @@ impl Net {
     /// announcement of a group when a link comes up are started here.
     pub(crate) fn start(
         host: HostRef,
-        cfg: NetConfig,
+        cfg: Config,
         fetch: Arc<dyn Connection>,
         sync: Arc<dyn Connection>,
     ) -> Arc<Net> {
@@ -226,7 +196,7 @@ impl Net {
             },
         );
         let shared = Arc::new(Shared {
-            fetcher: Fetcher::new(fetch, cfg.lifetime, cfg.in_flight),
+            fetcher: Fetcher::new(fetch, cfg.lifetime, cfg.in_flight.max(cfg.window)),
             host,
             cfg,
             grants: Granting::default(),
