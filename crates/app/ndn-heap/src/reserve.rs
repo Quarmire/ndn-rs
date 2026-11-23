@@ -359,9 +359,9 @@ struct ReserveState {
 pub(crate) struct Reservation {
     space: Name,
     block: u64,
-    /// The store itself, never an open batch of a stage: the flush ticket of
-    /// a write is taken after it returned, and a write kept in a batch has
-    /// not.
+    /// The store itself, never a log's [`crate::store::Batch`]: the flush
+    /// ticket of a write is taken after it returned, and a write kept in a
+    /// batch has not.
     store: Arc<dyn DataStore>,
     flusher: Arc<Flusher>,
     st: Mutex<ReserveState>,

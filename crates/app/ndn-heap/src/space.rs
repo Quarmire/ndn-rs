@@ -30,7 +30,7 @@ use bytes::Bytes;
 use futures::Stream;
 use ndn_foundation_types::Name;
 use ndn_security::confidentiality::ContentKey;
-use ndn_sync::{DataStore, StoreOp};
+use ndn_sync::StoreOp;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
@@ -531,7 +531,7 @@ impl SpaceInner {
         }
         let revoked = self.reader_revocations(node, log);
         !revoked.is_empty()
-            && node.stage.get(&store::revoked_key(&self.name)).as_deref()
+            && node.store.get(&store::revoked_key(&self.name)).as_deref()
                 != Some(&revocations_digest(&revoked)[..])
     }
 
@@ -576,7 +576,7 @@ impl SpaceInner {
             let accounted = revocations_digest(&self.reader_revocations(node, log));
             let step = log.sign_epoch(audience, now)?;
             if matches!(step, Step::Done(..)) {
-                node.stage.insert(
+                node.store.insert(
                     store::revoked_key(&self.name),
                     Bytes::copy_from_slice(&accounted),
                 );
@@ -747,7 +747,7 @@ impl SpaceInner {
     /// whole (`assembled/<entry>`): one lookup, nothing read.
     fn is_whole(&self, node: &NodeInner, blob: &Blob) -> bool {
         let entry = log_name(&blob.id.device, &self.name, blob.id.seq);
-        node.stage.contains(&store::assembled_key(&entry))
+        node.store.contains(&store::assembled_key(&entry))
     }
 
     /// The value in pieces of `blob`, joined from the store and opened:
@@ -764,10 +764,10 @@ impl SpaceInner {
             size: blob.size,
             root: blob.root,
         };
-        let stored = pieces::read(&*node.stage, &name, &body).map_err(|e| {
+        let stored = pieces::read(&*node.store, &name, &body).map_err(|e| {
             // The store lost or damaged a piece it recorded whole: the value
             // is gathered again, from what the store still holds and the peers.
-            node.stage.remove(&store::assembled_key(&name));
+            node.store.remove(&store::assembled_key(&name));
             node.flusher.note_write();
             self.whole.lock().remove(&blob.id);
             node.nudge(&self.name);
@@ -843,7 +843,7 @@ impl SpaceInner {
     /// pieces, in write order) and tell.
     pub(crate) fn assembled(self: &Arc<Self>, node: &Arc<NodeInner>, blob: &Blob) {
         let entry = log_name(&blob.id.device, &self.name, blob.id.seq);
-        node.stage
+        node.store
             .insert(store::assembled_key(&entry), Bytes::from_static(&[1]));
         node.flusher.note_write();
         self.whole.lock().insert(blob.id.clone());

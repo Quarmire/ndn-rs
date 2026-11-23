@@ -26,7 +26,7 @@ pub(super) struct View<'a> {
 impl<'a> View<'a> {
     pub(super) fn of(log: &'a Log) -> View<'a> {
         View {
-            store: &*log.store,
+            store: &log.store,
             space: &log.space,
             keys: &log.keys,
             devices: &log.devices,

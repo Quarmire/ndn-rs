@@ -8,7 +8,6 @@
 //! arrived in.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
@@ -167,8 +166,6 @@ impl Log {
         now: u64,
         probe: bool,
     ) -> (Outcome, Effects) {
-        let stage = Arc::clone(&self.store);
-        let _batch = stage.batch();
         let mut fx = Effects::default();
         let outcome = self.admit_in(wire, data, verified, now, &mut fx, probe);
         self.settle(&mut fx);
@@ -561,7 +558,7 @@ impl Log {
         let Some(kept) = self.kept.get(s.device) else {
             return Some(Verdict::Waiting);
         };
-        match kept.keeps(&*self.store, s.device, &self.space, s.seq, &s.digest) {
+        match kept.keeps(&self.store, s.device, &self.space, s.seq, &s.digest) {
             Keeps::Yes => None,
             Keeps::Waiting => Some(Verdict::Waiting),
             Keeps::No => Some(Verdict::Refuse(Refusal::OutsideCut(Cut {
@@ -630,7 +627,7 @@ impl Log {
             return;
         };
         let before = (kept.ranges.clone(), kept.frontier.clone());
-        kept.advance(&*self.store, device, &self.space);
+        kept.advance(&self.store, device, &self.space);
         if (kept.ranges.clone(), kept.frontier.clone()) == before {
             return;
         }
@@ -723,7 +720,7 @@ impl Log {
                 let put = a.put.as_ref().expect("a write that is applied is opened");
                 let write = write_for(put, a.person.clone());
                 let view = View {
-                    store: &*self.store,
+                    store: &self.store,
                     space: &self.space,
                     keys: &self.keys,
                     devices: &self.devices,
@@ -776,7 +773,7 @@ impl Log {
         match &a.entry.body {
             Body::Put(_) | Body::Sealed(_) => {
                 let view = View {
-                    store: &*self.store,
+                    store: &self.store,
                     space: &self.space,
                     keys: &self.keys,
                     devices: &self.devices,
@@ -915,7 +912,7 @@ impl Log {
             if self.kept.get(&device).is_some_and(|k| k.tips == tips) {
                 continue;
             }
-            let kept = Kept::compute(&*self.store, &device, &self.space, tips);
+            let kept = Kept::compute(&self.store, &device, &self.space, tips);
             fx.wants.extend(frontier_wants(&device, &kept));
             self.kept.insert(device, kept);
         }
@@ -923,9 +920,10 @@ impl Log {
 
     // -- Re-check -------------------------------------------------------------------
 
-    /// Judge the entries a change of facts may have changed, until none does.
-    /// Applying and withdrawing only ever add facts the owner signed, so this
-    /// ends.
+    /// Judge the entries a change of facts may have changed, until none does,
+    /// then hand everything the call wrote to the store as one batch. Applying
+    /// and withdrawing only ever add facts the owner signed, so this ends. The
+    /// last step of every call that stores.
     pub(super) fn settle(&mut self, fx: &mut Effects) {
         while let Some(scope) = self.queue.pop() {
             for (device, seqs) in self.candidates(&scope) {
@@ -934,6 +932,7 @@ impl Log {
                 }
             }
         }
+        self.store.commit();
     }
 
     fn candidates(&self, scope: &Scope) -> Vec<(Name, Ranges)> {
@@ -1057,8 +1056,6 @@ impl Log {
     /// store that failed) is kept as `Untrusted`, which a later copy that
     /// verifies re-assesses; kept as itself it would be final.
     pub(crate) fn withdraw(&mut self, device: &Name, seq: u64, why: Refusal) -> Effects {
-        let stage = Arc::clone(&self.store);
-        let _batch = stage.batch();
         let mut fx = Effects::default();
         self.reassess(device, seq, Rejudge::Refused(why), &mut fx);
         self.settle(&mut fx);

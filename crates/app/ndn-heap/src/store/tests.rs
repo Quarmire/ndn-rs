@@ -22,54 +22,45 @@ fn space() -> Name {
 #[test]
 fn batches_reach_the_store_as_one_apply() {
     let store = Arc::new(Held::default());
-    let stage = Stage::new(Arc::clone(&store) as Arc<dyn DataStore>);
-    {
-        let _batch = stage.batch();
-        stage.insert(n("/a"), bytes("1"));
-        stage.apply(vec![
-            StoreOp::Insert(n("/b"), bytes("2")),
-            StoreOp::Remove(n("/a")),
-        ]);
-        {
-            let _inner = stage.batch();
-            stage.remove(&n("/gone"));
-            stage.insert(n("/c"), bytes("3"));
-        }
-        assert_eq!(
-            store.batches(),
-            0,
-            "an inner batch joins the outer: nothing reaches the store before the outer ends"
-        );
-        assert!(
-            store.get(&n("/b")).is_none(),
-            "no part of a put reaches the store before all of it does"
-        );
-    }
+    let batch = Batch::new(Arc::clone(&store) as Arc<dyn DataStore>);
+    batch.insert(n("/a"), bytes("1"));
+    batch.apply(vec![
+        StoreOp::Insert(n("/b"), bytes("2")),
+        StoreOp::Remove(n("/a")),
+    ]);
+    batch.remove(&n("/gone"));
+    batch.insert(n("/c"), bytes("3"));
+    assert_eq!(
+        store.batches(),
+        0,
+        "nothing reaches the store before the commit"
+    );
+    assert!(
+        store.get(&n("/b")).is_none(),
+        "no part of a put reaches the store before all of it does"
+    );
+    batch.commit();
     assert_eq!(store.batches(), 1, "everything the batch kept is one apply");
     assert!(store.get(&n("/a")).is_none(), "the order made is kept");
     assert!(store.get(&n("/b")).is_some() && store.get(&n("/c")).is_some());
 
-    stage.insert(n("/d"), bytes("4"));
-    assert!(
-        store.get(&n("/d")).is_some(),
-        "a write with no batch open goes straight through"
-    );
+    batch.commit();
+    assert_eq!(store.batches(), 1, "a commit of nothing applies nothing");
 }
 
 #[test]
-fn a_read_by_prefix_inside_a_batch_answers_as_the_store_would_with_the_batch_applied() {
+fn a_read_through_a_batch_answers_as_the_store_would_with_the_batch_applied() {
     let store = Arc::new(Held::default());
     store.insert(n("/p/old"), bytes("old"));
     store.insert(n("/p/replaced"), bytes("before"));
     store.insert(n("/q/other"), bytes("other"));
-    let stage = Stage::new(Arc::clone(&store) as Arc<dyn DataStore>);
+    let batch = Batch::new(Arc::clone(&store) as Arc<dyn DataStore>);
 
-    let batch = stage.batch();
-    stage.insert(n("/p/new"), bytes("new"));
-    stage.insert(n("/p/replaced"), bytes("after"));
-    stage.remove(&n("/p/old"));
+    batch.insert(n("/p/new"), bytes("new"));
+    batch.insert(n("/p/replaced"), bytes("after"));
+    batch.remove(&n("/p/old"));
 
-    let under: Vec<(String, Bytes)> = stage
+    let under: Vec<(String, Bytes)> = batch
         .scan_under(&n("/p"), 0)
         .into_iter()
         .map(|(name, wire)| (name.to_string(), wire))
@@ -82,43 +73,41 @@ fn a_read_by_prefix_inside_a_batch_answers_as_the_store_would_with_the_batch_app
         ]
     );
     assert_eq!(
-        stage.scan_under(&n("/p"), 1).len(),
+        batch.scan_under(&n("/p"), 1).len(),
         1,
         "the limit counts what stands, not what the store held"
     );
-    assert_eq!(stage.find_under(&n("/p")), Some(bytes("new")));
-    assert_eq!(stage.get(&n("/p/old")), None);
-    assert!(!stage.contains(&n("/p/old")) && stage.contains(&n("/p/new")));
+    assert_eq!(batch.find_under(&n("/p")), Some(bytes("new")));
+    assert_eq!(batch.get(&n("/p/old")), None);
+    assert!(!batch.contains(&n("/p/old")) && batch.contains(&n("/p/new")));
     assert_eq!(
         store.get(&n("/p/replaced")),
         Some(bytes("before")),
         "a read is not a point to hand a part of a put to the store"
     );
-    drop(batch);
+    batch.commit();
     assert_eq!(store.get(&n("/p/replaced")), Some(bytes("after")));
 }
 
 #[test]
-fn another_threads_writes_do_not_join_an_open_batch() {
+fn a_batch_is_its_owners_alone() {
     let store = Arc::new(MemoryStore::new());
-    let stage = Stage::new(Arc::clone(&store) as Arc<dyn DataStore>);
-    let batch = stage.batch();
-    stage.insert(n("/mine"), bytes("1"));
-    {
-        let stage = Arc::clone(&stage);
-        std::thread::spawn(move || {
-            let _theirs = stage.batch();
-            stage.insert(n("/theirs"), bytes("2"));
-        })
-        .join()
-        .unwrap();
-    }
+    let mine = Batch::new(Arc::clone(&store) as Arc<dyn DataStore>);
+    let theirs = Batch::new(Arc::clone(&store) as Arc<dyn DataStore>);
+    mine.insert(n("/mine"), bytes("1"));
+    theirs.insert(n("/theirs"), bytes("2"));
+    theirs.commit();
     assert!(
         store.get(&n("/theirs")).is_some(),
-        "a thread whose batch could not open writes through"
+        "another batch commits whole"
     );
     assert!(store.get(&n("/mine")).is_none());
-    drop(batch);
+    assert!(
+        mine.get(&n("/theirs")).is_some(),
+        "a read through a batch sees the store"
+    );
+    assert!(theirs.get(&n("/mine")).is_none(), "and no other's batch");
+    mine.commit();
     assert!(store.get(&n("/mine")).is_some());
 }
 

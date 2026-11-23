@@ -14,7 +14,6 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::seal::{open_payload, seal_payload};
-use crate::store::Stage;
 use crate::test_kit::{Held, n};
 use crate::wire::{CHUNK, FANOUT, PAYLOAD_MAX, log_name};
 
@@ -233,17 +232,15 @@ fn pieces_are_written_in_one_batch_by_the_writer_and_kept_as_the_reader_proves_t
 
     // The writer side: every piece in one apply.
     let backing = Arc::new(Held::default());
-    let stage = Stage::new(backing.clone());
     let ops = pieces.ops();
     assert_eq!(ops.len(), total);
-    stage.apply(ops);
+    backing.apply(ops);
     assert_eq!(backing.batches(), 1);
 
     // The reader side: what a round proved is written at once, one apply per
     // round, and the assembler keeps none of it: the store holds the pieces
     // while the assembly is still incomplete.
     let backing = Arc::new(Held::default());
-    let stage = Stage::new(backing.clone());
     let mut asm = Assembler::new(e.clone(), pieces.blob()).unwrap();
     let mut rounds = 0;
     while !asm.is_complete() {
@@ -253,7 +250,7 @@ fn pieces_are_written_in_one_batch_by_the_writer_and_kept_as_the_reader_proves_t
             proved.extend(keep_op(held[&name].clone()));
         }
         let kept = proved.len();
-        stage.apply(proved);
+        backing.apply(proved);
         rounds += 1;
         assert_eq!(backing.batches(), rounds, "one batch per round");
         assert!(

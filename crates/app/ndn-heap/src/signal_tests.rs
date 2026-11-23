@@ -33,7 +33,6 @@ use crate::register::EntryId;
 use crate::reserve::Flusher;
 use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
-use crate::store::Stage;
 use crate::test_kit::{CrashStore, n};
 use crate::trust::Verified;
 use crate::wire::{
@@ -195,7 +194,6 @@ impl World {
         let dev = self.dev(device).await;
         let store = Arc::new(CrashStore::new());
         let raw = Arc::clone(&store) as Arc<dyn DataStore>;
-        let stage = Stage::new(Arc::clone(&raw));
         let flusher = Flusher::spawn(Arc::clone(&raw));
         let log = Log::open(
             Params {
@@ -208,7 +206,6 @@ impl World {
                 block: 8,
             },
             Arc::clone(&raw),
-            stage,
             Arc::clone(&flusher),
         )
         .unwrap();

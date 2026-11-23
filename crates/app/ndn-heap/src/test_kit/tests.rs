@@ -2,7 +2,6 @@
 //! killed process: what `kill -9` and a power cut leave.
 
 use super::*;
-use crate::store::Stage;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -133,11 +132,12 @@ fn held_blocks_sync_until_released_and_counts_batches() {
 const ROLE: &str = "NDN_HEAP_KILL_CHILD";
 
 /// The `k`th batch the child writes: an entry and the head that names it,
-/// kept together by the stage as one apply.
-fn write_batch(stage: &Stage, k: u64) {
-    let _batch = stage.batch();
-    stage.insert(n(&format!("/e/{k}")), Bytes::from(k.to_be_bytes().to_vec()));
-    stage.insert(n("/head"), Bytes::from(k.to_be_bytes().to_vec()));
+/// kept together as one apply.
+fn write_batch(store: &dyn DataStore, k: u64) {
+    store.apply(vec![
+        StoreOp::Insert(n(&format!("/e/{k}")), Bytes::from(k.to_be_bytes().to_vec())),
+        StoreOp::Insert(n("/head"), Bytes::from(k.to_be_bytes().to_vec())),
+    ]);
 }
 
 /// The head a store holds, and whether every entry up to it is there and
@@ -173,10 +173,9 @@ async fn power_cut_child() {
     let (engine, dir) = role.split_once('|').unwrap();
     let engine = Engine::parse(engine);
     let store = Arc::new(PowerCut::open(engine, &PathBuf::from(dir)));
-    let stage = Stage::new(Arc::clone(&store) as Arc<dyn DataStore>);
     let mut out = std::io::stdout();
     for k in 1u64.. {
-        write_batch(&stage, k);
+        write_batch(&*store, k);
         writeln!(out, "applied {k}").unwrap();
         out.flush().unwrap();
         if k % 5 == 0 {

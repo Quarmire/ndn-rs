@@ -20,7 +20,7 @@ use crate::reserve::Flusher;
 use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
 use crate::store::{
-    self, Marker, ReserveRecord, Stage, equivocal_key, status_key, structural_key, verified_key,
+    self, Marker, ReserveRecord, equivocal_key, status_key, structural_key, verified_key,
     walk_chain, write_reserve,
 };
 use crate::test_kit::{CrashStore, n};
@@ -223,8 +223,7 @@ struct Rig {
 
 fn open_on(store: &Arc<CrashStore>, me: &Dev) -> Rig {
     let raw = Arc::clone(store) as Arc<dyn DataStore>;
-    let stage = Stage::new(Arc::clone(&raw));
-    let suspicion = Suspicion::open(Arc::clone(&stage) as Arc<dyn DataStore>);
+    let suspicion = Suspicion::open(Arc::clone(&raw));
     let flusher = Flusher::spawn(Arc::clone(&raw));
     let log = Log::open(
         Params {
@@ -237,7 +236,6 @@ fn open_on(store: &Arc<CrashStore>, me: &Dev) -> Rig {
             block: BLOCK,
         },
         raw,
-        Arc::clone(&stage),
         Arc::clone(&flusher),
     )
     .unwrap();
@@ -1081,7 +1079,6 @@ async fn a_device_that_cannot_read_its_own_ledger_does_not_open_the_space() {
             block: BLOCK,
         },
         Arc::clone(&raw),
-        Stage::new(Arc::clone(&raw)),
         Flusher::spawn(raw),
     );
     let why = opened
@@ -1590,7 +1587,6 @@ async fn a_cold_open_reads_one_marker_per_device_not_one_per_entry() {
             block: BLOCK,
         },
         Arc::clone(&raw),
-        Stage::new(raw),
         Flusher::spawn(Arc::clone(&counting) as Arc<dyn DataStore>),
     )
     .unwrap();

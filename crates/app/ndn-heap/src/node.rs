@@ -44,7 +44,7 @@ use crate::rt;
 use crate::seal::{self, GrantRefusal, Granter, Keys};
 use crate::serve;
 use crate::space::{Follower, Heap, Share, SpaceInner, check_audience, new_id};
-use crate::store::{self, Stage};
+use crate::store;
 use crate::sync::{Host, Net, NetConfig, Taken};
 use crate::trust::{Adopter, Adoption, Judge, Judged};
 use crate::wire::{
@@ -169,8 +169,7 @@ pub(crate) struct NodeInner {
     pub(crate) signer: Arc<dyn Signer>,
     keys: Arc<SecurityManager>,
     pub(crate) judge: Arc<Judge>,
-    raw: Arc<dyn DataStore>,
-    pub(crate) stage: Arc<Stage>,
+    pub(crate) store: Arc<dyn DataStore>,
     /// The keys marked suspected, for every space's log.
     pub(crate) suspicion: Arc<Suspicion>,
     pub(crate) flusher: Arc<Flusher>,
@@ -259,7 +258,6 @@ impl Node {
             .map_err(|e| local(e.to_string()))?;
         drop(recipient);
 
-        let stage = Stage::new(Arc::clone(&store));
         let flusher = Flusher::spawn(Arc::clone(&store));
         let judge = Judge::new(
             Arc::clone(&validator),
@@ -282,9 +280,8 @@ impl Node {
             signer: identity.signer,
             keys,
             judge,
-            raw: store,
-            suspicion: Suspicion::open(Arc::clone(&stage) as Arc<dyn DataStore>),
-            stage,
+            suspicion: Suspicion::open(Arc::clone(&store)),
+            store,
             flusher,
             config,
             net: RwLock::new(None),
@@ -621,7 +618,7 @@ impl NodeInner {
     /// copies, counted from the markers.
     pub(crate) fn held_in(&self, space: &Name) -> u64 {
         let prefix = store::verified_key(&Name::root());
-        self.raw
+        self.store
             .scan_under(&prefix, 0)
             .into_iter()
             .filter(|(key, _)| {
@@ -655,8 +652,8 @@ impl NodeInner {
     /// The log of `space` from the store, and whether the last run left it
     /// without a clean close.
     fn open_log(&self, space: &Name) -> Result<(Log, bool), HeapError> {
-        let reserve = store::read_reserve(&*self.raw, space).map_err(|e| local(e.to_string()))?;
-        let head = store::read_head(&*self.raw, space).map_err(|e| local(e.to_string()))?;
+        let reserve = store::read_reserve(&*self.store, space).map_err(|e| local(e.to_string()))?;
+        let head = store::read_head(&*self.store, space).map_err(|e| local(e.to_string()))?;
         let head_seq = head.map_or(0, |h| h.seq);
         let recipient =
             seal::recipient_key(&self.keys, &self.device).map_err(|e| local(e.to_string()))?;
@@ -670,8 +667,7 @@ impl NodeInner {
                 keys: Keys::new(recipient),
                 block: self.config.reserve_block,
             },
-            Arc::clone(&self.raw),
-            Arc::clone(&self.stage),
+            Arc::clone(&self.store),
             Arc::clone(&self.flusher),
         )?;
         // Read before the open above, which writes the next reservation.
@@ -688,7 +684,7 @@ impl NodeInner {
         if self.stopped.load(Ordering::Relaxed) {
             return Err(local("the node is stopped"));
         }
-        self.stage.insert(
+        self.store.insert(
             store::space_key(space),
             Bytes::copy_from_slice(&[if follower { CARRIER } else { MEMBER }]),
         );
@@ -761,7 +757,7 @@ impl NodeInner {
     async fn restore(self: &Arc<Self>) -> Result<(), HeapError> {
         let prefix = store::space_key(&Name::root());
         let mut held = Vec::new();
-        for (key, mode) in self.raw.scan_under(&prefix, 0) {
+        for (key, mode) in self.store.scan_under(&prefix, 0) {
             let space = Name::from_components(key.components()[prefix.len()..].iter().cloned());
             if parse_space_name(&space).is_none() {
                 tracing::warn!(%key, "a record of a space that is no space name is ignored");
@@ -835,7 +831,7 @@ impl NodeInner {
         if let Some(net) = self.net() {
             net.leave(space).await;
         }
-        self.stage.remove(&store::space_key(space));
+        self.store.remove(&store::space_key(space));
         self.flusher.note_write();
         if let Some(held) = held {
             held.closing.store(true, Ordering::Relaxed);
@@ -921,7 +917,7 @@ impl NodeInner {
             let Some(log_name) = parse_log_name(&name) else {
                 continue;
             };
-            let Some(wire) = self.stage.get(&name) else {
+            let Some(wire) = self.store.get(&name) else {
                 continue;
             };
             let Ok(data) = Data::decode(wire) else {
@@ -1137,7 +1133,7 @@ impl Host for NodeInner {
             return None;
         }
         self.served(space, device, seq)?;
-        self.stage.get(piece)
+        self.store.get(piece)
     }
 
     fn seal_key_packet(&self, name: &Name) -> Option<Bytes> {
@@ -1152,12 +1148,12 @@ impl Host for NodeInner {
 
     fn held_piece(&self, space: &Name, name: &Name) -> Option<Bytes> {
         self.space_of(space)?;
-        self.stage.get(name)
+        self.store.get(name)
     }
 
     fn keep_pieces(&self, space: &Name, ops: Vec<StoreOp>) {
         if self.space_of(space).is_some() {
-            self.stage.apply(ops);
+            self.store.apply(ops);
             self.flusher.note_write();
         }
     }

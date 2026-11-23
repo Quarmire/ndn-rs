@@ -23,7 +23,6 @@ use crate::error::{Cut, NextStep, Refusal, Timestamp};
 use crate::log::{Log, Outcome, Params};
 use crate::reserve::Flusher;
 use crate::seal::{self, Keys};
-use crate::store::Stage;
 use crate::test_kit::{CrashStore, n};
 use crate::trust::{Judge, Verified};
 use crate::wire::{
@@ -181,7 +180,6 @@ fn open_with(suspicion: &Arc<Suspicion>, store: &Arc<CrashStore>, space: &Name) 
             block: 8,
         },
         Arc::clone(&raw),
-        Stage::new(Arc::clone(&raw)),
         Flusher::spawn(raw),
     )
     .unwrap()

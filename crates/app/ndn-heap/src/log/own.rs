@@ -1,8 +1,6 @@
 //! This device's own entries: a put, a Members entry, an Epoch entry, and
 //! the cut a removal lists (plan 3.5 "Own put").
 
-use std::sync::Arc;
-
 use ndn_foundation_types::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_security::confidentiality::ContentKey;
@@ -278,8 +276,6 @@ impl Log {
             entry.prev.map_or([0; 32], |p| p.digest),
             entry.prev.map_or(0, |p| p.seq.unwrap_or(seq - 1)),
         );
-        let stage = Arc::clone(&self.store);
-        let _batch = stage.batch();
         self.store.apply(extra);
         let person = self.person.clone();
         let applying = Applying::new(id.clone(), person.clone(), entry, put);

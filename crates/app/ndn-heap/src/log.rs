@@ -7,8 +7,8 @@
 //! validates first (`trust::Judge`, async) and hands the log the
 //! [`Verified`] it got; what the log wants fetched it returns as [`Want`]s.
 //!
-//! **One write, one batch.** A method that stores opens a [`Stage`] batch
-//! around everything it writes (the entry at its own name, its `verified/`
+//! **One write, one batch.** A method that stores writes through the log's
+//! [`Batch`], everything it writes (the entry at its own name, its `verified/`
 //! marker, `ledger/`, `status/`, `head/`, `heads/`, `supers/`, `structural/`,
 //! `epoch/`) and the batch reaches the store as ONE
 //! `DataStore::apply` before the method returns. So the log's [`Effects`]
@@ -86,7 +86,7 @@ use crate::reserve::{Flusher, Gate, Reservation, Ticket};
 use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
 use crate::store::{
-    self, Corrupt, Link, Marker, Stage, epoch_prefix, heads_prefix, ledger_key, ledger_prefix,
+    self, Batch, Corrupt, Link, Marker, epoch_prefix, heads_prefix, ledger_key, ledger_prefix,
     parse_epoch_key, parse_ledger_key, parse_structural_key, status_prefix, structural_prefix,
 };
 use crate::trust::Verified;
@@ -377,7 +377,7 @@ pub(crate) struct Log {
     key: Name,
     key_digest: [u8; 32],
     signer: Arc<dyn Signer>,
-    store: Arc<Stage>,
+    store: Batch,
     fold: Fold,
     register: Register,
     keys: Keys,
@@ -408,8 +408,7 @@ impl Log {
     /// Open the space from the store (see the module docs, item 1).
     pub(crate) fn open(
         params: Params,
-        raw: Arc<dyn DataStore>,
-        stage: Arc<Stage>,
+        store: Arc<dyn DataStore>,
         flusher: Arc<Flusher>,
     ) -> Result<Log, HeapError> {
         let Params {
@@ -428,11 +427,11 @@ impl Log {
             })?
             .owner;
         let local = |why: String| HeapError::Local { reason: why };
-        let head = Self::stored_head(&*stage, &space, &device)?;
-        let floor_r = store::read_reserve(&*stage, &space)
+        let head = Self::stored_head(&*store, &space, &device)?;
+        let floor_r = store::read_reserve(&*store, &space)
             .map_err(|e| local(e.to_string()))?
             .map_or(0, |r| r.r);
-        let opened = Reservation::open(raw, flusher, &space, block, head)
+        let opened = Reservation::open(Arc::clone(&store), flusher, &space, block, head)
             .map_err(|e| local(e.to_string()))?;
         let key_digest = signer
             .public_key()
@@ -462,7 +461,7 @@ impl Log {
             device,
             person,
             signer,
-            store: stage,
+            store: Batch::new(store),
             suspicion,
             keys,
         };
@@ -880,8 +879,6 @@ impl Log {
     /// open. Whether it was taken.
     pub(crate) fn key_arrived(&mut self, epoch: EpochId, key: ContentKey) -> (bool, Effects) {
         let mut fx = Effects::default();
-        let stage = Arc::clone(&self.store);
-        let _batch = stage.batch();
         if !self.keys.take_named(&self.fold, &self.space, &epoch, key) {
             return (false, fx);
         }
