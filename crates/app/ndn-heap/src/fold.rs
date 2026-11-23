@@ -282,6 +282,26 @@ impl Fold {
         tips.into_iter().cloned().collect()
     }
 
+    /// Every person whose writer Add was removed and who no standing writer
+    /// Add admits again, with the union of the removal tips (sorted); persons
+    /// sorted, the owner never listed. This is what a restarted node needs to
+    /// rebuild the cuts of removed writers from the entries alone.
+    pub fn removed_writers(&self) -> Vec<(Name, Vec<EntryRef>)> {
+        let mut gone: BTreeMap<&Name, BTreeSet<&EntryRef>> = BTreeMap::new();
+        for (id, added) in &self.facts.adds {
+            if added.role != Role::Writer || added.who == self.owner {
+                continue;
+            }
+            if let Some(tips) = self.facts.removed.get(id) {
+                gone.entry(&added.who).or_default().extend(tips);
+            }
+        }
+        gone.into_iter()
+            .filter(|(who, _)| !self.is_writer(who))
+            .map(|(who, tips)| (who.clone(), tips.into_iter().cloned().collect()))
+            .collect()
+    }
+
     /// The epochs, in the order [`Fold::in_force`] prefers them (ascending).
     pub fn epochs(&self) -> Vec<EpochId> {
         self.epochs.keys().cloned().collect()
