@@ -135,32 +135,13 @@ impl Log {
     /// Take an entry the judge verified (`verified` says who signed it and by
     /// which key) at `now` (`Config.clock`, ms). All the writes are one
     /// batch.
+    ///
+    /// `probe`: the entry was fetched only because an unsigned counter named
+    /// it (not something the log wants). If its signer is no member and
+    /// nothing of that device is vouched for, it is stored and told only when
+    /// it is the first this log holds of the device: what a stranger
+    /// advertises grows neither the store nor the host's alerts.
     pub(crate) fn admit(
-        &mut self,
-        wire: &Bytes,
-        data: &Data,
-        verified: &Verified,
-        now: u64,
-    ) -> (Outcome, Effects) {
-        self.admit_as(wire, data, verified, now, false)
-    }
-
-    /// [`Self::admit`] for an entry fetched only because an unsigned counter
-    /// named it (a probe, not something the log wants). If its signer is no
-    /// member and nothing of that device is vouched for, it is stored and
-    /// told only when it is the first this log holds of the device: what a
-    /// stranger advertises grows neither the store nor the host's alerts.
-    pub(crate) fn admit_probed(
-        &mut self,
-        wire: &Bytes,
-        data: &Data,
-        verified: &Verified,
-        now: u64,
-    ) -> (Outcome, Effects) {
-        self.admit_as(wire, data, verified, now, true)
-    }
-
-    fn admit_as(
         &mut self,
         wire: &Bytes,
         data: &Data,

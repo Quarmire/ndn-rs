@@ -197,7 +197,7 @@ fn admit_as(log: &mut Log, p: &Packet, digest: Option<[u8; 32]>, now: u64) -> Ou
         person: p.dev.person.clone(),
         key_digest: digest.unwrap_or_else(|| key_digest(&p.dev)),
     };
-    log.admit(&p.wire, &data, &v, now).0
+    log.admit(&p.wire, &data, &v, now, false).0
 }
 
 fn applied(log: &mut Log, p: &Packet, now: u64) {

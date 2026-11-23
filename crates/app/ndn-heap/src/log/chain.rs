@@ -327,8 +327,8 @@ impl Status {
             Status::Refused(Refusal::Untrusted { .. }) => 8,
             Status::Refused(Refusal::Chain) => 10,
             // The rest are never kept as a status (Lapsed and Suspected are
-            // not recorded, Rollback is not an entry's); they read back as
-            // the refusal that closes a copy's way in.
+            // not recorded); they read back as the refusal that closes a
+            // copy's way in.
             Status::Refused(_) => 11,
         }
     }

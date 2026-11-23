@@ -268,7 +268,9 @@ struct Signed {
 impl Rig {
     fn admit(&mut self, p: &Packet) -> Admitted {
         let data = Data::decode(p.wire.clone()).unwrap();
-        let (outcome, effects) = self.log.admit(&p.wire, &data, &verified(&p.dev), NOW);
+        let (outcome, effects) = self
+            .log
+            .admit(&p.wire, &data, &verified(&p.dev), NOW, false);
         Admitted { outcome, effects }
     }
 
@@ -1206,7 +1208,7 @@ async fn a_strangers_refused_entries_are_stored_once_and_alert_once() {
     let mut alerts = 0;
     for p in &packets[2..] {
         let data = Data::decode(p.wire.clone()).unwrap();
-        let (outcome, fx) = r.log.admit_probed(&p.wire, &data, &verified(&p.dev), NOW);
+        let (outcome, fx) = r.log.admit(&p.wire, &data, &verified(&p.dev), NOW, true);
         assert_eq!(outcome, Outcome::Refused(Refusal::NotMember));
         alerts += fx
             .alerts

@@ -82,9 +82,6 @@ pub enum Refusal {
     /// It does not verify: wrong signature, or bytes that do not match its
     /// name (a poisoned cache).
     BadSignature,
-    /// It is a register value or notice older than one already seen from the
-    /// same signer.
-    Rollback,
     /// It is not sealed, and the members entries seal the space: its writer
     /// wrote it before hearing the entry that sealed the space.
     Unsealed,
@@ -129,7 +126,7 @@ impl Refusal {
             | Refusal::Suspected { .. }
             | Refusal::Untrusted { .. }
             | Refusal::Fragmented => NextStep::AskOwner,
-            Refusal::BadSignature | Refusal::Rollback => NextStep::RetryLater,
+            Refusal::BadSignature => NextStep::RetryLater,
             Refusal::Unsealed | Refusal::Sealed | Refusal::Chain => NextStep::None,
         }
     }
@@ -157,10 +154,6 @@ impl fmt::Display for Refusal {
             Refusal::BadSignature => f.write_str(
                 "it does not verify (signature, name or sealed payload); try again later, for \
                  it may verify when fetched from another holder",
-            ),
-            Refusal::Rollback => f.write_str(
-                "it is older than one already seen from the same signer; try again later, for \
-                 a current copy may come from another holder",
             ),
             Refusal::Unsealed => f.write_str(
                 "it is not sealed, and the space is sealed: its writer wrote it before hearing \
@@ -343,7 +336,6 @@ mod tests {
             },
             Refusal::NotMember,
             Refusal::BadSignature,
-            Refusal::Rollback,
             Refusal::Unsealed,
             Refusal::Sealed,
             Refusal::Suspected {
@@ -364,7 +356,6 @@ mod tests {
             Refusal::Lapsed { .. } => 1,
             Refusal::NotMember => 2,
             Refusal::BadSignature => 3,
-            Refusal::Rollback => 4,
             Refusal::Unsealed => 5,
             Refusal::Sealed => 6,
             Refusal::Suspected { .. } => 7,
@@ -434,14 +425,13 @@ mod tests {
                 .map(variant_no)
                 .collect::<BTreeSet<_>>()
                 .len(),
-            11,
+            10,
             "the list covers every refusal"
         );
         let class = |r: Refusal| r.next();
         assert_eq!(class(Refusal::OutsideCut(cut())), NextStep::AskOwner);
         assert_eq!(class(Refusal::NotMember), NextStep::AskOwner);
         assert_eq!(class(Refusal::BadSignature), NextStep::RetryLater);
-        assert_eq!(class(Refusal::Rollback), NextStep::RetryLater);
         assert_eq!(class(Refusal::Chain), NextStep::None);
         assert_eq!(class(Refusal::Fragmented), NextStep::AskOwner);
         assert_eq!(class(Refusal::Unsealed), NextStep::None);
@@ -565,7 +555,7 @@ mod tests {
                     | Refusal::Lapsed { .. }
                     | Refusal::NotMember
                     | Refusal::Suspected { .. } => Code::NotMember,
-                    Refusal::BadSignature | Refusal::Rollback => Code::RetryLater,
+                    Refusal::BadSignature => Code::RetryLater,
                     _ => Code::Refused,
                 },
                 HeapError::Local { .. } => Code::Local,
@@ -637,7 +627,7 @@ mod tests {
             };
             let (code, next) = of(e);
             match &why {
-                Refusal::BadSignature | Refusal::Rollback => {
+                Refusal::BadSignature => {
                     assert_eq!((code, next), (Code::RetryLater, Next::Retry), "{why:?}");
                 }
                 Refusal::OutsideCut(_)

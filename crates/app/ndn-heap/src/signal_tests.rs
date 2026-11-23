@@ -300,7 +300,10 @@ impl Seat {
             .get(&log_name(&self.dev.name, &space(), seq))
             .expect("signed and stored");
         let data = Data::decode(wire.clone()).unwrap();
-        let (outcome, fx) = to.log.lock().admit(&wire, &data, &self.dev.verified(), NOW);
+        let (outcome, fx) = to
+            .log
+            .lock()
+            .admit(&wire, &data, &self.dev.verified(), NOW, false);
         assert_eq!(outcome, Outcome::Applied, "{:?}", fx.alerts);
     }
 

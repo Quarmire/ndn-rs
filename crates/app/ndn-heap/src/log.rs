@@ -461,7 +461,9 @@ impl Log {
         log.restore_keys();
         log.restore_register()?;
         log.sync_kept(&mut Effects::default());
-        log.restore_own_tip(head);
+        // The own tip is the newest own entry held, which the ledger restore
+        // read the marker of.
+        log.own_tip = log.devices.get(&log.device).and_then(|d| d.tip);
         Ok(log)
     }
 
@@ -561,19 +563,6 @@ impl Log {
         }
         self.register = restored.register;
         Ok(())
-    }
-
-    /// The own tip: the newest own entry held.
-    fn restore_own_tip(&mut self, head: u64) {
-        if let Some(marker) = (head > 0)
-            .then(|| self.view().marker(&self.device, head))
-            .flatten()
-        {
-            self.own_tip = Some(Link {
-                seq: head,
-                digest: marker.signed_digest,
-            });
-        }
     }
 
     /// The highest own seq the store holds in `space`, from the own

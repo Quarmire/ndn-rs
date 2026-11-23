@@ -2295,11 +2295,10 @@ Every error says why in its message and what to do in `HeapError::next()`, and
 | `Local { reason }` | the store, the keys, a closing node | `FixLocal` |
 
 `Refusal` is the verdict on an entry (§3.8): `OutsideCut`, `Lapsed`, `NotMember`,
-`Suspected`, `Untrusted` and `Fragmented` say `AskOwner`; `BadSignature`
-and `Rollback` say `RetryLater` (another holder's copy may verify); `Unsealed`,
+`Suspected`, `Untrusted` and `Fragmented` say `AskOwner`; `BadSignature` says
+`RetryLater` (another holder's copy may verify); `Unsealed`,
 `Sealed` and `Chain` say `None` (final, and its writer writes again).
-`Refusal::Rollback` is produced by no path of this crate (it is kept for hosts
-that map errors). An entry **received** and refused is not a call the host made:
+An entry **received** and refused is not a call the host made:
 it reaches the host as `Alert::Refused`, `Alert::OutsideCut` or
 `Change::Withdrawn` (§10.6), never as a failed call.
 
