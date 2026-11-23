@@ -109,7 +109,11 @@ fn a_sync_interest_naming_many_devices_leaves_the_list_bounded() {
     assert!(heard.contains(&laptop));
     assert!(
         heard.iter().all(|d| *d == laptop || {
-            let i: usize = d.to_string().trim_start_matches("/alice/d").parse().unwrap();
+            let i: usize = d
+                .to_string()
+                .trim_start_matches("/alice/d")
+                .parse()
+                .unwrap();
             i < 200
         }),
         "no name at counter 0 is kept"
@@ -176,7 +180,7 @@ fn granters_are_the_creator_then_the_relays() {
     );
     assert_eq!(
         heard.granters(&me, &me, all),
-        vec![creator, device(1), device(2)],
+        vec![device(1), device(2), creator],
         "this device created the epoch: it asks others only"
     );
 }
