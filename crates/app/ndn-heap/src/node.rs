@@ -44,7 +44,7 @@ use crate::revocation::{self, CutBound, CutProposal};
 use crate::rt;
 use crate::seal::{self, GrantRefusal, Granter, Keys};
 use crate::serve;
-use crate::space::{Follower, Heap, MembersChange, Share, SpaceInner, new_id};
+use crate::space::{Follower, Heap, MembersChange, Share, SpaceInner, check_audience, new_id};
 use crate::store::{self, Stage};
 use crate::sync::{Host, Net, NetConfig, Taken};
 use crate::trust::{Adopter, Adoption, Judge, Judged};
@@ -356,6 +356,11 @@ impl Node {
             return Err(HeapError::BadRequest {
                 why: format!("{space} is open here already: create makes a space once"),
             });
+        }
+        if let Readers::Persons(readers) = &share.readers {
+            let listed: std::collections::BTreeSet<&Name> =
+                readers.iter().chain(std::iter::once(&inner.ns)).collect();
+            check_audience(listed.len())?;
         }
         let attached = inner.attach(space, false).await?;
         let heap = Heap::new(Arc::clone(&attached), Arc::clone(inner));
@@ -1056,11 +1061,15 @@ impl Host for NodeInner {
                         let _ = v;
                     }
                     Judged::Valid(v) => break v,
-                    Judged::Refused(why) => return refused(why),
+                    Judged::Refused(why) => {
+                        held.alert_refused_packet(&data, &why);
+                        return refused(why);
+                    }
                     Judged::Pending(waiting) => return Taken::Pending(waiting),
                 }
             }
         };
+        tracing::trace!(target: crate::sync::TIMELINE, "judged");
         let (outcome, blobs, routed) = {
             let mut log = held.log.lock();
             let admitted = log.admit(&wire, &data, &verified, self.now());
@@ -1069,7 +1078,12 @@ impl Host for NodeInner {
             let routed = held.route(self, &log, admitted.effects, wrote);
             (admitted.outcome, blobs, routed)
         };
+        tracing::trace!(target: crate::sync::TIMELINE, "admitted");
         held.finish(&self.arc(), routed);
+        tracing::trace!(target: crate::sync::TIMELINE, "routed");
+        if let Outcome::Refused(why) = &outcome {
+            held.alert_refused_packet(&data, why);
+        }
         if matches!(
             outcome,
             Outcome::Applied | Outcome::Closed | Outcome::Waiting
