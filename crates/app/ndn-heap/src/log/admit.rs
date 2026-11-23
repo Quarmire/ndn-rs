@@ -226,13 +226,19 @@ impl Log {
         let outcome = self.take(arrival, fx);
         if let Some(old) = displaced {
             self.store.insert(store::equivocal_key(&name), old);
-            fx.alerts.push(Alert::Equivocation {
-                device: id.device.clone(),
-                seq: id.seq,
-            });
-            self.suspicion.mark_new(&v.key, Timestamp(now));
+            self.equivocated(&id, id.seq, v, now, fx);
         }
         outcome
+    }
+
+    /// The device of `id` signed two packets at `seq` (one name, or a chain
+    /// that forks there): told to the host, and its key suspected.
+    fn equivocated(&self, id: &EntryRef, seq: u64, v: &Verified, now: u64, fx: &mut Effects) {
+        fx.alerts.push(Alert::Equivocation {
+            device: id.device.clone(),
+            seq,
+        });
+        self.suspicion.mark_new(&v.key, Timestamp(now));
     }
 
     /// A suspected key's new entries are not taken, unless the owner's cut
@@ -300,11 +306,7 @@ impl Log {
             };
         }
         self.store.insert(at, wire.clone());
-        fx.alerts.push(Alert::Equivocation {
-            device: id.device.clone(),
-            seq: id.seq,
-        });
-        self.suspicion.mark_new(&v.key, Timestamp(now));
+        self.equivocated(id, id.seq, v, now, fx);
         // What the entry first held here said is absent is no longer taken as
         // said: its writer signed two.
         let retracted = self
@@ -400,38 +402,20 @@ impl Log {
         let link = Some((prev, prev_seq));
 
         // 6. The chain: the entry at `PREV_SEQ` must be the one `PREV` names.
-        if let Some(conflict) = self.chain_conflict(id, &prev, prev_seq) {
-            fx.alerts.push(Alert::Equivocation {
-                device: id.device.clone(),
-                seq: conflict,
-            });
-            self.suspicion.mark_new(&v.key, Timestamp(now));
-            let why = Refusal::Chain;
-            self.store_fresh(
-                fresh(Some(Status::Refused(why.clone())), link, None),
-                now,
-                fx,
-            );
-            refuse_alert(id, &why, fx);
-            return Outcome::Refused(why);
-        }
-
         // 3 to 5: carrier, membership, sealing.
-        let subject = Subject::new(id, v, &name);
-        match self.assess(&subject, &entry) {
+        let verdict = if let Some(conflict) = self.chain_conflict(id, &prev, prev_seq) {
+            self.equivocated(id, conflict, v, now, fx);
+            Verdict::Refuse(Refusal::Chain)
+        } else {
+            self.assess(&Subject::new(id, v, &name), &entry)
+        };
+        let (status, outcome, applying) = match verdict {
             Verdict::Apply(put) => {
                 let applying = Applying::new(id.clone(), v.person.clone(), entry, put);
-                self.store_fresh(fresh(None, link, Some(applying)), now, fx);
-                Outcome::Applied
+                (None, Outcome::Applied, Some(applying))
             }
-            Verdict::Closed => {
-                self.store_fresh(fresh(Some(Status::Closed), link, None), now, fx);
-                Outcome::Closed
-            }
-            Verdict::Waiting => {
-                self.store_fresh(fresh(Some(Status::Waiting), link, None), now, fx);
-                Outcome::Waiting
-            }
+            Verdict::Closed => (Some(Status::Closed), Outcome::Closed, None),
+            Verdict::Waiting => (Some(Status::Waiting), Outcome::Waiting, None),
             Verdict::Refuse(why) => {
                 // A probe of a device nothing vouches for keeps one refused
                 // entry here, the first: it is the one a later membership
@@ -449,15 +433,16 @@ impl Log {
                 {
                     return Outcome::Refused(why);
                 }
-                self.store_fresh(
-                    fresh(Some(Status::Refused(why.clone())), link, None),
-                    now,
-                    fx,
-                );
                 refuse_alert(id, &why, fx);
-                Outcome::Refused(why)
+                (
+                    Some(Status::Refused(why.clone())),
+                    Outcome::Refused(why),
+                    None,
+                )
             }
-        }
+        };
+        self.store_fresh(fresh(status, link, applying), now, fx);
+        outcome
     }
 
     /// Whether an own entry chaining to `(prev, prev_seq)` extends what this
