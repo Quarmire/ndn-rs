@@ -130,7 +130,7 @@ impl Log {
 
     /// Whether this device may write now, and the epoch to seal in (none in a
     /// public space).
-    fn judge_own(&self) -> Result<Option<EpochId>, HeapError> {
+    pub(crate) fn judge_own(&self) -> Result<Option<EpochId>, HeapError> {
         let not_ready = |why: &str| HeapError::NotReady {
             name: self.space.clone(),
             why: why.into(),
