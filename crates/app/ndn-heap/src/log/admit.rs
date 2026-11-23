@@ -51,13 +51,6 @@ pub(super) struct Applying {
     pub put: Option<PutBody>,
 }
 
-/// What a cut says to an entry of a removed writer.
-enum Cutting {
-    Keeps,
-    Waiting,
-    Outside(Refusal),
-}
-
 /// What `take` is given about the entry that arrived: its name, bytes, the
 /// verified signer, the time, and whether only an unsigned counter asked for it.
 struct Arrival<'a> {
@@ -547,12 +540,10 @@ impl Log {
         }
         // 4. The signer's person writes, or was removed and the entry is
         // inside the cut.
-        if !self.fold.is_writer(s.person) {
-            match self.cutting(s) {
-                Cutting::Keeps => {}
-                Cutting::Waiting => return Verdict::Waiting,
-                Cutting::Outside(why) => return Verdict::Refuse(why),
-            }
+        if !self.fold.is_writer(s.person)
+            && let Some(forced) = self.cutting(s)
+        {
+            return forced;
         }
         // 5. Sealing.
         let create = self.fold.create();
@@ -577,25 +568,27 @@ impl Log {
         }
     }
 
-    fn cutting(&self, s: &Subject<'_>) -> Cutting {
+    /// What a removed writer's cut forces on the entry: `None` when the cut
+    /// keeps it.
+    fn cutting(&self, s: &Subject<'_>) -> Option<Verdict> {
         let has_tip = self
             .fold
             .removal_tips(s.person)
             .iter()
             .any(|t| t.device == *s.device);
         if !has_tip {
-            return Cutting::Outside(Refusal::NotMember);
+            return Some(Verdict::Refuse(Refusal::NotMember));
         }
         let Some(kept) = self.kept.get(s.device) else {
-            return Cutting::Waiting;
+            return Some(Verdict::Waiting);
         };
         match kept.keeps(&*self.store, s.device, &self.space, s.seq, &s.digest) {
-            Keeps::Yes => Cutting::Keeps,
-            Keeps::Waiting => Cutting::Waiting,
-            Keeps::No => Cutting::Outside(Refusal::OutsideCut(Cut {
+            Keeps::Yes => None,
+            Keeps::Waiting => Some(Verdict::Waiting),
+            Keeps::No => Some(Verdict::Refuse(Refusal::OutsideCut(Cut {
                 device: s.device.clone(),
                 keeps_to: kept.keeps_to(),
-            })),
+            }))),
         }
     }
 
@@ -873,11 +866,7 @@ impl Log {
                         Some(Payload::Inline(bytes)) => {
                             fx.changes.push(Change::Put(head.item(&vc.path, bytes)));
                         }
-                        Some(Payload::Blob { size, root }) => fx.blobs.push(Blob {
-                            id: EntryId::from(&head.entry),
-                            size,
-                            root,
-                        }),
+                        Some(blob) => fx.blobs.extend(Blob::of(EntryId::from(&head.entry), &blob)),
                         None => {}
                     }
                 }

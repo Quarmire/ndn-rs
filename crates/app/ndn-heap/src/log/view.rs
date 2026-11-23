@@ -87,29 +87,32 @@ impl<'a> View<'a> {
         }
     }
 
+    /// The write the entry `r` carries, opened if sealed and under the key
+    /// held; `None` when its packet is not held as those bytes, or is no
+    /// write, or cannot be opened.
+    fn put_of(&self, r: &EntryRef) -> Option<PutBody> {
+        let (entry, digest) = decode_wire(&self.wire_at(&r.device, r.seq)?)?;
+        if digest != r.digest {
+            return None;
+        }
+        self.opened_put(&entry, &log_name(&r.device, self.space, r.seq))
+    }
+
     /// What the applied entry `r` wrote; `None` when it is not held, not
     /// applied, or not a write. The register asks for it when an entry it
     /// superseded returns.
     pub(super) fn write_of(&self, r: &EntryRef) -> Option<Write> {
-        let wire = self.wire_at(&r.device, r.seq)?;
-        if signed_digest(&wire) != r.digest || self.status(&r.device, r.seq).is_some() {
+        if self.status(&r.device, r.seq).is_some() {
             return None;
         }
-        let (entry, _) = decode_wire(&wire)?;
-        let put = self.opened_put(&entry, &log_name(&r.device, self.space, r.seq))?;
+        let put = self.put_of(r)?;
         let person = self.devices.get(&r.device)?.person.clone();
         Some(write_for(&put, person))
     }
 
     /// The payload the applied entry `r` wrote.
     pub(super) fn payload_of(&self, r: &EntryRef) -> Option<Payload> {
-        let wire = self.wire_at(&r.device, r.seq)?;
-        if signed_digest(&wire) != r.digest {
-            return None;
-        }
-        let (entry, _) = decode_wire(&wire)?;
-        let put = self.opened_put(&entry, &log_name(&r.device, self.space, r.seq))?;
-        Some(put.payload)
+        Some(self.put_of(r)?.payload)
     }
 }
 

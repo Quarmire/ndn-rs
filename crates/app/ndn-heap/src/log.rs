@@ -167,6 +167,16 @@ pub(crate) struct Blob {
     pub root: [u8; 32],
 }
 
+impl Blob {
+    /// The blob head of the entry `id` when `payload` is in pieces.
+    fn of(id: EntryId, payload: &Payload) -> Option<Blob> {
+        match *payload {
+            Payload::Blob { size, root } => Some(Blob { id, size, root }),
+            Payload::Inline(_) => None,
+        }
+    }
+}
+
 /// What a call asks of the node beyond the writes it already made.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Effects {
@@ -679,11 +689,7 @@ impl Log {
         for (path, head) in self.register.values() {
             match view.payload_of(&head.entry) {
                 Some(Payload::Inline(bytes)) => items.push(head.item(path, bytes)),
-                Some(Payload::Blob { size, root }) => blobs.push(Blob {
-                    id: EntryId::from(&head.entry),
-                    size,
-                    root,
-                }),
+                Some(payload) => blobs.extend(Blob::of(EntryId::from(&head.entry), &payload)),
                 None => {}
             }
         }
@@ -713,14 +719,7 @@ impl Log {
             .iter()
             .map(|id| {
                 view.payload_of(&EntryRef::from(id))
-                    .map(|payload| match payload {
-                        Payload::Inline(_) => None,
-                        Payload::Blob { size, root } => Some(Blob {
-                            id: id.clone(),
-                            size,
-                            root,
-                        }),
-                    })
+                    .map(|payload| Blob::of(id.clone(), &payload))
             })
             .collect()
     }
@@ -729,14 +728,10 @@ impl Log {
     /// the pieces layer); `None` for an inline value, a removal or no head.
     pub(crate) fn blob_head(&self, path: &Name) -> Option<Blob> {
         let head = self.register.value(path)?;
-        match self.view().payload_of(&head.entry)? {
-            Payload::Blob { size, root } => Some(Blob {
-                id: EntryId::from(&head.entry),
-                size,
-                root,
-            }),
-            Payload::Inline(_) => None,
-        }
+        Blob::of(
+            EntryId::from(&head.entry),
+            &self.view().payload_of(&head.entry)?,
+        )
     }
 
     /// The epoch key the applied entry was sealed under: `Some(None)` for a
