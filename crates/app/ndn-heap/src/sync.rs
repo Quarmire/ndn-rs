@@ -227,11 +227,13 @@ impl Net {
             )));
         };
         let stop = self.stop.child_token();
+        let heard_any = Arc::new(AtomicBool::new(false));
         let herald = Herald::new(
             Arc::clone(&self.svs),
             group_name.clone(),
             self.shared.host.device().clone(),
             Arc::clone(&observed),
+            Arc::clone(&heard_any),
             stop.clone(),
         );
         let group = Arc::new(Group {
@@ -245,7 +247,7 @@ impl Net {
             wake: Notify::new(),
             progress: Notify::new(),
             first_vector: Notify::new(),
-            heard_any: AtomicBool::new(false),
+            heard_any,
             relist: AtomicBool::new(true),
             own_seen: AtomicU64::new(0),
             stop,
@@ -256,6 +258,7 @@ impl Net {
         self.groups.lock().insert(space.clone(), Arc::clone(&group));
         rt::spawn(notices(Arc::clone(&group), handle));
         rt::spawn(fetch::run(Arc::clone(&group)));
+        group.herald.hail();
         Ok(group)
     }
 
@@ -316,7 +319,7 @@ pub(crate) struct Group {
     pub(crate) progress: Notify,
     /// The first notice arrived.
     pub(crate) first_vector: Notify,
-    pub(crate) heard_any: AtomicBool,
+    pub(crate) heard_any: Arc<AtomicBool>,
     /// List the values owed their pieces again.
     pub(crate) relist: AtomicBool,
     pub(crate) stop: CancellationToken,

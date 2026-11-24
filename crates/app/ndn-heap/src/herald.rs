@@ -1,4 +1,5 @@
-//! Announcing an own entry again while no peer is seen to have taken it (spec §7.10).
+//! Announcing a group's state again while no peer answers (spec §7.10): an own entry no peer is
+//! seen to have taken, and a group joined whose peers were not heard.
 //!
 //! A change announced once is heard by a peer whose link did not drop it; one
 //! that did hears it at the group's next periodic vector, half a minute by the
@@ -17,6 +18,11 @@
 //! forged counter or an absent peer costs a bounded handful of Sync Interests
 //! per change, never one a period. An announcement decides nothing at a peer: a
 //! counter only names an entry to be fetched and judged (D17).
+//!
+//! A joined group is announced again in the same way while no notice of it was heard
+//! ([`Herald::hail`]): the join announcement, or the vector a peer sent back to it, may be what a
+//! lossy link dropped, and the group's next period is half a minute away. Peers that wrote
+//! nothing never answer, so this too is bounded by [`HERALD_MAX`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,17 +39,20 @@ use crate::sync::TIMELINE;
 /// and a group of several peers has several links that may have dropped it.
 const HERALD_MIN: u32 = 3;
 
-/// The most announcements made again for one change: the pauses before them
+/// The most announcements made again for one change, or for one join: the pauses before them
 /// (`retry_pause`) add up to about twenty seconds, within the group's period.
 const HERALD_MAX: u32 = 8;
 
-/// One group's announcing again of this device's own newest entry.
+/// One group's announcing again of this device's own newest entry, and of the group when no one
+/// was heard in it.
 pub(crate) struct Herald {
     svs: Arc<MultiSvs>,
     group: Name,
     device: Name,
     /// The driver's observed state: what peers' vectors carry of this device.
     observed: Arc<ObservedState>,
+    /// A notice of the group was heard (`Group::heard_any`, the same flag).
+    heard: Arc<AtomicBool>,
     stop: CancellationToken,
     /// The highest seq of this device announced in the group.
     announced: AtomicU64,
@@ -59,6 +68,7 @@ impl Herald {
         group: Name,
         device: Name,
         observed: Arc<ObservedState>,
+        heard: Arc<AtomicBool>,
         stop: CancellationToken,
     ) -> Arc<Herald> {
         Arc::new(Herald {
@@ -66,11 +76,30 @@ impl Herald {
             group,
             device,
             observed,
+            heard,
             stop,
             announced: AtomicU64::new(0),
             taken: AtomicU64::new(0),
             running: AtomicBool::new(false),
         })
+    }
+
+    /// This device joined the group and announced itself (the driver's join announcement):
+    /// announce again, after each pause of the capped doubling, until a notice of the group is
+    /// heard or [`HERALD_MAX`] were made. A peer that is ahead answers an announcement with its
+    /// vector; one announcement and one answer both have to cross the link.
+    pub(crate) fn hail(self: &Arc<Self>) {
+        let herald = Arc::clone(self);
+        rt::spawn(async move {
+            for again in 0..HERALD_MAX {
+                rt::sleep(retry_pause(again)).await;
+                if herald.stop.is_cancelled() || herald.heard.load(Ordering::Relaxed) {
+                    return;
+                }
+                tracing::trace!(target: TIMELINE, group = %herald.group, again, "announce");
+                herald.svs.announce(herald.group.clone()).await;
+            }
+        });
     }
 
     /// A peer asked this device for its entry `seq` of the group's space.

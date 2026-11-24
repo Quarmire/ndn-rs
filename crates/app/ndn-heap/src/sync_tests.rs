@@ -1099,6 +1099,52 @@ async fn a_name_a_sync_interest_carried_is_never_asked_for_a_key() {
     );
 }
 
+/// A device that joined a group and heard no one asks the group again, after the capped
+/// doubling pauses, not once a group period (half a minute) later: the join announcement, or the
+/// reply a peer made to it, may be what the link lost (p1 at `--faulty --fault-seed 1`: the
+/// laptop joined the space the phone wrote into, the phone's reply was lost three times in a row,
+/// and the first notice came 95 s after the join). The asks are a bounded handful, then the
+/// group's period alone.
+#[tokio::test(start_paused = true)]
+async fn a_group_joined_and_heard_from_no_one_is_announced_again_with_growing_pauses() {
+    let r = rig().await;
+    let group = sync_group_of(&space()).unwrap();
+    pass(1).await;
+    let at_1s = r.face.sent_in(&group);
+    assert!(
+        at_1s >= 3,
+        "the join announcement and two more within a second, not {at_1s}"
+    );
+    pass(8).await;
+    let at_9s = r.face.sent_in(&group);
+    assert!(
+        at_9s >= 5,
+        "the pauses grow to seconds but go on while no one is heard, not {at_9s} by 9 s"
+    );
+    pass(60).await;
+    let at_70s = r.face.sent_in(&group);
+    assert!(
+        at_70s <= 1 + 8 + 3,
+        "bounded: the join, eight more, and the group's period, not {at_70s}"
+    );
+}
+
+/// The asking again ends at the first notice of the group: a peer is heard.
+#[tokio::test(start_paused = true)]
+async fn a_group_asked_again_stops_when_a_peer_is_heard() {
+    let r = rig().await;
+    let group = sync_group_of(&space()).unwrap();
+    pass(1).await;
+    r.group.on_update(notice(PHONE, 1));
+    let heard = r.face.sent_in(&group);
+    pass(25).await;
+    assert_eq!(
+        r.face.sent_in(&group),
+        heard,
+        "no more announcements within a group period once a peer is heard"
+    );
+}
+
 /// Over a real forwarder and the real SVS driver: a device publishes its
 /// counter, the other hears the notice, fetches the entry it names through
 /// the forwarder from the writer's server, and takes it: one fetch, one take.

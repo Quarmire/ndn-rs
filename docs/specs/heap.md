@@ -1603,10 +1603,11 @@ Sync Interests of every group of every space of `O`.
 The previous design **hailed** (it asked a group again for its members' state,
 with a growing pause, when a first look found no device heard) and **heralded**
 (it announced its newest change again while no member was heard to have taken
-it). This layer does not hail: a group's own period and the announcement at
-every link coming up (§7.7) repeat what is announced, and because the fetch is
-level-triggered by what the log wants (§7.4), no peer's progress depends on
-hearing a notice a second time.
+it). This layer does not hail without bound: a group's own period and the
+announcement at every link coming up (§7.7) repeat what is announced, and
+because the fetch is level-triggered by what the log wants (§7.4), no peer's
+progress depends on hearing a notice a second time once a peer is heard at all.
+It hails once per join, in the bounded form below.
 
 It heralds, in a form the faulty runs of the conformance suite (§13, `o5` at
 seeds 3 to 6) required. A notice is what makes a peer want an entry at all (a
@@ -1622,6 +1623,18 @@ eight for one change; a newer own entry starts the pauses again. Nothing is kept
 per peer, and what is announced is unchanged: a counter names an entry to be
 fetched and judged, never a head (D17), so an absent peer or a forged counter
 costs a bounded handful of Sync Interests per change, never one per period.
+
+It hails, in a form the faulty runs of the conformance suite (`p1` at seed 1)
+required. A device that joins a group announces itself at once, and a peer that
+is ahead answers with its vector; both Sync Interests must cross the link, and
+when one is lost nothing else comes before the group's next period (`p1`'s
+laptop joined a space its phone wrote into, the phone's answers were lost three
+times in a row, and the first notice of the phone came 95 s after the join, when
+the 120 s a host retries a refusal for were nearly spent). A device
+therefore announces a group it joined again after each pause of the same capped
+doubling until a notice of the group is heard (a counter of any device,
+this one included), at most eight times; peers that wrote nothing never answer,
+and cost the bounded handful and no more.
 
 ### 7.11 Timeline events
 
