@@ -30,8 +30,8 @@ use crate::policy::IntroPolicy;
 use crate::sealed::open_note;
 use crate::store;
 use crate::wire::{
-    self, HINT_TOKEN_LEN, IntroRecord, NONCE_LEN, OfferBody, OfferId, intro_prefix, offer_name,
-    parse_hint_name, parse_intro_name, parse_offer_name,
+    self, HINT_TOKEN_LEN, IntroRecord, NONCE_LEN, OfferBody, OfferId, offer_name, parse_hint_name,
+    parse_intro_name, parse_offer_name,
 };
 
 /// The keywords this crate's [`Extension`] claims: the asks and offers
@@ -384,8 +384,8 @@ impl Inner {
         if let Some((from, id)) = parse_offer_name(name) {
             return from == *device && st.offers.get(&id).is_some_and(|h| h.body.until > now);
         }
-        if name.has_prefix(&intro_prefix(device)) {
-            return st.offers.values().any(|h| h.body.until > now);
+        if let Some(from) = parse_intro_name(name) {
+            return from == *device && st.offers.values().any(|h| h.body.until > now);
         }
         if let Some((from, token)) = parse_hint_name(name) {
             return from == *device && st.hints.contains_key(&token);
