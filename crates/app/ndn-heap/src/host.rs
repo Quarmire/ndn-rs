@@ -177,7 +177,16 @@ impl Extensions {
                     String::from_utf8_lossy(word)
                 )
             } else if owned {
-                return None;
+                let key = |c: &ndn_foundation_types::NameComponent| {
+                    c.typ == tlv_type::GENERIC_NAME_COMPONENT && c.value.as_ref() == b"KEY"
+                };
+                if !name.components().iter().any(key) {
+                    return None;
+                }
+                "its name has a generic `KEY` component, the mark of a key's name and of a \
+                 certificate's (`<id>/KEY/<id>/<issuer>/v=<n>`), which the device key never signs \
+                 for an extension: name the packet without a `KEY` component"
+                    .to_string()
             } else {
                 format!(
                     "no extension registered its keyword {}",

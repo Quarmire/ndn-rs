@@ -352,15 +352,16 @@ impl Frontier {
         }
     }
 
-    /// The seq seen of `device`, 0 for none (every seq, for [`Self::everything`]).
+    /// The seq seen of `device`: what [`Self::set`] said of it, else 0 (every seq,
+    /// for [`Self::everything`]).
     pub fn get(&self, device: &Name) -> u64 {
-        if self.everything {
-            return u64::MAX;
-        }
-        self.seen.get(device).copied().unwrap_or(0)
+        let rest = if self.everything { u64::MAX } else { 0 };
+        self.seen.get(device).copied().unwrap_or(rest)
     }
 
-    /// Say `device` was seen up to `seq`.
+    /// Say `device` was seen up to `seq`: [`Self::get`] answers it from then on,
+    /// also on a frontier made by [`Self::everything`], where the devices not set
+    /// stay seen to the end.
     pub fn set(&mut self, device: Name, seq: u64) {
         self.seen.insert(device, seq);
     }
