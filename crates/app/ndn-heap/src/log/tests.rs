@@ -1488,6 +1488,75 @@ async fn what_is_wanted_is_the_holes_below_the_highest_entry_held_and_shrinks_on
     assert_eq!(r.log.held_prefix(&bob().name), 3);
 }
 
+fn id_of(p: &Packet) -> EntryId {
+    EntryId {
+        device: p.dev.name.clone(),
+        seq: p.seq,
+        digest: p.digest,
+    }
+}
+
+/// `Log::applied` says the entry is in the folded state: held as those bytes, admitted, and its
+/// writer's log chained below it (every seq under it held or declared void) in a space whose
+/// creation is known. An entry whose predecessor is missing is held and shown, but a caller that
+/// asks "may I build on it" (c1: the phone held the owner's first write, not the creation, and
+/// could not write) is answered no until the chain below it is whole.
+#[tokio::test]
+async fn an_entry_is_applied_only_once_the_log_below_it_is_held_or_declared_void_and_the_creation_is_known()
+ {
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    let creation = creation(&mut owner);
+    let first = Chain::new(&laptop()).put("/a", "one");
+    let mut b = Chain::new(&bob());
+    let (p1, p2, p3) = (b.put("/p1", "1"), b.put("/p2", "2"), b.put("/p3", "3"));
+    // The owner's laptop's first entry, its log whole, before the creation: judged provisionally
+    // (a plain write is taken until the creation says whether the space seals), not yet applied.
+    r.applied(&first);
+    assert!(
+        !r.log.applied(&id_of(&first)),
+        "the creation is not held: a plain write is not yet judged by it"
+    );
+    r.applied(&creation);
+    assert!(r.log.applied(&id_of(&creation)));
+    assert!(r.log.applied(&id_of(&first)), "the creation is known");
+
+    // Bob's tip alone: held and shown, its chain below it missing.
+    r.applied(&p3);
+    assert_eq!(r.value("/p3").as_deref(), Some("3"));
+    assert!(!r.log.applied(&id_of(&p3)), "seqs 1 and 2 are not held");
+    r.applied(&p2);
+    assert!(!r.log.applied(&id_of(&p3)), "seq 1 is not held");
+    assert!(!r.log.applied(&id_of(&p2)));
+    r.applied(&p1);
+    for p in [&p1, &p2, &p3] {
+        assert!(r.log.applied(&id_of(p)), "seq {} is chained now", p.seq);
+    }
+}
+
+/// A gap an entry declares is not a hole: the entry above it is applied without it.
+#[tokio::test]
+async fn an_entry_above_a_declared_gap_is_applied_without_the_seqs_the_gap_declares_absent() {
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let mut b = Chain::new(&bob());
+    let p1 = b.put("/p1", "1");
+    let _lost = b.put("/lost", "2");
+    let p3 = b.entry_after_gap(
+        Body::Put(PutBody {
+            path: n("/p3"),
+            payload: Payload::Inline(Bytes::from_static(b"3")),
+        }),
+        1,
+        p1.digest,
+    );
+    r.applied(&p3);
+    assert!(!r.log.applied(&id_of(&p3)), "seq 1 is missing");
+    r.applied(&p1);
+    assert!(r.log.applied(&id_of(&p3)), "seq 2 is declared absent");
+}
+
 #[tokio::test]
 async fn an_entry_naming_other_bytes_than_the_one_held_at_its_prev_is_refused_as_a_fork() {
     let mut r = rig(&carol());

@@ -661,17 +661,24 @@ impl Log {
         self.shown(self.register.value(path)?)?.err()
     }
 
-    /// Whether the entry `id` is applied here: held as exactly those signed
-    /// bytes (the marker of its verification names the digest), verified,
-    /// chained and admitted, and neither refused, waiting on a cut, closed
-    /// for want of its epoch key nor unreadable (it has no `status/`
-    /// record), and not withdrawn since. Two reads of the store, no entry
-    /// is decoded.
+    /// Whether the entry `id` is applied here, folded into the state: held as exactly those
+    /// signed bytes (the marker of its verification names the digest), admitted (neither
+    /// refused, waiting on a cut, closed for want of its epoch key nor unreadable: it has no
+    /// `status/` record, and not withdrawn since), its writer's log chained below it (every seq
+    /// under it is held or declared absent by a counting gap statement: an entry held while a
+    /// lower seq of its writer is still missing is shown, but not built on) and the space's
+    /// creation known (until it is, a plain write is taken provisionally and judged again when
+    /// it arrives). One marker and one status read; no entry is decoded.
     pub(crate) fn applied(&self, id: &EntryId) -> bool {
         let view = self.view();
         view.marker(&id.device, id.seq)
             .is_some_and(|marker| marker.signed_digest == id.digest)
             && view.status(&id.device, id.seq).is_none()
+            && self.fold.create().is_some()
+            && self
+                .devices
+                .get(&id.device)
+                .is_some_and(|dev| dev.held.prefix_with(&dev.voids()) >= id.seq)
     }
 
     /// The epoch key the applied entry was sealed under: `Some(None)` for a
