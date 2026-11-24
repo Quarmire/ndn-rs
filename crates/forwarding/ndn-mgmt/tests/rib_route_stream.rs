@@ -3,8 +3,8 @@
 //! learns a face carrying a prefix came up as an embedded one does
 //! (`ndn_app::Connection::routes`): a link's route is told, a local
 //! application's is not, the stream is local to the host, a client that was
-//! left behind is told it missed some, and a device of the data layer over
-//! IPC announces its sync group when a link route for it comes up.
+//! left behind is told it missed some, and a node of the heap layer over IPC
+//! announces the sync group of a space when a link route for it comes up.
 
 #![cfg(unix)]
 
@@ -13,10 +13,10 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ndn_app::{Connection, EngineBuilder, ForwarderEngine, IpcConnection, Node, RouteNews};
-use ndn_data::{Config, Device, Transport};
+use ndn_app::{Connection, EngineBuilder, ForwarderEngine, IpcConnection, RouteNews};
 use ndn_engine::{EngineConfig, RibRoute};
 use ndn_face_local::{InProcFace, InProcHandle};
+use ndn_heap::{Config, Node, Readers, Share, Transport};
 use ndn_ipc::ForwarderClient;
 use ndn_mgmt::{MgmtHandles, mount_management};
 use ndn_packet::{Data, Interest, Name, encode::InterestBuilder};
@@ -324,24 +324,21 @@ async fn an_ipc_connection_left_behind_is_told_it_missed_routes() {
     d.cancel.cancel();
 }
 
-/// A device of the data layer on an IPC connection announces its sync group
-/// when a link route for it comes up in the daemon: the announcement is
-/// forwarded on the link.
-#[tokio::test]
-async fn a_device_over_ipc_announces_when_a_link_route_for_its_group_comes_up() {
-    let d = daemon().await;
+/// A node of the heap layer over an IPC connection to the daemon: `device`'s
+/// key is made from `seed`.
+async fn node_over_ipc(d: &Daemon, device: &str, seed: u8) -> Node {
     let conn = d.ipc();
-    let device = n("/alice/laptop");
+    let device = n(device);
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     validator
         .adopt_context(Arc::new(SignedTrustContext::hierarchical(n("/alice"))))
         .unwrap();
     let keys = Arc::new(SecurityManager::new());
-    keys.generate_ed25519_from_seed(device.clone().append("KEY").append("1"), &[7; 32])
+    keys.generate_ed25519_from_seed(device.clone().append("KEY").append("1"), &[seed; 32])
         .unwrap();
-    let dev = Device::start(
+    Node::start(
         Transport {
-            node: Node::from_connection(Arc::clone(&conn) as Arc<dyn Connection>),
+            node: ndn_app::Node::from_connection(Arc::clone(&conn) as Arc<dyn Connection>),
             sync: conn as Arc<dyn Connection>,
         },
         device,
@@ -354,43 +351,80 @@ async fn a_device_over_ipc_announces_when_a_link_route_for_its_group_comes_up() 
         },
     )
     .await
-    .expect("the device starts over IPC");
+    .expect("the node starts over IPC")
+}
 
-    // Its start-up announcements settle with no link to carry them.
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    let group = n("/alice/32=sync");
+/// A node of the heap layer on an IPC connection makes a space and announces
+/// its sync group when a link route for the group comes up in the daemon: the
+/// announcement is forwarded on the link.
+///
+/// A peer opens the space and takes what the node signed: a group nobody was
+/// heard in, and an entry no peer took, are announced again, backing off, for
+/// some seconds (the herald, heap spec §7.10), which would put Sync Interests
+/// on the link whether or not a face came up. Once the peer has taken them
+/// only the face coming up announces.
+#[tokio::test]
+async fn a_node_over_ipc_announces_when_a_link_route_for_a_spaces_group_comes_up() {
+    let d = daemon().await;
+    let space = n("/alice/32=data/notes");
+    let node = node_over_ipc(&d, "/alice/laptop", 7).await;
+    let _heap = node
+        .create(
+            &space,
+            Share {
+                readers: Readers::Anyone,
+                writers: vec![],
+            },
+        )
+        .await
+        .expect("the space is made over IPC");
+    let peer = node_over_ipc(&d, "/alice/phone", 8).await;
+    peer.open(&space)
+        .await
+        .expect("the space is opened over IPC");
+
+    // Their start-up announcements settle with no link to carry them.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let group = ndn_heap::wire::sync_group_of(&space).expect("a space has a sync group");
+    // The link route is the namespace's group, which covers the space's.
+    let covering = n("/alice/32=sync");
+    assert!(group.has_prefix(&covering), "{group} lies under {covering}");
     let (link, link_end) = d.face(FaceKind::Quic);
     // The join announcement went out with no link to carry it. A link
-    // route for the group comes up; the device is told once it follows the
+    // route covering the group comes up; the node is told once it follows the
     // stream (the first routes may come up before it does: take it down
     // and up again until it is told).
     let mut told = None;
     for _ in 0..40 {
-        d.come_up(&group, link);
+        d.come_up(&covering, link);
         if let Some(name) = interest_within(&link_end, Duration::from_millis(400)).await {
             told = Some(name);
             break;
         }
-        d.go_down(&group, link);
+        d.go_down(&covering, link);
     }
     let told = told.expect(
-        "a link route for the device's group came up and the device announced nothing on the link in 16 s",
+        "a link route covering the space's group came up and the node announced nothing on the link in 16 s",
     );
     assert!(
         told.has_prefix(&group),
-        "the announcement is a Sync Interest of the group: {told}"
+        "the announcement is a Sync Interest of the space's group: {told}"
     );
 
-    // A local application's route for the group is no face coming up: the
+    // The link's route told both nodes: each announced. Those are drained
+    // until the link has been quiet for longer than the gate's second.
+    while interest_within(&link_end, Duration::from_millis(1200))
+        .await
+        .is_some()
+    {}
+    // A local application's route covering the group is no face coming up: the
     // announcement is not made again, to the link or to it.
-    tokio::time::sleep(Duration::from_millis(1200)).await;
     let (local, local_end) = d.face(FaceKind::App);
-    d.come_up(&group, local);
+    d.come_up(&covering, local);
+    let again = interest_within(&link_end, Duration::from_millis(1500)).await;
     assert!(
-        interest_within(&link_end, Duration::from_millis(1500))
-            .await
-            .is_none(),
-        "a local application's route announced the group again on the link"
+        again.is_none(),
+        "a local application's route announced the group again on the link: {again:?}"
     );
     assert!(
         interest_within(&local_end, Duration::from_millis(100))
@@ -398,6 +432,7 @@ async fn a_device_over_ipc_announces_when_a_link_route_for_its_group_comes_up() 
             .is_none(),
         "a local application's route announced the group to it"
     );
-    dev.shutdown();
+    node.shutdown();
+    peer.shutdown();
     d.cancel.cancel();
 }

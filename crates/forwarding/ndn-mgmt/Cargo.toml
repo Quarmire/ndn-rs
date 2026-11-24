@@ -82,9 +82,9 @@ ndn-ipc          = { workspace = true }
 parking_lot      = { workspace = true }
 # IPC-seam witness (tests/ipc_seam.rs) makes a socketpair.
 libc             = { workspace = true }
-# Route-stream witness (tests/rib_route_stream.rs): a device of the data layer
+# Route-stream witness (tests/rib_route_stream.rs): a node of the heap layer
 # over an IPC connection to an engine with management mounted.
-ndn-data         = { workspace = true }
+ndn-heap         = { workspace = true }
 ndn-sync         = { workspace = true }
 
 [[test]]
