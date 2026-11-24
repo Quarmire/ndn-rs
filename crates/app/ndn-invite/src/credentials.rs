@@ -124,7 +124,7 @@ impl Opened {
     /// The public key digest `key` has by these credentials, unverified: an anchor
     /// of the context (a key that is its own anchor shows no certificate), else the
     /// certificate of it a chain walk picks.
-    fn claimed(&self, key: &Name) -> Option<[u8; 32]> {
+    pub(crate) fn claimed(&self, key: &Name) -> Option<[u8; 32]> {
         let cert = self
             .ctx
             .anchor_for(key)
@@ -317,23 +317,6 @@ pub(crate) fn credentials(node: &NodeHandle, host: &dyn Host) -> Result<Vec<Byte
         "the chain of {} to its namespace's anchor is longer than {CHAIN_MAX} certificates",
         node.writer()
     )))
-}
-
-/// The digest of this device's public key: what an ask and its answer are bound
-/// to.
-pub(crate) fn own_digest(node: &NodeHandle) -> Result<[u8; 32], InviteError> {
-    let me = node.writer();
-    node.keys()
-        .get_signer_sync(me)
-        .ok()
-        .and_then(|signer| signer.public_key())
-        .map(|public| public_key_digest(&public))
-        .ok_or_else(|| {
-            InviteError::local(format!(
-                "the device key {me} gives no public key, so an answer cannot be bound to it: \
-                 fix this device's keys"
-            ))
-        })
 }
 
 /// Why `ns`, the namespace of an inviter or of an asker, cannot be brought by an
