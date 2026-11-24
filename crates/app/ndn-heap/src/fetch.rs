@@ -676,6 +676,16 @@ impl Group {
         } else {
             (launch.misses + 1, retry_pause(launch.misses))
         };
+        tracing::trace!(
+            target: TIMELINE,
+            device = %self.shared.host.device(),
+            %name,
+            probe = launch.probe,
+            turn = launch.misses,
+            resolved,
+            pause_ms = pause.as_millis() as u64,
+            "ask_end"
+        );
         self.asks.lock().by.insert(
             (launch.device, launch.seq),
             Ask {
