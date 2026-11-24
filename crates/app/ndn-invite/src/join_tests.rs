@@ -297,3 +297,186 @@ async fn a_code_of_this_devices_own_namespace_is_a_bad_request() {
     assert_eq!(e.next(), NextStep::FixRequest);
     assert!(calls.dialled().is_empty());
 }
+
+// ---- more of the joiner's side: roles, repeats, refusals, a host that does not adopt -------------
+
+/// Alice's laptop with an offer of her notebook as `role`, on a forwarder devices of other
+/// persons join.
+struct World {
+    net: Net,
+    cancel: CancellationToken,
+    offered: crate::test_kit::Offered,
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+async fn world(role: Role) -> World {
+    let net = Net::new().await;
+    let cancel = CancellationToken::new();
+    let alice = Person::new("/alice");
+    let laptop = Setup::new(&alice, "/alice/laptop")
+        .config(kit_config())
+        .on(&net, &cancel)
+        .start()
+        .await;
+    let offered = alice_offers(laptop, alice, role).await;
+    World {
+        net,
+        cancel,
+        offered,
+    }
+}
+
+/// `device` of a new person `ns`, on the world's forwarder.
+async fn joiner(world: &World, ns: &str, device: &str) -> crate::test_kit::Device {
+    let person = Person::new(ns);
+    Setup::new(&person, device)
+        .config(kit_config())
+        .on(&world.net, &world.cancel)
+        .start()
+        .await
+}
+
+/// A reader's join returns once the space lists the joiner as a reader and its epoch key is
+/// held: it is no writer of the space.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_join_returns_once_listed_as_a_reader_and_keyed() {
+    let w = world(Role::Reader).await;
+    let phone = joiner(&w, "/bob", "/bob/phone").await;
+    let joined = phone
+        .invites
+        .join(&w.offered.code.link)
+        .await
+        .expect("the reader joins");
+    assert_eq!(joined.role, Role::Reader);
+    let bobs = heap(&phone, &notebook());
+    assert!(bobs.members().readers.contains(&n("/bob")));
+    assert!(
+        !bobs.members().writers.contains(&n("/bob")),
+        "a reader was listed as a writer"
+    );
+    assert!(bobs.holds_epoch_key());
+}
+
+/// Joining again with the same code, once joined, is answered again: the offer answers the
+/// key it admitted, and the second join returns as the first did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn joining_again_with_the_same_code_returns_the_same_join() {
+    let w = world(Role::Writer).await;
+    let phone = joiner(&w, "/bob", "/bob/phone").await;
+    let first = phone
+        .invites
+        .join(&w.offered.code.link)
+        .await
+        .expect("joins");
+    let again = phone
+        .invites
+        .join(&w.offered.code.link)
+        .await
+        .expect("the same code joins again");
+    assert_eq!(again, first);
+}
+
+/// A code whose secret is wrong is refused by the inviter, and the refusal says how to go
+/// on (`FixRequest`: check the code); nothing of the space is held afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_secret_is_refused_and_the_space_is_not_opened() {
+    let w = world(Role::Writer).await;
+    let phone = joiner(&w, "/bob", "/bob/phone").await;
+    let Ok(TrustEnvelope::Intro(mut intro)) = TrustEnvelope::from_uri(&w.offered.code.link) else {
+        panic!("an introduction link");
+    };
+    intro.secret[0] ^= 1;
+    let wrong = TrustEnvelope::Intro(intro).to_uri();
+    let got = phone.invites.join(&wrong).await;
+    let Err(e @ InviteError::Refused(IntroRefusal::WrongProof { .. })) = &got else {
+        panic!("not refused as a wrong proof: {got:?}");
+    };
+    assert_eq!(e.next(), NextStep::FixRequest);
+    assert!(
+        phone.node.space(&notebook()).is_none(),
+        "a refused join opened the space"
+    );
+}
+
+/// An offer used by one key is refused to another: `Used`, `AskOwner`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_offer_used_by_one_device_is_refused_to_another_as_used() {
+    let w = world(Role::Writer).await;
+    let bob = joiner(&w, "/bob", "/bob/phone").await;
+    bob.invites
+        .join(&w.offered.code.link)
+        .await
+        .expect("the first joins");
+    let carol = joiner(&w, "/carol", "/carol/phone").await;
+    let got = carol.invites.join(&w.offered.code.link).await;
+    let Err(e @ InviteError::Refused(IntroRefusal::Used)) = &got else {
+        panic!("not refused as used: {got:?}");
+    };
+    assert_eq!(e.next(), NextStep::AskOwner);
+    assert!(carol.node.space(&notebook()).is_none());
+}
+
+/// A host that does not adopt the inviter's namespace fails the join as a local failure
+/// (`FixLocal`) that says what to do; the space is not opened, and the same code joins
+/// once the host is fixed (the offer answers the key it admitted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_does_not_adopt_the_inviter_fails_the_join_locally() {
+    let w = world(Role::Writer).await;
+    let bob = Person::new("/bob");
+    let phone = Setup::new(&bob, "/bob/phone")
+        .config(kit_config())
+        .refusing(&["/alice"])
+        .on(&w.net, &w.cancel)
+        .start()
+        .await;
+    let got = phone.invites.join(&w.offered.code.link).await;
+    let Err(e @ InviteError::Local { reason }) = &got else {
+        panic!("not a local failure: {got:?}");
+    };
+    assert!(reason.contains("did not adopt"), "{reason}");
+    assert!(reason.contains("join again with the same code"), "{reason}");
+    assert_eq!(e.next(), NextStep::FixLocal);
+    assert!(phone.node.space(&notebook()).is_none());
+}
+
+/// While a join waits it has opened the space and noted the join, so that a put before the
+/// entry that lists the person arrives waits (`NotReady`), and does not tell the joiner to
+/// ask the owner: the note is in the node's store while the join waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waiting_join_has_opened_the_space_and_noted_the_join() {
+    let gate = Gate::new();
+    gate.hold_names(is_log_or_key);
+    let (offered, phone, cancel) = on_a_net(Role::Writer, &gate).await;
+    let code = offered.code.link.clone();
+    let joining = {
+        let phone = Arc::clone(&phone);
+        tokio::spawn(async move { phone.invites.join(&code).await })
+    };
+    gate.wait_held().await;
+    let joined_notes = n("/localhost/ndn-heap/joined");
+    for _ in 0..100 {
+        if !phone.store.scan_under(&joined_notes, 0).is_empty() {
+            break;
+        }
+        ndn_app::rt::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !phone.store.scan_under(&joined_notes, 0).is_empty(),
+        "the join did not note that it was admitted to the space"
+    );
+    assert!(
+        phone.node.space(&notebook()).is_some(),
+        "the space is not open"
+    );
+    gate.release();
+    joining
+        .await
+        .unwrap()
+        .expect("the join returns once let through");
+    cancel.cancel();
+}

@@ -214,6 +214,11 @@ impl Connection for Gated {
                 released.await;
             }
         }
+        // The relay a hint names is the case's to model (the route above decides whether
+        // it carries); the forwarder here has none, so what is carried goes on by its
+        // name, as a forwarder sends an Interest on once its hint reached a producer
+        // region.
+        let wire = ndn_packet::interest::strip_forwarding_hint(&wire).unwrap_or(wire);
         self.face.send(wire).await
     }
 

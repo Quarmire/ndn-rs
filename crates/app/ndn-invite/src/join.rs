@@ -610,7 +610,7 @@ impl Inner {
             // The grant's other end (spec §19.8): the inviter, by the key that signed
             // the answer verified above, may link back for this space while it lists
             // this device.
-            self.grants.keep_mirror(inviter_key, &inviter, &space).await?;
+            self.keep_mirror(inviter_key, &inviter, &space).await?;
             Ok(Joined {
                 space,
                 role,
