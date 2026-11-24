@@ -2523,7 +2523,7 @@ pub enum Change {
     Withdrawn { id: EntryId, why: Refusal },
     Members(Members), Alert(Alert), Lagged { missed: u64 },
 }
-pub struct Frontier(/* device → seq */);   // new(), get(&Name) -> u64, set(Name, u64)
+pub struct Frontier(/* device → seq */);   // new(), everything(), get(&Name) -> u64, set(Name, u64): `set` is what `get` answers, also after `everything()` (the devices not set stay seen to the end)
 pub struct Changes;  // async fn next(&mut self) -> Option<Result<Change, HeapError>>; a Stream
 ```
 
@@ -2734,8 +2734,11 @@ signs a name the caller builds around it. Every other name (an entry
 `32=log`, a seal key, a grant, a signal run, a certificate or key name
 `<D>/KEY/…`, another device's, one with no keyword or the keyword not right
 after the device, an unregistered keyword) is `HeapError::BadRequest` naming why
-and what to register, signs nothing and counts no signature. So the node is no
-signing oracle: it cannot be made to sign an entry at a chosen name (the
+and what to register, signs nothing and counts no signature. A name with a
+generic `KEY` component anywhere, even under a registered keyword
+(`<D>/32=<keyword>/KEY/<id>/<issuer>/v=<n>` is a certificate's shape), is
+refused too, so a keyword is no way to have the device key certify a key. So the
+node is no signing oracle: it cannot be made to sign an entry at a chosen name (the
 device would equivocate, §3.7), speak for the namespace, or frame octets as
 an entry. A packet signed under a registered keyword parses as none of the
 core kinds (§2.3: the first keyword decides), so a peer never takes it for an
