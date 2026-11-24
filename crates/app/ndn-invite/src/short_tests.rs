@@ -175,7 +175,10 @@ fn short_codes_round_trip_and_fit_three_lines() {
 fn a_short_code_names_the_device_and_the_secret_not_the_offer() {
     let device = n("/alice/member/laptop");
     let text = named().encode().unwrap();
-    assert!(!text.contains("32=intro") && !text.contains("/offer/"), "{text}");
+    assert!(
+        !text.contains("32=intro") && !text.contains("/offer/"),
+        "{text}"
+    );
     let back = ShortCode::parse(&text, false).unwrap();
     assert_eq!(back.device, device);
     assert_eq!(back.secret, secret());
