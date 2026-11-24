@@ -268,8 +268,7 @@ fn a_full_link_carries_the_policys_candidates_and_relays() {
         candidates: (0..LINK_HINT_CANDIDATES_MAX as u16).map(host6).collect(),
     };
     let read = |policy: &IntroPolicy| {
-        let link =
-            LinkHint::code_link(code_with(offer.clone(), 5), Some(&hint), policy).unwrap();
+        let link = LinkHint::code_link(code_with(offer.clone(), 5), Some(&hint), policy).unwrap();
         let Ok(TrustEnvelope::Intro(i)) = TrustEnvelope::from_uri(&link) else {
             panic!("an introduction link");
         };
@@ -307,7 +306,8 @@ fn a_code_that_cannot_hold_the_whole_hint_trims_it_and_never_the_secret() {
     let mut trimmed = None;
     for pad in (1400..1700).step_by(4) {
         let offer = offer_uri(&"n".repeat(pad));
-        let Some(link) = LinkHint::code_link(code_with(offer.clone(), 40), Some(&hint), &uncapped())
+        let Some(link) =
+            LinkHint::code_link(code_with(offer.clone(), 40), Some(&hint), &uncapped())
         else {
             break;
         };
@@ -378,12 +378,25 @@ async fn the_defaults_of_a_host_dial_nothing_and_say_so() {
         candidates: vec![host(1)],
     };
     let within = Duration::from_secs(1);
-    let err = bare.dial(&hint, &n("/alice/laptop"), within).await.unwrap_err();
-    assert!(err.contains("/alice/laptop") && err.contains("Host::dial"), "{err}");
     let err = bare
-        .dial_first(&n("/alice/laptop"), "192.0.2.7:4433".parse().unwrap(), within)
+        .dial(&hint, &n("/alice/laptop"), within)
         .await
         .unwrap_err();
-    assert!(err.contains("Host::dial_first") && err.contains("route to it"), "{err}");
+    assert!(
+        err.contains("/alice/laptop") && err.contains("Host::dial"),
+        "{err}"
+    );
+    let err = bare
+        .dial_first(
+            &n("/alice/laptop"),
+            "192.0.2.7:4433".parse().unwrap(),
+            within,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("Host::dial_first") && err.contains("route to it"),
+        "{err}"
+    );
     bare.undial(&hint, &n("/alice/laptop"));
 }
