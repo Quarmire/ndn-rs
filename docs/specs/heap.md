@@ -537,7 +537,10 @@ use an owner device (`UseOwnerDevice`).
 A **suspected** key's new entries are not taken (`Suspected`) while its person
 is a writer, until its revocation is held (§9) or the host unsuspects it;
 entries held from before stay. A removed person's entries are judged by the
-removal cut alone, so suspicion does not touch them. `Suspected` is never kept
+removal cut alone, so suspicion does not touch them, and a fork in the chain among
+them is not refused as one: the cut decides what is kept. The fork is still the
+evidence of a key that signed two chains, so it raises `Alert::Equivocation` (no refusal
+and no suspicion) and the host sees a copied key even when the cut decides. `Suspected` is never kept
 as an entry's verdict: the entry is taken when the mark ends and it is offered
 again.
 
@@ -2841,7 +2844,7 @@ dropped, a start from the image), `image`, `restore` and `block_flush`.
 | Case | Property | Crate tests |
 |---|---|---|
 | q1 | Equivocation evidence: two packets at one name from a copied key are both kept, `Alert::Equivocation` is raised for an entry of any kind, the key is suspected and its new entries are not applied | `two_packets_at_one_name_are_evidence_and_the_key_is_suspected`, `equivocation_in_a_members_or_epoch_entry_is_reported_to_the_host`, `a_suspected_keys_new_entries_are_not_taken_until_its_revocation` |
-| q2 | A removal keeps exactly the chain ancestors of its tips: an orphan inside a declared gap is kept, other bytes at a kept seq refused, an entry above the tip refused | `an_orphan_inside_a_gap_is_kept`, `other_bytes_at_a_kept_seq_are_refused`, `a_removed_writers_entry_inside_the_cut_is_kept_and_outside_it_refused`, `an_entry_by_a_removed_person_after_the_tip_never_counts_in_any_arrival_order` |
+| q2 | A removal keeps exactly the chain ancestors of its tips: an orphan inside a declared gap is kept, other bytes at a kept seq refused, an entry above the tip refused; a fork among a removed writer's entries is the cut's to settle and is still told as an equivocation | `an_orphan_inside_a_gap_is_kept`, `other_bytes_at_a_kept_seq_are_refused`, `a_removed_writers_entry_inside_the_cut_is_kept_and_outside_it_refused`, `an_entry_by_a_removed_person_after_the_tip_never_counts_in_any_arrival_order`, `a_removed_writers_fork_below_the_tip_is_told_and_not_refused_as_a_chain_fork` |
 | q3 | The membership fold depends on the entries held alone: three devices applying the same `Members` entries in different arrival orders while offline hold the same members and epoch | `fold_state_is_independent_of_arrival_order`, `withdrawing_a_members_entry_equals_never_having_seen_it` |
 | q4 | A cold device joining a space whose writer crashed twice fetches every entry and asks for no seq inside a declared gap beyond the miss bound | `a_void_declared_by_a_gap_statement_is_never_asked`, `a_gap_in_the_notice_is_backfilled_in_a_window` |
 | q5 | Two owner devices remove two readers at once: after the repair writers seal in one complete epoch and neither removed reader opens later entries | `concurrent_removals_leave_a_complete_epoch_after_each_owner_device_repairs`, `concurrent_removals_end_with_one_complete_epoch`, `a_writer_never_seals_in_an_outgrown_epoch` |

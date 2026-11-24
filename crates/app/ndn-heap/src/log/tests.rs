@@ -1738,6 +1738,43 @@ async fn an_entry_naming_other_bytes_than_the_one_held_at_its_prev_is_refused_as
     assert!(r.store.contains(&forked.name()), "kept as evidence");
 }
 
+/// A removed writer's entries are judged by the cut alone, which settles a fork: it is not
+/// refused as one. The evidence that the key signed two chains is still told, once, as an
+/// equivocation, so the host sees a copied key even when the cut is what decides.
+#[tokio::test]
+async fn a_removed_writers_fork_below_the_tip_is_told_and_not_refused_as_a_chain_fork() {
+    let me = laptop();
+    let mut r = rig(&me);
+    r.members(members(Some(true), vec![add(1, "/bob", Role::Writer)]))
+        .await;
+    let mut b = Chain::new(&bob());
+    let (p1, _p2, p3) = (b.put("/p1", "1"), b.put("/p2", "2"), b.put("/p3", "3"));
+    // The same first entry, then another second one: a fork below the tip.
+    let mut other = Chain::new(&bob());
+    assert_eq!(other.put("/p1", "1").digest, p1.digest);
+    let forked = other.put("/p2", "other");
+    r.applied(&p1);
+    r.applied(&p3);
+    let ops = r.log.remove_ops(&n("/bob"));
+    assert_eq!(ops, vec![remove(1, vec![p3.entry_ref()])]);
+    r.members(members(None, ops)).await;
+
+    let a = r.admit(&forked);
+    assert!(
+        has_alert(&a, |al| matches!(
+            al,
+            Alert::Equivocation { device, seq: 2 } if *device == bob().name
+        )),
+        "{:?}",
+        a.effects.alerts
+    );
+    assert_ne!(
+        a.outcome,
+        Outcome::Refused(Refusal::Chain),
+        "the cut decides what a removed writer's fork is"
+    );
+}
+
 #[tokio::test]
 async fn an_owners_removal_binds_what_it_holds_and_the_cut_survives_a_restart() {
     let me = laptop();

@@ -357,14 +357,24 @@ impl Log {
                 // A removed person's entries are judged by the removal cut
                 // alone (spec 3.7): the cut names the bytes it keeps, so a
                 // fork with other bytes held at a name is the cut's to
-                // settle, not a reason to refuse what it names.
+                // settle, not a reason to refuse what it names. The fork is
+                // still the evidence of a key signing two chains: told to
+                // the host, with no refusal and no suspicion (the key is
+                // the removed writer's, and the owner decides by the cut).
                 Some(conflict) if !self.judged_by_cut(&v.person, &id.device) => {
                     self.equivocated(a, conflict, fx);
                     Err(Status::Refused(Refusal::Chain))
                 }
-                _ => self
-                    .assess(id, &v.person, v.owner_capable, &v.key, entry)
-                    .map(|()| entry),
+                conflict => {
+                    if let Some(seq) = conflict {
+                        fx.alerts.push(Alert::Equivocation {
+                            device: id.device.clone(),
+                            seq,
+                        });
+                    }
+                    self.assess(id, &v.person, v.owner_capable, &v.key, entry)
+                        .map(|()| entry)
+                }
             },
         };
         if let Err(Status::Refused(why)) = &verdict {
