@@ -245,7 +245,9 @@ fn parse_keyed<'a>(name: &'a Name, word: &[u8]) -> Option<(Name, &'a Bytes)> {
 
 /// A device's seal key's name: `<device>/32=seal/<public key>`, the last
 /// component the 32 octets of its X25519 public key.
-pub(crate) fn seal_key_name(device: &Name, public: &[u8; 32]) -> Name {
+///
+/// Public: a sibling crate's cases name a seal key as the layer does.
+pub fn seal_key_name(device: &Name, public: &[u8; 32]) -> Name {
     keyed(device, SEAL, Bytes::copy_from_slice(public))
 }
 
@@ -283,7 +285,7 @@ impl GrantAsk {
     /// An ask for `epoch` of `space` that carries `seal_packet`, the asker's seal key packet;
     /// refused if that is no Data named `<device>/32=seal/<public key>` or is over
     /// [`SEAL_KEY_PACKET_MAX`]. Whether the device signed it is for the granter's judge.
-    pub(crate) fn new(
+    pub fn new(
         space: Name,
         epoch: EpochId,
         seal_packet: Bytes,
@@ -313,7 +315,7 @@ impl GrantAsk {
     }
 
     /// The `GRANT_ASK` TLV: `{ Name(space), EPOCH_ID, SEAL_KEY_PACKET }`.
-    pub(crate) fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv::GRANT_ASK, |w| {
             write_name(w, &self.space);
@@ -343,7 +345,9 @@ impl GrantAsk {
 }
 
 /// A grant's name: `<granter>/32=grant/<GrantAsk TLV>`.
-pub(crate) fn grant_name(granter: &Name, ask: &GrantAsk) -> Name {
+///
+/// Public: a sibling crate's cases name a grant as the layer does.
+pub fn grant_name(granter: &Name, ask: &GrantAsk) -> Name {
     keyed(granter, GRANT, ask.encode())
 }
 
@@ -360,7 +364,9 @@ pub fn parse_grant_name(name: &Name) -> Option<(Name, GrantAsk)> {
 /// The name that asks holder `holder` for a packet it keeps of another
 /// device, `original` (an entry or a piece): `<holder>/32=held/<Name TLV>`.
 /// It routes to the holder by its own name.
-pub(crate) fn held_name(holder: &Name, original: &Name) -> Name {
+///
+/// Public: a sibling crate's cases name a held copy as the layer does.
+pub fn held_name(holder: &Name, original: &Name) -> Name {
     keyed(holder, HELD, original.encode_to_tlv())
 }
 
@@ -419,7 +425,9 @@ pub(crate) const RUN_ID_LEN: usize = 16;
 /// `<device>/32=signal/<scope>/32=run/<run>`, `device` the device whose key
 /// signs it, `scope` the space the run's signals are of and `run` the run's
 /// id, one generic component.
-pub(crate) fn signal_run_name(device: &Name, scope: &Name, run: &[u8; RUN_ID_LEN]) -> Name {
+///
+/// Public: a sibling crate's cases name a run header as the layer does.
+pub fn signal_run_name(device: &Name, scope: &Name, run: &[u8; RUN_ID_LEN]) -> Name {
     let mut comps = device.components().to_vec();
     comps.push(kw(SIGNAL));
     comps.extend(scope.components().iter().cloned());

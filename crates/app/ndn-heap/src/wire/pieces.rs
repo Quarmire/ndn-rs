@@ -53,7 +53,9 @@ pub struct PieceName {
 }
 
 /// The name of piece `kind` of the entry named `entry`.
-pub(crate) fn piece_name(entry: &Name, kind: PieceKind) -> Name {
+///
+/// Public: a sibling crate's cases name a piece as the layer does.
+pub fn piece_name(entry: &Name, kind: PieceKind) -> Name {
     let base = entry.clone().append_component(kw(PIECE));
     match kind {
         PieceKind::Chunk(i) => base.append_segment(i),
