@@ -113,11 +113,18 @@ fn every_error_says_why_and_what_to_do() {
         why: "the epoch key is not held".into(),
     }
     .to_string();
-    for part in ["/alice/32=data/notes", "the epoch key is not held", "try again"] {
+    let space = n("/alice/32=data/notes").to_string();
+    for part in [space.as_str(), "the epoch key is not held", "try again"] {
         assert!(not_ready.contains(part), "{not_ready}");
     }
     let local = InviteError::local("disk full").to_string();
-    assert!(local.contains("disk full") && local.contains("fix this device"), "{local}");
+    assert!(
+        local.contains("disk full") && local.contains("fix this device"),
+        "{local}"
+    );
     let bad = InviteError::BadRequest { why: "x".into() }.to_string();
-    assert!(bad.contains("x") && bad.contains("fix the request"), "{bad}");
+    assert!(
+        bad.contains("x") && bad.contains("fix the request"),
+        "{bad}"
+    );
 }
