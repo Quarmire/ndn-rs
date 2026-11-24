@@ -217,6 +217,37 @@ async fn sign_packet_refuses_a_name_no_extension_owns() {
     assert_eq!(node.signatures(), before + 3, "a refusal signs nothing");
 }
 
+/// A certificate is named `<issuer…>/KEY/<id>/<issuer>/v=<n>`: a name with a
+/// generic `KEY` component anywhere is never signed, so an extension's keyword
+/// is no way to have the device key certify a key (ContentType Key) in the
+/// namespace's name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sign_packet_refuses_a_name_with_a_key_component() {
+    let dev = solo().await;
+    let (node, _) = boot(&dev, cfg()).await;
+    node.extend(Arc::new(Claims(&["x"]))).unwrap();
+    let before = node.signatures();
+    for name in [
+        "/alice/laptop/32=x/KEY/1/self/v=1",
+        "/alice/laptop/32=x/a/KEY/b",
+        "/alice/laptop/32=x/KEY",
+    ] {
+        let why = node
+            .sign_packet(DataBuilder::new(n(name), b"x"))
+            .expect_err(name);
+        assert!(
+            matches!(&why, HeapError::BadRequest { why } if why.contains("KEY")),
+            "{name}: {why:?}"
+        );
+    }
+    assert_eq!(node.signatures(), before, "a refusal signs nothing");
+    // A component that only looks alike is an ordinary one.
+    for name in ["/alice/laptop/32=x/key/1", "/alice/laptop/32=x/KEYS/1"] {
+        node.sign_packet(DataBuilder::new(n(name), b"x"))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+}
+
 /// An extension may not claim a keyword the core serves or one already
 /// claimed, nor none, nor a word that is no keyword; a refused one registers
 /// nothing, not even its other keywords.

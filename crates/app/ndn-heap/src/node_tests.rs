@@ -444,6 +444,21 @@ async fn a_clean_close_leaves_no_hole_and_no_gap_statement() {
     }
 }
 
+/// `set` on a frontier made by `Frontier::everything` says what it was told: the
+/// device is seen up to that seq, the others stay seen to the end.
+#[test]
+fn a_frontier_set_after_everything_is_what_get_answers() {
+    let (bob, carol) = (n("/bob/laptop"), n("/carol/laptop"));
+    let mut frontier = Frontier::everything();
+    assert_eq!(frontier.get(&bob), u64::MAX);
+    frontier.set(bob.clone(), 7);
+    assert_eq!(frontier.get(&bob), 7, "the device set is seen up to 7");
+    assert_eq!(frontier.get(&carol), u64::MAX, "the others stay seen");
+    let mut empty = Frontier::new();
+    empty.set(bob.clone(), 7);
+    assert_eq!((empty.get(&bob), empty.get(&carol)), (7, 0));
+}
+
 /// A watch from `Frontier::everything` lists no head and tells what follows: a members
 /// change reaches it, the values held before it began do not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
