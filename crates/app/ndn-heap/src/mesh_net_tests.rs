@@ -719,6 +719,94 @@ async fn an_entry_the_owner_readmits_by_name_and_digest_returns_to_every_node() 
     .await;
 }
 
+/// A thief signs at a lost key's seq 1 and the reader hears the thief first; the honest entry at
+/// the same name comes second and is kept as evidence. The owner revokes the key with a cut that
+/// keeps neither and re-admits the honest entry by its digest: the reader withdraws the thief's
+/// bytes and applies the honest ones it holds as evidence, without asking for them again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_honest_copy_kept_as_evidence_is_applied_when_the_owner_readmits_it() {
+    let m = mesh(&["/alice/laptop", "/alice/phone"]).await;
+    let laptop = m.boot(0, fast()).await;
+    let mine = laptop.create(&space(), public()).await.unwrap();
+    let phone = m.devs[1].name.clone();
+    let key = phone.clone().append("KEY").append("1");
+    let signer = m.devs[1].keys.get_signer_sync(&key).unwrap();
+    let signed = |path: &str, value: &str| {
+        let content = WireEntry {
+            prev: None,
+            after: Vec::new(),
+            body: Body::Put(PutBody {
+                path: n(path),
+                payload: Payload::Inline(bytes(value)),
+            }),
+        }
+        .encode()
+        .unwrap();
+        seal::sign(
+            DataBuilder::new(log_name(&phone, &space(), 1), &content),
+            &*signer,
+        )
+        .unwrap()
+    };
+    let (thief, honest) = (signed("/thief", "stolen"), signed("/honest", "mine"));
+    for (wire, outcome) in [(&thief, Outcome::Applied), (&honest, Outcome::Evidence)] {
+        let taken = laptop.inner.take(&space(), wire.clone(), false).await;
+        assert!(
+            matches!(&taken, Taken::Decided { outcome: o, .. } if *o == outcome),
+            "{taken:?}"
+        );
+    }
+    assert!(has(&mine, "/thief", "stolen").await);
+
+    // The revocation keeps nothing of the key and names the honest bytes.
+    let bound = CutBound {
+        held_before: Some(Timestamp(0)),
+        ..CutBound::default()
+    };
+    let proposal = laptop.revocation_cut(&key, &bound).unwrap();
+    let adopt = |version: u64, cut: ndn_security::RevocationCut| {
+        for dev in &m.devs {
+            let held = dev
+                .validator
+                .keyring()
+                .contexts()
+                .into_iter()
+                .find(|c| *c.namespace() == n("/alice"))
+                .expect("the namespace's context");
+            let next = ndn_security::SignedTrustContext::hierarchical(n("/alice"))
+                .with_version(version)
+                .with_revocation(key.clone())
+                .with_revocation_cut(cut.clone());
+            for anchor in held.anchors().iter() {
+                next.add_anchor(anchor.value().clone());
+            }
+            dev.validator
+                .keyring()
+                .adopt_update(Arc::new(next))
+                .expect("adopted");
+        }
+    };
+    adopt(2, proposal.cut.clone());
+    eventually("the reader withdraws the thief's entry", || async {
+        matches!(mine.get(&n("/thief")).await, Ok(None))
+    })
+    .await;
+    let named = honest_full(&phone, &honest);
+    let mut cut = proposal.cut.clone();
+    assert!(cut.readmit(named).unwrap());
+    adopt(3, cut);
+    eventually("the reader applies the honest entry it held", || async {
+        has(&mine, "/honest", "mine").await
+    })
+    .await;
+    assert_eq!(mine.get(&n("/thief")).await.unwrap(), None);
+}
+
+/// The name a cut re-admits `wire` by: its entry name with the implicit digest.
+fn honest_full(device: &Name, wire: &Bytes) -> Name {
+    log_name(device, &space(), 1).append_implicit_digest(crate::wire::implicit_digest(wire))
+}
+
 /// A private space has an epoch in force once created, complete for exactly its readers, signed by
 /// an owner device; a public space has none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

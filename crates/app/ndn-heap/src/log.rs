@@ -865,8 +865,9 @@ impl Log {
     /// void: wanted as any hole is, whatever counter was heard of the device, since the cut is
     /// signed by the namespace's root and lists exactly what to take. The entries it re-admits
     /// one by one (`exact`, from [`Judge::cut_exact`](crate::trust::Judge::cut_exact)) are wanted
-    /// by the bytes it names unless a packet with those bytes is held already (a held entry
-    /// refused for the cut is judged again when the cut arrives, not asked for).
+    /// by the bytes it names unless the packet held at the name has those bytes (a held entry
+    /// refused for the cut is judged again when the cut arrives, not asked for; the same bytes
+    /// kept only as evidence beside others are asked for).
     pub(crate) fn cut_wants(
         &self,
         runs: &[(Name, u64, u64)],
@@ -892,10 +893,12 @@ impl Log {
         }
         let view = self.view();
         for (device, seq, digest) in exact {
+            // Only the packet at the name counts: the same bytes kept as evidence (the second
+            // packet of a device that signed two) are not the entry, and are taken in its place
+            // when the judge accepts them.
             let held = view
-                .wires_at(device, *seq)
-                .iter()
-                .any(|wire| implicit_digest(wire) == *digest);
+                .wire_at(device, *seq)
+                .is_some_and(|wire| implicit_digest(&wire) == *digest);
             if !held {
                 out.push(Want {
                     device: device.clone(),

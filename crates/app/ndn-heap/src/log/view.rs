@@ -195,12 +195,11 @@ impl Log {
         let mut out = Vec::new();
         for (device, dev) in self.devices.iter().filter(|(_, d)| d.person == *person) {
             for seq in dev.held.seqs() {
-                if matches!(
-                    view.status(device, seq),
-                    Some(Status::Refused(
-                        Refusal::OutsideCut(_) | Refusal::Untrusted { .. }
-                    ))
-                ) {
+                if view
+                    .status(device, seq)
+                    .as_ref()
+                    .is_some_and(Status::awaits_trust)
+                {
                     out.push(log_name(device, &self.space, seq));
                 }
             }

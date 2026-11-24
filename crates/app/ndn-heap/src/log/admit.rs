@@ -173,19 +173,37 @@ impl Log {
         if let Some(why) = self.suspicion(v) {
             return Outcome::Refused(why);
         }
+        self.take_in_place(&a, held.is_some(), true, fx)
+    }
+
+    /// Take the entry of `a`. `displacing`: other bytes are held at its name, and they are
+    /// kept as evidence in its place. `told`: that is told as the equivocation it is, and the
+    /// key is suspected.
+    fn take_in_place(
+        &mut self,
+        a: &Arrival<'_>,
+        displacing: bool,
+        told: bool,
+        fx: &mut Effects,
+    ) -> Outcome {
+        let (device, seq) = (&a.id.device, a.id.seq);
         // Other bytes were refused here as not on the cut's chain; these are
         // the bytes it names. They take the name; what was refused stays as
         // evidence.
-        let displaced = held.and_then(|_| {
-            let old = self.view().status(device, seq);
-            self.set_status(device, seq, old.as_ref(), None);
-            self.view().wire_at(device, seq)
-        });
-        let outcome = self.take(&a, fx);
+        let displaced = displacing
+            .then(|| {
+                let old = self.view().status(device, seq);
+                self.set_status(device, seq, old.as_ref(), None);
+                self.view().wire_at(device, seq)
+            })
+            .flatten();
+        let outcome = self.take(a, fx);
         if let Some(old) = displaced {
             self.store
                 .insert(Kind::EQUIVOCAL.of(&a.id.name(&self.space)), old);
-            self.equivocated(&a, seq, fx);
+            if told {
+                self.equivocated(a, seq, fx);
+            }
         }
         outcome
     }
@@ -973,6 +991,69 @@ impl Log {
         self.reassess(device, seq, Rejudge::Verified, &mut fx);
         self.settle(&mut fx);
         fx
+    }
+
+    /// The judge accepts the second packet kept at the name of a held entry that is refused for
+    /// what a cut or a trust context can change, while it does not accept the packet held
+    /// there (a thief's bytes were heard first, the key owner's bytes second): the packet that
+    /// is accepted takes the name, and the one refused is kept as evidence in its place.
+    /// Nothing is told as a second equivocation: it was told when the second packet arrived.
+    pub(crate) fn promote(
+        &mut self,
+        wire: &Bytes,
+        data: &Data,
+        verified: &Verified,
+        now: u64,
+    ) -> (Outcome, Effects) {
+        let mut fx = Effects::default();
+        let outcome = self.promote_in(wire, data, verified, now, &mut fx);
+        self.settle(&mut fx);
+        (outcome, fx)
+    }
+
+    fn promote_in(
+        &mut self,
+        wire: &Bytes,
+        data: &Data,
+        v: &Verified,
+        now: u64,
+        fx: &mut Effects,
+    ) -> Outcome {
+        let id = match parse_log_name(&data.name) {
+            Some(p) if p.space == self.space && p.device == v.device && p.seq > 0 => EntryRef {
+                device: p.device,
+                seq: p.seq,
+                digest: signed_digest_of(data),
+            },
+            _ => return Outcome::Refused(Refusal::BadSignature),
+        };
+        let a = Arrival {
+            id,
+            wire,
+            data,
+            v,
+            now,
+            probe: false,
+        };
+        let (device, seq) = (&a.id.device, a.id.seq);
+        let held = self.view().marker(device, seq);
+        let status = self.view().status(device, seq);
+        if held.is_none_or(|m| m.signed_digest == a.id.digest)
+            || !status.as_ref().is_some_and(Status::awaits_trust)
+        {
+            return Outcome::Evidence;
+        }
+        if let Some(why) = self.suspicion(v) {
+            return Outcome::Refused(why);
+        }
+        let accepted = shape(data, seq).is_some_and(|(entry, _, _)| {
+            self.assess(&a.id, &v.person, v.owner_capable, &v.key, &entry)
+                .is_ok()
+        });
+        if !accepted {
+            return Outcome::Evidence;
+        }
+        self.take_in_place(&a, true, false, fx)
     }
 }
 

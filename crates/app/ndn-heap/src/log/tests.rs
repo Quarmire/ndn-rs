@@ -2508,6 +2508,59 @@ async fn an_entry_a_cut_readmits_is_wanted_by_its_implicit_digest_until_held() {
     );
 }
 
+/// The thief's bytes were taken first and the honest ones kept as evidence beside them. A cut
+/// that names the honest bytes wants them (they are not the entry held at the name); once the
+/// thief's are refused, the honest bytes take the name and the thief's stay as evidence, and
+/// nothing is told again as an equivocation.
+#[tokio::test]
+async fn the_second_packet_kept_as_evidence_takes_the_name_when_the_first_is_refused() {
+    let mut r = rig(&laptop());
+    r.members(members(Some(true), vec![add(1, "/bob", Role::Writer)]))
+        .await;
+    let thief = Chain::new(&bob()).put("/a", "stolen");
+    let honest = Chain::new(&bob()).put("/a", "mine");
+    r.applied(&thief);
+    assert_eq!(r.admit(&honest).outcome, Outcome::Evidence);
+    let named = implicit_digest(&honest.wire);
+    let want = Want {
+        device: bob().name,
+        first: 1,
+        last: 1,
+        digest: Some(Pin::Implicit(named)),
+    };
+    assert_eq!(
+        r.log.cut_wants(&[], &[(bob().name, 1, named)]),
+        vec![want],
+        "the honest bytes kept as evidence are not the entry held at the name"
+    );
+
+    // The revocation that refuses the thief's bytes lifts the suspicion of the key.
+    r.suspicion.lift(&bob().key);
+    let cut = Refusal::OutsideCut(Cut {
+        device: bob().name,
+        keeps_to: 0,
+    });
+    r.log.withdraw(&bob().name, 1, cut);
+    assert_eq!(r.value("/a"), None, "the thief's entry is withdrawn");
+    let data = Data::decode(honest.wire.clone()).unwrap();
+    let (outcome, fx) = r.log.promote(&honest.wire, &data, &verified(&bob()), NOW);
+    assert_eq!(outcome, Outcome::Applied);
+    assert_eq!(r.value("/a").as_deref(), Some("mine"));
+    assert!(
+        !fx.alerts
+            .iter()
+            .any(|a| matches!(a, Alert::Equivocation { .. })),
+        "told when the second packet arrived, not again: {:?}",
+        fx.alerts
+    );
+    assert_eq!(
+        r.store.get(&Kind::EQUIVOCAL.of(&honest.name())),
+        Some(thief.wire.clone()),
+        "the refused bytes are the evidence now"
+    );
+    assert_eq!(r.log.cut_wants(&[], &[(bob().name, 1, named)]), vec![]);
+}
+
 // -- The owner's devices: only an `admin` or `member` device holds the owner's powers (§9.9) --
 
 fn guest() -> Dev {

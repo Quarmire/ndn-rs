@@ -331,6 +331,15 @@ impl Status {
             ),
         }
     }
+
+    /// Whether the entry is refused for what a later cut or trust context can change (it is
+    /// outside a cut, or not trusted): the refusals a re-admission may undo.
+    pub(super) fn awaits_trust(&self) -> bool {
+        matches!(
+            self,
+            Status::Refused(Refusal::OutsideCut(_) | Refusal::Untrusted { .. })
+        )
+    }
 }
 
 /// What a removal cut keeps of one device: the seqs reachable from its tips

@@ -2031,6 +2031,16 @@ is **withdrawn** (§3.8) with the refusal as its reason. A `Lapsed` verdict is l
 as it is. A person's newer version that refuses more does the same for her
 devices' entries in the spaces that list her.
 
+**What is refused may have a second packet.** A device that signed two packets at one name
+(§3.7: a thief heard first, the owner's bytes second) has the first held at the entry name and
+the second at `equivocal/<entry name>`. When the first is refused for what a cut or a trust
+context can change (`OutsideCut`, `Untrusted`) and the judge accepts the second, the second
+**takes the name**: the refused bytes go to `equivocal/` as the evidence, the entry is judged
+again as a fresh one (§3.8), and nothing is raised again as an equivocation. This is how the
+owner's re-admission of the honest bytes of a name (§9.5) works at a node that heard the
+thief first: it applies the honest entry it held, without asking for it again. The cut's wants
+(§7.4) count an exact entry as held only when the packet at the name has those bytes.
+
 ### 9.8 Suspicion
 
 A node marks a key it fears is in a thief's hands **suspected**: no new entry of
@@ -2784,7 +2794,7 @@ has is said so.
 | k9 | A cut binds the bytes it keeps: a device joining after the revocation reads the honest entry at every name in the cut, and the thief's other bytes at one are refused, also when a forwarder saw the thief's copy first | `the_cut_binds_the_digest_of_the_key_that_verified_each_entry_without_a_second_verification`, `other_bytes_at_a_kept_seq_are_refused` (the forwarder half: suite only) |
 | k10 | A later trust-context version that revokes an issuer re-judges what a device holds through it: the entry is withdrawn and told, on adoption and after a restart, and an honest entry returns once its key is certified anew | `a_key_revoked_while_the_node_was_off_is_withdrawn_at_start`, `a_context_the_keyring_adopts_is_announced` |
 | o1 | A cut that arrives is re-checked against what was already accepted: an entry accepted before and refused by the cut is withdrawn and told as withdrawn | `a_late_cut_withdraws_what_it_does_not_keep`, `withdrawing_a_head_restores_the_entry_it_superseded`, `withdrawal_leaves_what_never_applying_would_have_left` |
-| o2 | Entries outside a revocation cut are refused until the owner re-admits specific ones by name and digest; exactly those return, the thief's stay out, even one at the same name | `what_a_revocation_refused_is_listed_and_not_kept`, `a_withdrawn_entry_is_taken_back_only_when_offered_again_and_verified` |
+| o2 | Entries outside a revocation cut are refused until the owner re-admits specific ones by name and digest; exactly those return, the thief's stay out, even one at the same name, also at a node that heard the thief first and kept the honest entry as evidence | `what_a_revocation_refused_is_listed_and_not_kept`, `a_withdrawn_entry_is_taken_back_only_when_offered_again_and_verified`, `the_second_packet_kept_as_evidence_takes_the_name_when_the_first_is_refused`, `the_honest_copy_kept_as_evidence_is_applied_when_the_owner_readmits_it` |
 | o3 | Completeness is per writer: a reader holds exactly each other member's chain up to its tip, and an offline member is a tip that has not moved, not a gap the reader cannot see | `a_gap_in_the_notice_is_backfilled_in_a_window`, `one_new_entry_is_one_fetch`, `a_restart_finds_the_fold_the_register_and_the_held_ranges` |
 | o4 | A reader keeps up with a writer that never pauses: it comes to hold everything written before it looked, then every entry up to any later moment | `a_replayed_stale_notice_never_stops_the_fetch_of_a_newer_entry`, `a_gap_in_the_notice_is_backfilled_in_a_window`, `one_new_entry_is_one_fetch` |
 | o5 | With one packet in five lost on its way to each device, the first entry a writer seals reaches a reader's watch opened within seconds, not minutes: a grant, an epoch key, an entry that missed is asked again with a capped back-off until held | `a_forged_entry_is_asked_again_with_growing_pauses`, `the_grant_pull_walks_creator_then_relays_with_backoff` (the loss profile: suite only) |

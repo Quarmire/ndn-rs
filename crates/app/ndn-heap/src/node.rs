@@ -47,7 +47,7 @@ use crate::serve;
 use crate::space::{Follower, Heap, Share, SpaceInner, check_audience};
 use crate::store::{Kind, OWNER_RULE};
 use crate::sync::{HostRef, Net, Taken};
-use crate::trust::{Adopter, Adoption, Judge, Judged};
+use crate::trust::{Adopter, Adoption, Judge, Judged, Verified};
 use crate::wire::{
     EpochId, device_of, is_device_name, is_namespace, log_name, parse_log_name,
     parse_seal_key_name, parse_space_name,
@@ -819,6 +819,28 @@ impl NodeInner {
         }
     }
 
+    /// The second packets kept at the names given (evidence of a device that signed two) that
+    /// the judge accepts: the bytes, the packet and who signed it.
+    async fn accepted_seconds(
+        &self,
+        space: &Name,
+        names: Vec<Name>,
+    ) -> Vec<(Bytes, Data, Verified)> {
+        let mut out = Vec::new();
+        for name in names {
+            let Some(wire) = self.store.get(&Kind::EQUIVOCAL.of(&name)) else {
+                continue;
+            };
+            let Ok(data) = Data::decode(wire.clone()) else {
+                continue;
+            };
+            if let Judged::Valid(v) = self.judge.validate(&data, space).await {
+                out.push((wire, data, v));
+            }
+        }
+        out
+    }
+
     /// The entries named that the judge now accepts: device and seq.
     async fn accepted(&self, space: &Name, names: Vec<Name>) -> Vec<(Name, u64)> {
         let mut out = Vec::new();
@@ -886,6 +908,21 @@ impl NodeInner {
                 let routed = {
                     let mut log = held.log.lock();
                     let fx = log.reinstate(&device, seq);
+                    held.route(self, &log, fx, true)
+                };
+                held.finish(self, routed);
+            }
+            // What is refused still may have a second packet kept at its name (the judge refuses
+            // the packet that was heard first, a thief's, and accepts the one heard second): that
+            // one takes the name.
+            let refused: Vec<Name> = {
+                let log = held.log.lock();
+                persons.iter().flat_map(|p| log.refused_names(p)).collect()
+            };
+            for (wire, data, verified) in self.accepted_seconds(&space, refused).await {
+                let routed = {
+                    let mut log = held.log.lock();
+                    let (_, fx) = log.promote(&wire, &data, &verified, self.now());
                     held.route(self, &log, fx, true)
                 };
                 held.finish(self, routed);
