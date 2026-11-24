@@ -11,6 +11,7 @@ use ndn_foundation_types::{Name, tlv_type};
 use ndn_heap::wire::log_name;
 use ndn_heap::{EntryId, Heap};
 use ndn_packet::Data;
+use ndn_packet::encode::InterestBuilder;
 use ndn_security::anchor_fingerprint;
 use ndn_security::self_certifying::self_certifying_digest;
 use ndn_trust_envelope::words::WORD_COUNT as WORDS_FORM_WORDS;
@@ -236,6 +237,29 @@ impl Invites {
 }
 
 impl Inner {
+    /// Fetch `name` as fresh Data only (`MustBeFresh`), with the forwarding hint `hints`.
+    /// The offer is asked for so: a link or words code has nothing that verifies the
+    /// offer before the answer does, so a copy damaged in flight is found out only after
+    /// the ask, and a forwarder that kept it would answer every retry that does not ask
+    /// for fresh Data with the same copy until it is evicted. The offer packet has no
+    /// freshness period, which no cache counts as fresh, so each fetch reaches the
+    /// inviter's device.
+    async fn fetch_fresh(&self, name: Name, hints: &[Name]) -> Option<Data> {
+        let mut b = InterestBuilder::new(name)
+            .lifetime(self.node.config().lifetime)
+            .must_be_fresh();
+        if !hints.is_empty() {
+            b = b.forwarding_hint(hints.to_vec());
+        }
+        match self.node.consumer().fetch_with(b).await {
+            Ok(data) => Some(data),
+            Err(e) => {
+                debug!(me = %self.node.name(), "the offer fetch missed: {e}");
+                None
+            }
+        }
+    }
+
     /// The forwarding hint a join's Interests carry: the relays the code names, else
     /// those this device's own namespace advertises. Hints only reach; nothing they
     /// say is trusted (spec §19.7).
@@ -442,7 +466,7 @@ impl Inner {
             // The offer, as the offering device serves it.
             let mut fetched = None;
             for _ in 0..OFFER_TRIES {
-                fetched = self.fetch(offer.clone(), &hints, None).await;
+                fetched = self.fetch_fresh(offer.clone(), &hints).await;
                 if fetched.is_some() {
                     break;
                 }

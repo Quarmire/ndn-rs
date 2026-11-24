@@ -21,7 +21,7 @@ use crate::join_kit::{Gate, admitted_in, is_key, is_log_or_key, kit_config, sign
 use crate::policy::IntroRefusal;
 use crate::proofs::{answer_proof, proof_key};
 use crate::test_kit::{Calls, Net, Person, Setup, alice, alice_offers, heap, n, notebook};
-use crate::wire::{AnswerBody, Outcome, ask_name, parse_intro_name};
+use crate::wire::{AnswerBody, Outcome, ask_name, parse_intro_name, parse_offer_name};
 
 // ---- the wait: a join returns once this person may write --------------------------------
 
@@ -578,4 +578,47 @@ async fn a_words_code_whose_inviter_overlaps_a_held_namespace_is_refused_after_t
         phone.node.space(&notebook()).is_none(),
         "the space was opened"
     );
+}
+
+// ---- a damaged offer must not be answered again from a cache -------------------------------------
+
+/// A link or words code carries nothing that verifies the offer before the answer does, so
+/// an offer whose signature was damaged in flight (a forged octet, ndn-link's fault layer)
+/// is found out only after the ask. A forwarder on the way may keep that copy: it answers
+/// every later Interest for the offer's name that does not ask for fresh Data, so the
+/// joiner's retries would meet the same damaged copy until it is evicted. The offer is
+/// therefore asked for as fresh Data only, and it carries no freshness period (a copy
+/// that no cache can call fresh): every retry reaches the inviter's device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_offer_is_asked_for_fresh_so_that_no_cache_answers_a_damaged_copy_again() {
+    let gate = Gate::new();
+    let (offered, phone, cancel) = on_a_net(Role::Writer, &gate).await;
+    phone
+        .invites
+        .join(&offered.code.link)
+        .await
+        .expect("the join returns");
+    let asked = gate.sent_fresh_where(|name| parse_offer_name(name).is_some());
+    assert!(!asked.is_empty(), "the join asked for no offer");
+    assert!(
+        asked.iter().all(|(_, fresh)| *fresh),
+        "an Interest for the offer did not ask for fresh Data, so a cache may answer it with a \
+         damaged copy again and again: {asked:?}"
+    );
+    let packets: Vec<Data> = gate
+        .received()
+        .into_iter()
+        .filter_map(|wire| Data::decode(wire).ok())
+        .filter(|data| parse_offer_name(&data.name).is_some())
+        .collect();
+    assert!(!packets.is_empty(), "no offer reached the joiner");
+    for offer in packets {
+        let fresh = offer.meta_info().and_then(|m| m.freshness_period);
+        assert!(
+            fresh.is_none_or(|f| f.is_zero()),
+            "the offer says it stays fresh for {fresh:?}: a cache would answer a fresh Interest \
+             with a damaged copy of it"
+        );
+    }
+    cancel.cancel();
 }

@@ -65,6 +65,7 @@ type Names = Arc<dyn Fn(&Name) -> bool + Send + Sync>;
 #[derive(Default)]
 struct State {
     sent: Vec<Sent>,
+    fresh: Vec<(Name, bool)>,
     refused: Vec<Name>,
     received: Vec<Bytes>,
     drop: Option<Names>,
@@ -160,6 +161,17 @@ impl Gate {
             .collect()
     }
 
+    /// The Interests sent for the names `f` says so, each with whether it asked for fresh
+    /// Data only (`MustBeFresh`): a cache holding a copy of a Data that has no freshness
+    /// period answers none of those.
+    pub(crate) fn sent_fresh_where(&self, f: impl Fn(&Name) -> bool) -> Vec<(Name, bool)> {
+        self.state()
+            .fresh
+            .iter()
+            .filter(|(n, _)| f(n))
+            .cloned()
+            .collect()
+    }
     /// The Interests a [`route`](Self::route) did not carry.
     pub(crate) fn refused(&self) -> Vec<Name> {
         self.state().refused.clone()
@@ -192,6 +204,8 @@ impl Connection for Gated {
         let (dropped, held, routed) = {
             let mut st = self.gate.state();
             st.sent.push((name.clone(), hints.clone()));
+            st.fresh
+                .push((name.clone(), interest.selectors().must_be_fresh));
             let dropped = st.drop.as_ref().is_some_and(|f| f(&name));
             let held = st.hold.as_ref().is_some_and(|f| f(&name));
             let routed = st.route.as_ref().is_none_or(|f| f(&name, &hints));
