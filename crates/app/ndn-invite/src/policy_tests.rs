@@ -46,9 +46,15 @@ fn the_default_shared_list_is_the_documented_one() {
     assert_eq!(p.grant_for, None);
     assert_eq!(p.departure_for, DEPARTURE_FOR);
     assert_eq!(DEPARTURE_FOR.as_secs(), 7 * 24 * 3600);
-    assert!(!p.local_candidates, "a stranger's code dials no local address");
+    assert!(
+        !p.local_candidates,
+        "a stranger's code dials no local address"
+    );
     assert!(p.short_code && p.hint_while_open);
-    assert_eq!((p.short_width, p.code_candidates, p.code_relays), (294, 3, 2));
+    assert_eq!(
+        (p.short_width, p.code_candidates, p.code_relays),
+        (294, 3, 2)
+    );
     // A name under a shared one is a person's; the shared one and a name over
     // it are not.
     assert_eq!(p.refuses(&n("/com/acme")), None);
@@ -83,7 +89,10 @@ fn a_namespace_under_or_over_a_reserved_name_is_refused_with_the_reason() {
 #[test]
 fn every_refusal_says_why_and_what_to_do() {
     for (why, must) in [
-        (IntroRefusal::Unknown, &["holds no such offer", "new code"][..]),
+        (
+            IntroRefusal::Unknown,
+            &["holds no such offer", "new code"][..],
+        ),
         (IntroRefusal::Used, &["used by someone else", "new code"]),
         (IntroRefusal::Expired, &["expired", "new code"]),
         (IntroRefusal::Closed, &["closed to you", "new code"]),
@@ -101,7 +110,11 @@ fn every_refusal_says_why_and_what_to_do() {
                 inviter: n("/alice"),
                 why: "is your own".into(),
             },
-            &["/alice is your own", "nothing of it was adopted", "do not use"],
+            &[
+                "/alice is your own",
+                "nothing of it was adopted",
+                "do not use",
+            ],
         ),
         (
             IntroRefusal::Hint { why: "bad".into() },
@@ -118,7 +131,10 @@ fn every_refusal_says_why_and_what_to_do() {
     ] {
         let text = why.to_string();
         for part in must {
-            assert!(text.contains(part), "{why:?} says {text:?}, without {part:?}");
+            assert!(
+                text.contains(part),
+                "{why:?} says {text:?}, without {part:?}"
+            );
         }
     }
     assert_eq!(HINT_RETRIES_MAX, 3);
