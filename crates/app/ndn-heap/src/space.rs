@@ -1172,9 +1172,14 @@ impl Heap {
                 &c.add_writers,
                 &c.add_readers,
                 fold.in_force(),
-                |who, role| match role {
-                    Role::Writer => fold.is_writer(who),
-                    Role::Reader => fold.is_reader(who),
+                // What already stands is what stands once the removals are made.
+                |who, role| {
+                    let removed = c.remove.contains(who) && who != fold.owner();
+                    !removed
+                        && match role {
+                            Role::Writer => fold.is_writer(who),
+                            Role::Reader => fold.is_reader(who),
+                        }
                 },
             ));
             ops
