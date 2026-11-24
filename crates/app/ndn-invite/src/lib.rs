@@ -9,8 +9,8 @@
 //! compact `ndn-trust://intro/…` link ([`ndn_trust_envelope::Introduction`]), as
 //! words, or as a **short code** ([`ShortCode`]): a line of 20 or 36 words after
 //! the inviter's device name and a first contact, whose offer is named by a
-//! signed [`HintRecord`] the inviter serves at [`hint_name`]. The joiner's device
-//! fetches the offer, sends an **ask** sealed to the offering device carrying its
+//! signed [`wire::HintRecord`] the inviter serves at [`hint_name`]. The joiner's
+//! device fetches the offer, sends an **ask** sealed to the offering device carrying its
 //! own anchor link and a proof of the secret bound to its key, and takes the
 //! **answer**: the space, the role, the inviter's anchor link and the members
 //! entry that admitted it ([`wire::tlv::ADMITTED`]). [`IntroPolicy`] is what a

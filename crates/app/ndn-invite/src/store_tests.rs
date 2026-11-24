@@ -12,7 +12,7 @@ use crate::store::{
     accepted_key, apply_durable, closed_key, flush, grant_key, grant_listing, hint_key, joined_key,
     joined_listing, key_key, list, mirror_key, mirror_listing, offer_key, offer_listing,
     parse_grant_key, parse_joined_key, parse_mirror_key, parse_offer_key, put_durable,
-    remove_durable, root, tries_asker_key, tries_key, using_key, used_key,
+    remove_durable, root, tries_asker_key, tries_key, used_key, using_key,
 };
 use crate::wire::{OFFER_ID_LEN, OfferId};
 
@@ -93,9 +93,16 @@ fn every_key_is_under_the_invite_prefix_in_its_shape() {
         assert!(key.has_prefix(&root()), "{key}");
         let comps = key.components();
         assert_eq!(&comps[root().len()].value[..], kind.as_bytes(), "{key}");
-        assert_eq!(comps[root().len()].typ, 8, "the kind is a generic component");
+        assert_eq!(
+            comps[root().len()].typ,
+            8,
+            "the kind is a generic component"
+        );
         if !tail.is_empty() {
-            let lens: Vec<usize> = comps[root().len() + 1..].iter().map(|c| c.value.len()).collect();
+            let lens: Vec<usize> = comps[root().len() + 1..]
+                .iter()
+                .map(|c| c.value.len())
+                .collect();
             assert_eq!(lens, tail, "{key}");
         }
     }
@@ -106,7 +113,14 @@ fn every_key_is_under_the_invite_prefix_in_its_shape() {
 #[test]
 fn keys_of_different_kinds_and_ids_never_meet() {
     let builders: [fn(&OfferId) -> Name; 9] = [
-        offer_key, key_key, tries_key, using_key, accepted_key, closed_key, used_key, hint_key,
+        offer_key,
+        key_key,
+        tries_key,
+        using_key,
+        accepted_key,
+        closed_key,
+        used_key,
+        hint_key,
         grant_key,
     ];
     let mut seen = std::collections::BTreeSet::new();
@@ -133,13 +147,22 @@ fn keys_parse_back() {
     assert_eq!(parse_offer_key(&offer_key(&a)), Some(a));
     assert_eq!(parse_offer_key(&grant_key(&a)), None);
     assert_eq!(parse_offer_key(&offer_key(&a).append("more")), None);
-    assert_eq!(parse_offer_key(&root().append("offer").append([1u8; 15])), None);
+    assert_eq!(
+        parse_offer_key(&root().append("offer").append([1u8; 15])),
+        None
+    );
     assert_eq!(parse_grant_key(&grant_key(&a)), Some(a));
     assert_eq!(parse_grant_key(&offer_key(&a)), None);
     assert_eq!(parse_joined_key(&joined_key(&b)), Some(b.clone()));
     assert_eq!(parse_joined_key(&mirror_key(&b, &[1; 32])), None);
-    assert_eq!(parse_mirror_key(&b, &mirror_key(&b, &[1; 32])), Some([1; 32]));
-    assert_eq!(parse_mirror_key(&n("/alice/32=data/other"), &mirror_key(&b, &[1; 32])), None);
+    assert_eq!(
+        parse_mirror_key(&b, &mirror_key(&b, &[1; 32])),
+        Some([1; 32])
+    );
+    assert_eq!(
+        parse_mirror_key(&n("/alice/32=data/other"), &mirror_key(&b, &[1; 32])),
+        None
+    );
 }
 
 /// A space is a prefix of the spaces that extend it: spelled as components,
@@ -166,10 +189,15 @@ async fn a_durable_write_is_flushed_after_it_lands() {
     let key = offer_key(&id(1));
     let counting = Counting::new(key.clone());
     let store: Arc<dyn DataStore> = counting.clone();
-    put_durable(&store, key.clone(), Bytes::from_static(b"note")).await.unwrap();
+    put_durable(&store, key.clone(), Bytes::from_static(b"note"))
+        .await
+        .unwrap();
     assert_eq!(store.get(&key), Some(Bytes::from_static(b"note")));
     assert_eq!(counting.syncs.load(Ordering::SeqCst), 1);
-    assert!(counting.held_at_sync.load(Ordering::SeqCst), "flushed before it landed");
+    assert!(
+        counting.held_at_sync.load(Ordering::SeqCst),
+        "flushed before it landed"
+    );
 
     remove_durable(&store, &key).await.unwrap();
     assert_eq!(store.get(&key), None);
@@ -218,7 +246,10 @@ async fn a_failed_flush_is_an_error_that_says_what_to_do() {
         .await
         .unwrap_err();
     let text = err.to_string();
-    assert!(text.contains("no space left") && text.contains("fix this device"), "{text}");
+    assert!(
+        text.contains("no space left") && text.contains("fix this device"),
+        "{text}"
+    );
 }
 
 /// A listing returns what is under it, in name order, with the key and value.
