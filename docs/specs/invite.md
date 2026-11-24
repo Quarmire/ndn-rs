@@ -1062,6 +1062,11 @@ time, so a use, a counted try and a closing mark each see the one before. It kee
 last 1,024 answers it signed, each by the ask's name (the oldest dropped first): the same ask asked
 again gets the same answer while it is kept, and a refusal or an answer is never computed twice for one ask.
 
+**What a forwarder on the path sees.** The answer is a DigestSha256 Data (`offer.rs`, `sign_digest_sha256`), so any forwarder can carry
+and cache it; its authenticity is the proof inside, never the forwarder's. The offer and the hint record are signed by `D` and need the
+host's transit rule to reach a joiner that does not yet trust `D` (§12.1). The ask is an Interest whose parameters are sealed to the
+offering device (§4.1).
+
 ### 9.1 A crowd of asks is bounded
 
 The device holds at most `IntroPolicy::asks_queued` asks at once (32 by default),
@@ -1500,8 +1505,8 @@ pub type FirstDialing<'a> = BoxFuture<'a, Result<[u8; 32], String>>;
 | `anchor` | to give credentials: the signed trust-context Data of this device's namespace, whole, as the host adopted it (what an inline anchor link carries), by `offer`, a join, an answer and a hint record | return it, or `None` when none can be made: `offer` and `join` then refuse with `Local` (fix the host's enrollment), and a hint request is met with silence | — (required) |
 | `adopt(link)` | after the crate checked `link`, an inline anchor link (`TrustEnvelope::Anchor`: namespace, fingerprint, signed context): by the joiner at §8.2 step 5, by the inviter at §9.3 step 2 | `Ok` once this device's validator trusts the namespace; an error says why not. A host on a forwarder adopts through it so the forwarder also validates and routes the namespace. A self-certifying `/user/<h>` not held is adopted by name over the network (version 1 fetched and checked against the name, the newest reached from it; the context the link carries is never taken alone, a version 1 only compared with the fetched one, a different one refused as a fork); with no network to fetch over, refuse, saying to join again once the person's devices are reachable | — (required) |
 | `link_hint` | once per `offer`, and once for each hint record made on request (§7.1 item 4) | the device's link key and at most `LINK_HINT_CANDIDATES_MAX` candidates, so a joiner with no routes and no daemon dials this device by key | `None`: the code carries no hint |
-| `dial(hint, inviter, within)` | by the joiner, once per `join`, before any Interest (§8.2 step 0, §8.3 S6) | try `hint.candidates` in order and link only to the device whose key is `hint.key` (the handshake proves it; an address that answers with another key is no link), within `within` in all. `Ok` once a link is up that carries `inviter`'s introduction names to it. Send nothing of the code's secret | an error saying the host has no link layer to dial with and what to do |
-| `dial_first(inviter, addr, within)` | by the joiner, once, for a short code's address first contact (§8.3 S3) | dial **one** address with **no key to expect** and an **empty hello** (no certificate, no membership: ndn-link.md §13.3A); `Ok(key)` is the SHA-256 of the public key the handshake proved; until the joiner holds the inviter's namespace the link routes only `introduction_prefixes(inviter)` (§2.3), never the names the code claims for the device, and receives answers under those prefixes and Interests under the joiner's own device names only | an error saying the host has no link layer, so the join says the first contact could not be reached |
+| `dial(hint, inviter, within)` | by the joiner, once per `join`, before any Interest (§8.2 step 0, §8.3 S6) | try `hint.candidates` in order and link only to the device whose key is `hint.key` (the handshake proves it; an address that answers with another key is no link), within `within` in all. `Ok` once a link is up that carries `inviter`'s introduction names to it, **in transit** (§12.1). Send nothing of the code's secret | an error saying the host has no link layer to dial with and what to do |
+| `dial_first(inviter, addr, within)` | by the joiner, once, for a short code's address first contact (§8.3 S3) | dial **one** address with **no key to expect** and an **empty hello** (no certificate, no membership: ndn-link.md §13.3A); `Ok(key)` is the SHA-256 of the public key the handshake proved; until the joiner holds the inviter's namespace the link routes only `introduction_prefixes(inviter)` (§2.3), carried in transit (§12.1), never the names the code claims for the device, and receives answers under those prefixes and Interests under the joiner's own device names only | an error saying the host has no link layer, so the join says the first contact could not be reached |
 | `undial(hint, inviter)` | by the joiner, when a join fails after a dial, and at once when the verified record's key is not the first contact's (§8.3 S6, S8) | take down the link the dial made, unless it was up before the dial or has been identified since | nothing |
 | `grant(grant)` | by the inviter, once after the acceptance and the note are durable (§10 rule 3); again when a change alters the role (§10 rule 6); at start for every live grant; by the joiner for a mirror grant (§11 rule 17) | install the grant (§10 rules 5, 8, 13) | nothing |
 | `revoke_grant(key, space)` | when the fold stops listing the person (§10 rule 7), in memory and **before** the note is durable | end the entry of `(key, space)`; close the key's links when it was the last (§10 rule 13) | nothing |
@@ -1525,6 +1530,35 @@ pub type FirstDialing<'a> = BoxFuture<'a, Result<[u8; 32], String>>;
 The futures are boxed (`LocalBoxFuture` on wasm32, as ndn-heap's other aliases): the crate holds the host as
 `Arc<dyn Host>`.
 
+### 12.1 The host carries the introduction in transit (normative)
+
+The joiner's forwarder holds no trust of the inviter: the inviter's namespace is adopted only at §8.2 step 5, after the offer and the
+answer have been fetched. What the exchange fetches is therefore carried by the host's forwarder **without validating it**, and judged
+by this crate alone:
+
+- the **offer** `<D>/32=intro/32=offer/<id>` and the **hint record** `<D>/32=hint/<token>` are Data signed by a key of `D` (through
+  `Node::sign_packet`), which a validating forwarder that does not yet trust `D`'s namespace cannot validate;
+- the **answer** is signed with **DigestSha256** (`offer.rs`: `DataBuilder::new(…).sign_digest_sha256()`), named as the ask: its
+  authenticity is the offering device's proof inside it (the answer proof of §4.1 and the inviter's proof packet, checked at §8.2
+  step 3), not the forwarder's.
+
+Rules for a host that implements `Host::dial`, `Host::dial_first` or carries a join's Interests by forwarding hint:
+
+1. From the first contact (`dial_first` or `dial` returned `Ok`, or the first Interest of a join with no dial) until `undial` or until
+   the join ends (it succeeded and the host holds and identifies the inviter's namespace, or it failed and `undial` took the link down), the
+   host **MUST carry `introduction_prefixes(inviter)`** (`<D>/32=intro`, `<D>/32=hint`, §2.3) **in transit**: Data under them is forwarded
+   to the pending Interests only, **unvalidated** and **not cached** (ndn-link.md §15.7 describes transit for served namespaces).
+2. It carries those two prefixes of that device and nothing else of it: the link of a first contact routes no other name of `D` (§8.3 S3).
+3. Transit grants no trust. The crate verifies every packet itself before it acts: the hint record at §8.3 S5, the offer at S7 and §8.2
+   step 3, the answer at §8.2 step 3.
+4. A host that does not carry the prefixes in transit fails the join at the offer fetch: the offer does not reach the joiner, no
+   answer comes within the eight tries, and `join` returns `NotReady` ("the inviter's device … does not answer", `join.rs` `offline`)
+   after calling `undial`. This is a host's defect, not the code's: the join is refused, never accepted unverified.
+
+Implementations: ndn-link's `LinkHints::dial` and `LinkHints::dial_first` pass `introduction_prefixes(inviter)` as the link's routes
+(ndn-link `src/hints.rs`, over `Links::dial_by_key` and `Links::dial_first`); the conformance stand-in host does it explicitly; the
+daemon's `DaemonIntroducer` (stage 6) does not, and a join through it ends in `NotReady` at the offer fetch until it does.
+
 ## 13. The introduction surface and the folder scope
 
 A host that listens for links asks this crate **what may cross a link**, by name, per packet. `Invites::surface()` gives a
@@ -1539,9 +1573,8 @@ and a joiner that dials after the last offer expired meets no link, not a gone m
 
 Over the link `Surface::carries(name)` is true for exactly these names of the device `D`, and no other:
 
-1. the ask family: a name under `<D>/32=intro` that is not an offer's name — the ask is `<D>/32=intro/<ParametersSha256Digest>`
-   (§2.2) — while the surface is open. The family is carried as a family and only the ask is answered: the extension answers
-   nothing else under `32=intro` (§2.3), so an Interest of the family that is no ask meets silence at the device;
+1. the ask, `<D>/32=intro/<ParametersSha256Digest>` (exactly one digest component after `32=intro`, §2.2), while the surface is open: no
+   other name under `<D>/32=intro` crosses, neither the bare prefix nor a name of another form;
 2. the offer's own packet, `<D>/32=intro/32=offer/<id>` (§2.2), for an offer of this device that has not expired (a well-formed
    offer name of another id, or of an offer past its expiry, is not carried);
 3. a short code's hint record, `<D>/32=hint/<token>` (§2.2), `token` that of one of the device's own offers with a short code, whether
@@ -1569,9 +1602,10 @@ two names by the grammar of heap.md §2.3: nothing is looked up and nothing is c
   namespace** (the epoch's creator, or another owner device that holds the key: heap.md §6.5); no other seal key, no other granter;
 - a held copy `<H>/32=held/<Name TLV>` about a name carried by these rules, to the depth of two held names, and not deeper.
 
-Not carried: the sync group, certificates and the trust context (the host's link layer adds those: they are the namespaces', not the
-space's), introductions (the surface's, §13.1), anything that is not a name of this layer. `false` for a `space` that is no space name,
-so a grant for no space carries nothing.
+Not carried by these predicates: the sync group of the space (the link layer adds the owner's group of the granted space, which the
+heap names, `ndn_heap::wire::sync_group_of(space)`: ndn-link.md §8.7 rule 20, and the namespaces' own groups), certificates and the trust
+context (the link layer's: they are the namespaces', not the space's), introductions (the surface's, §13.1), anything that is not a name
+of this layer. `false` for a `space` that is no space name, so a grant for no space carries nothing.
 
 ### 13.3 Co-writers (rule 16)
 
@@ -1847,7 +1881,7 @@ first, and the ones that changed say so.
   no log entry, summary or held copy of the device crosses an introduction link (§13.1).
 - **An offer is not in the log.** The log of a space holds the membership the offer made and nothing of the offer, its use or
   its closing, so what a member or a relay holds of the space says nothing of who was invited, when, with what expiry or
-  how many tries. The use mark is a note of the offering device (`used/<id>`), local and unsigned: **only that device
+  how many tries. The use mark is a note of the offering device (`used/<id>`), local and authenticated by a MAC (below): **only that device
   sees the offer used**, and another device of the inviter answers `Unknown` for it (the old design's note "every device of
   the inviter sees the offer used" no longer holds, and need not: an offer is answered only by the device that made it).
 - **The notes an offer is judged by are authenticated, and fail closed.** The recipient key a note is wrapped to is
@@ -2115,6 +2149,11 @@ Everything not listed here is carried over as written (with `folder` read as `sp
 | §19.8 rule 15 (e) what is fetched is a members record of the folder's line | §11 rule 15 what is fetched is judged by `fetch_entry` as any entry; no separate check that it is a members entry | the heap's admission is the one judge |
 | §19.7 a removal closes offers by a closing mark in the log | §5.4 a removal of the person an offer was used by closes it by derivation, nothing written | no mark is signed or kept for it |
 | §19.2 the offer is served while unexpired (it was a log entry the link carried while unexpired) | §5.5 the extension serves an offer it holds whatever its expiry; the introduction link carries it while unexpired (§13.1) | the ask judges expiry (`Expired`), the link judges openness |
+| §19.4 the notes an offer is judged by (proof key, use mark, tries) were notes under the barrier, unauthenticated | §4.2, §5.2, §18.1 each ends in a MAC under a key derived from the recipient secret, and an unreadable one fails closed; the device's own signature on its offers is checked at a start | the recipient key is public, so a wrap proves nothing of who wrote it |
+| §19.8 rule 2 a grant for every admission | §10 rule 2, §11 rule 17 a Reader of a public space is granted nothing, and a device that only reads a public space keeps no mirror note | no entry could end such a grant; only the host could |
+| §19.3 step 3 the answer's namespace checks | §8.2 step 3 an `ADMITTED` entry of a device outside the inviter's namespace is `Forged`, and no Interest is sent for it; the space's owner must be the inviter's namespace | the joiner fetches no entry a stranger names |
+| §19.2 the surface carries `<D>/32=intro/…` | §13.1 only the ask's digest form `<D>/32=intro/<ParametersSha256Digest>`, the offer's own name and the hint token | no bare prefix or other name under `32=intro` crosses |
+| §19.3 the joiner's forwarder carried the offer as a `32=held` DigestSha256 wrapper | §12.1 the host carries `<D>/32=intro` and `<D>/32=hint` in transit from the first contact; the offer and hint records are signed by `D` | the offer is no wrapper any more, so the forwarder cannot validate it before the inviter's anchor is adopted |
 
 Other specifications still describe the old crate where they name its pieces (ndn-link.md §13.3A names the introduction's prefixes
 as three names and the `Introducer` trait; data-layer.md §19 as a whole): they stay as the specification of `ndn-data` until it moves.
