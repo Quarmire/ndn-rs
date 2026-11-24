@@ -704,28 +704,6 @@ impl Asks {
         }
     }
 
-    /// The ask of `(device, seq)` if it is due now, entered as in flight;
-    /// when it pauses, `next` is lowered to the time to look again.
-    fn begin(
-        &mut self,
-        device: &Name,
-        seq: u64,
-        digest: Option<Pin>,
-        now: Instant,
-        next: &mut Option<Duration>,
-    ) -> Option<Launch> {
-        let misses = match self.standing(&(device.clone(), seq), now) {
-            Standing::New => 0,
-            Standing::Flying => return None,
-            Standing::Waiting(left) => {
-                look_again(next, left);
-                return None;
-            }
-            Standing::Due(misses) => misses,
-        };
-        Some(self.launch(device, seq, misses, digest))
-    }
-
     /// The asks of the holes of `device` in `ranges`, in seq order, at most `window` of them
     /// in flight or pausing at once: an ask that missed holds its place while it pauses, so the
     /// walk does not slide over the seqs nothing answers. Those due again go first.
@@ -766,6 +744,49 @@ impl Asks {
             }
             budget -= 1;
             out.push(self.launch(device, seq, 0, None));
+        }
+    }
+
+    /// The asks of the entries a cut names for `device` (`exact`, in seq order, each with the
+    /// bytes it must have), within the device's `window` as a walk's asks are: at most `window`
+    /// in flight or pausing at once, those that missed keeping their place, those due again
+    /// first. A cut that names thousands holds the window of one device and no more.
+    fn walk_exact(
+        &mut self,
+        device: &Name,
+        exact: &[(u64, Pin)],
+        window: usize,
+        now: Instant,
+        next: &mut Option<Duration>,
+        out: &mut Vec<Launch>,
+    ) {
+        let (mut flying, busy) = self.busy(device);
+        let mut budget = window.saturating_sub(busy);
+        let mut fresh = Vec::new();
+        for &(seq, pin) in exact {
+            match self.standing(&(device.clone(), seq), now) {
+                Standing::Flying => {}
+                Standing::Waiting(left) => look_again(next, left),
+                Standing::Due(misses) if flying < window => {
+                    if misses >= REFRESH_TRIES {
+                        if budget == 0 {
+                            continue;
+                        }
+                        budget -= 1;
+                    }
+                    flying += 1;
+                    out.push(self.launch(device, seq, misses, Some(pin)));
+                }
+                Standing::Due(_) => {}
+                Standing::New => fresh.push((seq, pin)),
+            }
+        }
+        for (seq, pin) in fresh {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            out.push(self.launch(device, seq, 0, Some(pin)));
         }
     }
 
@@ -1038,8 +1059,13 @@ impl Group {
                 let window = self.shared.fetcher.window(device);
                 asks.walk(device, ranges, window, now, &mut next, &mut launches);
             }
+            let mut by_device: BTreeMap<&Name, Vec<(u64, Pin)>> = BTreeMap::new();
             for ((device, seq), digest) in &exact {
-                launches.extend(asks.begin(device, *seq, Some(*digest), now, &mut next));
+                by_device.entry(device).or_default().push((*seq, *digest));
+            }
+            for (device, named) in &by_device {
+                let window = self.shared.fetcher.window(device);
+                asks.walk_exact(device, named, window, now, &mut next, &mut launches);
             }
             asks.probe(
                 &probes,
@@ -1603,6 +1629,42 @@ mod tests {
             vec![1, 2, 3, 4],
             "the same seqs are asked again"
         );
+    }
+
+    /// Stage-4 review L2. The entries a cut re-admits one by one are asked within the window of
+    /// their device as a walk's asks are: a cut that names thousands holds the device's window
+    /// and no more, and the asks that missed keep their place while they pause.
+    #[test]
+    fn the_exact_asks_of_a_cut_are_asked_within_the_window_of_their_device() {
+        let device: Name = "/alice/phone".parse().expect("a name");
+        let named: Vec<(u64, Pin)> = (1..=1000)
+            .map(|seq| (seq, Pin::Implicit([7; 32])))
+            .collect();
+        let mut asks = Asks::default();
+        let (mut next, mut launches) = (None, Vec::new());
+        let began = Instant::now();
+        asks.walk_exact(&device, &named, 4, began, &mut next, &mut launches);
+        let seqs = |l: &[Launch]| l.iter().map(|l| l.seq).collect::<Vec<_>>();
+        assert_eq!(seqs(&launches), vec![1, 2, 3, 4], "a window of them");
+        assert!(
+            launches
+                .iter()
+                .all(|l| l.digest == Some(Pin::Implicit([7; 32])))
+        );
+        for launch in &launches {
+            asks.end(launch, false, began);
+        }
+        launches.clear();
+        asks.walk_exact(&device, &named, 4, began, &mut next, &mut launches);
+        assert!(
+            launches.is_empty(),
+            "the missed asks hold the window: {:?}",
+            seqs(&launches)
+        );
+        assert!(next.is_some(), "and it looks again when their pause ends");
+        let later = began + REFRESH_PAUSE_MAX;
+        asks.walk_exact(&device, &named, 4, later, &mut next, &mut launches);
+        assert_eq!(seqs(&launches), vec![1, 2, 3, 4], "the same ones again");
     }
 
     /// Stage-4 review M2. The pauses of a probe belong to the device: counters that rise at

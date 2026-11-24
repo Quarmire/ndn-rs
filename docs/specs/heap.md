@@ -1541,8 +1541,16 @@ a restart, a lost packet or a refusal changes nothing about what is owed.
   `(head, min(seen, R)]`.
   The prefix a device is held to is the largest `n` with every seq of `1..n`
   held or void.
-- **The exact entries** a removal cut names that are not held, by their
-  signed-region digest (§3.8): the bytes must be those.
+- **The entries a cut names.** A revocation cut a held trust context lists (§9.5) wants the
+  seqs it keeps that are neither held nor void, whatever counter the group shows, and the
+  entries it re-admits one by one, by their implicit digest: the bytes must be those. Only
+  the cuts of keys the context itself governs count, those under its own namespace: a
+  context another person signed that lists a cut for someone else's device says nothing
+  here, and wants nothing (an adopted friend's context cannot make a node walk another
+  person's log). An exact entry is held only when the packet at its name (the first one
+  taken) has those bytes: the same bytes kept as evidence beside others (§3.7) are not the
+  entry, and are asked for, and §9.7 takes them in place of the others when the judge
+  accepts them. The exact asks are windowed as the holes are, below.
 - **Windowing.** The asks of one device in flight, or pausing after a miss, are at most
   its **window**, which the node keeps per device (not per space or value: the asks of
   every space and every value in pieces count against it). It starts at 16, grows by
@@ -2790,7 +2798,7 @@ has is said so.
 | k5 | A renewed certificate continues the key's log: entries signed before and after stay valid at every reader, also once the old certificate expired | suite only (the judge's mapping, §9.2, is in `a_signer_of_a_held_namespace_is_valid_and_named`) |
 | k6 | After the namespace recovers from a compromised root a revoked key's cut still holds everywhere, a device joining later included, and honest data verifies under renewed certificates | `the_authority_is_the_context_the_node_holds_for_the_key` (the recovery flow: suite only) |
 | k7 | A thief's entries between the theft and the owner's report stay out of the cut though the owner's node held them: the cut keeps only what was first verified before the stated loss, the node takes nothing new of a suspected key, and the honest entries left out come back one by one | `a_thiefs_entry_first_verified_after_the_loss_is_left_out`, `a_suspected_keys_new_entries_are_not_taken_until_its_revocation`, `an_unreadable_entry_is_left_out_and_listed`, `unsuspect_lifts_every_space_and_a_non_key_is_refused` |
-| k8 | A key's authority over data ends with its certificate: what it signs after the lapse is refused by a reader whose clock says so, and the host is told once per entry; after the cut, what it wrote before is accepted and what it wrote after stays out | `a_key_lapsed_by_this_clock_is_lapsed`, `a_refusal_the_judge_or_the_mark_makes_is_alerted_once_and_replayed` (the cut half: suite only) |
+| k8 | A friend's guest key's authority over data ends with its certificate (the writer is `/bob/guest/phone`, a device of the listed writer Bob: a guest of the owner's own namespace holds none of the owner's powers, §1.2): what it signs after the lapse is refused by a reader whose clock says so, and the host is told once per entry; after the cut of Bob's root, what it wrote before is accepted and what it wrote after stays out | `a_key_lapsed_by_this_clock_is_lapsed`, `a_refusal_the_judge_or_the_mark_makes_is_alerted_once_and_replayed`, `only_the_cuts_of_keys_a_context_governs_raise_wants` (the cut half: suite only) |
 | k9 | A cut binds the bytes it keeps: a device joining after the revocation reads the honest entry at every name in the cut, and the thief's other bytes at one are refused, also when a forwarder saw the thief's copy first | `the_cut_binds_the_digest_of_the_key_that_verified_each_entry_without_a_second_verification`, `other_bytes_at_a_kept_seq_are_refused` (the forwarder half: suite only) |
 | k10 | A later trust-context version that revokes an issuer re-judges what a device holds through it: the entry is withdrawn and told, on adoption and after a restart, and an honest entry returns once its key is certified anew | `a_key_revoked_while_the_node_was_off_is_withdrawn_at_start`, `a_context_the_keyring_adopts_is_announced` |
 | o1 | A cut that arrives is re-checked against what was already accepted: an entry accepted before and refused by the cut is withdrawn and told as withdrawn | `a_late_cut_withdraws_what_it_does_not_keep`, `withdrawing_a_head_restores_the_entry_it_superseded`, `withdrawal_leaves_what_never_applying_would_have_left` |

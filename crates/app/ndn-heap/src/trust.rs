@@ -32,7 +32,8 @@ use ndn_security::cert_name::key_name_of;
 use ndn_security::safe_data::TrustPath;
 use ndn_security::self_certifying::{Genesis, in_personal_namespace, personal_namespace_of};
 use ndn_security::{
-    SafeData, ScopedContext, SignedTrustContext, TrustError, ValidationResult, Validator,
+    RevocationCut, SafeData, ScopedContext, SignedTrustContext, TrustError, ValidationResult,
+    Validator,
 };
 use ndn_sync::DataStore;
 use parking_lot::Mutex;
@@ -729,11 +730,13 @@ impl Judge {
 
     /// What the trust contexts this node holds keep of each device's log of `space` by a
     /// revocation cut: `(device, first, last)` runs of the seqs the cut accepts. The entries of a
-    /// revoked key a cut keeps are wanted whatever counter the group shows for the key.
+    /// revoked key a cut keeps are wanted whatever counter the group shows for the key. Only the
+    /// cuts of keys a context governs count (the key lies under the context's namespace): a
+    /// context signed by another person cannot make this node walk a log it has no say over.
     pub(crate) fn cut_runs(&self, space: &Name) -> Vec<(Name, u64, u64)> {
         let mut out = Vec::new();
         for ctx in self.validator.keyring().contexts() {
-            for cut in ctx.revocation_cuts() {
+            for cut in governed_cuts(&ctx) {
                 let Some(device) = device_of(cut.key()) else {
                     continue;
                 };
@@ -748,11 +751,12 @@ impl Judge {
 
     /// The entries the trust contexts this node holds re-admit one by one in a revocation cut,
     /// of `space`: `(device, seq, implicit digest)`. The owner names the exact packet; the
-    /// entries are wanted by those bytes whatever the cut's ranges say.
+    /// entries are wanted by those bytes whatever the cut's ranges say. Only the cuts of keys a
+    /// context governs count ([`Self::cut_runs`]).
     pub(crate) fn cut_exact(&self, space: &Name) -> Vec<(Name, u64, [u8; 32])> {
         let mut out = Vec::new();
         for ctx in self.validator.keyring().contexts() {
-            for cut in ctx.revocation_cuts() {
+            for cut in governed_cuts(&ctx) {
                 for full in cut.exact() {
                     let Some((last, rest)) = full.components().split_last() else {
                         continue;
@@ -1025,6 +1029,16 @@ fn cut_of(ctx: &SignedTrustContext, key: &Name, device: Name, space: &Name) -> C
         .and_then(|range| range.runs.iter().map(|&(_, last)| last).max())
         .unwrap_or(0);
     Cut { device, keeps_to }
+}
+
+/// The revocation cuts of `ctx` that it governs: the cuts of keys under its own namespace. A
+/// context lists whatever cuts its root signs, and a node holds the contexts of the persons it
+/// reads with, so another namespace's context saying where a key of someone else's stopped
+/// decides nothing here and wants nothing.
+fn governed_cuts(ctx: &SignedTrustContext) -> impl Iterator<Item = &RevocationCut> {
+    ctx.revocation_cuts()
+        .iter()
+        .filter(|cut| cut.key().has_prefix(ctx.namespace()))
 }
 
 /// Whether `key`, a key of a device governed by `ctx`, may act as an owner

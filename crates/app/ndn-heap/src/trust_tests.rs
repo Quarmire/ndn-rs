@@ -929,6 +929,37 @@ async fn a_revoked_key_is_outside_its_cut() {
     }
 }
 
+/// A context lists a cut for any key it likes, but the keys it governs are the ones under its
+/// namespace: a cut for another namespace's device raises no wants (an adopted friend's context
+/// cannot make a node walk someone else's log), and one for a key under its own namespace does.
+#[tokio::test]
+async fn only_the_cuts_of_keys_a_context_governs_raise_wants() {
+    let log_prefix_of = |device: &Name| {
+        let entry = log_name(device, &bob_space(), 0);
+        Name::from_components(entry.components()[..entry.len() - 1].iter().cloned())
+    };
+    let digest = |device: &Name, seq: u64, byte: u8| {
+        log_name(device, &bob_space(), seq).append_implicit_digest([byte; 32])
+    };
+    let mut own = RevocationCut::new(n(PHONE_KEY));
+    own.add_run(&bob_log_prefix(), 1, 3);
+    own.readmit(digest(&n(DEVICE), 9, 4)).unwrap();
+    let other_key = "/alice/member/phone/KEY/k1";
+    let other = n("/alice/member/phone");
+    let mut foreign = RevocationCut::new(n(other_key));
+    foreign.add_run(&log_prefix_of(&other), 1, 1 << 40);
+    foreign.readmit(digest(&other, 5, 5)).unwrap();
+    let (judge, _) = bob((PAST, u64::MAX), |c| {
+        c.with_revocation(n(PHONE_KEY))
+            .with_revocation_cut(own)
+            .with_revocation(n(other_key))
+            .with_revocation_cut(foreign)
+    })
+    .await;
+    assert_eq!(judge.cut_runs(&bob_space()), vec![(n(DEVICE), 1, 3)]);
+    assert_eq!(judge.cut_exact(&bob_space()), vec![(n(DEVICE), 9, [4; 32])]);
+}
+
 /// A key of a role whose Data needs a cut, whose certificates all lapsed by
 /// this clock, is lapsed, with the dates; it is not kept as refused, which is
 /// the log's rule: judged again when fetched again.
