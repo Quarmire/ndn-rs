@@ -20,6 +20,9 @@
 //!   in), the node decides again with the key that signed it (a revoked key is
 //!   granted nothing), and the answer is signed by this device with the key
 //!   wrapped to that seal key.
+//! * `<D>/32=<keyword>/…` for a keyword a host registered
+//!   ([`Node::extend`](crate::Node::extend)): the extension answers, `None` is Nacked.
+//!   Core keywords are never given to an extension.
 //!
 //! Names under `/localhost` are never served, and neither is a name another
 //! device owns. Every ask that is not answered is Nacked, never left to time
@@ -142,7 +145,18 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
             }
             None
         }
-        None => None,
+        // A keyword no core kind owns: the extension that registered it, if one did, answers
+        // (its own task, as a grant's: it may sign and wait); anything else is Nacked.
+        None => match shared.extensions.answering(&me, &name) {
+            Some(extension) if !is_local(&name) => {
+                rt::spawn(async move {
+                    let wire = extension.answer(&interest).await;
+                    reply(&name, responder, wire).await;
+                });
+                return;
+            }
+            _ => None,
+        },
     };
     reply(&name, responder, packet).await;
 }

@@ -54,12 +54,15 @@ use ndn_packet::{Data, NackReason};
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
+use crate::error::HeapError;
 use crate::log::{Blob, Outcome, Pin};
 use crate::pieces::{self, Assembler, Offered};
+use crate::register::EntryId;
 use crate::rt::{self, Instant};
 use crate::sync::{Group, TIMELINE, Taken};
 use crate::wire::{
-    ChunksBody, EpochId, GrantAsk, WireError, grant_name, held_name, log_name, seal_key_name,
+    ChunksBody, EpochId, GrantAsk, LogName, WireError, grant_name, held_name, log_name,
+    seal_key_name, signed_digest_of,
 };
 
 /// The pause before asking again for something after `misses` asks for it
@@ -100,6 +103,10 @@ const RTO_INITIAL: Duration = Duration::from_secs(1);
 /// How many seqs above its own head a device fetches its own entries back,
 /// in reservation blocks.
 const OWN_BLOCKS: u64 = 4;
+
+/// The most turns [`Group::fetch_entry`] takes: two asks of the writer and two
+/// of the heard members that vouch for its log.
+const ENTRY_TURNS: u32 = 4;
 
 /// How often the group's observed state is read for a peer's counter of this
 /// device's own name while nothing else wakes the pump (a notice for it never
@@ -1065,6 +1072,74 @@ impl Group {
             Ok(data) if *data.name == *name => Ok(wire),
             _ => Err(Miss::Again),
         }
+    }
+
+    /// Fetch the entry `entry` of this space by its log name and admit it as
+    /// any entry that arrives is: the node judges it by the durable rule and
+    /// the log takes or refuses it ([`crate::node::NodeInner::take`]); there is
+    /// no other way in. The writer is asked on the even turns and the heard
+    /// members that vouch for its log on the odd ones ([`Self::source`]), at
+    /// most [`ENTRY_TURNS`] turns, each within one Interest lifetime. The id of
+    /// the entry, held now (applied or not: [`Heap::applied`] says), or why not:
+    /// the judge's refusal, a judgement still waiting for a context or a
+    /// certificate, or no answer.
+    pub(crate) async fn fetch_entry(
+        self: &Arc<Self>,
+        entry: &LogName,
+    ) -> Result<EntryId, HeapError> {
+        let name = log_name(&entry.device, &self.space, entry.seq);
+        let mut waiting = None;
+        for turn in 0..ENTRY_TURNS {
+            let Some(source) = self.source(&entry.device, turn) else {
+                continue;
+            };
+            let Ok(wire) = self.fetch_original(&source, &name, &Kind::Pull).await else {
+                continue;
+            };
+            let Ok(data) = Data::decode(wire.clone()) else {
+                continue;
+            };
+            let id = EntryId {
+                device: entry.device.clone(),
+                seq: entry.seq,
+                digest: signed_digest_of(&data),
+            };
+            match self.shared.host.take(&self.space, wire, false).await {
+                Taken::Pending(why) => waiting = Some(why),
+                Taken::Decided { outcome, blobs } => match outcome {
+                    Outcome::Applied | Outcome::Closed | Outcome::Waiting | Outcome::Duplicate => {
+                        self.assemble(blobs);
+                        return Ok(id);
+                    }
+                    Outcome::Refused(why) => return Err(HeapError::Refused { name, why }),
+                    Outcome::Evidence => {
+                        return Err(HeapError::BadRequest {
+                            why: format!(
+                                "{name} holds another packet here already: its writer signed two \
+                                 entries at one name, which is recorded as evidence (an alert) and \
+                                 applies nothing; ask the owner to remove the writer"
+                            ),
+                        });
+                    }
+                    Outcome::Unreadable => {
+                        return Err(HeapError::BadRequest {
+                            why: format!(
+                                "{name} verifies as its writer's but does not decode as an \
+                                 entry; it is recorded and never fetched again, so ask for the \
+                                 entry another name names"
+                            ),
+                        });
+                    }
+                },
+            }
+        }
+        Err(match waiting {
+            Some(waiting) => HeapError::NotReady {
+                name,
+                why: waiting.to_string(),
+            },
+            None => HeapError::Unavailable { name },
+        })
     }
 
     /// Everything wanted of the own device and the bound it is fetched

@@ -295,6 +295,12 @@ fn check_path(path: &Name) -> Result<(), HeapError> {
     })
 }
 
+/// The wait a refusal for want of a listing becomes for a device an offer
+/// admitted.
+const LISTING_AWAITED: &str = "an offer's answer admitted this device to the space, but the \
+    members entry that lists its person has not arrived here yet; put again, or join again with \
+    the same code (the offer answers the device it admitted)";
+
 impl SpaceInner {
     pub(crate) fn new(
         log: Log,
@@ -374,6 +380,7 @@ impl SpaceInner {
         let mut repair = false;
         if fx.membership {
             node.judge.note(&self.name, &Self::listing(log));
+            node.release_joined(log);
             repair = !self.follower
                 && log.sealed()
                 && log.owner_only().is_ok()
@@ -426,7 +433,7 @@ impl SpaceInner {
             let wait = {
                 let mut log = self.log.lock();
                 self.own_key_refusal(node, &log)?;
-                match step(&mut log)? {
+                match step(&mut log).map_err(|e| self.awaiting_listing(node, &log, e))? {
                     None => return Ok(None),
                     Some(Step::Done(id, fx)) => {
                         let mut routed = self.route(node, &log, fx, true);
@@ -512,6 +519,7 @@ impl SpaceInner {
         node.nudge(&self.name);
         let owed = {
             let log = self.log.lock();
+            node.release_joined(&log);
             self.revocation_owed(node, &log) || self.rule_owed(&log)
         };
         if owed {
@@ -668,6 +676,22 @@ impl SpaceInner {
             name: log_name(&log.device, &self.name, log.next_seq()),
             why,
         })
+    }
+
+    /// `refused`, a refusal to write for want of a listing, as it stands for
+    /// this device: [`HeapError::NotAllowed`] ("ask the owner") becomes
+    /// [`HeapError::NotReady`] while an offer's answer admitted the device
+    /// ([`crate::Node::note_joined`]) and the fold does not list its person yet:
+    /// the entry that does is on its way. Only a device that really is no
+    /// member is told to ask the owner. Any other error is returned as it is.
+    fn awaiting_listing(&self, node: &NodeInner, log: &Log, refused: HeapError) -> HeapError {
+        if matches!(refused, HeapError::NotAllowed { .. }) && node.joining(log) {
+            return HeapError::NotReady {
+                name: self.name.clone(),
+                why: LISTING_AWAITED.into(),
+            };
+        }
+        refused
     }
 
     /// A writer that is no reader of a sealed space cannot seal in it: told

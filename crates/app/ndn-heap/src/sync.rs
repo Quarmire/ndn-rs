@@ -30,6 +30,7 @@ use crate::face_up::FaceUp;
 use crate::fetch::{self, Asks, Fetcher};
 use crate::heard::{HEARD_MAX, Heard};
 use crate::herald::Herald;
+use crate::host::Extensions;
 use crate::log::{Blob, Outcome};
 use crate::node::Config;
 use crate::register::EntryId;
@@ -82,6 +83,9 @@ pub(crate) struct Shared {
     pub(crate) cfg: Config,
     pub(crate) fetcher: Fetcher,
     pub(crate) grants: Granting,
+    /// What the host registered to answer keywords of its own
+    /// ([`crate::host::Extension`]).
+    pub(crate) extensions: Extensions,
 }
 
 // -- The node's one network half ------------------------------------------------------------------------
@@ -166,6 +170,7 @@ impl Net {
             host,
             cfg,
             grants: Granting::default(),
+            extensions: Extensions::default(),
         });
         Arc::new(Net {
             shared,

@@ -646,6 +646,21 @@ impl Judge {
         Some(ctx.context().version())
     }
 
+    /// The persons whose trust context is adopted here for the spaces that
+    /// list them (scoped adoption), sorted: a person this node holds the
+    /// context of itself is not one, and neither is one still being adopted.
+    pub(crate) fn adopted_persons(&self) -> Vec<Name> {
+        let scopes = self.scopes.lock();
+        let mut persons: Vec<Name> = scopes
+            .adopted
+            .iter()
+            .filter(|(_, person)| person.held.is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        persons.sort();
+        persons
+    }
+
     // -- judging --
 
     /// Judge `data`, an entry or other packet about `space`, by the durable

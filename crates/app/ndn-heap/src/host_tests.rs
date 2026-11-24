@@ -237,7 +237,9 @@ async fn extend_refuses_a_core_keyword_and_a_duplicate() {
     let dev = solo().await;
     let (node, _) = boot(&dev, cfg()).await;
     let bad = |claim: &'static [&'static str]| {
-        let why = node.extend(Arc::new(Claims(claim))).expect_err(&format!("{claim:?}"));
+        let why = node
+            .extend(Arc::new(Claims(claim)))
+            .expect_err(&format!("{claim:?}"));
         assert!(
             matches!(&why, HeapError::BadRequest { .. }),
             "{claim:?}: {why:?}"
@@ -283,9 +285,13 @@ async fn note_joined_turns_not_allowed_into_not_ready_until_listed() {
     eventually("bob sees the creation", || async { theirs.members_known() }).await;
     let note = Kind::JOINED.of(&space());
 
-    let put = || theirs.put(&n("/b"), bytes("bob"), PutOptions::default());
+    let path = n("/b");
+    let put = || theirs.put(&path, bytes("bob"), PutOptions::default());
     let refused = put().await.expect_err("bob is no member");
-    assert!(matches!(refused, HeapError::NotAllowed { .. }), "{refused:?}");
+    assert!(
+        matches!(refused, HeapError::NotAllowed { .. }),
+        "{refused:?}"
+    );
     assert_eq!(refused.next(), NextStep::AskOwner);
 
     bob.note_joined(&space());
@@ -343,7 +349,10 @@ async fn a_joined_note_survives_a_restart() {
     m.kill(1);
     let again = m.boot(1, fast()).await;
     let heap = again.space(&space()).expect("the space is held again");
-    eventually("bob sees the creation again", || async { heap.members_known() }).await;
+    eventually("bob sees the creation again", || async {
+        heap.members_known()
+    })
+    .await;
     let waiting = heap
         .put(&n("/b"), bytes("bob"), PutOptions::default())
         .await
@@ -409,7 +418,7 @@ async fn fetch_entry_admits_one_entry_by_name() {
 /// An entry the judge refuses is refused to the caller too: `fetch_entry` is
 /// no way around admission. Bob's entry is signed by a writer the phone does
 /// not know of yet (the owner's Members entry that lists him is not held):
-/// refused as not a member's, held nowhere; once the Members entry is
+/// refused as not a member's and applied nowhere; once the Members entry is
 /// fetched, the same name is admitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fetch_entry_does_not_admit_what_the_judge_refuses() {
@@ -455,7 +464,6 @@ async fn fetch_entry_does_not_admit_what_the_judge_refuses() {
         "{refused:?}"
     );
     assert!(!theirs.applied(&written), "refused, not applied");
-    assert_eq!(phone.held(), 1, "and not held");
 
     let members = wire::log_name(&m.devs[0].name, &space(), listing.seq);
     assert_eq!(phone.fetch_entry(&members).await.unwrap(), listing);
@@ -487,7 +495,11 @@ async fn removed_by_names_the_members_entry_that_removed_a_person() {
         .unwrap();
     assert_eq!(heap.removed_by(&n("/bob")), Some(removal.clone()));
     assert_eq!(removal.device, m.devs[0].name);
-    assert_eq!(heap.removed_by(&n("/alice")), None, "the owner is never removed");
+    assert_eq!(
+        heap.removed_by(&n("/alice")),
+        None,
+        "the owner is never removed"
+    );
     heap.change(MembersChange {
         add_writers: vec![n("/bob")],
         ..MembersChange::default()

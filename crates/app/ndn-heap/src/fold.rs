@@ -266,6 +266,40 @@ impl Fold {
             || self.standing(Role::Reader).any(|a| a.who == *person)
     }
 
+    /// Whether `person` is listed: the owner, a standing writer, or a standing
+    /// reader. A public space lists no reader by being public, so a person who
+    /// only reads it is not listed unless an Add names her.
+    pub fn lists(&self, person: &Name) -> bool {
+        *person == self.owner
+            || self.standing(Role::Writer).any(|a| a.who == *person)
+            || self.standing(Role::Reader).any(|a| a.who == *person)
+    }
+
+    /// The Members entry that removed `person`, who is listed no more: of the
+    /// entries applied that carry a Remove naming an Add of hers, the one of
+    /// the lowest rank (signed digest first, as the entries that claim one
+    /// fact are ordered), so that every node holding the same entries names
+    /// the same one. `None` for a person who is listed, never was, or is the
+    /// owner.
+    pub fn removal_record(&self, person: &Name) -> Option<EntryRef> {
+        if self.lists(person) {
+            return None;
+        }
+        self.carriers
+            .iter()
+            .filter(|(_, body)| {
+                body.ops.iter().any(|op| match op {
+                    Op::Remove { id, .. } => {
+                        self.facts.adds.get(id).is_some_and(|a| a.who == *person)
+                    }
+                    Op::Add { .. } => false,
+                })
+            })
+            .map(|(carrier, _)| carrier)
+            .min_by(|a, b| rank(a).cmp(&rank(b)))
+            .cloned()
+    }
+
     /// The union of the tips of every removed writer Add naming `person`:
     /// what the owner held of that person's devices when it removed them.
     /// Sorted. Never any for the owner.

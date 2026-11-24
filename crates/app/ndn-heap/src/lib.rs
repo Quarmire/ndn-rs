@@ -20,6 +20,7 @@ mod fetch;
 mod fold;
 mod heard;
 mod herald;
+pub mod host;
 mod limit;
 mod log;
 mod node;

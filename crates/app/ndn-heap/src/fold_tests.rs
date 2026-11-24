@@ -597,7 +597,11 @@ fn removal_record_names_the_lowest_entry_that_removed_a_person_listed_no_more() 
     assert_eq!(f.removal_record(&person(0)), Some(early.clone()));
     // The record follows the carriers: an entry withdrawn removes nobody.
     assert!(f.withdraw_members(&early));
-    assert_eq!(f.removal_record(&person(0)), None, "her first Add stands again");
+    assert_eq!(
+        f.removal_record(&person(0)),
+        None,
+        "her first Add stands again"
+    );
 }
 
 #[test]

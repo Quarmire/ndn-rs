@@ -380,6 +380,46 @@ fn the_keyword_router_names_each_served_kind_in_one_look() {
     assert_eq!(served_kind(&space), None);
 }
 
+/// An extension may claim any keyword the layer's own names do not carry
+/// (`host::Extension`): so `CORE_KEYWORDS` must list every keyword a name
+/// builder of the layer writes, or an extension could be given Interests the
+/// core serves.
+#[test]
+fn every_keyword_the_layers_names_carry_is_a_core_keyword() {
+    let device = n("/alice/laptop");
+    let space = n("/alice/32=data/docs/plan");
+    let log = log_name(&device, &space, 7);
+    let names = [
+        space.clone(),
+        log.clone(),
+        piece_name(&log, PieceKind::Chunk(2)),
+        piece_name(&log, PieceKind::Manifest(0)),
+        seal_key_name(&device, &[9; 32]),
+        grant_name(&device, &ask(&space)),
+        held_name(&device, &log),
+        sync_group_of(&space).unwrap(),
+        signal_run_name(&device, &space, &[3; RUN_ID_LEN]),
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for name in &names {
+        for c in name.components() {
+            if c.typ == ndn_foundation_types::tlv_type::KEYWORD {
+                assert!(
+                    CORE_KEYWORDS.contains(&c.value.as_ref()),
+                    "{name} carries the keyword {:?}, which an extension could claim",
+                    String::from_utf8_lossy(&c.value)
+                );
+                seen.insert(c.value.to_vec());
+            }
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        CORE_KEYWORDS.len(),
+        "the list names no keyword the builders do not write: {seen:?}"
+    );
+}
+
 #[test]
 fn owns_is_a_device_prefix_not_a_component_prefix() {
     let notes = n("/alice/32=data/notes/p1");

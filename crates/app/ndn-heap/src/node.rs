@@ -38,6 +38,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::error::{HeapError, Refusal, Timestamp};
 use crate::fold::Readers;
+use crate::host::NodeHandle;
 use crate::log::{Alert, Blob, Change, Log, Outcome, Params, Want};
 use crate::reserve::{Flusher, Publisher};
 use crate::revocation::{self, CutBound, CutProposal, Suspicion};
@@ -143,8 +144,13 @@ impl Default for Config {
 // -- The node ----------------------------------------------------------------------
 
 /// A device's heap layer.
+///
+/// It dereferences to its [`NodeHandle`], the surface `ndn-invite` and
+/// `ndn-surface` use (see [`crate::host`]); the handle is the same node, cheap to
+/// clone, and does not stop it when dropped.
 pub struct Node {
     pub(crate) inner: Arc<NodeInner>,
+    host: NodeHandle,
 }
 
 /// What a node is made of; shared by its handles, its tasks and its network
@@ -154,6 +160,10 @@ pub(crate) struct NodeInner {
     pub(crate) device: Name,
     pub(crate) ns: Name,
     pub(crate) signer: Arc<dyn Signer>,
+    /// The key store the device was started with.
+    pub(crate) keys: Arc<SecurityManager>,
+    /// The connection fetches and serving go over.
+    pub(crate) conn: Arc<dyn Connection>,
     recipient: RecipientKey,
     pub(crate) judge: Arc<Judge>,
     pub(crate) store: Arc<dyn DataStore>,
@@ -249,11 +259,14 @@ impl Node {
             Arc::clone(&store),
             config.adopter.clone(),
         );
+        let conn = transport.node.connection();
         let inner = Arc::new_cyclic(|me| NodeInner {
             me: me.clone(),
             device: device.clone(),
             ns,
             signer: identity.signer,
+            keys,
+            conn: Arc::clone(&conn),
             recipient,
             judge,
             suspicion: Suspicion::open(Arc::clone(&store)),
@@ -271,11 +284,12 @@ impl Node {
         });
         let node = Node {
             inner: Arc::clone(&inner),
+            host: NodeHandle::of(Arc::clone(&inner)),
         };
         let net = Net::start(
             Arc::clone(&inner) as HostRef,
             inner.config.clone(),
-            transport.node.connection(),
+            conn,
             transport.sync,
         );
         *inner.net.write() = Some(net);
@@ -348,25 +362,17 @@ impl Node {
     /// Join a space made elsewhere. Idempotent; a node's start opens every
     /// space it held.
     pub async fn open(&self, space: &Name) -> Result<Heap, HeapError> {
-        let inner = &self.inner;
-        let _opening = inner.opening.lock().await;
-        Ok(Heap::new(
-            inner.hold(space, false).await?,
-            Arc::clone(inner),
-        ))
+        self.inner.open_space(space).await
     }
 
     /// The space `space`, if this node has it open as a member.
     pub fn space(&self, space: &Name) -> Option<Heap> {
-        let held = self.inner.spaces.read().get(space).cloned()?;
-        (!held.follower).then(|| Heap::new(held, Arc::clone(&self.inner)))
+        self.inner.member_space(space)
     }
 
     /// The spaces this node has open as a member, by name.
     pub fn spaces(&self) -> Vec<Name> {
-        let spaces = self.inner.sorted();
-        let members = spaces.iter().filter(|s| !s.follower);
-        members.map(|s| s.name.clone()).collect()
+        self.inner.member_spaces()
     }
 
     /// Carry `space`: join it, verify and store what it holds and serve it,
@@ -483,6 +489,22 @@ impl Node {
         self.inner
             .with_logs(|logs| revocation::refused_by_revocation(logs, key))
     }
+
+    /// A handle to this node that a task or an [`Extension`](crate::host::Extension)
+    /// can keep: the same surface as the node's own host methods
+    /// ([`crate::host`]), cheap to clone, and not stopping the node when
+    /// dropped. Once the node stops it answers [`HeapError::Local`].
+    pub fn handle(&self) -> NodeHandle {
+        self.host.clone()
+    }
+}
+
+impl std::ops::Deref for Node {
+    type Target = NodeHandle;
+
+    fn deref(&self) -> &NodeHandle {
+        &self.host
+    }
 }
 
 impl Drop for Node {
@@ -508,8 +530,32 @@ impl NodeInner {
         (self.config.clock)().0
     }
 
-    fn net(&self) -> Option<Arc<Net>> {
+    pub(crate) fn net(&self) -> Option<Arc<Net>> {
         self.net.read().clone()
+    }
+
+    /// This device's X25519 recipient key.
+    pub(crate) fn recipient(&self) -> &RecipientKey {
+        &self.recipient
+    }
+
+    /// [`Node::open`].
+    pub(crate) async fn open_space(self: &Arc<Self>, space: &Name) -> Result<Heap, HeapError> {
+        let _opening = self.opening.lock().await;
+        Ok(Heap::new(self.hold(space, false).await?, Arc::clone(self)))
+    }
+
+    /// [`Node::space`].
+    pub(crate) fn member_space(self: &Arc<Self>, space: &Name) -> Option<Heap> {
+        let held = self.spaces.read().get(space).cloned()?;
+        (!held.follower).then(|| Heap::new(held, Arc::clone(self)))
+    }
+
+    /// [`Node::spaces`].
+    pub(crate) fn member_spaces(&self) -> Vec<Name> {
+        let spaces = self.sorted();
+        let members = spaces.iter().filter(|s| !s.follower);
+        members.map(|s| s.name.clone()).collect()
     }
 
     pub(crate) fn nudge(&self, space: &Name) {

@@ -34,6 +34,16 @@ const GRANT: &[u8] = b"grant";
 const HELD: &[u8] = b"held";
 pub(super) const PIECE: &[u8] = b"piece";
 pub(super) const MANIFEST: &[u8] = b"manifest";
+const SYNC: &[u8] = ndn_security::trust_context::SYNC_GROUP_KEYWORD;
+
+/// Every keyword the layer's own names carry: a space (`data`), an entry
+/// (`log`), its pieces (`piece`, `manifest`), a seal key, a grant, a held copy
+/// (`seal`, `grant`, `held`), a sync group (`sync`) and a signal run
+/// (`signal`, `run`). The sibling surface refuses an extension that claims one
+/// of them ([`crate::host`]).
+pub(crate) const CORE_KEYWORDS: &[&[u8]] = &[
+    DATA, LOG, SEAL, GRANT, HELD, PIECE, MANIFEST, SYNC, SIGNAL, RUN,
+];
 
 /// The most components a space name has after its `32=data`.
 pub(crate) const SPACE_REST_MAX: usize = 4;
@@ -369,17 +379,21 @@ pub(crate) enum Served {
 /// no digest, so only the first such component can be that keyword. The
 /// parser of the kind still judges the name.
 pub(crate) fn served_kind(name: &Name) -> Option<Served> {
-    let first = name.components().iter().find(|c| !is_plain(c))?;
-    if first.typ != tlv_type::KEYWORD {
-        return None;
-    }
-    match first.value.as_ref() {
+    match keyword_of(name)? {
         LOG => Some(Served::Log),
         HELD => Some(Served::Held),
         SEAL => Some(Served::Seal),
         GRANT => Some(Served::Grant),
         _ => None,
     }
+}
+
+/// The first keyword of `name`: what a device's names are routed by, since
+/// the device name before it holds no keyword and no digest. `None` when the
+/// first component that is not plain is no keyword, or there is none.
+pub(crate) fn keyword_of(name: &Name) -> Option<&[u8]> {
+    let first = name.components().iter().find(|c| !is_plain(c))?;
+    (first.typ == tlv_type::KEYWORD).then(|| first.value.as_ref())
 }
 
 const SIGNAL: &[u8] = b"signal";
