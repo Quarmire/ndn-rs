@@ -1904,6 +1904,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "ndn-invite"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "getrandom 0.2.17",
+ "hkdf 0.13.0",
+ "hmac 0.13.0",
+ "ndn-app",
+ "ndn-foundation-types",
+ "ndn-heap",
+ "ndn-packet",
+ "ndn-security",
+ "ndn-sync",
+ "ndn-tlv",
+ "ndn-trust-envelope",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "web-time",
+ "zeroize",
+]
+
+[[package]]
 name = "ndn-ipc"
 version = "0.1.0"
 dependencies = [
