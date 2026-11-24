@@ -1020,7 +1020,9 @@ impl MgmtClient {
 
     /// `security/transit`: ask the daemon to carry the self-certifying
     /// namespace `namespace` (`/user/<0xA1: …>`), which this app adopted for
-    /// one scope of its own alone, in transit (`carry`: one mark more), or
+    /// one scope of its own alone, or an introduction's prefix
+    /// (`<device>/32=intro`, `<device>/32=hint`) for the length of a join, in
+    /// transit (`carry`: one mark more), or
     /// to take one mark back (`!carry`). While a mark is held the daemon,
     /// not holding the namespace, forwards its Data unvalidated to the
     /// Interests pending for it and caches none of it: the app validates

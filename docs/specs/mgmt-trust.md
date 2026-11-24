@@ -238,7 +238,10 @@ YubiKey PIV support (`operation` = `yubikey`).
 app that adopted it for one scope of its own alone (trust-context.md
 §4.5.7; a data-layer device's folders, data-layer.md §6.3), on a forwarder
 that does not hold it, so the namespace's Data reaches the app, which
-validates every packet itself.
+validates every packet itself. It carries as well the two prefixes of an
+introduction, `<device>/32=intro` and `<device>/32=hint`, for a data host that
+joins by a code (invite.md §12.1): the offer and the hint record are signed by
+a namespace the joiner's forwarder does not hold until the join ends.
 
 - **Who may mark.** The transit gate: on the local management socket, by
   the kernel's peer credentials, a local operator (as for every trust
@@ -250,11 +253,16 @@ validates every packet itself.
   naming who may and how to be given it); a face with no caller identity
   is refused (`trust-change-unidentified`); over `/localhop` it is
   refused as every trust change is (`trust-change-over-localhop`).
-- **The namespace.** Name is exactly a self-certifying namespace,
-  `/user/<0xA1: 32 bytes>` (trust-context.md §4.5). Any other is refused
-  (`transit-not-personal`): such a namespace is adopted on the node from
-  its anchor link, or carried by the link that serves its devices
-  ([ndn-link.md](ndn-link.md) §15.7).
+- **The name.** Exactly a self-certifying namespace,
+  `/user/<0xA1: 32 bytes>` (trust-context.md §4.5), or exactly an
+  introduction's prefix: a device name (one or more components, none a
+  keyword or a digest) followed by the one keyword `intro` or `hint`
+  (`<device>/32=intro`, `<device>/32=hint`; invite.md §2.3). Any other is
+  refused (`transit-not-personal`): such a namespace is adopted on the node
+  from its anchor link, or carried by the link that serves its devices
+  ([ndn-link.md](ndn-link.md) §15.7). An introduction's prefix runs no sync
+  group action (it has none); a namespace the node holds is validated
+  whatever the marks say, as for a person's namespace.
 - **Marks, counted, owned by the face that asked.** Each command is one
   mark; Flags `TRANSIT_RELEASE` takes one back. Each mark is owned by the
   management face the command arrived on (an internally generated command
@@ -290,7 +298,7 @@ validates every packet itself.
 
 | code | status | retry | next | params | meaning |
 |---|---|---|---|---|---|
-| `transit-not-personal` | 400 | no | fix-request | `namespace` | the namespace is not a self-certifying one; adopt it on the node, or let a link carry it |
+| `transit-not-personal` | 400 | no | fix-request | `namespace` | the name is neither a self-certifying namespace nor an introduction's prefix (`<device>/32=intro`, `<device>/32=hint`); adopt it on the node, or let a link carry it |
 | `transit-not-permitted` | 403 | no | fix-local | `uid`, `daemon_uid`, `groups`, `transit_groups` (`, `-separated; empty: none) | the caller is a local user who is neither an operator nor in a transit group |
 
 **Threat note: who may mark, and what a local app then receives.** Only a
