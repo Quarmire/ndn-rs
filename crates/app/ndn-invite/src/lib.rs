@@ -24,6 +24,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 
+pub(crate) mod credentials;
 pub mod error;
 pub mod host;
 pub mod policy;
