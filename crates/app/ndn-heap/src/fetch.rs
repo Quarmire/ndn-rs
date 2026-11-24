@@ -736,6 +736,18 @@ struct Probe {
 /// The most counters of one vouched device asked at once ([`Asks::probe`]).
 const PROBE_FLIGHTS: usize = 4;
 
+/// The most hole tops of one device asked at once, beside its window ([`Asks::walk`]).
+const HOLE_TOPS: usize = 4;
+
+/// What of the undeclared holes of one device is asked now.
+struct Holes {
+    /// The first seqs of each hole, a window deep or a block ([`reach`]).
+    reach: Vec<(u64, u64)>,
+    /// The highest seq of each hole, ascending: the entry the chain of the held entry above
+    /// it names (§7.4).
+    tops: Vec<u64>,
+}
+
 /// The most probes of one group in flight at once: a group has at most
 /// [`HEARD_MAX`](crate::heard::HEARD_MAX) devices heard, and the probes of devices nothing
 /// vouches for are for names anyone can send, so the others wait their turn (the devices
@@ -788,10 +800,13 @@ impl Asks {
 
     /// The asks of `device` in flight, and those that hold a place in its window: in flight, or
     /// pausing before they have missed [`REFRESH_TRIES`] times in a row (one that has waits
-    /// idle, a minute at a time, and holds a place only while it is asked).
-    fn busy(&self, device: &Name) -> (usize, usize) {
+    /// idle, a minute at a time, and holds a place only while it is asked). The asks of the
+    /// hole tops `tops` are the lane's, not the window's ([`Self::walk`]).
+    fn busy(&self, device: &Name, tops: &[u64]) -> (usize, usize) {
         let (mut flying, mut busy) = (0, 0);
-        for ask in self.by.range(span(device)).map(|(_, ask)| ask) {
+        let asks = self.by.range(span(device));
+        for ask in asks.filter(|((_, s), _)| tops.binary_search(s).is_err()) {
+            let ask = ask.1;
             if ask.until.is_none() {
                 flying += 1;
                 busy += 1;
@@ -800,6 +815,15 @@ impl Asks {
             }
         }
         (flying, busy)
+    }
+
+    /// How many of the hole tops `tops` of `device` hold a place in the lane: in flight, or
+    /// pausing before they have missed [`REFRESH_TRIES`] times in a row.
+    fn lane(&self, device: &Name, tops: &[u64]) -> usize {
+        let asks = self.by.range(span(device));
+        let tops = asks.filter(|((_, s), _)| tops.binary_search(s).is_ok());
+        tops.filter(|(_, a)| a.until.is_none() || a.misses < REFRESH_TRIES)
+            .count()
     }
 
     /// Enter the ask of `(device, seq)` as in flight.
@@ -824,19 +848,46 @@ impl Asks {
     /// The asks of the holes of `device` in `ranges`, in seq order, at most `window` of them
     /// in flight or pausing at once: an ask that missed holds its place while it pauses, so the
     /// walk does not slide over the seqs nothing answers. Those due again go first.
+    ///
+    /// `tops` are the highest seqs of the holes (sorted): the entry a held entry's chain
+    /// names (§7.4). They are asked **before** the window and outside it, in a lane of at most
+    /// [`HOLE_TOPS`] of the device at once (lowest hole first, the same rule for what is in
+    /// flight or pausing as for the window), so a window of asks from the bottom that nothing
+    /// answers never keeps the one entry that may declare the hole void from being asked.
     fn walk(
         &mut self,
         device: &Name,
-        ranges: &[(u64, u64)],
+        holes: &Holes,
         window: usize,
         now: Instant,
         next: &mut Option<Duration>,
         out: &mut Vec<Launch>,
     ) {
-        let (mut flying, busy) = self.busy(device);
+        let (ranges, tops) = (&holes.reach[..], &holes.tops[..]);
+        let mut lane = self.lane(device, tops);
+        for &seq in tops {
+            match self.standing(&(device.clone(), seq), now) {
+                Standing::Flying => {}
+                Standing::Waiting(left) => look_again(next, left),
+                Standing::Due(misses) if misses < REFRESH_TRIES => {
+                    out.push(self.launch(device, seq, misses, None));
+                }
+                Standing::Due(misses) if lane < HOLE_TOPS => {
+                    lane += 1;
+                    out.push(self.launch(device, seq, misses, None));
+                }
+                Standing::New if lane < HOLE_TOPS => {
+                    lane += 1;
+                    out.push(self.launch(device, seq, 0, None));
+                }
+                _ => {}
+            }
+        }
+        let (mut flying, busy) = self.busy(device, tops);
         let mut budget = window.saturating_sub(busy);
         let known: Vec<u64> = self.by.range(span(device)).map(|((_, s), _)| *s).collect();
-        for &seq in known.iter().filter(|s| within(ranges, **s)) {
+        let bottom = |s: &u64| tops.binary_search(s).is_err();
+        for &seq in known.iter().filter(|s| bottom(s) && within(ranges, **s)) {
             match self.standing(&(device.clone(), seq), now) {
                 Standing::Waiting(left) => look_again(next, left),
                 Standing::Due(misses) if flying < window => {
@@ -852,7 +903,7 @@ impl Asks {
                 _ => {}
             }
         }
-        for seq in ranges.iter().flat_map(|&(a, b)| a..=b) {
+        for seq in ranges.iter().flat_map(|&(a, b)| a..=b).filter(bottom) {
             if budget == 0 {
                 break;
             }
@@ -877,7 +928,7 @@ impl Asks {
         next: &mut Option<Duration>,
         out: &mut Vec<Launch>,
     ) {
-        let (mut flying, busy) = self.busy(device);
+        let (mut flying, busy) = self.busy(device, &[]);
         let mut budget = window.saturating_sub(busy);
         let mut fresh = Vec::new();
         for &(seq, pin) in exact {
@@ -1252,7 +1303,7 @@ impl Group {
         // verified, the holes below it are the log's to want.
         let probes = self.probes();
 
-        let mut per: BTreeMap<Name, Vec<(u64, u64)>> = BTreeMap::new();
+        let mut raw: BTreeMap<Name, Vec<(u64, u64)>> = BTreeMap::new();
         let mut exact: BTreeMap<(Name, u64), Pin> = BTreeMap::new();
         let wants = host.missing(space);
         for want in &wants {
@@ -1260,24 +1311,39 @@ impl Group {
                 Some(digest) => {
                     exact.insert((want.device.clone(), want.first), digest);
                 }
-                None => per
+                None => raw
                     .entry(want.device.clone())
                     .or_default()
                     .push((want.first, want.last)),
             }
         }
-        per.remove(&me);
+        raw.remove(&me);
         // An undeclared hole of another device is asked a reservation block at a time: its
         // writer reserved no more seqs than that at once, and what an entry far above names
         // proves of the seqs below it is only that they were signed, not that they can be
         // had. The next block is asked once this one is held (the hole's start moves up) or
-        // a later entry declares it void.
-        for ranges in per.values_mut() {
-            *ranges = reach(ranges, block);
-        }
+        // a later entry declares it void. The top of each hole is asked besides, first: the
+        // entry above it, held and verified, names it by its chain, and it is the one entry
+        // that may declare the rest of the hole void (§7.4).
+        let mut per: BTreeMap<Name, Holes> = raw
+            .into_iter()
+            .map(|(device, ranges)| {
+                let mut tops: Vec<u64> = ranges.iter().map(|&(_, last)| last).collect();
+                tops.sort_unstable();
+                tops.dedup();
+                let reach = reach(&ranges, block);
+                (device, Holes { reach, tops })
+            })
+            .collect();
         let own = self.own_wants(&wants);
         if !own.is_empty() {
-            per.insert(me.clone(), own);
+            per.insert(
+                me.clone(),
+                Holes {
+                    reach: own,
+                    tops: Vec::new(),
+                },
+            );
         }
 
         let mut launches: Vec<Launch> = Vec::new();
@@ -1286,12 +1352,14 @@ impl Group {
             let mut asks = self.asks.lock();
             asks.by.retain(|(d, s), a| {
                 a.until.is_none()
-                    || per.get(d).is_some_and(|rs| within(rs, *s))
+                    || per
+                        .get(d)
+                        .is_some_and(|h| within(&h.reach, *s) || h.tops.binary_search(s).is_ok())
                     || exact.contains_key(&(d.clone(), *s))
             });
-            for (device, ranges) in &per {
+            for (device, holes) in &per {
                 let window = self.shared.fetcher.window(device);
-                asks.walk(device, ranges, window, now, &mut next, &mut launches);
+                asks.walk(device, holes, window, now, &mut next, &mut launches);
             }
             let mut by_device: BTreeMap<&Name, Vec<(u64, Pin)>> = BTreeMap::new();
             for ((device, seq), digest) in &exact {
@@ -1906,14 +1974,18 @@ mod tests {
         let mut asks = Asks::default();
         let (mut next, mut launches) = (None, Vec::new());
         let began = Instant::now();
-        asks.walk(&device, &[(1, 1000)], 4, began, &mut next, &mut launches);
+        let holes = Holes {
+            reach: vec![(1, 1000)],
+            tops: Vec::new(),
+        };
+        asks.walk(&device, &holes, 4, began, &mut next, &mut launches);
         let seqs = |l: &[Launch]| l.iter().map(|l| l.seq).collect::<Vec<_>>();
         assert_eq!(seqs(&launches), vec![1, 2, 3, 4]);
         for launch in &launches {
             asks.end(launch, false, false, began);
         }
         launches.clear();
-        asks.walk(&device, &[(1, 1000)], 4, began, &mut next, &mut launches);
+        asks.walk(&device, &holes, 4, began, &mut next, &mut launches);
         assert!(
             launches.is_empty(),
             "the missed asks hold the window: {:?}",
@@ -1924,11 +1996,55 @@ mod tests {
             "and the walk looks again when their pause ends"
         );
         let later = began + REFRESH_PAUSE_MAX;
-        asks.walk(&device, &[(1, 1000)], 4, later, &mut next, &mut launches);
+        asks.walk(&device, &holes, 4, later, &mut next, &mut launches);
         assert_eq!(
             seqs(&launches),
             vec![1, 2, 3, 4],
             "the same seqs are asked again"
+        );
+    }
+
+    /// The top of a hole (the entry a held entry's chain names) is asked besides the window,
+    /// even when the window is full of asks that missed and are pausing: it is one of at most
+    /// [`HOLE_TOPS`] asked at once beside it, the lowest holes first.
+    #[test]
+    fn the_top_of_a_hole_is_asked_beside_a_window_full_of_missed_asks() {
+        let device: Name = "/alice/phone".parse().expect("a name");
+        let mut asks = Asks::default();
+        let (mut next, mut launches) = (None, Vec::new());
+        let began = Instant::now();
+        let seqs = |l: &[Launch]| l.iter().map(|l| l.seq).collect::<Vec<_>>();
+        let below = Holes {
+            reach: vec![(1, 1000)],
+            tops: Vec::new(),
+        };
+        asks.walk(&device, &below, 4, began, &mut next, &mut launches);
+        for launch in &launches {
+            asks.end(launch, false, false, began);
+        }
+        launches.clear();
+        let holes = Holes {
+            reach: vec![
+                (1, 1000),
+                (3000, 3000),
+                (4000, 4000),
+                (5000, 5000),
+                (6000, 6000),
+            ],
+            tops: vec![1000, 3000, 4000, 5000, 6000],
+        };
+        asks.walk(&device, &holes, 4, began, &mut next, &mut launches);
+        assert_eq!(
+            seqs(&launches),
+            vec![1000, 3000, 4000, 5000],
+            "the tops of the four lowest holes, though the window is full of missed asks, and no ask from the bottom"
+        );
+        launches.clear();
+        asks.walk(&device, &holes, 4, began, &mut next, &mut launches);
+        assert!(
+            launches.is_empty(),
+            "what is in the lane is not asked again, and the lane is full: {:?}",
+            seqs(&launches)
         );
     }
 

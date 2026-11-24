@@ -254,6 +254,67 @@ async fn a_void_declared_by_a_gap_statement_is_never_asked() {
     assert!(!r.host.holds(PHONE, 500));
 }
 
+/// A writer resumed above its reservation after an unclean stop: seq 4999 carries the gap
+/// statement `PREV_SEQ = 2` (3..4998 void) and 5000 follows it densely; a reader that held
+/// 1..2 and hears only the counter 5000 probes it, holds it, and must then ask the entry its
+/// chain names, 4999, before it walks the hole from the bottom: the walk from the bottom
+/// asks the 4,996 seqs of a void only a later entry declares, a window at a time, and a
+/// writer that Nacks them never lets it reach the one entry that ends them (the e2e
+/// `stolen`: 60 s of asks 4..19 and never 1025). Once 4999 is held nothing inside its void is
+/// asked, and the asks inside it before were at most the window, not the length of the void.
+#[tokio::test(start_paused = true)]
+async fn the_entry_a_held_tip_names_is_asked_before_the_hole_below_it_is_walked() {
+    let r = rig().await;
+    r.host.hold(PHONE, 2);
+    r.host.st.lock().vouched.insert(n(PHONE));
+    r.wire.delay(Duration::from_millis(50));
+    // The writer has only what it signed: the tip, its declaring predecessor, and 1..2.
+    r.wire.script(|name| match direct(name) {
+        Some((d, 4999)) if d == n(PHONE) => Reply::Data(declaring(PHONE, 4999, 2)),
+        Some((d, 5000)) if d == n(PHONE) => Reply::Data(genuine(PHONE, 5000)),
+        _ => Reply::Nack(NackReason::NoRoute),
+    });
+    r.group.on_update(notice(PHONE, 5000));
+    pass(120).await;
+    assert!(
+        r.host.holds(PHONE, 4999),
+        "the declaring entry the tip's chain names was never held"
+    );
+    assert!(
+        r.host.missing(&space()).is_empty(),
+        "the void is learned: nothing is wanted below the tip"
+    );
+    let times = r.wire.times();
+    let asked: Vec<(u64, tokio::time::Instant)> = times
+        .iter()
+        .filter_map(|(name, t)| {
+            direct(name)
+                .filter(|(d, _)| *d == n(PHONE))
+                .map(|(_, s)| (s, *t))
+        })
+        .collect();
+    let declared_at = asked
+        .iter()
+        .find(|(s, _)| *s == 4999)
+        .map(|(_, t)| *t)
+        .expect("the declaring entry was asked");
+    let inside: Vec<_> = asked
+        .iter()
+        .filter(|(s, _)| (3..=4998).contains(s))
+        .collect();
+    assert!(
+        inside.len() <= 16,
+        "{} asks inside the void, a window's worth is the most",
+        inside.len()
+    );
+    assert!(
+        inside
+            .iter()
+            .all(|(_, t)| *t <= declared_at + Duration::from_millis(60)),
+        "an ask inside the void after the declaring entry was held"
+    );
+}
+
 /// An entry that does not verify is refused and applies nothing; what it was
 /// fetched for stays wanted and the next ask goes to another holder.
 #[tokio::test(start_paused = true)]

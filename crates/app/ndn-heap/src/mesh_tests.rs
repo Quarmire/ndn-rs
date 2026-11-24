@@ -370,6 +370,65 @@ async fn d12_a_restored_old_image_with_peers_online_raises_rolledback_and_reuses
     .await;
 }
 
+/// The e2e `stolen` shape, with the real log. A device resumes above its reservation after an
+/// unclean stop and signs two entries (the first carries the gap statement: a void of
+/// `reserve_block` seqs); a reader that was away hears only the top counter. It holds the top
+/// entry, and the entry the top's chain names is the declaring one: asked before the seqs of
+/// the void are walked from the bottom (each is a Nack at the writer), so the void is learned
+/// within seconds and not after a walk of a thousand asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_that_hears_only_the_top_counter_learns_a_declared_void_from_the_entry_below() {
+    let mut m = mesh(&["/alice/laptop", "/alice/phone"]).await;
+    let crash = Arc::new(CrashStore::new());
+    m.devs[1].store = Arc::clone(&crash) as Arc<dyn DataStore>;
+    let phone = m.boot(1, fast()).await;
+    let heap = phone.create(&space(), public()).await.unwrap();
+    let kept = heap
+        .put(&n("/a"), bytes("one"), durable(true))
+        .await
+        .unwrap();
+    let image = crash.crash();
+    drop(heap);
+    drop(phone);
+    m.kill(1);
+
+    // The phone is back over what its disk kept, with no peer to ask what it signed since: it
+    // resumes above the reservation, and the first entry signs the gap.
+    let phone = m.boot_on(1, Arc::new(image), fast()).await;
+    let heap = phone.space(&space()).unwrap();
+    let first = heap
+        .put(&n("/a"), bytes("two"), durable(false))
+        .await
+        .unwrap();
+    let top = heap
+        .put(&n("/a"), bytes("three"), durable(false))
+        .await
+        .unwrap();
+    assert!(
+        first.seq > kept.seq + 1000 && top.seq == first.seq + 1,
+        "the resume jumped: {} after {}, then {}",
+        first.seq,
+        kept.seq,
+        top.seq
+    );
+
+    // The laptop was away: it hears the phone's counter, and only the top one.
+    let laptop = m.boot(0, fast()).await;
+    let theirs = laptop.open(&space()).await.unwrap();
+    eventually(
+        "the laptop holds the declaring entry and the void is learned",
+        || async {
+            has(&theirs, "/a", "three").await
+                && m.devs[0]
+                    .store
+                    .get(&log_name(&m.devs[1].name, &space(), first.seq))
+                    .is_some()
+                && theirs.inner.log.lock().missing().is_empty()
+        },
+    )
+    .await;
+}
+
 /// Sync Interests are unsigned: a counter for a device the log vouches for
 /// names an entry the reader may probe, not a range it must walk. The heap
 /// stays ready, with nothing wanted (M4).

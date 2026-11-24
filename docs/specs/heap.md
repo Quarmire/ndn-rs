@@ -1578,6 +1578,26 @@ a restart, a lost packet or a refusal changes nothing about what is owed.
   `(head, min(seen, R)]`.
   The prefix a device is held to is the largest `n` with every seq of `1..n`
   held or void.
+- **The top of a hole is asked first.** The seq just below a held entry that is neither
+  held nor void is the **top** of its hole, and the held, verified entry above it names
+  it by its chain (§3.6: `PREV` at `seq − 1`, or the `PREV_SEQ` of a gap statement
+  that declares what lies above it void). It is the one entry that can end the hole
+  at once: if it carries a `PREV_SEQ`, everything between that and the top is void, and
+  the next top is that `PREV_SEQ`. A node therefore asks the top of every hole **before**
+  the asks from the bottom, and **beside** their window, never behind it: in a lane of
+  at most `HOLE_TOPS` (4) tops of a device at once (the lowest holes first; one that is in
+  flight or pausing holds a place until it has missed `REFRESH_TRIES` times, as a
+  window's ask does), so a window of asks from the bottom that nothing answers cannot
+  keep the declaring entry from being asked. The top is asked whatever the hole's length,
+  even where `reserve_block` stops the asks from the bottom short of it. This is **not**
+  a top-down chain walk alone: a dense hole of a thousand entries a reader missed while
+  away (o4) would then cost a thousand round trips in a row, where the window from the
+  bottom takes them in parallel; the two ends meet, and each round that holds a top moves the
+  next top down or ends the hole by its `PREV_SEQ` (a device that resumed above its
+  reservation, `stolen`: the reader hears only the counter 1026, probes and holds it,
+  asks 1025 with the first asks of the hole, holds the gap statement `PREV_SEQ = 2`,
+  and asks nothing of 3..1024). The asks inside a void that were already in flight when its
+  declaring entry was held are at most the window, never the length of the void.
 - **The entries a cut names.** A revocation cut a held trust context lists (§9.5) wants the
   seqs it keeps that are neither held nor void, whatever counter the group shows, and the
   entries it re-admits one by one, by their implicit digest: the bytes must be those. Only
@@ -1617,7 +1637,8 @@ a restart, a lost packet or a refusal changes nothing about what is owed.
   the window while it pauses (until it has missed 16 times in a row, when it waits a
   minute at a time and holds a place only while asked), so the walk does not slide on
   over the seqs nothing answers. The asks go in seq order, the entry at the highest
-  seq first and alone while it is not held (§7.3).
+  seq first and alone while nothing at or above it is held (§7.3), and the tops of the
+  holes before the asks from the bottom.
 - **Own entries** are wanted only up to `4 × reserve_block` above the own head
   (§4.8).
 - **Sources.** The ask goes to the **writer** by its own name; after a miss to
@@ -1792,6 +1813,13 @@ nothing a node does; the `put_watch` example records them (§13.8).
   their place in the window instead of letting the walk slide on. The same holds for
   pieces nothing serves (they take the device's window and slots). A grant pull, a
   seal key and the probe of a device not asked yet find a slot (§7.3).
+- **The top of a hole names no counter.** The entry asked first is the one an admitted,
+  verified entry's chain names (D17 holds: nothing unsigned raises a head or a want),
+  one per hole, at most `HOLE_TOPS` of a device at once, so a writer that signs an
+  entry at seq 10^9 costs one ask more than its window, never an ask proportional to
+  the seq, and a counter heard adds none. A top that is not to be had (its writer
+  withholds it) is asked again by the miss ladder, as any want is, and holds a place in
+  the lane, not in the window: it keeps no honest ask of the same device waiting.
 - **Strangers' entries (L7).** A device certified in a held context that is no
   member has at most one refused entry stored and one alert per device: a
   probe of it (`Host::take(.., probe = true)`) is neither stored nor told when
