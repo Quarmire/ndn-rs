@@ -42,7 +42,7 @@ use tokio::sync::mpsc;
 use crate::error::{Cut, Refusal, Timestamp};
 use crate::rt::{self, Instant};
 use crate::store::Kind;
-use crate::wire::{device_of, log_prefix};
+use crate::wire::{device_of, log_prefix, parse_log_name};
 
 /// The first pause before a person the host could not adopt is asked again;
 /// it doubles on each refusal, up to [`SCOPE_PAUSE_MAX`].
@@ -727,6 +727,36 @@ impl Judge {
                 let prefix = log_prefix(&device, space);
                 for range in cut.ranges().iter().filter(|r| r.prefix == prefix) {
                     out.extend(range.runs.iter().map(|&(lo, hi)| (device.clone(), lo, hi)));
+                }
+            }
+        }
+        out
+    }
+
+    /// The entries the trust contexts this node holds re-admit one by one in a revocation cut,
+    /// of `space`: `(device, seq, implicit digest)`. The owner names the exact packet; the
+    /// entries are wanted by those bytes whatever the cut's ranges say.
+    pub(crate) fn cut_exact(&self, space: &Name) -> Vec<(Name, u64, [u8; 32])> {
+        let mut out = Vec::new();
+        for ctx in self.validator.keyring().contexts() {
+            for cut in ctx.revocation_cuts() {
+                for full in cut.exact() {
+                    let Some((last, rest)) = full.components().split_last() else {
+                        continue;
+                    };
+                    let Ok(digest) = <[u8; 32]>::try_from(last.value.as_ref()) else {
+                        continue;
+                    };
+                    if last.typ != ndn_packet::tlv_type::IMPLICIT_SHA256 {
+                        continue;
+                    }
+                    let entry = Name::from_components(rest.iter().cloned());
+                    let Some(log) = parse_log_name(&entry) else {
+                        continue;
+                    };
+                    if log.space == *space && device_of(cut.key()).as_ref() == Some(&log.device) {
+                        out.push((log.device, log.seq, digest));
+                    }
                 }
             }
         }

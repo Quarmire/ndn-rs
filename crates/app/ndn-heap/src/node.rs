@@ -747,6 +747,26 @@ impl NodeInner {
         out
     }
 
+    /// The entries named that the judge now accepts: device and seq.
+    async fn accepted(&self, space: &Name, names: Vec<Name>) -> Vec<(Name, u64)> {
+        let mut out = Vec::new();
+        for name in names {
+            let Some(log_name) = parse_log_name(&name) else {
+                continue;
+            };
+            let Some(wire) = self.store.get(&name) else {
+                continue;
+            };
+            let Ok(data) = Data::decode(wire) else {
+                continue;
+            };
+            if matches!(self.judge.validate(&data, space).await, Judged::Valid(_)) {
+                out.push((log_name.device, log_name.seq));
+            }
+        }
+        out
+    }
+
     /// Judge the held entries of `persons` again in `spaces`, and withdraw
     /// what is refused now.
     async fn rejudge(self: &Arc<Self>, spaces: Vec<Name>, persons: &[Name]) {
@@ -762,6 +782,21 @@ impl NodeInner {
                 let routed = {
                     let mut log = held.log.lock();
                     let fx = log.withdraw(&device, seq, why);
+                    held.route(self, &log, fx, true)
+                };
+                held.finish(self, routed);
+            }
+            // What a re-admission lets in again: the entries held refused by a cut that the
+            // judge now accepts (the owner named their bytes), taken back as when another copy
+            // of them verifies.
+            let refused: Vec<Name> = {
+                let log = held.log.lock();
+                persons.iter().flat_map(|p| log.refused_names(p)).collect()
+            };
+            for (device, seq) in self.accepted(&space, refused).await {
+                let routed = {
+                    let mut log = held.log.lock();
+                    let fx = log.reinstate(&device, seq);
                     held.route(self, &log, fx, true)
                 };
                 held.finish(self, routed);
@@ -881,7 +916,7 @@ impl NodeInner {
         self.space_of(space).map_or_else(Vec::new, |s| {
             let log = s.log.lock();
             let mut wants = log.missing();
-            wants.extend(log.cut_wants(&self.judge.cut_runs(space)));
+            wants.extend(log.cut_wants(&self.judge.cut_runs(space), &self.judge.cut_exact(space)));
             wants
         })
     }

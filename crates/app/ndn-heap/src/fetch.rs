@@ -46,13 +46,11 @@ use ndn_packet::{Data, NackReason};
 use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
-use crate::log::{Blob, Outcome};
+use crate::log::{Blob, Outcome, Pin};
 use crate::pieces::{self, Assembler, Offered};
 use crate::rt::{self, Instant};
 use crate::sync::{Group, TIMELINE, Taken};
-use crate::wire::{
-    ChunksBody, EpochId, GrantAsk, grant_name, held_name, log_name, seal_key_name, signed_digest,
-};
+use crate::wire::{ChunksBody, EpochId, GrantAsk, grant_name, held_name, log_name, seal_key_name};
 
 /// The pause before asking again for something after `misses` asks for it
 /// missed in a row: this long, doubled each time, at most [`REFRESH_PAUSE_MAX`].
@@ -332,7 +330,7 @@ impl Asks {
         device: &Name,
         seq: u64,
         probe: bool,
-        digest: Option<[u8; 32]>,
+        digest: Option<Pin>,
         now: Instant,
         next: &mut Option<Duration>,
     ) -> Option<Launch> {
@@ -381,7 +379,7 @@ struct Launch {
     probe: bool,
     /// The signed digest the bytes must have (a removal cut names its
     /// entries by it): other bytes are not handed to the log.
-    digest: Option<[u8; 32]>,
+    digest: Option<Pin>,
 }
 
 /// What a restarting device's wait for its own entries came to.
@@ -479,7 +477,7 @@ impl Group {
         let probes = self.probes();
 
         let mut per: BTreeMap<Name, Vec<(u64, u64)>> = BTreeMap::new();
-        let mut exact: BTreeMap<(Name, u64), [u8; 32]> = BTreeMap::new();
+        let mut exact: BTreeMap<(Name, u64), Pin> = BTreeMap::new();
         let wants = host.missing(space);
         for want in &wants {
             match want.digest {
@@ -560,7 +558,7 @@ impl Group {
         // bytes: others are not handed to the log, and the next source is
         // asked.
         let wire = wire.filter(|_| !self.stop.is_cancelled()).filter(|wire| {
-            let right = launch.digest.is_none_or(|want| signed_digest(wire) == want);
+            let right = launch.digest.is_none_or(|pin| pin.accepts(wire));
             if !right {
                 tracing::debug!(%name, "not the bytes the cut keeps: the next source is asked");
             }

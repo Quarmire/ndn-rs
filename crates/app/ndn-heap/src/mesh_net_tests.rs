@@ -630,3 +630,91 @@ async fn a_late_device_reads_what_a_revocation_cut_keeps_below_a_counter_nobody_
     .await;
     assert_eq!(late.get(&n("/c")).await.unwrap(), None);
 }
+
+/// The owner re-admits one entry a revocation cut left out, by its name and digest: every node
+/// that refused it takes it back, its writer serves it again, and a device that never got it
+/// reads it. Nothing is offered again by anyone: the new context version is the whole news.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entry_the_owner_readmits_by_name_and_digest_returns_to_every_node() {
+    let m = mesh(&["/alice/laptop", "/alice/phone", "/alice/tablet"]).await;
+    let (laptop, phone) = (m.boot(0, fast()).await, m.boot(1, fast()).await);
+    let mine = laptop.create(&space(), public()).await.unwrap();
+    let theirs = phone.open(&space()).await.unwrap();
+    eventually("the phone holds the space", || async { theirs.ready() }).await;
+    theirs
+        .put(&n("/a"), bytes("one"), durable(false))
+        .await
+        .unwrap();
+    eventually("the laptop holds the phone's entry", || async {
+        has(&mine, "/a", "one").await
+    })
+    .await;
+
+    // The cut keeps what the laptop holds; the phone writes once more, which it leaves out.
+    let key = m.devs[1].name.clone().append("KEY").append("1");
+    let bound = CutBound {
+        held_before: Some(Timestamp(u64::MAX / 2)),
+        ..CutBound::default()
+    };
+    let proposal = laptop.revocation_cut(&key, &bound).unwrap();
+    theirs
+        .put(&n("/c"), bytes("three"), durable(false))
+        .await
+        .unwrap();
+    let adopt = |version: u64, cut: ndn_security::RevocationCut| {
+        for dev in &m.devs {
+            for packet in &proposal.manifest {
+                let data = ndn_packet::Data::decode(packet.clone()).unwrap();
+                dev.validator.cut_manifests().insert(&data).unwrap();
+            }
+            let held = dev
+                .validator
+                .keyring()
+                .contexts()
+                .into_iter()
+                .find(|c| *c.namespace() == n("/alice"))
+                .expect("the namespace's context");
+            let next = ndn_security::SignedTrustContext::hierarchical(n("/alice"))
+                .with_version(version)
+                .with_revocation(key.clone())
+                .with_revocation_cut(cut.clone());
+            for anchor in held.anchors().iter() {
+                next.add_anchor(anchor.value().clone());
+            }
+            dev.validator
+                .keyring()
+                .adopt_update(Arc::new(next))
+                .expect("adopted");
+        }
+    };
+    adopt(2, proposal.cut.clone());
+    eventually("the laptop refuses what the cut leaves out", || async {
+        matches!(mine.get(&n("/c")).await, Ok(None))
+    })
+    .await;
+    eventually(
+        "the phone lists its own entry as refused by the revocation",
+        || async { !phone.refused_by_revocation(&key).is_empty() },
+    )
+    .await;
+    let full = phone.refused_by_revocation(&key).remove(0);
+
+    let mut cut = proposal.cut.clone();
+    assert!(cut.readmit(full).unwrap());
+    adopt(3, cut);
+    eventually("the laptop reads the re-admitted entry", || async {
+        has(&mine, "/c", "three").await
+    })
+    .await;
+    eventually("its writer takes it back too", || async {
+        has(&theirs, "/c", "three").await
+    })
+    .await;
+    // A device of the owner that never held it asks for the exact packet the cut names.
+    let tablet = m.boot(2, fast()).await;
+    let late = tablet.open(&space()).await.unwrap();
+    eventually("a device that never held it reads it", || async {
+        has(&late, "/a", "one").await && has(&late, "/c", "three").await
+    })
+    .await;
+}

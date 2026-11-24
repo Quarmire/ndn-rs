@@ -886,6 +886,16 @@ impl Log {
         self.settle(&mut fx);
         fx
     }
+
+    /// The judge now accepts a held entry that was refused (a cut re-admitted it, or a
+    /// certificate arrived): it is judged again as when another copy of it verifies, and returns
+    /// to the register or the fold if nothing else refuses it.
+    pub(crate) fn reinstate(&mut self, device: &Name, seq: u64) -> Effects {
+        let mut fx = Effects::default();
+        self.reassess(device, seq, Rejudge::Verified, &mut fx);
+        self.settle(&mut fx);
+        fx
+    }
 }
 
 /// An alert for a refusal the host should see.

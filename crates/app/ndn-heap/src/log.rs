@@ -88,8 +88,8 @@ use crate::seal::{self, Keys};
 use crate::store::{self, Batch, Kind, Link, Marker};
 use crate::trust::Verified;
 use crate::wire::{
-    self, Body, Entry, EntryRef, EpochId, Payload, PutBody, log_name, parse_space_name,
-    signed_digest,
+    self, Body, Entry, EntryRef, EpochId, Payload, PutBody, implicit_digest, log_name,
+    parse_space_name, signed_digest,
 };
 
 mod admit;
@@ -127,9 +127,29 @@ pub(crate) struct Params {
     pub block: u64,
 }
 
+/// The bytes a [`Want`] pins down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pin {
+    /// The packet whose signed region has this digest.
+    Signed([u8; 32]),
+    /// The packet with this implicit digest (SHA-256 of its whole encoding): how an owner names
+    /// one entry it re-admits.
+    Implicit([u8; 32]),
+}
+
+impl Pin {
+    /// Whether `wire` is the packet this pins down.
+    pub(crate) fn accepts(&self, wire: &Bytes) -> bool {
+        match self {
+            Pin::Signed(digest) => signed_digest(wire) == *digest,
+            Pin::Implicit(digest) => implicit_digest(wire) == *digest,
+        }
+    }
+}
+
 /// An entry the log wants fetched. `first..=last` of `device` when `digest`
-/// is `None`; the one entry `first` with exactly these signed bytes when it
-/// is set (a removal cut names it).
+/// is `None`; the one entry `first` with exactly these bytes when it is set
+/// (a removal cut names it, or the owner re-admits it).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Want {
     /// The device whose entries.
@@ -138,8 +158,8 @@ pub(crate) struct Want {
     pub first: u64,
     /// The last seq.
     pub last: u64,
-    /// The signed-region digest the bytes must have, when a cut names it.
-    pub digest: Option<[u8; 32]>,
+    /// The bytes it must have, when a cut names them.
+    pub digest: Option<Pin>,
 }
 
 /// An own entry to publish.
@@ -769,8 +789,15 @@ impl Log {
     /// The entries a revocation cut keeps (`runs` of `(device, first, last)` seqs, from
     /// [`Judge::cut_runs`](crate::trust::Judge::cut_runs)) that are neither held nor declared
     /// void: wanted as any hole is, whatever counter was heard of the device, since the cut is
-    /// signed by the namespace's root and lists exactly what to take.
-    pub(crate) fn cut_wants(&self, runs: &[(Name, u64, u64)]) -> Vec<Want> {
+    /// signed by the namespace's root and lists exactly what to take. The entries it re-admits
+    /// one by one (`exact`, from [`Judge::cut_exact`](crate::trust::Judge::cut_exact)) are wanted
+    /// by the bytes it names unless a packet with those bytes is held already (a held entry
+    /// refused for the cut is judged again when the cut arrives, not asked for).
+    pub(crate) fn cut_wants(
+        &self,
+        runs: &[(Name, u64, u64)],
+        exact: &[(Name, u64, [u8; 32])],
+    ) -> Vec<Want> {
         let mut out = Vec::new();
         for (device, first, last) in runs {
             let gaps = match self.devices.get(device) {
@@ -787,6 +814,21 @@ impl Log {
                         digest: None,
                     });
                 }
+            }
+        }
+        let view = self.view();
+        for (device, seq, digest) in exact {
+            let held = view
+                .wires_at(device, *seq)
+                .iter()
+                .any(|wire| implicit_digest(wire) == *digest);
+            if !held {
+                out.push(Want {
+                    device: device.clone(),
+                    first: *seq,
+                    last: *seq,
+                    digest: Some(Pin::Implicit(*digest)),
+                });
             }
         }
         out
@@ -850,7 +892,7 @@ fn frontier_wants(device: &Name, kept: &Kept) -> Vec<Want> {
             device: device.clone(),
             first: f.seq,
             last: f.seq,
-            digest: Some(f.digest),
+            digest: Some(Pin::Signed(f.digest)),
         })
         .collect()
 }

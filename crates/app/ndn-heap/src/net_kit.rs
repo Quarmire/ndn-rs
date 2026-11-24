@@ -537,7 +537,7 @@ impl Host for Toyhost {
                     device: device.clone(),
                     first: *seq,
                     last: *seq,
-                    digest: Some(*digest),
+                    digest: Some(crate::log::Pin::Signed(*digest)),
                 });
             }
         }

@@ -383,12 +383,9 @@ async fn a_removed_writers_entry_inside_the_cut_is_kept_and_outside_it_refused()
     // The tip first: it is the entry the cut names, so it is kept; what it
     // chains to is wanted.
     let a = r.applied(&p2);
-    assert!(
-        a.effects
-            .wants
-            .iter()
-            .any(|w| w.device == p2.dev.name && w.first == 1 && w.digest == Some(p1.digest))
-    );
+    assert!(a.effects.wants.iter().any(|w| {
+        w.device == p2.dev.name && w.first == 1 && w.digest == Some(Pin::Signed(p1.digest))
+    }));
     r.applied(&p1);
     let a = r.admit(&p3);
     assert!(matches!(
@@ -1498,7 +1495,7 @@ async fn a_cut_whose_chain_is_not_whole_is_walked_again_after_a_restart() {
         device: bob().name,
         first: p.seq,
         last: p.seq,
-        digest: Some(p.digest),
+        digest: Some(Pin::Signed(p.digest)),
     };
     for mut again in [r, open_on(&image, &me)] {
         assert!(again.log.missing().contains(&want(&p2)));
@@ -2182,4 +2179,35 @@ async fn a_member_cannot_make_the_ledger_grow_without_bound_by_fragmenting_its_r
     // An entry that extends the last run starts no fragment.
     let top = 2 * chain::RANGES_MAX as u64;
     r.applied(&gap_entry(&bob(), top + 1, prev, top, "x"));
+}
+
+/// A cut that re-admits an entry by its name and digest has it wanted by the bytes it names,
+/// the implicit digest of the packet, until a packet with those bytes is held; other bytes at
+/// the name do not satisfy it.
+#[tokio::test]
+async fn an_entry_a_cut_readmits_is_wanted_by_its_implicit_digest_until_held() {
+    let me = laptop();
+    let mut r = rig(&me);
+    r.members(members(Some(true), vec![add(1, "/bob", Role::Writer)]))
+        .await;
+    let mut b = Chain::new(&bob());
+    let p1 = b.put("/p1", "1");
+    let named = implicit_digest(&p1.wire);
+    let want = |digest: [u8; 32]| Want {
+        device: bob().name,
+        first: 1,
+        last: 1,
+        digest: Some(Pin::Implicit(digest)),
+    };
+    assert_eq!(
+        r.log.cut_wants(&[], &[(bob().name, 1, named)]),
+        vec![want(named)]
+    );
+    r.applied(&p1);
+    assert_eq!(r.log.cut_wants(&[], &[(bob().name, 1, named)]), vec![]);
+    assert_eq!(
+        r.log.cut_wants(&[], &[(bob().name, 1, [7; 32])]),
+        vec![want([7; 32])],
+        "other bytes at the name are not the ones the cut names"
+    );
 }

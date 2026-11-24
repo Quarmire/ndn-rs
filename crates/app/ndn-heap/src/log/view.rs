@@ -186,4 +186,25 @@ impl Log {
             });
         }
     }
+
+    /// The names of the entries held of `person`'s devices that are refused for what a later
+    /// cut or trust context can change (outside a cut, or not trusted): the ones a re-admission
+    /// may let in.
+    pub(crate) fn refused_names(&self, person: &Name) -> Vec<Name> {
+        let view = self.view();
+        let mut out = Vec::new();
+        for (device, dev) in self.devices.iter().filter(|(_, d)| d.person == *person) {
+            for seq in dev.held.seqs() {
+                if matches!(
+                    view.status(device, seq),
+                    Some(Status::Refused(
+                        Refusal::OutsideCut(_) | Refusal::Untrusted { .. }
+                    ))
+                ) {
+                    out.push(log_name(device, &self.space, seq));
+                }
+            }
+        }
+        out
+    }
 }
