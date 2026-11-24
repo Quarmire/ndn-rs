@@ -29,7 +29,8 @@ fn devices() -> [Name; 2] {
 
 /// The grant name of a device `granter` for `space`'s epoch, asked by `reader`'s seal key.
 fn grant(granter: &str, space: &Name) -> Name {
-    let packet = DataBuilder::new(seal_key_name(&n("/alice/member/phone"), &[3; 32]), b"key").build();
+    let packet =
+        DataBuilder::new(seal_key_name(&n("/alice/member/phone"), &[3; 32]), b"key").build();
     let ask = GrantAsk::new(
         space.clone(),
         EpochId {
@@ -78,7 +79,10 @@ fn the_spaces_entries_cross_and_no_other_space_does() {
                 !folder_carries(&space, &entry),
                 "an entry of {outside} crossed the link of {space}"
             );
-            assert!(!folder_carries(&space, &piece_name(&entry, PieceKind::Chunk(1))));
+            assert!(!folder_carries(
+                &space,
+                &piece_name(&entry, PieceKind::Chunk(1))
+            ));
         }
     }
 }
@@ -96,7 +100,10 @@ fn names_that_are_no_name_of_the_layer_or_no_spaces_carry_nothing() {
         n("/alice/32=data/notebook"),
         n("/"),
     ] {
-        assert!(!folder_carries(&space, &name), "{name} crossed a space's link");
+        assert!(
+            !folder_carries(&space, &name),
+            "{name} crossed a space's link"
+        );
     }
     // A grant for no space carries nothing.
     let entry = log_name(&device, &space, 1);
@@ -125,13 +132,19 @@ fn held_copies_and_grants_are_judged_by_the_name_they_are_about() {
     assert!(!folder_carries(&space, &thrice));
 
     // A grant, by the space whose epoch key it is, to a device of the owner's namespace.
-    assert!(folder_carries(&space, &grant("/alice/member/laptop", &space)));
+    assert!(folder_carries(
+        &space,
+        &grant("/alice/member/laptop", &space)
+    ));
     assert!(!folder_carries(
         &space,
         &grant("/alice/member/laptop", &n("/alice/32=data/diary"))
     ));
     // The name of a grant of another form is no grant.
-    assert!(!folder_carries(&space, &n("/alice/member/laptop/32=grant/not-an-ask")));
+    assert!(!folder_carries(
+        &space,
+        &n("/alice/member/laptop/32=grant/not-an-ask")
+    ));
 }
 
 #[test]

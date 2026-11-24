@@ -64,6 +64,8 @@ mod join_kit;
 #[cfg(test)]
 mod join_tests;
 #[cfg(test)]
+mod mirror_tests;
+#[cfg(test)]
 mod offer_tests;
 #[cfg(test)]
 mod policy_tests;
@@ -73,6 +75,8 @@ mod proofs_tests;
 mod short_tests;
 #[cfg(test)]
 mod store_tests;
+#[cfg(test)]
+mod surface_tests;
 #[cfg(test)]
 mod wire_tests;
 
