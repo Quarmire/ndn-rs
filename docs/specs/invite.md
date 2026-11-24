@@ -1557,7 +1557,10 @@ Rules for a host that implements `Host::dial`, `Host::dial_first` or carries a j
 
 Implementations: ndn-link's `LinkHints::dial` and `LinkHints::dial_first` pass `introduction_prefixes(inviter)` as the link's routes
 (ndn-link `src/hints.rs`, over `Links::dial_by_key` and `Links::dial_first`); the conformance stand-in host does it explicitly; the
-daemon's `DaemonIntroducer` (stage 6) does not, and a join through it ends in `NotReady` at the offer fetch until it does.
+`ndn-heap` tool (`ndn-fwd`, a host with no link layer, so no `dial` call) asks its daemon to carry the two prefixes in transit
+(`security/transit`, mgmt-trust.md "Transit") for the length of each `join` verb, naming the inviter by `Invites::inviter_of(code)` (the
+device a code names, read as `join` reads it, with nothing dialled or asked): a host with no dial has no other call before the first
+Interest.
 
 ## 13. The introduction surface and the folder scope
 

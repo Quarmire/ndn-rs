@@ -234,6 +234,20 @@ impl Invites {
     pub async fn join(&self, code: &str) -> Result<Joined, InviteError> {
         self.inner.join_by(code).await
     }
+
+    /// The inviter's device a code names (the offer's device of a link or words code, a
+    /// short code's device), read as [`join`](Self::join) reads it and with nothing dialled
+    /// or asked. A host whose forwarder holds no trust of the inviter yet carries
+    /// [`introduction_prefixes`](crate::introduction_prefixes) of this device in transit
+    /// (spec §12.1) from before the join's first Interest and releases them when the join
+    /// ends.
+    ///
+    /// # Errors
+    ///
+    /// [`InviteError::BadRequest`] for a code that does not read, as `join` answers it.
+    pub fn inviter_of(&self, code: &str) -> Result<Name, InviteError> {
+        parse_code(code, self.inner.policy.local_candidates).map(|parsed| parsed.device)
+    }
 }
 
 impl Inner {

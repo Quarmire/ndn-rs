@@ -622,3 +622,24 @@ async fn the_offer_is_asked_for_fresh_so_that_no_cache_answers_a_damaged_copy_ag
     }
     cancel.cancel();
 }
+
+/// A host that has to carry the inviter's introduction prefixes before the first
+/// Interest learns the inviter from the code alone, in each of its forms: the link, the
+/// words, and a code that is none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_inviter_of_a_code_is_read_without_dialling_or_asking() {
+    let gate = Gate::new();
+    let (offered, phone, cancel) = on_a_net(Role::Writer, &gate).await;
+    let laptop = n("/alice/laptop");
+    assert_eq!(
+        phone.invites.inviter_of(&offered.code.link),
+        Ok(laptop.clone())
+    );
+    assert_eq!(phone.invites.inviter_of(&offered.code.words), Ok(laptop));
+    let garbage = phone.invites.inviter_of("this is no code");
+    assert!(
+        matches!(garbage, Err(InviteError::BadRequest { .. })),
+        "a text that is no code gave {garbage:?}"
+    );
+    cancel.cancel();
+}
