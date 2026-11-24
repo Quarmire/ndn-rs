@@ -1446,7 +1446,13 @@ An update `(D, high)` of a group is handled so:
    alone, `FETCH_TRIES` (3) asks and then asks after a pause that climbs from 4 s,
    doubling, to a minute (a real entry the path lost several asks in a row comes within a
    minute; a forged counter's steady cost is one ask a minute); the holes below it are
-   wanted once it is held and verified. This device's own counter is told
+   wanted once it is held and verified. **The ladder belongs to the device**: a
+   higher counter changes the entry the probe names and never its pauses, there is one
+   probe at a time per device, and at most 8 (`PROBES_MAX`) of a group are in flight
+   (the devices with the fewest misses first, vouched ones before strangers, then by name), so
+   counters that rise at every Sync Interest cost one ladder each, not an ask each.
+   A probe that is answered ends the ladder: the device's next counter is asked at
+   once. This device's own counter is told
    (`note_own_counter`: `UnbackedCounter` above the head, and the entries within
    `R` wanted). A device nothing vouches for yet costs the same one probe; the
    log hears its entry only once admitted.
@@ -1475,8 +1481,12 @@ re-expression or missed, at least 250 ms (a forwarder holds back a fresh-nonce
 Interest from the same face for about that long), at most the lifetime, and
 doubled again at each re-expression of one ask. A Nack with reason Congestion
 is asked again by the consumer after a
-short jittered pause. The node has `Config.in_flight` (256) slots for asks of
-every kind; an ask waits for one at most one lifetime and is then a miss.
+short jittered pause. The node has `Config.in_flight` (256) slots for asks, shared by
+kind so that nobody's asks starve the others': the asks of the wanted entries and
+pieces (**walks**) hold at most three quarters of them, one device's walks at most
+half; the probes (§7.2) at most an eighth; a grant pull and a seal key fetched for
+one (**pulls**) take from what is left, so they find a slot whoever floods the
+walks. An ask waits for its slots at most one lifetime and is then a miss.
 
 A **miss** is: nothing answered in time; a Congestion Nack that asking again
 soon did not mend; a packet refused as not genuine (a forwarder's
@@ -1496,19 +1506,35 @@ a restart, a lost packet or a refusal changes nothing about what is owed.
   §3.6). A heard counter adds nothing here (it is unsigned): the entry it names
   is probed alone (§7.3), and only once it is held and verified are the holes
   below it wanted. Entries inside a declared void are **never asked for**; an
-  undeclared hole costs misses until a later entry declares it, bounded by
-  `reserve_block`. For this device the heard counter is also believed up to
-  `R` (what an earlier run could have signed), `(head, min(seen, R)]`.
+  undeclared hole of another device is asked a block at a time: the seq below a hole
+  is held or void, so only the first `reserve_block` seqs of each hole are asked,
+  that is at most `reserve_block` above what is held, and the next ones once those
+  are held (the hole's start moves up) or a later entry declares the rest void. A
+  device that signs an entry at seq 10^9 and nothing between therefore costs a
+  few asks (its window), never the walk of 10^9 seqs. For this device the heard
+  counter is also believed up to `R` (what an earlier run could have signed),
+  `(head, min(seen, R)]`.
   The prefix a device is held to is the largest `n` with every seq of `1..n`
   held or void.
 - **The exact entries** a removal cut names that are not held, by their
   signed-region digest (§3.8): the bytes must be those.
-- **Windowing.** At most `Config.window` (128) asks of one device are in flight;
-  they go in seq order, the entry at the highest seq first and alone while it is
-  not held (§7.3). The window is sized for a path of over a second's round trip that
-  loses a third of its asks: 1,200 owed entries are held within a minute of virtual
-  time there (with 32 they took 87 s), what a reader of an entry-per-save writer (o4)
-  needs to keep up.
+- **Windowing.** The asks of one device in flight, or pausing after a miss, are at most
+  its **window**, which the node keeps per device (not per space or value: the asks of
+  every space and every value in pieces count against it). It starts at 16, grows by
+  one for every ask answered (it doubles each round), is at most `Config.window` (128)
+  and half of `Config.in_flight`, and halves, to at least 2, after a round (as many
+  asks answered or timed out as the window is wide) in which more asks timed out than
+  were answered. Loss is not silence: a path that loses a third of its asks answers
+  more than it misses and keeps its window, so 1,200 owed entries over a path of over
+  a second's round trip that loses a third of its asks are still held within a minute
+  of virtual time (with a window of 32 they took 87 s), what a reader of an
+  entry-per-save writer (o4) needs to keep up; a device that answers nothing is down to
+  2 after a few rounds, however many seqs lie below its newest entry. A Nack, or a
+  reply that is not genuine, counts neither way. An ask that missed holds its place in
+  the window while it pauses (until it has missed 16 times in a row, when it waits a
+  minute at a time and holds a place only while asked), so the walk does not slide on
+  over the seqs nothing answers. The asks go in seq order, the entry at the highest
+  seq first and alone while it is not held (§7.3).
 - **Own entries** are wanted only up to `4 × reserve_block` above the own head
   (§4.8).
 - **Sources.** The ask goes to the **writer** by its own name; after a miss to
@@ -1624,6 +1650,17 @@ per peer, and what is announced is unchanged: a counter names an entry to be
 fetched and judged, never a head (D17), so an absent peer or a forged counter
 costs a bounded handful of Sync Interests per change, never one per period.
 
+What ends the announcing early is not signed, and that is a **bounded residual**: any
+requester of the newest entry (an Interest names no sender) or a vector that carries
+this device's counter (a Sync Interest is unsigned) stops it after the three
+announcements made whatever is seen. A stranger can thus cut a change's re-announcing
+to three; a lost notice is then heard at the group's next period, a delay and never
+a wrong state (a counter names an entry to be fetched and judged, D17). No signed signal
+closes it: the only evidence of a peer holding the entry that a peer signs is an entry
+of its own that supersedes this one on the same path (`after`), which most puts never
+get, so waiting for it would make every put announce eight times to save a stranger
+three.
+
 It hails, in a form the faulty runs of the conformance suite (`p1` at seed 1)
 required. A device that joins a group announces itself at once, and a peer that
 is ahead answers with its vector; both Sync Interests must cross the link, and
@@ -1652,10 +1689,22 @@ nothing a node does; the `put_watch` example records them (§13.8).
   list of at most 64 names per group, vouched-for devices never displaced, and,
   per device, one entry probed alone: `FETCH_TRIES` (3) asks, then asks after a pause
   climbing from 4 s, doubling, to a minute (liveness: an honest writer away still comes;
-  a forged counter's steady cost is one ask a minute). It raises no head, no
+  a forged counter's steady cost is one ask a minute, however often it rises: the
+  ladder is the device's, not the counter's, §7.2). At most 8 probes of a group are in
+  flight and at most an eighth of the node's slots hold probes, so counters that rise
+  at every Sync Interest of 64 names (M2) take no slot an owed ask or a grant pull
+  waits for. It raises no head, no
   want and no head of `ready()` (a counter wants nothing of the log: M4), ends
   no ask (D17, §4.8), and cannot flip `put`'s `durable` default (`no_peers` is
   decided by vouched devices in the log, not by the unsigned vector).
+- **One device pins the slots (M3).** A writer's device that signs an entry at a huge
+  seq with no gap statement, and answers nothing, leaves a hole of that size that
+  every member is owed. What is asked of it is its window (starts at 16, down to 2
+  while nothing answers, §7.4), the first `reserve_block` seqs of the hole only, at
+  most half of the node's slots whatever the spaces, and the asks that missed keep
+  their place in the window instead of letting the walk slide on. The same holds for
+  pieces nothing serves (they take the device's window and slots). A grant pull, a
+  seal key and the probe of a device not asked yet find a slot (§7.3).
 - **Strangers' entries (L7).** A device certified in a held context that is no
   member has at most one refused entry stored and one alert per device: a
   probe of it (`Host::take(.., probe = true)`) is neither stored nor told when
@@ -1721,8 +1770,10 @@ limit `PAYLOAD_MAX`).
 A reader gathers the pieces of one value with these rules:
 
 1. It asks for the **manifest nodes first** (each unlocks up to 128 more), then
-   chunks in order, at most `Config.window` (128) at a time, from the writer and
-   then the heard members (§7.4); the root's digest is the entry's `ROOT`.
+   chunks in order, at most the writer's window (§7.4: it starts at 16 and is at most
+   `Config.window` (128); the asks of the values gathered at once, up to 4, share it)
+   at a time, from the writer and then the heard members (§7.4); the root's digest is
+   the entry's `ROOT`.
 2. It names and accepts a piece **only** if its parent, already held, lists its
    implicit digest, its name is the piece's, a node lists as many digests as its
    place in the tree holds and a chunk has as many octets as its place holds. A
@@ -2120,8 +2171,8 @@ protocol that frames them like an entry); a run header is signed by
 | `clock` | the system clock, ms since the Unix epoch | the time of a marker's `at` and of a cut bound; display only (§1.4) |
 | `lifetime` | 4 s (the NDN default) | Interest lifetime of every fetch: the budget of an ask, within which its Interests are expressed again and a late reply to any of them answers (§7.3); under the faulty profile (round trips of up to 3 s) 2 s misses a reply that was on its way |
 | `first_look` | 4 s | how long a removal looks for entries heard of and not yet held (§5.6) |
-| `window` | 128 | asks of one device in flight (§7.4) |
-| `in_flight` | 256 (at least `window`) | asks of the whole node in flight (§7.3) |
+| `window` | 128 | the most asks of one device in flight, node-wide, whatever space or value they are for; at most half of `in_flight`; it starts at 16 and follows what the device answers (§7.4) |
+| `in_flight` | 256 (at least `window`) | asks of the whole node in flight, by kind: walks at most three quarters, probes an eighth (§7.3) |
 | `settle` | 1 s | the wait for the first group vector at an unclean start (§4.8) |
 | `reserve_block` | 1,024 | seqs one durable reservation covers (§4.5) |
 | `watch_queue` | 4,096 (at least 1) | changes a watcher may leave unread before it lags (§10.4) |
