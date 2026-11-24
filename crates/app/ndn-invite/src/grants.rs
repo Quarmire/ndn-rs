@@ -47,7 +47,7 @@ use crate::notes::{
 };
 use crate::policy::IntroPolicy;
 use crate::store;
-use crate::wire::{IntroRecord, OfferId, offer_name, parse_offer_name};
+use crate::wire::{OfferId, offer_name, parse_offer_name};
 
 /// Departure marks one device lets be taken (`Surface::take_departure`) in a minute: a
 /// hostile inviter's stream of `Departure` messages costs this many fetches a minute,
@@ -115,6 +115,9 @@ pub(crate) struct Grants {
     departing: Mutex<BTreeSet<Name>>,
     /// When the departure takes of the last minute began.
     departures_begun: Mutex<VecDeque<Timestamp>>,
+    /// The `(key, space)` of each grant the host holds from this device in this run: a
+    /// live grant not in it (its space was not known at start) is told when it stands.
+    told: Mutex<BTreeSet<([u8; 32], Name)>>,
 }
 
 /// A take of a space's departure entry under way, let go as it is dropped.
@@ -149,6 +152,7 @@ impl Grants {
             joined_seen: Mutex::new(Vec::new()),
             departing: Mutex::new(BTreeSet::new()),
             departures_begun: Mutex::new(VecDeque::new()),
+            told: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -157,7 +161,7 @@ impl Grants {
     /// `Change::Members` of one, and every half sync interval, judges them all.
     pub(crate) fn start(self: &Arc<Self>) {
         for grant in self.live_grants() {
-            self.host.grant(&grant);
+            self.tell(&grant);
         }
         for departure in self.live_departures() {
             self.host.departure(&departure);
@@ -179,6 +183,25 @@ impl Grants {
 
     fn store(&self) -> &Arc<dyn DataStore> {
         self.node.store()
+    }
+
+    /// Tell the host of `grant`, and remember it was told in this run.
+    fn tell(&self, grant: &Grant) {
+        self.told.lock().insert((grant.key, grant.folder.clone()));
+        self.host.grant(grant);
+    }
+
+    /// Whether the host was told of the grant of `key` for `space` in this run.
+    fn was_told(&self, key: &[u8; 32], space: &Name) -> bool {
+        self.told.lock().contains(&(*key, space.clone()))
+    }
+
+    /// Whether `space` is public (its members list everybody as a reader), as the
+    /// members here say.
+    fn is_public(&self, space: &Name) -> bool {
+        self.node
+            .space(space)
+            .is_some_and(|heap| heap.members().readers == Readers::Anyone)
     }
 
     /// Every grant note kept that this device reads, held here or not. One that fails
@@ -224,13 +247,8 @@ impl Grants {
         let Some((_, id)) = parse_offer_name(&note.offer) else {
             return false;
         };
-        let Some(mark) = self.store().get(&store::used_key(&id)) else {
-            return false;
-        };
-        matches!(
-            IntroRecord::decode(mark),
-            Ok(IntroRecord::Used(used)) if used.by.as_ref().is_some_and(|(_, digest)| *digest == note.key)
-        )
+        crate::marks::used_digest(self.store().as_ref(), self.node.recipient(), &id)
+            == Some(note.key)
     }
 
     /// Every mirror note kept that this device reads, ended or not. One that fails its
@@ -432,7 +450,9 @@ impl Grants {
     }
 
     async fn watch(weak: &Weak<Grants>, heap: &Heap) -> Result<(), InviteError> {
-        let mut changes = heap.watch(&Frontier::new()).await?;
+        // From everything held now: the members change is what is wanted, not a replay of
+        // every head (and a read of every value in pieces) of a space at each start.
+        let mut changes = heap.watch(&Frontier::everything()).await?;
         // What changed before the watch was subscribed is judged now: nothing of the
         // members' history is missed between a grant and the first change told.
         match weak.upgrade() {
@@ -478,7 +498,7 @@ impl Grants {
     /// The person's grants of other spaces are not touched. Called with the notes held.
     async fn judge_inviter_notes(&self) {
         let now = self.node.now();
-        let (mut ending, mut retold) = (Vec::new(), Vec::new());
+        let (mut ending, mut retold, mut installing) = (Vec::new(), Vec::new(), Vec::new());
         for note in self.used_grants().into_iter().filter(|note| !note.ended) {
             match self.standing(&note.namespace, &note.space) {
                 Standing::Out => {
@@ -486,6 +506,13 @@ impl Grants {
                     ending.push(GrantNote { departure, ..note });
                 }
                 Standing::In(role) if role != note.role => retold.push(GrantNote { role, ..note }),
+                // A grant that stands and the host was not told of in this run: its space
+                // was not known when the invitations started.
+                Standing::In(_)
+                    if !note.dated_out(now) && !self.was_told(&note.key, &note.space) =>
+                {
+                    installing.push(note);
+                }
                 Standing::In(_) | Standing::Unknown => {}
             }
         }
@@ -498,6 +525,7 @@ impl Grants {
                 self.host.departure(&departure);
             }
             self.host.revoke_grant(&note.key, &note.space);
+            self.told.lock().remove(&(note.key, note.space.clone()));
             note.ended = true;
             if let Err(why) = self.keep_grant(&note).await {
                 tracing::debug!(offer = %note.offer, %why, "the end of a grant was not durable; the next judgement ends it again");
@@ -506,12 +534,16 @@ impl Grants {
             tracing::info!(offer = %note.offer, space = %note.space, namespace = %note.namespace, record = ?note.departure.as_ref().map(|m| m.record.to_string()), "the space's members leave the person out: its grant to link ended");
         }
         for note in retold {
-            self.host.grant(&note.grant());
+            self.tell(&note.grant());
             if let Err(why) = self.keep_grant(&note).await {
                 tracing::debug!(offer = %note.offer, %why, "a grant's new role was not durable; the next judgement tells it again");
                 continue;
             }
             tracing::info!(offer = %note.offer, space = %note.space, namespace = %note.namespace, role = ?note.role, "the space's members change the person's role: its grant to link now bears it");
+        }
+        for note in installing {
+            self.tell(&note.grant());
+            tracing::info!(offer = %note.offer, space = %note.space, namespace = %note.namespace, "the space is known and lists the person: its grant to link is installed");
         }
     }
 
@@ -527,7 +559,7 @@ impl Grants {
     /// Space not open here: nothing is done (nothing to judge by). Called with the notes
     /// held.
     async fn judge_mirrors(&self) {
-        let (mut ending, mut retold) = (Vec::new(), Vec::new());
+        let (mut ending, mut retold, mut installing) = (Vec::new(), Vec::new(), Vec::new());
         for note in self.mirror_notes().into_iter().filter(|note| !note.ended) {
             match self.mirror_standing(&note) {
                 MirrorStanding::Out => ending.push(note),
@@ -537,11 +569,15 @@ impl Grants {
                         ..note
                     });
                 }
+                MirrorStanding::In { .. } if !self.was_told(&note.key, &note.space) => {
+                    installing.push(note);
+                }
                 MirrorStanding::In { .. } | MirrorStanding::Unknown => {}
             }
         }
         for mut note in ending {
             self.host.revoke_grant(&note.key, &note.space);
+            self.told.lock().remove(&(note.key, note.space.clone()));
             note.ended = true;
             self.store().apply(vec![self.mirror_op(&note)]);
             // Published before the flush: the routes follow the memory.
@@ -553,12 +589,15 @@ impl Grants {
             tracing::info!(space = %note.space, owner = %note.owner, "the space's members leave this device out: the inviter's mirror grant to link ended");
         }
         for note in retold {
-            self.host.grant(&note.grant());
+            self.tell(&note.grant());
             if let Err(why) = self.keep_mirror_note(&note).await {
                 tracing::debug!(space = %note.space, %why, "a mirror grant's new role was not durable; the next judgement tells it again");
                 continue;
             }
             tracing::info!(space = %note.space, owner = %note.owner, role = ?note.role, "the space's members change the inviter's role: its mirror grant to link now bears it");
+        }
+        for note in installing {
+            self.tell(&note.grant());
         }
     }
 
@@ -604,6 +643,12 @@ impl Grants {
         space: &Name,
         role: Role,
     ) -> Option<(StoreOp, PendingGrant)> {
+        if role == Role::Reader && self.is_public(space) {
+            // Nobody is listed as a reader of a public space, so no entry could take this
+            // grant away: it would be a link slot nothing but the host ends.
+            tracing::info!(%space, %namespace, "a Reader of a public space is admitted and granted no link: everybody reads it, and no members' change could end the grant");
+            return None;
+        }
         let until = match self.policy.grant_for {
             Some(d) if d.is_zero() => return None,
             Some(d) => {
@@ -629,7 +674,7 @@ impl Grants {
     /// Tell the host of the grant a durable admission made, and begin to follow its
     /// space.
     pub(crate) fn granted(self: &Arc<Self>, pending: &PendingGrant) {
-        self.host.grant(&pending.note.grant());
+        self.tell(&pending.note.grant());
         self.follow(&pending.note.space);
     }
 
@@ -668,6 +713,13 @@ impl Grants {
             ended: false,
         };
         let note = match self.mirror_standing(&probe) {
+            MirrorStanding::In {
+                device: Role::Reader,
+                ..
+            } if self.is_public(space) => {
+                tracing::warn!(%space, "this device only reads a public space: no mirror grant is kept, as nothing could end it but the host");
+                return Ok(());
+            }
             MirrorStanding::In { entry, .. } => MirrorNote {
                 role: entry,
                 ..probe
@@ -678,7 +730,7 @@ impl Grants {
             }
         };
         self.keep_mirror_note(&note).await?;
-        self.host.grant(&note.grant());
+        self.tell(&note.grant());
         self.publish_joined();
         self.follow(space);
         tracing::info!(%space, %owner, role = ?note.role, "joined: the inviter may link back for this space");

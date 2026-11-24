@@ -1216,14 +1216,8 @@ async fn a_mark_added_cleared_or_moved_in_the_store_is_ignored() {
     .await;
 }
 
-/// Spec §10 rule 6, 7 (a public space): the members list no reader by being public, so a
-/// person's standing there is a writer's while the members list them, and a reader's
-/// otherwise unless an entry removed them. An entry that removes a writer ends the grant
-/// (the removal is what `Heap::removed_by` names, and the mark names it); a person who
-/// only reads a public space cannot be removed from it, and their grant stands.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_grant_of_a_public_space_ends_when_an_entry_removes_the_person() {
-    let alice = Inviter::new(Role::Writer, None).await;
+/// A public space Alice's laptop owns.
+async fn public_space(alice: &Inviter) -> Name {
     let open = n("/alice/32=data/open");
     alice
         .laptop()
@@ -1237,15 +1231,22 @@ async fn a_grant_of_a_public_space_ends_when_an_entry_removes_the_person() {
         )
         .await
         .unwrap();
+    open
+}
+
+/// Spec §10 rule 6, 7 (a public space): the members list no reader by being public, so a
+/// writer's standing there is the members' while they list them. An entry that removes a
+/// writer ends the grant (the removal is what `Heap::removed_by` names, and the mark names
+/// it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_of_a_public_space_ends_when_an_entry_removes_the_person() {
+    let alice = Inviter::new(Role::Writer, None).await;
+    let open = public_space(&alice).await;
     let bob_phone = phone_of("/bob").await;
-    let reader_phone = phone_of("/carol").await;
     alice.invites(&open, Role::Writer, &bob_phone).await;
-    alice.invites(&open, Role::Reader, &reader_phone).await;
     let grants = alice.laptop().invites.grants();
-    assert_eq!(grants.len(), 2, "{grants:?}");
-    let role_of = |key: [u8; 32]| grants.iter().find(|g| g.key == key).map(|g| g.role);
-    assert_eq!(role_of(key_of(&bob_phone)), Some(Role::Writer));
-    assert_eq!(role_of(key_of(&reader_phone)), Some(Role::Reader));
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    assert_eq!(grants[0].role, Role::Writer);
 
     alice.changes(&open, &[], &[], &["/bob"]).await;
     eventually("the writer's grant ends", || {
@@ -1262,11 +1263,62 @@ async fn a_grant_of_a_public_space_ends_when_an_entry_removes_the_person() {
         marks[0].record,
         crate::grants_kit::removal_of(alice.laptop(), &open, "/bob")
     );
-    let left = alice.laptop().invites.grants();
-    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(alice.laptop().invites.grants(), Vec::new());
+}
+
+/// Spec §10 rule 2 (a public space): a person who only reads a public space cannot be
+/// removed from it (everybody reads it, and no entry lists them), so a grant for them
+/// could not end by the members' change as the rule requires: a Reader's admission to a
+/// public space makes **no grant** (and no note), and the host is told nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_grant_of_a_public_space_ends() {
+    let alice = Inviter::new(Role::Writer, None).await;
+    let open = public_space(&alice).await;
+    let carol_phone = phone_of("/carol").await;
+    alice.invites(&open, Role::Reader, &carol_phone).await;
     assert_eq!(
-        left[0].key,
-        key_of(&reader_phone),
-        "the reader's grant of the public space stands"
+        alice.laptop().invites.grants(),
+        Vec::new(),
+        "a Reader of a public space was granted a link nothing can end"
     );
+    assert_eq!(alice.calls.granted(), Vec::new());
+    assert_eq!(grant_notes(&*alice.store), Vec::new());
+    // A Reader of a private space is granted, and the members' change ends it.
+    let dave_phone = phone_of("/dave").await;
+    alice.invites(&notebook(), Role::Reader, &dave_phone).await;
+    assert_eq!(alice.laptop().invites.grants().len(), 1);
+}
+
+/// Spec §10 rule 6: a grant whose space is not known when the invitations start (it was
+/// not restored with the node's spaces) is told to the host when the space is known: the
+/// first judgement that finds the person listed installs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_whose_space_is_known_only_after_start_is_installed_when_it_is() {
+    let mut alice = Inviter::new(Role::Writer, None).await;
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    let told = alice.calls.granted();
+    assert_eq!(told.len(), 1);
+    // The node's record of the space goes: it is not restored at the next start.
+    let again = alice.restart_polling(Duration::from_millis(200)).await;
+    assert_eq!(
+        again.granted(),
+        Vec::new(),
+        "a grant of a space not known was installed"
+    );
+    assert_eq!(alice.laptop().invites.grants(), Vec::new());
+    // The space is known again.
+    alice
+        .laptop()
+        .node
+        .open(&notebook())
+        .await
+        .expect("the space opens from what the store holds");
+    eventually("the grant is installed once its space is known", || {
+        again.granted() == told
+    })
+    .await;
+    assert_eq!(alice.laptop().invites.grants(), told);
+    settle(alice.laptop()).await;
+    assert_eq!(again.granted().len(), 1, "the grant was installed twice");
 }

@@ -2376,6 +2376,7 @@ impl Heap {
                      -> Result<EntryId, HeapError>;
     pub async fn get(&self, path: &Name) -> Result<Option<Item>, HeapError>;
     pub async fn watch(&self, since: &Frontier) -> Result<Changes, HeapError>;
+    // `Frontier::everything()`: everything held now is seen, so no head is replayed and no value read; only what follows is told.
     pub fn members(&self) -> Members;
     pub fn ready(&self) -> bool;
     pub fn holds_epoch_key(&self) -> bool;

@@ -1266,7 +1266,11 @@ of a members **entry** (§11). The host's side of every call is §12.
    (`grant_for` `None`, `until` `None`): it follows the members, lasting while the fold lists the person
    and ending when it does not, so removal is the control and there is no day on which every link
    silently stops. `Some(d)` bounds it as well: its `until` is the device's clock when it answered plus
-   `d`, and the host may renew it (rule 10).
+   `d`, and the host may renew it (rule 10). **A Reader admitted to a public space is granted nothing**: a public space
+   (`Readers::Anyone`) lists nobody as a reader, so no members' entry can remove one (`Heap::change` answers "nothing to sign"
+   for a person with no `ADD`), and a grant for them could never end by the rule below (rule 7) — a link slot only the host
+   could take away, for data any carrier serves. The admission is made and answered as for any asker; the device keeps no note,
+   tells the host nothing and says why in its log. A Writer of a public space is granted: the entry that removes them ends it.
 3. **Durable before the answer, told after.** The device keeps a grant note `grant/<id>` (§15) in its
    local store: the offer, the key's digest, the namespace, the space, the role, whether it has a date and
    `until`, whether it ended, and a MAC (rule 11). The note is written with the acceptance under the
@@ -1300,8 +1304,12 @@ of a members **entry** (§11). The host's side of every call is §12.
    grant, the device updates the note durably and calls `Host::grant` again with the grant as it now stands (the host replaces its
    grant; ndn-link closes a link made under the old scope); a writer demoted to a reader is a reader at once, not at the grant's end.
    It is derived from the notes and the fold, so it is the same after a restart, less what ended. While the space is not open here,
-   or its creation is not held, **nothing is judged and no grant of it is in force** (nothing ends either: a note waits for the fold
-   to be seen). One `Grant` is listed for each live note (rule 13).
+   or its creation is not held, **nothing is judged and no grant of it is in force**, and nothing ends either: a note waits for the
+   fold to be seen. The first judgement that finds the space known and the fold listing the person **installs the grant through
+   `Host::grant`** if the host was not told of it in this run (its space was not restored when the invitations started), once.
+   The watch of a space is subscribed from everything held (`Frontier::everything`, heap.md §10.4): it replays no head and reads no
+   value, since only the members' changes matter, and the first judgement after subscribing covers what changed before it. One
+   `Grant` is listed for each live note (rule 13).
 7. **It ends** at its date, if it has one (the link layer judges it by its own clock; the device does not
    announce a lapse), when the host ends it (rule 9), or when the fold of **the grant's own space** lists the
    namespace neither as a writer nor as a reader (each note is judged against the fold of its own space, so a
@@ -1415,7 +1423,8 @@ note can cite one number for one rule). Rule 16, the co-writers, is the surface'
     what to do (join again with a new offer). The note names **no role the device trusts**: the entry's role is **re-derived from the fold
     at every judgement** — a writer when the space lists the owner's namespace as a writer, else a reader, never wider than the fold says —
     and the entry **stands only while the fold lists this device's person** (a writer when the fold lists it as a writer, else a reader; a
-    public space lists every person as a reader). A space not open here: no entry (nothing to judge by, so nothing is granted). The note
+    public space lists every person as a reader — and a device that **only reads** a public space keeps no mirror note, for the same
+    reason as rule 2: nothing could end it but the host). A space not open here: no entry (nothing to judge by, so nothing is granted). The note
     is kept **only for a space owned by the inviter's own namespace** (`owner(space) == owner`): a hostile offer that names a space of the
     joiner's own namespace — whose fold lists the joiner — would otherwise grant the inviter a link into it. When the note is not kept
     (that, or a fold that does not list this device's person, or a space not open here) the join says so in its log, keeps nothing, and still

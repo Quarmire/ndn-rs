@@ -280,12 +280,31 @@ impl Inviter {
     /// Alice's laptop stopped and started again over its store and keys, its host a new
     /// one recording in the calls returned.
     pub(crate) async fn restart(&mut self) -> Arc<Calls> {
+        self.restart_with(None, false).await
+    }
+
+    /// A restart in which the node does not restore the spaces it held (its record of them
+    /// is gone) and the invitations judge every `poll`.
+    pub(crate) async fn restart_polling(&mut self, poll: Duration) -> Arc<Calls> {
+        self.restart_with(Some(poll), true).await
+    }
+
+    async fn restart_with(&mut self, poll: Option<Duration>, forget_spaces: bool) -> Arc<Calls> {
         let old = self.rig.take().expect("the laptop runs");
         let keys = Arc::clone(&old.keys);
         drop(old);
+        if forget_spaces {
+            for (key, _) in self.store.scan_under(&n("/localhost/ndn-heap/space"), 0) {
+                self.store.remove(&key);
+            }
+        }
         let calls = Arc::new(Calls::default());
+        let mut config = Self::config_of(self.slow);
+        if let Some(poll) = poll {
+            config.svs.sync_interval = poll * 2;
+        }
         let mut setup = Setup::new(&self.alice, "/alice/laptop")
-            .config(Self::config_of(self.slow))
+            .config(config)
             .keys(keys)
             .clock(Arc::clone(&self.clock))
             .policy(self.policy.clone())
