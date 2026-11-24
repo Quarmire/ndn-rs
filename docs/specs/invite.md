@@ -894,7 +894,10 @@ place of the offer's, never the token.
   address learns nothing of the joiner, and the inviter, which gives an introduction link
   to a device with no certificate while an offer is open, still answers. Whoever answers
   is linked with the two introduction prefixes of `D` as its only routes (ndn-link.md
-  §13.3A), and the key it proved is the link's name, nothing more. An address dialled
+  §13.3A), and **what it may send in is bounded as well** (the link's inbound scope): answers
+  under those prefixes, and Interests only under the joiner's own device names (the inviter
+  fetches the joiner's seal key there), nothing else, so it cannot make the joiner's forwarder ask
+  the joiner's other links for anything. The key it proved is the link's name, nothing more. An address dialled
   after the inviter's last offer expired meets no link (§13.1: the inviter refuses it as
   any device nobody knows), so the join reports the first contact did not answer. *A
   relay:* nothing is dialled; the relay's device name is the ForwardingHint of the fetch
