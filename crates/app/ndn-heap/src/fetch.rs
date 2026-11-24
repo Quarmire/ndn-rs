@@ -748,6 +748,15 @@ struct Holes {
     tops: Vec<u64>,
 }
 
+impl Holes {
+    /// The tops asked first and beside the window: those of the lowest [`HOLE_TOPS`] holes.
+    /// A pure function of the holes, so the lane never holds a place the window needs and
+    /// the tops of the other holes are asked as the window gets to them.
+    fn lane(&self) -> &[u64] {
+        &self.tops[..self.tops.len().min(HOLE_TOPS)]
+    }
+}
+
 /// The most probes of one group in flight at once: a group has at most
 /// [`HEARD_MAX`](crate::heard::HEARD_MAX) devices heard, and the probes of devices nothing
 /// vouches for are for names anyone can send, so the others wait their turn (the devices
@@ -817,15 +826,6 @@ impl Asks {
         (flying, busy)
     }
 
-    /// How many of the hole tops `tops` of `device` hold a place in the lane: in flight, or
-    /// pausing before they have missed [`REFRESH_TRIES`] times in a row.
-    fn lane(&self, device: &Name, tops: &[u64]) -> usize {
-        let asks = self.by.range(span(device));
-        let tops = asks.filter(|((_, s), _)| tops.binary_search(s).is_ok());
-        tops.filter(|(_, a)| a.until.is_none() || a.misses < REFRESH_TRIES)
-            .count()
-    }
-
     /// Enter the ask of `(device, seq)` as in flight.
     fn launch(&mut self, device: &Name, seq: u64, misses: u32, digest: Option<Pin>) -> Launch {
         self.by.insert(
@@ -845,15 +845,15 @@ impl Asks {
         }
     }
 
-    /// The asks of the holes of `device` in `ranges`, in seq order, at most `window` of them
+    /// The asks of the holes of `device` in `holes`, in seq order, at most `window` of them
     /// in flight or pausing at once: an ask that missed holds its place while it pauses, so the
     /// walk does not slide over the seqs nothing answers. Those due again go first.
     ///
-    /// `tops` are the highest seqs of the holes (sorted): the entry a held entry's chain
-    /// names (§7.4). They are asked **before** the window and outside it, in a lane of at most
-    /// [`HOLE_TOPS`] of the device at once (lowest hole first, the same rule for what is in
-    /// flight or pausing as for the window), so a window of asks from the bottom that nothing
-    /// answers never keeps the one entry that may declare the hole void from being asked.
+    /// The tops of the lowest [`HOLE_TOPS`] holes ([`Holes::lane`]), the entries a held
+    /// entry's chain names (§7.4), are asked **first** and **beside** the window: whatever
+    /// the window holds, a window of asks from the bottom that nothing answers never keeps the
+    /// one entry that may declare a hole void from being asked. The other tops are seqs of the
+    /// window like any.
     fn walk(
         &mut self,
         device: &Name,
@@ -863,24 +863,13 @@ impl Asks {
         next: &mut Option<Duration>,
         out: &mut Vec<Launch>,
     ) {
-        let (ranges, tops) = (&holes.reach[..], &holes.tops[..]);
-        let mut lane = self.lane(device, tops);
+        let (ranges, tops) = (&holes.reach[..], holes.lane());
         for &seq in tops {
             match self.standing(&(device.clone(), seq), now) {
                 Standing::Flying => {}
                 Standing::Waiting(left) => look_again(next, left),
-                Standing::Due(misses) if misses < REFRESH_TRIES => {
-                    out.push(self.launch(device, seq, misses, None));
-                }
-                Standing::Due(misses) if lane < HOLE_TOPS => {
-                    lane += 1;
-                    out.push(self.launch(device, seq, misses, None));
-                }
-                Standing::New if lane < HOLE_TOPS => {
-                    lane += 1;
-                    out.push(self.launch(device, seq, 0, None));
-                }
-                _ => {}
+                Standing::Due(misses) => out.push(self.launch(device, seq, misses, None)),
+                Standing::New => out.push(self.launch(device, seq, 0, None)),
             }
         }
         let (mut flying, busy) = self.busy(device, tops);
@@ -1354,7 +1343,7 @@ impl Group {
                 a.until.is_none()
                     || per
                         .get(d)
-                        .is_some_and(|h| within(&h.reach, *s) || h.tops.binary_search(s).is_ok())
+                        .is_some_and(|h| within(&h.reach, *s) || h.lane().binary_search(s).is_ok())
                     || exact.contains_key(&(d.clone(), *s))
             });
             for (device, holes) in &per {
@@ -2045,6 +2034,28 @@ mod tests {
             launches.is_empty(),
             "what is in the lane is not asked again, and the lane is full: {:?}",
             seqs(&launches)
+        );
+    }
+
+    /// Many one-seq holes (a reader of a writer that never pauses, over a lossy path: o4) are
+    /// asked by the window, not four at a time by the lane: the tops of the holes past the
+    /// lowest [`HOLE_TOPS`] are seqs of the window like any other.
+    #[test]
+    fn the_tops_of_holes_past_the_lane_are_asked_by_the_window() {
+        let device: Name = "/alice/phone".parse().expect("a name");
+        let mut asks = Asks::default();
+        let (mut next, mut launches) = (None, Vec::new());
+        let seqs = |l: &[Launch]| l.iter().map(|l| l.seq).collect::<Vec<_>>();
+        let tops: Vec<u64> = (1..=10).map(|i| i * 10).collect();
+        let holes = Holes {
+            reach: tops.iter().map(|&s| (s, s)).collect(),
+            tops,
+        };
+        asks.walk(&device, &holes, 4, Instant::now(), &mut next, &mut launches);
+        assert_eq!(
+            seqs(&launches),
+            vec![10, 20, 30, 40, 50, 60, 70, 80],
+            "the lane of four, and then a window of four"
         );
     }
 

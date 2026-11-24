@@ -1583,13 +1583,15 @@ a restart, a lost packet or a refusal changes nothing about what is owed.
   it by its chain (§3.6: `PREV` at `seq − 1`, or the `PREV_SEQ` of a gap statement
   that declares what lies above it void). It is the one entry that can end the hole
   at once: if it carries a `PREV_SEQ`, everything between that and the top is void, and
-  the next top is that `PREV_SEQ`. A node therefore asks the top of every hole **before**
-  the asks from the bottom, and **beside** their window, never behind it: in a lane of
-  at most `HOLE_TOPS` (4) tops of a device at once (the lowest holes first; one that is in
-  flight or pausing holds a place until it has missed `REFRESH_TRIES` times, as a
-  window's ask does), so a window of asks from the bottom that nothing answers cannot
-  keep the declaring entry from being asked. The top is asked whatever the hole's length,
-  even where `reserve_block` stops the asks from the bottom short of it. This is **not**
+  the next top is that `PREV_SEQ`. A node therefore asks the tops of the **lowest
+  `HOLE_TOPS` (4) holes** of a device **before** the asks from the bottom, and **beside**
+  their window, never behind it (a lane of its own: they take no place in the window, and
+  a window of asks from the bottom that nothing answers cannot keep the declaring entry
+  from being asked). The tops of the other holes are seqs of the window like any, in seq
+  order: a reader of a writer that never pauses, over a lossy path, has many one-seq holes,
+  and four at a time would hold its catch-up to a trickle (o4). A top is asked whatever
+  the hole's length, even where `reserve_block` stops the asks from the bottom short of it.
+  This is **not**
   a top-down chain walk alone: a dense hole of a thousand entries a reader missed while
   away (o4) would then cost a thousand round trips in a row, where the window from the
   bottom takes them in parallel; the two ends meet, and each round that holds a top moves the
@@ -1815,11 +1817,11 @@ nothing a node does; the `put_watch` example records them (§13.8).
   seal key and the probe of a device not asked yet find a slot (§7.3).
 - **The top of a hole names no counter.** The entry asked first is the one an admitted,
   verified entry's chain names (D17 holds: nothing unsigned raises a head or a want),
-  one per hole, at most `HOLE_TOPS` of a device at once, so a writer that signs an
-  entry at seq 10^9 costs one ask more than its window, never an ask proportional to
-  the seq, and a counter heard adds none. A top that is not to be had (its writer
-  withholds it) is asked again by the miss ladder, as any want is, and holds a place in
-  the lane, not in the window: it keeps no honest ask of the same device waiting.
+  one per hole, at most `HOLE_TOPS` of a device at once beside its window, so a writer
+  that signs an entry at seq 10^9 costs a few asks more than its window, never an ask
+  proportional to the seq, and a counter heard adds none. A top that is not to be had
+  (its writer withholds it) is asked again by the miss ladder, as any want is, and holds
+  no place in the window: it keeps no honest ask of the same device waiting.
 - **Strangers' entries (L7).** A device certified in a held context that is no
   member has at most one refused entry stored and one alert per device: a
   probe of it (`Host::take(.., probe = true)`) is neither stored nor told when
