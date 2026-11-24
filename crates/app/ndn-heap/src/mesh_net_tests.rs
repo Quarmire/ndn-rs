@@ -751,3 +751,88 @@ async fn a_follower_knows_no_members_until_the_creation_arrives() {
     .await;
     assert_eq!(theirs.members().readers, Readers::Anyone);
 }
+
+/// A face that swallows the next `swallow` Sync Interests its node sends, as a lossy link does.
+struct Swallow {
+    inner: Arc<dyn Connection>,
+    swallow: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Connection for Swallow {
+    async fn send(&self, wire: Bytes) -> Result<(), AppError> {
+        use std::sync::atomic::Ordering;
+        if Interest::decode(wire.clone()).is_ok()
+            && self
+                .swallow
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return Ok(());
+        }
+        self.inner.send(wire).await
+    }
+    async fn recv(&self) -> Option<Bytes> {
+        self.inner.recv().await
+    }
+    async fn register_prefix(&self, prefix: &Name) -> Result<(), AppError> {
+        self.inner.register_prefix(prefix).await
+    }
+}
+
+/// A notice lost on its way to the only peer costs it a moment, not the group's period (half a
+/// minute): the device that announced its newest entry announces it again, after a pause that
+/// doubles from a quarter second, until a peer is seen to have taken it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notice_lost_to_the_only_peer_is_announced_again() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let m = mesh(&["/alice/laptop", "/alice/phone"]).await;
+    // The reference timing: a group's period is thirty seconds.
+    let slow = || {
+        let mut c = cfg();
+        c.settle = Duration::from_secs(3);
+        c
+    };
+    let swallow = Arc::new(AtomicUsize::new(0));
+    let cancel = CancellationToken::new();
+    let dev = &m.devs[0];
+    let laptop = Node::start(
+        Transport {
+            node: m.engine.app_node(cancel.child_token()),
+            sync: Arc::new(Swallow {
+                inner: m.engine.app_face(cancel.child_token()),
+                swallow: Arc::clone(&swallow),
+            }),
+        },
+        dev.name.clone(),
+        Arc::clone(&dev.keys),
+        Arc::clone(&dev.validator),
+        Arc::clone(&dev.store),
+        slow(),
+    )
+    .await
+    .expect("the laptop starts");
+    let phone = m.boot(1, slow()).await;
+    let heap = laptop.create(&space(), public()).await.unwrap();
+    let theirs = phone.open(&space()).await.unwrap();
+    eventually("the phone sees the creation", || async { theirs.ready() }).await;
+    let mut changes = theirs.watch(&Frontier::new()).await.unwrap();
+    // The next Sync Interest the laptop sends, the notice of this put, is lost.
+    swallow.store(1, Ordering::SeqCst);
+    heap.put(&n("/a"), bytes("one"), PutOptions::default())
+        .await
+        .unwrap();
+    let began = tokio::time::Instant::now();
+    let item = until(&mut changes, |c| match c {
+        Change::Put(item) if item.path == n("/a") => Some(item.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(item.bytes, bytes("one"));
+    assert_eq!(swallow.load(Ordering::SeqCst), 0, "the notice was lost");
+    assert!(
+        began.elapsed() < Duration::from_secs(8),
+        "the phone heard the put {:?} after it, a group period",
+        began.elapsed()
+    );
+}

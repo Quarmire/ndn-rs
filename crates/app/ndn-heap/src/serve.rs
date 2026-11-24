@@ -115,7 +115,18 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
     let host = &shared.host;
     let me = host.device().clone();
     let packet = match served_kind(&name).filter(|_| !is_local(&name)) {
-        Some(Served::Log) => packet(host, &name, Some(&me)),
+        Some(Served::Log) => {
+            let wire = packet(host, &name, Some(&me));
+            // A peer asking for an entry of this device took the notice that
+            // named it (or a later one): nothing is announced again for it.
+            if wire.is_some()
+                && let Some(log) = parse_log_name(&name)
+                && let Some(group) = net.group(&log.space)
+            {
+                group.herald.taken(log.seq);
+            }
+            wire
+        }
         Some(Served::Held) => held_packet(host, &me, &name),
         Some(Served::Seal) => host.seal_key_packet(&name),
         Some(Served::Grant) => {

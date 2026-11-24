@@ -19,6 +19,7 @@ mod face_up;
 mod fetch;
 mod fold;
 mod heard;
+mod herald;
 mod limit;
 mod log;
 mod node;

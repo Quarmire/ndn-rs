@@ -1588,25 +1588,30 @@ for the namespace), and the entries' and pieces' names route to their devices by
 their own prefix (§2.2). A sync face that registers `<O>/32=sync` receives the
 Sync Interests of every group of every space of `O`.
 
-### 7.10 What the previous design did that this one does not
+### 7.10 What the previous design did that this one does not, and what it has back
 
 The previous design **hailed** (it asked a group again for its members' state,
 with a growing pause, when a first look found no device heard) and **heralded**
 (it announced its newest change again while no member was heard to have taken
-it). This layer does neither. A group's own period, the announcement of every
-own entry by the in-order publisher, and the announcement at every link coming up
-(§7.7) repeat what is announced; and because the fetch is level-triggered by
-what the log wants (§7.4), no peer's progress depends on hearing a notice a
-second time, nor on a heard-by bookkeeping per group. What remains is plain: a
-change announced once and lost to every peer is heard at the group's next
-periodic vector or the next link coming up (half a minute by default), not
-sooner.
+it). This layer does not hail: a group's own period and the announcement at
+every link coming up (§7.7) repeat what is announced, and because the fetch is
+level-triggered by what the log wants (§7.4), no peer's progress depends on
+hearing a notice a second time.
 
-That these four suffice under loss is a claim, and the faulty runs of the
-conformance suite (§13: every case over a lossy path, seeds 0 to 39, `o5` among
-them) are what shows whether it holds. Loss that costs a peer a whole group
-period for one dropped notice is a result of those runs, and the remedy then is
-a measured one reopened here, not a habit carried over.
+It heralds, in a form the faulty runs of the conformance suite (§13, `o5` at
+seeds 3 to 6) required. A notice is what makes a peer want an entry at all (a
+counter names it), so a notice lost on its way to the only peer that wants the
+entry cost that peer a whole group period (half a minute by default; `o5` took 32
+and 62 s against a bound of 10 s). A device therefore announces its newest own
+entry again after each pause of the capped doubling of §7.4 (250 ms, 500 ms, 1 s,
+2 s, then 4 s) until a peer is seen to have taken it: a peer's vector carries this
+device's counter at that seq, or a peer asked this device for that entry or a
+later one. Three announcements are made whatever is seen (a group has several
+peers, and the one that took the entry says nothing of the others), and at most
+eight for one change; a newer own entry starts the pauses again. Nothing is kept
+per peer, and what is announced is unchanged: a counter names an entry to be
+fetched and judged, never a head (D17), so an absent peer or a forged counter
+costs a bounded handful of Sync Interests per change, never one per period.
 
 ### 7.11 Timeline events
 

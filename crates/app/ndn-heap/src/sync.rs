@@ -29,6 +29,7 @@ use crate::error::HeapError;
 use crate::face_up::FaceUp;
 use crate::fetch::{self, Asks, Fetcher};
 use crate::heard::{HEARD_MAX, Heard};
+use crate::herald::Herald;
 use crate::log::{Blob, Outcome};
 use crate::node::Config;
 use crate::register::EntryId;
@@ -225,6 +226,14 @@ impl Net {
                 "the sync driver keeps no observed state for {group_name}; it needs a multi-SVS group"
             )));
         };
+        let stop = self.stop.child_token();
+        let herald = Herald::new(
+            Arc::clone(&self.svs),
+            group_name.clone(),
+            self.shared.host.device().clone(),
+            Arc::clone(&observed),
+            stop.clone(),
+        );
         let group = Arc::new(Group {
             space: space.clone(),
             group: group_name,
@@ -239,9 +248,10 @@ impl Net {
             heard_any: AtomicBool::new(false),
             relist: AtomicBool::new(true),
             own_seen: AtomicU64::new(0),
-            stop: self.stop.child_token(),
+            stop,
             svs: Arc::clone(&self.svs),
             observed,
+            herald,
         });
         self.groups.lock().insert(space.clone(), Arc::clone(&group));
         rt::spawn(notices(Arc::clone(&group), handle));
@@ -316,6 +326,8 @@ pub(crate) struct Group {
     /// The highest counter of this device's own name the group's carriage
     /// showed, as far as the log was told.
     pub(crate) own_seen: AtomicU64,
+    /// Announces this device's own newest entry again while no peer took it.
+    pub(crate) herald: Arc<Herald>,
 }
 
 /// What the group carries of this device's own name is not a notice: the
@@ -394,6 +406,7 @@ impl Group {
         Arc::new(Sink {
             group: self.group.clone(),
             svs: Arc::clone(&self.svs),
+            herald: Arc::clone(&self.herald),
         })
     }
 }
@@ -402,6 +415,7 @@ impl Group {
 struct Sink {
     group: Name,
     svs: Arc<MultiSvs>,
+    herald: Arc<Herald>,
 }
 
 #[async_trait::async_trait]
@@ -409,6 +423,7 @@ impl FlushSink for Sink {
     async fn publish(&self, seq: u64) {
         tracing::trace!(target: TIMELINE, seq, "announce");
         self.svs.publish_at(self.group.clone(), seq).await;
+        self.herald.announced(seq);
     }
 }
 

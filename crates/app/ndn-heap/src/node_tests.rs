@@ -7,7 +7,7 @@
 //! (`NodeInner::take`) and judged as a fetch would.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -117,12 +117,26 @@ impl crate::sync::net_kit::Host for NodeInner {
 /// A forwarder that delivers nothing and counts what the node sent into it.
 pub(crate) struct Counting {
     pub(crate) sent: AtomicUsize,
+    /// The highest counter any Sync Interest of the test space's group carried.
+    pub(crate) carried: AtomicU64,
 }
 
 #[async_trait::async_trait]
 impl Connection for Counting {
-    async fn send(&self, _wire: Bytes) -> Result<(), AppError> {
+    async fn send(&self, wire: Bytes) -> Result<(), AppError> {
         self.sent.fetch_add(1, Ordering::SeqCst);
+        if let Ok(interest) = ndn_packet::Interest::decode(wire)
+            && let Some(group) = crate::wire::sync_group_of(&space())
+            && let Some(vector) = ndn_sync::svs_sync::sync_interest_state(
+                &group,
+                &interest,
+                ndn_sync::WireDialect::V2,
+            )
+        {
+            for entry in vector {
+                self.carried.fetch_max(entry.seq, Ordering::SeqCst);
+            }
+        }
         Ok(())
     }
     async fn recv(&self) -> Option<Bytes> {
@@ -232,6 +246,7 @@ pub(crate) fn cfg() -> Config {
 pub(crate) async fn boot(dev: &Dev, config: Config) -> (Node, Arc<Counting>) {
     let conn = Arc::new(Counting {
         sent: AtomicUsize::new(0),
+        carried: AtomicU64::new(0),
     });
     let face: Arc<dyn Connection> = Arc::clone(&conn) as Arc<dyn Connection>;
     let node = Node::start(
@@ -537,7 +552,6 @@ async fn put_visible_at_once_is_served_before_the_flush_returns() {
     let (node, conn) = boot(&dev, cfg()).await;
     let heap = node.create(&space(), public()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let before = conn.sent.load(Ordering::SeqCst);
     let hold = held.hold();
     let id = heap
         .put(&n("/a"), bytes("one"), durable(false))
@@ -553,7 +567,7 @@ async fn put_visible_at_once_is_served_before_the_flush_returns() {
     );
     let mut announced = false;
     for _ in 0..40 {
-        if conn.sent.load(Ordering::SeqCst) > before {
+        if conn.carried.load(Ordering::SeqCst) >= id.seq {
             announced = true;
             break;
         }
@@ -571,7 +585,6 @@ async fn d16_a_members_operation_is_not_served_or_announced_before_its_flush() {
     let (node, conn) = boot(&dev, cfg()).await;
     let heap = node.create(&space(), public()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let before = conn.sent.load(Ordering::SeqCst);
     let hold = held.hold();
     let changing = {
         let heap = heap.clone();
@@ -599,9 +612,8 @@ async fn d16_a_members_operation_is_not_served_or_announced_before_its_flush() {
         node.inner.served(&space(), &dev.name, seq).is_none(),
         "a Members entry is not served before its flush returned"
     );
-    assert_eq!(
-        conn.sent.load(Ordering::SeqCst),
-        before,
+    assert!(
+        conn.carried.load(Ordering::SeqCst) < seq,
         "nor announced before its flush returned"
     );
     assert!(!changing.is_finished(), "change returns after the flush");
@@ -610,7 +622,7 @@ async fn d16_a_members_operation_is_not_served_or_announced_before_its_flush() {
     assert!(node.inner.served(&space(), &dev.name, seq).is_some());
     let mut announced = false;
     for _ in 0..40 {
-        if conn.sent.load(Ordering::SeqCst) > before {
+        if conn.carried.load(Ordering::SeqCst) >= seq {
             announced = true;
             break;
         }
