@@ -45,7 +45,10 @@ fn the_derivations_are_the_documented_ones() {
 
     let mut key = [0u8; 32];
     Hkdf::<Sha256>::new(None, &secret)
-        .expand_multi_info(&[b"ndn-invite/intro/proof/1", &offer.encode_to_tlv()], &mut key)
+        .expand_multi_info(
+            &[b"ndn-invite/intro/proof/1", &offer.encode_to_tlv()],
+            &mut key,
+        )
         .unwrap();
     assert_eq!(proof_key(&secret, &offer), key);
 
@@ -127,7 +130,11 @@ fn the_keyed_fingerprint_depends_on_the_secret_and_the_whole_anchor() {
     let tag = keyed_fingerprint(&secret, &anchor);
     assert_eq!(tag.len(), SHORT_FINGERPRINT_LEN);
     assert_eq!(tag, keyed_fingerprint(&secret, &anchor), "deterministic");
-    assert_ne!(tag[..], anchor[..SHORT_FINGERPRINT_LEN], "not the plain truncation");
+    assert_ne!(
+        tag[..],
+        anchor[..SHORT_FINGERPRINT_LEN],
+        "not the plain truncation"
+    );
     let mut other_secret = secret;
     other_secret[15] ^= 1;
     assert_ne!(tag, keyed_fingerprint(&other_secret, &anchor));
@@ -144,7 +151,10 @@ fn the_keyed_fingerprint_depends_on_the_secret_and_the_whole_anchor() {
         !keyed_fingerprint_matches(&secret, &anchor, &anchor[..SHORT_FINGERPRINT_LEN]),
         "the plain truncation of the anchor is no tag"
     );
-    assert!(!keyed_fingerprint_matches(&secret, &anchor, &tag[..9]), "short");
+    assert!(
+        !keyed_fingerprint_matches(&secret, &anchor, &tag[..9]),
+        "short"
+    );
     let mut long = tag.to_vec();
     long.push(0);
     assert!(!keyed_fingerprint_matches(&secret, &anchor, &long), "long");
