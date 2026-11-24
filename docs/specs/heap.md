@@ -1543,7 +1543,7 @@ lifetime), doubled for every ask since the last sample that needed a
 re-expression or missed, at least 250 ms (a forwarder holds back a fresh-nonce
 Interest from the same face for about that long), at most the lifetime, and
 doubled again at each re-expression of one ask. A Nack with reason Congestion
-is asked again by the consumer after a short jittered pause, and cuts the device's window (§7.4). The node has `Config.in_flight` (256) slots for asks, shared by
+is asked again by the consumer after a short jittered pause, and, when the ask was made to the device itself, cuts the device's window (§7.4). The node has `Config.in_flight` (256) slots for asks, shared by
 kind so that nobody's asks starve the others': the asks of the wanted entries and
 pieces (**walks**) hold at most three quarters of them, one device's walks at most
 half; the probes (§7.2) at most an eighth; a grant pull takes from what is
@@ -1594,7 +1594,10 @@ a restart, a lost packet or a refusal changes nothing about what is owed.
   one for every ask answered (it doubles each round), is at most `Config.window` (128)
   and half of `Config.in_flight`, and halves, to at least 2, after a round (as many
   asks answered or timed out as the window is wide) in which more asks timed out than
-  were answered. **A Congestion Nack cuts it too:** the path says it is over a rate (a link's
+  were answered. **A Congestion Nack cuts it too,** the Nack of an ask made to the device
+  itself (never one of an ask for a copy through a heard member, `<H>/32=held/…`, which says
+  nothing of the path to the writer: a holder that Nacks must not hold a good writer's window
+  down): the path says it is over a rate (a link's
   quota of what one key may ask or be answered), so the window halves, to at least 2, at
   once, **once for all the asks that were in flight** (an ask carries the number of cuts its
   device's window had when it began; the Nack of an ask that began before the last cut says

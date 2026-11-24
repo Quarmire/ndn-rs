@@ -473,7 +473,11 @@ async fn an_ask_is_answered_by_a_path_that_replies_after_three_seconds_under_the
         let fetcher =
             crate::fetch::Fetcher::new(Arc::clone(&wire) as Arc<dyn Connection>, lifetime, 4, 4);
         fetcher
-            .once(log_name(&n(PHONE), &space(), 2), &crate::fetch::Kind::Pull)
+            .once(
+                log_name(&n(PHONE), &space(), 2),
+                &crate::fetch::Kind::Pull,
+                true,
+            )
             .await
     };
     assert!(
@@ -483,6 +487,55 @@ async fn an_ask_is_answered_by_a_path_that_replies_after_three_seconds_under_the
     assert!(
         ask(Config::new().lifetime).await.is_ok(),
         "the default lifetime does"
+    );
+}
+
+/// Review of round 12 (L4). The window of a device is the writer's: a holder of a copy that
+/// Nacks Congestion over `<H>/32=held/...` says nothing of the path to the writer, and an
+/// ask for a copy must not halve the window of the direct asks (a hostile holder could hold
+/// a good writer's window at the least). The writer's own Nack does cut it.
+#[tokio::test(start_paused = true)]
+async fn a_holders_congestion_nacks_do_not_cut_the_writers_window() {
+    let wire = Wire::new();
+    wire.script(|name| {
+        if parse_held_name(name).is_some() {
+            Reply::Nack(NackReason::Congestion)
+        } else {
+            Reply::Data(genuine(PHONE, direct(name).map_or(0, |(_, s)| s)))
+        }
+    });
+    let fetcher = crate::fetch::Fetcher::new(
+        Arc::clone(&wire) as Arc<dyn Connection>,
+        Config::new().lifetime,
+        256,
+        128,
+    );
+    let walk = crate::fetch::Kind::Walk(n(PHONE));
+    let entry = |seq| log_name(&n(PHONE), &space(), seq);
+    let before = fetcher.window(&n(PHONE));
+    for seq in 1..=6 {
+        let held = crate::wire::held_name(&n(TABLET), &entry(seq));
+        assert!(fetcher.once(held, &walk, false).await.is_err());
+    }
+    assert_eq!(
+        fetcher.window(&n(PHONE)),
+        before,
+        "a holder's Nacks cut the writer's window"
+    );
+    for seq in 1..=3 {
+        fetcher
+            .once(entry(seq), &walk, true)
+            .await
+            .expect("answered");
+    }
+    assert_eq!(fetcher.window(&n(PHONE)), before + 3, "answers grow it");
+    // The writer's own Nack does cut it.
+    wire.script(|_| Reply::Nack(NackReason::Congestion));
+    assert!(fetcher.once(entry(9), &walk, true).await.is_err());
+    assert!(
+        fetcher.window(&n(PHONE)) <= (before + 3) / 2,
+        "the writer's Nack leaves the window at {}",
+        fetcher.window(&n(PHONE))
     );
 }
 

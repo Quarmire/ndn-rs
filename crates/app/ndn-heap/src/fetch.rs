@@ -624,9 +624,11 @@ impl Fetcher {
     /// [`REEXPRESS_MAX`] times. A Nack with reason Congestion is asked again
     /// by the consumer after a short jittered pause
     /// ([`Consumer::fetch_reexpressing_noting`]), and the window of the
-    /// device is cut at it. The packet is unverified: the caller hands it to
-    /// the node.
-    pub(crate) async fn once(&self, name: Name, kind: &Kind) -> Result<Data, Miss> {
+    /// device is cut at it when the ask went `direct`ly to the device (the writer's own
+    /// path). An ask through a heard member's copy (`<H>/32=held/..`) says nothing of the
+    /// path to the writer, and a holder that Nacks must not hold a good writer's window
+    /// down. The packet is unverified: the caller hands it to the node.
+    pub(crate) async fn once(&self, name: Name, kind: &Kind, direct: bool) -> Result<Data, Miss> {
         let _slot = self.slot(kind).await?;
         let rto = self.rtt.lock().rto(&name, self.lifetime);
         let cuts = self.cuts(kind);
@@ -641,7 +643,9 @@ impl Fetcher {
                 (0..REEXPRESS_MAX).map(|k| rto.saturating_mul(1 << k)),
                 || {
                     nacked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.congested(kind, cuts);
+                    if direct {
+                        self.congested(kind, cuts);
+                    }
                 },
             )
             .await;
@@ -684,7 +688,9 @@ impl Fetcher {
                     AppError::Nacked {
                         reason: Some(NackReason::Congestion),
                     } => {
-                        self.congested(kind, cuts);
+                        if direct {
+                            self.congested(kind, cuts);
+                        }
                         Miss::Again
                     }
                     _ => Miss::Gone,
@@ -1134,9 +1140,9 @@ impl Group {
     ) -> Result<Bytes, Miss> {
         let fetcher = &self.shared.fetcher;
         let wire = match source {
-            Source::Writer => fetcher.once(name.clone(), kind).await?.raw().clone(),
+            Source::Writer => fetcher.once(name.clone(), kind, true).await?.raw().clone(),
             Source::Relay(holder) => {
-                let wrapper = fetcher.once(held_name(holder, name), kind).await?;
+                let wrapper = fetcher.once(held_name(holder, name), kind, false).await?;
                 wrapper.content().cloned().ok_or(Miss::Again)?
             }
         };
@@ -1551,7 +1557,12 @@ impl Group {
                 });
             for granter in granters {
                 let name = grant_name(&granter, &ask);
-                let Ok(data) = self.shared.fetcher.once(name.clone(), &Kind::Pull).await else {
+                let Ok(data) = self
+                    .shared
+                    .fetcher
+                    .once(name.clone(), &Kind::Pull, true)
+                    .await
+                else {
                     continue;
                 };
                 if *data.name != name {
