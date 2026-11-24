@@ -197,6 +197,30 @@ impl Fib {
         });
     }
 
+    /// Replace the nexthops at exactly `prefix` with what `update` makes of
+    /// the current ones, atomically (`update` may run again on a concurrent
+    /// swap, so it must be pure); an empty result removes the entry.
+    /// Returns the entry that was there.
+    pub fn update_nexthops(
+        &self,
+        prefix: &Name,
+        update: impl Fn(&[FibNexthop]) -> Vec<FibNexthop>,
+    ) -> Option<Arc<FibEntry>> {
+        let before = self.trie.rcu(|cur| {
+            let mut t = FibTrie::clone(cur);
+            let current = t.get(prefix);
+            let mut nexthops = update(current.as_ref().map_or(&[][..], |e| e.nexthops.as_slice()));
+            if nexthops.is_empty() {
+                t.remove(prefix);
+            } else {
+                nexthops.sort_by_key(|n| n.cost); // FIB invariant: cost-sorted (see add_nexthop)
+                t.insert(prefix, Arc::new(FibEntry { nexthops }));
+            }
+            t
+        });
+        before.get(prefix)
+    }
+
     pub fn remove_face(&self, face_id: FaceId) {
         self.trie.rcu(|cur| {
             let mut t = FibTrie::clone(cur);

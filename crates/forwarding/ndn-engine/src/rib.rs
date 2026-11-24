@@ -58,10 +58,13 @@ const ROUTE_EVENTS: usize = 256;
 /// For each name prefix the RIB collapses all registered routes to a single
 /// `FibEntry` by selecting, **per unique face_id**, the route with the lowest
 /// cost (ties broken by lowest origin value). The resulting nexthop set is
-/// atomically written to the FIB via [`Fib::set_nexthops`].
+/// atomically written to the FIB ([`Fib::update_nexthops`]), replacing the
+/// nexthops the RIB wrote there before.
 ///
-/// Discovery protocols write directly to the FIB via `EngineDiscoveryContext`
-/// and are **not** tracked in the RIB.
+/// Nexthops written directly to the FIB (an application's registration on an
+/// embedded engine, discovery routes via `EngineDiscoveryContext`) are not
+/// tracked in the RIB, and the RIB never removes them: a route installed at
+/// the same prefix is merged with them.
 ///
 /// # Readvertise
 ///
@@ -71,6 +74,10 @@ const ROUTE_EVENTS: usize = 256;
 /// unregistration, its face going down, its expiry, or a flush.
 pub struct Rib {
     routes: DashMap<Name, Vec<RibRoute>>,
+    /// The faces [`Self::install`] last wrote into the FIB at each prefix:
+    /// what the RIB owns there. A nexthop in the entry that is not one of
+    /// these was written to the FIB directly and is never removed by the RIB.
+    written: DashMap<Name, Vec<FaceId>>,
     up: broadcast::Sender<RouteUp>,
     readvertise: Mutex<Readvertise>,
 }
@@ -89,6 +96,7 @@ impl Rib {
     pub fn new() -> Self {
         Self {
             routes: DashMap::new(),
+            written: DashMap::new(),
             up: broadcast::channel(ROUTE_EVENTS).0,
             readvertise: Mutex::new(Readvertise::default()),
         }
@@ -350,7 +358,32 @@ impl Rib {
     /// that are new there ([`RouteUp`]).
     fn install(&self, prefix: &Name, fib: &Fib) {
         let nexthops = self.effective_nexthops(prefix);
-        let before = fib.get(prefix);
+        // The faces this RIB wrote at `prefix` last time are its own to
+        // replace; any other nexthop in the entry was written straight to
+        // the FIB (an application's registration, a discovery route) and
+        // stays. The lock on the prefix's record spans the FIB write, so
+        // two installs of one prefix do not interleave.
+        let mut written = self.written.entry(prefix.clone()).or_default();
+        let before = fib.update_nexthops(prefix, |current| {
+            let mut merged = nexthops.clone();
+            merged.extend(
+                current
+                    .iter()
+                    .filter(|n| {
+                        !written.contains(&n.face_id)
+                            && !nexthops.iter().any(|m| m.face_id == n.face_id)
+                    })
+                    .cloned(),
+            );
+            merged
+        });
+        *written = nexthops.iter().map(|n| n.face_id).collect();
+        let none_left = written.is_empty();
+        drop(written);
+        if none_left {
+            // Re-checked under the shard lock: an install meanwhile keeps it.
+            self.written.remove_if(prefix, |_, w| w.is_empty());
+        }
         let came_up: Vec<FaceId> = nexthops
             .iter()
             .map(|n| n.face_id)
@@ -360,7 +393,6 @@ impl Rib {
                     .is_some_and(|e| e.nexthops.iter().any(|n| n.face_id == *face))
             })
             .collect();
-        fib.set_nexthops(prefix, nexthops);
         for face in came_up {
             // No subscriber is no one to tell.
             let _ = self.up.send(RouteUp {
@@ -879,5 +911,54 @@ mod tests {
         rib.add(&nn("/a/32=sync"), flagged(9, 0, 0));
         rib.apply_to_fib(&nn("/a/32=sync"), &fib);
         assert!(told(&mut rx).is_empty(), "face 9 was there already");
+    }
+
+    /// A face the FIB was given directly (an application's own registration
+    /// on an embedded engine, a discovery route) stays in the entry when the
+    /// RIB then installs a route to another face at the same prefix, and
+    /// stays when that route leaves: the RIB removes only what it wrote.
+    #[test]
+    fn a_route_installed_at_a_directly_registered_prefix_keeps_the_registration() {
+        let rib = Rib::new();
+        let fib = Fib::new();
+        let group = nn("/alice/32=sync");
+        fib.add_nexthop(&group, FaceId(9), 0);
+
+        rib.add(&group, flagged(5, 0, 0));
+        rib.apply_to_fib(&group, &fib);
+        assert_eq!(
+            faces_at(&fib, "/alice/32=sync"),
+            vec![5, 9],
+            "the link's route and the application's registration both forward"
+        );
+
+        rib.remove(&group, FaceId(5), 255);
+        rib.apply_to_fib(&group, &fib);
+        assert_eq!(
+            faces_at(&fib, "/alice/32=sync"),
+            vec![9],
+            "the link's route left; the registration stays"
+        );
+    }
+
+    /// What the RIB wrote it still owns: a route that leaves takes its
+    /// face out of the FIB, and an entry nothing owns is removed.
+    #[test]
+    fn the_rib_still_removes_what_it_wrote() {
+        let rib = Rib::new();
+        let fib = Fib::new();
+        let group = nn("/alice/32=sync");
+        rib.add(&group, flagged(5, 0, 0));
+        rib.add(&group, flagged(6, 0, 0));
+        rib.apply_to_fib(&group, &fib);
+        assert_eq!(faces_at(&fib, "/alice/32=sync"), vec![5, 6]);
+
+        rib.remove(&group, FaceId(5), 255);
+        rib.apply_to_fib(&group, &fib);
+        assert_eq!(faces_at(&fib, "/alice/32=sync"), vec![6]);
+
+        rib.remove(&group, FaceId(6), 255);
+        rib.apply_to_fib(&group, &fib);
+        assert!(fib.get(&group).is_none(), "no route and no registration");
     }
 }
