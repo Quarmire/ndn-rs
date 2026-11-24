@@ -284,7 +284,7 @@ pub struct GrantAsk {
 impl GrantAsk {
     /// An ask for `epoch` of `space` that carries `seal_packet`, the asker's seal key packet;
     /// refused if that is no Data named `<device>/32=seal/<public key>` or is over
-    /// [`SEAL_KEY_PACKET_MAX`]. Whether the device signed it is for the granter's judge.
+    /// 2,048 octets. Whether the device signed it is for the granter's judge.
     pub fn new(space: Name, epoch: EpochId, seal_packet: Bytes) -> Result<GrantAsk, WireError> {
         if seal_packet.len() > SEAL_KEY_PACKET_MAX {
             return Err(WireError::TooLarge {
@@ -445,7 +445,7 @@ pub struct SignalRunName {
 
 /// Parse `<device>/32=signal/<scope>/32=run/<run>`: the device is everything
 /// before the first `32=signal` (a device name has no keyword), the scope a
-/// space name, the run a generic component of exactly [`RUN_ID_LEN`] octets.
+/// space name, the run a generic component of exactly 16 octets.
 /// `None` for any other name.
 ///
 /// Public: a sibling crate that filters names reads a run header's space by it.

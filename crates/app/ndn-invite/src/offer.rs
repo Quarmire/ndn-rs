@@ -33,10 +33,10 @@ impl Invites {
     /// Make a one-use offer of `space` (spec §19.2): a space of this device's
     /// namespace that this node has open. The offer — the space, the role, the expiry,
     /// the wrong tries that close it, a commitment to a fresh secret and this device's
-    /// seal key — is a Data named `<D>/32=intro/offer/<id>` (`id`: 16 random octets,
+    /// seal key — is a Data named `<D>/32=intro/32=offer/<id>` (`id`: 16 random octets,
     /// as hard to guess as a secret of that size), signed by the device's key; it and
     /// the offer's proof key are durable before the code is returned. The code is the
-    /// compact link, the words, and — when [`IntroPolicy::short_code`] is on, the
+    /// compact link, the words, and — when [`crate::IntroPolicy::short_code`] is on, the
     /// host gives a first contact and the line fits — a short code, whose hint token
     /// is kept the same way and whose hint record is then served
     /// ([`Code::short_why`] says why a code has no short form, and then nothing of a
