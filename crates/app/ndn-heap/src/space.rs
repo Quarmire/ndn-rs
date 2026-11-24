@@ -1083,6 +1083,22 @@ impl Heap {
         Some((epoch, complete))
     }
 
+    /// Whether a put of this node seals now instead of answering [`HeapError::NotReady`] while
+    /// the key of the epoch in force is asked for (§6.5): it holds that key, or the space is
+    /// public and needs none. `false` while the space's creation is not seen and, in a sealed
+    /// space, while no epoch is in force.
+    pub fn holds_epoch_key(&self) -> bool {
+        let log = self.inner.log.lock();
+        match log.fold.create() {
+            None => false,
+            Some(true) => true,
+            Some(false) => log
+                .fold
+                .in_force()
+                .is_some_and(|epoch| log.keys.key(&self.inner.name, &epoch).is_some()),
+        }
+    }
+
     /// Whether this node has applied the entry `id`: it holds exactly those
     /// signed bytes (the id's digest is the signed-region digest), verified
     /// and chained to its writer's log, and admitted it: the writer's person

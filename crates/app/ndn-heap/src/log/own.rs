@@ -225,9 +225,11 @@ impl Log {
             not_ready("no epoch of the space is in force yet, so nothing can be sealed")
         })?;
         if self.keys.key(&self.space, &epoch).is_none() {
-            return Err(not_ready(
-                "the key of the epoch in force has not arrived yet",
-            ));
+            return Err(not_ready(&format!(
+                "the key of the epoch in force (made by {} at its seq {}) has not arrived yet; \
+                 it is asked for: put again once it is here",
+                epoch.creator, epoch.seq
+            )));
         }
         Ok(Some(epoch))
     }

@@ -151,6 +151,10 @@ async fn a_new_device_of_an_admitted_person_gets_the_key_by_a_grant() {
         || async { has(&theirs, "/history", "sealed history").await },
     )
     .await;
+    assert!(
+        theirs.holds_epoch_key(),
+        "a device that read a sealed entry after the grant holds the key of the epoch in force"
+    );
     // And what Alice writes next, in the same epoch, it reads at once.
     heap.put(&n("/next"), bytes("later"), PutOptions::default())
         .await
