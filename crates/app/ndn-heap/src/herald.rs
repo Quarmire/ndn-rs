@@ -19,6 +19,15 @@
 //! per change, never one a period. An announcement decides nothing at a peer: a
 //! counter only names an entry to be fetched and judged (D17).
 //!
+//! What ends the announcing early is not signed, which is a **bounded residual**: any requester of the
+//! newest entry (an Interest names no sender), or a vector carrying this device's counter (a
+//! Sync Interest is unsigned), stops it after the [`HERALD_MIN`] announcements made whatever is
+//! seen. A stranger can thus cut a change's announcing to three, and a lost notice is then
+//! heard at the group's next period: a delay, never a wrong state. No signed signal closes it:
+//! the only evidence of a peer holding the entry that a peer signs is an entry of its own that
+//! supersedes this one on the same path, which most puts never get, so waiting for it would
+//! make every put announce [`HERALD_MAX`] times to save a stranger [`HERALD_MIN`].
+//!
 //! A joined group is announced again in the same way while no notice of it was heard
 //! ([`Herald::hail`]): the join announcement, or the vector a peer sent back to it, may be what a
 //! lossy link dropped, and the group's next period is half a minute away. Peers that wrote
