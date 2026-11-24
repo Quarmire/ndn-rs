@@ -422,19 +422,27 @@ impl Group {
             .collect()
     }
 
-    /// The source for a packet of `device` on turn `turn`: the sources are
-    /// the writer (unless it is this device), then the heard members the log
-    /// vouches for, and each turn asks the next of them in a ring.
+    /// The source for a packet of `device` on turn `turn`: the writer (unless it is this
+    /// device) on every even turn, the heard members the log vouches for one after another
+    /// on the odd ones; this device's own packets are asked of the heard members alone. The
+    /// writer holds what it signed; a heard member holds it only if it got it, and the
+    /// members missing a hole are as many as the devices that heard of it, so a ring
+    /// that gave the writer one turn in nine left a hole only it held for minutes.
     fn source(&self, device: &Name, turn: u32) -> Option<Source> {
         let host = &self.shared.host;
         let me = host.device();
-        let relays = (self.heard.lock()).relays(me, device, &[], |d| host.standing(&self.space, d));
-        let writer = (device != me).then_some(Source::Writer);
-        let mut sources: Vec<Source> = (writer.into_iter())
-            .chain(relays.into_iter().map(Source::Relay))
-            .collect();
-        let pick = (turn as usize).checked_rem(sources.len())?;
-        Some(sources.swap_remove(pick))
+        let mut relays =
+            (self.heard.lock()).relays(me, device, &[], |d| host.standing(&self.space, d));
+        let turn = turn as usize;
+        if device == me {
+            let pick = turn.checked_rem(relays.len())?;
+            return Some(Source::Relay(relays.swap_remove(pick)));
+        }
+        if turn % 2 == 0 || relays.is_empty() {
+            return Some(Source::Writer);
+        }
+        let pick = (turn / 2) % relays.len();
+        Some(Source::Relay(relays.swap_remove(pick)))
     }
 
     /// The packet `name` (an entry or a piece) as `source` gives it: the

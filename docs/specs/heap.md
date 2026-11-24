@@ -1515,10 +1515,14 @@ a restart, a lost packet or a refusal changes nothing about what is owed.
   `<H>/32=held/<Name TLV of the original>` (§2.2), at most `RELAYS_ASKED` (8) of
   them, those of which this node holds an unbroken prefix of their own log
   leading, never this node or the
-  writer. Miss number `m` goes to source `m mod n`. A relay's answer is the
+  writer. Miss number `m` goes to the writer when `m` is even, and to the `⌊m/2⌋ mod k`-th
+  of the `k` heard members when it is odd (the writer holds what it signed; a member
+  holds a hole only if it got it, and the members that heard of a hole are as many as
+  miss it too, so a ring over all of them left a hole only the writer held for minutes
+  at 20 % loss). A relay's answer is the
   original packet, whose name MUST equal the name asked for; the original is
   verified as if it had come from the writer. An own entry is asked of relays
-  only.
+  only (miss `m` goes to the `m mod k`-th).
 - **Asking again.** After an ask resolved, the next look at the same entry waits
   250 ms. After `m` misses in a row an ask waits 250 ms × 2^`m`, at most 4 s;
   from 16 misses in a row, 64 s: a source away for long costs one ask a minute,

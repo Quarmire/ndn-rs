@@ -420,6 +420,49 @@ async fn a_counters_entry_the_path_lost_five_asks_in_a_row_is_held_within_a_minu
     );
 }
 
+/// o3 under loss: a hole the writer alone holds (the eight devices that would answer for it are
+/// missing the same entry: they keep asking each other) is asked of the writer every other
+/// miss, not once in nine, so two lost asks to the writer cost seconds, not minutes.
+#[tokio::test(start_paused = true)]
+async fn a_hole_only_the_writer_holds_is_asked_of_the_writer_every_other_miss() {
+    let r = rig().await;
+    {
+        let mut st = r.host.st.lock();
+        st.vouched.insert(n(PHONE));
+        for i in 0..8 {
+            let relay = n(&format!("/alice/relay{i}"));
+            st.vouched.insert(relay.clone());
+            st.standing.insert(relay, true);
+        }
+    }
+    for i in 0..8 {
+        r.group.on_update(notice(&format!("/alice/relay{i}"), 1));
+    }
+    let begun = tokio::time::Instant::now();
+    r.wire.script(move |name| match direct(name) {
+        Some((d, 6)) if d == n(PHONE) => {
+            if begun.elapsed() < Duration::from_secs(6) {
+                Reply::Silent
+            } else {
+                Reply::Data(genuine(PHONE, 6))
+            }
+        }
+        Some((d, seq)) if d == n(PHONE) => Reply::Data(genuine(PHONE, seq)),
+        _ => Reply::Silent,
+    });
+    r.group.on_update(notice(PHONE, 10));
+    let began = tokio::time::Instant::now();
+    while r.host.held_count(PHONE) < 10 && began.elapsed() < Duration::from_secs(300) {
+        pass(1).await;
+    }
+    assert!(
+        r.host.held_count(PHONE) == 10 && began.elapsed() <= Duration::from_secs(25),
+        "{} of 10 held, after {:?}",
+        r.host.held_count(PHONE),
+        began.elapsed()
+    );
+}
+
 /// A Sync Interest is unsigned: a forged counter for a device the log
 /// vouches for names an entry and nothing else. It is asked for alone, a
 /// bounded number of times; what lies below it is not asked, nothing is
