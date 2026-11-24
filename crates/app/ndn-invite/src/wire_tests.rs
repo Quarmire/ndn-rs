@@ -11,7 +11,7 @@ use crate::policy::IntroRefusal;
 use crate::proofs::{SECRET_LEN, answer_proof, answer_proves, commitment, proof_key};
 use crate::wire::{
     AnswerBody, AskBody, AskProtocol, IntroAsk, IntroRecord, NONCE_LEN, OFFER_ID_LEN, OfferBody,
-    Outcome, OfferId, UsedBody, ask_binding, ask_name, hint_prefix, intro_name, intro_prefix,
+    OfferId, Outcome, UsedBody, ask_binding, ask_name, hint_prefix, intro_name, intro_prefix,
     introduction_prefixes, offer_name, offer_prefix, parse_ask_name, parse_intro_name,
     parse_offer_name, tlv, write_name,
 };
@@ -80,19 +80,22 @@ fn an_offer_name_is_device_intro_offer_id_and_parses_back() {
     );
     let typed = offer_prefix(&device).append_component(NameComponent::sequence_num(9));
     assert_eq!(parse_offer_name(&typed), None);
-    let ask = intro_name(&device, &IntroAsk {
-        ephemeral: [1; 32],
-        key: Bytes::from_static(&[2; 4]),
-        sealed: Bytes::from_static(&[3; 4]),
-    }
-    .encode());
+    let ask = intro_name(
+        &device,
+        &IntroAsk {
+            ephemeral: [1; 32],
+            key: Bytes::from_static(&[2; 4]),
+            sealed: Bytes::from_static(&[3; 4]),
+        }
+        .encode(),
+    );
     assert_eq!(parse_offer_name(&ask), None);
     assert_eq!(parse_intro_name(&name), None, "an offer is not an ask");
     let keyworded = intro_prefix(&device).append("x");
     assert_eq!(
-        parse_offer_name(&keyworded.append_component(NameComponent::keyword(
-            Bytes::from_static(b"offer")
-        ))),
+        parse_offer_name(
+            &keyworded.append_component(NameComponent::keyword(Bytes::from_static(b"offer")))
+        ),
         None
     );
     assert_eq!(parse_offer_name(&n("/offer").append(id())), None);
@@ -157,10 +160,12 @@ fn intro_records_round_trip_and_malformed_ones_are_refused() {
             write_name(w, &n("/alice/laptop/32=log/alice/32=data/notes/seq=7"));
         });
     });
-    let tries = |tries: u32| IntroRecord::Offer(OfferBody {
-        tries,
-        ..offer_body.clone()
-    });
+    let tries = |tries: u32| {
+        IntroRecord::Offer(OfferBody {
+            tries,
+            ..offer_body.clone()
+        })
+    };
     assert!(IntroRecord::decode(tries(0).encode()).is_err());
     assert!(IntroRecord::decode(tries(1).encode()).is_ok());
     let not_a_space = IntroRecord::Offer(OfferBody {
@@ -226,7 +231,10 @@ fn an_ask_round_trips_and_its_binding_covers_its_fields() {
 #[test]
 fn bindings_are_labelled_by_protocol() {
     assert_eq!(AskProtocol::IntroAsk.label(), b"ndn-invite intro ask\0");
-    assert_eq!(AskProtocol::IntroAnswer.label(), b"ndn-invite intro answer\0");
+    assert_eq!(
+        AskProtocol::IntroAnswer.label(),
+        b"ndn-invite intro answer\0"
+    );
     for (i, a) in AskProtocol::ALL.iter().enumerate() {
         assert_eq!(a.label().last(), Some(&0), "ends in a zero octet");
         for b in &AskProtocol::ALL[i + 1..] {
@@ -372,24 +380,33 @@ fn the_admitted_field_names_one_entry_whole() {
     let got = with(&whole).unwrap();
     assert!(matches!(
         got.outcome,
-        Outcome::Accepted { admitted: Some(EntryId { seq: 7, .. }), .. }
+        Outcome::Accepted {
+            admitted: Some(EntryId { seq: 7, .. }),
+            ..
+        }
     ));
-    assert!(with(&|w| {
-        write_name(w, &n("/alice/laptop"));
-        crate::wire::write_nni(w, tlv::SEQ, 7);
-    })
-    .is_err());
-    assert!(with(&|w| {
-        whole(w);
-        crate::wire::write_nni(w, tlv::SEQ, 8);
-    })
-    .is_err());
-    assert!(with(&|w| {
-        write_name(w, &n("/alice/laptop"));
-        crate::wire::write_nni(w, tlv::SEQ, 7);
-        w.write_tlv(tlv::DIGEST, &[1; 31]);
-    })
-    .is_err());
+    assert!(
+        with(&|w| {
+            write_name(w, &n("/alice/laptop"));
+            crate::wire::write_nni(w, tlv::SEQ, 7);
+        })
+        .is_err()
+    );
+    assert!(
+        with(&|w| {
+            whole(w);
+            crate::wire::write_nni(w, tlv::SEQ, 8);
+        })
+        .is_err()
+    );
+    assert!(
+        with(&|w| {
+            write_name(w, &n("/alice/laptop"));
+            crate::wire::write_nni(w, tlv::SEQ, 7);
+            w.write_tlv(tlv::DIGEST, &[1; 31]);
+        })
+        .is_err()
+    );
 }
 
 /// Credentials are Data packets, whole, and at least one.
