@@ -438,7 +438,7 @@ impl Group {
             let pick = turn.checked_rem(relays.len())?;
             return Some(Source::Relay(relays.swap_remove(pick)));
         }
-        if turn % 2 == 0 || relays.is_empty() {
+        if turn.is_multiple_of(2) || relays.is_empty() {
             return Some(Source::Writer);
         }
         let pick = (turn / 2) % relays.len();
