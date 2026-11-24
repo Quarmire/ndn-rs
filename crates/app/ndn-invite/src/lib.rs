@@ -26,17 +26,45 @@
 
 pub(crate) mod credentials;
 pub mod error;
+pub mod folder_scope;
+pub(crate) mod grants;
+pub(crate) mod hint;
 pub mod host;
+pub(crate) mod invites;
+pub(crate) mod join;
+pub(crate) mod join_hint;
+pub(crate) mod notes;
+pub(crate) mod offer;
 pub mod policy;
 pub mod proofs;
+pub(crate) mod sealed;
 pub mod short;
 pub mod store;
+pub mod surface;
+#[cfg(test)]
+pub(crate) mod test_kit;
 pub mod wire;
 
 #[cfg(test)]
 mod error_tests;
 #[cfg(test)]
+mod folder_scope_tests;
+#[cfg(test)]
+mod grants_kit;
+#[cfg(test)]
+mod grants_tests;
+#[cfg(test)]
+mod hint_tests;
+#[cfg(test)]
 mod host_tests;
+#[cfg(test)]
+mod join_hint_tests;
+#[cfg(test)]
+mod join_kit;
+#[cfg(test)]
+mod join_tests;
+#[cfg(test)]
+mod offer_tests;
 #[cfg(test)]
 mod policy_tests;
 #[cfg(test)]
@@ -49,13 +77,16 @@ mod store_tests;
 mod wire_tests;
 
 pub use crate::error::InviteError;
+pub use crate::folder_scope::{departure_carries, folder_carries, writer_carries};
 pub use crate::host::{
     Adopting, Code, Departure, Dialing, FirstDialing, Grant, HintCandidate, HintKind, Host,
     JOINED_WRITERS_MAX, Joined, JoinedFolder, LINK_HINT_CANDIDATES_MAX, LinkHint, Offer, Role,
 };
+pub use crate::invites::{Entropy, InviteConfig, Invites};
 pub use crate::policy::{DEPARTURE_FOR, HINT_RETRIES_MAX, IntroPolicy, IntroRefusal};
 pub use crate::proofs::{SECRET_LEN, hint_token};
 pub use crate::short::{Contact, SHORT_FINGERPRINT_LEN, ShortCode, ShortError};
+pub use crate::surface::Surface;
 pub use crate::wire::{
     hint_name, hint_prefix, intro_name, intro_prefix, introduction_prefixes, offer_name,
     parse_hint_name, parse_intro_name, parse_offer_name,
