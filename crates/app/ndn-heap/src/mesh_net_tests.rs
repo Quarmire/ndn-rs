@@ -554,3 +554,79 @@ async fn a_sealed_value_in_pieces_reaches_a_device_that_opens_the_space_after_th
     })
     .await;
 }
+
+/// A device that opens a space after a key was revoked with a cut reads the entries the cut keeps,
+/// though the counter the group shows for the key names an entry above the cut that nobody
+/// serves (its writer refuses it, as does every holder): the cut says which seqs of the key's
+/// log are wanted, and they are asked for without waiting for the counter's entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_device_reads_what_a_revocation_cut_keeps_below_a_counter_nobody_answers() {
+    let m = mesh(&["/alice/laptop", "/alice/phone", "/alice/tablet"]).await;
+    let (laptop, phone) = (m.boot(0, fast()).await, m.boot(1, fast()).await);
+    let mine = laptop.create(&space(), public()).await.unwrap();
+    let theirs = phone.open(&space()).await.unwrap();
+    eventually("the phone holds the space", || async { theirs.ready() }).await;
+    for (path, value) in [("/a", "one"), ("/b", "two")] {
+        theirs
+            .put(&n(path), bytes(value), durable(false))
+            .await
+            .unwrap();
+    }
+    eventually("the laptop holds the phone's two entries", || async {
+        has(&mine, "/a", "one").await && has(&mine, "/b", "two").await
+    })
+    .await;
+
+    // The laptop vouches for what it holds; the phone writes once more, which the cut leaves out.
+    let key = m.devs[1].name.clone().append("KEY").append("1");
+    let bound = CutBound {
+        held_before: Some(Timestamp(u64::MAX / 2)),
+        ..CutBound::default()
+    };
+    let proposal = laptop.revocation_cut(&key, &bound).unwrap();
+    theirs
+        .put(&n("/c"), bytes("three"), durable(false))
+        .await
+        .unwrap();
+
+    // Every node adopts the revocation and holds its cut's manifest.
+    let (cut, manifest) = (proposal.cut.clone(), proposal.manifest.clone());
+    for dev in &m.devs {
+        for packet in &manifest {
+            let data = ndn_packet::Data::decode(packet.clone()).unwrap();
+            dev.validator.cut_manifests().insert(&data).unwrap();
+        }
+        let held = dev
+            .validator
+            .keyring()
+            .contexts()
+            .into_iter()
+            .find(|c| *c.namespace() == n("/alice"))
+            .expect("the namespace's context");
+        let revoking = ndn_security::SignedTrustContext::hierarchical(n("/alice"))
+            .with_version(2)
+            .with_revocation(key.clone())
+            .with_revocation_cut(cut.clone());
+        for anchor in held.anchors().iter() {
+            revoking.add_anchor(anchor.value().clone());
+        }
+        dev.validator
+            .keyring()
+            .adopt_update(Arc::new(revoking))
+            .expect("adopted");
+    }
+    eventually(
+        "the phone's third entry is refused by the laptop",
+        || async { matches!(mine.get(&n("/c")).await, Ok(None)) },
+    )
+    .await;
+
+    // A device of the owner that was never in the group reads what the cut keeps.
+    let tablet = m.boot(2, fast()).await;
+    let late = tablet.open(&space()).await.unwrap();
+    eventually("the tablet reads the entries the cut keeps", || async {
+        has(&late, "/a", "one").await && has(&late, "/b", "two").await
+    })
+    .await;
+    assert_eq!(late.get(&n("/c")).await.unwrap(), None);
+}

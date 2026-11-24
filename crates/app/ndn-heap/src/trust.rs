@@ -714,6 +714,25 @@ impl Judge {
             .collect()
     }
 
+    /// What the trust contexts this node holds keep of each device's log of `space` by a
+    /// revocation cut: `(device, first, last)` runs of the seqs the cut accepts. The entries of a
+    /// revoked key a cut keeps are wanted whatever counter the group shows for the key.
+    pub(crate) fn cut_runs(&self, space: &Name) -> Vec<(Name, u64, u64)> {
+        let mut out = Vec::new();
+        for ctx in self.validator.keyring().contexts() {
+            for cut in ctx.revocation_cuts() {
+                let Some(device) = device_of(cut.key()) else {
+                    continue;
+                };
+                let prefix = log_prefix(&device, space);
+                for range in cut.ranges().iter().filter(|r| r.prefix == prefix) {
+                    out.extend(range.runs.iter().map(|&(lo, hi)| (device.clone(), lo, hi)));
+                }
+            }
+        }
+        out
+    }
+
     // -- adoption --
 
     /// The listing of `space` is now `listing` (an empty one when no fold

@@ -878,8 +878,12 @@ impl NodeInner {
     }
 
     pub(crate) fn missing(&self, space: &Name) -> Vec<Want> {
-        self.space_of(space)
-            .map_or_else(Vec::new, |s| s.log.lock().missing())
+        self.space_of(space).map_or_else(Vec::new, |s| {
+            let log = s.log.lock();
+            let mut wants = log.missing();
+            wants.extend(log.cut_wants(&self.judge.cut_runs(space)));
+            wants
+        })
     }
 
     pub(crate) fn high(&self, space: &Name, device: &Name) -> u64 {

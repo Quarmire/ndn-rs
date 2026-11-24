@@ -766,6 +766,32 @@ impl Log {
             .map_or(0, |d| d.held.prefix_with(&d.voids()))
     }
 
+    /// The entries a revocation cut keeps (`runs` of `(device, first, last)` seqs, from
+    /// [`Judge::cut_runs`](crate::trust::Judge::cut_runs)) that are neither held nor declared
+    /// void: wanted as any hole is, whatever counter was heard of the device, since the cut is
+    /// signed by the namespace's root and lists exactly what to take.
+    pub(crate) fn cut_wants(&self, runs: &[(Name, u64, u64)]) -> Vec<Want> {
+        let mut out = Vec::new();
+        for (device, first, last) in runs {
+            let gaps = match self.devices.get(device) {
+                Some(dev) => dev.held.gaps(*last, &dev.voids()),
+                None => vec![(1, *last)],
+            };
+            for (lo, hi) in gaps {
+                let lo = lo.max(*first);
+                if lo <= hi {
+                    out.push(Want {
+                        device: device.clone(),
+                        first: lo,
+                        last: hi,
+                        digest: None,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Everything wanted: the holes below the highest seq held of each device
     /// it walks ([`Self::high`]), and the exact entries a removal cut names
     /// that are not held. A device is walked once an admitted entry of it is
