@@ -559,6 +559,48 @@ fn removed_writers_lists_each_person_removed_and_not_readmitted() {
 }
 
 #[test]
+fn removal_record_names_the_lowest_entry_that_removed_a_person_listed_no_more() {
+    let mut f = Fold::new(owner());
+    f.apply_members(
+        &carrier(0, 1, 1),
+        &members(vec![
+            add(1, person(0), Role::Writer),
+            add(2, person(0), Role::Reader),
+            add(3, person(1), Role::Reader),
+            add(4, owner(), Role::Writer),
+        ]),
+    );
+    for who in [person(0), person(1), person(2), owner()] {
+        assert_eq!(f.removal_record(&who), None, "{who} was not removed");
+    }
+    // Two owner devices each remove one of her Adds: while the other stands
+    // she is still listed, and once both are gone the entry of the lower
+    // rank (signed digest first) is the one named.
+    let (late, early) = (carrier(1, 5, 9), carrier(0, 2, 2));
+    f.apply_members(&late, &members(vec![remove(2, vec![])]));
+    assert_eq!(f.removal_record(&person(0)), None, "still a writer");
+    f.apply_members(&early, &members(vec![remove(1, vec![])]));
+    assert_eq!(f.removal_record(&person(0)), Some(early.clone()));
+    f.apply_members(&carrier(0, 3, 3), &members(vec![remove(3, vec![])]));
+    assert_eq!(f.removal_record(&person(1)), Some(carrier(0, 3, 3)));
+    // A Remove of the owner's Add is ignored, so the owner has no record.
+    f.apply_members(&carrier(0, 4, 4), &members(vec![remove(4, vec![])]));
+    assert_eq!(f.removal_record(&owner()), None);
+    // Admitted again under a fresh id: listed, so nothing removed her.
+    f.apply_members(
+        &carrier(0, 6, 6),
+        &members(vec![add(5, person(0), Role::Writer)]),
+    );
+    assert_eq!(f.removal_record(&person(0)), None);
+    // Removed again by a third entry: the lowest of the three is named.
+    f.apply_members(&carrier(0, 7, 7), &members(vec![remove(5, vec![])]));
+    assert_eq!(f.removal_record(&person(0)), Some(early.clone()));
+    // The record follows the carriers: an entry withdrawn removes nobody.
+    assert!(f.withdraw_members(&early));
+    assert_eq!(f.removal_record(&person(0)), None, "her first Add stands again");
+}
+
+#[test]
 fn in_force_picks_the_greatest_epoch_whose_audience_is_within_readers() {
     let mut f = Fold::new(owner());
     f.apply_members(

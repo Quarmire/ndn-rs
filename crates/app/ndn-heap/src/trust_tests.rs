@@ -375,6 +375,11 @@ async fn a_person_listed_by_a_members_entry_is_adopted_for_that_space_only() {
         "a space that does not list her has no view of hers: {waiting:?}"
     );
     assert_eq!(host.asked(), BTreeSet::from([carol.ns.clone()]));
+    assert_eq!(
+        judge.adopted_persons(),
+        vec![carol.ns.clone()],
+        "the judge says whom it adopted for the spaces that list them"
+    );
 }
 
 /// The persons no listing keeps are handed back to the host, and judged by
@@ -395,6 +400,7 @@ async fn a_person_no_fold_lists_is_released() {
     judge.note(&other_space(), &Listing::default());
     assert!(!host.carries(&carol.ns), "no fold lists her: released");
     assert_eq!(judge.adopted_version(&carol.ns), None);
+    assert!(judge.adopted_persons().is_empty(), "and no longer says it");
     let waiting = judge.validate(&phone.entry(&space(), 1), &space()).await;
     assert!(
         matches!(&waiting, Judged::Pending(Waiting::Adoption(p)) if *p == carol.ns),

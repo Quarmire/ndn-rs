@@ -25,6 +25,9 @@ use crate::wire::{Entry, log_name};
 #[path = "mesh_net_tests.rs"]
 mod net;
 
+#[path = "host_tests.rs"]
+mod host;
+
 /// Devices on one forwarder; the sync group of every namespace is carried.
 struct Mesh {
     engine: ForwarderEngine,
