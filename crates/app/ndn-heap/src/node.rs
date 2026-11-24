@@ -106,7 +106,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// Defaults: SVS's reference timing, the system clock, 2 s Interests, a
+    /// Defaults: SVS's reference timing, the system clock, 4 s Interests, a
     /// 4 s first look, 128 asks in flight per walk and 256 per node, a 1 s
     /// settle, reservations of 1,024 seqs, 4,096 changes a watcher may leave
     /// unread, no adopter.
@@ -119,7 +119,7 @@ impl Config {
                     .unwrap_or_default();
                 Timestamp(since.as_millis() as u64)
             }),
-            lifetime: Duration::from_secs(2),
+            lifetime: Duration::from_secs(4),
             first_look: Duration::from_secs(4),
             window: 128,
             in_flight: 256,

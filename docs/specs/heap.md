@@ -1460,7 +1460,7 @@ ends an ask (§7.4).
 The entry a notice names is `<D>/32=log/<S>/seq=<high>`. It is fetched
 **directly** from `D`, **first and alone** while nothing at or above it is held
 (its own gap statement may declare everything below it void), as one Interest
-with a lifetime of `Config.lifetime` (2 s by default), verified and taken
+with a lifetime of `Config.lifetime` (4 s by default), verified and taken
 (§3.8). Only after that is the rest below it asked for (§7.4). One new entry
 therefore costs one Interest.
 
@@ -2118,7 +2118,7 @@ protocol that frames them like an entry); a run header is signed by
 |---|---|---|
 | `svs` | SVS's reference timing | State Vector Sync settings of every group (§7.1) |
 | `clock` | the system clock, ms since the Unix epoch | the time of a marker's `at` and of a cut bound; display only (§1.4) |
-| `lifetime` | 2 s | Interest lifetime of every fetch (§7.3) |
+| `lifetime` | 4 s (the NDN default) | Interest lifetime of every fetch: the budget of an ask, within which its Interests are expressed again and a late reply to any of them answers (§7.3); under the faulty profile (round trips of up to 3 s) 2 s misses a reply that was on its way |
 | `first_look` | 4 s | how long a removal looks for entries heard of and not yet held (§5.6) |
 | `window` | 128 | asks of one device in flight (§7.4) |
 | `in_flight` | 256 (at least `window`) | asks of the whole node in flight (§7.3) |

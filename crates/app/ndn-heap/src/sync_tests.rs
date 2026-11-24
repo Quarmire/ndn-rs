@@ -194,7 +194,13 @@ async fn a_gap_in_the_notice_is_backfilled_in_a_window() {
 /// and the walk keeps the path full: with the window of 32 asks the same walk took 87 s here.
 #[tokio::test(start_paused = true)]
 async fn a_long_hole_below_a_held_tip_is_repaired_within_a_minute_over_a_lossy_long_path() {
-    let r = rig().await;
+    // The toy path loses an ask by silence, which costs the whole lifetime: the test's lifetime
+    // is the 2 s of the measurement in the comment above, so what it measures is the window.
+    let r = rig_with(Config {
+        lifetime: Duration::from_secs(2),
+        ..Config::new()
+    })
+    .await;
     r.wire.delay(Duration::from_millis(1150));
     let tick = std::sync::atomic::AtomicU64::new(0);
     r.wire.script(move |name| match direct(name) {
@@ -417,6 +423,33 @@ async fn a_counters_entry_the_path_lost_five_asks_in_a_row_is_held_within_a_minu
         "held: {}, after {:?}",
         r.host.holds(PHONE, 2),
         began.elapsed()
+    );
+}
+
+/// o1/o3/q3 under loss: on a path whose round trip often passes two seconds (the faulty profile's
+/// delay, block and reorder times add to 3 s), an ask that waits two seconds, and half a second of
+/// slack, for its reply misses a reply that comes in three, and an Interest that stays pending
+/// two seconds loses it at the forwarder; with the default lifetime (4 s, the NDN default) the
+/// ask is answered, so a path that is slow, and not only lossy, does not turn every miss into
+/// a longer pause.
+#[tokio::test(start_paused = true)]
+async fn an_ask_is_answered_by_a_path_that_replies_after_three_seconds_under_the_default_lifetime()
+{
+    let ask = |lifetime: Duration| async move {
+        let wire = Wire::new();
+        wire.delay(Duration::from_millis(3000));
+        wire.script(|name| Reply::Data(genuine(PHONE, direct(name).map_or(0, |(_, s)| s))));
+        let fetcher =
+            crate::fetch::Fetcher::new(Arc::clone(&wire) as Arc<dyn Connection>, lifetime, 4);
+        fetcher.once(log_name(&n(PHONE), &space(), 2)).await
+    };
+    assert!(
+        ask(Duration::from_secs(2)).await.is_err(),
+        "a 2 s lifetime does not wait for a 3 s reply"
+    );
+    assert!(
+        ask(Config::new().lifetime).await.is_ok(),
+        "the default lifetime does"
     );
 }
 
@@ -932,7 +965,12 @@ async fn a_bad_piece_is_never_taken_and_another_holder_is_asked() {
 /// members that vouch, in rounds with growing pauses, until a grant arrives.
 #[tokio::test(start_paused = true)]
 async fn the_grant_pull_walks_creator_then_relays_with_backoff() {
-    let r = rig().await;
+    // The script below counts asks by the 2 s lifetime.
+    let r = rig_with(Config {
+        lifetime: Duration::from_secs(2),
+        ..Config::new()
+    })
+    .await;
     {
         let mut st = r.host.st.lock();
         for d in [TABLET, DESKTOP] {
