@@ -357,13 +357,15 @@ impl Rib {
     /// Write `prefix`'s computed nexthops to the FIB and tell the faces
     /// that are new there ([`RouteUp`]).
     fn install(&self, prefix: &Name, fib: &Fib) {
-        let nexthops = self.effective_nexthops(prefix);
         // The faces this RIB wrote at `prefix` last time are its own to
         // replace; any other nexthop in the entry was written straight to
         // the FIB (an application's registration, a discovery route) and
-        // stays. The lock on the prefix's record spans the FIB write, so
-        // two installs of one prefix do not interleave.
+        // stays. The prefix's lock spans reading the RIB's routes and writing
+        // the FIB, so two installs of one prefix are ordered and the later
+        // one, having read the routes after the earlier one's caller changed
+        // them, is the one that stands.
         let mut written = self.written.entry(prefix.clone()).or_default();
+        let nexthops = self.effective_nexthops(prefix);
         let before = fib.update_nexthops(prefix, |current| {
             let mut merged = nexthops.clone();
             merged.extend(
@@ -960,5 +962,43 @@ mod tests {
         rib.remove(&group, FaceId(6), 255);
         rib.apply_to_fib(&group, &fib);
         assert!(fib.get(&group).is_none(), "no route and no registration");
+    }
+
+    /// An `add` and a `remove` of one prefix on two threads, each followed by
+    /// its own `apply_to_fib`: once both have returned the FIB equals what
+    /// the RIB holds, with no further install. (A set computed before the
+    /// prefix's lock and written after another install's would leave the
+    /// removed face forwarding, or the added one missing.)
+    #[test]
+    fn concurrent_installs_of_one_prefix_end_at_the_ribs_state() {
+        use std::sync::Barrier;
+
+        let group = nn("/alice/32=sync");
+        for round in 0..5_000 {
+            let rib = Rib::new();
+            let fib = Fib::new();
+            rib.add(&group, flagged(2, 0, 0));
+            rib.apply_to_fib(&group, &fib);
+            let start = Barrier::new(2);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    start.wait();
+                    rib.add(&group, flagged(1, 0, 0));
+                    rib.apply_to_fib(&group, &fib);
+                });
+                s.spawn(|| {
+                    start.wait();
+                    rib.remove(&group, FaceId(1), 255);
+                    rib.apply_to_fib(&group, &fib);
+                });
+            });
+            let mut held: Vec<u64> = rib.dump()[0].1.iter().map(|r| r.face_id.0).collect();
+            held.sort();
+            assert_eq!(
+                faces_at(&fib, "/alice/32=sync"),
+                held,
+                "round {round}: the FIB is not the RIB's state"
+            );
+        }
     }
 }
