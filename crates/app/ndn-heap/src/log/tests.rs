@@ -1643,16 +1643,43 @@ async fn an_entry_above_a_declared_gap_is_applied_without_the_seqs_the_gap_decla
     assert!(r.log.applied(&id_of(&p3)), "seq 2 is declared absent");
 }
 
-/// A device that holds the owner's newest members entry but not the ones below it does not know
-/// who the space lists (o3: a member held the creation and the epoch, not the entries that made
-/// the readers, and was told it was a writer outside the audience, for good): it may not tell
-/// whether it may write until the owner's log is whole below what it holds.
+/// A device the fold lets write writes while the owner's log has a hole below an entry it holds:
+/// a put never waits on other devices (p1), and an entry in the hole that removes the device
+/// binds what it signs after the cut it names, as a removal that has not reached it yet does
+/// (o1).
 #[tokio::test]
-async fn a_device_may_not_write_while_the_owners_log_has_a_hole_below_an_entry_it_holds() {
+async fn a_device_the_fold_lets_write_writes_while_the_owners_log_has_a_hole() {
     let mut r = rig(&bob());
     let mut owner = Chain::new(&phone());
     let create = creation(&mut owner);
     let more = owner.members(members(None, vec![add(2, "/carol", Role::Writer)]));
+    let tip = owner.members(members(None, vec![add(3, "/dave", Role::Reader)]));
+    r.applied(&create);
+    r.applied(&tip);
+    assert!(r.log.applied(&id_of(&create)));
+    assert!(
+        !r.log.applied(&id_of(&tip)),
+        "seq 2 of the owner's log is missing"
+    );
+    assert_eq!(
+        r.log.judge_own().unwrap(),
+        None,
+        "bob is a writer, hole or not"
+    );
+    r.applied(&more);
+    assert_eq!(r.log.judge_own().unwrap(), None);
+}
+
+/// A device the fold refuses does not know it is refused while the owner's log has a hole below an
+/// entry it holds (o3: a member held the creation and the epoch, not the entries that made the
+/// readers, and was told it was a writer outside the audience, for good): the answer is to ask
+/// again until the hole is filled.
+#[tokio::test]
+async fn a_device_the_fold_refuses_is_told_to_wait_while_the_owners_log_has_a_hole() {
+    let mut r = rig(&bob());
+    let mut owner = Chain::new(&phone());
+    let create = owner.members(members(Some(true), vec![add(1, "/carol", Role::Writer)]));
+    let adds_bob = owner.members(members(None, vec![add(2, "/bob", Role::Writer)]));
     let tip = owner.members(members(None, vec![add(3, "/dave", Role::Reader)]));
     r.applied(&create);
     r.applied(&tip);
@@ -1661,7 +1688,7 @@ async fn a_device_may_not_write_while_the_owners_log_has_a_hole_below_an_entry_i
         "seq 2 of the owner's log is missing: {:?}",
         r.log.judge_own()
     );
-    r.applied(&more);
+    r.applied(&adds_bob);
     assert_eq!(r.log.judge_own().unwrap(), None);
 }
 
