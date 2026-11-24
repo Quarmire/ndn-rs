@@ -185,9 +185,13 @@ else under `32=intro` is served.
 
 The crate registers one `Extension` with `Node::extend` (the sibling surface of
 heap.md, documented there as the interface for `ndn-invite` and `ndn-surface`
-only). Its keywords are `intro` and `hint`: the node's keyword router
-(heap.md §2.4) hands an Interest whose first keyword is one of them to
-`Extension::answer`, and to nothing else. The device's whole introduction
+only). The extension is held weakly by the node: once the `Invites` handle and its
+clones are gone, it answers nothing. Its keywords are `intro` and `hint`, which
+carry the exchange, and `ask`, which only lets the node sign the proof packets
+`<X>/32=ask/<binding>` an ask and an answer carry (the node signs only under a
+keyword an extension registered, §18.1) and answers nothing under it. The node's
+keyword router (heap.md §2.4) hands an Interest whose first keyword is one of them
+to `Extension::answer`, and to nothing else. The device's whole introduction
 surface is therefore **two prefixes**:
 
 ```text
@@ -201,8 +205,7 @@ is gone: the offer is fetched directly (§8.2).
 **Silence.** `Extension::answer` returns `None` for an Interest it will not
 answer, and the node Nacks it as it does every unanswerable name (heap.md §2.4,
 §7.6): the same for a name that does not parse, a name that parses and names no
-offer or token this device holds, an offer the device does not serve (§5.5), and
-an ask that does not open (§9.2 step 1). A refusal that names a reason travels
+offer or token this device holds, and an ask that does not open (§9.2 step 1). A refusal that names a reason travels
 only inside an answer to an ask that opened and whose asker proved a key (§9.2),
 never as the response to a name. A prober who does not hold a code therefore
 learns nothing of what the device holds: an offer name is 128 random bits, a hint
@@ -364,72 +367,75 @@ each under a name no device serves:
 
 | Key | Value |
 |---|---|
-| `offer/<id>` | the signed offer packet, as signed |
+| `offer/<id>` | the signed offer packet, as signed (its Content is the `INTRO_OFFER`) |
 | `key/<id>` | the proof key, wrapped to the device's recipient key |
-| `hint/<id>` | the hint token, wrapped the same way, only for an offer with a short code |
-| `tries/<id>` | the wrong tries counted toward the overall cap, and when the last was counted |
-| `tries/<id>/<digest>` | the wrong tries of one asker key, by its public key's digest |
-| `using/<id>` | while a use is under way, the key it is for |
-| `accepted/<id>` | once used, the acceptance it answered (§9.4) |
-| `used/<id>` | the use mark: the key the offer was used by and its public key's digest |
-| `closed/<id>` | the closing mark: the offer admits no one new |
+| `hint/<id>` | the hint token, wrapped the same way; only for an offer with a short code |
+| `tries/<id>` | the wrong tries counted toward the overall cap (4 octets, big-endian) and when the last was counted (8 octets, big-endian, ms by the device's clock) |
+| `tries/<id>/<digest>` | the wrong tries of one asker key, by its public key's digest (4 octets, big-endian) |
+| `using/<id>` | while a use is under way, the key it is for: its Name TLV, then the public key's digest (32 octets) |
+| `accepted/<id>` | once used, the acceptance it answered (one `INTRO_ANSWER`, §9.3) |
+| `used/<id>` | the use mark: one `INTRO_USED` naming the offer, the key the offer was used by and its public key's digest |
+| `closed/<id>` | the closing mark: one octet, `1`; the offer admits no one new |
 
-Each is durable (`Node::flush`) before the reply that depends on it (§9.6). `<id>`
-is written as the offer's 16 octets. The first mark naming a key stands and a
-device writes no second one (`used/<id>` is written at most once, and never
-changed); a closing mark closes the offer whenever it comes, used or not, and is
-written at most once. Only the offering device marks its offer: the marks are
-local, not served and not signed, because nobody else reads them. Other devices
-of the inviter answer `Unknown` for an offer they do not hold (§18).
+Each is durable (`Node::flush`) before the reply that depends on it (§9.6). `<id>` is the offer's 16 octets as one
+generic component (§15). The wrapped notes (`key/<id>`, `hint/<id>`) bind the key's own Name TLV as associated data,
+so a note moved to another key does not open (§4.2). A device writes `used/<id>` at most once and never changes it
+(the first mark naming a key stands); `closed/<id>` is written by `close_offer` and by the overall cap, and writing it
+again changes nothing. Only the offering device marks its offer: the marks are local, not served and not signed,
+because nobody else reads them. Other devices of the inviter answer `Unknown` for an offer they do not hold (§18).
 
 ### 5.3 Offering
 
-`offer(S, { role, until, tries })` on an owner device of `S`'s namespace whose
-fold of `S` is held (the space is open here, heap.md §10.2):
+`offer(S, { role, until, tries })` on a device of `S`'s namespace that has `S` open (heap.md §10.2):
 
-1. MUST refuse an `S` of another namespace (`NotOwner`), `tries` = 0 or an expiry
-   already past by its clock (`BadRequest`), a space that is not open here or
-   whose creation is not held (`BadRequest`: open it and wait for `ready`), and
-   a host that cannot give a link when `Host` says so (`Local`, naming the
-   setting).
-2. Draws a fresh 16-octet secret and a fresh 16-octet id from the device's
-   entropy, wraps the proof key and (for a short code) the hint token into its
-   store, signs the offer through `Node::sign_packet`, and keeps it.
-3. Returns the code only once the offer, the wrapped proof key and, when there is
-   a short code, its wrapped hint token are durable: a reply before could let a
-   power loss take the offer and leave a joiner holding a code for it.
+1. MUST refuse an `S` that is no space name or that is not open here (`BadRequest`: create it or open it, then offer
+   it), an `S` of another namespace (`NotOwner`, from the heap), `tries` = 0 or an expiry already past by its clock
+   (`BadRequest`), and a host whose anchor is not this namespace's signed trust context with a chain to this device's key
+   (`Local`: fix the host's enrollment). Whether this device is an **owner device** of `S` (heap.md §2.1) is not read at
+   `offer`: it is `Heap::change`'s to judge at the answer (§9.4), where a device that is not one admits no one and
+   answers nothing.
+2. Draws a fresh 16-octet secret and a fresh 16-octet id from the device's entropy (`InviteConfig::entropy`, the operating
+   system's by default), wraps the proof key (and, for a short code, the hint token) into its store, signs the offer
+   through `Node::sign_packet`, and keeps it.
+3. Returns the code only once the offer, the wrapped proof key and, when there is a short code, its wrapped hint token
+   are durable (one batch for the first two): a reply before could let a power loss take the offer and leave a joiner
+   holding a code for it. The offer is served, and the code shown, only after that.
 
 ### 5.4 Closing an offer
 
-`close_offer(offer)` on the device that made the offer writes `closed/<id>` and
-returns once it is durable: the offer admits no one new, every ask by a key
-other than the one it was used by is refused `Closed`, even with the right
-secret, and it still answers the key it admitted, with the acceptance kept for its
-use and nothing else, until the offer expires (§9.2 step 4). A host that closes
-an offer as soon as it sees the new member needs no pending close of its own for
-a joiner whose answer was lost.
+`close_offer(offer)` on the device that made the offer writes `closed/<id>` and returns once it is durable: the offer admits
+no one new, every ask by a key other than the one it was used by is refused `Closed`, even with the right secret, and it still
+answers the key it admitted, with the acceptance kept for its use and nothing else, until the offer expires (§9.2 step 4). It
+also drops the signed hint packet kept for the offer's token, so the next request for the token is answered with the gone mark
+(§7.1 item 7). A host that closes an offer as soon as it sees the new member needs no pending close of its own for a joiner
+whose answer was lost.
 
-An offer is also closed, with no call, when:
+An offer is **closed**, judged on every ask and every hint request from durable data and never cached, when any of these holds:
 
-- all askers' wrong tries are at the device's cap (§9.6);
-- the members entries of `S` no longer list the person the offer brought (§10
-  rule 7): the offer is then closed to everyone new, and its user alone is
-  answered, until the offer expires.
+- `closed/<id>` is held;
+- all askers' wrong tries are at the device's cap (§9.6): the overall counter reached `wrong_tries_max`; the ask that reaches it
+  also writes `closed/<id>`;
+- the space's members no longer list the person the offer was used by — or, while a use is under way, the key being admitted
+  (`Heap::removed_by` names a removal of that device's person, heap.md §10.3): a removed member never comes back by its code
+  (§9.5). This is a derivation, **not** a mark: nothing is written, the offer is closed for as long as the removal stands in
+  the fold.
 
-What the offer granted stays until a members entry removes it. Another device's
-offer, or a name that is no offer held, is `BadRequest`; closing a closed offer
-does nothing more. The hint record of a closed offer is its gone mark (§7.3).
+What the offer granted stays until a members entry removes it. Another device's offer, or a name that is no offer this device
+holds, is `BadRequest`; closing a closed offer does nothing more. The hint record of a closed offer is its gone mark (§7.1 item 3).
 
 ### 5.5 When an offer is served
 
 The extension answers an Interest for `<D>/32=intro/32=offer/<id>` with the stored
-packet, as signed, while the offer is **open**: not expired by the device's clock.
-A closed offer counts as open for this purpose, because it still answers the one
-key it admitted, and that key's retry fetches the offer again (§8.2). After the
-expiry no offer packet is served: the extension answers nothing, which is the
-silence of §2.3. A joiner that fetches an offer after it expired therefore hears
-no refusal; it hears that the inviter did not answer, and learns the cause from
-the hint record's gone mark when its code is short (§7.3) or from the inviter.
+packet, as signed, for as long as the device holds the offer: an offer is never
+pruned (§7.1 item 7), and one made before a restart is read back from the store at
+start. It does not judge the expiry itself: a closed offer and an expired one are
+served as an open one is, and the one place an expiry is read is the ask (§9.2
+step 7), which answers `Expired` to a joiner that holds the right secret. What an
+introduction link carries is narrower (§13.1): the offer's name crosses it only
+while the offer has not expired, so a stranger whose dial arrives after the last
+offer expired meets no link, and a joiner that reaches the device by name still
+gets a clear refusal. Only a name that parses as an offer of this device and
+names one it holds is answered; any other name under `32=intro` is silence (§2.3).
 
 ## 6. The code
 
@@ -512,8 +518,8 @@ RelayHint 0x0476) are read, never written.
 The offer's name in a link is the new one, `<D>/32=intro/32=offer/<id>`, in the same
 `IntroOfferWire` field: the envelope carries a `Name` and assumes nothing of its
 shape (trust-envelope.md §4.3). A link made by `ndn-data` names a log entry
-(`<D>/32=log/<F>/seq=<n>`): the joiner fetches no such packet here and the join
-is refused as an offer that does not exist (`Unknown`, §17.1).
+(`<D>/32=log/<F>/seq=<n>`): the joiner reads a code whose offer is no `<device>/32=intro/32=offer/<id>` as a
+`BadRequest` (the offer's name is no offer's; check the code), before anything is dialled (§8.1).
 
 The link stays within one QR (`ndn_trust_envelope::qr::MAX_TEXT_LEN` = 2331
 characters). A hint costs 34 octets and 9 (IPv4) or 21 (IPv6) per candidate, a
@@ -709,8 +715,8 @@ the words form fetches no hint record.
    `FreshnessPeriod` is 0, item 3); a change, a closing mark included, is signed at
    once. A device whose host cannot give credentials answers nothing.
 5. **Served while the offer is open.** The record is served while the offer is open
-   (not expired by the device's clock, not closed: `closed/<id>` held, or the overall
-   wrong tries at the cap, §9.6), and a gone mark after, when
+   (not expired by the device's clock, not closed in the sense of §5.4: `closed/<id>` held, the overall
+   wrong tries at the cap, §9.6, or a removal of the person it was used by), and a gone mark after, when
    `IntroPolicy::hint_while_open` is on (the default). With it off the record is
    served until the device stops, with no gone mark. Either way the offer answers by
    its own rules (§9.2): a hint that outlives its offer joins no one.
@@ -722,7 +728,7 @@ the words form fetches no hint record.
    name of another device is not answered either.
 7. **What the device keeps.** `offer` makes the token from the secret, wraps it to the
    device's recipient key under `hint/<id>` beside the offer's proof key (the same
-   kind of note: a writer of the store cannot make one read), and keeps `token →
+   kind of note, which wraps 32 octets: the token is the first 16 of them; a writer of the store cannot make one read), and keeps `token →
    offer` in memory, rebuilt from the store at start for the offers it holds (a note
    not wrapped to the device's key is ignored, and its offer publishes no hint). The
    offer packet holds nothing of the hint. A hint record exists only for an offer that
@@ -759,6 +765,10 @@ claim.
    and a second invitation from it is welcome. Without the exception a code could
    claim a device of a namespace this device trusts, and the link, with that
    namespace's Interests, would go to whoever holds the key.
+
+Before these, for every form of code: a code whose device is this device, or lies under this device's own namespace, is a
+`BadRequest` ("the code offers a space of this device's own namespace: it is yours already"), and a code whose offer is no
+offer's name is a `BadRequest` too (§6.2).
 
 ### 8.2 The steps
 
@@ -798,22 +808,23 @@ claim.
    content key wrapped to the offer's `SEAL_KEY` and the body sealed under it, both
    binding `<D>/32=intro` (its Name TLV) as associated data. Before sending, the
    joiner checks that its own credentials verify its proof packet (else `Local`: its
-   enrollment is broken). It sends the same Interest again on no answer, then
-   answers `NotReady` as in step 1.
+   enrollment is broken). It sends the same Interest again on no answer, up to 8 sends in all
+   (`ASK_TRIES`; the inviter keeps its answer by the ask's name, §9), then answers `NotReady` as in step 1.
 3. **Takes the answer**, a DigestSha256 Data of the ask's name whose Content is an
    `INTRO_ANSWER`. A refusal is reported as it is (§17.1). An acceptance MUST pass
    every check, else the join answers `Forged` (`RetryLater`) and adopts nothing: it
    names the offer, this device's key and its digest; its `PROOF` verifies under the
    proof key the code's secret yields; its credentials open (§9.2 step 2) to a
    context whose anchor fingerprint is the code's (whole for a link and a 36-word
-   short code, a prefix for the words and a 20-word short code), whose namespace is
-   the code's (when it names one) and a prefix of `D`; the inviter's proof packet
-   `<D>/32=ask/<binding>`, the binding SHA-256 of the intro-answer label (§4.5) and
-   the answer's fields before it, and the offer packet are both signed by a key of
-   `D` that chains to that anchor through those certificates; the offer's commitment
-   is the code's secret's; the space and role are the offer's; and `ADMITTED`, the
-   entry that admitted this device, is named by a device that lies under the
-   inviter's namespace.
+   short code, a plain prefix for the words form, the keyed fingerprint of §6.4 for a
+   20-word short code), whose namespace is the code's (when it names one) and a prefix
+   of `D`; the inviter's proof packet `<D>/32=ask/<binding>`, the binding SHA-256 of the
+   intro-answer label (§4.5) and the answer's fields before it, and the offer packet are
+   both signed by a key of `D` that chains to that anchor through those certificates;
+   the offer's commitment is the code's secret's; the space and role are the offer's;
+   and the space's owner namespace is the inviter's. `ADMITTED` is not judged here: the
+   entry is the heap's to admit (§8.5), and a name that no entry answers to is a wait
+   that ends in `NotReady`, never an admission.
 4. **The inviter's namespace is no other's**, judged by this device (the words and a
    short code of a named namespace name none, so it is judged here for them too): not
    the root, not one the policy refuses (`IntroPolicy::refuses`, §14), not this
@@ -924,10 +935,11 @@ place of the offer's, never the token.
   7. the signing key is a key of device `D`, and the context's trust schema lets it sign
      this name, else `HintMismatch` (`signer`);
   8. **a gone mark** that passed 3–7 ends the join as it says, `Closed` or `Expired`
-     (`AskOwner`), and no further step runs. A gone mark that failed any of 3–7, or does not
-     read, is `GoneUnproven` (`RetryLater`) — "the first contact says the offer is closed but
+     (`AskOwner`), and no further step runs. A gone mark that failed any of 3–7 is
+     `GoneUnproven` (`RetryLater`) — "the first contact says the offer is closed but
      can't prove it: retry, or ask the inviter" — never `Closed` or `Expired`: anyone on the
-     path can make a mark that proves nothing (§18);
+     path can make a mark that proves nothing (§18); Content that is neither a record nor a
+     mark was already refused by check 2 (`Hint`, `wrong record`);
   9. the record's offer is an offer name of device `D` (§2.2), else `HintMismatch` (`offer`);
   10. the namespace is judged as an inviter's (step 4), now that the fingerprint is whole and
       proven, before the record's key is dialled: `InviterConflict`.
@@ -975,61 +987,70 @@ place of the offer's, never the token.
 Absent a dial that succeeded, the joiner's Interests carry a ForwardingHint: the relays the code names,
 else those its own namespace's trust context advertises; none, routed by name. Hints only reach (§18).
 
-### 8.4 What the previous steps took from the old walk
+### 8.4 No walk
 
-The previous design's joiner followed the folder and then waited for a walk of every device of the
-inviter's namespace toward the folder (a summary tree). This layer has no summaries: a space replicates
-exactly its members' logs (heap.md §3.8, §7), so there is nothing to walk. The wait is §8.5.
+The joiner of the previous design followed the folder and then waited for a walk of every device of the
+inviter's namespace toward it (a summary tree). This layer has no summaries: a space replicates exactly its
+members' logs (heap.md §3.8, §7), so there is nothing to walk. The wait is §8.5.
 
 ### 8.5 The wait: returns once the joiner may write
 
 After step 5, `join`:
 
-1. calls `Node::open(space)` (heap.md §10.2: idempotent, never waits for the network);
-2. calls `Node::note_joined(space)` **before** the wait's first look. The note is local, never served,
-   and keeps the joiner's `put` into the space from answering `NotAllowed` (`AskOwner`) while the
-   admission is on its way: the heap answers `NotReady` (`RetryLater`) in its place, from the
-   note's creation until the fold lists this device's person, and it ends then. It does not live
-   longer than the offer would have (§8.6);
-3. waits, for at most `Config::first_look * 3 + Config::lifetime` (the bound of every wait of a
-   join), for **all** of these:
-   1. the fold lists this device's person: `Heap::members()` lists it as a writer when the role is
-      writer, as a reader otherwise (heap.md §5.4);
-   2. for a sealed space, the epoch key is held (`Heap::holds_epoch_key`, heap.md §10.3): while it
-      is missing the node asks for the grant (heap.md §6.5, §7.8) and the wait does not end it;
-   3. the entry the answer named as `ADMITTED` is held and applied (`Heap::applied`, heap.md §10.3):
-      the entry that admitted it, in the log of the owner device that signed it. Until it is applied
-      the fold may list the person by another carrier, and the entries the writer is about to depend
-      on (its own `put`) would be judged against a fold that does not hold the carrier;
-   no wait ends the others' asks;
-4. returns `Joined { space, role, inviter }` — the offer answered **and** all of the above held, so a
-   `put` in the space is refused for want of none of them.
+1. calls `Node::open(space)` (heap.md §10.2: idempotent, never waits for the network); the heap then asks for what it lacks —
+   the epoch key by its grant, among it (heap.md §6.5, §7.8);
+2. calls `Node::note_joined(space)` **before** the wait's first look. The note is the node's own, stored at
+   `/localhost/ndn-heap/joined/<space>`, never served (heap.md §10.9): while it stands and the fold does not list this
+   device's person, a `put` the fold would refuse as `NotAllowed` (`AskOwner`) answers `NotReady`
+   (`RetryLater`) in its place, because the entry that lists the person is on its way. The node removes the
+   note when the fold lists the person (owner, writer or reader), and when a removal of the person arrives that the note did
+   not name while no `ADD` of hers stands; `note_joined` keeps nothing for a space that lists the person already. The note is
+   durable with the node's next flush, so a restart between the answer and the entry still tells the device to wait;
+3. waits, for at most `Config::first_look * 3 + Config::lifetime` counted from the start of the wait (the bound of
+   every wait of a join), polling the heap every 20 ms, until **all** of these hold, checked in this order:
+   1. the space's creation is held (`Heap::members_known`);
+   2. the fold lists this device's person: for a writer, as a writer **and** as a reader (a writer of a sealed space must
+      be a reader to hold the key, heap.md §5.7); for a reader, as a reader (`Heap::members()`, heap.md §5.4; a public
+      space lists every person as a reader);
+   3. the epoch key is held (`Heap::holds_epoch_key`, heap.md §10.3; a public space needs none);
+   4. when the answer names an `ADMITTED` entry, that entry is held and applied (`Heap::applied`, heap.md §10.3): the entry
+      that admitted it, in the log of the owner device that signed it. While it is not applied the join fetches it by name
+      (`Node::fetch_entry` of `<device>/32=log/<space>/seq=<n>`: the writer is asked, then the members that vouch for its
+      log), so a notice that never reaches the joiner does not keep the entry from it. An answer that names none (the
+      space listed the person already when it was answered, §9.4) waits for the fold alone;
+4. keeps the **mirror note**, durably, and tells the host (§11 rule 17);
+5. returns `Joined { space, role, inviter }` — the offer answered **and** all of the above held, so a `put` in the space is
+   refused for want of none of them.
 
-When the bound passes: `NotReady { name: <space>, why }` with next step `RetryLater`, `why` naming which
-is missing ("the space's creation is not held here yet", "the members of the space held here do not list
-this device's person yet", "the epoch key of the space (its grant) is not held here yet", "the entry
-that admitted this device (`<id>`) is not applied here yet") and what to do: join again with the same
-code, or put again; both are safe. A device that is lost is marked suspected or revoked, and is not
-waited for then. A reader waits for the same things (a reader needs no writer listing: the fold lists it as a
-reader).
+When the bound passes: `NotReady { name: <space>, why }` with next step `RetryLater`, `why` naming the first thing
+missing ("the creation of the space has not been heard here yet", "the members of the space held here do not list this
+device's person as a writer (or reader) yet", "the epoch key of the space (its grant) is not held here yet", "the members
+entry `<device>` seq `<n>` that admitted this device is not applied here yet") and what to do: join again with the same
+code (the offer answers the device it admitted), or put again; both are safe. A device that is lost is marked suspected or
+revoked, and is not waited for then.
 
 ### 8.6 `join` is idempotent for the same code
 
 A second call by the key an offer admitted asks the offer again, which answers it as it answered the first
 (§9.2 step 6: the same key asking again is answered again, and a closed offer still answers the key it
 admitted until it expires, §5.4), and then waits for the same things. It never answers "already used" to the
-device it admitted. The joiner's note (§8.5 step 2) lets go when the offer has expired by this device's clock
-(an inviter that never sends the entry cannot keep a retrying program waiting for good), and when the
-fold held here lists the person and a later removal then dropped it (a removed joiner who joins again,
-answered as it was, is told so, not to wait: its `put` is `AskOwner`, or `Sealed` under an audience that
-leaves it out).
+device it admitted.
+
+**A removed joiner who joins again.** The acceptance kept for the use names the entry that once admitted the device, and
+that entry stays applied; the fold, however, no longer lists the person. The note of §8.5 step 2 is made with the digests of the
+removals held when it was made, so the removal of the earlier invitation does not end it (heap.md §10.9): the join ends at the
+bound of §8.5 with `NotReady` naming that the members do not list this device's person, and a `put` made meanwhile is
+`NotReady` rather than `AskOwner`. Only a removal the note did not name, arriving while no `ADD` of the person stands (an
+admission undone before this device ever saw it listed), ends the note and makes the refusal `NotAllowed` again. This differs
+from data-layer.md §19.3 step 6, whose note let go at a record of the admission's revision or later that left the device out
+(§20): a removed joiner is told to retry, not to ask the owner, and a new offer is what admits it again.
 
 ## 9. Answering
 
 The offering device answers an ask of its own name in its own task, one ask at a
-time, so a use, a counted try and a closing mark each see the one before. It keeps
-each answer by the ask's name: the same ask asked again gets the same answer while
-it is kept, and a refusal or an answer is never computed twice for one ask.
+time, so a use, a counted try and a closing mark each see the one before. It keeps the
+last 1,024 answers it signed, each by the ask's name (the oldest dropped first): the same ask asked
+again gets the same answer while it is kept, and a refusal or an answer is never computed twice for one ask.
 
 ### 9.1 A crowd of asks is bounded
 
@@ -1051,13 +1072,15 @@ at once (8 by default), before any unwrapping.
 3. **The offer is its own and known**: named under this device
    (`<D>/32=intro/32=offer/<id>`), an offer it holds (`offer/<id>`), its proof key in its
    store (`key/<id>`). Else `Unknown`.
-4. **Not closed to this key.** An offer is *closed* when `closed/<id>` is held, or when
+4. **Not closed to this key.** An offer is *closed* when `closed/<id>` is held, when
    at least `IntroPolicy::wrong_tries_max` wrong tries are counted toward the overall
-   cap. A closed offer admits no one new: it answers `Closed`, except to the key
-   `used/<id>` names (not a use a stop interrupted, which was never completed; `using/<id>`
-   alone is no use), which it answers as step 6 says — the acceptance kept for its use,
-   and nothing else — while the offer has not expired by this device's clock, and
-   `Expired` after. So closing never makes an offer answer more than it did: an open
+   cap, or when the fold shows a removal of the person it was used by (§5.4). A closed offer
+   admits no one new: it answers `Closed`, except to the key `used/<id>` names (not a use
+   a stop interrupted, which was never completed; `using/<id>` alone is no use), which it
+   answers as step 6 says — the acceptance kept for its use, and nothing else — while the
+   offer has not expired by this device's clock, and `Expired` after. This comparison is
+   made on the key the proof packet claims, before step 5 checks its chain; step 6 compares
+   the verified key. So closing never makes an offer answer more than it did: an open
    offer's user is answered whenever it asks (step 6), a closed offer's until the offer
    expires.
 5. **The asker's key chains to the anchor it sent**: the proof packet, named
@@ -1067,9 +1090,10 @@ at once (8 by default), before any unwrapping.
    enrollment the joiner's own check (§8.2 step 2) reports.
 6. **Not used by another key**: `used/<id>` — or a use under way that a stop interrupted
    (`using/<id>`) — naming another key or digest is `Used`; nothing is counted. Used by this
-   key, it answers the acceptance it kept for the use (`accepted/<id>`), and does nothing
-   else: no step below runs again, no anchor is adopted and no members entry is signed — a
-   person a later members entry removed is never added back by its code.
+   key, it answers the acceptance it kept for the use (`accepted/<id>`; made again, without `ADMITTED`, from the proof key
+   when none was kept), and does nothing else: no step below runs again, no anchor is adopted and no members entry is
+   signed — a person a later members entry removed is never added back by its code. A key whose use a stop interrupted
+   (`using/<id>` naming it, no `used/<id>`) goes on through steps 7–10 and the use again.
 7. **Not expired**: its expiry is after this device's clock now. Else `Expired`.
 8. **The asker's tries are not spent**: fewer wrong tries of this key counted than the
    offer's `TRIES`. Else `Closed`.
@@ -1104,39 +1128,45 @@ Then the use. The device, in this order:
    ask); takes into its validator the certificates on the verified chain from the asker's key to
    its anchor, named under the asker's namespace, and no other presented certificate.
 4. **Makes the members entry**, one `Heap::change(MembersChange { add_writers: [ns] if the role is
-   writer, add_readers: [ns], remove: [] })` of `S` (§9.4). The `EntryId` it returns goes into the
-   answer as `ADMITTED`.
-5. **Keeps the acceptance and the use mark**: `accepted/<id>` (the acceptance it answers: the offer,
-   the asker's key and digest, the space, the role, `ADMITTED`, the inviter's credentials and the
-   inviter's proof packet, the answer proof) and `used/<id>` (the key and the digest), together
-   with the grant note (§10 rule 3), all durable (`Node::flush`) before the answer.
+   writer, add_readers: [ns], remove: [] })` of `S` (§9.4), unless the fold lists `ns` already in every role asked. The
+   `EntryId` it returns goes into the answer as `ADMITTED`.
+5. **Keeps the acceptance, the use mark and the grant** in one durable batch (`Node::flush`) before the answer:
+   `accepted/<id>` (the acceptance it answers: the offer, the asker's key and digest, the space, the role, `ADMITTED`, the
+   inviter's credentials and the inviter's proof packet, the answer proof), `used/<id>` (the key and the digest), the grant note
+   (§10 rule 3), and the removal of `using/<id>`: all of it is there before the answer, or none.
 6. **Tells the host** (`Host::grant`, once, §10 rule 3), and only then sends the answer.
 
-If the adoption, the proof check or the entry fails, the device drops `using/<id>` durably — the
-offer is not spent — and gives no answer to a failure, `Conflict` to refused anchors; the joiner's
-retry is judged again. A stop after step 1 and before step 5 leaves the offer to that key: its retry
-runs the use again (step 6 of the checks lets no other key in, and no other key is counted).
+If the adoption or the entry fails, the device drops `using/<id>` durably — the offer is not spent — and gives
+no answer (a Nack); if the host adopts the asker but the namespace it adopted from its genesis does not hold the presented
+anchors, or the asker's proof does not verify under the namespace as this device now holds it, the device drops
+`using/<id>` the same way and answers `Conflict`. The joiner's retry is judged again. If the durable batch of step 5 fails,
+`using/<id>` stays and the device gives no answer: a stop after step 1 and before the batch leaves the offer to that key,
+and its retry runs the use again (step 6 of the checks lets no other key in, and no other key is counted).
 
 ### 9.4 The inviter's effect on the space
 
 The inviter's whole effect on the space is **one members entry**, signed by this device through the
 heap: `Heap::change(MembersChange { add_writers, add_readers, remove: [] })`, with the asker's person
-`ns` (the namespace the exchange adopted, never one the asker merely claims over another) as a writer
-when the role is writer and as a reader always (a writer of a sealed space MUST also be a reader,
-heap.md §5.7; a reader of a public space is everybody, and the `ADD` is harmless there). Everything the
-heap does for a members change follows from it: a reader's `ADD` names the epoch in force, so the
-reader is in its audience and is granted its key by the pull of heap.md §6.5 with no new epoch
-(heap.md §10.3). The crate signs no entry of its own, adds nothing to the space but this entry, and
-needs no walk or note from the joiner beyond §8.5.
+`ns` (the namespace the exchange adopted, never one the asker merely claims over another) as a writer when the role
+is writer and as a reader (a writer of a sealed space MUST also be a reader, heap.md §5.7). Everything the heap
+does for a members change follows from it: a reader's `ADD` names the epoch in force, so the reader is in its
+audience and is granted its key by the pull of heap.md §6.5 with no new epoch (heap.md §10.3). The crate signs no
+entry of its own, adds nothing to the space but this entry, and needs no walk or note from the joiner beyond §8.5.
 
-The entry's `EntryId` (the device, seq and signed-region digest of the entry `change` returned, heap.md
-§10.3) goes into the answer as `ADMITTED` (§16.1). It says which entry admitted the joiner: the joiner
-waits for exactly that entry (§8.5), so it never returns before the entry that admitted it is applied
-here, and an entry that raced it (another owner device's entry, a removal) cannot be taken for it. The
-inviter's `change` is subject to heap.md §10.3: `NotOwner` from a device that is not an owner device
-(an offer is made only by one, §5.3), `Refused` from a revoked or suspected key, and `BadRequest` when
-nothing was to be signed (the person already stands in every role asked); an answer built after any of
-them is not made, `using/<id>` is dropped and the joiner's retry is judged again.
+**When no entry is made.** The device reads `Heap::members()` first. When the fold lists `ns` already in every role
+asked (as a writer when the role is writer, and as a reader — a public space lists every person as a reader) it signs
+nothing, and the answer carries **no `ADMITTED`**: the joiner then waits for the fold alone (§8.5). Otherwise it makes the
+one entry; the heap itself skips a role in which the person already stands.
+
+The entry's `EntryId` (the device, seq and signed-region digest of the entry `change` returned, heap.md §10.3) goes into
+the answer as `ADMITTED` (§16.1): the id `Heap::change` returned, which is the last entry the change signed — its Members entry,
+or the Epoch entry it owed a sealed space, which follows it in the same log (heap.md §10.9). It says which entry admitted the
+joiner: the joiner waits for exactly that entry (§8.5), so it never returns before it is applied here, and an entry that raced it
+(another owner device's entry, a removal) cannot be taken for it. The inviter's `change` is subject to heap.md §10.3: `NotOwner`
+from a device that is not an owner device (`offer` does not read this, §5.3), `Refused` from a revoked or suspected key, `Local`
+from the disk.
+When it fails, the device drops `using/<id>`, signs nothing more, and gives no answer (a Nack): the joiner's retry is
+judged again.
 
 ### 9.5 Replay: one key never two
 
@@ -1152,12 +1182,11 @@ asks that race (the device answers one ask at a time).
 
 The removal of the member an offer brought lasts: the offer's user asking again — a fresh ask, before or
 after a restart — is answered the acceptance kept for its use and never admitted again (§9.2 step 6),
-and no other key can use it, whichever owner device removed the member. A members entry that removes the
-namespace the offer's user was admitted as closes the offer (`closed/<id>`) as if `close_offer` had been
-called (§10 rule 7): the offer then admits no one new, and its user alone is still answered until the
-offer expires, with the acceptance kept for its use and nothing else. Nothing is adopted or signed, so
-asking does not make a removed member a member again, and what the answer shows is what the code's holder
-already had.
+and no other key can use it, whichever owner device removed the member. While the fold shows a removal of the
+person the offer was used by (`Heap::removed_by`, §5.4) the offer counts as closed, with no mark written (§5.4): it
+admits no one new, and its user alone is still answered until the offer expires, with the acceptance kept for its use
+and nothing else. Nothing is adopted or signed, so asking does not make a removed member a member again, and what the
+answer shows is what the code's holder already had.
 
 ### 9.6 Wrong tries, and their durability
 
@@ -1238,10 +1267,12 @@ of a members **entry** (§11). The host's side of every call is §12.
    `until`, whether it ended, and a MAC (rule 11). The note is written with the acceptance under the
    `Node::flush` the use mark waits for, so a durable use mark means a durable note; the device then calls
    `Host::grant` once, and only then sends the answer. A note is the device's own and never served or
-   published. **No TLV-TYPE is registered or used for it:** its value is a fixed-width local form (a
-   version octet, flags (ended, dated, marked), the role, `until`, the key digest, three length-prefixed
-   Names, on a marked note the mark's date and its record Name (rule 14), then the 32-octet MAC), like the
-   other notes under `/localhost/ndn-invite/`. A note this version does not read, or whose MAC does not
+   published. **No TLV-TYPE is registered or used for it:** its value is a fixed-width local form: a version octet (3;
+   a version 2 note, written before departure marks, is still read), flags (1 ended, 2 dated, 4 marked — a mark only on
+   an ended note), the role (0 reader, 1 writer), `until` (8 octets, big-endian, zero when undated), the key digest
+   (32 octets), three Name TLVs each behind a 2-octet big-endian length — the offer, the space, the namespace — on a
+   marked note the mark's date (8 octets) and its record Name in the same form (rule 14), then the 32-octet MAC;
+   like the other notes under `/localhost/ndn-invite/`. A note this version does not read, or whose MAC does not
    check, is ignored, and the device logs which and why (a person whose note is ignored has no grant: offer
    the space to them again).
 4. **A retry grants nothing.** An asker answered again (§9.2 step 6: the acceptance kept) MUST NOT be
@@ -1255,15 +1286,17 @@ of a members **entry** (§11). The host's side of every call is §12.
 6. **In force, in the role the fold gives.** `Invites::grants` lists the grants whose offer this device made
    and used by the very key the note names, that have not ended, whose date (if it has one) has not passed
    by the device's clock, and whose space's fold lists the namespace as a writer or as a reader
-   (`Heap::members()`, heap.md §5.4). Its `role` is **derived from the fold at every call**: a writer if the
-   fold lists the namespace as a writer, else a reader — never the role the offer had. **The grants are
-   re-evaluated on every `Change::Members` of the space (`Heap::watch`, heap.md §10.4) and once at start**: a
-   restart installs every live grant again through `Host::grant`. When a change alters the role of a grant,
-   the device updates the note durably and calls `Host::grant` again with the grant as it now stands (the
-   host replaces its grant; ndn-link closes a link made under the old scope); a writer demoted to a reader
-   is a reader at once, not at the grant's end. It is derived from the notes and the fold, so it is the same
-   after a restart, less what ended. While the space is not open here no grant of it is in force. One `Grant`
-   is listed for each live note (rule 13).
+   (`Heap::members()`, heap.md §5.4; in a public space every person is a reader unless a held entry removed it).
+   Its `role` is **derived from the fold at every call**: a writer if the fold lists the namespace as a writer, else a
+   reader — never the role the offer had. **The grants are re-evaluated on every `Change::Members`, `Change::Alert` and
+   `Change::Lagged` of a followed space (`Heap::watch`, heap.md §10.4), every half of the node's `svs.sync_interval` (never
+   faster than every 10 ms: the poll the plan keeps for a watcher that is slow), and once at start**: a restart installs every live
+   grant and every departure mark in force again through `Host::grant` and `Host::departure`. When a change alters the role of a
+   grant, the device updates the note durably and calls `Host::grant` again with the grant as it now stands (the host replaces its
+   grant; ndn-link closes a link made under the old scope); a writer demoted to a reader is a reader at once, not at the grant's end.
+   It is derived from the notes and the fold, so it is the same after a restart, less what ended. While the space is not open here,
+   or its creation is not held, **nothing is judged and no grant of it is in force** (nothing ends either: a note waits for the fold
+   to be seen). One `Grant` is listed for each live note (rule 13).
 7. **It ends** at its date, if it has one (the link layer judges it by its own clock; the device does not
    announce a lapse), when the host ends it (rule 9), or when the fold of **the grant's own space** lists the
    namespace neither as a writer nor as a reader (each note is judged against the fold of its own space, so a
@@ -1334,10 +1367,11 @@ note can cite one number for one rule). Rule 16, the co-writers, is the surface'
     `IntroPolicy::departure_for` is not zero (default seven days), the note keeps a **departure mark**: the log name of the members entry
     that removed the person — `<signer device>/32=log/<space>/seq=<n>` — and the date after which the mark is no longer shown (`until`,
     by this device's clock, the end's time plus `departure_for`). The entry is the one `Heap::removed_by(person)` names, a function of the
-    entries held (heap.md §10.3): where several entries carry a removal of the person, the one of lowest rank (signed-region digest, then
-    device name, then seq, heap.md §5.2), so every device that holds the same entries names the same one. When no held entry names a
-    removal of the person (the person was dropped by a cut that no members operation names), **no mark is made** and the link layer just
-    closes (a fallback that is never an open link). A mark is made **only when a held entry ends the grant**: `Invites::end_grant` and
+    entries applied (heap.md §10.3): of the applied Members entries that remove an `ADD` of the person's, the one of lowest signed-region
+    digest (heap.md §1.5), so every device that holds the same entries names the same one; it is `None` for a person the space still lists,
+    one it never listed, and the owner. When it names none (the person was dropped by a cut that no members operation names), **no mark is made**
+    and the link layer just closes (a fallback that is never an open link). A mark is made **only when a held entry ends the grant**:
+    `Invites::end_grant` and
     `end_grant_in` (the host's end, which no entry lets the person go by) make none, and a host that wants none for any end sets
     `departure_for` to `Duration::ZERO`. The mark is inside the MAC (rule 11). `Host::departure` is called **once, just before
     `revoke_grant` of the same grant** (in memory, before the note is durable, so a link layer that narrows its link at its last entry's
@@ -1351,32 +1385,36 @@ note can cite one number for one rule). Rule 16, the co-writers, is the surface'
 15. **The departed person's side.** `Surface::take_departure(from, space, record)` is what the person's host calls when its link layer was
     told, by the inviter's, which entry let it go (`Departure`, ndn-link.md §8.8). `from` is the **authenticated device of the peer that
     told it** (the link layer's: a full link, whose peer's certificate validated in a namespace this device holds; never an enrollment or
-    introduction link). It fetches `record` by name, from the link it came over or from the devices of its namespace, with
-    `Node::fetch_entry` (heap.md §10.2), and takes it **as any held entry**: the signature and chain are validated, the entry is judged
+    introduction link). It fetches `record` by name with `Node::fetch_entry` (heap.md §10.9): the writer is asked, then the members that
+    vouch for its log. The entry is taken **as any held entry**: the signature and chain are validated, the entry is judged
     and applied as ever, so this device's own space then no longer lists it, it withdraws what it wrote after the cut and takes no more
     writing there. **The name carries no authority**; the call MUST refuse (`BadRequest`, saying why and what to do) unless (a) `space`
     is a space name, (a2) `from` lies under the owner namespace of `space` (only a device of the space's own namespace lets a member go
     of it; checked first, so a refusal costs the fetch slot and the minute's bound nothing), (b) `record` is a log entry whose space is
-    `space`, (c) this device has the space open (it is, or was, a member), (d) the record's device lies under a namespace this device
-    holds a trust context of, and (e) what is fetched is a members entry of `space`. An entry already held is `Ok` at once (for a `from`
-    that passed (a2)). At most **one take of a space is in flight** and at most **six begin a minute** (the device's clock; a bound on a
-    hostile inviter's stream of hints, not a correctness rule): the call is `NotReady` — ask again — for either, and when the entry could
-    not be fetched. Correctness never depends on timing: the person's own space keeps being judged by the entries it holds, whether it
-    was told or not.
+    `space`, (c) this device has the space open (it is, or was, a member), and (d) the record's device lies under this device's own
+    namespace or a namespace this device holds a trust context of. The call does not separately require that what is fetched is a
+    members entry: the heap admits an entry only as the judge of heap.md §3.8 allows, and an entry that is no members entry changes
+    nothing about who the space lists (§20). An entry already held is `Ok` at once (for a `from` that passed (a2)). At most
+    **one take of a space is in flight** and at most **six begin a minute** (the device's clock; a bound on a hostile inviter's stream of
+    hints, not a correctness rule): the call is `NotReady` — ask again — for either, and when the entry could not be fetched. Correctness
+    never depends on timing: the person's own space keeps being judged by the entries it holds, whether it was told or not.
 17. **The mirror grant: the joiner's end.** A successful `join` keeps, after the entry that admits the device is applied (§8.5), a
     **mirror note** — durable before `join` returns, the host told after (`Host::grant`): the inviter's **key** (the digest of the key that
     signed the answer, which the join verified belongs to the offering device under the anchor the code named), the **space**, and the
     inviter's namespace as the space's **owner**. It is the mirror of the inviter's note (rule 2) and is kept the same way: a fixed-width
-    local value under `mirror/<space>/<key>` (§15; never served, never on the wire, **no TLV-TYPE registered**), ending in an HMAC-SHA256
-    under a key derived (HKDF) from the device's recipient secret **with labels of its own** (§4.5), so a mirror note is never read as an
-    inviter's note nor the reverse; a note that fails its check, or is of a version not read, is ignored with a warning that says why and
+    local value under `mirror/<space>/<key>` (§15; never served, never on the wire, **no TLV-TYPE registered**): a version octet (1),
+    flags (1 ended), the inviter's role (0 reader, 1 writer), the inviter's key digest (32 octets), the space and the owner as Name TLVs
+    each behind a 2-octet big-endian length, then an HMAC-SHA256 over every octet before it (32 octets), under a key derived (HKDF) from the
+    device's recipient secret **with labels of its own** (§4.5), so a mirror note is never read as an inviter's
+    note nor the reverse; a note that fails its check, or is of a version not read, is ignored with a warning that says why and
     what to do (join again with a new offer). The note names **no role the device trusts**: the entry's role is **re-derived from the fold
     at every judgement** — a writer when the space lists the owner's namespace as a writer, else a reader, never wider than the fold says —
     and the entry **stands only while the fold lists this device's person** (a writer when the fold lists it as a writer, else a reader; a
     public space lists every person as a reader). A space not open here: no entry (nothing to judge by, so nothing is granted). The note
     is kept **only for a space owned by the inviter's own namespace** (`owner(space) == owner`): a hostile offer that names a space of the
-    joiner's own namespace — whose fold lists the joiner — would otherwise grant the inviter a link into it; the join says so and keeps
-    nothing. `Invites::grants()` lists a live mirror entry like any grant (key = the inviter's, `namespaces = [owner]`, `folder` the space,
+    joiner's own namespace — whose fold lists the joiner — would otherwise grant the inviter a link into it. When the note is not kept
+    (that, or a fold that does not list this device's person, or a space not open here) the join says so in its log, keeps nothing, and still
+    returns `Joined`: it is the grant that is missing, not the admission, and a new offer makes it. `Invites::grants()` lists a live mirror entry like any grant (key = the inviter's, `namespaces = [owner]`, `folder` the space,
     the inviter's role, `until = None`: it follows the fold); `Host::grant` is called once the note is durable and again when a change alters
     the inviter's role; `Host::revoke_grant(key, space)` when a change leaves this device's person out (in memory first, then the note is
     marked ended durably); **`Host::departure` is never called for a mirror**: the person who is let go is told by the inviter (rules 14–15),
@@ -1426,8 +1464,8 @@ pub trait Host: Send + Sync {
     fn anchor(&self) -> Option<Bytes>;
     fn adopt<'a>(&'a self, link: &'a TrustEnvelope) -> Adopting<'a>;
     fn link_hint(&self) -> Option<LinkHint> { None }
-    fn dial<'a>(&'a self, hint: &'a LinkHint, inviter: &'a Name, within: Duration) -> Dialing<'a>;
-    fn dial_first<'a>(&'a self, inviter: &'a Name, addr: SocketAddr, within: Duration) -> FirstDialing<'a>;
+    fn dial<'a>(&'a self, hint: &'a LinkHint, inviter: &'a Name, within: Duration) -> Dialing<'a> { /* Err: no link layer */ }
+    fn dial_first<'a>(&'a self, inviter: &'a Name, addr: SocketAddr, within: Duration) -> FirstDialing<'a> { /* Err: no link layer */ }
     fn undial(&self, hint: &LinkHint, inviter: &Name) {}
     fn grant(&self, grant: &Grant) {}
     fn revoke_grant(&self, key: &[u8; 32], folder: &Name) {}
@@ -1440,7 +1478,7 @@ pub type FirstDialing<'a> = BoxFuture<'a, Result<[u8; 32], String>>;
 
 | Method | When the crate calls it | What it MUST do | Default |
 |---|---|---|---|
-| `anchor` | to give credentials: the signed trust-context Data of this device's namespace, whole, as the host adopted it (what an inline anchor link carries) | return it, or `None` when none can be made: the device then answers no ask and makes no hint record | — (required) |
+| `anchor` | to give credentials: the signed trust-context Data of this device's namespace, whole, as the host adopted it (what an inline anchor link carries), by `offer`, a join, an answer and a hint record | return it, or `None` when none can be made: `offer` and `join` then refuse with `Local` (fix the host's enrollment), and a hint request is met with silence | — (required) |
 | `adopt(link)` | after the crate checked `link`, an inline anchor link (`TrustEnvelope::Anchor`: namespace, fingerprint, signed context): by the joiner at §8.2 step 5, by the inviter at §9.3 step 2 | `Ok` once this device's validator trusts the namespace; an error says why not. A host on a forwarder adopts through it so the forwarder also validates and routes the namespace. A self-certifying `/user/<h>` not held is adopted by name over the network (version 1 fetched and checked against the name, the newest reached from it; the context the link carries is never taken alone, a version 1 only compared with the fetched one, a different one refused as a fork); with no network to fetch over, refuse, saying to join again once the person's devices are reachable | — (required) |
 | `link_hint` | once per `offer`, and once for each hint record made on request (§7.1 item 4) | the device's link key and at most `LINK_HINT_CANDIDATES_MAX` candidates, so a joiner with no routes and no daemon dials this device by key | `None`: the code carries no hint |
 | `dial(hint, inviter, within)` | by the joiner, once per `join`, before any Interest (§8.2 step 0, §8.3 S6) | try `hint.candidates` in order and link only to the device whose key is `hint.key` (the handshake proves it; an address that answers with another key is no link), within `within` in all. `Ok` once a link is up that carries `inviter`'s introduction names to it. Send nothing of the code's secret | an error saying the host has no link layer to dial with and what to do |
@@ -1452,9 +1490,8 @@ pub type FirstDialing<'a> = BoxFuture<'a, Result<[u8; 32], String>>;
 
 **Guarantees of the crate to the host.**
 
-1. Every call is made from the crate's own tasks, never under one of its locks, and never concurrently for the
-   same `(key, space)`. `grant`, `revoke_grant` and `departure` are not awaited and MUST NOT block or call back
-   into the crate (§10 rule 8).
+1. Every call is made from the crate's own tasks. `grant`, `revoke_grant` and `departure` are not awaited and MUST NOT block or
+   call back into the crate (§10 rule 8).
 2. `grant` is called after, never before, the note it reports is durable; `revoke_grant` is called before the
    note's end is durable (§10 rule 7).
 3. `adopt`, `dial` and `dial_first` are called only after the code was judged (§8.1) and, for a short code,
@@ -1483,17 +1520,20 @@ and a joiner that dials after the last offer expired meets no link, not a gone m
 
 Over the link `Surface::carries(name)` is true for exactly these names of the device `D`, and no other:
 
-1. the ask, `<D>/32=intro/<ParametersSha256Digest>` (§2.2), while the surface is open;
-2. the offer's own packet, `<D>/32=intro/32=offer/<id>` (§2.2), for an offer of this device that has not expired;
+1. the ask family: a name under `<D>/32=intro` that is not an offer's name — the ask is `<D>/32=intro/<ParametersSha256Digest>`
+   (§2.2) — while the surface is open. The family is carried as a family and only the ask is answered: the extension answers
+   nothing else under `32=intro` (§2.3), so an Interest of the family that is no ask meets silence at the device;
+2. the offer's own packet, `<D>/32=intro/32=offer/<id>` (§2.2), for an offer of this device that has not expired (a well-formed
+   offer name of another id, or of an offer past its expiry, is not carried);
 3. a short code's hint record, `<D>/32=hint/<token>` (§2.2), `token` that of one of the device's own offers with a short code, whether
    the offer is open, closed or expired: the answer is then its gone mark (§7.1 item 3).
 
-No other name crosses: not another name of the `32=intro` family (the prefix alone, a `32=offer` with another id, a name that is neither
-`32=offer` nor a digest), not another name of the `32=hint` family (the prefix alone, a token the device does not hold), not any log entry,
-piece, seal key or held copy the device holds by name — though the device serves them to its members — and nothing of another device. The
-offer is fetched by its own name, so the previous design's `32=held` family is gone. **The two prefixes** `introduction_prefixes(D)` =
-`[<D>/32=intro, <D>/32=hint]` are what a dialled link routes, the surface's per-name decision is what it carries (ndn-link.md §13.3,
-§13.3A). `Surface` also answers `open()` for the link layer to decide whether to admit a stranger at all.
+No other name crosses: not another name of the `32=hint` family (the prefix alone, a token the device does not hold), not any log
+entry, piece, seal key or held copy the device holds by name — though the device serves them to its members — and nothing of another
+device. The offer is fetched by its own name, so the previous design's `32=held` family is gone. **The two prefixes**
+`introduction_prefixes(D)` = `[<D>/32=intro, <D>/32=hint]` are what a dialled link routes, the surface's per-name decision is what it
+carries (ndn-link.md §13.3, §13.3A). `Surface::open()` answers whether some offer has not expired, for the link layer to decide
+whether to admit a stranger at all.
 
 ### 13.2 What a grant link carries: `folder_carries`
 
@@ -1520,11 +1560,12 @@ so a grant for no space carries nothing.
 `writer_carries(space, writer_namespaces(space), name)`, the writers read **live, on every call**, from the fold of `space`
 (`Heap::members()`; no cache), so a writer the fold no longer lists drops out at the next call and one it lists appears at the next.
 
-The namespaces are **derived by the device, once, for every use** (`Surface::writer_namespaces(space)`): for each writer person of the
-fold, the namespace of the trust context governing it here (a person is a namespace, heap.md §1.2; for a self-certifying person, the
-person's namespace once adopted for a space, heap.md §9.4), kept when it is not the space's own owner (`folder_carries`'s). The
-functions take these namespaces, never the writers' names, and match a name's namespace **whole**: a writer namespace `/home/carol` unlocks the
-names of `/home/carol`'s devices — never those of the broader `/home` its name merely starts with.
+The namespaces are **derived by the device, once, for every use** (`Surface::writer_namespaces(space)`): each writer person the fold
+of `space` lists now (a person is a namespace, matched exactly, heap.md §1.2: the fold lists persons, not name prefixes, so nothing
+is looked up through trust contexts), the space's own owner excluded (`folder_carries`'s), sorted and without repeats; empty when the
+space is not open here or its creation is not held. The functions take these namespaces, never the writers' names, and match a name's
+namespace **whole**: a writer namespace `/home/carol` unlocks the names of `/home/carol`'s devices — never those of the broader
+`/home` its name merely starts with.
 
 `writer_carries(space, namespaces, name)` adds only what a writer invited by an invitation of its own needs to reach the other
 writers' devices and keys:
@@ -1575,8 +1616,9 @@ number below is a field, and a deployment changes it without changing the crate.
 | `code_candidates` | 3 | the most link-hint candidates a full link carries (the record serves all 8) |
 | `code_relays` | 2 | the most relays a full link names |
 
-`InviteConfig` holds the crate's own bounds that are not a person's policy: `asks_verifying` (8, §9.1) and the
-timings it reads from the node's `Config` (`first_look`, `lifetime`, §8.5).
+`InviteConfig` holds the crate's own bounds that are not a person's policy: `asks_verifying` (8, §9.1, at least 1) and `entropy`
+(where an offer's secret and id and an ask's nonce come from; the operating system's randomness by default). The timings a join
+waits by (`first_look`, `lifetime`, §8.5) are the node's `Config` (heap.md §10.2).
 
 **What `refuses(ns)` says.** `IntroPolicy::refuses(ns)` answers why no introduction brings the namespace `ns`, if
 it does not, in a text that completes "the namespace `<ns>` …": the root; fewer than `min_components`
@@ -1607,19 +1649,20 @@ component; `<key>` the public-key digest, 32 octets, as one generic component.
 | `offer/<id>` | the signed offer packet | at `offer` | inviter |
 | `key/<id>` | the proof key, wrapped to the device's recipient key | at `offer` | inviter |
 | `hint/<id>` | the hint token, wrapped the same way; only with a short code | at `offer` | inviter |
-| `tries/<id>` | the overall wrong tries and when the last was counted | each wrong try (§9.6) | inviter |
-| `tries/<id>/<digest>` | one asker key's wrong tries | each wrong try | inviter |
-| `using/<id>` | the key a use under way is for | start of the use (§9.3 step 1); dropped on failure | inviter |
-| `accepted/<id>` | the acceptance answered to the key that used the offer | with `used/<id>` (§9.3 step 5) | inviter |
-| `used/<id>` | the use mark: the key and its public key's digest (`INTRO_USED`, §16.1) | with the acceptance; at most once | inviter |
-| `closed/<id>` | the closing mark (`INTRO_USED` naming the offer alone) | `close_offer`, the overall cap, a removal | inviter |
+| `tries/<id>` | the overall wrong tries (4 octets) and when the last was counted (8 octets), big-endian | each wrong try (§9.6) | inviter |
+| `tries/<id>/<digest>` | one asker key's wrong tries (4 octets, big-endian) | each wrong try | inviter |
+| `using/<id>` | the key a use under way is for: its Name TLV, then the digest (32 octets) | start of the use (§9.3 step 1); dropped on failure and in the batch of step 5 | inviter |
+| `accepted/<id>` | the acceptance answered to the key that used the offer (one `INTRO_ANSWER`) | with `used/<id>` (§9.3 step 5) | inviter |
+| `used/<id>` | the use mark: one `INTRO_USED` naming the offer, the key and its public key's digest (§16.1) | with the acceptance; at most once | inviter |
+| `closed/<id>` | the closing mark: one octet, `1` | `close_offer`, the overall cap (a removal closes by derivation, nothing is written, §5.4) | inviter |
 | `grant/<id>` | the grant note, MAC'd (§10 rule 3, 11) | with the acceptance | inviter |
-| `joined/<space>` | the note that this device was admitted to `<space>`: the offer's expiry and the admitting entry (§8.5) | §8.5 step 2 | joiner |
+| `joined/<space>` | this crate's note of a space this device joined, what the mirror note and the joined list are re-derived from (§11 rules 17, 18); distinct from the node's own `/localhost/ndn-heap/joined/<space>` of §8.5 step 2 | after §8.5 | joiner |
 | `mirror/<space>/<key>` | the mirror note, MAC'd (§11 rule 17) | when the admission is held | joiner |
 
-The values of `grant/…` and `mirror/…` are fixed-width local forms and are not TLV (§10 rule 3); the values
-of `used/…` and `closed/…` are one `INTRO_USED` TLV each (§16.1). The proof key and the token are
-wrapped to the device's recipient key (heap.md §6.2) so that a party that can write the store cannot make a note read.
+The values of `grant/…` and `mirror/…` are fixed-width local forms and are not TLV (§10 rule 3); the value of `used/…` is one
+`INTRO_USED` TLV (§16.1) and of `accepted/…` one `INTRO_ANSWER`. The proof key and the token are wrapped to the device's
+recipient key (heap.md §6.2), each bound to its own key's Name TLV as associated data, so that a party that can write the store
+cannot make a note read nor move one to another key.
 No key of this table is a Name that any function answering an Interest knows: a note is never answered, whatever the
 Interest asks, `CanBePrefix` included.
 
@@ -1642,7 +1685,7 @@ read only by a device that implements this specification.
 | TLV-TYPE | Name | Value |
 |---|---|---|
 | 0x0561 | `INTRO_OFFER` | `Name` (the space), `ROLE`, `KEEP_UNTIL` (its expiry), `TRIES`, `DIGEST` (the commitment), `SEAL_KEY` (the offering device's): the Content of an offer packet (§5.1) |
-| 0x0563 | `INTRO_USED` | `Name` (the offer), then `WRITER` and `DIGEST` (the asker key it was used by and its public key's digest) when used, neither when closed: the value of `used/<id>` and `closed/<id>` (§5.2). It is no longer a log record |
+| 0x0563 | `INTRO_USED` | `Name` (the offer), then `WRITER` and `DIGEST` (the asker key it was used by and its public key's digest) when used, neither when closed: the value of `used/<id>` (§5.2); the closed form is read but not written (`closed/<id>` is one octet). It is no longer a log record |
 | 0x0565 | `INTRO_ASK` | `EPHEMERAL_KEY`, `CIPHERTEXT` (a content key wrapped to the offer's `SEAL_KEY`), `CIPHERTEXT` (the `AskBody`: `Name` (offer), `NONCE`, `PROOF`, `CREDENTIALS`, `ASKER`, sealed under it): an ask Interest's ApplicationParameters (§8.2 step 2) |
 | 0x0567 | `INTRO_ANSWER` | `Name` (offer), `WRITER` (the asker key), `DIGEST` (its public key's digest), then `Name` (space), `ROLE`, `ADMITTED`, `CREDENTIALS`, `ASKER` (the offering device's proof), `PROOF` — or `INTRO_REFUSED`, with no `PROOF`: an answer's Content (§8.2 step 3, §9) |
 | 0x0569 | `ROLE` | NonNegativeInteger: 0 reader, 1 writer. (heap.md's `ROLE` 0x062B reads 0 writer, 1 reader: they are different TLVs, and this one is an offer's, never a members operation's) |
@@ -1726,7 +1769,7 @@ in a class (`NextStep`, heap.md §10.5); `retry()` says the same call can succee
 | `Forged` | an acceptance fails a check of §8.2 step 3, or an offer fails S7 (never on the wire) | `RetryLater` | yes |
 | `Hint { why }` | what answered at a short code's first contact came damaged or does not prove itself (§8.3 S5, checks 1–4; never on the wire; its code, were it sent, is 6): `why` begins with the check that failed — `wrong name`, `wrong record`, `credentials`, `signer` (the signature is not good by a key the credentials chain to their anchor). Damage in flight fails these checks as an impostor's packet does, and the packet is intact the next time, as a corrupted answer is (`Forged`) | `RetryLater`: retry at most 3 times (`HINT_RETRIES_MAX`), then do not use this code's first contact: ask for a new code | yes, bounded |
 | `HintMismatch { why }` | a record that **verifies** (its signature is good by a key that credentials which open vouch for) but is not the inviter this code names (§8.3 S5, checks 5–7 and 9; S7; never on the wire; code 6): `why` begins with `namespace`, `anchor` (also: the code was made before the keyed fingerprint), `signer` (not a key of the code's device, or not one the schema lets sign this name) or `offer` (no offer of the device, or not made with the code's secret). No damage in flight does this | `AskOwner` (do not use this code's first contact: ask for a new code) | no |
-| `GoneUnproven { why }` | a gone mark that fails any check of §8.3 S5 (3–7), or does not read: anyone on the path can make one (never on the wire; code 6) | `RetryLater`: retry at most 3 times, or ask the inviter | yes, bounded |
+| `GoneUnproven { why }` | a gone mark that fails any check of §8.3 S5 (3–7): anyone on the path can make one (never on the wire; code 6) | `RetryLater`: retry at most 3 times, or ask the inviter | yes, bounded |
 
 The inviter unreachable is `NotReady { name: <offer> }` (`RetryLater`): the offer waits. A code that does not
 parse is `BadRequest`; a host without a link layer when one is needed, or one that refuses an adoption, is `Local`.
@@ -1792,9 +1835,9 @@ first, and the ones that changed say so.
   heap's rules, judged by every reader as any members entry (heap.md §3.8 step 6), and the joiner waits for exactly it
   (§8.5): an entry that raced it, or a fold that listed the person by another carrier, is not taken for it.
 - **The signing the host surface lends is bounded.** The node signs for the extension only a name `<this device>/32=<keyword>/…`
-  of a keyword the extension registered (`intro`, `hint`): the key signs offers and hint records and cannot be made to sign
-  an entry's name, a certificate's, another device's or any octets the caller names (heap.md §10.2; the node offers no raw
-  signing).
+  of a keyword the extension registered (`intro`, `hint`, `ask`): the key signs offers, hint records, answers and the proof packets
+  `<X>/32=ask/<binding>` and cannot be made to sign an entry's name, a certificate's, another device's or any octets the caller names
+  (heap.md §10.2; the node offers no raw signing).
 
 ### 18.2 Carried over
 
@@ -1802,12 +1845,12 @@ first, and the ones that changed say so.
   One use binds it to one key (§9.2 step 6); the owner sees who joined in the space's members and removes them as any member
   (heap.md §5.6). The removal lasts: a used offer's user asking again — a fresh ask, before or after a restart — is answered the
   acceptance kept for its use and never admitted again (§9.5), and no other key can use it, whichever owner device removed the
-  member. A members entry the offering device sees that removes a namespace also closes every offer of that device a key under it
-  used (or was using): the offer then admits no one new, and its user alone is still answered, until the offer expires, the
-  acceptance kept for its use and nothing else: nothing is adopted or signed, so asking does not make a removed member a member
-  again, and what the answer shows is what the code's holder already had — the space's name, the role and the inviter's public
-  credentials. A removal another owner device signs closes the offers of the **offering** device the same way, as soon as the
-  offering device holds it: the closing mark is the offering device's own (§10 rule 7); it is only the offering device that marks.
+  member. A removal the offering device holds of the person an offer was used by (or was being used by), by whichever owner device
+  signed it, closes that offer by derivation (§5.4): the offer then admits no one new, and its user alone is still answered, until
+  the offer expires, the acceptance kept for its use and nothing else: nothing is adopted or signed, so asking does not make a
+  removed member a member again, and what the answer shows is what the code's holder already had — the space's name, the role and
+  the inviter's public credentials. Only the offering device judges its offers, and it writes no mark for this; a removal it has not
+  yet taken closes nothing yet.
   `close_offer` closes an offer to everyone new at any time, and keeps answering its user so: a host that closes an offer as soon as
   the new member appears loses no joiner whose answer was lost. Keep expiries short.
 - **Replay.** An ask replayed by anyone gets the answer kept for it: bound to the asker's key and digest, it admits only the asker's
@@ -2032,6 +2075,12 @@ Everything not listed here is carried over as written (with `folder` read as `sp
 | §19.9 `Device::local_notes` | not carried: the link memory of ndn-link keeps its own notes under `/localhost/ndn-link/memory/` | not an introduction |
 | `Introducer::adopt_scoped`, `release_scoped` | `Adopter` of heap.md §9.4 | they adopt a person for one space, and belong to the node |
 | `DataError::Introduction { why }` | `InviteError::Refused(IntroRefusal)`; `InviteError::{Heap, Local, NotReady, BadRequest}` | `InviteError::next()` and `refusal()` keep the old mapping for `ndf`'s `Code::BadCode` |
+| §19.3 step 6 the joined note lets go at a record of the admission's revision or later that leaves the device out | §8.5 step 2, §8.6 heap.md §10.9's note: it ends when the fold lists the person, or when a removal it did not name arrives while no `ADD` of hers stands | a removed joiner who joins again with its code waits and is `NotReady` (retry), not `AskOwner` |
+| §19.4 the answer carries the admission's revision whenever one is signed | §9.4 no entry is made, and no `ADMITTED` named, when the fold lists the person in every role asked | one `Heap::change` or none |
+| §19.1 the offering device checked `F` was a folder it signs members records of | §5.3 `offer` checks the space is open here and of this namespace; whether the device is an owner device is `change`'s to judge at the answer | the check lives where the owner rule is judged |
+| §19.8 rule 15 (e) what is fetched is a members record of the folder's line | §11 rule 15 what is fetched is judged by `fetch_entry` as any entry; no separate check that it is a members entry | the heap's admission is the one judge |
+| §19.7 a removal closes offers by a closing mark in the log | §5.4 a removal of the person an offer was used by closes it by derivation, nothing written | no mark is signed or kept for it |
+| §19.2 the offer is served while unexpired (it was a log entry the link carried while unexpired) | §5.5 the extension serves an offer it holds whatever its expiry; the introduction link carries it while unexpired (§13.1) | the ask judges expiry (`Expired`), the link judges openness |
 
 Other specifications still describe the old crate where they name its pieces (ndn-link.md §13.3A names the introduction's prefixes
 as three names and the `Introducer` trait; data-layer.md §19 as a whole): they stay as the specification of `ndn-data` until it moves.
