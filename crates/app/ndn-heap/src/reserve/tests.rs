@@ -594,3 +594,44 @@ async fn a_head_at_the_largest_seq_does_not_overflow_the_reservation() {
     assert_eq!(res.first_seq, u64::MAX, "there is no seq above it");
     assert!(res.sign_gate(u64::MAX).is_ok());
 }
+
+/// A disk that stalls must not stop a simulation's clock: under a paused tokio clock the runtime
+/// advances time only while no task of its blocking pool runs, so a flush held on that pool
+/// would freeze every timer of the node and of the network around it (the conformance suite's
+/// `d9`, `d10`). The flush runs on a thread of its own.
+#[test]
+fn a_held_flush_does_not_stop_a_paused_clock() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let store = Arc::new(Held::default());
+            let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
+            let holding = store.hold();
+            store.insert(n("/alice/32=data/notes/x"), Bytes::from_static(b"x"));
+            flusher.note_write();
+            // Let the flusher begin its flush (its thread starts in real time), then a second
+            // of virtual time pass while it is held.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            for _ in 0..5_000 {
+                if store.syncs_started() == 1 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let began = store.syncs_started();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(holding);
+            flusher.flush().await.unwrap();
+            done.send(began).unwrap();
+        });
+    });
+    let began = finished
+        .recv_timeout(Duration::from_secs(20))
+        .expect("a second of virtual time passed while the flush was held");
+    assert_eq!(began, 1, "the flush began, and was held while time passed");
+}

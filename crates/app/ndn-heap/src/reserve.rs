@@ -151,20 +151,28 @@ impl Flusher {
         }
     }
 
-    /// The store's barrier, on a blocking thread: a flush takes as long as
+    /// The store's barrier, on a thread of its own: a flush takes as long as
     /// the disk does. A store whose flush returns at once is flushed inline,
     /// and so is a browser store, which commits each write durably.
+    ///
+    /// The thread is not one of the runtime's blocking pool: a paused tokio
+    /// clock (a simulation) advances only while no pool task runs, so a flush
+    /// held on the pool would stop every timer around it.
     async fn sync(&self) -> std::io::Result<()> {
         #[cfg(not(target_arch = "wasm32"))]
         if !self.store.sync_is_immediate() {
             let store = Arc::clone(&self.store);
-            return tokio::task::spawn_blocking(move || store.sync())
-                .await
-                .unwrap_or_else(|e| {
-                    Err(std::io::Error::other(format!(
-                        "the flush did not finish ({e})"
-                    )))
-                });
+            let (done, flushed) = tokio::sync::oneshot::channel();
+            std::thread::Builder::new()
+                .name("ndn-heap-flush".into())
+                .spawn(move || {
+                    let _ = done.send(store.sync());
+                })?;
+            return flushed.await.unwrap_or_else(|e| {
+                Err(std::io::Error::other(format!(
+                    "the flush did not finish ({e})"
+                )))
+            });
         }
         self.store.sync()
     }
