@@ -87,10 +87,13 @@ pub struct Config {
     /// How long a removal looks for entries of the removed person's devices
     /// that were heard of and are not held yet, so that its cut binds them.
     pub first_look: Duration,
-    /// How many asks one device's walk has in flight at once.
+    /// The most asks of one device the node has in flight at once, whatever space or value
+    /// they are for: a device's window starts at 16, follows what it answers and is at most
+    /// this and half of [`Self::in_flight`].
     pub window: usize,
-    /// How many asks the whole node has in flight at once; at least
-    /// [`Self::window`].
+    /// How many asks the whole node has in flight at once, by kind: the wanted entries and
+    /// pieces take at most three quarters, probes of a counter at most an eighth, and a
+    /// grant pull or seal key what is left; at least [`Self::window`].
     pub in_flight: usize,
     /// How long a restarting device waits for the first group vector before
     /// it fetches its own entries from its peers.
@@ -107,9 +110,9 @@ pub struct Config {
 
 impl Config {
     /// Defaults: SVS's reference timing, the system clock, 4 s Interests, a
-    /// 4 s first look, 128 asks in flight per walk and 256 per node, a 1 s
-    /// settle, reservations of 1,024 seqs, 4,096 changes a watcher may leave
-    /// unread, no adopter.
+    /// 4 s first look, windows of at most 128 asks per device and 256 asks in
+    /// flight per node, a 1 s settle, reservations of 1,024 seqs, 4,096
+    /// changes a watcher may leave unread, no adopter.
     pub fn new() -> Config {
         Config {
             svs: SvsConfig::default(),
