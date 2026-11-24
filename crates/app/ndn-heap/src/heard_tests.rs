@@ -162,6 +162,35 @@ fn relays_are_vouched_for_ranked_and_bounded() {
     assert_eq!(sorted.len(), asked.len(), "each device once");
 }
 
+/// The holders the host configured come after the relays, never this device, the writer or a
+/// relay twice, and never past [`RELAYS_ASKED`] with them: a holder displaces no relay.
+#[test]
+fn holders_follow_the_relays_within_the_bound_and_never_displace_one() {
+    let me = n("/alice/me");
+    let writer = n("/alice/writer");
+    let holders = vec![
+        me.clone(),
+        writer.clone(),
+        device(1),
+        device(50),
+        device(51),
+    ];
+    let few = vec![device(1), device(2)];
+    assert_eq!(
+        holders_after(&holders, &me, &writer, &few),
+        vec![device(50), device(51)],
+        "not this device, the writer or a relay already listed"
+    );
+    let many: Vec<Name> = (0..RELAYS_ASKED - 1).map(device).collect();
+    assert_eq!(
+        holders_after(&holders, &me, &writer, &many),
+        vec![device(50)],
+        "the relays and holders together are at most RELAYS_ASKED"
+    );
+    let full: Vec<Name> = (0..RELAYS_ASKED).map(device).collect();
+    assert!(holders_after(&holders, &me, &writer, &full).is_empty());
+}
+
 /// An epoch key is asked of its creator first, then of the relays; a creator
 /// that is this device is not asked.
 #[test]

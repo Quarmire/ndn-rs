@@ -1425,6 +1425,139 @@ async fn a_name_a_sync_interest_carried_is_never_asked_for_a_key() {
     );
 }
 
+/// A place the host names (`Config.holders`: a repo follower, a NAS) keeps copies: a reader
+/// that no vouched member can serve, with the writer unreachable, gets the entry from it
+/// through `32=held`; without the field the entry never comes. The holder is never this
+/// device itself.
+const NAS: &str = "/alice/nas";
+
+fn holder_serves(name: &Name, holder: &str) -> Option<(Name, u64)> {
+    relayed(name)
+        .filter(|(h, d, _)| *h == n(holder) && *d == n(PHONE))
+        .map(|(_, d, s)| (d, s))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_configured_holder_gives_an_entry_when_the_writer_is_unreachable() {
+    let script = |name: &Name| {
+        if holder_serves(name, NAS).is_some_and(|(_, seq)| seq == 1) {
+            return Reply::Data(wrapped(name, genuine(PHONE, 1)));
+        }
+        Reply::Nack(NackReason::NoRoute)
+    };
+    let without = rig().await;
+    without.wire.script(script);
+    without.group.on_update(notice(PHONE, 1));
+    pass(60).await;
+    assert!(
+        !without.host.holds(PHONE, 1),
+        "no vouched member and no writer: nothing serves the entry"
+    );
+
+    let r = rig_with(Config {
+        holders: vec![n(LAPTOP), n(NAS)],
+        ..Config::default()
+    })
+    .await;
+    r.wire.script(script);
+    r.group.on_update(notice(PHONE, 1));
+    pass(60).await;
+    assert!(
+        r.host.holds(PHONE, 1),
+        "the holder's copy was asked for and taken"
+    );
+    let names = r.wire.names();
+    assert!(
+        names
+            .iter()
+            .all(|name| relayed(name).is_none_or(|(h, _, _)| h != n(LAPTOP))),
+        "this device is never asked for a copy"
+    );
+    assert_eq!(
+        direct(&names[0]),
+        Some((n(PHONE), 1)),
+        "the writer is asked first"
+    );
+}
+
+/// What a holder gives is verified as the writer's own: a packet that does not verify, and
+/// another entry's packet under the name asked, are refused, the entry stays wanted and the
+/// next holder is asked; nothing a holder says makes an entry count by itself.
+#[tokio::test(start_paused = true)]
+async fn a_holder_that_serves_a_bad_or_foreign_packet_is_refused_and_the_next_is_asked() {
+    const SECOND: &str = "/alice/nas2";
+    const THIRD: &str = "/alice/nas3";
+    let r = rig_with(Config {
+        holders: vec![n(NAS), n(SECOND), n(THIRD)],
+        ..Config::default()
+    })
+    .await;
+    r.wire.script(|name| {
+        if holder_serves(name, NAS).is_some() {
+            return Reply::Data(wrapped(name, forged(PHONE, 1)));
+        }
+        if holder_serves(name, SECOND).is_some() {
+            return Reply::Data(wrapped(name, genuine(PHONE, 2)));
+        }
+        if holder_serves(name, THIRD).is_some() {
+            return Reply::Data(wrapped(name, genuine(PHONE, 1)));
+        }
+        Reply::Nack(NackReason::NoRoute)
+    });
+    r.group.on_update(notice(PHONE, 1));
+    pass(60).await;
+    assert!(r.host.holds(PHONE, 1), "the third holder's genuine copy");
+    assert!(!r.host.holds(PHONE, 2), "the foreign packet was not taken");
+    let asked: Vec<Name> = r
+        .wire
+        .names()
+        .iter()
+        .filter_map(|name| relayed(name).map(|(h, _, _)| h))
+        .collect();
+    assert_eq!(
+        asked,
+        vec![n(NAS), n(SECOND), n(THIRD)],
+        "the holders in turn, in the order configured"
+    );
+    assert_eq!(
+        r.host.st.lock().applied,
+        vec![(n(PHONE), 1)],
+        "only the genuine copy applied anything"
+    );
+}
+
+/// A holder buys copies only: an owed epoch key is asked of its creator and vouched members,
+/// never of a holder.
+#[tokio::test(start_paused = true)]
+async fn a_holder_is_never_asked_for_a_key() {
+    let r = rig_with(Config {
+        holders: vec![n(NAS)],
+        ..Config::default()
+    })
+    .await;
+    {
+        let mut st = r.host.st.lock();
+        st.owed = vec![EpochId {
+            creator: n(PHONE),
+            seq: 4,
+        }];
+    }
+    r.wire.script(|_| Reply::Silent);
+    r.group.on_update(notice(PHONE, 1));
+    pass(30).await;
+    let granters: std::collections::BTreeSet<Name> = r
+        .wire
+        .names()
+        .iter()
+        .filter_map(|name| parse_grant_name(name).map(|(g, _)| g))
+        .collect();
+    assert_eq!(
+        granters,
+        [n(PHONE)].into_iter().collect(),
+        "only the epoch's creator"
+    );
+}
+
 /// A device that joined a group and heard no one asks the group again, after the capped
 /// doubling pauses, not once a group period (half a minute) later: the join announcement, or the
 /// reply a peer made to it, may be what the link lost (p1 at `--faulty --fault-seed 1`: the

@@ -104,6 +104,12 @@ pub struct Config {
     /// How many changes a watcher may leave unread before it is told it
     /// lagged; at least 1.
     pub watch_queue: usize,
+    /// Devices the host names as places that keep copies of the space's entries and pieces (a
+    /// repo follower, a NAS), asked for held copies (`<H>/32=held/…`) after the heard
+    /// members that vouch, within the same eight asks in all (spec §7.4). A holder buys
+    /// availability only: what it gives is verified as if the writer had, it raises no
+    /// head, and it is never asked for a key. This device is skipped. Empty by default.
+    pub holders: Vec<Name>,
     /// What the host does so that persons a space lists can be judged
     /// (adopting their trust contexts for the data layer alone).
     pub adopter: Option<Arc<dyn Adopter>>,
@@ -130,6 +136,7 @@ impl Config {
             settle: Duration::from_secs(1),
             reserve_block: 1024,
             watch_queue: 4096,
+            holders: Vec::new(),
             adopter: None,
         }
     }

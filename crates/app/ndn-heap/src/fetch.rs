@@ -55,6 +55,7 @@ use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
 use crate::error::HeapError;
+use crate::heard::holders_after;
 use crate::log::{Blob, Outcome, Pin};
 use crate::pieces::{self, Assembler, Offered};
 use crate::register::EntryId;
@@ -1149,15 +1150,18 @@ impl Group {
 
     /// The source for a packet of `device` on turn `turn`: the writer (unless it is this
     /// device) on every even turn, the heard members the log vouches for one after another
-    /// on the odd ones; this device's own packets are asked of the heard members alone. The
-    /// writer holds what it signed; a heard member holds it only if it got it, and the
-    /// members missing a hole are as many as the devices that heard of it, so a ring
+    /// on the odd ones, and after them the holders the host configured (`Config.holders`),
+    /// within the same [`RELAYS_ASKED`] in all; this device's own packets are asked of those
+    /// alone. The writer holds what it signed; a heard member holds it only if it got it, and
+    /// the members missing a hole are as many as the devices that heard of it, so a ring
     /// that gave the writer one turn in nine left a hole only it held for minutes.
     fn source(&self, device: &Name, turn: u32) -> Option<Source> {
         let host = &self.shared.host;
         let me = host.device();
         let mut relays =
             (self.heard.lock()).relays(me, device, &[], |d| host.standing(&self.space, d));
+        let holders = holders_after(&self.shared.cfg.holders, me, device, &relays);
+        relays.extend(holders);
         let turn = turn as usize;
         if device == me {
             let pick = turn.checked_rem(relays.len())?;

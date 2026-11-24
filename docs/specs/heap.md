@@ -1648,14 +1648,22 @@ a restart, a lost packet or a refusal changes nothing about what is owed.
   `<H>/32=held/<Name TLV of the original>` (§2.2), at most `RELAYS_ASKED` (8) of
   them, those of which this node holds an unbroken prefix of their own log
   leading, never this node or the
-  writer. Miss number `m` goes to the writer when `m` is even, and to the `⌊m/2⌋ mod k`-th
-  of the `k` heard members when it is odd (the writer holds what it signed; a member
+  writer, and then the **holders** (`Config.holders`, in the order configured: places
+  the host names that keep copies, such as a repo follower, which signs no entry of
+  the space and so is never vouched for; never this node, the writer or a relay already
+  listed), asked the same way, so that the relays and holders together are at most
+  `RELAYS_ASKED`: a holder never displaces a vouched relay. Miss number `m` goes to the
+  writer when `m` is even, and to the `⌊m/2⌋ mod k`-th of the `k` relays and holders
+  when it is odd (the writer holds what it signed; a member
   holds a hole only if it got it, and the members that heard of a hole are as many as
   miss it too, so a ring over all of them left a hole only the writer held for minutes
-  at 20 % loss). A relay's answer is the
+  at 20 % loss). A relay's or holder's answer is the
   original packet, whose name MUST equal the name asked for; the original is
-  verified as if it had come from the writer. An own entry is asked of relays
-  only (miss `m` goes to the `m mod k`-th).
+  verified as if it had come from the writer, so a holder that gives a packet that does
+  not verify, or another entry's packet, is a miss and the next source is asked. An
+  own entry is asked of relays and holders only (miss `m` goes to the `m mod k`-th).
+  A holder is for **copies only**: epoch keys are asked of the epoch's creator and the
+  vouched members (§6.5), never of a holder.
 - **Asking again.** After an ask resolved, the next look at the same entry waits
   250 ms. After `m` misses in a row an ask waits 250 ms × 2^`m`, at most 4 s;
   from 16 misses in a row, 64 s: a source away for long costs one ask a minute,
@@ -1695,6 +1703,10 @@ A name under `/localhost` is never served.
 
 An entry is served from the entry's own record: held and verified, and either
 applied or held closed; one refused, waiting or unreadable is not served.
+
+A place that keeps copies and signs nothing of the space (a repo follower, a NAS) answers
+the `32=held` row alone. No reader vouches for it, so none asks it by itself: a reader
+asks it only when its host names it in `Config.holders` (§7.4).
 
 ### 7.7 Face up
 
@@ -1822,6 +1834,15 @@ nothing a node does; the `put_watch` example records them (§13.8).
   proportional to the seq, and a counter heard adds none. A top that is not to be had
   (its writer withholds it) is asked again by the miss ladder, as any want is, and holds
   no place in the window: it keeps no honest ask of the same device waiting.
+- **A holder is a place, not an authority.** `Config.holders` names where copies may
+  be had, and nothing else about it is believed. What it gives is verified as if the
+  writer had given it (the original packet, under the name asked), so it can withhold
+  or lie, and the cost is a miss: it cannot make an entry count (§3.8 decides), raise a
+  head (a counter heard of it raises nothing, D17), displace a vouched relay (it is asked
+  only within what `RELAYS_ASKED` leaves), or be asked for a key (§6.5: creator and
+  vouched members only), and a device that is not in the list is never asked by this
+  rule. A holder that withholds costs one ask in `RELAYS_ASKED` per round, on the same
+  capped back-off as any source.
 - **Strangers' entries (L7).** A device certified in a held context that is no
   member has at most one refused entry stored and one alert per device: a
   probe of it (`Host::take(.., probe = true)`) is neither stored nor told when
@@ -2350,6 +2371,7 @@ registered and never under one of the core keywords above.
 | `reserve_block` | 1,024 | seqs one durable reservation covers (§4.5) |
 | `watch_queue` | 4,096 (at least 1) | changes a watcher may leave unread before it lags (§10.4) |
 | `adopter` | none | adopts persons for the spaces that list them (§9.4); with none, their entries wait |
+| `holders` | empty | devices the host names as places that keep copies (a repo follower, a NAS): asked for held copies (`<H>/32=held/…`) of the entries and pieces a reader wants, after the vouched heard members and within the same `RELAYS_ASKED` (8) in all; never granters; never this device (§7.4) |
 
 **`start`** gives a device its layer: it signs with the key `keys` holds for
 `device`, keeps the X25519 recipient secret there too (made on the first start,
@@ -2994,6 +3016,7 @@ are zeroed when dropped and never shown by `Debug`.
 | Failure | Required behaviour | Rests on |
 |---|---|---|
 | Partition / offline | Reads and writes continue locally under each device's key; the group reconciles when a path returns: what a returning device is missing is fetched by what the log wants. | §4, §7 |
+| Writer offline, and no heard member vouched for here holds the entry | A device the host names in `Config.holders` (a repo follower, a NAS) is asked for a held copy after the vouched relays; the copy is verified as the writer's own, so the holder buys availability only: it can never make an entry count, raise a head or give a key. | §7.4, §7.6, §7.12 |
 | Lost device | The devices that hold its entries keep serving them as held copies; the owner marks its key suspected on the node it revokes from, says when it was lost, and revokes it in the trust context with a cut of what that node first verified before then; the entries left out are listed and any honest one is re-admitted by exact name and digest. | §7.6, §9.5, §9.8 |
 | Compromised key | The revocation cut keeps exactly the entries it lists, by seq and digest, and refuses the rest whatever they claim; the key's seal keys and grants are refused; sealed data re-keys forward. | §9.5, §6 |
 | Bad or lying clock | Never makes an entry accepted: Data is judged without certificate validity periods and a cut, not a date, ends a key; a reader's clock only decides when a lapsed key's entries start being refused until its renewal or its cut. A writer's clock moves only the display time of its markers. | §1.4, §9.3 |

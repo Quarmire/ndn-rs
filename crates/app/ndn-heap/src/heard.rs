@@ -6,7 +6,8 @@
 //! fetch, nothing vouching) not kept at all, and only a device that signed
 //! data held here vouches for — a member, not a name a Sync Interest carried
 //! — is asked to answer for another (a relay, a granter), at most
-//! [`RELAYS_ASKED`] of them per ask. A name heard and not vouched for is
+//! [`RELAYS_ASKED`] of them per ask; the holders the host configures
+//! (`Config.holders`) are asked for copies only, after them, within the same bound. A name heard and not vouched for is
 //! still walked toward itself, as any device a notice names: that costs one
 //! device's asks, never more.
 //!
@@ -167,6 +168,30 @@ impl Heard {
         out.extend(self.relays(me, creator, &[], standing));
         out
     }
+}
+
+/// The configured holders (`Config.holders`: places the host names that keep copies, a repo
+/// follower, a NAS) asked after the `relays` for a held copy of `writer`'s packet (spec §7.4):
+/// in the order configured, never `me`, `writer` or a relay already listed, and only so many
+/// as keep the relays and holders together within [`RELAYS_ASKED`], so a holder never
+/// displaces a vouched relay and an ask goes to at most that many in all. A holder is asked
+/// for copies alone: it is not a granter ([`Heard::granters`] does not list it).
+pub(crate) fn holders_after(
+    holders: &[Name],
+    me: &Name,
+    writer: &Name,
+    relays: &[Name],
+) -> Vec<Name> {
+    let mut out: Vec<Name> = Vec::new();
+    for holder in holders {
+        if relays.len() + out.len() >= RELAYS_ASKED {
+            break;
+        }
+        if holder != me && holder != writer && !relays.contains(holder) && !out.contains(holder) {
+            out.push(holder.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
