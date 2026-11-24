@@ -869,3 +869,40 @@ async fn a_value_whose_piece_the_store_lost_is_unavailable_and_gathered_again() 
     let again = heap.get(&n("/big")).await.unwrap_err();
     assert!(matches!(again, HeapError::Unavailable { .. }), "{again:?}");
 }
+
+/// A removal is made before the additions, so a person listed in `remove` and
+/// in `add_readers` is demoted: no longer a writer, still a reader. The
+/// additions are not filtered against who stood before the removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_person_removed_and_added_as_a_reader_is_demoted_not_dropped() {
+    let dev = solo().await;
+    let (node, _) = boot(&dev, cfg()).await;
+    let heap = node
+        .create(
+            &space(),
+            Share {
+                readers: Readers::Persons(vec![n("/bob")]),
+                writers: vec![n("/bob")],
+            },
+        )
+        .await
+        .unwrap();
+    let members = heap.members();
+    assert!(members.writers.contains(&n("/bob")), "{members:?}");
+    heap.change(changed(&[], &["/bob"], &["/bob"]))
+        .await
+        .unwrap();
+    let members = heap.members();
+    assert_eq!(members.writers, vec![n("/alice")], "no longer a writer");
+    match &members.readers {
+        Readers::Persons(readers) => assert!(readers.contains(&n("/bob")), "{members:?}"),
+        Readers::Anyone => panic!("the space is private: {members:?}"),
+    }
+
+    // And the other way: a reader removed and added as a writer is a writer.
+    heap.change(changed(&["/bob"], &[], &["/bob"]))
+        .await
+        .unwrap();
+    let members = heap.members();
+    assert!(members.writers.contains(&n("/bob")), "{members:?}");
+}
