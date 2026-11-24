@@ -166,7 +166,7 @@ pub fn parse_space_name(name: &Name) -> Option<SpaceName> {
 
 /// The sync group of a space: `<O>/32=sync/<rest of S>`, the owner's group
 /// ([`ndn_security::sync_group`]) plus the components after `32=data`.
-pub(crate) fn sync_group_of(space: &Name) -> Option<Name> {
+pub fn sync_group_of(space: &Name) -> Option<Name> {
     let s = parse_space_name(space)?;
     let mut comps = ndn_security::sync_group(&s.owner).components().to_vec();
     comps.extend(s.rest);
@@ -285,11 +285,7 @@ impl GrantAsk {
     /// An ask for `epoch` of `space` that carries `seal_packet`, the asker's seal key packet;
     /// refused if that is no Data named `<device>/32=seal/<public key>` or is over
     /// [`SEAL_KEY_PACKET_MAX`]. Whether the device signed it is for the granter's judge.
-    pub fn new(
-        space: Name,
-        epoch: EpochId,
-        seal_packet: Bytes,
-    ) -> Result<GrantAsk, WireError> {
+    pub fn new(space: Name, epoch: EpochId, seal_packet: Bytes) -> Result<GrantAsk, WireError> {
         if seal_packet.len() > SEAL_KEY_PACKET_MAX {
             return Err(WireError::TooLarge {
                 what: "a grant ask's seal key packet",

@@ -74,7 +74,7 @@ pub use digest::{signed_digest, signed_digest_of};
 pub use names::{
     GrantAsk, LogName, SignalRunName, SpaceName, grant_name, held_name, is_namespace, log_name,
     parse_grant_name, parse_held_name, parse_log_name, parse_seal_key_name, parse_signal_run_name,
-    parse_space_name, seal_key_name, signal_run_name,
+    parse_space_name, seal_key_name, signal_run_name, sync_group_of,
 };
 pub use pieces::{PieceKind, PieceName, parse_piece_name, piece_name};
 pub use types::*;
