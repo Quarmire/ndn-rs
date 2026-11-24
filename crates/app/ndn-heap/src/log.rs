@@ -603,6 +603,40 @@ impl Log {
         self.closed > 0
     }
 
+    /// The epochs the entries held closed are sealed in: the keys whose arrival opens them.
+    /// Read from the held packets of the entries whose status says closed, so only as often as a
+    /// read is refused for them.
+    pub(crate) fn closed_epochs(&self) -> BTreeSet<EpochId> {
+        let view = self.view();
+        self.store
+            .scan_under(&Kind::STATUS.listing(&self.space), 0)
+            .into_iter()
+            .filter(|(_, value)| value.first() == Some(&1))
+            .filter_map(|(key, _)| Kind::STATUS.parse_seq(&self.space, &key))
+            .filter_map(|(device, seq)| decode_wire(&view.wire_at(&device, seq)?))
+            .filter_map(|(entry, _)| match entry.body {
+                Body::Sealed(sealed) => Some(sealed.epoch),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether what this device holds closed is a matter of keys it is to be granted, not of an
+    /// audience it is outside: its person reads the space, and no epoch the closed entries are
+    /// sealed in is known to leave it out. An epoch whose key this device lacks and holds
+    /// nothing sealed in is no reason to refuse (nothing it holds waits for that key), and an
+    /// epoch whose Epoch entry is not held yet names no audience: the owner's entry that does is
+    /// asked for, and until it arrives this device cannot tell it is left out.
+    pub(crate) fn awaits_keys(&self) -> bool {
+        let (fold, person) = (&self.fold, &self.person);
+        fold.is_reader(person)
+            && self
+                .closed_epochs()
+                .iter()
+                .filter(|e| self.keys.key(&self.space, e).is_none())
+                .all(|e| fold.epoch_body(e).is_none() || fold.audience(e).contains(person))
+    }
+
     /// Whether the space seals (its creation said readers are not everybody).
     pub(crate) fn sealed(&self) -> bool {
         self.fold.create() == Some(false)

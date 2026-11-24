@@ -912,6 +912,92 @@ async fn a_sealed_entry_without_the_key_is_held_closed_and_opens_when_the_key_ar
     assert!(!taken || r.value("/secret").is_some());
 }
 
+/// A second epoch of the owner's phone, for the owner alone: Carol, a reader, is outside its
+/// audience.
+fn owner_only_epoch(s: &Sealed) -> Sealed {
+    let epoch = EpochId {
+        creator: phone().name,
+        seq: 3,
+    };
+    let key = [8u8; 32];
+    let epoch_entry = sign_entry(
+        &phone(),
+        3,
+        &Entry {
+            prev: Some(Prev {
+                digest: s.epoch_entry.digest,
+                seq: None,
+            }),
+            after: vec![],
+            body: Body::Epoch(EpochBody {
+                key_check: seal::key_check(&ContentKey::from_bytes(key), &space(), &epoch),
+                audience: vec![n("/alice")],
+            }),
+        },
+    );
+    Sealed {
+        key,
+        epoch,
+        created: s.created.clone(),
+        epoch_entry,
+    }
+}
+
+#[tokio::test]
+async fn a_reader_awaits_the_key_of_its_closed_entry_whatever_epoch_leaves_it_out() {
+    let s = sealed_space();
+    let outgrown = owner_only_epoch(&s);
+    let mut r = rig(&carol());
+    r.applied(&s.created);
+    r.applied(&s.epoch_entry);
+    r.applied(&outgrown.epoch_entry);
+    assert_eq!(
+        r.admit(&sealed_put(&s, "/secret", "hush")).outcome,
+        Outcome::Closed
+    );
+    // The key Carol lacks and may be granted opens what she holds closed; the key of the epoch
+    // that leaves her out opens nothing she holds.
+    assert_eq!(r.log.closed_epochs(), [s.epoch.clone()].into());
+    assert!(
+        r.log.awaits_keys(),
+        "Carol is in the audience of the epoch her closed entry is sealed in"
+    );
+}
+
+#[tokio::test]
+async fn a_reader_left_out_of_the_epoch_of_its_closed_entry_does_not_await_its_key() {
+    let s = sealed_space();
+    let outgrown = owner_only_epoch(&s);
+    let mut r = rig(&carol());
+    r.applied(&s.created);
+    r.applied(&s.epoch_entry);
+    r.applied(&outgrown.epoch_entry);
+    assert_eq!(
+        r.admit(&sealed_put(&outgrown, "/secret", "hush")).outcome,
+        Outcome::Closed
+    );
+    assert_eq!(r.log.closed_epochs(), [outgrown.epoch.clone()].into());
+    assert!(
+        !r.log.awaits_keys(),
+        "Carol is outside the audience of the epoch her closed entry is sealed in"
+    );
+}
+
+#[tokio::test]
+async fn a_reader_awaits_the_epoch_entry_of_a_closed_entry_it_does_not_hold_yet() {
+    let s = sealed_space();
+    let mut r = rig(&carol());
+    r.applied(&s.created);
+    assert_eq!(
+        r.admit(&sealed_put(&s, "/secret", "hush")).outcome,
+        Outcome::Closed
+    );
+    assert!(
+        r.log.awaits_keys(),
+        "the epoch's audience is unknown until its entry arrives"
+    );
+}
+
 #[tokio::test]
 async fn an_unsealed_entry_in_a_sealed_space_is_refused() {
     let s = sealed_space();

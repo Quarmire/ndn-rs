@@ -668,18 +668,11 @@ impl SpaceInner {
     }
 
     /// What a read of a sealed space with an entry held closed answers: a
-    /// wait when this device's person reads the space and is in the audience
-    /// of every epoch whose key it lacks (the key comes by the grant pull),
-    /// else [`HeapError::Sealed`].
+    /// wait when the keys of the closed entries are to be granted to this
+    /// device ([`Log::awaits_keys`]; the key comes by the grant pull), else
+    /// [`HeapError::Sealed`].
     fn sealed_error(&self, log: &Log) -> HeapError {
-        let (fold, person) = (&log.fold, &log.person);
-        let waits = fold.is_reader(person)
-            && fold
-                .epochs()
-                .iter()
-                .filter(|e| log.keys.key(&self.name, e).is_none())
-                .all(|e| fold.audience(e).contains(person));
-        if waits {
+        if log.awaits_keys() {
             HeapError::NotReady {
                 name: self.name.clone(),
                 why: "an entry of it is sealed in an epoch whose key this device is entitled to \

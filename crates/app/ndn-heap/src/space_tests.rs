@@ -616,6 +616,36 @@ async fn an_audience_member_waiting_for_its_key_is_told_to_retry_not_sealed() {
     );
 }
 
+/// An entry sealed in an epoch whose Epoch entry has not arrived: the reader the members record
+/// lists cannot tell it is left out of that epoch's audience, so it is told to wait for the
+/// owner's entry, not to ask the owner to add it as a reader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_that_lacks_the_epoch_entry_of_a_closed_entry_is_told_to_retry_not_sealed() {
+    let devs = world(&["/alice/laptop", "/bob/laptop"]).await;
+    let (alice, _) = boot(&devs[0], cfg()).await;
+    let heap = alice.create(&space(), private(&["/bob"])).await.unwrap();
+    let id = heap
+        .put(&n("/secret"), bytes("for bob"), PutOptions::default())
+        .await
+        .unwrap();
+    let (bob, _) = boot(&devs[1], cfg()).await;
+    let theirs = bob.open(&space()).await.unwrap();
+    // Everything of Alice's but her Epoch entry, the one before the put.
+    for seq in (1..=id.seq).filter(|seq| *seq != id.seq - 1) {
+        let wire = devs[0]
+            .store
+            .get(&log_name(&devs[0].name, &space(), seq))
+            .expect("held");
+        bob.inner.take(&space(), wire, false).await;
+    }
+    let waiting = theirs
+        .get(&n("/secret"))
+        .await
+        .expect_err("the entry is held closed: bob holds no epoch entry and no key");
+    assert!(matches!(waiting, HeapError::NotReady { .. }), "{waiting:?}");
+    assert_eq!(waiting.next(), NextStep::RetryLater);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refusal_the_judge_or_the_mark_makes_is_alerted_once_and_replayed() {
     let devs = world(&["/alice/laptop", "/bob/laptop"]).await;
