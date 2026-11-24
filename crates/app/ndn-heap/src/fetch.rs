@@ -41,7 +41,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::future::join_all;
 use ndn_app::{AppError, Connection, Consumer};
-use ndn_foundation_types::Name;
+use ndn_foundation_types::{Name, tlv_type};
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, NackReason};
 use parking_lot::Mutex;
@@ -167,6 +167,59 @@ impl Rtt {
     }
 }
 
+/// The most devices a node keeps a round-trip estimate of: the devices it asks are the ones
+/// it heard, bounded per group, so this is a bound on memory, not a limit anyone meets.
+const RTTS_MAX: usize = 256;
+
+/// The round-trip estimates of a node, one per device it asks (the writer of an entry, or the
+/// holder that is asked for a copy): a device that is away answers nothing and its asks, timing
+/// out one after another, double the wait before an Interest is expressed again — that
+/// is no reason to wait longer for another device that answers.
+#[derive(Debug, Default)]
+pub(crate) struct Rtts {
+    by: BTreeMap<Name, Rtt>,
+}
+
+impl Rtts {
+    /// The device `name` is asked of: the name before its first keyword (`<D>/32=log/…`,
+    /// `<H>/32=held/…`, `<G>/32=grant/…`, `<D>/32=seal/…` all name their device first).
+    fn device(name: &Name) -> Name {
+        Name::from_components(
+            name.components()
+                .iter()
+                .take_while(|c| c.typ != tlv_type::KEYWORD)
+                .cloned(),
+        )
+    }
+
+    /// The wait before an Interest for `name` is expressed again ([`Rtt::rto`] of its device).
+    pub(crate) fn rto(&self, name: &Name, lifetime: Duration) -> Duration {
+        self.by
+            .get(&Self::device(name))
+            .map_or(RTO_INITIAL, |rtt| rtt.rto(lifetime))
+            .clamp(RTO_MIN, lifetime.max(RTO_MIN))
+    }
+
+    /// The estimate of the device `name` is asked of, made if there is none.
+    fn of(&mut self, name: &Name) -> &mut Rtt {
+        let device = Self::device(name);
+        if !self.by.contains_key(&device) && self.by.len() >= RTTS_MAX {
+            self.by.pop_first();
+        }
+        self.by.entry(device).or_default()
+    }
+
+    /// Take the round trip of an ask for `name` answered by its first Interest.
+    pub(crate) fn sample(&mut self, name: &Name, r: Duration) {
+        self.of(name).sample(r);
+    }
+
+    /// An ask for `name` needed a re-expression, or nothing answered it.
+    pub(crate) fn missed(&mut self, name: &Name) {
+        self.of(name).missed();
+    }
+}
+
 /// Why an ask brought no packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Miss {
@@ -199,7 +252,7 @@ pub(crate) struct Fetcher {
     lifetime: Duration,
     slots: Semaphore,
     assemblies: Semaphore,
-    rtt: Mutex<Rtt>,
+    rtt: Mutex<Rtts>,
 }
 
 impl Fetcher {
@@ -211,7 +264,7 @@ impl Fetcher {
             lifetime,
             slots: Semaphore::new(in_flight.max(1)),
             assemblies: Semaphore::new(ASSEMBLIES_MAX),
-            rtt: Mutex::new(Rtt::default()),
+            rtt: Mutex::new(Rtts::default()),
         }
     }
 
@@ -253,7 +306,7 @@ impl Fetcher {
     /// caller hands it to the node.
     pub(crate) async fn once(&self, name: Name) -> Result<Data, Miss> {
         let _slot = self.slot().await?;
-        let rto = self.rtt.lock().rto(self.lifetime);
+        let rto = self.rtt.lock().rto(&name, self.lifetime);
         tracing::trace!(target: TIMELINE, %name, "fetch_out");
         let asked = Instant::now();
         let fetched = Consumer::new(Arc::clone(&self.conn))
@@ -269,9 +322,9 @@ impl Fetcher {
                 tracing::trace!(target: TIMELINE, %name, expressed, "fetch_in");
                 let mut rtt = self.rtt.lock();
                 if expressed == 1 {
-                    rtt.sample(asked.elapsed());
+                    rtt.sample(&name, asked.elapsed());
                 } else {
-                    rtt.missed();
+                    rtt.missed(&name);
                 }
                 Ok(data)
             }
@@ -280,7 +333,7 @@ impl Fetcher {
                 tracing::trace!(%name, "fetch missed: {e}");
                 Err(match e {
                     AppError::Timeout => {
-                        self.rtt.lock().missed();
+                        self.rtt.lock().missed(&name);
                         Miss::Again
                     }
                     // A reply that does not verify was forged or altered on the
@@ -901,5 +954,29 @@ mod tests {
             rtt.rto(Duration::from_millis(600)),
             Duration::from_millis(600)
         );
+    }
+
+    /// An unreachable device is not a slow network: the asks to a writer that is away, one
+    /// after another timing out, do not stretch the wait before an Interest to another device
+    /// that answers is expressed again.
+    #[test]
+    fn a_device_that_never_answers_does_not_slow_the_asks_of_another() {
+        let space: Name = "/alice/32=data/notes".parse().expect("a name");
+        let name = |device: &str, seq: u64| {
+            crate::wire::log_name(&device.parse().expect("a name"), &space, seq)
+        };
+        let lifetime = Duration::from_secs(2);
+        let mut rtts = Rtts::default();
+        for seq in 1..=6 {
+            rtts.missed(&name("/alice/phone", seq));
+        }
+        // Nothing was ever measured toward the laptop: its first Interest waits the initial
+        // timeout, not what six lost asks of the phone doubled it to.
+        assert_eq!(rtts.rto(&name("/alice/laptop", 1), lifetime), RTO_INITIAL);
+        // And what the laptop answers fast shortens its own wait, not the phone's.
+        let laptop = name("/alice/laptop", 1);
+        rtts.sample(&laptop, Duration::from_millis(40));
+        assert!(rtts.rto(&laptop, lifetime) < RTO_INITIAL);
+        assert_eq!(rtts.rto(&name("/alice/phone", 7), lifetime), lifetime);
     }
 }

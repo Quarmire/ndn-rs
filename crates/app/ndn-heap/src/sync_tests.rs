@@ -944,7 +944,13 @@ async fn the_grant_pull_walks_creator_then_relays_with_backoff() {
             seq: 4,
         }];
     }
-    let answered = Arc::new(parking_lot::Mutex::new(0usize));
+    // The desktop's asks so far, and when the latest began: an Interest within one lifetime of
+    // that is the same ask expressed again (how many times it is depends on the round-trip
+    // estimate of that device), a later one is the next ask.
+    let answered = Arc::new(parking_lot::Mutex::new((
+        0usize,
+        None::<tokio::time::Instant>,
+    )));
     let counter = Arc::clone(&answered);
     r.wire.script(move |name| {
         let Some((granter, _)) = parse_grant_name(name) else {
@@ -958,8 +964,15 @@ async fn the_grant_pull_walks_creator_then_relays_with_backoff() {
         }
         // The third round's desktop answers; before, it is silent.
         let mut asked = counter.lock();
-        *asked += 1;
-        if *asked < 3 {
+        let now = tokio::time::Instant::now();
+        if asked
+            .1
+            .is_none_or(|began| now.duration_since(began) >= Duration::from_secs(2))
+        {
+            asked.0 += 1;
+            asked.1 = Some(now);
+        }
+        if asked.0 < 3 {
             Reply::Silent
         } else {
             Reply::Data(DataBuilder::new(name.clone(), b"a key, wrapped").sign_digest_sha256())
