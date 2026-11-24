@@ -96,10 +96,12 @@ impl Kind {
     /// that name an entry in their `after`.
     pub(crate) const SUPERS: Kind = Kind("supers");
     /// `joined/<S>`: that an offer's answer admitted this device to the space
-    /// `S` and the space's members do not list its person yet (one octet,
-    /// [`crate::Node::note_joined`]). While it stands, a put the fold refuses
-    /// for want of a listing is a wait; it is removed when the fold lists the
-    /// person.
+    /// `S` and the space's members do not list its person yet
+    /// ([`crate::Node::note_joined`]): one octet, 1, then the 32-octet
+    /// signed-region digest of each members entry held that removes her. While
+    /// it stands, a put the fold refuses for want of a listing is a wait; it is
+    /// removed when the fold lists the person, and when a removal of her
+    /// arrives that it does not name.
     pub(crate) const JOINED: Kind = Kind("joined");
 
     /// `/localhost/ndn-heap/<kind>`: the prefix of every key of the kind.

@@ -360,6 +360,71 @@ async fn a_joined_note_survives_a_restart() {
     assert!(matches!(waiting, HeapError::NotReady { .. }), "{waiting:?}");
 }
 
+/// A device told to wait for the entry that lists it stops waiting when the
+/// admission was undone before it ever saw it listed: a removal of its person
+/// it did not know of arrives, and no Add of hers stands. Here Bob hears the
+/// removal an owner device signed (Alice's phone) before the Add it names (her
+/// laptop's), so the fold never lists him; he is then told to ask the owner, not
+/// to wait for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joined_note_ends_when_the_listing_it_waited_for_was_undone() {
+    let m = mesh(&["/alice/laptop", "/alice/phone", "/bob/laptop"]).await;
+    let (laptop, phone) = (m.boot(0, fast()).await, m.boot(1, fast()).await);
+    let heap = laptop.create(&space(), public()).await.unwrap();
+    let add = heap
+        .change(MembersChange {
+            add_writers: vec![n("/bob")],
+            ..MembersChange::default()
+        })
+        .await
+        .unwrap();
+    let theirs = phone.open(&space()).await.unwrap();
+    eventually("the phone holds the listing", || async {
+        theirs.members().writers.contains(&n("/bob"))
+    })
+    .await;
+    let removal = theirs
+        .change(MembersChange {
+            remove: vec![n("/bob")],
+            ..MembersChange::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(removal.device, m.devs[1].name);
+
+    let bob = boot_deaf(&m, 2).await;
+    let bobs = bob.open(&space()).await.unwrap();
+    let creation = wire::log_name(&m.devs[0].name, &space(), 1);
+    bob.fetch_entry(&creation).await.expect("the creation");
+    bob.note_joined(&space());
+    let note = Kind::JOINED.of(&space());
+    let path = n("/b");
+    let put = || bobs.put(&path, bytes("bob"), PutOptions::default());
+    let waiting = put().await.unwrap_err();
+    assert!(matches!(waiting, HeapError::NotReady { .. }), "{waiting:?}");
+
+    // The removal first: the Add it names is not held, so it names nobody here.
+    let removing = wire::log_name(&m.devs[1].name, &space(), removal.seq);
+    assert_eq!(bob.fetch_entry(&removing).await.unwrap(), removal);
+    let waiting = put().await.unwrap_err();
+    assert!(matches!(waiting, HeapError::NotReady { .. }), "{waiting:?}");
+    assert!(bob.store().get(&note).is_some());
+
+    // Then the Add: Bob is removed already, listed at no moment.
+    let adding = wire::log_name(&m.devs[0].name, &space(), add.seq);
+    assert_eq!(bob.fetch_entry(&adding).await.unwrap(), add);
+    let refused = put().await.unwrap_err();
+    assert!(
+        matches!(refused, HeapError::NotAllowed { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(refused.next(), NextStep::AskOwner);
+    assert!(
+        bob.store().get(&note).is_none(),
+        "the note ended with the wait"
+    );
+}
+
 /// One entry is fetched by its log name and judged as any entry is: held and
 /// applied, its id returned, and nothing else fetched with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

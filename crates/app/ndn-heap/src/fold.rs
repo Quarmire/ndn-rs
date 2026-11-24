@@ -275,17 +275,14 @@ impl Fold {
             || self.standing(Role::Reader).any(|a| a.who == *person)
     }
 
-    /// The Members entry that removed `person`, who is listed no more: of the
-    /// entries applied that carry a Remove naming an Add of hers, the one of
-    /// the lowest rank (signed digest first, as the entries that claim one
-    /// fact are ordered), so that every node holding the same entries names
-    /// the same one. `None` for a person who is listed, never was, or is the
-    /// owner.
-    pub fn removal_record(&self, person: &Name) -> Option<EntryRef> {
-        if self.lists(person) {
-            return None;
-        }
-        self.carriers
+    /// Every applied Members entry that carries a Remove naming an Add of
+    /// `person` this fold knows, in the order of the entries' rank (signed
+    /// digest first, as the entries that claim one fact are ordered). A Remove
+    /// whose Add is not known yet names nobody here, so it is not counted until
+    /// the Add arrives.
+    pub fn removers(&self, person: &Name) -> Vec<EntryRef> {
+        let mut found: Vec<EntryRef> = self
+            .carriers
             .iter()
             .filter(|(_, body)| {
                 body.ops.iter().any(|op| match op {
@@ -295,9 +292,21 @@ impl Fold {
                     Op::Add { .. } => false,
                 })
             })
-            .map(|(carrier, _)| carrier)
-            .min_by(|a, b| rank(a).cmp(&rank(b)))
-            .cloned()
+            .map(|(carrier, _)| carrier.clone())
+            .collect();
+        found.sort_by(|a, b| rank(a).cmp(&rank(b)));
+        found
+    }
+
+    /// The Members entry that removed `person`, who is listed no more: of the
+    /// entries [`Self::removers`] lists, the first (lowest rank), so that every
+    /// node holding the same entries names the same one. `None` for a person
+    /// who is listed, never was, or is the owner.
+    pub fn removal_record(&self, person: &Name) -> Option<EntryRef> {
+        if self.lists(person) {
+            return None;
+        }
+        self.removers(person).into_iter().next()
     }
 
     /// The union of the tips of every removed writer Add naming `person`:

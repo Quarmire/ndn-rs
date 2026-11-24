@@ -1,5 +1,5 @@
 //! The sibling surface of the node: the interface for `ndn-invite` and
-//! `ndn-surface` only (spec §12). A program that only reads and writes spaces
+//! `ndn-surface` only (spec §10.9). A program that only reads and writes spaces
 //! never needs it.
 //!
 //! A sibling crate adds a protocol of its own to a device (introductions, a
@@ -97,6 +97,9 @@ fn is_keyword(word: &str) -> bool {
             .bytes()
             .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
 }
+
+/// The first octet of a join note ([`Kind::JOINED`]): its form.
+const JOINED_NOTE: u8 = 1;
 
 fn stopped() -> HeapError {
     HeapError::local("the node is stopped")
@@ -250,26 +253,42 @@ impl NodeInner {
 
     /// [`NodeHandle::note_joined`].
     pub(crate) fn note_joined(&self, space: &Name) {
-        let listed = self
-            .space_of(space)
-            .is_some_and(|held| held.log.lock().fold.lists(&self.ns));
-        if listed {
-            return;
+        let mut note = vec![JOINED_NOTE];
+        if let Some(held) = self.space_of(space) {
+            let log = held.log.lock();
+            if log.fold.lists(&log.person) {
+                return;
+            }
+            for remover in log.fold.removers(&log.person) {
+                note.extend_from_slice(&remover.digest);
+            }
         }
-        self.store
-            .insert(Kind::JOINED.of(space), Bytes::from_static(&[1]));
+        self.store.insert(Kind::JOINED.of(space), Bytes::from(note));
         self.flusher.note_write();
     }
 
     /// Whether a refusal for want of a listing is a wait: an offer's answer
-    /// admitted this device to `log`'s space and the fold does not list its
-    /// person. The note is removed when it does.
+    /// admitted this device to `log`'s space ([`NodeHandle::note_joined`]), the
+    /// fold does not list its person, and no removal of her arrived since the
+    /// note was made (the admission was not undone before it was ever seen).
+    /// The note is removed when the fold lists the person, and when a removal
+    /// of her arrived that the note did not know of: what it waited for is no
+    /// more to come.
     pub(crate) fn joining(&self, log: &Log) -> bool {
-        if !self.store.contains(&Kind::JOINED.of(&log.space)) {
+        let key = Kind::JOINED.of(&log.space);
+        let Some(note) = self.store.get(&key) else {
             return false;
-        }
+        };
         if log.fold.lists(&log.person) {
             self.release_joined(log);
+            return false;
+        }
+        let known: Vec<&[u8]> = note.get(1..).unwrap_or_default().chunks_exact(32).collect();
+        let undone =
+            (log.fold.removers(&log.person).iter()).any(|r| !known.contains(&&r.digest[..]));
+        if undone {
+            self.store.remove(&key);
+            self.flusher.note_write();
             return false;
         }
         true
@@ -428,9 +447,13 @@ impl NodeHandle {
     /// fold does not list the person, a put the fold would refuse as
     /// [`HeapError::NotAllowed`] answers [`HeapError::NotReady`] (retry: the
     /// entry that lists the person is on its way); the note is removed when the
-    /// fold lists the person (owner, writer or reader), and nothing is noted for
-    /// a space that lists it already. Durable with the node's next flush, as
-    /// the host's own notes are.
+    /// fold lists the person (owner, writer or reader) and when a removal of her
+    /// arrives that the note did not know of (the admission was undone before it
+    /// was ever seen: the refusal is `NotAllowed` again), and nothing is noted
+    /// for a space that lists her already. Durable with the node's next flush,
+    /// as the host's own notes are. Open the space first: the note keeps the
+    /// removals of her held then, so that an earlier invitation's are not taken
+    /// for this one's.
     pub fn note_joined(&self, space: &Name) {
         self.inner.note_joined(space);
     }
