@@ -1047,6 +1047,16 @@ impl Heap {
         self.inner.log.lock().members()
     }
 
+    /// The epoch writers seal in, as this node's fold holds it: its id (the owner device that
+    /// signed the Epoch entry, and its seq) and whether it is for exactly the readers. `None` for
+    /// a public space, or while no epoch is in force.
+    pub fn epoch(&self) -> Option<(crate::wire::EpochId, bool)> {
+        let log = self.inner.log.lock();
+        let epoch = log.fold.in_force()?;
+        let complete = log.fold.complete();
+        Some((epoch, complete))
+    }
+
     /// Whether this node has applied the entry `id`: it holds exactly those
     /// signed bytes (the id's digest is the signed-region digest), verified
     /// and chained to its writer's log, and admitted it: the writer's person

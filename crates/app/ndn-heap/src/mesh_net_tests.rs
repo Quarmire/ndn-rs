@@ -718,3 +718,20 @@ async fn an_entry_the_owner_readmits_by_name_and_digest_returns_to_every_node() 
     })
     .await;
 }
+
+/// A private space has an epoch in force once created, complete for exactly its readers, signed by
+/// an owner device; a public space has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_space_reports_its_epoch_and_a_public_one_none() {
+    let m = mesh(&["/alice/laptop"]).await;
+    let laptop = m.boot(0, fast()).await;
+    let sealed = laptop.create(&space(), private(&["/bob"])).await.unwrap();
+    let (epoch, complete) = sealed.epoch().expect("an epoch in force");
+    assert_eq!(epoch.creator, m.devs[0].name);
+    assert!(complete, "the epoch is for exactly the readers");
+    let open = laptop
+        .create(&n("/alice/32=data/open"), public())
+        .await
+        .unwrap();
+    assert_eq!(open.epoch(), None, "a public space is never sealed");
+}
