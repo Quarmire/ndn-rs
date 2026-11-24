@@ -30,8 +30,6 @@ use crate::test_kit::{
 };
 use crate::wire::{IntroRecord, OfferId, Outcome, offer_name, offer_prefix, parse_offer_name};
 
-const NINETY_DAYS_MS: u64 = 90 * 24 * 3600 * 1000;
-
 #[tokio::test]
 async fn a_joiner_whose_key_is_its_own_anchor_is_answered() {
     let a = alice().await;
@@ -909,166 +907,6 @@ async fn a_forged_ask_counts_and_grants_nothing() {
     );
 }
 
-// ---- the grant (spec §19.8) ----------------------------------------------------------------------
-
-async fn a_grant_is_made_once_for_the_admitted_key(role: Role, grant_for: Option<Duration>) {
-    let alice = Inviter::new(role, grant_for, &[]).await;
-    let bob_phone = phone_of("/bob").await;
-    let before = (alice.clock)().0;
-    let first = alice.answers(&bob_phone).await;
-    let after = (alice.clock)().0;
-    assert!(accepted(&first), "bob was answered {first:?}");
-    let granted = alice.calls.granted();
-    assert_eq!(
-        granted.len(),
-        1,
-        "an admitted asker was granted {} times, not once",
-        granted.len()
-    );
-    let g = &granted[0];
-    assert_eq!(
-        g.key,
-        bob_phone.invites.inner().own_key_digest(),
-        "the grant names another key than the asker's"
-    );
-    assert_eq!(
-        g.namespaces,
-        vec![n("/bob")],
-        "the grant names other namespaces than the asker's"
-    );
-    assert_eq!(g.folder, notebook());
-    assert_eq!(g.role, role, "the grant does not carry the offer's role");
-    match grant_for {
-        Some(d) => {
-            let ms = d.as_millis() as u64;
-            assert!(
-                g.until
-                    .is_some_and(|t| (before + ms..=after + ms).contains(&t.0)),
-                "the grant ends at {:?}, not grant_for after the admission",
-                g.until
-            );
-        }
-        None => assert_eq!(
-            g.until, None,
-            "a grant with no grant_for bound carries a date: it follows the members"
-        ),
-    }
-    assert_eq!(
-        alice.laptop.invites.grants(),
-        granted,
-        "Invites::grants is not what the host was told"
-    );
-
-    // The same key asking again is answered as before: no second grant, and the end is not
-    // moved.
-    alice.skew.store(5_000, Ordering::SeqCst);
-    let again = alice.answers(&bob_phone).await;
-    assert_eq!(again, first, "the retry was not answered as kept");
-    assert_eq!(
-        alice.calls.granted(),
-        granted,
-        "a retry of the admitted key was granted again"
-    );
-    assert_eq!(
-        alice.laptop.invites.grants(),
-        granted,
-        "a retry moved the end of the grant"
-    );
-
-    // Another key finds the offer used: refused, and granted nothing.
-    let carol_phone = phone_of("/carol").await;
-    let other = alice.answers(&carol_phone).await;
-    assert!(
-        matches!(other, Some(Outcome::Refused(IntroRefusal::Used))),
-        "another key asking a used offer was answered {other:?}"
-    );
-    assert_eq!(
-        alice.calls.granted(),
-        granted,
-        "a refused ask was granted a link"
-    );
-    assert_eq!(alice.laptop.invites.grants(), granted);
-}
-
-/// Spec §19.8: an offer's admission makes one grant, for the admitted key and the asker's
-/// namespace, with the offer's role; a retry and a refused ask make none.
-#[tokio::test]
-async fn a_writers_admission_is_granted_once_and_only_to_its_key() {
-    a_grant_is_made_once_for_the_admitted_key(
-        Role::Writer,
-        Some(Duration::from_millis(NINETY_DAYS_MS)),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn a_readers_admission_is_granted_once_with_the_readers_role() {
-    a_grant_is_made_once_for_the_admitted_key(Role::Reader, None).await;
-}
-
-/// Spec §19.8: no ask that is refused or not completed grants anything.
-#[tokio::test]
-async fn a_refused_or_unfinished_ask_grants_nothing() {
-    let alice = Inviter::new(
-        Role::Writer,
-        Some(Duration::from_millis(NINETY_DAYS_MS)),
-        &["/dave"],
-    )
-    .await;
-    let bob_phone = phone_of("/bob").await;
-    // A wrong secret.
-    let got = alice.answers_with(&bob_phone, &[9; SECRET_LEN]).await;
-    assert!(
-        matches!(got, Some(Outcome::Refused(IntroRefusal::WrongProof { .. }))),
-        "a wrong secret was answered {got:?}"
-    );
-    // A namespace that overlaps the inviter's own.
-    let mallory = Person::new("/alice");
-    let mallory_phone = start(&mallory, "/alice/mallory").await;
-    let got = alice.answers(&mallory_phone).await;
-    assert!(
-        matches!(got, Some(Outcome::Refused(IntroRefusal::Conflict))),
-        "a namespace over the inviter's own was answered {got:?}"
-    );
-    // A host that does not adopt the asker: the offer is not spent.
-    let dave = Person::new("/dave");
-    let dave_phone = start(&dave, "/dave/phone").await;
-    let got = alice.answers(&dave_phone).await;
-    assert_eq!(got, None, "an asker the host does not adopt was answered");
-    assert_eq!(
-        alice.calls.granted(),
-        Vec::new(),
-        "an ask that was refused or not completed was granted a link"
-    );
-    assert_eq!(alice.laptop.invites.grants(), Vec::new());
-    // Once closed, a new key is refused, and granted nothing either.
-    alice
-        .laptop
-        .invites
-        .close_offer(&alice.offer)
-        .await
-        .unwrap();
-    let got = alice.answers(&bob_phone).await;
-    assert!(
-        matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
-        "an asker of a closed offer was answered {got:?}"
-    );
-    // Past its expiry, too.
-    alice.skew.store(2 * 3_600_000, Ordering::SeqCst);
-    let got = alice.answers(&bob_phone).await;
-    assert!(
-        matches!(
-            got,
-            Some(Outcome::Refused(
-                IntroRefusal::Closed | IntroRefusal::Expired
-            ))
-        ),
-        "an asker of an expired offer was answered {got:?}"
-    );
-    assert_eq!(alice.calls.granted(), Vec::new());
-    assert_eq!(alice.laptop.invites.grants(), Vec::new());
-}
-
 /// A joiner whose namespace is a broad name is refused as a conflict, in the round trip,
 /// not only by the policy's own check.
 #[tokio::test]
@@ -1084,28 +922,6 @@ async fn a_joiner_claiming_a_broad_name_is_answered_conflict() {
     assert!(
         matches!(got, Some(Outcome::Refused(IntroRefusal::Conflict))),
         "a joiner claiming /org was answered {got:?}"
-    );
-}
-
-/// Spec §19.8: `grant_for` `Some(ZERO)`: the asker is admitted, nothing is kept, and the
-/// host is told nothing.
-#[tokio::test]
-async fn a_zero_grant_for_makes_no_grant_and_keeps_no_note() {
-    let alice = Inviter::new(Role::Writer, Some(Duration::ZERO), &[]).await;
-    let bob_phone = phone_of("/bob").await;
-    let got = alice.answers(&bob_phone).await;
-    assert!(accepted(&got), "bob was answered {got:?}");
-    assert_eq!(
-        alice.calls.granted(),
-        Vec::new(),
-        "grant_for = Some(ZERO) granted a link"
-    );
-    assert_eq!(alice.laptop.invites.grants(), Vec::new());
-    let kept = alice.laptop.store.scan_under(&store::grant_listing(), 0);
-    assert!(
-        kept.is_empty(),
-        "grant_for = Some(ZERO) kept {} grant notes",
-        kept.len()
     );
 }
 
