@@ -647,9 +647,14 @@ impl SpaceInner {
     }
 
     /// A writer that is no reader of a sealed space cannot seal in it: told
-    /// as it is, not as a wait that never ends.
+    /// as it is, not as a wait that never ends. Not told while the owner's
+    /// logs have a hole below an entry held ([`Log::owner_whole`]): the
+    /// audience is then only partly known.
     fn may_seal(&self, log: &Log) -> Result<(), HeapError> {
         let (fold, person) = (&log.fold, &log.person);
+        if log.sealed() {
+            log.owner_whole()?;
+        }
         if log.sealed() && fold.is_writer(person) && !fold.is_reader(person) {
             return Err(HeapError::NotAllowed {
                 space: self.name.clone(),

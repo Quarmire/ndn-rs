@@ -131,6 +131,31 @@ impl Log {
         }
     }
 
+    /// Whether the owner's logs are whole below what this device holds of them: no seq of another
+    /// owner device lies missing under one it holds. A members or epoch entry is signed only by
+    /// an owner device, so until the holes are filled the fold may lack who the space lists (a
+    /// writer, or a reader, the entry in the hole adds or removes): this device cannot tell
+    /// whether it may write, and says to ask again, not that it may not. A gap an entry
+    /// declared is no hole; this device's own log is not asked (its lost entries are fetched back
+    /// from peers and its structural entries replay from the store).
+    pub(crate) fn owner_whole(&self) -> Result<(), HeapError> {
+        let owner = self.fold.owner();
+        let hole = self.devices.iter().find(|(device, dev)| {
+            **device != self.device
+                && dev.person == *owner
+                && dev.held.prefix_with(&dev.voids()) < dev.high()
+        });
+        match hole {
+            None => Ok(()),
+            Some((device, _)) => Err(HeapError::NotReady {
+                name: self.space.clone(),
+                why: format!(
+                    "this device does not hold every entry of the owner's device {device} below the newest it holds, so it cannot tell who the space lists yet"
+                ),
+            }),
+        }
+    }
+
     /// Whether this device may write now, and the epoch to seal in (none in a
     /// public space).
     pub(crate) fn judge_own(&self) -> Result<Option<EpochId>, HeapError> {
@@ -143,6 +168,7 @@ impl Log {
                 "this device has not seen the space's creation, so it cannot tell whether it may write",
             ));
         };
+        self.owner_whole()?;
         if !self.fold.is_writer(&self.person) {
             return Err(HeapError::NotAllowed {
                 space: self.space.clone(),

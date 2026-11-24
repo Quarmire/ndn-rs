@@ -1557,6 +1557,28 @@ async fn an_entry_above_a_declared_gap_is_applied_without_the_seqs_the_gap_decla
     assert!(r.log.applied(&id_of(&p3)), "seq 2 is declared absent");
 }
 
+/// A device that holds the owner's newest members entry but not the ones below it does not know
+/// who the space lists (o3: a member held the creation and the epoch, not the entries that made
+/// the readers, and was told it was a writer outside the audience, for good): it may not tell
+/// whether it may write until the owner's log is whole below what it holds.
+#[tokio::test]
+async fn a_device_may_not_write_while_the_owners_log_has_a_hole_below_an_entry_it_holds() {
+    let mut r = rig(&bob());
+    let mut owner = Chain::new(&phone());
+    let create = creation(&mut owner);
+    let more = owner.members(members(None, vec![add(2, "/carol", Role::Writer)]));
+    let tip = owner.members(members(None, vec![add(3, "/dave", Role::Reader)]));
+    r.applied(&create);
+    r.applied(&tip);
+    assert!(
+        matches!(r.log.judge_own(), Err(HeapError::NotReady { .. })),
+        "seq 2 of the owner's log is missing: {:?}",
+        r.log.judge_own()
+    );
+    r.applied(&more);
+    assert_eq!(r.log.judge_own().unwrap(), None);
+}
+
 #[tokio::test]
 async fn an_entry_naming_other_bytes_than_the_one_held_at_its_prev_is_refused_as_a_fork() {
     let mut r = rig(&carol());
