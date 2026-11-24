@@ -539,6 +539,12 @@ impl<'a> Setup<'a> {
         self
     }
 
+    /// The introductions' tuning.
+    pub(crate) fn invite_config(mut self, config: InviteConfig) -> Self {
+        self.invite = config;
+        self
+    }
+
     /// Replace the node's face by `wrap` of it, after `on` chose it: a case wraps
     /// it to record, filter or tamper with what crosses (the sync face is untouched).
     pub(crate) fn wrapping(
@@ -749,6 +755,23 @@ pub(crate) fn ask(
     secret: &[u8; SECRET_LEN],
     extra: &[Certificate],
 ) -> (Name, Bytes) {
+    let (_, id) = parse_offer_name(offer).expect("an offer's name");
+    let seal_key = inviter.invites.inner().state.lock().offers[&id]
+        .body
+        .seal_key;
+    ask_sealed_to(joiner, &inviter.name, &seal_key, offer, secret, extra)
+}
+
+/// [`ask`] for an offer the inviter does not hold (one a case forged): sealed to
+/// `seal_key`, the inviter device `inviter`'s seal key.
+pub(crate) fn ask_sealed_to(
+    joiner: &Rig,
+    inviter: &Name,
+    seal_key: &[u8; 32],
+    offer: &Name,
+    secret: &[u8; SECRET_LEN],
+    extra: &[Certificate],
+) -> (Name, Bytes) {
     let j = joiner.invites.inner();
     let me = joiner.node.writer().clone();
     let digest = j.own_key_digest();
@@ -763,13 +786,9 @@ pub(crate) fn ask(
         credentials: cred,
         asker: Bytes::new(),
     };
-    body.asker = j.ask_proof(&body.binding(&inviter.name)).unwrap();
-    let (_, id) = parse_offer_name(offer).expect("an offer's name");
-    let seal_key = inviter.invites.inner().state.lock().offers[&id]
-        .body
-        .seal_key;
-    let aad = intro_prefix(&inviter.name).encode_to_tlv();
-    let sealed = AskKey::to(&seal_key, &aad)
+    body.asker = j.ask_proof(&body.binding(inviter)).unwrap();
+    let aad = intro_prefix(inviter).encode_to_tlv();
+    let sealed = AskKey::to(seal_key, &aad)
         .unwrap()
         .seal(&body.encode(), &aad);
     let params = IntroAsk {
@@ -778,7 +797,7 @@ pub(crate) fn ask(
         sealed: sealed.sealed,
     }
     .encode();
-    (intro_name(&inviter.name, &params), params)
+    (intro_name(inviter, &params), params)
 }
 
 /// What `inviter` answers the ask: `None` for no answer.
@@ -799,4 +818,16 @@ pub(crate) async fn answer(inviter: &Rig, (name, params): (Name, Bytes)) -> Opti
 /// Whether the outcome is an acceptance.
 pub(crate) fn accepted(o: &Option<Outcome>) -> bool {
     matches!(o, Some(Outcome::Accepted { .. }))
+}
+
+/// Timings that let a sync vector cross a forwarder in milliseconds: for the cases whose
+/// devices learn of each other's members entries.
+pub(crate) fn fast() -> Config {
+    let mut c = Config::new();
+    c.first_look = Duration::from_millis(50);
+    c.settle = Duration::from_secs(3);
+    c.svs.jitter_ms = 20;
+    c.svs.suppression_period = Duration::from_millis(30);
+    c.svs.sync_interval = Duration::from_secs(1);
+    c
 }

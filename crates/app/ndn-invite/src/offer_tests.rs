@@ -30,6 +30,9 @@ use crate::test_kit::{
 };
 use crate::wire::{IntroRecord, OfferId, Outcome, offer_name, offer_prefix, parse_offer_name};
 
+#[path = "offer_audit_tests.rs"]
+mod audit;
+
 #[tokio::test]
 async fn a_joiner_whose_key_is_its_own_anchor_is_answered() {
     let a = alice().await;
