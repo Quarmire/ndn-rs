@@ -13,11 +13,13 @@
 //! * `<D>/32=seal/<key>`: this device's seal key packet.
 //! * `<G>/32=grant/<ask>`: the key of an epoch, **only** when the node says
 //!   the asker may have it (`NodeInner::may_grant`); anything else is not
-//!   answered and this device fetches nothing for it. Then the asker's seal key
-//!   packet is fetched and judged (once per key: kept while verified and while
-//!   the judge's generation is the one it was verified in), the node decides
-//!   again with the key that signed it (a revoked key is granted nothing), and
-//!   the answer is signed by this device with the key wrapped to that seal key.
+//!   answered, and nothing is decoded or judged for it. The ask carries the
+//!   asker's seal key packet, so this is one exchange and the granter fetches
+//!   nothing: the packet is judged as the asker device's (once per key: kept
+//!   while verified and while the judge's generation is the one it was verified
+//!   in), the node decides again with the key that signed it (a revoked key is
+//!   granted nothing), and the answer is signed by this device with the key
+//!   wrapped to that seal key.
 //!
 //! Names under `/localhost` are never served, and neither is a name another
 //! device owns. Every ask that is not answered is Nacked, never left to time
@@ -33,7 +35,6 @@ use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, NackReason};
 use parking_lot::Mutex;
 
-use crate::fetch::Kind;
 use crate::limit::Counts;
 use crate::rt;
 use crate::seal::seal_key_matches;
@@ -50,7 +51,7 @@ const GRANTS_KEPT: usize = 4096;
 
 /// The most grant asks of one asker device worked on at once: an admitted
 /// reader can name any number of seal keys of its own device, and none of them
-/// is to take the node's fetch slots from its own fetches.
+/// is to take the judge's time from the node's own entries.
 const GRANTS_PER_ASKER: usize = 32;
 
 /// A map that keeps the last [`GRANTS_KEPT`] entries put in it, for one
@@ -108,8 +109,9 @@ pub(crate) struct Granting {
     asks: Counts,
 }
 
-/// Answer one Interest for this device. Spawn it per Interest: a grant fetches
-/// before it answers, so it runs as its own task.
+/// Answer one Interest for this device. Spawn it per Interest: a grant judges the seal key
+/// packet it carries (which may need a certificate fetched) before it answers, so it runs as
+/// its own task.
 pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Responder) {
     let shared = Arc::clone(&net.shared);
     let name = (*interest.name).clone();
@@ -191,11 +193,12 @@ fn held_packet(host: &HostRef, me: &Name, name: &Name) -> Option<Bytes> {
     Some(DataBuilder::new(name.clone(), &wire).sign_digest_sha256())
 }
 
-/// Answer a grant ask (spec §6.5): the node decides first, before anything is
-/// fetched; then the asker's seal key is fetched and judged, the node decides
-/// again with the key that signed it, and the key is wrapped to the seal key.
-/// One name, one packet while it is kept: kept only for the judge's
-/// generation it was made in (a revocation ends what was kept before it).
+/// Answer a grant ask (spec §6.5) in the one exchange: the node decides first, from the names
+/// alone, before anything is decoded or judged; then the seal key packet the ask carries is
+/// judged as the asker's device's (nothing is fetched), the node decides again with the key
+/// that signed it, and the key is wrapped to the seal key. One name, one packet while it is
+/// kept: kept only for the judge's generation it was made in (a revocation ends what was kept
+/// before it).
 async fn grant(shared: &Arc<Shared>, name: &Name, ask: GrantAsk) -> Option<Bytes> {
     let host = &shared.host;
     let (asker, public) = parse_seal_key_name(&ask.seal_key)?;
@@ -219,12 +222,8 @@ async fn grant(shared: &Arc<Shared>, name: &Name, ask: GrantAsk) -> Option<Bytes
     let key = match kept {
         Some(key) => key,
         None => {
-            let verified = match shared.fetcher.once(ask.seal_key.clone(), &Kind::Pull).await {
-                Ok(data) => seal_key_verified(shared, &data, &ask, &asker, &public).await,
-                Err(_) => None,
-            };
-            let Some(key) = verified else {
-                tracing::debug!(%asker, "grant not answered: its seal key did not come, or did not verify as its own; the asker's next round asks again");
+            let Some(key) = seal_key_verified(shared, &ask, &asker, &public).await else {
+                tracing::debug!(%asker, "grant not answered: the seal key packet in the ask is not the asker's own (it does not carry the key it is named for, or its device's key does not verify); the asker's next round asks again");
                 return None;
             };
             shared
@@ -248,21 +247,21 @@ async fn grant(shared: &Arc<Shared>, name: &Name, ask: GrantAsk) -> Option<Bytes
     Some(wire)
 }
 
-/// The key that signed `data` if it is `asker`'s seal key packet for `public`,
-/// judged as signed by the asker's device.
+/// The key that signed the seal key packet the ask carries, if it is `asker`'s seal key packet
+/// for `public`, judged as signed by the asker's device.
 async fn seal_key_verified(
     shared: &Shared,
-    data: &Data,
     ask: &GrantAsk,
     asker: &Name,
     public: &[u8; 32],
 ) -> Option<Name> {
-    if !seal_key_matches(data, asker, public) {
+    let data = Data::decode(ask.seal_packet.clone()).ok()?;
+    if !seal_key_matches(&data, asker, public) {
         return None;
     }
     match shared
         .host
-        .validate_device_packet(&ask.space, data, asker)
+        .validate_device_packet(&ask.space, &data, asker)
         .await
     {
         Judged::Valid(v) => Some(v.key),

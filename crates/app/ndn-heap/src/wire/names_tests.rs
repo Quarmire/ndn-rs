@@ -1,5 +1,6 @@
 //! Names, digests and the keyword router (spec §2).
 
+use crate::wire::encode_seal_key;
 use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent};
 use ndn_packet::encode::DataBuilder;
@@ -41,12 +42,18 @@ fn epoch() -> EpochId {
     }
 }
 
+/// A seal key packet of `name` carrying `key`, signed as a device would.
+fn seal_packet_of(name: &Name, key: &[u8; 32]) -> Bytes {
+    DataBuilder::new(name.clone(), &encode_seal_key(key)).sign_digest_sha256()
+}
+
 fn ask(space: &Name) -> GrantAsk {
-    GrantAsk {
-        seal_key: seal_key_name(&n("/alice/laptop"), &[9; 32]),
-        space: space.clone(),
-        epoch: epoch(),
-    }
+    GrantAsk::new(
+        space.clone(),
+        epoch(),
+        seal_packet_of(&seal_key_name(&n("/alice/laptop"), &[9; 32]), &[9; 32]),
+    )
+    .expect("a grant ask")
 }
 
 #[test]
@@ -204,22 +211,38 @@ fn seal_key_grant_and_held_names_round_trip_and_refuse_what_they_are_not() {
                 ..ask.clone()
             },
         ),
-        // an ask whose seal key names no seal key packet
+        // an ask whose packet is named for no seal key
         grant_name(
             &device,
             &GrantAsk {
-                seal_key: n("/alice/laptop"),
+                seal_packet: seal_packet_of(&n("/alice/laptop"), &[9; 32]),
                 ..ask.clone()
             },
         ),
         grant_name(
             &device,
             &GrantAsk {
-                seal_key: n("/alice/laptop/32=seal/short"),
+                seal_packet: seal_packet_of(&n("/alice/laptop/32=seal/short"), &[9; 32]),
                 ..ask.clone()
             },
         ),
-        // the old form: the 32 octets of the key, not its name
+        // an ask whose packet is no Data
+        grant_name(
+            &device,
+            &GrantAsk {
+                seal_packet: Bytes::from_static(b"not a Data packet"),
+                ..ask.clone()
+            },
+        ),
+        // an ask whose packet is over the most an ask may carry
+        grant_name(
+            &device,
+            &GrantAsk {
+                seal_packet: Bytes::from(vec![0; SEAL_KEY_PACKET_MAX + 1]),
+                ..ask.clone()
+            },
+        ),
+        // the old form: the seal key's name or its 32 octets, not its packet
         device
             .clone()
             .append_component(kw(b"grant"))
@@ -229,6 +252,32 @@ fn seal_key_grant_and_held_names_round_trip_and_refuse_what_they_are_not() {
                     w.write_tlv(tlv::SEAL_KEY, &[9; 32]);
                     prim::write_name(w, &space);
                     prim::write_epoch_id(w, &epoch());
+                });
+                w.finish()
+            })),
+        device
+            .clone()
+            .append_component(kw(b"grant"))
+            .append_component(NameComponent::generic({
+                let mut w = ndn_tlv::TlvWriter::new();
+                w.write_nested(tlv::GRANT_ASK, |w| {
+                    prim::write_name(w, &seal_key_name(&n("/alice/laptop"), &[9; 32]));
+                    prim::write_name(w, &space);
+                    prim::write_epoch_id(w, &epoch());
+                });
+                w.finish()
+            })),
+        // an ask that carries its packet twice
+        device
+            .clone()
+            .append_component(kw(b"grant"))
+            .append_component(NameComponent::generic({
+                let mut w = ndn_tlv::TlvWriter::new();
+                w.write_nested(tlv::GRANT_ASK, |w| {
+                    prim::write_name(w, &space);
+                    prim::write_epoch_id(w, &epoch());
+                    w.write_tlv(tlv::SEAL_KEY_PACKET, &ask.seal_packet);
+                    w.write_tlv(tlv::SEAL_KEY_PACKET, &ask.seal_packet);
                 });
                 w.finish()
             })),

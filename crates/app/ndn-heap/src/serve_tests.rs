@@ -207,19 +207,21 @@ async fn localhost_and_other_devices_names_are_never_served() {
     );
 }
 
-/// A grant Interest naming the asker's seal key, for the epoch with creator
-/// `me`.
-fn grant_ask(asker: &str, public: [u8; 32]) -> (GrantAsk, Name) {
-    let ask = GrantAsk {
-        seal_key: seal_key_name(&n(asker), &public),
-        space: space(),
-        epoch: EpochId {
-            creator: me(),
-            seq: 2,
-        },
-    };
+/// A grant Interest for the epoch with creator `me` and seq `seq`, carrying the asker's seal
+/// key packet.
+fn grant_ask_of(asker: &str, public: [u8; 32], seq: u64) -> (GrantAsk, Name) {
+    let ask = GrantAsk::new(
+        space(),
+        EpochId { creator: me(), seq },
+        seal_packet(asker, public),
+    )
+    .expect("a grant ask");
     let name = grant_name(&me(), &ask);
     (ask, name)
+}
+
+fn grant_ask(asker: &str, public: [u8; 32]) -> (GrantAsk, Name) {
+    grant_ask_of(asker, public, 2)
 }
 
 /// The asker's seal key packet, as its device would serve it.
@@ -229,7 +231,7 @@ fn seal_packet(asker: &str, public: [u8; 32]) -> Bytes {
 }
 
 /// A grant is answered only for a reader: when the host refuses the ask, no
-/// answer carries a key and nothing is fetched on its behalf.
+/// answer carries a key and nothing is sent on its behalf.
 #[tokio::test(start_paused = true)]
 async fn a_non_reader_gets_no_answer_and_the_granter_fetches_nothing() {
     let s = serving(ME).await;
@@ -241,55 +243,70 @@ async fn a_non_reader_gets_no_answer_and_the_granter_fetches_nothing() {
         0,
         "no Interest was sent for the asker's seal key or anything else"
     );
+    assert!(
+        s.host.st.lock().granted_to.is_empty(),
+        "and no key was wrapped"
+    );
 }
 
-/// A new device of an admitted person gets the key: the granter fetches the
-/// device's seal key packet, has it judged, wraps the key to it, and keeps
-/// the verified key so the next ask costs no fetch.
+/// A grant is one exchange: the ask carries the asker's seal key packet, so the granter fetches
+/// nothing for it. An Interest sent back would have to return within the one lifetime the
+/// asker's ask lives, and on a lossy path (Data held back a second or more on every link) that
+/// nested exchange almost never does: k2, k6 and o2 under `--faulty`.
+#[tokio::test(start_paused = true)]
+async fn a_grant_ask_is_answered_without_the_granter_fetching_anything() {
+    let s = serving(ME).await;
+    let (_, name) = grant_ask(TABLET, [9; 32]);
+    let got = s.ask(&name).await.expect("the grant is answered");
+    assert_eq!(&*got.name, &name, "under the grant's own name");
+    assert_eq!(
+        s.wire.total(),
+        0,
+        "no Interest left the granter for the asker's seal key"
+    );
+    assert_eq!(
+        s.host.st.lock().granted_to,
+        vec![[9; 32]],
+        "the key is wrapped to the seal key in the packet the asker's device signed"
+    );
+}
+
+/// A new device of an admitted person gets the key, and the seal key the granter verified is
+/// kept: another epoch's ask carrying the same packet is not judged again within one generation
+/// of the judge.
 #[tokio::test(start_paused = true)]
 async fn a_new_device_of_an_admitted_person_gets_the_key_by_a_grant() {
     let s = serving(ME).await;
-    let (ask, name) = grant_ask(TABLET, [9; 32]);
-    let packet = seal_packet(TABLET, [9; 32]);
-    let seal = ask.seal_key.clone();
-    s.wire.script(move |n| {
-        if *n == seal {
-            Reply::Data(packet.clone())
-        } else {
-            Reply::Nack(NackReason::NoRoute)
-        }
-    });
+    let (_, name) = grant_ask(TABLET, [9; 32]);
     let got = s.ask(&name).await.expect("the grant is answered");
     assert_eq!(&*got.name, &name, "under the grant's own name");
-    assert_eq!(s.wire.count(&ask.seal_key), 1, "its seal key fetched once");
     let again = s.ask(&name).await.expect("asked again, answered again");
     assert_eq!(again.name, got.name);
-    assert_eq!(
-        s.wire.count(&ask.seal_key),
-        1,
-        "a seal key verified is kept: no second fetch"
+    s.host.st.lock().device_packets_valid = false;
+    let (_, next) = grant_ask_of(TABLET, [9; 32], 3);
+    assert!(
+        s.ask(&next).await.is_some(),
+        "a seal key verified is kept: the next epoch's ask is not judged again"
     );
 }
 
 /// A reader who was removed is refused every later grant, even the one
-/// already answered once: the decision is the host's at each ask.
+/// already answered once: the decision is the host's at each ask. A captured ask replayed after
+/// the removal gets nothing, and one replayed while the reader reads gets the key wrapped to
+/// the asker's seal key, which only the asker opens.
 #[tokio::test(start_paused = true)]
 async fn a_removed_reader_is_refused_every_later_grant() {
     let s = serving(ME).await;
-    let (ask, name) = grant_ask(TABLET, [9; 32]);
-    let packet = seal_packet(TABLET, [9; 32]);
-    let seal = ask.seal_key.clone();
-    s.wire.script(move |n| {
-        if *n == seal {
-            Reply::Data(packet.clone())
-        } else {
-            Reply::Nack(NackReason::NoRoute)
-        }
-    });
+    let (_, name) = grant_ask(TABLET, [9; 32]);
     s.host.st.lock().grant_says = vec![Ok(()), Err(GrantRefusal::NotReaderNow)];
     assert!(s.ask(&name).await.is_some(), "while a reader");
     assert!(s.ask(&name).await.is_none(), "removed: refused");
     assert!(s.ask(&name).await.is_none(), "and every ask after");
+    assert_eq!(
+        s.host.st.lock().granted_to,
+        vec![[9; 32]],
+        "one key wrapped, to the asker's seal key alone"
+    );
 }
 
 /// A packet that is not the asker's seal key (another key inside, or one the
@@ -297,31 +314,28 @@ async fn a_removed_reader_is_refused_every_later_grant() {
 #[tokio::test(start_paused = true)]
 async fn a_seal_key_that_is_not_the_askers_gets_no_grant() {
     let s = serving(ME).await;
-    let (ask, name) = grant_ask(TABLET, [9; 32]);
-    let seal = ask.seal_key.clone();
     // Content names another public key than the name does.
-    let wrong = DataBuilder::new(seal.clone(), &encode_seal_key(&[1; 32])).sign_digest_sha256();
-    s.wire.script(move |n| {
-        if *n == seal {
-            Reply::Data(wrong.clone())
-        } else {
-            Reply::Nack(NackReason::NoRoute)
-        }
-    });
-    assert!(s.ask(&name).await.is_none(), "mismatched content");
+    let seal = seal_key_name(&n(TABLET), &[9; 32]);
+    let wrong = DataBuilder::new(seal, &encode_seal_key(&[1; 32])).sign_digest_sha256();
+    let ask = GrantAsk::new(
+        space(),
+        EpochId {
+            creator: me(),
+            seq: 2,
+        },
+        wrong,
+    )
+    .expect("a well-formed ask");
+    assert!(
+        s.ask(&grant_name(&me(), &ask)).await.is_none(),
+        "mismatched content"
+    );
 
     let s = serving(ME).await;
     s.host.st.lock().device_packets_valid = false;
-    let packet = seal_packet(TABLET, [9; 32]);
-    let seal = ask.seal_key.clone();
-    s.wire.script(move |n| {
-        if *n == seal {
-            Reply::Data(packet.clone())
-        } else {
-            Reply::Nack(NackReason::NoRoute)
-        }
-    });
+    let (_, name) = grant_ask(TABLET, [9; 32]);
     assert!(s.ask(&name).await.is_none(), "the judge refuses the packet");
+    assert!(s.host.st.lock().granted_to.is_empty());
 }
 
 /// An asker whose key is revoked is granted nothing, though its person reads:
@@ -329,16 +343,7 @@ async fn a_seal_key_that_is_not_the_askers_gets_no_grant() {
 #[tokio::test(start_paused = true)]
 async fn an_asker_with_a_revoked_key_gets_no_grant() {
     let s = serving(ME).await;
-    let (ask, name) = grant_ask(TABLET, [9; 32]);
-    let packet = seal_packet(TABLET, [9; 32]);
-    let seal = ask.seal_key.clone();
-    s.wire.script(move |n| {
-        if *n == seal {
-            Reply::Data(packet.clone())
-        } else {
-            Reply::Nack(NackReason::NoRoute)
-        }
-    });
+    let (_, name) = grant_ask(TABLET, [9; 32]);
     s.host
         .st
         .lock()
@@ -353,21 +358,11 @@ async fn an_asker_with_a_revoked_key_gets_no_grant() {
 #[tokio::test(start_paused = true)]
 async fn a_kept_seal_key_and_grant_are_not_served_after_the_judge_moves() {
     let s = serving(ME).await;
-    let (ask, name) = grant_ask(TABLET, [9; 32]);
-    let packet = seal_packet(TABLET, [9; 32]);
-    let seal = ask.seal_key.clone();
-    s.wire.script(move |n| {
-        if *n == seal {
-            Reply::Data(packet.clone())
-        } else {
-            Reply::Nack(NackReason::NoRoute)
-        }
-    });
+    let (_, name) = grant_ask(TABLET, [9; 32]);
     assert!(
         s.ask(&name).await.is_some(),
         "granted while the key is good"
     );
-    assert_eq!(s.wire.count(&ask.seal_key), 1);
     {
         // The tablet is stolen and its key revoked: the judge moves on and
         // refuses what the key signed.
@@ -379,8 +374,9 @@ async fn a_kept_seal_key_and_grant_are_not_served_after_the_judge_moves() {
         s.ask(&name).await.is_none(),
         "neither the kept grant nor the kept seal key answers for a revoked key"
     );
+    let (_, next) = grant_ask_of(TABLET, [9; 32], 3);
     assert!(
-        s.wire.count(&ask.seal_key) > 1,
-        "its seal key is fetched and judged again, not taken from what was kept"
+        s.ask(&next).await.is_none(),
+        "the seal key in the next ask is judged again, not taken from what was kept"
     );
 }

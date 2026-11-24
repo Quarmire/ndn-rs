@@ -58,7 +58,9 @@ use crate::log::{Blob, Outcome, Pin};
 use crate::pieces::{self, Assembler, Offered};
 use crate::rt::{self, Instant};
 use crate::sync::{Group, TIMELINE, Taken};
-use crate::wire::{ChunksBody, EpochId, GrantAsk, grant_name, held_name, log_name, seal_key_name};
+use crate::wire::{
+    ChunksBody, EpochId, GrantAsk, WireError, grant_name, held_name, log_name, seal_key_name,
+};
 
 /// The pause before asking again for something after `misses` asks for it
 /// missed in a row: this long, doubled each time, at most [`REFRESH_PAUSE_MAX`].
@@ -1361,21 +1363,38 @@ impl Group {
 
     /// Ask for the key of `epoch` while it is owed (spec §6.5): round after
     /// round, each of the epoch's creator and then the heard members that
-    /// vouch ([`Heard::granters`]), with a capped backoff between rounds. A
-    /// granted key is taken only if the log accepts it (it matches the check
-    /// of the Epoch entry naming the epoch); one that does not is dropped and
-    /// the ask goes on.
+    /// vouch ([`Heard::granters`]), with a capped backoff between rounds. The
+    /// ask carries this device's seal key packet, so a granter answers it in
+    /// the one exchange. A granted key is taken only if the log accepts it (it
+    /// matches the check of the Epoch entry naming the epoch); one that does
+    /// not is dropped and the ask goes on.
     async fn pull_key(self: Arc<Self>, epoch: EpochId) {
+        self.pull_rounds(&epoch).await;
+        self.asking.lock().remove(&epoch);
+        self.progress.notify_waiters();
+        self.wake.notify_one();
+    }
+
+    /// The rounds of [`Self::pull_key`], until the key is held, no longer owed, or the group
+    /// stops.
+    async fn pull_rounds(&self, epoch: &EpochId) {
         let host = &self.shared.host;
-        let ask = GrantAsk {
-            seal_key: seal_key_name(host.device(), &host.seal_public()),
-            space: self.space.clone(),
-            epoch: epoch.clone(),
+        let own = seal_key_name(host.device(), &host.seal_public());
+        let ask = match host
+            .seal_key_packet(&own)
+            .ok_or(WireError::Malformed("this device holds no seal key packet"))
+            .and_then(|packet| GrantAsk::new(self.space.clone(), epoch.clone(), packet))
+        {
+            Ok(ask) => ask,
+            Err(e) => {
+                tracing::warn!(space = %self.space, "the key of {epoch:?} is not asked for: this device's seal key packet cannot be carried in a grant ask ({e}); sign it with a device key whose signature is smaller");
+                return;
+            }
         };
         let mut misses = 0u32;
-        'rounds: loop {
-            if self.stop.is_cancelled() || !host.owed_keys(&self.space).contains(&epoch) {
-                break;
+        loop {
+            if self.stop.is_cancelled() || !host.owed_keys(&self.space).contains(epoch) {
+                return;
             }
             let granters = self
                 .heard
@@ -1401,17 +1420,14 @@ impl Group {
                 let Some(content) = data.content().cloned() else {
                     continue;
                 };
-                if host.key_arrived(&self.space, &epoch, &name, content) {
-                    break 'rounds;
+                if host.key_arrived(&self.space, epoch, &name, content) {
+                    return;
                 }
                 tracing::debug!(%granter, ?epoch, "refused: a granted key that does not match its epoch's key check");
             }
             rt::sleep(retry_pause(misses)).await;
             misses += 1;
         }
-        self.asking.lock().remove(&epoch);
-        self.progress.notify_waiters();
-        self.wake.notify_one();
     }
 
     // -- Recovery -------------------------------------------------------------------------------

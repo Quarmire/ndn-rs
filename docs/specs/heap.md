@@ -243,7 +243,7 @@ device.
 | chunk of the payload of entry `E` | `<E>/32=piece/seg=<i>` | the chunk's octets (§8) | DigestSha256 |
 | manifest node `k` of entry `E` | `<E>/32=piece/32=manifest/seg=<k>` | `DIGEST`* (§8) | DigestSha256 |
 | seal key of device `D` | `<D>/32=seal/<public key>`, the last component 32 octets | one `SEAL_KEY` TLV (§6.2) | a key of device `D` |
-| grant | `<G>/32=grant/<GrantAsk TLV>`, the last component one GenericNameComponent holding the `GRANT_ASK` TLV | one `GRANT` TLV (§6.5) | a key of the granter `G` |
+| grant | `<G>/32=grant/<GrantAsk TLV>`, the last component one GenericNameComponent holding the `GRANT_ASK` TLV, which carries the asker's seal key packet | one `GRANT` TLV (§6.5) | a key of the granter `G` |
 | held copy | `<H>/32=held/<Name TLV of the original>`, the last component one GenericNameComponent | the complete wire of the original packet | DigestSha256 |
 | signal run header (§11; never stored, served or fetched) | `<D>/32=signal/<S>/32=run/<run id>`, the run id one GenericNameComponent of 16 octets | the run's body | a key of device `D` |
 | sync group | `<O>/32=sync/<c1>[/<c2>…]` | State Vector Sync Interests and Data (§7) | as `ndn-sync` |
@@ -281,13 +281,15 @@ Every name parses one way, and a node MUST refuse a name that does not parse.
   the X25519 public key, equal to the key the packet's Content carries.
 - **Grant.** `G` is the components before the first `32=grant` (a device
   name); exactly one GenericNameComponent follows whose value is one `GRANT_ASK`
-  TLV: two `Name` TLVs in this order, the asker's **seal key name**
-  `<D>/32=seal/<public key>` (which MUST parse as a seal key name) and the
-  space (which MUST parse as a space name), then one `EPOCH_ID`. The ask names
-  the seal key by its packet name, not by its octets, so a granter learns which
-  device to fetch it from and whose person to test (§6.5). The encoding MUST be
-  canonical: re-encoding the decoded ask MUST give the same octets, so one ask
-  has one name.
+  TLV: the space as one `Name` TLV (which MUST parse as a space name), one
+  `EPOCH_ID`, and one `SEAL_KEY_PACKET`, the asker's **seal key packet** — the
+  whole signed Data `<D>/32=seal/<public key>` (its name MUST parse as a seal key
+  name, and it is at most 2,048 octets, `SEAL_KEY_PACKET_MAX`). The ask carries
+  the packet itself, not its name, so the granter learns the asker's device and
+  key, and judges the packet, from the ask alone and sends no Interest (§6.5).
+  The encoding MUST be canonical: re-encoding the decoded ask MUST give the same
+  octets, so one ask has one name. A name of the older form (the seal key named,
+  not carried) names no grant.
 - **Held copy.** `H` is the components before the first `32=held` (a device
   name); exactly one GenericNameComponent follows whose value is the Name TLV
   of the original.
@@ -407,13 +409,14 @@ class.
 | `EPOCH_BODY` | 0x062F | `ENTRY` | `KEY_CHECK`, `AUDIENCE` | at most one |
 | `KEY_CHECK` | 0x0631 | `EPOCH_BODY` | 32 octets (§6.2) | exactly one |
 | `AUDIENCE` | 0x0633 | `EPOCH_BODY` | `Name`* (persons) | exactly one; 0 to 256 persons |
-| `GRANT_ASK` | 0x0635 | the last name component of a grant | `Name` (seal key), `Name` (space), `EPOCH_ID` | see §2.3 |
+| `GRANT_ASK` | 0x0635 | the last name component of a grant | `Name` (space), `EPOCH_ID`, `SEAL_KEY_PACKET` | see §2.3 |
 | `SEAL_KEY` | 0x0637 | Content of a seal key packet | 32 octets: an X25519 public key | exactly one |
 | `GRANT` | 0x0639 | Content of a grant packet | `EPHEMERAL_KEY`, `CIPHERTEXT` | exactly one of each |
+| `SEAL_KEY_PACKET` | 0x063B | `GRANT_ASK` | the wire of the asker's seal key packet, a whole Data | exactly one; ≤ 2,048 octets (`SEAL_KEY_PACKET_MAX`) |
 
 `SEAL_KEY` and `GRANT` are packet Contents, not parts of an entry; `GRANT_ASK`
-lives in a name. 0x063B–0x063F and every even number of the block are free
-(§15).
+and `SEAL_KEY_PACKET` live in a name. 0x063D–0x063F and every even number of the
+block are free (§15).
 
 ### 3.4 Decoding
 
@@ -1327,7 +1330,7 @@ or no longer owed. It MUST NOT ask a name that only a Sync Interest carried (a
 notice names nothing it decides, §7). A granted key is taken only if it
 matches the key check of a held owner-signed `Epoch` entry naming `E`;
 otherwise it is dropped. It unwraps with its recipient key and the grant's name
-as AAD.
+as AAD. Every ask carries the device's own seal key packet as it signed it.
 
 **Granter side.** A device `G` answers `<G>/32=grant/<GrantAsk>` **only when all
 six hold**, checked in this order:
@@ -1344,27 +1347,42 @@ six hold**, checked in this order:
 5. `G` holds the epoch's key (`KeyNotHeld`);
 6. the key that signed the asker's seal key packet is **not revoked** by a trust
    context `G` holds (`AskerKeyRevoked`): known only once the packet is judged,
-   so it is checked after the fetch.
+   so it is checked after the judging.
 
-Anything else gets **no answer**, and `G` fetches nothing for it. Conditions 1–5
-are decided first, before anything is fetched. Then `G` fetches the seal key
-packet named by the ask — `<D>/32=seal/<pk>` — and verifies it (§6.2: signed by
-a key of `D`, the Content equal to `pk`, one run per seal key, kept once
-verified); all six conditions are checked **again** after the fetch, with the
-key that signed it, since the records may have moved. It answers with the key
-wrapped to `pk` (§6.2) under the **grant's own name** as AAD, signed by its
-device key. One name has one packet while it is kept; a granter keeps its last
+Anything else gets **no answer**, and `G` sends no Interest for any ask: the
+exchange is one Interest and one Data. Conditions 1–5 are decided first, from the
+ask's names alone, before the packet in it is decoded. Then `G` decodes the seal
+key packet the ask carries — `<D>/32=seal/<pk>` — and verifies it (§6.2: signed
+by a key of `D`, chained to `D`'s person's trust context as any packet of a
+device is, the Content equal to `pk`; kept once verified); all six conditions
+are checked **again** after the judging, with the key that signed it, since the
+records may have moved. It answers with the key wrapped to `pk` (§6.2) under the
+**grant's own name** as AAD, signed by its device key. `pk` is the key of the
+packet `D`'s device signed, never a key the ask names on its own: a grant ask
+made by anyone but `D` cannot make `G` wrap the key to any key but `D`'s.
+One name has one packet while it is kept; a granter keeps its last
 4,096 grants and the last 4,096 seal keys it verified (with the key that signed
 each), **for one generation of its judge**: a counter that moves whenever a
 revoking context is adopted or a person's newer version refuses more
 (`Judge::generation`). What was kept under another generation is not served;
-the packet is fetched and judged again. It works on at most 32 asks of one
-asker device at a time; a seal key that does not come in place gets no answer
-now, and the asker's next round asks for it again. An epoch that
+the packet is judged again. It works on at most 32 asks of one asker device at a
+time; a packet that does not verify gets no answer, and the asker's next round
+asks again. An epoch that
 this device itself made is not granted until its `Epoch` entry has been
 flushed (it is not servable before), so that a power loss cannot take the entry
 and leave the key granted. Every ask a device does not answer is Nacked, never
 left to time out.
+
+Why the exchange is one: an ask that made the granter fetch the asker's seal key
+packet put two exchanges inside one Interest lifetime (the ask, the granter's
+Interest for the packet, the packet, then the grant: four legs, two of them Data).
+On a path that delays and drops Data (the suite's faulty profile holds a Data up
+to 1.9 s on every link and drops one packet in five) the four legs together
+outlast the lifetime almost always: in the suite's k2 under `--faulty --fault-seed
+2`, none of the phone's 34 grant asks was answered in time and 2 of the 17 seal
+key fetches arrived, so the key never came within the case's 120 s. The asker
+has the packet, signed, and is the one party that must send it; the granter's
+judging of it is local.
 
 ### 6.6 Forward only
 
@@ -1397,6 +1415,16 @@ inside the sealed body.
 - **Key to the wrong device.** A grant is wrapped only to a seal key that a key
   of the asker's device signed, and only to a person the records admit; the key
   that arrives is checked against the owner-signed check.
+- **A captured ask replayed.** A grant ask is a name, and a name can be sent
+  again by anyone who saw it. It gives the replayer nothing: the reply is
+  wrapped to the seal key inside the packet the ask carries, which the asker's
+  device signed, so only the holder of that recipient key opens it, and the
+  granter takes the key to wrap to from nowhere else (the ask names no key of
+  its own). A replayer cannot put its own key in the ask either: the packet must
+  verify as signed by the asker's device. Every ask is decided afresh, so a
+  replay after the asker's person was removed from the readers, or after its key
+  was revoked, is refused as the asker's own ask would be (§6.6), and the kept
+  grant answers only within the judge's generation it was made in.
 - **Stolen epoch key.** An epoch key a thief holds opens what it was sealed in;
   revoking the device's key rotates the epoch for what follows (§5.3 rules 7–8),
   it does not recall (invariant 9). Between the theft and the revocation the
@@ -1411,7 +1439,9 @@ inside the sealed body.
   revocation clears them, so a revoked device is judged again, never served from
   what was kept before.
 - **A forged ask.** An ask names no sender; a stranger's ask costs the granter
-  no fetch (conditions 1–4 are checked first).
+  no signature check (conditions 1–4 are checked first, from the names alone),
+  and one that passes them for a real reader's device costs at most one
+  judging of a packet of at most 2,048 octets, under the per-asker bound of 32.
 
 ## 7. Sync and fetch
 
@@ -1513,8 +1543,8 @@ is asked again by the consumer after a
 short jittered pause. The node has `Config.in_flight` (256) slots for asks, shared by
 kind so that nobody's asks starve the others': the asks of the wanted entries and
 pieces (**walks**) hold at most three quarters of them, one device's walks at most
-half; the probes (§7.2) at most an eighth; a grant pull and a seal key fetched for
-one (**pulls**) take from what is left, so they find a slot whoever floods the
+half; the probes (§7.2) at most an eighth; a grant pull takes from what is
+left, so it finds a slot whoever floods the
 walks. An ask waits for its slots at most one lifetime and is then a miss.
 
 A **miss** is: nothing answered in time; a Congestion Nack that asking again
@@ -1650,7 +1680,8 @@ The conditions and the cryptography are §6.5. As implemented:
   Interest carried. A grant is judged as a packet of the granter's device
   (§9.1), unwrapped with the recipient key under the grant's name, and taken
   only if the log accepts it (§6.2); one that fails is dropped and the asking
-  goes on.
+  goes on. The ask is built once per epoch owed from this device's own seal key
+  packet, which the node signed at start (`SEAL_KEY_PACKET`).
 - **Granter.** §6.5, with its bounds (asks per asker, grants kept).
 
 ### 7.9 Routing is the forwarder's
@@ -2339,6 +2370,7 @@ impl Heap {
     pub async fn watch(&self, since: &Frontier) -> Result<Changes, HeapError>;
     pub fn members(&self) -> Members;
     pub fn ready(&self) -> bool;
+    pub fn holds_epoch_key(&self) -> bool;
     pub fn applied(&self, id: &EntryId) -> bool;
     pub async fn change(&self, c: MembersChange) -> Result<EntryId, HeapError>;
 }
@@ -2421,6 +2453,18 @@ from the fold (§5.4), the owner first; it never waits. **`ready()`** says the
 first catch-up is done: the space's creation is held and everything heard of
 is held (§7.4). A host that opens a space made elsewhere waits for it before it
 reads `members()`, and before any call that answers `NotReady` for the creation.
+
+**`holds_epoch_key()`** says whether a `put` seals now instead of answering
+`NotReady` while the key of the epoch in force is asked for (§6.4, §6.5): the
+node holds that key, or the space is public and needs none. It is `false` while
+the creation is not held and, in a sealed space, while no epoch is in force. The
+owner's devices each sign an epoch for the readers they see, and the greatest is
+in force (§5.3 rule 6), so the epoch in force of a device can change when it
+learns of another owner device's epoch, and the key of the new one comes by a
+grant (one exchange). A host that is to write while cut off from the others waits
+for this before it goes offline, and a `put` made when it is `true` is not
+answered `NotReady` for the key unless the epoch in force changed since. It reads
+the space's records under the space's lock and never waits.
 
 **`applied(id)`** says whether this node has applied the entry `id` (an
 `EntryId` from `put`, `change`, an `Item` or a peer): it holds exactly those
@@ -3062,7 +3106,7 @@ Each property of §1.6 is held by one module and shown by named tests (the
 The data layer owns **0x0600–0x063F** (64 numbers), registered in
 [README.md](README.md#tlv-type-numbers). **Odd** numbers are critical: a decoder
 refuses a record holding one it does not know. **Even** numbers are skippable
-and reserved for additive fields (§3.4). Every number in use is odd; 0x063B–0x063F
+and reserved for additive fields (§3.4). Every number in use is odd; 0x063D–0x063F
 and every even number of the block are free.
 
 | TLV-TYPE | Name | Value | § |
@@ -3093,9 +3137,10 @@ and every even number of the block are free.
 | 0x062F | `EPOCH_BODY` | `KEY_CHECK`, `AUDIENCE` | 3.5, 6.3 |
 | 0x0631 | `KEY_CHECK` | 32 octets | 6.2 |
 | 0x0633 | `AUDIENCE` | `Name`* (≤ 256 persons) | 3.5 |
-| 0x0635 | `GRANT_ASK` | `Name` (seal key packet), `Name` (space), `EPOCH_ID`: the last component of a grant's name | 2.3, 6.5 |
+| 0x0635 | `GRANT_ASK` | `Name` (space), `EPOCH_ID`, `SEAL_KEY_PACKET`: the last component of a grant's name | 2.3, 6.5 |
 | 0x0637 | `SEAL_KEY` | 32 octets: an X25519 public key; the Content of a seal key packet | 6.2 |
 | 0x0639 | `GRANT` | `EPHEMERAL_KEY`, `CIPHERTEXT`: the Content of a grant packet | 6.2, 6.5 |
+| 0x063B | `SEAL_KEY_PACKET` | the wire of the asker's seal key packet (a whole Data), at most 2,048 octets | 2.3, 3.3, 6.5 |
 
 Name keywords this specification owns (KeywordNameComponent, TLV-TYPE 0x20): `data`,
 `log`, `piece`, `manifest`, `seal`, `grant`, `held`, `sync`, `signal`, `run` (§2, §11). The numbers

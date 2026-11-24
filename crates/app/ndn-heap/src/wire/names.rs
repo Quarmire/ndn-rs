@@ -20,6 +20,7 @@
 
 use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent, tlv_type};
+use ndn_packet::Data;
 use ndn_tlv::TlvWriter;
 
 use super::prim::{WireError, fields, once, read_epoch_id, read_name, write_epoch_id, write_name};
@@ -238,57 +239,88 @@ pub(crate) fn parse_seal_key_name(name: &Name) -> Option<(Name, [u8; 32])> {
     Some((device, public.as_ref().try_into().ok()?))
 }
 
+/// The most octets of the seal key packet a grant ask carries: a signed Data of one X25519 key
+/// is a few hundred, so this bounds what an ask may make a granter hold and decode, and the
+/// size of the Interest name.
+pub(crate) const SEAL_KEY_PACKET_MAX: usize = 2048;
+
 /// What a grant answers: the key of one epoch of a space, for the holder of
-/// a seal key. The ask names the asker's seal key packet, and through it the
-/// asker's device.
+/// a seal key. The ask carries the asker's seal key packet itself (a signed
+/// Data of a few hundred octets), so the granter judges it where it stands and
+/// asks nothing back: the exchange is one Interest and one Data.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct GrantAsk {
     /// The asker's seal key packet's name, `<D>/32=seal/<public key>`
-    /// ([`seal_key_name`]).
+    /// ([`seal_key_name`]): the name of the packet in [`Self::seal_packet`].
     pub seal_key: Name,
     /// The space whose epoch key is asked for.
     pub space: Name,
     /// The epoch.
     pub epoch: EpochId,
+    /// The asker's seal key packet as signed by its device: the whole Data.
+    pub seal_packet: Bytes,
 }
 
 impl GrantAsk {
-    /// The `GRANT_ASK` TLV: `{ Name(seal key), Name(space), EPOCH_ID }`.
+    /// An ask for `epoch` of `space` that carries `seal_packet`, the asker's seal key packet;
+    /// refused if that is no Data named `<device>/32=seal/<public key>` or is over
+    /// [`SEAL_KEY_PACKET_MAX`]. Whether the device signed it is for the granter's judge.
+    pub(crate) fn new(
+        space: Name,
+        epoch: EpochId,
+        seal_packet: Bytes,
+    ) -> Result<GrantAsk, WireError> {
+        if seal_packet.len() > SEAL_KEY_PACKET_MAX {
+            return Err(WireError::TooLarge {
+                what: "a grant ask's seal key packet",
+                size: seal_packet.len(),
+                max: SEAL_KEY_PACKET_MAX,
+            });
+        }
+        let data = Data::decode(seal_packet.clone()).map_err(|_| {
+            WireError::Malformed("a grant ask carries the asker's seal key packet, a Data")
+        })?;
+        if parse_seal_key_name(&data.name).is_none() || parse_space_name(&space).is_none() {
+            return Err(WireError::Malformed(
+                "a grant ask carries a seal key packet (<device>/32=seal/<key>) and names a \
+                 space (<owner>/32=data/<path>)",
+            ));
+        }
+        Ok(GrantAsk {
+            seal_key: (*data.name).clone(),
+            space,
+            epoch,
+            seal_packet,
+        })
+    }
+
+    /// The `GRANT_ASK` TLV: `{ Name(space), EPOCH_ID, SEAL_KEY_PACKET }`.
     pub(crate) fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv::GRANT_ASK, |w| {
-            write_name(w, &self.seal_key);
             write_name(w, &self.space);
             write_epoch_id(w, &self.epoch);
+            w.write_tlv(tlv::SEAL_KEY_PACKET, &self.seal_packet);
         });
         w.finish()
     }
 
-    /// Decode a `GRANT_ASK` TLV; the seal key must be a seal key packet's
-    /// name, the space a space name and the epoch's creator a device.
+    /// Decode a `GRANT_ASK` TLV; the space must be a space name, the epoch's
+    /// creator a device and the packet a seal key packet's Data ([`Self::new`]).
     pub(crate) fn decode(content: Bytes) -> Result<GrantAsk, WireError> {
         let value = super::prim::only(content, tlv::GRANT_ASK, "a grant ask is one GRANT_ASK TLV")?;
-        let (mut names, mut epoch) = (Vec::new(), None);
+        let (mut space, mut epoch, mut packet) = (None, None, None);
         fields!(value, |v| {
-            tlv_type::NAME => names.push(read_name(v)?),
+            tlv_type::NAME => once(&mut space, read_name(v)?, "a grant ask's space")?,
             tlv::EPOCH_ID => once(&mut epoch, read_epoch_id(v)?, "a grant ask's epoch")?,
+            tlv::SEAL_KEY_PACKET => once(&mut packet, v, "a grant ask's seal key packet")?,
         });
-        let (Ok([seal_key, space]), Some(epoch)) = (<[Name; 2]>::try_from(names), epoch) else {
+        let (Some(space), Some(epoch), Some(packet)) = (space, epoch, packet) else {
             return Err(WireError::Malformed(
-                "a grant ask has a seal key name, a space name and an epoch",
+                "a grant ask has a space name, an epoch and the asker's seal key packet",
             ));
         };
-        if parse_seal_key_name(&seal_key).is_none() || parse_space_name(&space).is_none() {
-            return Err(WireError::Malformed(
-                "a grant ask names a seal key packet (<device>/32=seal/<key>) and a space \
-                 (<owner>/32=data/<path>)",
-            ));
-        }
-        Ok(GrantAsk {
-            seal_key,
-            space,
-            epoch,
-        })
+        GrantAsk::new(space, epoch, packet)
     }
 }
 

@@ -1023,10 +1023,21 @@ async fn the_grant_pull_walks_creator_then_relays_with_backoff() {
         None::<tokio::time::Instant>,
     )));
     let counter = Arc::clone(&answered);
+    let own_seal_packet = r
+        .host
+        .st
+        .lock()
+        .seal
+        .clone()
+        .expect("the toy host has a seal key packet");
     r.wire.script(move |name| {
-        let Some((granter, _)) = parse_grant_name(name) else {
+        let Some((granter, ask)) = parse_grant_name(name) else {
             return Reply::Nack(NackReason::NoRoute);
         };
+        assert_eq!(
+            ask.seal_packet, own_seal_packet,
+            "the ask carries this device's own seal key packet, so a granter fetches nothing"
+        );
         if granter == n(PHONE) {
             return Reply::Silent;
         }

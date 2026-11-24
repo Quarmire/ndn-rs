@@ -253,7 +253,7 @@ fn an_unknown_even_tlv_is_skipped_and_an_unknown_odd_one_refuses() {
                 "even {even:#x} in {path:?}"
             );
         }
-        for odd in [0x063B, 0x063D, 0x0641, 0x0001] {
+        for odd in [0x063D, 0x063F, 0x0641, 0x0001] {
             let wire = with_extra(entry, &path, odd);
             assert_eq!(
                 Entry::decode(&wire),
@@ -641,7 +641,7 @@ fn grant_ask_seal_key_and_manifest_content_round_trip() {
             .collect()
     });
     let critical = rewrite(&value, &[], &|mut list| {
-        list.push((0x063B, Bytes::new()));
+        list.push((0x063D, Bytes::new()));
         list
     });
     for body in [short, missing] {
@@ -649,7 +649,7 @@ fn grant_ask_seal_key_and_manifest_content_round_trip() {
     }
     assert_eq!(
         Grant::decode(serialize(&[(tlv::GRANT, critical)])),
-        Err(WireError::UnknownCritical(0x063B))
+        Err(WireError::UnknownCritical(0x063D))
     );
     let doubled = serialize(&[(tlv::GRANT, value.clone()), (tlv::GRANT, value)]);
     assert!(Grant::decode(doubled).is_err());
@@ -710,8 +710,8 @@ fn the_sealed_plaintext_is_a_path_and_one_payload() {
     };
     assert_eq!(decode_sealed_plain(&with(0x0640)), Ok(put.clone()));
     assert_eq!(
-        decode_sealed_plain(&with(0x063B)),
-        Err(WireError::UnknownCritical(0x063B))
+        decode_sealed_plain(&with(0x063D)),
+        Err(WireError::UnknownCritical(0x063D))
     );
     // No payload, two payloads, no path, a path twice.
     let first = children(&plain);

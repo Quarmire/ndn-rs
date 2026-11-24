@@ -1,6 +1,6 @@
 //! TLV-TYPE numbers, the block 0x0600–0x063F (`docs/specs/heap.md`, §3).
 //! Odd is critical: a decoder refuses a type it does not know. Even is
-//! skippable and reserved for additive fields. 0x063B–0x063F and every even
+//! skippable and reserved for additive fields. 0x063D–0x063F and every even
 //! number stay free.
 
 /// The Content of every log packet.
@@ -59,10 +59,14 @@ pub(crate) const EPOCH_BODY: u64 = 0x062F;
 pub(crate) const KEY_CHECK: u64 = 0x0631;
 /// `{ Name* }`, at most 256 persons.
 pub(crate) const AUDIENCE: u64 = 0x0633;
-/// `{ Name(seal key packet), Name(space), EPOCH_ID }`: the last component of
-/// a grant's name.
+/// `{ Name(space), EPOCH_ID, SEAL_KEY_PACKET }`: the last component of a
+/// grant's name.
 pub(crate) const GRANT_ASK: u64 = 0x0635;
 /// 32 octets: an X25519 public key, the Content of a seal-key packet.
 pub(crate) const SEAL_KEY: u64 = 0x0637;
 /// `{ EPHEMERAL_KEY, CIPHERTEXT }`: the Content of a grant answer.
 pub(crate) const GRANT: u64 = 0x0639;
+/// The asker's seal key packet, the whole signed Data `<D>/32=seal/<public
+/// key>`, carried in the grant ask so the granter verifies it without fetching
+/// it.
+pub(crate) const SEAL_KEY_PACKET: u64 = 0x063B;

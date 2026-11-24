@@ -31,7 +31,7 @@ use crate::seal::GrantRefusal;
 use crate::sync::Taken;
 use crate::test_kit::n;
 use crate::trust::{Judged, Verified};
-use crate::wire::{EpochId, log_name, parse_log_name};
+use crate::wire::{EpochId, encode_seal_key, log_name, parse_log_name, seal_key_name};
 
 /// The space the cases run in.
 pub(crate) const SPACE: &str = "/alice/32=data/notes";
@@ -318,6 +318,8 @@ pub(crate) struct Toy {
     pub generation: u64,
     /// The keys the toy says are revoked.
     pub revoked_keys: BTreeSet<Name>,
+    /// The seal keys the grants the toy made were wrapped to.
+    pub granted_to: Vec<[u8; 32]>,
 }
 
 /// What the network half asks of the node, as the toy host answers it: the
@@ -378,6 +380,13 @@ impl Toyhost {
             st: Mutex::new(Toy {
                 key_matches: true,
                 device_packets_valid: true,
+                seal: Some(
+                    DataBuilder::new(
+                        seal_key_name(&n(device), &[7; 32]),
+                        &encode_seal_key(&[7; 32]),
+                    )
+                    .sign_digest_sha256(),
+                ),
                 ..Toy::default()
             }),
         })
@@ -684,9 +693,10 @@ impl Host for Toyhost {
         _epoch: &EpochId,
         _asker: &Name,
         _key: &Name,
-        _to: &[u8; 32],
+        to: &[u8; 32],
         name: &Name,
     ) -> Option<Bytes> {
+        self.st.lock().granted_to.push(*to);
         Some(DataBuilder::new(name.clone(), b"a key, wrapped").sign_digest_sha256())
     }
 }
