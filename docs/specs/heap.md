@@ -684,11 +684,12 @@ offered again and verifies.
 ### 3.10 The public wire module
 
 The crate exports its wire format as `ndn_heap::wire`, so that a program that is
-not a node (the conformance suite, §13) can build, name, sign, read and digest
+not a node (the conformance suite, §13) can build, name, read and digest
 entries exactly as a node does. Nothing else of the module is public (the
 names of grants, held copies, seal keys and signal runs, the pieces, the record
-codecs, the TLV registry are the layer's own). There is no switch and no
-feature behind it: it is the format this section and §2 specify.
+codecs, the TLV registry, the function that signs an entry are the layer's own).
+There is no switch and no feature behind it: it is the format this section and §2
+specify.
 
 ```rust
 pub mod wire {
@@ -707,27 +708,20 @@ pub mod wire {
     // SealedBody, EpochId, MembersBody, Op, Role, EpochBody: the shapes of §5, §6.
     pub enum WireError { /* §3.4 refusals */ }
     pub fn log_name(device: &Name, space: &Name, seq: u64) -> Name;       // §2.2
-    pub fn sign_entry(signer: &dyn Signer, name: &Name, entry: &Entry)
-                      -> Result<Bytes, SignError>;
-    pub enum SignError { Wire(WireError), Signer { key: Name, reason: String } }
     pub fn signed_digest(wire: &Bytes) -> [u8; 32];                      // §1.5
     pub fn signed_digest_of(data: &Data) -> [u8; 32];
 }
 ```
 
-`sign_entry` is the function a node signs its own entries with: it encodes
-`entry`, builds the Data packet at `name` and signs it synchronously with
-`signer` (the KeyLocator is `signer`'s key name), so a program that holds a
-device's `Signer` can write the entry that device would have written at any
-`(device, space, seq)`, with any `PREV`/`PREV_SEQ` and `after`, a Put body
-whose empty inline payload is a removal. It does not check that `name` is a log
-name or that `signer` belongs to the device the name carries: it signs what it
-is given, and a node judges the packet by §3.8 as it judges any packet from the
-network (a key naming another device, a non-member's writer, a chain that does
-not connect and the rest are refused there). The entry's id is
-`(device, seq, signed_digest(&packet))`. `Entry::decode` reads the Content of a
-stored packet back (`Data::decode`, then `content()`) into the fields it was
-built from.
+There is no public function that signs an entry. One that signed `entry` at any
+`(device, space, seq)` with a `Signer` the caller passes would let a host make a device
+equivocate (two entries at one name: its key is suspected everywhere, invariant 8), and
+nothing outside the crate needs it: a node signs its own entries with its own key through
+`Heap::put` and `Heap::change`, under the reservation of §4, and the conformance suite makes
+a device write through them. A doctest of the crate fails if it is made public again.
+`Entry::decode` reads the Content of a stored packet back (`Data::decode`, then
+`content()`) into the fields it was built from, `log_name` names where it is stored, and
+`signed_digest` is the id of its bytes.
 
 ## 4. Durability, normative
 

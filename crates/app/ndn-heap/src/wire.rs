@@ -1,7 +1,7 @@
 //! The log's wire format (`docs/specs/heap.md`, §2 and §3), public so that a
-//! program outside the crate can build, name, sign, read and digest an entry
-//! exactly as the log does, for example a conformance suite that forges the
-//! entry of a device at an exact `(device, space, seq)`.
+//! program outside the crate can build, name, read and digest an entry exactly
+//! as the log does, for example a conformance suite that reads what a node
+//! stored at an exact `(device, space, seq)`.
 //!
 //! * An entry is [`Entry`]: its `PREV`/`PREV_SEQ` link ([`Prev`]), the heads
 //!   it supersedes (`after`, a list of [`EntryRef`]) and its [`Body`]. A
@@ -11,15 +11,23 @@
 //!   Content of its packet, refusing with a [`WireError`] what the format
 //!   cannot carry.
 //! * [`log_name`] is the name of the entry at `(device, space, seq)`.
-//! * [`sign_entry`] signs an entry at a name with a
-//!   [`Signer`](ndn_security::Signer), as the log signs its own: the packet
-//!   it returns is what a store holds at that name, and a node is handed.
 //! * [`signed_digest`] (of the wire bytes) and [`signed_digest_of`] (of a
 //!   decoded Data) are the digest of the signed region, the one every `PREV`,
 //!   `after` and [`EntryRef`] names an entry by.
 //!
+//! The function that signs an entry is not public: a program that could sign
+//! an entry with a signer it passes in could make a device equivocate (two
+//! entries at one name, its key suspected everywhere), and nothing outside
+//! the crate needs it, since [`Heap::put`](crate::Heap::put) signs with the
+//! node's own key.
+//!
+//! ```compile_fail,E0603
+//! // Signing an entry at a chosen name is the node's own business.
+//! let _ = ndn_heap::wire::sign_entry;
+//! ```
+//!
 //! A node holds the same entries to the same rules whoever built them: what
-//! this module lets a program write, the node's admission still judges
+//! this module lets a program build, the node's admission still judges
 //! (signature and trust, membership, the chain, cuts).
 //!
 //! The other submodules (names, the keyword router, pieces, grant, seal-key
@@ -41,7 +49,7 @@ pub(crate) use names::*;
 pub(crate) use pieces::*;
 pub use prim::WireError;
 pub(crate) use prim::{each, fields, once, read_name};
-pub use sign::{SignError, sign_entry};
+pub(crate) use sign::{SignError, sign_entry};
 
 pub use digest::{signed_digest, signed_digest_of};
 pub use names::log_name;
