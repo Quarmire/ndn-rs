@@ -33,6 +33,7 @@ pub mod host;
 pub(crate) mod invites;
 pub(crate) mod join;
 pub(crate) mod join_hint;
+pub(crate) mod marks;
 pub(crate) mod notes;
 pub(crate) mod offer;
 pub mod policy;

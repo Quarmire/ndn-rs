@@ -271,10 +271,12 @@ Audited RustCrypto primitives only (`hmac`, `hkdf`, `sha2`, `subtle`,
 ### 4.2 What the inviter keeps of the secret
 
 The inviter keeps **no secret**. It keeps the proof key, wrapped to its own
-recipient key (heap.md §6.2) under `key/<id>` (§15), which is all it needs to
-verify an ask and to prove an answer. It never keeps the secret itself, so a
-copy of its store opens no code. A note that is not wrapped to the device's own
-recipient key is ignored, and its offer answers nothing.
+recipient key (heap.md §6.2) under `key/<id>` (§15) and authenticated by a MAC under
+a key derived from the recipient secret, which is all it needs to verify an ask and to
+prove an answer. It never keeps the secret itself, so a copy of its store opens no code.
+A note that is not wrapped to the device's own recipient key, or whose MAC does not
+check (the recipient key is public, so a wrap is anyone's to make), is ignored, and its
+offer answers nothing (§18.1).
 
 ### 4.3 The seal key
 
@@ -378,11 +380,14 @@ each under a name no device serves:
 | `closed/<id>` | the closing mark: one octet, `1`; the offer admits no one new |
 
 Each is durable (`Node::flush`) before the reply that depends on it (§9.6). `<id>` is the offer's 16 octets as one
-generic component (§15). The wrapped notes (`key/<id>`, `hint/<id>`) bind the key's own Name TLV as associated data,
-so a note moved to another key does not open (§4.2). A device writes `used/<id>` at most once and never changes it
-(the first mark naming a key stands); `closed/<id>` is written by `close_offer` and by the overall cap, and writing it
-again changes nothing. Only the offering device marks its offer: the marks are local, not served and not signed,
-because nobody else reads them. Other devices of the inviter answer `Unknown` for an offer they do not hold (§18).
+generic component (§15). `key/<id>`, `hint/<id>`, `using/<id>`, `used/<id>`, `tries/<id>` and `tries/<id>/<digest>` end in
+a 32-octet HMAC-SHA256 over their own key's Name TLV and their value, under a key derived from the device's recipient
+secret (§18.1): a note that does not check is **unread** and fails closed (a use mark or use under way: a use by a key
+nobody knows; tries: the cap; a proof key: `Unknown`), and a note moved to another key does not check. A device writes
+`used/<id>` at most once and never changes it (the first mark naming a key stands); `closed/<id>` is written by `close_offer`
+and by the overall cap, and writing it again changes nothing. Only the offering device marks its offer: the marks are local,
+not served, and authenticated by the MAC, not signed, because nobody else reads them. Other devices of the inviter answer
+`Unknown` for an offer they do not hold (§18).
 
 ### 5.3 Offering
 
@@ -1661,8 +1666,8 @@ component; `<key>` the public-key digest, 32 octets, as one generic component.
 | Key | Value | Written | By |
 |---|---|---|---|
 | `offer/<id>` | the signed offer packet | at `offer` | inviter |
-| `key/<id>` | the proof key, wrapped to the device's recipient key | at `offer` | inviter |
-| `hint/<id>` | the hint token, wrapped the same way; only with a short code | at `offer` | inviter |
+| `key/<id>` | the proof key, wrapped to the device's recipient key, then a MAC | at `offer` | inviter |
+| `hint/<id>` | the hint token, wrapped the same way, then a MAC; only with a short code | at `offer` | inviter |
 | `tries/<id>` | the overall wrong tries (4 octets) and when the last was counted (8 octets), big-endian | each wrong try (§9.6) | inviter |
 | `tries/<id>/<digest>` | one asker key's wrong tries (4 octets, big-endian) | each wrong try | inviter |
 | `using/<id>` | the key a use under way is for: its Name TLV, then the digest (32 octets) | start of the use (§9.3 step 1); dropped on failure and in the batch of step 5 | inviter |
@@ -1670,13 +1675,13 @@ component; `<key>` the public-key digest, 32 octets, as one generic component.
 | `used/<id>` | the use mark: one `INTRO_USED` naming the offer, the key and its public key's digest (§16.1) | with the acceptance; at most once | inviter |
 | `closed/<id>` | the closing mark: one octet, `1` | `close_offer`, the overall cap (a removal closes by derivation, nothing is written, §5.4) | inviter |
 | `grant/<id>` | the grant note, MAC'd (§10 rule 3, 11) | with the acceptance | inviter |
-| `joined/<space>` | this crate's note of a space this device joined, what the mirror note and the joined list are re-derived from (§11 rules 17, 18); distinct from the node's own `/localhost/ndn-heap/joined/<space>` of §8.5 step 2 | after §8.5 | joiner |
 | `mirror/<space>/<key>` | the mirror note, MAC'd (§11 rule 17) | when the admission is held | joiner |
 
 The values of `grant/…` and `mirror/…` are fixed-width local forms and are not TLV (§10 rule 3); the value of `used/…` is one
-`INTRO_USED` TLV (§16.1) and of `accepted/…` one `INTRO_ANSWER`. The proof key and the token are wrapped to the device's
-recipient key (heap.md §6.2), each bound to its own key's Name TLV as associated data, so that a party that can write the store
-cannot make a note read nor move one to another key.
+`INTRO_USED` TLV (§16.1) and of `accepted/…` one `INTRO_ANSWER`; `used/…`, `using/…` and `tries/…` are followed by their MAC (§18.1). The
+proof key and the token are wrapped to the device's recipient key (heap.md §6.2), each bound to its own key's Name TLV as associated
+data, and **followed by a MAC** under a key derived from the recipient secret: the wrap alone proves nothing, the key it is made to
+being public. So a party that can write the store cannot make a note read nor move one to another key; it can delete one (§18.1).
 No key of this table is a Name that any function answering an Interest knows: a note is never answered, whatever the
 Interest asks, `CanBePrefix` included.
 
@@ -1845,6 +1850,21 @@ first, and the ones that changed say so.
   how many tries. The use mark is a note of the offering device (`used/<id>`), local and unsigned: **only that device
   sees the offer used**, and another device of the inviter answers `Unknown` for it (the old design's note "every device of
   the inviter sees the offer used" no longer holds, and need not: an offer is answered only by the device that made it).
+- **The notes an offer is judged by are authenticated, and fail closed.** The recipient key a note is wrapped to is
+  public, so the wrap proves nothing of who wrote it: `key/<id>`, `hint/<id>`, `using/<id>`, `used/<id>`, `tries/<id>` and
+  `tries/<id>/<digest>` each end in an HMAC-SHA256 under a key derived (HKDF, labels `ndn-invite/offer-note/…`) from the
+  recipient secret the key store keeps, over the note's own key name and value. A party that can write the data store and
+  not the key store cannot make a proof key (which would admit whoever knew the secret it names), a use mark, a use under way or
+  a count that reads, nor move a note to another key. A note that is there and does not read fails **closed**: a proof key that
+  does not read makes the offer `Unknown`; a use mark or a use under way that does not read is a use by a key nobody knows
+  (`Used` to every asker, its user included); a count that does not read is the cap (`Closed`, for that asker or for all). The
+  offer is a signed Data and the device checks its own signature when it reads its offers at a start: a note the device's key
+  did not sign is not an offer of the device's, so one written into the store is neither served nor judged. `closed/<id>` takes any
+  value (a forgery only closes) and `accepted/<id>` is not read when it does not decode (the acceptance is made again, never
+  admitting). **Residual, not defended:** a MAC cannot protect a note against its **deletion** or against its replacement by an
+  older note that read. A party that can delete or roll back `used/<id>`, `using/<id>` or `tries/…` reopens the single use or
+  gives wrong tries back; the store of a device is the device's, and its protection (permissions, encryption at rest, backups
+  that are not restored under a running device) is the host's.
 - **The inviter's effect is one entry.** Nothing but one `Heap::change` reaches the space (§9.4). The entry is signed by the
   heap's rules, judged by every reader as any members entry (heap.md §3.8 step 6), and the joiner waits for exactly it
   (§8.5): an entry that raced it, or a fold that listed the person by another carrier, is not taken for it.

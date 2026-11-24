@@ -19,6 +19,7 @@ use crate::credentials::{Opened, device_of, open_credentials, overlap};
 use crate::error::InviteError;
 use crate::host::{Code, LinkHint, Offer, Role};
 use crate::invites::{Held, Inner, Invites, Queued};
+use crate::marks::{self, Use};
 use crate::policy::IntroRefusal;
 use crate::proofs::{SECRET_LEN, answer_proof, ask_proves, commitment, proof_key};
 use crate::sealed::{open_ask, open_note, wrap_note};
@@ -244,27 +245,31 @@ impl Inner {
     /// [`IntroPolicy::wrong_tries_max`](crate::IntroPolicy), and when the last one was
     /// counted (milliseconds, by this device's clock).
     pub(crate) fn overall_tries(&self, id: &OfferId) -> (u32, u64) {
-        let Some(b) = self.store.get(&store::tries_key(id)) else {
+        let key = store::tries_key(id);
+        let Some(note) = self.store.get(&key) else {
             return (0, 0);
         };
-        let count = b
-            .get(..4)
-            .and_then(|c| <[u8; 4]>::try_from(c).ok())
-            .map_or(0, u32::from_be_bytes);
-        let at = b
-            .get(4..12)
-            .and_then(|t| <[u8; 8]>::try_from(t).ok())
-            .map_or(0, u64::from_be_bytes);
-        (count, at)
+        marks::open(self.node.recipient(), &key, &note)
+            .and_then(|b| {
+                let count = u32::from_be_bytes(b.get(..4)?.try_into().ok()?);
+                let at = u64::from_be_bytes(b.get(4..12)?.try_into().ok()?);
+                (b.len() == 12).then_some((count, at))
+            })
+            // A count that does not read is the cap: wrong tries are never given back by
+            // a note that cannot be told from a forgery.
+            .unwrap_or((u32::MAX, u64::MAX))
     }
 
     /// How many wrong tries the key of public key digest `digest` asked the own offer
-    /// `id` with.
+    /// `id` with; a count that does not read is more than any offer allows.
     fn asker_tries(&self, id: &OfferId, digest: &[u8; 32]) -> u32 {
-        self.store
-            .get(&store::tries_asker_key(id, digest))
+        let key = store::tries_asker_key(id, digest);
+        let Some(note) = self.store.get(&key) else {
+            return 0;
+        };
+        marks::open(self.node.recipient(), &key, &note)
             .and_then(|b| <[u8; 4]>::try_from(b.as_ref()).ok())
-            .map_or(0, u32::from_be_bytes)
+            .map_or(u32::MAX, u32::from_be_bytes)
     }
 
     /// Count a wrong try of the offer `id` by the key of digest `digest`, durably:
@@ -276,10 +281,12 @@ impl Inner {
         id: &OfferId,
         digest: &[u8; 32],
     ) -> Result<(u32, u32), InviteError> {
+        let recipient = self.node.recipient();
         let mine = self.asker_tries(id, digest).saturating_add(1);
+        let asker = store::tries_asker_key(id, digest);
         let mut ops = vec![StoreOp::Insert(
-            store::tries_asker_key(id, digest),
-            Bytes::copy_from_slice(&mine.to_be_bytes()),
+            asker.clone(),
+            marks::seal(recipient, &asker, &mine.to_be_bytes()),
         )];
         let (mut all, last) = self.overall_tries(id);
         let now = self.now().0;
@@ -291,45 +298,50 @@ impl Inner {
             let mut v = Vec::with_capacity(12);
             v.extend_from_slice(&all.to_be_bytes());
             v.extend_from_slice(&now.to_be_bytes());
-            ops.push(StoreOp::Insert(store::tries_key(id), Bytes::from(v)));
+            let overall = store::tries_key(id);
+            ops.push(StoreOp::Insert(
+                overall.clone(),
+                marks::seal(recipient, &overall, &v),
+            ));
         }
         store::apply_durable(&self.store, ops).await?;
         Ok((mine, all))
     }
 
-    /// The key a use of the own offer `id` is under way for, if one is (a stop came
-    /// between its start and its use mark).
-    fn using(&self, id: &OfferId) -> Option<(Name, [u8; 32])> {
-        let b = self.store.get(&store::using_key(id))?;
-        let split = b.len().checked_sub(32)?;
-        let key = Name::decode_from_tlv(b.slice(..split)).ok()?;
-        Some((key, <[u8; 32]>::try_from(&b[split..]).ok()?))
+    /// The use of the own offer `id` that is under way (a stop came between its start and
+    /// its use mark).
+    fn using(&self, id: &OfferId) -> Use {
+        marks::using_by(self.store.as_ref(), self.node.recipient(), id)
     }
 
-    /// The key the own offer `id` was used by, from its use mark.
-    fn used(&self, id: &OfferId) -> Option<(Name, [u8; 32])> {
-        let mark = self.store.get(&store::used_key(id))?;
-        match IntroRecord::decode(mark).ok()? {
-            IntroRecord::Used(UsedBody { by, .. }) => by,
-            IntroRecord::Offer(_) => None,
-        }
+    /// The use mark of the own offer `id`.
+    fn used(&self, id: &OfferId) -> Use {
+        marks::used_by(self.store.as_ref(), self.node.recipient(), id)
     }
 
-    /// Whether a closing mark of the own offer `id` is held.
+    /// Whether a closing mark of the own offer `id` is held. Any value closes: a forged
+    /// closing mark only closes, which is the side to fail on.
     fn closing_mark(&self, id: &OfferId) -> bool {
         self.store.contains(&store::closed_key(id))
     }
 
     /// Whether the offer `id` is closed: by its closing mark, by wrong tries of all
-    /// askers at the policy's cap, or because the person it was used by is no longer
-    /// listed by its space (a removed member never comes back by its code, spec §19.7).
-    /// Derived from signed, durable data on every call, never cached.
+    /// askers at the policy's cap, because a use note does not read, or because the
+    /// person it was used by is no longer listed by its space (a removed member never
+    /// comes back by its code, spec §19.7). Derived from durable data on every call, never
+    /// cached.
     pub(crate) fn offer_closed(&self, id: &OfferId, body: &OfferBody) -> bool {
         if self.closing_mark(id) || self.overall_tries(id).0 >= self.policy.wrong_tries_max {
             return true;
         }
-        let Some((key, _)) = self.used(id).or_else(|| self.using(id)) else {
-            return false;
+        let key = match self.used(id) {
+            Use::By(key, _) => key,
+            Use::Unreadable => return true,
+            Use::Not => match self.using(id) {
+                Use::By(key, _) => key,
+                Use::Unreadable => return true,
+                Use::Not => return false,
+            },
         };
         let (Some(device), Some(heap)) = (device_of(&key), self.node.space(&body.space)) else {
             return false;
@@ -449,7 +461,13 @@ impl Inner {
         let Some((id, pk, ob)) = held else {
             return Some(refuse(claimed, IntroRefusal::Unknown));
         };
-        let used = self.used(&id);
+        // A use mark that is there and does not read is a use by a key nobody knows: the
+        // offer is used, whoever asks (spec §18).
+        let used = match self.used(&id) {
+            Use::By(key, digest) => Some((key, digest)),
+            Use::Unreadable => return Some(refuse(claimed, IntroRefusal::Used)),
+            Use::Not => None,
+        };
         let closed = self.offer_closed(&id, &ob);
         // A closed offer admits no one new: only the key a use mark names is still
         // answered (below), until the offer expires (spec §19.4 step 4).
@@ -467,7 +485,14 @@ impl Inner {
         // One use: a use mark, else a use a stop interrupted. Its user is answered
         // again — never admitted again: a later members entry may have removed it
         // (spec §19.7).
-        match used.clone().or_else(|| self.using(&id)) {
+        let user = match (&used, self.using(&id)) {
+            (Some(user), _) => Some(user.clone()),
+            (None, Use::By(key, digest)) => Some((key, digest)),
+            // A use under way that does not read is a use by a key nobody knows.
+            (None, Use::Unreadable) => return Some(refuse(by, IntroRefusal::Used)),
+            (None, Use::Not) => None,
+        };
+        match user {
             Some(user) if user != by => return Some(refuse(by, IntroRefusal::Used)),
             Some(_) if used.is_some() => {
                 if closed && ob.until <= self.now() {
@@ -511,11 +536,16 @@ impl Inner {
         }
         // The use, noted before anything of it is done: a stop from here on leaves the
         // offer this key's, and its retry finishes the use.
+        let using_note = store::using_key(&id);
         let mut using = by.0.encode_to_tlv().to_vec();
         using.extend_from_slice(&by.1);
-        store::put_durable(&self.store, store::using_key(&id), Bytes::from(using))
-            .await
-            .ok()?;
+        store::put_durable(
+            &self.store,
+            using_note.clone(),
+            marks::seal(self.node.recipient(), &using_note, &using),
+        )
+        .await
+        .ok()?;
         if let Err(why) = self.host.adopt(&opened.link()).await {
             tracing::warn!(%offer, namespace = %theirs, "the host did not adopt the asker's anchor: {why}; the offer is not spent and the asker's retry is judged again");
             self.release(&id).await;
@@ -553,15 +583,17 @@ impl Inner {
         let grant = self
             .grants
             .grant_note(&id, by.1, &theirs, &ob.space, ob.role);
+        let used_note = store::used_key(&id);
+        let mark = IntroRecord::Used(UsedBody {
+            offer: offer.clone(),
+            by: Some(by),
+        })
+        .encode();
         let mut ops = vec![
             StoreOp::Insert(store::accepted_key(&id), answer.encode()),
             StoreOp::Insert(
-                store::used_key(&id),
-                IntroRecord::Used(UsedBody {
-                    offer: offer.clone(),
-                    by: Some(by),
-                })
-                .encode(),
+                used_note.clone(),
+                marks::seal(self.node.recipient(), &used_note, &mark),
             ),
         ];
         if let Some((op, _)) = &grant {

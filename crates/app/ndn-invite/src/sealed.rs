@@ -9,6 +9,8 @@ use ndn_security::confidentiality::{
     ConfidentialityError, ContentKey, RecipientKey, Sealed, wrap_ck_to,
 };
 
+use crate::marks;
+
 /// An ask sealed to a device's seal key: a fresh content key wrapped to that key with a
 /// fresh ephemeral X25519 key, and the ask's plaintext sealed under the content key,
 /// both bound to `aad`, the Interest's name without its parameters digest.
@@ -77,8 +79,10 @@ pub(crate) fn open_ask(
 }
 
 /// `secret` (32 octets) wrapped to the device's own recipient key under the note's
-/// key `name`, so a writer of the store cannot read it: the ephemeral public key,
-/// then the wrapped content key.
+/// key `name`, so a writer of the store cannot read it: the ephemeral public key, then
+/// the wrapped content key, then a MAC ([`marks::seal`]) under a key only the key store's
+/// secret derives. The wrap alone proves nothing — the recipient key it is made to is
+/// public — so a note of anyone else's making does not read.
 pub(crate) fn wrap_note(
     recipient: &RecipientKey,
     name: &Name,
@@ -91,12 +95,13 @@ pub(crate) fn wrap_note(
     )?;
     let mut out = ephemeral.to_vec();
     out.extend_from_slice(&wrapped.to_bytes());
-    Ok(Bytes::from(out))
+    Ok(marks::seal(recipient, name, &out))
 }
 
-/// The 32 octets [`wrap_note`] wrapped under `name`; `None` for a note that is not
-/// wrapped to this device's key under that name.
+/// The 32 octets [`wrap_note`] wrapped under `name`; `None` for a note whose MAC does not
+/// check under this device's key or that is not wrapped to it under that name.
 pub(crate) fn open_note(recipient: &RecipientKey, name: &Name, note: &[u8]) -> Option<[u8; 32]> {
+    let note = marks::open(recipient, name, note)?;
     let (ephemeral, wrapped) = note.split_first_chunk::<32>()?;
     let key = recipient
         .unwrap_ck(

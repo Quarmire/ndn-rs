@@ -18,7 +18,8 @@ use ndn_heap::host::{AnswerFuture, Extension, NodeHandle};
 use ndn_heap::{Node, Timestamp};
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest};
-use ndn_security::public_key_digest;
+use ndn_security::verifier::verify_public_key_signature;
+use ndn_security::{VerifyOutcome, public_key_digest};
 use ndn_sync::DataStore;
 use parking_lot::Mutex;
 
@@ -147,6 +148,8 @@ pub(crate) struct Inner {
     pub(crate) store: Arc<dyn DataStore>,
     /// SHA-256 of this device's public key as its certificate carries it.
     own_key: [u8; 32],
+    /// This device's public key: what its offers' signatures are verified under.
+    own_public: Bytes,
     pub(crate) state: Mutex<State>,
     /// Opening and verifying asks: at most [`InviteConfig::asks_verifying`] at once.
     pub(crate) verifying: tokio::sync::Semaphore,
@@ -202,12 +205,11 @@ impl Invites {
         config: InviteConfig,
     ) -> Result<Invites, InviteError> {
         let node = node.handle();
-        let own_key = node
+        let public = node
             .keys()
             .signing_identity_for(node.name())
             .ok()
             .and_then(|identity| identity.signer.public_key())
-            .map(|public| public_key_digest(&public))
             .ok_or_else(|| {
                 InviteError::local(format_args!(
                     "no public key of {} is available to the introductions: give the device a \
@@ -215,6 +217,8 @@ impl Invites {
                     node.name()
                 ))
             })?;
+        let own_key = public_key_digest(&public);
+        let own_public = public;
         let grants = Grants::new(node.clone(), Arc::clone(&host), policy.clone());
         let inner = Arc::new(Inner {
             store: Arc::clone(node.store()),
@@ -224,6 +228,7 @@ impl Invites {
             policy,
             config,
             own_key,
+            own_public,
             state: Mutex::new(State {
                 offers: BTreeMap::new(),
                 hints: BTreeMap::new(),
@@ -416,6 +421,23 @@ impl Inner {
             };
             if *data.name != name {
                 tracing::warn!(%name, "an offer note named otherwise than its key; ignored");
+                continue;
+            }
+            // The device's own key signed every offer it made: a note that anyone else
+            // wrote into the store, or changed, is not an offer of this device's (spec §18).
+            let signed = data.sig_info().is_some_and(|info| {
+                matches!(
+                    verify_public_key_signature(
+                        info.sig_type,
+                        data.signed_region(),
+                        data.sig_value(),
+                        &self.own_public,
+                    ),
+                    Ok(VerifyOutcome::Valid)
+                )
+            });
+            if !signed {
+                tracing::warn!(%name, "an offer note the device's key did not sign; ignored");
                 continue;
             }
             let hint = store::hint_key(&id);

@@ -9,10 +9,10 @@ use ndn_foundation_types::Name;
 use ndn_sync::{DataStore, MemoryStore, StoreOp};
 
 use crate::store::{
-    accepted_key, apply_durable, closed_key, flush, grant_key, grant_listing, hint_key, joined_key,
-    joined_listing, key_key, list, mirror_key, mirror_listing, offer_key, offer_listing,
-    parse_grant_key, parse_joined_key, parse_mirror_key, parse_offer_key, put_durable,
-    remove_durable, root, tries_asker_key, tries_key, used_key, using_key,
+    accepted_key, apply_durable, closed_key, flush, grant_key, grant_listing, hint_key, key_key,
+    list, mirror_key, mirror_listing, offer_key, offer_listing, parse_grant_key, parse_mirror_key,
+    parse_offer_key, put_durable, remove_durable, root, tries_asker_key, tries_key, used_key,
+    using_key,
 };
 use crate::wire::{OFFER_ID_LEN, OfferId};
 
@@ -87,7 +87,6 @@ fn every_key_is_under_the_invite_prefix_in_its_shape() {
         (used_key(&id(1)), "used", vec![16]),
         (hint_key(&id(1)), "hint", vec![16]),
         (grant_key(&id(1)), "grant", vec![16]),
-        (joined_key(&space), "joined", vec![]),
         (mirror_key(&space, &digest), "mirror", vec![]),
     ] {
         assert!(key.has_prefix(&root()), "{key}");
@@ -153,8 +152,6 @@ fn keys_parse_back() {
     );
     assert_eq!(parse_grant_key(&grant_key(&a)), Some(a));
     assert_eq!(parse_grant_key(&offer_key(&a)), None);
-    assert_eq!(parse_joined_key(&joined_key(&b)), Some(b.clone()));
-    assert_eq!(parse_joined_key(&mirror_key(&b, &[1; 32])), None);
     assert_eq!(
         parse_mirror_key(&b, &mirror_key(&b, &[1; 32])),
         Some([1; 32])
@@ -176,7 +173,6 @@ fn a_space_listing_holds_that_space_and_no_space_that_extends_it() {
     assert!(mirror_key(&short, &k2).has_prefix(&mirror_listing(&short)));
     assert!(!mirror_key(&long, &k1).has_prefix(&mirror_listing(&short)));
     assert!(mirror_key(&long, &k1).has_prefix(&mirror_listing(&long)));
-    assert!(joined_key(&short).has_prefix(&joined_listing()));
     assert!(grant_key(&id(1)).has_prefix(&grant_listing()));
     assert!(offer_key(&id(1)).has_prefix(&offer_listing()));
     assert!(!offer_key(&id(1)).has_prefix(&grant_listing()));

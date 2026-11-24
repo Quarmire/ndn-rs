@@ -4,25 +4,23 @@
 //!
 //! | key | what it holds |
 //! |---|---|
-//! | `offer/<id>` | the offer: its secret's commitment, its space, role and expiry |
-//! | `key/<id>` | the offer's proof key |
-//! | `tries/<id>` | the wrong tries of all askers of the offer, and the time of the last counted |
-//! | `tries/<id>/<digest>` | the wrong tries of one asker (the digest of its key) |
-//! | `using/<id>` | the asker key being admitted: the one that holds the offer until it is used |
+//! | `offer/<id>` | the offer: the Data the device signed, served as it is |
+//! | `key/<id>` | the offer's proof key, wrapped to the recipient key, with a MAC |
+//! | `tries/<id>` | the wrong tries of all askers of the offer and the time of the last counted, with a MAC |
+//! | `tries/<id>/<digest>` | the wrong tries of one asker (the digest of its key), with a MAC |
+//! | `using/<id>` | the asker key being admitted: the one that holds the offer until it is used, with a MAC |
 //! | `accepted/<id>` | the acceptance made for that key (a retry of it is answered alike) |
-//! | `closed/<id>` | that the offer was closed, by its maker or by wrong tries |
-//! | `used/<id>` | the use mark: the key the offer was used by |
-//! | `hint/<id>` | the offer's hint record (short code) |
-//! | `joined/<S>` | a space this device joined, and what to adopt from it |
+//! | `closed/<id>` | that the offer was closed, by its maker or by wrong tries (any value closes) |
+//! | `used/<id>` | the use mark: the key the offer was used by, with a MAC |
+//! | `hint/<id>` | the offer's hint token (short code), wrapped like the proof key, with a MAC |
 //! | `grant/<id>` | a grant of an offer: the key, the namespaces, the space, the role |
 //! | `mirror/<S>/<key>` | the joiner's grant for its inviter's link (`<key>`: the inviter's digest) |
 //!
 //! `<id>` is the offer's id, one generic component of 16 octets; `<digest>` and
 //! `<key>` one generic component of 32. A space is a prefix of the names of spaces
 //! that extend it, so spelled as components a scan of one space's keys would list
-//! another's: where a space is followed by more components in a key (`mirror`),
-//! or a scan lists the spaces (`joined`), it is one component holding its `Name`
-//! TLV.
+//! another's: where a space is followed by more components in a key (`mirror`), it is one
+//! component holding its `Name` TLV.
 //!
 //! A write is in the store when [`put_durable`] returns, and a flush of the store
 //! ([`DataStore::sync`]) that began after it has returned: a restart finds it. The
@@ -128,11 +126,6 @@ pub fn grant_key(id: &OfferId) -> Name {
     of_id("grant", id)
 }
 
-/// `joined/<S>`: that this device joined `space`.
-pub fn joined_key(space: &Name) -> Name {
-    kind("joined").append_component(tlv_component(space))
-}
-
 /// `mirror/<S>/<key>`: the joiner's grant for the inviter's link in `space`,
 /// `key` being the inviter's key digest.
 pub fn mirror_key(space: &Name, key: &[u8; 32]) -> Name {
@@ -149,11 +142,6 @@ pub fn grant_listing() -> Name {
     kind("grant")
 }
 
-/// `joined/`: every space this device joined.
-pub fn joined_listing() -> Name {
-    kind("joined")
-}
-
 /// `mirror/<S>`: every mirror note of `space`, and of no space that extends it.
 pub fn mirror_listing(space: &Name) -> Name {
     kind("mirror").append_component(tlv_component(space))
@@ -167,18 +155,6 @@ pub fn parse_offer_key(key: &Name) -> Option<OfferId> {
 /// The id a `grant/<id>` key names.
 pub fn parse_grant_key(key: &Name) -> Option<OfferId> {
     parse_id("grant", key)
-}
-
-/// The space a `joined/<S>` key names.
-pub fn parse_joined_key(key: &Name) -> Option<Name> {
-    let prefix = joined_listing();
-    if !key.has_prefix(&prefix) {
-        return None;
-    }
-    let [space] = &key.components()[prefix.len()..] else {
-        return None;
-    };
-    Name::decode_from_tlv(space.value.clone()).ok()
 }
 
 /// The inviter's key digest a `mirror/<S>/<key>` key of `space` names.
