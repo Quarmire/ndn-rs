@@ -916,6 +916,21 @@ fn within(ranges: &[(u64, u64)], seq: u64) -> bool {
     ranges.iter().any(|&(a, b)| a <= seq && seq <= b)
 }
 
+/// How many windows deep above what it holds a hole of another device is asked ([`hole_reach`]).
+const REACH_WINDOWS: u64 = 8;
+
+/// How many seqs above the first one missing a hole of another device is asked: a reservation
+/// block (a writer reserved no more than that at once, and what an entry far above names
+/// proves of the seqs below it is only that they were signed, not that they can be had), and
+/// never less than [`REACH_WINDOWS`] windows, so that a block tuned small (the conformance
+/// suite's is 8) does not hold the walk of a device to a few asks in flight while the holes of
+/// an honest writer's log are many.
+fn hole_reach(reserve_block: u64, window: usize) -> u64 {
+    reserve_block
+        .max(REACH_WINDOWS.saturating_mul(window as u64))
+        .max(1)
+}
+
 /// What of `ranges` is asked now: the first `block` seqs of each range. A range is a maximal
 /// run of seqs neither held nor declared void, so the seq below it is held or void (or none):
 /// the seqs asked are at most `block` above what is held, and move up as it is.
@@ -1009,7 +1024,7 @@ impl Group {
         let host = &self.shared.host;
         let space = &self.space;
         let me = host.device().clone();
-        let block = self.shared.cfg.reserve_block.max(1);
+        let block = hole_reach(self.shared.cfg.reserve_block, self.shared.cfg.window);
         let now = Instant::now();
 
         // What a notice named is unsigned: it wants nothing of the log. The

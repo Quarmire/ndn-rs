@@ -1379,6 +1379,35 @@ fn seqs_asked(wire: &Wire, device: &str, within: Duration) -> std::collections::
         .collect()
 }
 
+/// A hole of another device is asked a window deep above what is held, however small the
+/// reservation block is (the conformance suite's is 8): over a path whose round trip is a
+/// second, a reader of a writer with 400 entries held 8 per second when the reach was the
+/// block (o4 on a faulty network held 1,100 of 2,500 in 120 s), and a window's worth, which
+/// grows with the answers, when it is not.
+#[tokio::test(start_paused = true)]
+async fn a_hole_is_asked_a_window_deep_whatever_the_reservation_block() {
+    let r = rig_with(Config {
+        reserve_block: 8,
+        ..Config::default()
+    })
+    .await;
+    r.wire.delay(Duration::from_secs(1));
+    r.host.hold_at(PHONE, 400);
+    r.host.st.lock().vouched.insert(n(PHONE));
+    r.group.on_update(notice(PHONE, 400));
+    r.wire.script(|name| match direct(name) {
+        Some((d, seq)) if d == n(PHONE) => Reply::Data(genuine(PHONE, seq)),
+        _ => Reply::Silent,
+    });
+    pass(6).await;
+    let held = r.host.held_count(PHONE);
+    assert!(
+        held >= 150,
+        "{held} of the 400 entries held after 6 s over a path of one second: the walk was held \
+         to the reservation block above the first missing seq"
+    );
+}
+
 /// Stage-4 review M3. A writer's two devices each signed one entry at seq 10^9 with no gap
 /// statement and answer nothing. What each is asked for starts small and shrinks to a few
 /// while nothing answers (a window counts the asks that missed, so the walk does not slide
