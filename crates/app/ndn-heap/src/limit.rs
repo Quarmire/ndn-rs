@@ -1,6 +1,5 @@
 //! A bound on how much of one thing runs at once for one key: the grant asks
-//! of one asker device, the run headers of one sender namespace waiting for
-//! certificates.
+//! of one asker device.
 
 use std::collections::HashMap;
 
@@ -30,12 +29,6 @@ impl Counts {
             counts: self,
             key: key.clone(),
         })
-    }
-
-    /// How many keys have a place taken.
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.0.lock().len()
     }
 }
 

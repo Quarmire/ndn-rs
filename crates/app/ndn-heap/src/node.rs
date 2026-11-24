@@ -179,8 +179,6 @@ pub(crate) struct NodeInner {
     opening: tokio::sync::Mutex<()>,
     seal_packet: Bytes,
     pub(crate) signatures: AtomicU64,
-    /// The certificate fetches signal run headers wait for (spec §11).
-    pub(crate) signal_gate: crate::signal::SignalGate,
     stopped: AtomicBool,
     serving: Mutex<Option<ServeGuard>>,
 }
@@ -278,7 +276,6 @@ impl Node {
             opening: tokio::sync::Mutex::new(()),
             seal_packet,
             signatures: AtomicU64::new(0),
-            signal_gate: crate::signal::SignalGate::default(),
             stopped: AtomicBool::new(false),
             serving: Mutex::new(None),
         });

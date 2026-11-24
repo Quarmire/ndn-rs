@@ -1,7 +1,8 @@
 //! The signal gate through two nodes over one real forwarder (spec §11): a
-//! member's run header, signed by one node, is admitted by another through
-//! `Node::signal_admit`, and a removed writer's is refused from the first call
-//! after the removal is held.
+//! member's run header, signed by one node, is answered a signer by another
+//! (`Node::signal_sender`) and is given the validator that verifies it live
+//! (`Node::signal_view`, the transport's admission); a removed writer's is
+//! refused from the first call after the removal is held.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,6 +10,8 @@ use std::time::Duration;
 use ndn_app::EngineAppExt;
 use ndn_engine::EngineBuilder;
 use ndn_packet::Data;
+use ndn_security::ValidationResult;
+use ndn_security::safe_data::TrustPath;
 use tokio_util::sync::CancellationToken;
 
 use crate::HeapError;
@@ -87,6 +90,19 @@ async fn a_members_header_is_admitted_at_a_peer_node_and_a_removed_writers_is_no
         .unwrap();
     bob.open(&space()).await.unwrap();
 
+    // A name that is no space is refused for its name (fix the name), not
+    // told to retry: no space of that name can ever be opened.
+    for not_a_space in [n("/alice/board"), n("/alice/32=data")] {
+        match bob.signal_scope(&not_a_space) {
+            Err(e @ HeapError::BadName { .. }) => assert_eq!(e.next(), NextStep::FixName),
+            other => panic!("{not_a_space} is no space name: {other:?}"),
+        }
+        match bob.signal_header(&not_a_space, &RUN, b"run") {
+            Err(HeapError::BadName { .. }) => {}
+            other => panic!("no header is signed for {not_a_space}: {other:?}"),
+        }
+    }
+
     // Before the creation reaches it, a device decides nothing.
     let bob_key = bob.writer().clone();
     eventually("bob holds the creation, so it may use signals", || async {
@@ -103,12 +119,30 @@ async fn a_members_header_is_admitted_at_a_peer_node_and_a_removed_writers_is_no
     let header = Data::decode(wire).unwrap();
     assert_eq!(*header.name, signal_run_name(bob.name(), &space(), &RUN));
     let got = alice
-        .signal_admit(&space(), &header)
-        .await
-        .expect("a member's header is admitted at the peer");
+        .signal_sender(&space(), &header)
+        .expect("a member's header names its signer at the peer");
     assert_eq!(
         (got.key.clone(), got.device, got.namespace),
         (bob_key.clone(), bob.name().clone(), n("/bob"))
+    );
+    // The view a transport verifies the header by: the live rule, certificates
+    // held first.
+    let view = alice
+        .signal_view(&space(), &header)
+        .expect("a space open here gives its view");
+    match view.validate_chain_cached(&header).await {
+        (ValidationResult::Valid(safe), _) => assert!(
+            !matches!(safe.trust_path(), TrustPath::DigestSha256),
+            "verified by a certificate chain, not a digest"
+        ),
+        (other, _) => panic!("a member's header verifies by the view: {other:?}"),
+    }
+    assert!(
+        matches!(
+            alice.signal_view(&n("/alice/32=data/other"), &header),
+            Err(SignalRefusal::NotReady { .. })
+        ),
+        "a space not open here has no view"
     );
     assert_eq!(alice.signal_sender(&space(), &header).unwrap().key, bob_key);
     assert!(alice.signal_member(&space(), &bob_key));
@@ -123,7 +157,7 @@ async fn a_members_header_is_admitted_at_a_peer_node_and_a_removed_writers_is_no
     .unwrap();
     assert!(!alice.signal_member(&space(), &bob_key));
     assert_eq!(
-        alice.signal_admit(&space(), &header).await,
+        alice.signal_sender(&space(), &header),
         Err(SignalRefusal::NotMember {
             scope: space(),
             key: bob_key

@@ -3,9 +3,11 @@
 //! A signal is ephemeral live data — presence, cursors, a drag — pushed to the
 //! members of a space and never an entry: nothing of it is stored, served or
 //! counted here. The signal transport (`ndn_surface::signal`) asks the node
-//! six things ([`Node::signal_scope`], [`Node::signal_header`],
-//! [`Node::signal_sender`], [`Node::signal_admit`], [`Node::signal_member`],
-//! [`Node::revocations`]) and nothing else leaves this module.
+//! six things ([`NodeHandle::signal_scope`], [`NodeHandle::signal_header`],
+//! [`NodeHandle::signal_sender`], [`NodeHandle::signal_view`],
+//! [`NodeHandle::signal_member`], [`NodeHandle::revocations`]) and nothing
+//! else leaves this module. What a run header costs the network (the
+//! certificates its chain fetches, the budget of them) is the transport's.
 //!
 //! A **member** of a space, for signals, is a key of a device whose person the
 //! operation fold lists as a writer (the owner always is) and which the trust
@@ -14,13 +16,12 @@
 //! removes a person, or the context that revokes a key, is held.
 //!
 //! The logic is free functions over one space's [`Log`] and the node's
-//! [`Judge`], wrapped by the `Node` methods: none holds a lock across an
-//! `.await`, and none writes.
+//! [`Judge`], wrapped by the `NodeHandle` methods (a [`Node`](crate::Node)
+//! dereferences to its handle): none holds a lock across an `.await`, and
+//! none writes.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use hkdf::Hkdf;
@@ -29,17 +30,13 @@ use ndn_packet::Data;
 use ndn_packet::encode::DataBuilder;
 use ndn_security::cert_name::key_name_of;
 use ndn_security::confidentiality::ContentKey;
-use ndn_security::safe_data::TrustPath;
-use ndn_security::{Signer, ValidationResult, Validator};
-use parking_lot::Mutex;
+use ndn_security::{Signer, Validator};
 use sha2::Sha256;
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::error::HeapError;
-use crate::limit::{Counts, Place};
+use crate::host::NodeHandle;
 use crate::log::Log;
-use crate::node::Node;
-use crate::rt::Instant;
 use crate::seal;
 use crate::space::SpaceInner;
 use crate::trust::{Judge, owner_capable};
@@ -58,19 +55,6 @@ pub const KEY_ID_LEN: usize = 8;
 
 /// The octets of a signal run's id: a run header's last name component.
 pub const RUN_ID_LEN: usize = wire::RUN_ID_LEN;
-
-/// Run headers of one sender namespace that may wait for certificates at once.
-const SIGNAL_FETCHES_PER_NAMESPACE: usize = 2;
-
-/// How long no certificate is fetched for a device's run headers again once a
-/// fetch for one of them brought none.
-const SIGNAL_FETCH_BACKOFF: Duration = Duration::from_secs(30);
-
-/// Certificates fetched for one run header at most: one chain.
-const SIGNAL_CHAIN_FETCHES: usize = 4;
-
-/// Size at which devices past their back-off are swept.
-const SIGNAL_BACKOFF_PRUNE_AT: usize = 1024;
 
 /// Why nothing about a space is decided here yet.
 const NO_RECORD: &str = "its creation, the owner's first members entry, is not held here yet; \
@@ -161,7 +145,7 @@ impl fmt::Debug for SignalKey {
 }
 
 /// The signer of a run header, a member of the space by the entries held
-/// (`signal_sender`, `signal_admit`).
+/// (`signal_sender`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignalSender {
     /// The key that signed it.
@@ -175,7 +159,8 @@ pub struct SignalSender {
     pub namespace: Name,
 }
 
-/// Why a run header is not admitted (`signal_admit`). Each says what to do.
+/// Why a run header is not admitted (`signal_sender` and the transport's
+/// verification). Each says what to do.
 /// None is kept: a refused header is dropped with its run.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SignalRefusal {
@@ -277,7 +262,7 @@ fn standing(log: &Log, judge: &Judge, key: &Name, reads: bool) -> Result<Name, S
     }
 }
 
-/// [`Node::signal_member`] over one space.
+/// [`NodeHandle::signal_member`] over one space.
 pub(crate) fn signal_member(log: &Log, judge: &Judge, scope: &Name, key: &Name) -> bool {
     scope == &log.space && standing(log, judge, key, false).is_ok()
 }
@@ -308,7 +293,7 @@ fn own_gate(log: &Log, judge: &Judge, reads: bool) -> Result<(), HeapError> {
 
 // -- The scope and the header ------------------------------------------------------------
 
-/// [`Node::signal_scope`] over the space `log` holds.
+/// [`NodeHandle::signal_scope`] over the space `log` holds.
 pub(crate) fn signal_scope(log: &Log, judge: &Judge) -> Result<SignalScope, HeapError> {
     own_gate(log, judge, true)?;
     let space = &log.space;
@@ -365,7 +350,7 @@ fn sealed_keys(log: &Log) -> Result<Vec<SignalKey>, HeapError> {
     Ok(keys)
 }
 
-/// [`Node::signal_header`] over one space, signed by `signer`.
+/// [`NodeHandle::signal_header`] over one space, signed by `signer`.
 pub(crate) fn signal_header(
     log: &Log,
     judge: &Judge,
@@ -390,7 +375,7 @@ pub(crate) fn signal_header(
 
 // -- Run headers -------------------------------------------------------------------------
 
-/// [`Node::signal_sender`] over one space.
+/// [`NodeHandle::signal_sender`] over one space.
 pub(crate) fn signal_sender(
     log: &Log,
     judge: &Judge,
@@ -442,143 +427,9 @@ pub(crate) fn signal_sender(
     })
 }
 
-/// [`Node::signal_admit`] over one space: `log` is locked only to read, never
-/// across a fetch.
-pub(crate) async fn signal_admit(
-    gate: &SignalGate,
-    log: &Mutex<Log>,
-    judge: &Judge,
-    scope: &Name,
-    header: &Data,
-) -> Result<SignalSender, SignalRefusal> {
-    let sender = signal_sender(&log.lock(), judge, scope, header)?;
-    let view = judge.view_for(&header.name, scope, true);
-    gate.verify(&view, &sender, header).await?;
-    // A revocation or a removal held while the chain was fetched.
-    standing(&log.lock(), judge, &sender.key, false)?;
-    Ok(sender)
-}
-
-// -- The certificate fetch budget --------------------------------------------------------
-
-/// What the gate keeps between questions (spec §11): the certificate fetches
-/// run headers wait for.
-#[derive(Default)]
-pub(crate) struct SignalGate {
-    /// Run headers waiting for certificates, per sender namespace.
-    waiting: Counts,
-    /// Devices no certificate is fetched for until then.
-    backoff: Mutex<HashMap<Name, Instant>>,
-}
-
-impl SignalGate {
-    /// A place for `sender`'s header among those waiting for certificates:
-    /// refused while its device backs off, or while its namespace has
-    /// [`SIGNAL_FETCHES_PER_NAMESPACE`] waiting.
-    fn fetch_slot(&self, sender: &SignalSender) -> Result<Place<'_>, SignalRefusal> {
-        let unverified = |why: String| SignalRefusal::Unverified {
-            key: sender.key.clone(),
-            why,
-        };
-        let backing_off = self
-            .backoff
-            .lock()
-            .get(&sender.device)
-            .is_some_and(|&until| Instant::now() < until);
-        if backing_off {
-            return Err(unverified(format!(
-                "a certificate a header of {} needed could not be had a moment ago, and none is \
-                 fetched for that device for {} s after",
-                sender.device,
-                SIGNAL_FETCH_BACKOFF.as_secs()
-            )));
-        }
-        self.waiting
-            .take(&sender.namespace, SIGNAL_FETCHES_PER_NAMESPACE)
-            .ok_or_else(|| {
-                unverified(format!(
-                    "{SIGNAL_FETCHES_PER_NAMESPACE} run headers of {} wait for certificates \
-                     here already",
-                    sender.namespace
-                ))
-            })
-    }
-
-    /// A fetch for a header of `device` brought no certificate: none is
-    /// fetched for it for [`SIGNAL_FETCH_BACKOFF`].
-    fn backoff(&self, device: &Name) {
-        let mut backoff = self.backoff.lock();
-        let now = Instant::now();
-        if backoff.len() >= SIGNAL_BACKOFF_PRUNE_AT {
-            backoff.retain(|_, until| now < *until);
-        }
-        backoff.insert(device.clone(), now + SIGNAL_FETCH_BACKOFF);
-    }
-
-    /// Verify `sender`'s run header by `view`, the live rule (see
-    /// [`signal_admit`]): the certificates held first; one missing fetched
-    /// within the sender namespace's place among the headers waiting for
-    /// certificates, at most [`SIGNAL_CHAIN_FETCHES`] of them.
-    async fn verify(
-        &self,
-        view: &Validator,
-        sender: &SignalSender,
-        header: &Data,
-    ) -> Result<(), SignalRefusal> {
-        let key = &sender.key;
-        let unverified = |why: String| SignalRefusal::Unverified {
-            key: key.clone(),
-            why,
-        };
-        let mut slot = None;
-        for _ in 0..=SIGNAL_CHAIN_FETCHES {
-            let missing = match view.validate_chain_cached(header).await {
-                (ValidationResult::Valid(safe), _)
-                    if !matches!(safe.trust_path(), TrustPath::DigestSha256) =>
-                {
-                    return Ok(());
-                }
-                (ValidationResult::Pending, Some(missing)) => missing,
-                (other, _) => {
-                    tracing::debug!(name = %header.name, %key, "signal run header refused: {other:?}");
-                    return Err(SignalRefusal::BadSignature { key: key.clone() });
-                }
-            };
-            let Some(fetcher) = view.cert_fetcher() else {
-                return Err(unverified(format!(
-                    "the certificate {missing} its chain needs is not held here, and this device \
-                     fetches none"
-                )));
-            };
-            if slot.is_none() {
-                slot = Some(self.fetch_slot(sender)?);
-            }
-            if let Err(e) = fetcher.fetch_missing(&missing, None).await {
-                self.backoff(&sender.device);
-                let held = match view.cert_cache().all(&missing).is_empty() {
-                    false => {
-                        "only an expired certificate of it is held here, so its device renews \
-                         its certificate; "
-                    }
-                    true => "",
-                };
-                return Err(unverified(format!(
-                    "no current certificate {missing} its chain needs could be had ({e}); {held}\
-                     none is fetched for {} for {} s",
-                    sender.device,
-                    SIGNAL_FETCH_BACKOFF.as_secs()
-                )));
-            }
-        }
-        Err(unverified(format!(
-            "its chain needs more than {SIGNAL_CHAIN_FETCHES} certificates not held here"
-        )))
-    }
-}
-
 // -- The node's methods ------------------------------------------------------------------
 
-impl Node {
+impl NodeHandle {
     /// The space `space` as a member has it open: the one a signal question is
     /// about. A space not open here (or carried only) is not decided.
     fn signal_space(&self, space: &Name) -> Option<Arc<SpaceInner>> {
@@ -598,9 +449,9 @@ impl Node {
     /// group to push into and the one to listen on. A writer or a reader gets
     /// it (a reader of a sealed space holds the epoch key and must be able to
     /// receive); only a writer may send ([`Self::signal_header`]) or be
-    /// admitted ([`Self::signal_member`], [`Self::signal_sender`],
-    /// [`Self::signal_admit`]).
+    /// admitted ([`Self::signal_member`], [`Self::signal_sender`]).
     ///
+    /// [`HeapError::BadName`] when `space` is no space name (fix the name).
     /// [`HeapError::NotReady`] when the space is not open here or its creation
     /// is not held yet (retry), or, sealed, the key of its epoch in force has
     /// not arrived (it comes as a grant: ask again). [`HeapError::NotAllowed`]
@@ -643,33 +494,21 @@ impl Node {
             .unwrap_or_else(|| Err(not_open_refusal(scope)))
     }
 
-    /// Admit another device's run header for `scope` (spec §11): its signer
-    /// is a member ([`Self::signal_sender`], asked first, so a stranger's
-    /// header costs nothing more), and it verifies by the validator that
-    /// judges the signer's person (the node's own, or the view adopted for
-    /// her) by the **live** rule: its certificates valid now, a revoked key
-    /// refused. The chain is walked from the certificates held first; one not
-    /// held is fetched only while fewer than 2 headers of the signer's person
-    /// wait for certificates, and not for a device whose last fetch brought
-    /// none within 30 s (`Unverified` otherwise: ask again when the header
-    /// rides again). Its signer is a member still once it verified. The
-    /// header is not kept, served nor counted.
-    pub async fn signal_admit(
-        &self,
-        scope: &Name,
-        data: &Data,
-    ) -> Result<SignalSender, SignalRefusal> {
-        let held = self
-            .signal_space(scope)
+    /// The validator that judges the signer of `data`, a run header for
+    /// `scope` (spec §11.3): the node's own, or the view adopted for the
+    /// signer's person while a listing of the space names her. A transport
+    /// verifies the header by it under the **live** rule (certificates valid
+    /// now, a revoked key refused), fetching the certificates of its chain as
+    /// it budgets them, between two [`Self::signal_sender`] calls: the first
+    /// before it spends anything on the header, the second once it verified,
+    /// so a removal or a revocation held meanwhile ends the admission. The
+    /// view decides nothing about membership and costs nothing to ask.
+    ///
+    /// [`SignalRefusal::NotReady`] when `scope` is not open here as a member.
+    pub fn signal_view(&self, scope: &Name, data: &Data) -> Result<Arc<Validator>, SignalRefusal> {
+        self.signal_space(scope)
             .ok_or_else(|| not_open_refusal(scope))?;
-        signal_admit(
-            &self.inner.signal_gate,
-            &held.log,
-            &self.inner.judge,
-            scope,
-            data,
-        )
-        .await
+        Ok(self.inner.judge.view_for(&data.name, scope, true))
     }
 
     /// Whether `key` is a member of `scope` now (spec §11): a key of a device
@@ -693,8 +532,12 @@ impl Node {
     }
 }
 
-/// Why nothing about `space` is decided: this node has not opened it.
+/// Why nothing about `space` is decided: it is no space name, which no node
+/// can open (fix the name), or this node has not opened it (retry).
 fn not_open(space: &Name) -> HeapError {
+    if wire::parse_space_name(space).is_none() {
+        return HeapError::not_a_space(space);
+    }
     HeapError::NotReady {
         name: space.clone(),
         why: NOT_OPEN.into(),

@@ -2281,8 +2281,8 @@ impl Node {
                          -> Result<Bytes, HeapError>;
     pub fn signal_sender(&self, scope: &Name, data: &Data)
                          -> Result<SignalSender, SignalRefusal>;
-    pub async fn signal_admit(&self, scope: &Name, data: &Data)
-                              -> Result<SignalSender, SignalRefusal>;
+    pub fn signal_view(&self, scope: &Name, data: &Data)
+                       -> Result<Arc<Validator>, SignalRefusal>;
     pub fn signal_member(&self, scope: &Name, key: &Name) -> bool;
     pub fn revocations(&self) -> u64;
 }
@@ -2296,7 +2296,9 @@ The crate exports exactly these, the types they use (`Transport`, `Config`,
 `SignalRefusal`) and the host's trust seam (`Adopter`, `Scoping`, §9.4), and,
 for `ndn-invite` and `ndn-surface` alone, the sibling surface of §10.9. The
 signal methods are the gate of §11 (`revocations` is its count of revocations;
-each answers `NotReady` for a space not open here as a member). The node
+each answers `NotReady` for a space not open here as a member). They are
+methods of the node's `NodeHandle` (§10.9), which a `Node` dereferences to: a
+transport holds a handle and the host keeps the node. The node
 offers no raw signing: nothing signs octets a caller names with the device key
 (a signature over bytes of the host's choosing would be an oracle for any
 protocol that frames them like an entry); a run header is signed by
@@ -2836,8 +2838,9 @@ A **signal** is ephemeral live data — presence, cursors, a drag — pushed to 
 members of a space and never an entry: nothing of it is stored, served or counted
 by this layer. The transport that carries signals (`ndn-surface`, signals.md)
 asks the node six things, and nothing else leaves this layer. The scope of a
-signal is **one space**. The clock and sequence reservation of signals belong to
-the transport, not to this layer.
+signal is **one space**. The clock and sequence reservation of signals, and the
+admission of a run header (the certificate fetches it may cost), belong to the
+transport, not to this layer.
 
 ### 11.1 Members
 
@@ -2861,8 +2864,8 @@ receive what members send.
 |---|---|
 | `signal_scope(space)` | this device's `SignalScope { space, keys, groups, listen }`, to a writer **or a reader** of the space: its signal keys when the space is sealed, the group to push into (`sync_group_of(space)`) and the group to listen on (the same one) |
 | `signal_header(scope, run id, body)` | a run header signed by this device's key |
-| `signal_sender(scope, header)` | the header's signer if it is a member, before anything is verified |
-| `signal_admit(scope, header)` (async) | admit another device's run header, or say why not |
+| `signal_sender(scope, header)` | the header's signer if it is a member, before anything is verified, and again once the transport verified it |
+| `signal_view(scope, header)` | the validator that judges the header's signer (the node's own, or the view adopted for her): what the transport verifies the header by |
 | `signal_member(scope, key)` | whether a key is a member now; asked for every packet |
 | `revocations()` | a count that moves when a trust context that revokes keys is adopted (the judge's generation, §9.1), so a transport walks the chains of the runs it admitted again |
 
@@ -2873,12 +2876,13 @@ a header, `signal_header`) only as a writer, that is, as a member. Otherwise
 as a member, or its creation is not held;
 or, sealed, no epoch is in force, or the key of the epoch in force is not held
 yet and this device is in the audience: ask again after the grant; the gate
-starts no ask), `NotAllowed` (neither writer nor reader, or, for
+starts no ask), `BadName` (the name is no space name: no node can open one of
+that name, fix the name), `NotAllowed` (neither writer nor reader, or, for
 `signal_header`, not a writer; or its own key is revoked) or `Sealed` (a person
 outside the sealed space's audience, which may not hold its key; the owner
 counts as inside). A header can be signed without the epoch's key. The checks
-that judge another device's key (`signal_member`, `signal_sender`,
-`signal_admit`) count writers only, whoever asks.
+that judge another device's key (`signal_member`, `signal_sender`) count writers
+only, whoever asks.
 
 ### 11.3 Run headers
 
@@ -2894,16 +2898,21 @@ name's), `NotReady` (the creation is not held), `NotMember`, or `BadSignature`
 transport bounds a sender's admissions and runs by it, since a person can make as
 many keys and devices as it likes and never more persons.
 
-`signal_admit` asks `signal_sender` first (a stranger's header costs nothing
-more), then verifies the header by the validator that judges the signer's person
-by the **live** rule: its certificates valid now, a revoked key refused. The
-chain is walked from the certificates held first; one not held is fetched, but
-only while fewer than **2** headers of the signer's person wait for certificates,
-not for a device whose last fetch brought none within **30 s**, and at most **4**
-certificates for one header; otherwise `Unverified` (ask again when the header
-rides again). Once it verified, the signer is checked a member again, so a removal
-or revocation held while the chain was fetched ends it (`NotMember`,
-`BadSignature`). A refused header is dropped with its run; none is kept.
+The transport admits a header in three steps: `signal_sender` first (a stranger's
+header costs nothing more); then it verifies the header by the validator
+`signal_view` gives, the one that judges the signer's person (the node's own,
+or the view adopted for her), by the **live** rule: its certificates valid now,
+a revoked key refused; and then `signal_sender` again, so a removal or
+revocation held while the chain was fetched ends it (`NotMember`,
+`BadSignature`). `signal_view` decides nothing about membership and answers
+`NotReady` for a space not open here as a member. The chain is walked from the
+certificates held first; one not held is fetched, and the transport bounds those
+fetches: only while fewer than **2** headers of the signer's person wait for
+certificates, not for a device whose last fetch brought none within **30 s**,
+and at most **4** certificates for one header; otherwise `Unverified` (ask again
+when the header rides again). The layer enforces none of these: they are the
+transport's policy over the view (`ndn_surface::signal`). A refused header is
+dropped with its run; none is kept.
 
 ### 11.4 Signal keys
 
@@ -2931,13 +2940,22 @@ are zeroed when dropped and never shown by `Debug`.
 - The gate asks the node's judge for persons and revocations; `revocations()`
   is the judge's generation, with no counter of its own.
 - The clock, the sequence floor and their store keys are not in this layer.
+- **Admission is the transport's.** The previous gate's `signal_admit` (the walk
+  of the header's certificate chain, the fetch budget, the 30 s back-off) is not in
+  this layer: the transport verifies the header itself by the view the node gives
+  (`signal_view`, §11.2), and asks `signal_sender` before and after. The layer
+  keeps the membership, which is a function of what is held; the network cost of
+  a header is the transport's to bound, by the rules of §11.3, kept in
+  `ndn-surface` and tested there.
 
 ### 11.6 Threat notes
 
 - **A removed member** keeps sending until the removal is held here: the answer
   is exact by what is held, never by time.
-- **A stranger's headers** cost no certificate fetch, and a member's cost at most
-  2 waiting per person and one fetch run per device per 30 s.
+- **A stranger's headers** cost no certificate fetch (`signal_sender` refuses them
+  offline before the transport spends anything), and a member's cost what the
+  transport's budget allows: at most 2 waiting per person and one fetch run per
+  device per 30 s (signals.md §10).
 - **A revoked issuer** ends the runs it certified: the count of §11.2 moves and a
   transport walks the chains again.
 

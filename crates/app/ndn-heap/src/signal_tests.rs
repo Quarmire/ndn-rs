@@ -4,12 +4,9 @@
 //!
 //! The logs are real (own writes signed by real Ed25519 keys, entries relayed
 //! between them through `Log::admit`), the judge is real over a validator
-//! holding each person's trust context, and certificates are fetched through a
-//! fetch function the case controls.
+//! holding each person's trust context.
 
-use std::future::pending;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use hkdf::Hkdf;
@@ -18,7 +15,7 @@ use ndn_packet::Data;
 use ndn_packet::encode::DataBuilder;
 use ndn_security::confidentiality::{ContentKey, RecipientKey};
 use ndn_security::{
-    Certificate, FetchMiss, SecurityManager, SignedTrustContext, Signer, TrustSchema, Validator,
+    Certificate, SecurityManager, SignedTrustContext, Signer, TrustSchema, Validator,
     public_key_digest,
 };
 use ndn_sync::DataStore;
@@ -160,43 +157,28 @@ impl World {
             .expect("a device of a person of the world")
     }
 
-    /// `device`'s key `KEY/<id>`, certified by its person's authority for
-    /// `validity_ms` from now; the certificate is held by the validator only
-    /// when `held`. The certificate is returned too, for a fetch to serve.
-    async fn dev_key(
-        &self,
-        device: &str,
-        id: &str,
-        validity_ms: u64,
-        held: bool,
-    ) -> (Dev, Certificate) {
+    /// A device with its key `KEY/1`, certified by its person's authority;
+    /// every seat holds the certificate.
+    async fn dev(&self, device: &str) -> Dev {
         let name = n(device);
         let a = self.authority(&name);
         let keys = SecurityManager::new();
         let key = keys
-            .generate_ed25519(name.clone().append("KEY").append(id))
+            .generate_ed25519(name.clone().append("KEY").append("1"))
             .unwrap();
         let public = keys.get_signer_sync(&key).unwrap().public_key().unwrap();
         let cert = a
             .keys
-            .certify(&key, public, &a.issuer, validity_ms)
+            .certify(&key, public, &a.issuer, VALIDITY_MS)
             .await
             .unwrap();
-        if held {
-            self.validator.cert_cache().insert(cert.clone());
-        }
-        let dev = Dev {
+        self.validator.cert_cache().insert(cert);
+        Dev {
             person: a.ns.clone(),
             signer: keys.get_signer_sync(&key).unwrap(),
             name,
             key,
-        };
-        (dev, cert)
-    }
-
-    /// A device whose certificate every seat holds.
-    async fn dev(&self, device: &str) -> Dev {
-        self.dev_key(device, "1", VALIDITY_MS, true).await.0
+        }
     }
 
     /// `ns`'s trust context at `version`, revoking `revoked`, adopted.
@@ -233,7 +215,6 @@ impl World {
         Seat {
             log: Mutex::new(log),
             judge: Judge::new(Arc::clone(&self.validator), raw, None).0,
-            gate: SignalGate::default(),
             store,
             flusher,
             dev,
@@ -245,7 +226,6 @@ impl World {
 struct Seat {
     log: Mutex<Log>,
     judge: Arc<Judge>,
-    gate: SignalGate,
     store: Arc<CrashStore>,
     flusher: Arc<Flusher>,
     dev: Dev,
@@ -347,10 +327,6 @@ impl Seat {
     fn sender(&self, data: &Data) -> Result<SignalSender, SignalRefusal> {
         signal_sender(&self.log.lock(), &self.judge, &space(), data)
     }
-
-    async fn admit(&self, data: &Data) -> Result<SignalSender, SignalRefusal> {
-        signal_admit(&self.gate, &self.log, &self.judge, &space(), data).await
-    }
 }
 
 /// A run header of `space` for `dev`, signed by its key.
@@ -362,40 +338,6 @@ fn header_by(dev: &Dev, space: &Name) -> Data {
 fn named(dev: &Dev, name: Name) -> Data {
     let wire = seal::sign(DataBuilder::new(name, b"run"), &*dev.signer).unwrap();
     Data::decode(wire).unwrap()
-}
-
-/// What the fetch was asked, in order.
-type Asked = Arc<std::sync::Mutex<Vec<Name>>>;
-
-/// The validator fetches missing certificates through a fetch that notes
-/// every name asked, never answers a name under `/bob/slow` or `/rita/slow`,
-/// answers a name `serve` holds a certificate of with it, and answers every
-/// other that none is to be had.
-fn fetching(world: &World, serve: Vec<Certificate>) -> Asked {
-    let asked: Asked = Arc::default();
-    let noted = Arc::clone(&asked);
-    let serve: Vec<Bytes> = serve.iter().map(|c| c.data_wire().unwrap()).collect();
-    let fetch: ndn_security::FetchFn = Arc::new(move |name: Name| {
-        noted.lock().unwrap().push(name.clone());
-        let served = serve
-            .iter()
-            .map(|w| Data::decode(w.clone()).unwrap())
-            .find(|d| d.name.has_prefix(&name));
-        Box::pin(async move {
-            if name.has_prefix(&n("/bob/slow")) || name.has_prefix(&n("/rita/slow")) {
-                pending::<()>().await;
-            }
-            served.ok_or(FetchMiss::Absent)
-        })
-    });
-    let fetcher = ndn_security::CertFetcher::new(
-        world.validator.cert_cache_arc(),
-        fetch,
-        Duration::from_secs(60),
-    )
-    .with_negative_ttl(Duration::ZERO);
-    assert!(world.validator.set_cert_fetcher(Arc::new(fetcher)).is_ok());
-    asked
 }
 
 /// The owner's seat creating the space public with Bob a writer, and the
@@ -756,16 +698,12 @@ async fn a_reader_of_a_sealed_space_gets_scope_and_keys_but_cannot_send_and_its_
     assert!(!alice.member(&rita.dev.key), "a reader is no member");
     assert!(!rita.member(&rita.dev.key));
     assert_eq!(
-        alice.admit(&forged).await,
+        alice.sender(&forged),
         Err(SignalRefusal::NotMember {
             scope: space(),
             key: rita.dev.key.clone()
         })
     );
-    assert!(matches!(
-        alice.sender(&forged),
-        Err(SignalRefusal::NotMember { .. })
-    ));
 
     assert!(
         matches!(eve.scope(), Err(HeapError::NotAllowed { .. })),
@@ -775,19 +713,18 @@ async fn a_reader_of_a_sealed_space_gets_scope_and_keys_but_cannot_send_and_its_
 
 // -- Run headers ------------------------------------------------------------------------
 
-/// A header of a member is admitted, its signer answered, and nothing is
-/// kept. A stranger's, one of another space, one misnamed, one named under
-/// another device than its signer's, one whose signature is damaged and one
-/// of a revoked key are each refused saying why; a space whose creation is not
-/// held decides nothing.
+/// A header of a member names its signer and nothing is kept. A stranger's,
+/// one of another space, one misnamed, one named under another device than its
+/// signer's and one of a revoked key are each refused saying why; a space
+/// whose creation is not held decides nothing. (Verifying the signature is the
+/// transport's: `ndn_surface`'s admission.)
 #[tokio::test]
 async fn a_header_signed_by_a_non_member_is_refused_with_the_reason() {
     let world = World::new().await;
     let (alice, observer) = bob_may_write(&world).await;
-    let asked = fetching(&world, Vec::new());
     let bob = world.dev("/bob/phone").await;
     let header = header_by(&bob, &space());
-    let got = alice.admit(&header).await.expect("a member's header");
+    let got = alice.sender(&header).expect("a member's header");
     assert_eq!(
         (got.key, got.device, got.namespace),
         (bob.key.clone(), bob.name.clone(), n("/bob"))
@@ -801,34 +738,19 @@ async fn a_header_signed_by_a_non_member_is_refused_with_the_reason() {
         Err(r @ SignalRefusal::Malformed { .. }) => r.to_string(),
         other => panic!("not a run header of the space: {other:?}"),
     };
-    malformed(alice.admit(&header_by(&bob, &other_space())).await);
+    malformed(alice.sender(&header_by(&bob, &other_space())));
     let mut comps = signal_run_name(&bob.name, &space(), &RUN)
         .components()
         .to_vec();
     comps.pop();
     comps.push(NameComponent::generic(Bytes::from_static(&[7; 15])));
-    malformed(
-        alice
-            .admit(&named(&bob, Name::from_components(comps)))
-            .await,
-    );
+    malformed(alice.sender(&named(&bob, Name::from_components(comps))));
     let elsewhere = signal_run_name(&n("/bob/tablet"), &space(), &RUN);
-    let why = malformed(alice.admit(&named(&bob, elsewhere)).await);
+    let why = malformed(alice.sender(&named(&bob, elsewhere)));
     assert!(why.contains("another device"), "{why}");
 
-    let mut damaged = header.raw().to_vec();
-    *damaged.last_mut().unwrap() ^= 1;
-    assert_eq!(
-        alice
-            .admit(&Data::decode(Bytes::from(damaged)).unwrap())
-            .await,
-        Err(SignalRefusal::BadSignature {
-            key: bob.key.clone()
-        })
-    );
-
     let eve = world.dev("/eve/pc").await;
-    let why = alice.admit(&header_by(&eve, &space())).await;
+    let why = alice.sender(&header_by(&eve, &space()));
     assert_eq!(
         why,
         Err(SignalRefusal::NotMember {
@@ -841,13 +763,9 @@ async fn a_header_signed_by_a_non_member_is_refused_with_the_reason() {
         text.contains("no member") && text.contains("owner adds it"),
         "{text}"
     );
-    assert!(
-        asked.lock().unwrap().is_empty(),
-        "a stranger costs no fetch"
-    );
 
     let fresh = world.seat("/eve/laptop").await;
-    match fresh.admit(&header).await {
+    match fresh.sender(&header) {
         Err(r @ SignalRefusal::NotReady { .. }) => {
             assert!(r.to_string().contains("again"), "{r}")
         }
@@ -857,183 +775,17 @@ async fn a_header_signed_by_a_non_member_is_refused_with_the_reason() {
     // The owner removes Bob: his header is the stranger's from the first
     // call after the entry is held, and until then a member's.
     let removal = alice.members(members(None, vec![remove(1)])).await;
-    assert!(observer.admit(&header).await.is_ok());
+    assert!(observer.sender(&header).is_ok());
     alice.relay(&removal, &observer);
     assert!(matches!(
-        observer.admit(&header).await,
+        observer.sender(&header),
         Err(SignalRefusal::NotMember { .. })
     ));
 
     let (alice, _) = bob_may_write(&world).await;
     world.revoke("/bob", 2, &bob.key);
     assert_eq!(
-        alice.admit(&header).await,
+        alice.sender(&header),
         Err(SignalRefusal::BadSignature { key: bob.key })
     );
-}
-
-/// Live data is admitted by the live rule: a header signed by a key whose
-/// certificate has expired is refused though the key is a member and revoked
-/// by nothing.
-#[tokio::test]
-async fn a_header_under_an_expired_certificate_is_refused() {
-    let world = World::new().await;
-    let (alice, _) = bob_may_write(&world).await;
-    let (bob, _) = world.dev_key("/bob/phone", "2", 1, true).await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(alice.member(&bob.key), "a member, revoked by nothing");
-    match alice.admit(&header_by(&bob, &space())).await {
-        Err(r @ SignalRefusal::BadSignature { .. }) => {
-            assert!(r.to_string().contains("expired"), "{r}")
-        }
-        other => panic!("a header under an expired certificate: {other:?}"),
-    }
-}
-
-/// A member's header whose certificate is not held is admitted once the chain
-/// is fetched, by asking for exactly the certificate its chain needs.
-#[tokio::test]
-async fn a_member_header_admitted_after_the_chain_fetch() {
-    let world = World::new().await;
-    let (alice, _) = bob_may_write(&world).await;
-    let (bob, cert) = world.dev_key("/bob/phone", "3", VALIDITY_MS, false).await;
-    let asked = fetching(&world, vec![cert.clone()]);
-    let header = header_by(&bob, &space());
-
-    let got = alice
-        .admit(&header)
-        .await
-        .expect("admitted after the fetch");
-    assert_eq!(got.key, bob.key);
-    let asked = asked.lock().unwrap().clone();
-    assert_eq!(asked.len(), 1, "one certificate: {asked:?}");
-    assert!(cert.name.has_prefix(&asked[0]), "the signer's: {asked:?}");
-    assert!(alice.store.get(&header.name).is_none(), "nothing is kept");
-}
-
-/// A header's certificates are fetched for a member only within its
-/// namespace's budget: 2 headers of one namespace wait for certificates at a
-/// time, the others are refused at once and asked again; a stranger costs no
-/// fetch, a member whose certificate is held is admitted meanwhile and another
-/// namespace has a budget of its own. Time is tokio's, paused.
-#[tokio::test]
-async fn the_fetch_budget_bounds_waiting_headers() {
-    let world = World::new().await;
-    let alice = Arc::new(world.seat("/alice/laptop").await);
-    alice
-        .members(members(
-            Some(true),
-            vec![add(1, "/bob", Role::Writer), add(2, "/rita", Role::Writer)],
-        ))
-        .await;
-    let asked = fetching(&world, Vec::new());
-    let mut slow = Vec::new();
-    for d in ["/bob/slow/1", "/bob/slow/2", "/bob/slow/3", "/bob/slow/4"] {
-        slow.push(header_by(
-            &world.dev_key(d, "1", VALIDITY_MS, false).await.0,
-            &space(),
-        ));
-    }
-    let rita = header_by(
-        &world
-            .dev_key("/rita/slow/1", "1", VALIDITY_MS, false)
-            .await
-            .0,
-        &space(),
-    );
-    let held = world.dev("/bob/phone").await;
-    tokio::time::pause();
-
-    let tasks: Vec<_> = slow
-        .iter()
-        .chain([&rita])
-        .map(|h| {
-            let (alice, h) = (Arc::clone(&alice), Data::decode(h.raw().clone()).unwrap());
-            tokio::spawn(async move { alice.admit(&h).await })
-        })
-        .collect();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let fetching: Vec<Name> = asked.lock().unwrap().clone();
-    let of = |ns: &str| fetching.iter().filter(|x| x.has_prefix(&n(ns))).count();
-    assert_eq!(
-        of("/bob"),
-        2,
-        "a namespace holds 2 fetches at once: {fetching:?}"
-    );
-    assert_eq!(of("/rita"), 1, "another namespace has its own budget");
-    let refused: Vec<usize> = (0..slow.len())
-        .filter(|i| tasks[*i].is_finished())
-        .collect();
-    assert_eq!(refused.len(), 2, "the others are refused at once");
-
-    // A member whose certificate is held is not asked to wait.
-    let got = alice.admit(&header_by(&held, &space())).await;
-    assert_eq!(got.map(|s| s.key), Ok(held.key.clone()));
-
-    let mut waiting = Vec::new();
-    for (i, task) in tasks.into_iter().enumerate() {
-        if refused.contains(&i) {
-            match task.await.unwrap() {
-                Err(r @ SignalRefusal::Unverified { .. }) => {
-                    let text = r.to_string();
-                    assert!(
-                        text.contains("2 run headers of /bob wait") && text.contains("again"),
-                        "{text}"
-                    );
-                }
-                other => panic!("over its namespace's fetches: {other:?}"),
-            }
-        } else {
-            waiting.push(task);
-        }
-    }
-    // The fetches that never answer end with the fetcher's own timeout and
-    // each refuses its header: the slots are given back.
-    for task in waiting {
-        assert!(matches!(
-            task.await.unwrap(),
-            Err(SignalRefusal::Unverified { .. })
-        ));
-    }
-    let slots = alice.gate.waiting.len();
-    assert_eq!(slots, 0, "every place is given back");
-}
-
-/// A device whose certificate could not be had is not fetched for again for
-/// 30 s, whatever key id its next header names, and is fetched for again once
-/// they are over: a fresh key id per header drives no fetch per header.
-#[tokio::test]
-async fn a_device_whose_certificate_could_not_be_had_is_not_asked_again_for_30_seconds() {
-    let world = World::new().await;
-    let alice = world.seat("/alice/laptop").await;
-    alice
-        .members(members(Some(true), vec![add(1, "/bob", Role::Writer)]))
-        .await;
-    let asked = fetching(&world, Vec::new());
-    let mut headers = Vec::new();
-    for id in ["1", "2", "3", "4"] {
-        let (dev, _) = world.dev_key("/bob/tablet", id, VALIDITY_MS, false).await;
-        headers.push(header_by(&dev, &space()));
-    }
-    tokio::time::pause();
-
-    for (i, header) in headers[..3].iter().enumerate() {
-        match alice.admit(header).await {
-            Err(r @ SignalRefusal::Unverified { .. }) => {
-                if i > 0 {
-                    assert!(r.to_string().contains("30 s"), "{r}");
-                }
-            }
-            other => panic!("no certificate of the key is to be had: {other:?}"),
-        }
-        assert_eq!(
-            asked.lock().unwrap().len(),
-            1,
-            "header {i}: one fetch for the device, then none while it backs off"
-        );
-    }
-    tokio::time::advance(Duration::from_secs(31)).await;
-    assert!(alice.admit(&headers[3]).await.is_err());
-    assert_eq!(asked.lock().unwrap().len(), 2, "asked again after 30 s");
 }

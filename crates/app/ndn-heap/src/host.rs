@@ -340,7 +340,7 @@ impl NodeInner {
 /// [`HeapError::Local`] and the rest read what the node held.
 #[derive(Clone)]
 pub struct NodeHandle {
-    inner: Arc<NodeInner>,
+    pub(crate) inner: Arc<NodeInner>,
 }
 
 impl std::fmt::Debug for NodeHandle {
