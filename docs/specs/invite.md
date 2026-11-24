@@ -822,9 +822,11 @@ offer's name is a `BadRequest` too (§6.2).
    intro-answer label (§4.5) and the answer's fields before it, and the offer packet are
    both signed by a key of `D` that chains to that anchor through those certificates;
    the offer's commitment is the code's secret's; the space and role are the offer's;
-   and the space's owner namespace is the inviter's. `ADMITTED` is not judged here: the
-   entry is the heap's to admit (§8.5), and a name that no entry answers to is a wait
-   that ends in `NotReady`, never an admission.
+   and the space's owner namespace is the inviter's. When the answer names an `ADMITTED`
+   entry, the device that signed it lies under the inviter's namespace (`Forged`
+   otherwise, and no Interest is sent for an entry of a device outside it); whether the
+   entry itself is admitted is the heap's to judge (§8.5), and a name that no entry
+   answers to is a wait that ends in `NotReady`, never an admission.
 4. **The inviter's namespace is no other's**, judged by this device (the words and a
    short code of a named namespace name none, so it is judged here for them too): not
    the root, not one the policy refuses (`IntroPolicy::refuses`, §14), not this

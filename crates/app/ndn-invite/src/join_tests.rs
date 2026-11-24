@@ -7,16 +7,21 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use ndn_heap::NextStep;
+use ndn_heap::{EntryId, NextStep};
+use ndn_packet::Data;
+use ndn_packet::encode::DataBuilder;
 use ndn_trust_envelope::TrustEnvelope;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::InviteError;
 use crate::host::{HintCandidate, HintKind, LinkHint, Role};
-use crate::join_kit::{Gate, admitted_in, is_key, is_log_or_key, kit_config};
+use crate::join_kit::{Gate, admitted_in, is_key, is_log_or_key, kit_config, sign_as};
 use crate::policy::IntroRefusal;
+use crate::proofs::{answer_proof, proof_key};
 use crate::test_kit::{Calls, Net, Person, Setup, alice, alice_offers, heap, n, notebook};
+use crate::wire::{AnswerBody, Outcome, ask_name, parse_intro_name};
 
 // ---- the wait: a join returns once this person may write --------------------------------
 
@@ -479,4 +484,98 @@ async fn a_waiting_join_has_opened_the_space_and_noted_the_join() {
         .unwrap()
         .expect("the join returns once let through");
     cancel.cancel();
+}
+
+// ---- what the answer must be, and what a joiner holds, before it is believed ---------------------
+
+/// An answer that names, as the entry that admitted the joiner, one of a device outside the
+/// inviter's namespace — made as the inviter would make it (a good proof, the inviter's own
+/// signatures), so that no check but the device's fails — is forged: the join is refused as
+/// `Forged` and no Interest is sent for an entry of that device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admitted_entry_of_a_device_outside_the_inviter_namespace_is_forged() {
+    let gate = Gate::new();
+    let (offered, phone, cancel) = on_a_net(Role::Writer, &gate).await;
+    let pk = proof_key(&offered.secret, &offered.offer());
+    let laptop = Arc::clone(&offered.laptop);
+    gate.tamper(move |wire| {
+        let data = Data::decode(wire.clone()).ok()?;
+        if parse_intro_name(&data.name).is_none() {
+            return Some(wire);
+        }
+        let mut answer = AnswerBody::decode(data.content()?.clone()).ok()?;
+        let Outcome::Accepted { admitted, .. } = &mut answer.outcome else {
+            return Some(wire);
+        };
+        *admitted = Some(EntryId {
+            device: n("/mallory/laptop"),
+            seq: 1,
+            digest: [7; 32],
+        });
+        // The inviter's proof packet names the answer's fields, so it is made again; the
+        // answer's own proof covers it, so it is made last.
+        let proof_packet = sign_as(
+            &laptop,
+            DataBuilder::new(ask_name(&laptop.name, &answer.binding()), &[])
+                .freshness(Duration::ZERO),
+        )?;
+        if let Outcome::Accepted { inviter, .. } = &mut answer.outcome {
+            *inviter = proof_packet;
+        }
+        answer.proof = Some(answer_proof(&pk, &answer));
+        sign_as(
+            &laptop,
+            DataBuilder::new((*data.name).clone(), &answer.encode()),
+        )
+    });
+    let got = phone.invites.join(&offered.code.link).await;
+    assert!(
+        matches!(&got, Err(InviteError::Refused(IntroRefusal::Forged))),
+        "an admitting entry of a device outside the inviter's namespace was believed: {got:?}"
+    );
+    let asked = gate.sent_where(|name| name.has_prefix(&n("/mallory")));
+    assert!(
+        asked.is_empty(),
+        "the join asked for entries of a device outside the inviter's namespace: {asked:?}"
+    );
+    assert!(
+        phone.node.space(&notebook()).is_none(),
+        "the space was opened"
+    );
+    cancel.cancel();
+}
+
+/// A words code names no namespace, so the inviter's is judged only once the answer has
+/// proved the code: a namespace that lies over one this device trusts is refused then, as
+/// an inviter in conflict, and nothing of it is adopted or opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_words_code_whose_inviter_overlaps_a_held_namespace_is_refused_after_the_answer() {
+    let w = world(Role::Writer).await;
+    let bob = Person::new("/bob");
+    let calls = Arc::new(Calls::default());
+    let phone = Setup::new(&bob, "/bob/phone")
+        .config(kit_config())
+        .calls(Arc::clone(&calls))
+        .on(&w.net, &w.cancel)
+        .start()
+        .await;
+    // Bob trusts /alice/team: Alice's /alice lies over it, and her device /alice/laptop is not
+    // under it, so nothing but the answer's credentials show the conflict.
+    let team = Person::new("/alice/team");
+    phone
+        .validator
+        .adopt_context(Arc::clone(&team.ctx))
+        .unwrap();
+    let got = phone.invites.join(&w.offered.code.words).await;
+    let Err(e @ InviteError::Refused(IntroRefusal::InviterConflict { inviter, why })) = &got else {
+        panic!("not refused as an inviter in conflict: {got:?}");
+    };
+    assert_eq!(*inviter, n("/alice"));
+    assert!(why.contains("lies over"), "{why}");
+    assert_eq!(e.next(), NextStep::AskOwner);
+    assert!(!calls.adopted(), "the conflicting namespace was adopted");
+    assert!(
+        phone.node.space(&notebook()).is_none(),
+        "the space was opened"
+    );
 }

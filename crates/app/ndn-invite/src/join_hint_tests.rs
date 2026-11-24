@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::credentials::{Fingerprint, credentials};
 use crate::error::InviteError;
 use crate::host::{HintCandidate, HintKind, Joined, LinkHint, Offer, Role};
-use crate::join_kit::{Gate, kit_config};
+use crate::join_kit::{Gate, kit_config, sign_as};
 use crate::policy::{HINT_RETRIES_MAX, IntroPolicy, IntroRefusal};
 use crate::proofs::{SECRET_LEN, hint_token, keyed_fingerprint};
 use crate::short::{Contact, ShortCode};
@@ -294,18 +294,6 @@ fn short_text(
 /// The inviter's address, as a code's first contact.
 fn address() -> Contact {
     Contact::Address("192.0.2.7:4433".parse().unwrap())
-}
-
-/// `data`'s Data as `who` signs it with its own key, whatever the name (a tamperer's
-/// signature: the node itself signs only the names of its own device).
-fn sign_as(who: &Device, built: DataBuilder) -> Option<Bytes> {
-    let identity = who.keys.signing_identity_for(&who.name).ok()?;
-    let key = identity.signer.key_name().clone();
-    Some(
-        built.sign_sync(identity.signer.sig_type(), Some(&key), |region| {
-            identity.signer.sign_sync(region).unwrap_or_default()
-        }),
-    )
 }
 
 /// `rig`'s offer as an old link wrote it (TLVs of trust-envelope.md §5.1: an envelope of

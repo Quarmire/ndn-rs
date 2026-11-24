@@ -46,6 +46,8 @@ pub(crate) mod test_kit;
 pub mod wire;
 
 #[cfg(test)]
+mod credentials_tests;
+#[cfg(test)]
 mod error_tests;
 #[cfg(test)]
 mod folder_scope_tests;

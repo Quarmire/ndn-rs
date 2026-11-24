@@ -557,6 +557,9 @@ impl Inner {
                 || ob.space != space
                 || ob.role != role
                 || space_owner(&space).as_ref() != Some(&inviter)
+                || admitted
+                    .as_ref()
+                    .is_some_and(|id| !id.device.has_prefix(&inviter))
             {
                 return Err(forged());
             }

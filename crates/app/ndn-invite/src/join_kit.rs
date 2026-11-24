@@ -262,3 +262,18 @@ pub(crate) fn admitted_in(gate: &Gate) -> Option<ndn_heap::EntryId> {
         }
     })
 }
+
+/// `built` as `who` signs it with its own key, whatever the name (a tamperer's signature:
+/// the node itself signs only the names of its own device).
+pub(crate) fn sign_as(
+    who: &crate::test_kit::Device,
+    built: ndn_packet::encode::DataBuilder,
+) -> Option<Bytes> {
+    let identity = who.keys.signing_identity_for(&who.name).ok()?;
+    let key = identity.signer.key_name().clone();
+    Some(
+        built.sign_sync(identity.signer.sig_type(), Some(&key), |region| {
+            identity.signer.sign_sync(region).unwrap_or_default()
+        }),
+    )
+}
