@@ -312,11 +312,14 @@ name is none of these. If it is a keyword:
 | `held` | a held copy |
 | `seal` | a seal key packet |
 | `grant` | a grant answer |
+| any other, **registered by an extension** (§10.9) | that extension's answer |
 | any other | not served |
 
 The parser of the kind still judges the name; the router only chooses which
 parser to run. A node MUST NOT serve any other name, and MUST NOT serve a
-name under `/localhost`.
+name under `/localhost`. The keywords above, and `data`, `piece`, `manifest`,
+`sync`, `signal` and `run` (the other keywords this layer's names carry), are
+**core**: an extension MUST NOT be given an Interest under one (§10.9).
 
 ### 2.5 The sync group of a space
 
@@ -819,6 +822,7 @@ big-endian, so keys order numerically. Other names are appended as components.
 | `revoked/<S>` | 32 octets: the digest of the revocations of the readers' devices (§5.3 rule 8) that the last `Epoch` entry this device signed accounted for | after each Epoch entry this device signs |
 | `rule/<S>` | 1 octet: the version of the owner rule (§2.1, §9.9) the space's entries were last judged by here; 1 is the role rule | at the first open of a space with no entries, and after the one judgement at start (and the fresh epoch an owner device of a sealed space signs) of a space stored under an earlier rule |
 | `space/<S>` | 1 octet: 1 a space this node is a member of, 2 a space it only follows (§10) | when the space is created, opened or followed |
+| `joined/<S>` | 1 octet, 1, then the 32-octet signed-region digest of each `Members` entry held that removes the device's person: an offer's answer admitted this device to the space and the fold does not list its person yet (§10.9); while it stands, a refusal for want of a listing is a wait | at `note_joined`, when the fold does not list the person; removed when it does, and when a removal of her arrives that it does not name |
 | `structural/<S as TLV component>/<device as TLV component>/<seq 8>` | empty | with a `Members` or `Epoch` entry (start replays only these) |
 | `heads/<S as TLV component>/<SHA-256 of the PATH TLV>` | the `PATH` TLV ‖ `ENTRY_REF`* | with the apply |
 | `supers/<S as TLV component>/<device as TLV component>/<seq 8>/<digest 32>` | `ENTRY_REF`* of the applied entries that name the entry `<device>/<seq>` of that signed-region digest in their `after` (not recorded for a target held at another path than the namer's) | with the apply |
@@ -1652,6 +1656,7 @@ A name under `/localhost` is never served.
 | `<H>/32=held/<Name TLV>` with `H` this device | the packet named — another device's entry, or a piece — **only if it is held and admitted** (a follower serves what it verified), wrapped as the Content of a DigestSha256 packet, so it carries no claim of having been signed by this device |
 | `<D>/32=seal/<pk>` with `D` this device and `pk` its recipient public key | its seal key packet |
 | `<G>/32=grant/<ask>` with `G` this device | by §6.5 |
+| `<D>/32=<keyword>/…` with `D` this device and `keyword` registered by an extension | by §10.9: what the extension answers, else Nacked |
 
 An entry is served from the entry's own record: held and verified, and either
 applied or held closed; one refused, waiting or unreadable is not served.
@@ -2276,13 +2281,16 @@ The crate exports exactly these, the types they use (`Transport`, `Config`,
 `Frontier`, `Item`, `EntryId`, `Change`, `Changes`, `Alert`, `Follower`,
 `HeapError`, `NextStep`, `Refusal`, `Cut`, `Timestamp`, `CutBound`,
 `CutProposal`, `RUN_ID_LEN`, `SignalScope`, `SignalKey`, `SignalSender`,
-`SignalRefusal`) and the host's trust seam (`Adopter`, `Scoping`, §9.4). The
+`SignalRefusal`) and the host's trust seam (`Adopter`, `Scoping`, §9.4), and,
+for `ndn-invite` and `ndn-surface` alone, the sibling surface of §10.9. The
 signal methods are the gate of §11 (`revocations` is its count of revocations;
 each answers `NotReady` for a space not open here as a member). The node
 offers no raw signing: nothing signs octets a caller names with the device key
 (a signature over bytes of the host's choosing would be an oracle for any
 protocol that frames them like an entry); a run header is signed by
-`signal_header` under a name this gate defines.
+`signal_header` under a name this gate defines. The one exception is the
+sibling surface (§10.9), which signs a packet only under a keyword an extension
+registered and never under one of the core keywords above.
 
 **`Config`** tunes a node; each field's default is what the spec's numbers are:
 
@@ -2652,6 +2660,159 @@ decided show what they decided before.
 - **`Item.by` is the namespace of the held context governing the writer's
   device name** (§9.1), not a claim in the entry: a host that shows who wrote a
   value shows `by` and `writer`, and not the entry's bytes.
+
+### 10.9 The sibling surface
+
+`ndn_heap::host` is the interface for `ndn-invite` and `ndn-surface` and for
+no other program; a host that reads and writes spaces never uses it. It lets a
+sibling crate add a protocol of its own to a device (introductions, invite.md)
+that rides the device's key, trust, store and serving, without this layer
+growing a case for it. `Node` dereferences to a `NodeHandle`, the same
+surface held by a task or an extension: a `Node` stops when it is dropped, a
+handle does not, and a stopped node makes every method that needs the network
+answer `HeapError::Local` and the rest read what it held.
+
+```rust
+pub trait Extension: Send + Sync {
+    fn keywords(&self) -> &'static [&'static str];
+    fn answer<'a>(&'a self, interest: &'a Interest) -> AnswerFuture<'a>; // Option<Bytes>
+}
+
+impl Node { pub fn handle(&self) -> NodeHandle; }          // and Deref<Target = NodeHandle>
+impl NodeHandle {                                          // Clone; every method is Node's too
+    pub fn sign_packet(&self, packet: DataBuilder) -> Result<Bytes, HeapError>;
+    pub fn extend(&self, extension: Arc<dyn Extension>) -> Result<(), HeapError>;
+    pub fn consumer(&self) -> Consumer;
+    pub fn validator(&self) -> &Arc<Validator>;
+    pub fn keys(&self) -> &Arc<SecurityManager>;
+    pub fn store(&self) -> &Arc<dyn DataStore>;
+    pub fn recipient(&self) -> &RecipientKey;
+    pub fn note_joined(&self, space: &Name);
+    pub async fn fetch_entry(&self, name: &Name) -> Result<EntryId, HeapError>;
+    pub fn now(&self) -> Timestamp;
+    pub fn config(&self) -> &Config;
+    pub fn person_of(&self, device: &Name) -> Name;
+    pub fn adopted_persons(&self) -> Vec<Name>;
+    pub fn name(&self) -> &Name;  pub fn namespace(&self) -> &Name;  pub fn writer(&self) -> &Name;
+    pub async fn open(&self, space: &Name) -> Result<Heap, HeapError>;
+    pub fn space(&self, space: &Name) -> Option<Heap>;
+    pub async fn flush(&self) -> Result<(), HeapError>;
+}
+impl Heap { pub fn removed_by(&self, person: &Name) -> Option<EntryId>; }
+```
+
+**Extensions.** `extend` registers an extension for **all** its keywords or for
+none, and answers `HeapError::BadRequest` (next step `FixRequest`) when it
+claims no keyword; a word that is not a keyword (lowercase ASCII letters,
+digits and `-`, at least one); a core keyword (§2.4: `data`, `log`, `seal`,
+`grant`, `held`, `piece`, `manifest`, `sync`, `signal`, `run`); or a keyword
+claimed already, by another extension or twice by itself. An Interest whose
+name is under this device's own name and whose keyword right after it is
+registered is **given to that extension, and to no other code**: it answers
+in a task of its own (it may sign, wait for the store or ask the network), a
+`None` is **Nacked** like any Interest nothing answers, and a name under
+`/localhost`, a name of another device, and a name of a core kind never
+reach it. The router of §2.4 is otherwise unchanged. A sibling's records live
+in the store under `/localhost/ndn-<crate>/`, which no device serves and this
+layer neither scans nor writes; `flush` makes them durable.
+
+**Signing.** `sign_packet` signs with the device's key, and **only** a Data
+named `<D>/32=<keyword>/…` where `D` is this device, the keyword is the
+component right after it, and an extension has registered it. The name is read
+from the very bytes about to be signed, before the key is used, so nothing
+signs a name the caller builds around it. Every other name (an entry
+`32=log`, a seal key, a grant, a signal run, a certificate or key name
+`<D>/KEY/…`, another device's, one with no keyword or the keyword not right
+after the device, an unregistered keyword) is `HeapError::BadRequest` naming why
+and what to register, signs nothing and counts no signature. So the node is no
+signing oracle: it cannot be made to sign an entry at a chosen name (the
+device would equivocate, §3.7), speak for the namespace, or frame octets as
+an entry. A packet signed under a registered keyword parses as none of the
+core kinds (§2.3: the first keyword decides), so a peer never takes it for an
+entry, a seal key or a grant.
+
+**Joining.** `note_joined(space)` records at `joined/<S>` (§4.3) that an offer's
+answer admitted this device to `space`. While the record stands and the fold of
+`space` held here does not list this device's person (the owner, a standing
+writer or a standing reader), a `put` that would answer `NotAllowed` (the
+person is not a writer) answers **`NotReady`**, next step `RetryLater`, and says
+the entry that lists the person has not arrived: the entry is on its way, not
+refused. Nothing else changes: the judge is as strict as before, the put still
+writes nothing until the fold lists the person, and an error other than
+`NotAllowed` is returned as it is (`NotOwner`, `Sealed`, a refused key). The
+record is removed when the fold lists the person (checked when a members entry
+is applied and when the space is opened), and when a removal of her arrives
+that the record did not name while no Add of hers stands (the admission was
+undone before this device ever saw it listed: the record keeps the digests of
+the removals held when it was made, so a removal of an earlier invitation is not
+mistaken for one of this): then the entry it waited for is never to come, and
+the refusal is `NotAllowed` again. It is not made for a space that lists the
+person already. It survives a restart, so a device that stopped between the
+answer and the entry still waits instead of being told to ask the owner. A
+device that really is no member, with no record, is told `NotAllowed`. No
+clock takes part: what ends the wait is a listing or a removal, both signed
+entries.
+
+**One entry by name.** `fetch_entry(name)` takes the log name of one entry,
+`<device>/32=log/<S>/seq=<n>`, of a space **open here** (`BadName` for any
+other name, `BadRequest` for a space not open). It asks the writer and the
+heard members that vouch for its log, in turn (two asks of each, within one
+Interest lifetime each), and hands what arrives to the same admission every
+fetched entry passes (§3.8, through the judge of §9.1 and the log): **no
+bypass, and nothing else is fetched**. It answers the entry's id (`device`,
+`seq`, signed-region digest) when the entry is held, a duplicate included;
+whether it was applied is `Heap::applied`'s to say (a refused entry is
+`HeapError::Refused` with the judge's reason; one that waits for a context or
+a certificate is `NotReady`; none answered is `Unavailable`). It is the call a
+removed person's node makes for the entry that removed it, the name `removed_by`
+gave its inviter.
+
+**Who removed a person.** `Heap::removed_by(person)` is `None` for a person
+the fold lists (as owner, writer or reader), one it never listed, and the
+owner. For a person it lists no more it is the id of the applied `Members`
+entry that carries a `Remove` naming an `Add` of hers, and of those the one of
+the lowest rank (signed-region digest, then device, then seq: the order that
+picks between entries claiming one fact, §5.2), so every node holding the same
+entries names the same one. A withdrawn entry names nobody.
+
+**What else a sibling reads.** `consumer` is a consumer on the node's own face
+(its Interests go where the node's go, a new one per call; it may carry a
+forwarding hint and parameters). `validator` and `keys` are the node's own
+(the keyring of trust contexts held, the certificate caches, the key store).
+`recipient` is this device's X25519 key: the secret stays in the key store,
+never in the data store, so a sibling derives the keys that protect its own
+notes from it with an HKDF label of its own. `now` is `Config.clock`, as the
+times the node writes are read. `config` gives the node's `lifetime` and
+`first_look`, the bounds of a sibling's waits. `person_of(device)` is the
+namespace of the context that governs the device here (the self-certifying
+namespace its name hashes to, while no context of it is held).
+`adopted_persons` is the sorted set of persons whose context the host's
+`Adopter` adopted here for the spaces that list them (§9.4), not those the
+keyring holds and not those still being adopted.
+
+**Waiting for a join** needs no other call: a sibling opens the space, notes
+the join, and waits, bounded, for `Heap::members` to list the person
+(`watch` yields `Change::Members`; re-check on a bounded tick as well), for
+`Heap::holds_epoch_key`, and for `Heap::applied` of the id `Heap::change`
+returned to the inviter (the last entry that change signed: its Members entry,
+or the Epoch entry it owed a sealed space, which follows it in the same log).
+
+Threat notes:
+
+- **A registered keyword cannot reach the core, nor the core an extension.** The
+  core keywords are refused at registration, and a name is routed by its first
+  keyword alone (§2.4), so an extension that registers `ping` cannot be asked
+  for `<D>/32=log/…` and cannot make a node sign one.
+- **A sibling is trusted with the device's name under its keywords**, and with
+  nothing else: the signing it is lent is bounded as above, the validator and
+  the store it reads are the node's, and a sibling that signs a wrong answer
+  under `<D>/32=<its keyword>` harms only the protocol of that keyword.
+- **`note_joined` admits no one.** It changes the words of one refusal, and only
+  while the fold does not list the person; a forged or stale record keeps a
+  device waiting, never lets it write.
+- **`fetch_entry` is no admission path.** An entry a caller names is judged
+  by the rules of §3.8 and §9; a name of a space not open here is refused
+  before anything is asked.
 
 ## 11. Signals: the gate
 
@@ -3036,6 +3197,18 @@ included) is under 5 s; the layer has no checkpoint, and a start over 5 s is to
 be reported to the owner of the layer, checkpoints being a later work. With
 1,000 paths of 100 versions each: store open 57 ms, `Node::start` 0.28
 to 0.40 s, first `get` 0.014 ms, listing 5.4 ms.
+
+### 13.9 The sibling surface (this layer only)
+
+| Case | Property | Crate tests |
+|---|---|---|
+| s1 | An extension answers the Interests under the keyword it registered, signed by the device's key and verified by a peer, and no others: an unregistered keyword and a core one are Nacked and never reach it; the core router serves as before | `an_extension_answers_its_keyword_only` |
+| s2 | The node signs for its extensions only `<D>/32=<keyword>/…` of a registered keyword; every other name is refused and signs nothing | `sign_packet_refuses_a_name_no_extension_owns` |
+| s3 | An extension claiming a core keyword, a keyword already claimed, none, or a word that is no keyword is refused, and a refused claim registers none of its keywords | `extend_refuses_a_core_keyword_and_a_duplicate`, `every_keyword_the_layers_names_carry_is_a_core_keyword` |
+| s4 | A device an offer admitted is told `NotReady` (retry), not `NotAllowed`, until the fold lists its person; the note is removed when it does, survives a restart, is not made for a listed person, and ends (`NotAllowed` again) when the admission was undone before the device ever saw it listed | `note_joined_turns_not_allowed_into_not_ready_until_listed`, `a_joined_note_survives_a_restart`, `a_joined_note_ends_when_the_listing_it_waited_for_was_undone` |
+| s5 | One entry is fetched by its log name and admitted by the ordinary judge: held and applied, nothing else fetched; a refused entry is refused to the caller; none answered is `Unavailable` | `fetch_entry_admits_one_entry_by_name`, `fetch_entry_does_not_admit_what_the_judge_refuses` |
+| s6 | The Members entry that removed a person is named identically by every node holding the same entries, and by none for a person listed, never listed, or the owner | `removed_by_names_the_members_entry_that_removed_a_person`, `removal_record_names_the_lowest_entry_that_removed_a_person_listed_no_more` |
+| s7 | The node lends its key store, validator, store, clock, config, persons and the persons adopted for spaces | `the_node_lends_its_keys_validator_store_clock_and_persons`, `a_person_listed_by_a_members_entry_is_adopted_for_that_space_only` |
 
 ## 14. Threat notes
 
