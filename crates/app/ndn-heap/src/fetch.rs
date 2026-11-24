@@ -83,6 +83,11 @@ const REEXPRESS_MAX: u32 = 3;
 /// would be aggregated at the first hop and cost an Interest for nothing.
 const RTO_MIN: Duration = Duration::from_millis(250);
 
+/// The retransmission timeout before the node has measured a round trip
+/// (RFC 6298 §2.1): a lost first Interest is expressed again after a second,
+/// within a lifetime of two, not after it.
+const RTO_INITIAL: Duration = Duration::from_secs(1);
+
 /// How many seqs above its own head a device fetches its own entries back,
 /// in reservation blocks.
 const OWN_BLOCKS: u64 = 4;
@@ -119,8 +124,8 @@ pub(crate) fn probe_pause(misses: u32) -> Duration {
 /// answered by their first Interest, and how many asks since the last such
 /// answer needed a re-expression or missed. An ask answered after a
 /// re-expression gives no sample (Karn: which Interest was answered is not
-/// known). Before any sample nothing is re-expressed: the timeout is the
-/// lifetime.
+/// known). Before any sample the timeout is [`RTO_INITIAL`], as RFC 6298 §2.1
+/// has it.
 #[derive(Debug, Default)]
 pub(crate) struct Rtt {
     srtt: Option<Duration>,
@@ -151,12 +156,12 @@ impl Rtt {
     }
 
     /// The wait before expressing an unanswered Interest again: srtt +
-    /// 4·rttvar (the lifetime before any sample), doubled per
+    /// 4·rttvar ([`RTO_INITIAL`] before any sample), doubled per
     /// [`Self::missed`] since the last sample, at least [`RTO_MIN`] and at
     /// most `lifetime`.
     pub(crate) fn rto(&self, lifetime: Duration) -> Duration {
         self.srtt
-            .map_or(lifetime, |srtt| srtt + self.rttvar * 4)
+            .map_or(RTO_INITIAL, |srtt| srtt + self.rttvar * 4)
             .saturating_mul(1 << self.backoff)
             .clamp(RTO_MIN, lifetime.max(RTO_MIN))
     }
@@ -877,5 +882,24 @@ pub(crate) async fn run(group: Arc<Group>) {
         if group.stop.run_until_cancelled(woken).await.is_none() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Before the first sample (RFC 6298 §2.1) the timeout is a second: the first Interest a
+    /// node expresses, lost, is expressed again within its lifetime, not after it.
+    #[test]
+    fn before_any_sample_a_lost_interest_is_expressed_again_within_the_lifetime() {
+        let rtt = Rtt::default();
+        let lifetime = Duration::from_secs(2);
+        assert_eq!(rtt.rto(lifetime), Duration::from_secs(1));
+        // The lifetime still bounds it.
+        assert_eq!(
+            rtt.rto(Duration::from_millis(600)),
+            Duration::from_millis(600)
+        );
     }
 }

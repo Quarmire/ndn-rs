@@ -968,12 +968,15 @@ async fn the_grant_pull_walks_creator_then_relays_with_backoff() {
     r.group.on_update(notice(TABLET, 1));
     r.group.on_update(notice(DESKTOP, 1));
     pass(60).await;
-    let asks: Vec<(Name, tokio::time::Instant)> = r
+    // An ask the granter left unanswered is expressed again under a fresh nonce within its
+    // lifetime: one ask, however many Interests it took.
+    let mut asks: Vec<(Name, tokio::time::Instant)> = r
         .wire
         .times()
         .into_iter()
         .filter(|(name, _)| parse_grant_name(name).is_some())
         .collect();
+    asks.dedup_by(|again, first| again.0 == first.0);
     let order: Vec<Name> = asks
         .iter()
         .take(3)
@@ -998,7 +1001,12 @@ async fn the_grant_pull_walks_creator_then_relays_with_backoff() {
     assert!(rounds.len() >= 3, "round after round: {}", rounds.len());
     let gaps: Vec<Duration> = rounds.windows(2).map(|w| w[1] - w[0]).collect();
     assert!(gaps[1] > gaps[0], "the pauses grow: {gaps:?}");
-    let total = asks.len();
+    let total = r
+        .wire
+        .times()
+        .iter()
+        .filter(|(name, _)| parse_grant_name(name).is_some())
+        .count();
     pass(120).await;
     assert_eq!(
         r.wire

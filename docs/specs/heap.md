@@ -1468,7 +1468,8 @@ An ask is made by an **expressed** Interest: if nothing answers within the
 retransmission timeout, the same Interest is expressed again under a fresh
 nonce, up to 3 times within the lifetime; the timeout is the smoothed round
 trip plus four times its variation (RFC 6298; only an ask answered by its first
-Interest gives a sample; none before the first sample: then the timeout is the
+Interest gives a sample; none before the first sample: then the timeout is one
+second, RFC 6298 §2.1, so a lost first Interest is expressed again within the
 lifetime), doubled for every ask since the last sample that needed a
 re-expression or missed, at least 250 ms (a forwarder holds back a fresh-nonce
 Interest from the same face for about that long), at most the lifetime, and
