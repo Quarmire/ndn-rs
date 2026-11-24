@@ -324,11 +324,15 @@ impl Log {
                 Err(Status::Unreadable)
             }
             Some((entry, prev, prev_seq)) => match self.chain_conflict(id, prev, *prev_seq) {
-                Some(conflict) => {
+                // A removed person's entries are judged by the removal cut
+                // alone (spec 3.7): the cut names the bytes it keeps, so a
+                // fork with other bytes held at a name is the cut's to
+                // settle, not a reason to refuse what it names.
+                Some(conflict) if !self.judged_by_cut(&v.person, &id.device) => {
                     self.equivocated(a, conflict, fx);
                     Err(Status::Refused(Refusal::Chain))
                 }
-                None => self.assess(id, &v.person, &v.key, entry).map(|()| entry),
+                _ => self.assess(id, &v.person, &v.key, entry).map(|()| entry),
             },
         };
         if let Err(Status::Refused(why)) = &verdict {
@@ -461,6 +465,18 @@ impl Log {
             }
             Body::Put(_) | Body::Members(_) | Body::Epoch(_) => Ok(()),
         }
+    }
+
+    /// Whether the entries of `device` signed by `person` are judged by a
+    /// removal cut alone: the person is no writer now and a cut names a tip
+    /// of this device.
+    fn judged_by_cut(&self, person: &Name, device: &Name) -> bool {
+        !self.fold.is_writer(person)
+            && self
+                .fold
+                .removal_tips(person)
+                .iter()
+                .any(|t| t.device == *device)
     }
 
     /// What a removed writer's cut says of the entry: `Ok` when the cut keeps
@@ -842,7 +858,12 @@ impl Log {
             Rejudge::Held | Rejudge::Verified => {
                 let held_for_trust =
                     matches!(l.status, Some(Status::Refused(Refusal::Untrusted { .. })));
-                if l.status.as_ref().is_some_and(|s| !s.can_change())
+                // A fork refused this entry before a removal cut named its
+                // writer; the cut settles what it keeps (spec 3.7), so the
+                // verdict is judged again.
+                let forked_then_cut = matches!(l.status, Some(Status::Refused(Refusal::Chain)))
+                    && self.judged_by_cut(&l.person, device);
+                if (l.status.as_ref().is_some_and(|s| !s.can_change()) && !forked_then_cut)
                     || (held_for_trust && matches!(how, Rejudge::Held))
                 {
                     return;

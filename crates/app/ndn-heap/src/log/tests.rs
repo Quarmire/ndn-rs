@@ -439,6 +439,84 @@ async fn other_bytes_at_a_kept_seq_are_refused() {
     assert_eq!(r.value("/p1").as_deref(), Some("1"));
 }
 
+/// Every order of `0..n`.
+fn orders(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![vec![]];
+    }
+    let mut all = Vec::new();
+    for rest in orders(n - 1) {
+        for at in 0..=rest.len() {
+            let mut order = rest.clone();
+            order.insert(at, n - 1);
+            all.push(order);
+        }
+    }
+    all
+}
+
+#[tokio::test]
+async fn other_bytes_below_the_tip_never_keep_the_honest_chain_out_in_any_arrival_order() {
+    // r5/q2: the cut names p3; a copy of Bob's key signed other bytes at
+    // seq 2, below the tip. Whatever comes first, the chain from the tip
+    // is what is kept: p1, p2 and p3 are read, the copy's bytes are not.
+    let mut owner = Chain::new(&phone());
+    let mut b = Chain::new(&bob());
+    let created = creation(&mut owner);
+    let (p1, p2, p3) = (b.put("/p1", "1"), b.put("/p2", "2"), b.put("/p3", "3"));
+    let other = sign_entry(
+        &bob(),
+        2,
+        &Entry {
+            prev: Some(Prev {
+                digest: p1.digest,
+                seq: None,
+            }),
+            after: vec![],
+            body: Body::Put(PutBody {
+                path: n("/p2"),
+                payload: Payload::Inline(Bytes::from_static(b"forged")),
+            }),
+        },
+    );
+    let cut = owner.members(members(None, vec![remove(1, vec![p3.entry_ref()])]));
+    let all = [created, cut, p1, p2, p3, other];
+    let mut failures = Vec::new();
+    for order in orders(all.len()) {
+        let mut r = rig(&carol());
+        // The fetch asks again for what the log still wants, in the order
+        // of its passes: every packet is offered again, in rounds, as
+        // long as an offer changes what is read; a duplicate changes
+        // nothing.
+        let mut last = None;
+        for _round in 0..6 {
+            for &i in &order {
+                r.admit(&all[i]);
+            }
+            let now = [r.value("/p1"), r.value("/p2"), r.value("/p3")];
+            if last.as_ref() == Some(&now) {
+                break;
+            }
+            last = Some(now);
+        }
+        let read = [r.value("/p1"), r.value("/p2"), r.value("/p3")];
+        let want = [
+            Some("1".to_owned()),
+            Some("2".to_owned()),
+            Some("3".to_owned()),
+        ];
+        if read != want {
+            failures.push((order, read));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of 720 orders read other than the chain from the tip; the first: {:?}",
+        failures.len(),
+        failures.first()
+    );
+}
+
 #[tokio::test]
 async fn an_orphan_inside_a_gap_is_kept() {
     let mut r = rig(&carol());
