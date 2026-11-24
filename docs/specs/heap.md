@@ -1543,8 +1543,7 @@ lifetime), doubled for every ask since the last sample that needed a
 re-expression or missed, at least 250 ms (a forwarder holds back a fresh-nonce
 Interest from the same face for about that long), at most the lifetime, and
 doubled again at each re-expression of one ask. A Nack with reason Congestion
-is asked again by the consumer after a
-short jittered pause. The node has `Config.in_flight` (256) slots for asks, shared by
+is asked again by the consumer after a short jittered pause, and cuts the device's window (§7.4). The node has `Config.in_flight` (256) slots for asks, shared by
 kind so that nobody's asks starve the others': the asks of the wanted entries and
 pieces (**walks**) hold at most three quarters of them, one device's walks at most
 half; the probes (§7.2) at most an eighth; a grant pull takes from what is
@@ -1595,13 +1594,23 @@ a restart, a lost packet or a refusal changes nothing about what is owed.
   one for every ask answered (it doubles each round), is at most `Config.window` (128)
   and half of `Config.in_flight`, and halves, to at least 2, after a round (as many
   asks answered or timed out as the window is wide) in which more asks timed out than
-  were answered. Loss is not silence: a path that loses a third of its asks answers
+  were answered. **A Congestion Nack cuts it too:** the path says it is over a rate (a link's
+  quota of what one key may ask or be answered), so the window halves, to at least 2, at
+  once, **once for all the asks that were in flight** (an ask carries the number of cuts its
+  device's window had when it began; the Nack of an ask that began before the last cut says
+  what that cut already answered), and from then on it grows by one a round, not by one for
+  every ask answered, until it is cut again. A window that doubled back every round would
+  meet the rate again at every transfer, with a Nack for each ask over it, and a link Nacks
+  only so many a second (`CONGESTION_NACKS`, 256 at once and 128 a second per link: what is
+  Nacked past it is dropped silently, and its asker left to its timer). An ask that was
+  asked again after Nacks only (none by the timer) gives no round-trip sample and does not
+  double the timeout. Loss is not silence: a path that loses a third of its asks answers
   more than it misses and keeps its window, so 1,200 owed entries over a path of over
   a second's round trip that loses a third of its asks are still held within a minute
   of virtual time (with a window of 32 they took 87 s), what a reader of an
   entry-per-save writer (o4) needs to keep up; a device that answers nothing is down to
-  2 after a few rounds, however many seqs lie below its newest entry. A Nack, or a
-  reply that is not genuine, counts neither way. An ask that missed holds its place in
+  2 after a few rounds, however many seqs lie below its newest entry. A reply that is not
+  genuine counts neither way. An ask that missed holds its place in
   the window while it pauses (until it has missed 16 times in a row, when it waits a
   minute at a time and holds a place only while asked), so the walk does not slide on
   over the seqs nothing answers. The asks go in seq order, the entry at the highest

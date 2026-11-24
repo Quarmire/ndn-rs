@@ -500,10 +500,28 @@ impl Consumer {
     /// fetch behaves the same on every runtime, a virtual one included.
     pub async fn fetch_reexpressing(
         &mut self,
+        make: impl FnMut() -> InterestBuilder,
+        budget: Duration,
+        min_left: Duration,
+        gaps: impl IntoIterator<Item = Duration>,
+    ) -> Result<(Data, u32), AppError> {
+        self.fetch_reexpressing_noting(make, budget, min_left, gaps, || {})
+            .await
+    }
+
+    /// [`fetch_reexpressing`](Self::fetch_reexpressing), calling `on_congestion` each time an
+    /// Interest is Nacked with reason `Congestion` and is about to be expressed again after
+    /// its pause: what the caller learns of the path from it (a window to cut) the Nack says
+    /// at once, where the count of Interests expressed cannot tell a re-expression the timer
+    /// made from one a Nack did. The last Nack, the one a fetch ends with, is its error and
+    /// does not call it.
+    pub async fn fetch_reexpressing_noting(
+        &mut self,
         mut make: impl FnMut() -> InterestBuilder,
         budget: Duration,
         min_left: Duration,
         gaps: impl IntoIterator<Item = Duration>,
+        mut on_congestion: impl FnMut(),
     ) -> Result<(Data, u32), AppError> {
         let wire = make().lifetime(budget).build();
         let interest = interest_identity(&wire).map_err(|e| AppError::Protocol(e.to_string()))?;
@@ -537,6 +555,7 @@ impl Consumer {
                     && budget.saturating_sub(spent + congestion_pause(nonce, congested))
                         >= min_left =>
                 {
+                    on_congestion();
                     let pause = congestion_pause(nonce, congested);
                     crate::rt::sleep(pause).await;
                     spent += pause;
@@ -2023,6 +2042,46 @@ mod subscription_tests {
                 gaps[k]
             );
         }
+    }
+
+    /// The caller is told of each Nack the fetch asks again after, when it comes (the data
+    /// layer cuts a window at it), and of no other: not of the Interests the timer expresses
+    /// again, not of the Nack a fetch ends with.
+    #[tokio::test(start_paused = true)]
+    async fn the_caller_is_told_of_each_congestion_nack_it_is_asked_again_after() {
+        let conn = NacksFirst::new(3, ndn_packet::NackReason::Congestion);
+        let mut consumer = Consumer::new(crate::DemuxConnection::new(conn.clone()));
+        let name: Name = "/rate/limited".parse().unwrap();
+        let mut told = 0;
+        let got = consumer
+            .fetch_reexpressing_noting(
+                || InterestBuilder::new(name.clone()),
+                Duration::from_secs(2),
+                Duration::from_millis(250),
+                doubling(),
+                || told += 1,
+            )
+            .await;
+        assert!(got.is_ok(), "{got:?}");
+        assert_eq!(told, 3, "three Nacks, each asked again after");
+
+        let conn = NacksFirst::new(usize::MAX, ndn_packet::NackReason::Congestion);
+        let mut consumer = Consumer::new(crate::DemuxConnection::new(conn.clone()));
+        let mut told = 0;
+        let got = consumer
+            .fetch_reexpressing_noting(
+                || InterestBuilder::new(name.clone()),
+                Duration::from_secs(2),
+                Duration::from_millis(250),
+                doubling(),
+                || told += 1,
+            )
+            .await;
+        assert!(matches!(got, Err(AppError::Nacked { .. })), "{got:?}");
+        assert_eq!(
+            told, CONGESTION_RETRIES,
+            "the Nack the fetch ends with is its error, not a call"
+        );
     }
 
     /// Every other reason is an answer, as before: one Interest, the Nack returned at once.

@@ -308,13 +308,27 @@ impl Rtts {
 /// out than were answered. A round is as many answered or timed-out asks as the window is
 /// wide. Loss is not silence: a path that loses a third of its asks answers more than it
 /// misses and keeps its window; a device that answers nothing is down to the minimum after a
-/// few rounds, however many seqs lie below its newest entry. A Nack, or a reply that is not
-/// genuine, says nothing of the device's reach and counts neither way.
+/// few rounds, however many seqs lie below its newest entry. A reply that is not genuine says
+/// nothing of the device's reach and counts neither way.
+///
+/// A Congestion Nack is the path saying it is over a rate (a link's quota of what one key may
+/// ask or be answered): the window halves, at least to [`WINDOW_MIN`], at once, **once for
+/// all the asks that were in flight** (an ask carries the number of cuts the window had when
+/// it began, and a Nack of an ask that began before the last cut says what the cut already
+/// answered). From then on the window grows by one a round, not one an ask answered, until it
+/// is cut again: a window that doubled back every round would meet the rate again and again,
+/// each time with a Nack for every ask over it, and a link Nacks only so many a second.
 #[derive(Debug)]
 struct Window {
     size: usize,
     answered: usize,
     missed: usize,
+    /// How many times a Congestion Nack cut the window.
+    cuts: u64,
+    /// After a cut: the size from which the window grows by one a round.
+    threshold: Option<usize>,
+    /// The asks answered since the window last grew by a round's step.
+    credit: usize,
 }
 
 /// The first window of a device: sized for a hole of some hundreds of entries, not a cold start
@@ -331,6 +345,9 @@ impl Default for Window {
             size: WINDOW_INITIAL,
             answered: 0,
             missed: 0,
+            cuts: 0,
+            threshold: None,
+            credit: 0,
         }
     }
 }
@@ -343,7 +360,15 @@ impl Window {
 
     /// An ask was answered.
     fn answer(&mut self, cap: usize) {
-        self.size = (self.size + 1).min(cap);
+        if self.threshold.is_some_and(|t| self.size >= t) {
+            self.credit += 1;
+            if self.credit >= self.size {
+                self.credit = 0;
+                self.size = (self.size + 1).min(cap);
+            }
+        } else {
+            self.size = (self.size + 1).min(cap);
+        }
         self.answered += 1;
         self.round(cap);
     }
@@ -352,6 +377,25 @@ impl Window {
     fn miss(&mut self, cap: usize) {
         self.missed += 1;
         self.round(cap);
+    }
+
+    /// How many times the window was cut by a Congestion Nack: what an ask carries from its
+    /// start to tell [`Self::congested`] which cut it began after.
+    fn cuts(&self) -> u64 {
+        self.cuts
+    }
+
+    /// An ask that began when the window had been cut `began_after` times was Nacked
+    /// Congestion.
+    fn congested(&mut self, cap: usize, began_after: u64) {
+        if began_after != self.cuts {
+            return;
+        }
+        self.cuts += 1;
+        self.size = (self.size(cap) / 2).max(WINDOW_MIN);
+        self.threshold = Some(self.size);
+        self.credit = 0;
+        (self.answered, self.missed) = (0, 0);
     }
 
     /// End the round when it is as long as the window.
@@ -559,24 +603,46 @@ impl Fetcher {
         }
     }
 
+    /// How many times the window of `kind`'s device was cut by a Congestion Nack so far
+    /// (zero for asks that have no window): taken when an ask begins.
+    fn cuts(&self, kind: &Kind) -> u64 {
+        let Kind::Walk(device) = kind else { return 0 };
+        self.windows.lock().peek(device).map_or(0, Window::cuts)
+    }
+
+    /// An ask of `kind` that began after `cuts` cuts was Nacked Congestion: the window of its
+    /// device is cut, once for the asks in flight ([`Window`]).
+    fn congested(&self, kind: &Kind, cuts: u64) {
+        let Kind::Walk(device) = kind else { return };
+        let cap = self.slots.per_device();
+        self.windows.lock().of(device).congested(cap, cuts);
+    }
+
     /// One ask within one Interest lifetime: an Interest nothing answered
     /// within the retransmission timeout ([`Rtt::rto`]) is expressed again
     /// under a fresh nonce, the timeout doubling each time, at most
     /// [`REEXPRESS_MAX`] times. A Nack with reason Congestion is asked again
     /// by the consumer after a short jittered pause
-    /// ([`Consumer::fetch_reexpressing`]). The packet is unverified: the
-    /// caller hands it to the node.
+    /// ([`Consumer::fetch_reexpressing_noting`]), and the window of the
+    /// device is cut at it. The packet is unverified: the caller hands it to
+    /// the node.
     pub(crate) async fn once(&self, name: Name, kind: &Kind) -> Result<Data, Miss> {
         let _slot = self.slot(kind).await?;
         let rto = self.rtt.lock().rto(&name, self.lifetime);
+        let cuts = self.cuts(kind);
         tracing::trace!(target: TIMELINE, %name, "fetch_out");
         let asked = Instant::now();
+        let nacked = std::sync::atomic::AtomicU32::new(0);
         let fetched = Consumer::new(Arc::clone(&self.conn))
-            .fetch_reexpressing(
+            .fetch_reexpressing_noting(
                 || InterestBuilder::new(name.clone()),
                 self.lifetime,
                 RTO_MIN,
                 (0..REEXPRESS_MAX).map(|k| rto.saturating_mul(1 << k)),
+                || {
+                    nacked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.congested(kind, cuts);
+                },
             )
             .await;
         match fetched {
@@ -584,9 +650,12 @@ impl Fetcher {
                 tracing::trace!(target: TIMELINE, %name, expressed, "fetch_in");
                 self.learn(kind, true);
                 let mut rtt = self.rtt.lock();
+                // Only the first Interest's round trip is a sample, and only the timer's
+                // re-expressions are the path being slow or lossy: the ones a Nack made
+                // say the path is over a rate, which the window answers.
                 if expressed == 1 {
                     rtt.sample(&name, asked.elapsed());
-                } else {
+                } else if expressed > 1 + nacked.load(std::sync::atomic::Ordering::Relaxed) {
                     rtt.missed(&name);
                 }
                 Ok(data)
@@ -610,11 +679,14 @@ impl Fetcher {
                             Miss::Gone
                         }
                     }
-                    // Dropped for rate and asking again soon already failed:
-                    // not an answer.
+                    // Dropped for rate and asking again soon already failed: not an
+                    // answer, and the path's word that the window is too wide.
                     AppError::Nacked {
                         reason: Some(NackReason::Congestion),
-                    } => Miss::Again,
+                    } => {
+                        self.congested(kind, cuts);
+                        Miss::Again
+                    }
                     _ => Miss::Gone,
                 })
             }
@@ -1704,6 +1776,52 @@ mod tests {
             "and answers bring it back: {}",
             silent.size(cap)
         );
+    }
+
+    /// Round 12, the ladder. A Congestion Nack halves a device's window once for all the asks
+    /// that were in flight, however many of them are Nacked; a later ask that is Nacked halves
+    /// it again, down to the minimum; and after a cut the window grows by one a round, where
+    /// before it doubled each round and met the link's rate again at every transfer.
+    #[test]
+    fn a_congestion_nack_cuts_the_window_once_and_it_grows_back_by_a_round() {
+        let cap = 128;
+        let mut w = Window::default();
+        for _ in 0..1000 {
+            w.answer(cap);
+        }
+        assert_eq!(w.size(cap), cap);
+        let in_flight = w.cuts();
+        w.congested(cap, in_flight);
+        assert_eq!(w.size(cap), cap / 2, "halved by the first Nack");
+        for _ in 0..127 {
+            w.congested(cap, in_flight);
+        }
+        assert_eq!(
+            w.size(cap),
+            cap / 2,
+            "the other asks that were in flight say what the cut already answered"
+        );
+        // A round of answers is one step, not a doubling.
+        for _ in 0..(cap / 2) {
+            w.answer(cap);
+        }
+        assert_eq!(w.size(cap), cap / 2 + 1, "one step for a round of answers");
+        for _ in 0..(cap / 2 + 1) {
+            w.answer(cap);
+        }
+        assert_eq!(w.size(cap), cap / 2 + 2);
+        // An ask that began after the cut and is Nacked cuts again, to the least window.
+        for _ in 0..20 {
+            let began = w.cuts();
+            w.congested(cap, began);
+        }
+        assert_eq!(w.size(cap), WINDOW_MIN);
+        // Answers bring it back, slowly: no doubling a round.
+        for _ in 0..(8 * WINDOW_MIN) {
+            w.answer(cap);
+        }
+        assert!(w.size(cap) <= 2 * WINDOW_MIN + 4, "{}", w.size(cap));
+        assert!(w.size(cap) > WINDOW_MIN);
     }
 
     /// Stage-4 review M3. One device holds at most half of the node's slots, walks at most

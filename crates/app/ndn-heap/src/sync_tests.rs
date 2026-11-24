@@ -936,6 +936,123 @@ async fn only_a_few_values_are_gathered_at_once_and_every_one_in_turn() {
     );
 }
 
+/// What a link in front of the writer does with an Interest, as `ndn-link` does: it answers
+/// within a budget of pieces (a burst, then a rate), Nacks Congestion what is over it for as
+/// long as its bucket of Nacks lasts (256 at once, then 128 a second) and drops the rest
+/// silently, which leaves the asker to its timer.
+struct RatedLink {
+    pieces: f64,
+    nacks: f64,
+    at: tokio::time::Instant,
+    answered: usize,
+    nacked: usize,
+    silent: usize,
+}
+
+impl RatedLink {
+    const BURST: f64 = 48.0;
+    const PER_SEC: f64 = 500.0;
+    const NACK_BURST: f64 = 256.0;
+    const NACK_PER_SEC: f64 = 128.0;
+
+    fn new() -> RatedLink {
+        RatedLink {
+            pieces: Self::BURST,
+            nacks: Self::NACK_BURST,
+            at: tokio::time::Instant::now(),
+            answered: 0,
+            nacked: 0,
+            silent: 0,
+        }
+    }
+
+    fn ask(&mut self, data: &Bytes) -> Reply {
+        let now = tokio::time::Instant::now();
+        let secs = now.duration_since(self.at).as_secs_f64();
+        self.at = now;
+        self.pieces = (self.pieces + secs * Self::PER_SEC).min(Self::BURST);
+        self.nacks = (self.nacks + secs * Self::NACK_PER_SEC).min(Self::NACK_BURST);
+        if self.pieces >= 1.0 {
+            self.pieces -= 1.0;
+            self.answered += 1;
+            Reply::Data(data.clone())
+        } else if self.nacks >= 1.0 {
+            self.nacks -= 1.0;
+            self.nacked += 1;
+            Reply::Nack(NackReason::Congestion)
+        } else {
+            self.silent += 1;
+            Reply::Silent
+        }
+    }
+}
+
+/// Round 12, the ladder: a value of 1 MiB (256 pieces) gathered over a link that answers a
+/// piece every 2 ms past a burst of 48. A window that grows by one for every answer ran into
+/// the rate again and again, and a Congestion Nack changed nothing for it: its asks were
+/// Nacked by the hundred, the link's bucket of Nacks emptied, and what it lost after that
+/// was dropped silently and waited for its timer. The window now halves at a Congestion Nack
+/// (once for the asks that were in flight) and grows back by one a round, so the asks that
+/// meet the rate are few, every one is told, and no ask waits for a timer.
+#[tokio::test(start_paused = true)]
+async fn a_value_over_a_rated_link_is_gathered_without_an_ask_left_to_its_timer() {
+    let r = rig().await;
+    r.wire.delay(Duration::from_millis(4));
+    let entry_name = log_name(&n(PHONE), &space(), 1);
+    let payload: Vec<u8> = (0..(1 << 20) as u32).map(|i| (i % 251) as u8).collect();
+    let cut = pieces::split(&entry_name, &payload).unwrap();
+    let id = EntryId {
+        device: n(PHONE),
+        seq: 1,
+        digest: [3; 32],
+    };
+    r.host.st.lock().blobs_on_take = vec![Blob {
+        id: id.clone(),
+        size: cut.size,
+        root: cut.root,
+    }];
+    let link = Arc::new(parking_lot::Mutex::new(RatedLink::new()));
+    let packets = cut.packets.clone();
+    let on_link = Arc::clone(&link);
+    r.wire.script(move |name| {
+        if direct(name) == Some((n(PHONE), 1)) {
+            return Reply::Data(genuine(PHONE, 1));
+        }
+        match packets.iter().find(|p| p.name == *name) {
+            Some(p) => on_link.lock().ask(&p.wire),
+            None => Reply::Nack(NackReason::NoRoute),
+        }
+    });
+    let began = tokio::time::Instant::now();
+    r.group.on_update(notice(PHONE, 1));
+    while r.host.st.lock().assembled.is_empty() && began.elapsed() < Duration::from_secs(60) {
+        pass(1).await;
+    }
+    let took = began.elapsed();
+    let link = link.lock();
+    assert!(
+        link.nacked <= 128,
+        "{} asks met the rate (answered {}, {} Interests sent in {took:?}): more than a link Nacks in a second",
+        link.nacked,
+        link.answered,
+        r.wire.total()
+    );
+    assert_eq!(
+        r.host.st.lock().assembled,
+        vec![id],
+        "the value is gathered"
+    );
+    assert_eq!(
+        link.silent,
+        0,
+        "{} asks were dropped silently, each left to its timer (answered {}, Nacked {} in {took:?}, {} Interests sent)",
+        link.silent,
+        link.answered,
+        link.nacked,
+        r.wire.total()
+    );
+}
+
 /// A copy of a piece that is not the one its parent lists is never taken;
 /// the piece is asked of another holder and the value assembles.
 #[tokio::test(start_paused = true)]
