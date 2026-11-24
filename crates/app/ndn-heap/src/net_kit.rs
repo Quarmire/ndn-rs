@@ -389,6 +389,12 @@ impl Toyhost {
         st.held.entry(n(device)).or_default().extend(1..=up_to);
     }
 
+    /// Hold the one seq `seq` of `device`: a tip with a hole below it.
+    pub(crate) fn hold_at(&self, device: &str, seq: u64) {
+        let mut st = self.st.lock();
+        st.held.entry(n(device)).or_default().insert(seq);
+    }
+
     pub(crate) fn holds(&self, device: &str, seq: u64) -> bool {
         self.st
             .lock()
@@ -508,27 +514,35 @@ impl Host for Toyhost {
             .chain(std::iter::once(self.device.clone()))
             .collect();
         for device in &devices {
-            let high = &walked(&st, &self.device, device);
-            let held = st.held.get(device);
-            let void = st.voids.get(device);
-            let mut run: Option<u64> = None;
-            for seq in 1..=*high + 1 {
-                let absent = seq <= *high
-                    && !held.is_some_and(|h| h.contains(&seq))
-                    && !void.is_some_and(|v| v.contains(&seq));
-                match (absent, run) {
-                    (true, None) => run = Some(seq),
-                    (false, Some(first)) => {
-                        out.push(Want {
-                            device: device.clone(),
-                            first,
-                            last: seq - 1,
-                            digest: None,
-                        });
-                        run = None;
-                    }
-                    _ => {}
+            let high = walked(&st, &self.device, device);
+            let covered: BTreeSet<u64> = st
+                .held
+                .get(device)
+                .into_iter()
+                .chain(st.voids.get(device))
+                .flatten()
+                .copied()
+                .filter(|seq| *seq <= high)
+                .collect();
+            let mut next = 1;
+            for seq in covered {
+                if seq > next {
+                    out.push(Want {
+                        device: device.clone(),
+                        first: next,
+                        last: seq - 1,
+                        digest: None,
+                    });
                 }
+                next = seq + 1;
+            }
+            if next <= high {
+                out.push(Want {
+                    device: device.clone(),
+                    first: next,
+                    last: high,
+                    digest: None,
+                });
             }
         }
         for (device, seq, digest) in &st.exact {

@@ -33,6 +33,7 @@ use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, NackReason};
 use parking_lot::Mutex;
 
+use crate::fetch::Kind;
 use crate::limit::Counts;
 use crate::rt;
 use crate::seal::seal_key_matches;
@@ -218,7 +219,7 @@ async fn grant(shared: &Arc<Shared>, name: &Name, ask: GrantAsk) -> Option<Bytes
     let key = match kept {
         Some(key) => key,
         None => {
-            let verified = match shared.fetcher.once(ask.seal_key.clone()).await {
+            let verified = match shared.fetcher.once(ask.seal_key.clone(), &Kind::Pull).await {
                 Ok(data) => seal_key_verified(shared, &data, &ask, &asker, &public).await,
                 Err(_) => None,
             };

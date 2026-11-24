@@ -157,7 +157,12 @@ impl Net {
             },
         );
         let shared = Arc::new(Shared {
-            fetcher: Fetcher::new(fetch, cfg.lifetime, cfg.in_flight.max(cfg.window)),
+            fetcher: Fetcher::new(
+                fetch,
+                cfg.lifetime,
+                cfg.in_flight.max(cfg.window),
+                cfg.window,
+            ),
             host,
             cfg,
             grants: Granting::default(),

@@ -440,8 +440,10 @@ async fn an_ask_is_answered_by_a_path_that_replies_after_three_seconds_under_the
         wire.delay(Duration::from_millis(3000));
         wire.script(|name| Reply::Data(genuine(PHONE, direct(name).map_or(0, |(_, s)| s))));
         let fetcher =
-            crate::fetch::Fetcher::new(Arc::clone(&wire) as Arc<dyn Connection>, lifetime, 4);
-        fetcher.once(log_name(&n(PHONE), &space(), 2)).await
+            crate::fetch::Fetcher::new(Arc::clone(&wire) as Arc<dyn Connection>, lifetime, 4, 4);
+        fetcher
+            .once(log_name(&n(PHONE), &space(), 2), &crate::fetch::Kind::Pull)
+            .await
     };
     assert!(
         ask(Duration::from_secs(2)).await.is_err(),
@@ -1306,4 +1308,190 @@ async fn a_peers_counter_for_this_device_is_read_from_the_observed_state() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// An honest device whose name sorts after the strangers' in the cases below, so that its asks
+/// are launched after theirs.
+const ZED: &str = "/alice/zed";
+
+/// Stage-4 review M2. A stranger multicasts a Sync Interest every 250 ms that raises the
+/// counters of the 64 devices heard by one. A probe is kept per device, not per counter: a
+/// higher counter changes the entry the probe names, never its pause, so the strangers cost
+/// the ladder of one entry each (three asks, then one every 4 s doubling) and not a new ask
+/// per counter; and a hole an admitted entry proves, owed to a device that answers, is asked
+/// at once, because the probes do not hold the node's slots.
+#[tokio::test(start_paused = true)]
+async fn rising_forged_counters_cost_a_bounded_number_of_asks_and_leave_owed_asks_their_slots() {
+    let r = rig().await;
+    r.wire.script(|name| match direct(name) {
+        Some((d, seq)) if d == n(ZED) => Reply::Data(genuine(ZED, seq)),
+        _ => Reply::Silent,
+    });
+    let flood = |tick: u64| {
+        for i in 0..64 {
+            r.group
+                .on_update(notice(&format!("/alice/fake{i}"), tick + 1));
+        }
+    };
+    for tick in 0..40 {
+        flood(tick);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // The owed asks: an admitted entry at 60 proves 1 to 59 exist.
+    r.host.hold_at(ZED, 60);
+    r.host.st.lock().vouched.insert(n(ZED));
+    r.group.on_update(notice(ZED, 60));
+    let began = tokio::time::Instant::now();
+    let mut tick = 40;
+    while r.host.held_count(ZED) < 60 && began.elapsed() < Duration::from_secs(30) {
+        flood(tick);
+        tick += 1;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        r.host.held_count(ZED) == 60 && began.elapsed() <= Duration::from_secs(5),
+        "{} of 60 held after {:?} of forged counters rising every 250 ms",
+        r.host.held_count(ZED),
+        began.elapsed()
+    );
+    let strangers = r
+        .wire
+        .names()
+        .iter()
+        .filter(|name| direct(name).is_some_and(|(d, _)| d != n(ZED)))
+        .count();
+    assert!(
+        strangers <= 64 * 12,
+        "{strangers} Interests for 64 strangers whose counters rose {tick} times in all"
+    );
+}
+
+/// The distinct seqs of `device` asked within `within` of the first ask.
+fn seqs_asked(wire: &Wire, device: &str, within: Duration) -> std::collections::BTreeSet<u64> {
+    let times = wire.times();
+    let began = times.first().map(|(_, t)| *t);
+    times
+        .iter()
+        .filter(|(_, t)| began.is_some_and(|b| *t - b <= within))
+        .filter_map(|(name, _)| direct(name))
+        .filter(|(d, _)| *d == n(device))
+        .map(|(_, s)| s)
+        .collect()
+}
+
+/// Stage-4 review M3. A writer's two devices each signed one entry at seq 10^9 with no gap
+/// statement and answer nothing. What each is asked for starts small and shrinks to a few
+/// while nothing answers (a window counts the asks that missed, so the walk does not slide
+/// over them), so the two hold a bounded share of the node's slots, and a third device's
+/// owed asks, however late they come, are asked at once.
+#[tokio::test(start_paused = true)]
+async fn a_silent_device_with_a_huge_hole_holds_a_bounded_share_of_the_slots() {
+    let r = rig().await;
+    for mallory in [PHONE, TABLET] {
+        r.host.hold_at(mallory, 1_000_000_000);
+        r.host.st.lock().vouched.insert(n(mallory));
+        r.group.on_update(notice(mallory, 1_000_000_000));
+    }
+    r.wire.script(|name| match direct(name) {
+        Some((d, seq)) if d == n(ZED) => Reply::Data(genuine(ZED, seq)),
+        _ => Reply::Silent,
+    });
+    pass(5).await;
+    for mallory in [PHONE, TABLET] {
+        let burst = seqs_asked(&r.wire, mallory, Duration::from_secs(5));
+        assert!(
+            burst.len() <= 32,
+            "{mallory}: {} seqs asked within 5 s, a silent device's window starts small",
+            burst.len()
+        );
+    }
+    pass(5).await;
+    r.host.hold_at(ZED, 5);
+    r.host.st.lock().vouched.insert(n(ZED));
+    r.group.on_update(notice(ZED, 5));
+    let began = tokio::time::Instant::now();
+    while r.host.held_count(ZED) < 5 && began.elapsed() < Duration::from_secs(30) {
+        pass(1).await;
+    }
+    assert!(
+        r.host.held_count(ZED) == 5 && began.elapsed() <= Duration::from_secs(3),
+        "{} of 5 held after {:?} while two silent devices have holes of 10^9",
+        r.host.held_count(ZED),
+        began.elapsed()
+    );
+    pass(60).await;
+    for mallory in [PHONE, TABLET] {
+        let all = seqs_asked(&r.wire, mallory, Duration::from_secs(3600));
+        assert!(
+            all.len() <= 64,
+            "{mallory}: {} distinct seqs asked within 70 s of silence, lowest {:?}, highest {:?}",
+            all.len(),
+            all.first(),
+            all.last()
+        );
+    }
+}
+
+/// Stage-4 review M3, pieces. A writer's entries name values whose manifests are served and
+/// whose chunks are not. Four are gathered at once; what they ask of one device at once is
+/// that device's window, not a window each: at most 64 chunks in the first seconds, and a
+/// few while nothing answers.
+#[tokio::test(start_paused = true)]
+async fn unserved_pieces_of_four_values_are_asked_within_one_window_of_the_device() {
+    let r = rig().await;
+    let (mut owed, mut served, mut chunks) = (Vec::new(), Vec::new(), Vec::new());
+    for seq in 1..=4u64 {
+        let entry_name = log_name(&n(PHONE), &space(), seq);
+        let cut = pieces::split(&entry_name, &vec![seq as u8; 4096 * 300]).unwrap();
+        let count = (cut.size as usize).div_ceil(crate::wire::CHUNK);
+        owed.push(Blob {
+            id: EntryId {
+                device: n(PHONE),
+                seq,
+                digest: [seq as u8; 32],
+            },
+            size: cut.size,
+            root: cut.root,
+        });
+        chunks.extend(cut.packets[..count].iter().map(|p| p.name.clone()));
+        served.extend(cut.packets[count..].iter().cloned());
+    }
+    r.host.st.lock().blobs_owed = owed;
+    let every_chunk = chunks.clone();
+    r.host.st.lock().vouched.insert(n(PHONE));
+    r.wire.script(move |name| {
+        if chunks.contains(name) {
+            return Reply::Silent;
+        }
+        match served.iter().find(|p| p.name == *name) {
+            Some(p) => Reply::Data(p.wire.clone()),
+            None => Reply::Nack(NackReason::NoRoute),
+        }
+    });
+    r.group.on_update(notice(PHONE, 1));
+    pass(3).await;
+    let asked = |within: Duration| {
+        let times = r.wire.times();
+        let began = times.first().map(|(_, t)| *t);
+        times
+            .iter()
+            .filter(|(_, t)| began.is_some_and(|b| *t - b <= within))
+            .filter(|(name, _)| every_chunk.contains(name))
+            .map(|(name, _)| name.clone())
+            .collect::<std::collections::BTreeSet<Name>>()
+            .len()
+    };
+    // A silent ask lasts the whole lifetime (4 s): what is asked in the first 3 s is in flight
+    // at once.
+    let first = asked(Duration::from_secs(3));
+    assert!(
+        first <= 128,
+        "{first} distinct names asked within 3 s for the unserved pieces of four values, one device has at most half of the 256 slots"
+    );
+    pass(120).await;
+    let later = asked(Duration::from_secs(3600));
+    assert!(
+        later <= 4 * 64,
+        "{later} distinct names asked within 125 s of silence"
+    );
 }

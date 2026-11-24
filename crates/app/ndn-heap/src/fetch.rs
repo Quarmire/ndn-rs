@@ -12,11 +12,16 @@
 //! holds nothing at or above it (and, for this device, asks nothing up to it
 //! within its reservation): its own gap statement may declare everything
 //! below it absent, and only once it is held and verified are the holes below
-//! it wanted, asked for in a window ([`Config::window`]), in seq order,
+//! it wanted, asked for in a window ([`Window`]: one per device, node-wide, starting small
+//! and following what the device answers, whose places an ask that missed keeps while it
+//! pauses), in seq order, the first [`Config::reserve_block`] seqs of each hole at a time,
 //! minus what a gap statement declared void. A counter nothing signs
 //! therefore costs [`FETCH_TRIES`] asks, then asks after a pause that climbs
 //! from 4 s to a minute ([`probe_pause`]), so a forger's steady cost is one ask
-//! a minute, and wants nothing of the log.
+//! a minute however often the counter rises (the ladder is the device's: a higher counter
+//! changes the entry asked, nothing else), and wants nothing of the log. The node's slots
+//! are shared by kind ([`Kind`], [`Slots`]), so probes and a flooded walk leave a grant
+//! pull a slot.
 //!
 //! **Sources.** The writer first, then the heard members vouched for
 //! ([`Heard::relays`]) through `<H>/32=held/<name>`, one after another as the
@@ -45,7 +50,7 @@ use ndn_foundation_types::{Name, tlv_type};
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, NackReason};
 use parking_lot::Mutex;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
 use crate::log::{Blob, Outcome, Pin};
 use crate::pieces::{self, Assembler, Offered};
@@ -167,9 +172,64 @@ impl Rtt {
     }
 }
 
-/// The most devices a node keeps a round-trip estimate of: the devices it asks are the ones
-/// it heard, bounded per group, so this is a bound on memory, not a limit anyone meets.
+/// The most devices a node keeps a round-trip estimate or a window of: the devices it asks are
+/// the ones it heard, bounded per group, so this is a bound on memory, not a limit anyone
+/// meets.
 const RTTS_MAX: usize = 256;
+
+/// Per-device state of a node, at most [`RTTS_MAX`] devices. A device not in the table is
+/// made when it is first used; when the table is full that drops the device used least
+/// recently, so names that others invent never reset what was measured of a device in use.
+#[derive(Debug)]
+struct Recent<V> {
+    by: BTreeMap<Name, (u64, V)>,
+    tick: u64,
+}
+
+impl<V> Default for Recent<V> {
+    fn default() -> Self {
+        Recent {
+            by: BTreeMap::new(),
+            tick: 0,
+        }
+    }
+}
+
+impl<V: Default> Recent<V> {
+    /// The state of `device` if there is one, which is then the one used last.
+    fn used(&mut self, device: &Name) -> Option<&mut V> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.by.get_mut(device).map(|(at, v)| {
+            *at = tick;
+            v
+        })
+    }
+
+    /// The state of `device`, made if there is none, and the one used last.
+    fn of(&mut self, device: &Name) -> &mut V {
+        self.tick += 1;
+        let tick = self.tick;
+        if !self.by.contains_key(device) && self.by.len() >= RTTS_MAX {
+            let oldest = self
+                .by
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(device, _)| device.clone());
+            if let Some(oldest) = oldest {
+                self.by.remove(&oldest);
+            }
+        }
+        let (at, v) = self.by.entry(device.clone()).or_default();
+        *at = tick;
+        v
+    }
+
+    /// The state of `device` without counting it as used.
+    fn peek(&self, device: &Name) -> Option<&V> {
+        self.by.get(device).map(|(_, v)| v)
+    }
+}
 
 /// The round-trip estimates of a node, one per device it asks (the writer of an entry, or the
 /// holder that is asked for a copy): a device that is away answers nothing and its asks, timing
@@ -177,7 +237,7 @@ const RTTS_MAX: usize = 256;
 /// is no reason to wait longer for another device that answers.
 #[derive(Debug, Default)]
 pub(crate) struct Rtts {
-    by: BTreeMap<Name, Rtt>,
+    by: Recent<Rtt>,
 }
 
 impl Rtts {
@@ -193,30 +253,171 @@ impl Rtts {
     }
 
     /// The wait before an Interest for `name` is expressed again ([`Rtt::rto`] of its device).
-    pub(crate) fn rto(&self, name: &Name, lifetime: Duration) -> Duration {
+    pub(crate) fn rto(&mut self, name: &Name, lifetime: Duration) -> Duration {
         self.by
-            .get(&Self::device(name))
+            .used(&Self::device(name))
             .map_or(RTO_INITIAL, |rtt| rtt.rto(lifetime))
             .clamp(RTO_MIN, lifetime.max(RTO_MIN))
     }
 
-    /// The estimate of the device `name` is asked of, made if there is none.
-    fn of(&mut self, name: &Name) -> &mut Rtt {
-        let device = Self::device(name);
-        if !self.by.contains_key(&device) && self.by.len() >= RTTS_MAX {
-            self.by.pop_first();
-        }
-        self.by.entry(device).or_default()
-    }
-
     /// Take the round trip of an ask for `name` answered by its first Interest.
     pub(crate) fn sample(&mut self, name: &Name, r: Duration) {
-        self.of(name).sample(r);
+        self.by.of(&Self::device(name)).sample(r);
     }
 
     /// An ask for `name` needed a re-expression, or nothing answered it.
     pub(crate) fn missed(&mut self, name: &Name) {
-        self.of(name).missed();
+        self.by.of(&Self::device(name)).missed();
+    }
+}
+
+/// The asks of one device that a node has in flight at once, as far as the device has answered
+/// them: it starts at [`WINDOW_INITIAL`], grows by one with each ask answered (so it doubles
+/// each round), and halves, at least to [`WINDOW_MIN`], after a round in which more asks timed
+/// out than were answered. A round is as many answered or timed-out asks as the window is
+/// wide. Loss is not silence: a path that loses a third of its asks answers more than it
+/// misses and keeps its window; a device that answers nothing is down to the minimum after a
+/// few rounds, however many seqs lie below its newest entry. A Nack, or a reply that is not
+/// genuine, says nothing of the device's reach and counts neither way.
+#[derive(Debug)]
+struct Window {
+    size: usize,
+    answered: usize,
+    missed: usize,
+}
+
+/// The first window of a device: sized for a hole of some hundreds of entries, not a cold start
+/// of one.
+const WINDOW_INITIAL: usize = 16;
+
+/// The least window of a device that answers nothing: its asks, one after another, are what
+/// tells that it answers again.
+const WINDOW_MIN: usize = 2;
+
+impl Default for Window {
+    fn default() -> Self {
+        Window {
+            size: WINDOW_INITIAL,
+            answered: 0,
+            missed: 0,
+        }
+    }
+}
+
+impl Window {
+    /// The window, at most `cap`.
+    fn size(&self, cap: usize) -> usize {
+        self.size.min(cap).max(1)
+    }
+
+    /// An ask was answered.
+    fn answer(&mut self, cap: usize) {
+        self.size = (self.size + 1).min(cap);
+        self.answered += 1;
+        self.round(cap);
+    }
+
+    /// An ask timed out.
+    fn miss(&mut self, cap: usize) {
+        self.missed += 1;
+        self.round(cap);
+    }
+
+    /// End the round when it is as long as the window.
+    fn round(&mut self, cap: usize) {
+        if self.answered + self.missed < self.size(cap) {
+            return;
+        }
+        if self.missed > self.answered {
+            self.size = (self.size / 2).max(WINDOW_MIN).min(cap);
+        }
+        (self.answered, self.missed) = (0, 0);
+    }
+}
+
+/// What an ask is for: which of the node's slots it may take.
+#[derive(Clone, Debug)]
+pub(crate) enum Kind {
+    /// An entry or a piece of `device` that the log or an assembly wants: its asks share the
+    /// device's window and its share of the node's slots, whatever space or value they are for.
+    Walk(Name),
+    /// The entry a counter names: a few at once per group and per node, so that counters
+    /// anyone can send never fill the slots wants and grants wait for.
+    Probe,
+    /// A key pulled or granted, a seal key fetched: it takes from the slots the walks and the
+    /// probes leave.
+    Pull,
+}
+
+/// The node's slots, by what they are for. Walks take at most three quarters of them, one
+/// device's walks at most half, probes an eighth: a grant pull, a seal key and the first
+/// probe of a new device always find a slot, whoever floods the walks.
+struct Slots {
+    all: Semaphore,
+    walks: Semaphore,
+    probes: Semaphore,
+    /// The slots of each device being walked now; a device is dropped from the table when it
+    /// holds none.
+    devices: Mutex<BTreeMap<Name, Arc<Semaphore>>>,
+    per_device: usize,
+}
+
+/// A slot taken: given back when dropped.
+struct Slot<'a> {
+    _device: Option<OwnedSemaphorePermit>,
+    _class: Option<SemaphorePermit<'a>>,
+    _all: SemaphorePermit<'a>,
+}
+
+impl Slots {
+    /// The slots of a node with `in_flight`, and a device's window of at most `window`.
+    fn new(in_flight: usize, window: usize) -> Slots {
+        let all = in_flight.max(1);
+        Slots {
+            all: Semaphore::new(all),
+            walks: Semaphore::new((all - all / 4).max(1)),
+            probes: Semaphore::new((all / 8).max(1)),
+            devices: Mutex::new(BTreeMap::new()),
+            per_device: window.min(all / 2).max(1),
+        }
+    }
+
+    /// The most asks of one device in flight at once.
+    fn per_device(&self) -> usize {
+        self.per_device
+    }
+
+    /// The semaphore of `device`'s slots.
+    fn device(&self, device: &Name) -> Arc<Semaphore> {
+        let mut devices = self.devices.lock();
+        if let Some(semaphore) = devices.get(device) {
+            return Arc::clone(semaphore);
+        }
+        if devices.len() >= RTTS_MAX {
+            devices.retain(|_, semaphore| Arc::strong_count(semaphore) > 1);
+        }
+        let semaphore = Arc::new(Semaphore::new(self.per_device));
+        devices.insert(device.clone(), Arc::clone(&semaphore));
+        semaphore
+    }
+
+    /// The slots `kind` may take, waiting for each: `None` when the node's slots are closed.
+    async fn take(&self, kind: &Kind) -> Option<Slot<'_>> {
+        let device = match kind {
+            Kind::Walk(device) => Some(self.device(device).acquire_owned().await.ok()?),
+            Kind::Probe | Kind::Pull => None,
+        };
+        let class = match kind {
+            Kind::Walk(_) => Some(self.walks.acquire().await.ok()?),
+            Kind::Probe => Some(self.probes.acquire().await.ok()?),
+            Kind::Pull => None,
+        };
+        let all = self.all.acquire().await.ok()?;
+        Some(Slot {
+            _device: device,
+            _class: class,
+            _all: all,
+        })
     }
 }
 
@@ -246,39 +447,56 @@ enum Gathered {
     Stuck { progressed: bool },
 }
 
-/// The node's Interests: its slots, its round-trip estimate, its face.
+/// The node's Interests: its slots, its round-trip estimates and windows, its face.
 pub(crate) struct Fetcher {
     conn: Arc<dyn Connection>,
     lifetime: Duration,
-    slots: Semaphore,
+    slots: Slots,
     assemblies: Semaphore,
     rtt: Mutex<Rtts>,
+    windows: Mutex<Recent<Window>>,
 }
 
 impl Fetcher {
     /// A fetcher over `conn` with `in_flight` slots, expressing Interests of
-    /// `lifetime`.
-    pub(crate) fn new(conn: Arc<dyn Connection>, lifetime: Duration, in_flight: usize) -> Fetcher {
+    /// `lifetime`; one device's window is at most `window` and half of the slots.
+    pub(crate) fn new(
+        conn: Arc<dyn Connection>,
+        lifetime: Duration,
+        in_flight: usize,
+        window: usize,
+    ) -> Fetcher {
         Fetcher {
             conn,
             lifetime,
-            slots: Semaphore::new(in_flight.max(1)),
+            slots: Slots::new(in_flight, window),
             assemblies: Semaphore::new(ASSEMBLIES_MAX),
             rtt: Mutex::new(Rtts::default()),
+            windows: Mutex::new(Recent::default()),
         }
     }
 
-    /// One of the node's fetch slots, waiting at most one Interest lifetime:
-    /// a queue of fetches others made never holds a slot longer than the
-    /// Interest it waits to send would have lived. [`Miss::Again`]: every
-    /// slot stayed taken, so the node is busy, not the packet absent.
-    async fn slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, Miss> {
-        match rt::timeout(self.lifetime, self.slots.acquire()).await {
-            Ok(Ok(slot)) => Ok(slot),
-            Ok(Err(_)) => Err(Miss::Gone),
+    /// How many asks of `device` the node has in flight at once now ([`Window`]).
+    pub(crate) fn window(&self, device: &Name) -> usize {
+        let cap = self.slots.per_device();
+        self.windows
+            .lock()
+            .peek(device)
+            .map_or_else(|| WINDOW_INITIAL.min(cap).max(1), |w| w.size(cap))
+    }
+
+    /// The slots `kind` may take, waiting at most one Interest lifetime for all of them: a
+    /// queue of fetches others made never holds a slot longer than the Interest it waits to
+    /// send would have lived. [`Miss::Again`]: the slots stayed taken, so the node is busy,
+    /// not the packet absent.
+    async fn slot(&self, kind: &Kind) -> Result<Slot<'_>, Miss> {
+        match rt::timeout(self.lifetime, self.slots.take(kind)).await {
+            Ok(Some(slot)) => Ok(slot),
+            Ok(None) => Err(Miss::Gone),
             Err(_) => {
                 tracing::debug!(
-                    "fetch not sent: every fetch slot stayed taken for an Interest lifetime ({:?}); it is asked again after its pause, or raise Config::in_flight",
+                    ?kind,
+                    "fetch not sent: the fetch slots it may take stayed taken for an Interest lifetime ({:?}); it is asked again after its pause, or raise Config::in_flight",
                     self.lifetime
                 );
                 Err(Miss::Again)
@@ -297,6 +515,19 @@ impl Fetcher {
             .expect("the assembly semaphore is never closed")
     }
 
+    /// An ask of the walk of `kind`'s device was answered or timed out: its window learns.
+    fn learn(&self, kind: &Kind, answered: bool) {
+        let Kind::Walk(device) = kind else { return };
+        let cap = self.slots.per_device();
+        let mut windows = self.windows.lock();
+        let window = windows.of(device);
+        if answered {
+            window.answer(cap);
+        } else {
+            window.miss(cap);
+        }
+    }
+
     /// One ask within one Interest lifetime: an Interest nothing answered
     /// within the retransmission timeout ([`Rtt::rto`]) is expressed again
     /// under a fresh nonce, the timeout doubling each time, at most
@@ -304,8 +535,8 @@ impl Fetcher {
     /// by the consumer after a short jittered pause
     /// ([`Consumer::fetch_reexpressing`]). The packet is unverified: the
     /// caller hands it to the node.
-    pub(crate) async fn once(&self, name: Name) -> Result<Data, Miss> {
-        let _slot = self.slot().await?;
+    pub(crate) async fn once(&self, name: Name, kind: &Kind) -> Result<Data, Miss> {
+        let _slot = self.slot(kind).await?;
         let rto = self.rtt.lock().rto(&name, self.lifetime);
         tracing::trace!(target: TIMELINE, %name, "fetch_out");
         let asked = Instant::now();
@@ -320,6 +551,7 @@ impl Fetcher {
         match fetched {
             Ok((data, expressed)) => {
                 tracing::trace!(target: TIMELINE, %name, expressed, "fetch_in");
+                self.learn(kind, true);
                 let mut rtt = self.rtt.lock();
                 if expressed == 1 {
                     rtt.sample(&name, asked.elapsed());
@@ -333,6 +565,7 @@ impl Fetcher {
                 tracing::trace!(%name, "fetch missed: {e}");
                 Err(match e {
                     AppError::Timeout => {
+                        self.learn(kind, false);
                         self.rtt.lock().missed(&name);
                         Miss::Again
                     }
@@ -376,19 +609,99 @@ struct Ask {
     until: Option<Instant>,
 }
 
-/// Every ask that is in flight or pausing, by `(device, seq)`. Entries are
-/// dropped once the log no longer wants what they are for.
+/// The probe of one device: the entry its counter names, asked alone. The ladder of misses
+/// and pauses belongs to the device, not to the counter: a higher counter changes the entry
+/// asked ([`Self::seq`]) and nothing else, so counters that rise without end (an unsigned
+/// vector costs nothing to send) cost the one ladder, never an ask each.
+struct Probe {
+    seq: u64,
+    misses: u32,
+    /// When the next ask may be made (`None`: one is in flight).
+    until: Option<Instant>,
+}
+
+/// The most probes of one group in flight at once: a group has at most
+/// [`HEARD_MAX`](crate::heard::HEARD_MAX) devices heard, and the probes of devices nothing
+/// vouches for are for names anyone can send, so the others wait their turn (the devices
+/// with the fewest misses first, vouched ones before the rest).
+pub(crate) const PROBES_MAX: usize = 8;
+
+/// Where the ask of a seq stands.
+enum Standing {
+    /// Never asked, or forgotten.
+    New,
+    /// In flight.
+    Flying,
+    /// Pausing for this much longer.
+    Waiting(Duration),
+    /// Its pause is over; it missed this many times in a row.
+    Due(u32),
+}
+
+/// Every ask that is in flight or pausing, by `(device, seq)`, and the probe of each device
+/// whose counter names an entry the log neither holds nor asks for. Entries are dropped once
+/// the log no longer wants what they are for.
 #[derive(Default)]
 pub(crate) struct Asks {
     by: BTreeMap<(Name, u64), Ask>,
+    probes: BTreeMap<Name, Probe>,
+}
+
+/// The keys of `device` among the asks.
+fn span(device: &Name) -> std::ops::RangeInclusive<(Name, u64)> {
+    (device.clone(), 0)..=(device.clone(), u64::MAX)
+}
+
+/// Lower `next`, the time to look again, to `left`.
+fn look_again(next: &mut Option<Duration>, left: Duration) {
+    *next = Some(next.map_or(left, |n| n.min(left)));
 }
 
 impl Asks {
-    fn flying(&self, device: &Name) -> usize {
-        self.by
-            .iter()
-            .filter(|((d, _), a)| d == device && a.until.is_none())
-            .count()
+    /// Where the ask of `key` stands at `now`.
+    fn standing(&self, key: &(Name, u64), now: Instant) -> Standing {
+        match self.by.get(key) {
+            None => Standing::New,
+            Some(Ask { until: None, .. }) => Standing::Flying,
+            Some(Ask {
+                until: Some(until), ..
+            }) if *until > now => Standing::Waiting(*until - now),
+            Some(ask) => Standing::Due(ask.misses),
+        }
+    }
+
+    /// The asks of `device` in flight, and those that hold a place in its window: in flight, or
+    /// pausing before they have missed [`REFRESH_TRIES`] times in a row (one that has waits
+    /// idle, a minute at a time, and holds a place only while it is asked).
+    fn busy(&self, device: &Name) -> (usize, usize) {
+        let (mut flying, mut busy) = (0, 0);
+        for ask in self.by.range(span(device)).map(|(_, ask)| ask) {
+            if ask.until.is_none() {
+                flying += 1;
+                busy += 1;
+            } else if ask.misses < REFRESH_TRIES {
+                busy += 1;
+            }
+        }
+        (flying, busy)
+    }
+
+    /// Enter the ask of `(device, seq)` as in flight.
+    fn launch(&mut self, device: &Name, seq: u64, misses: u32, digest: Option<Pin>) -> Launch {
+        self.by.insert(
+            (device.clone(), seq),
+            Ask {
+                misses,
+                until: None,
+            },
+        );
+        Launch {
+            device: device.clone(),
+            seq,
+            misses,
+            probe: false,
+            digest,
+        }
     }
 
     /// The ask of `(device, seq)` if it is due now, entered as in flight;
@@ -397,43 +710,160 @@ impl Asks {
         &mut self,
         device: &Name,
         seq: u64,
-        probe: bool,
         digest: Option<Pin>,
         now: Instant,
         next: &mut Option<Duration>,
     ) -> Option<Launch> {
-        let key = (device.clone(), seq);
-        let misses = match self.by.get(&key) {
-            None => 0,
-            Some(Ask { until: None, .. }) => return None,
-            Some(Ask {
-                until: Some(until), ..
-            }) if *until > now => {
-                let left = *until - now;
-                *next = Some(next.map_or(left, |n| n.min(left)));
+        let misses = match self.standing(&(device.clone(), seq), now) {
+            Standing::New => 0,
+            Standing::Flying => return None,
+            Standing::Waiting(left) => {
+                look_again(next, left);
                 return None;
             }
-            Some(ask) => ask.misses,
+            Standing::Due(misses) => misses,
         };
-        self.by.insert(
-            key,
-            Ask {
-                misses,
-                until: None,
-            },
-        );
-        Some(Launch {
-            device: device.clone(),
-            seq,
-            misses,
-            probe,
-            digest,
-        })
+        Some(self.launch(device, seq, misses, digest))
+    }
+
+    /// The asks of the holes of `device` in `ranges`, in seq order, at most `window` of them
+    /// in flight or pausing at once: an ask that missed holds its place while it pauses, so the
+    /// walk does not slide over the seqs nothing answers. Those due again go first.
+    fn walk(
+        &mut self,
+        device: &Name,
+        ranges: &[(u64, u64)],
+        window: usize,
+        now: Instant,
+        next: &mut Option<Duration>,
+        out: &mut Vec<Launch>,
+    ) {
+        let (mut flying, busy) = self.busy(device);
+        let mut budget = window.saturating_sub(busy);
+        let known: Vec<u64> = self.by.range(span(device)).map(|((_, s), _)| *s).collect();
+        for &seq in known.iter().filter(|s| within(ranges, **s)) {
+            match self.standing(&(device.clone(), seq), now) {
+                Standing::Waiting(left) => look_again(next, left),
+                Standing::Due(misses) if flying < window => {
+                    if misses >= REFRESH_TRIES {
+                        if budget == 0 {
+                            continue;
+                        }
+                        budget -= 1;
+                    }
+                    flying += 1;
+                    out.push(self.launch(device, seq, misses, None));
+                }
+                _ => {}
+            }
+        }
+        for seq in ranges.iter().flat_map(|&(a, b)| a..=b) {
+            if budget == 0 {
+                break;
+            }
+            if known.binary_search(&seq).is_ok() {
+                continue;
+            }
+            budget -= 1;
+            out.push(self.launch(device, seq, 0, None));
+        }
+    }
+
+    /// The probes to make now, for the entries `named` (a device and the entry its counter
+    /// names): the probe of a device not named any more is dropped unless one is in flight,
+    /// the entry a probe asks is the counter's as it stands, and at most [`PROBES_MAX`] are
+    /// in flight. `vouched` says whether signed data vouches for a device.
+    fn probe(
+        &mut self,
+        named: &[(Name, u64)],
+        vouched: impl Fn(&Name) -> bool,
+        now: Instant,
+        next: &mut Option<Duration>,
+        out: &mut Vec<Launch>,
+    ) {
+        self.probes
+            .retain(|d, p| p.until.is_none() || named.iter().any(|(n, _)| n == d));
+        for (device, high) in named {
+            self.probes
+                .entry(device.clone())
+                .or_insert(Probe {
+                    seq: *high,
+                    misses: 0,
+                    until: Some(now),
+                })
+                .seq = *high;
+        }
+        let mut flying = self.probes.values().filter(|p| p.until.is_none()).count();
+        let mut due: Vec<(u32, bool, Name)> = Vec::new();
+        for (device, probe) in &self.probes {
+            match probe.until {
+                Some(until) if until > now => look_again(next, until - now),
+                Some(_) => due.push((probe.misses, !vouched(device), device.clone())),
+                None => {}
+            }
+        }
+        due.sort();
+        for (_, _, device) in due {
+            if flying >= PROBES_MAX {
+                break;
+            }
+            flying += 1;
+            if let Some(probe) = self.probes.get_mut(&device) {
+                probe.until = None;
+                out.push(Launch {
+                    seq: probe.seq,
+                    misses: probe.misses,
+                    device,
+                    probe: true,
+                    digest: None,
+                });
+            }
+        }
+    }
+
+    /// The ask of `launch` ended, `resolved` or not: how many asks of it missed in a row now,
+    /// and how long it pauses. A walk's ask pauses by [`retry_pause`] after a miss and
+    /// [`REFRESH_PAUSE`] after what resolved it. A probe, which decides nothing and is never
+    /// given up, climbs from [`REFRESH_PAUSE_MAX`] to [`REFRESH_IDLE`] by doubling
+    /// ([`probe_pause`]) once [`FETCH_TRIES`] asks missed: a real counter whose entry a lossy
+    /// path lost several asks in a row still comes within a minute or so, and a forger costs
+    /// one ask a minute in the end. A probe that resolved is over: the next counter of the
+    /// device is asked at once.
+    fn end(&mut self, launch: &Launch, resolved: bool, now: Instant) -> (u32, Duration) {
+        let (misses, pause) = if resolved {
+            (0, REFRESH_PAUSE)
+        } else if launch.probe && launch.misses >= FETCH_TRIES {
+            (launch.misses + 1, probe_pause(launch.misses))
+        } else {
+            (launch.misses + 1, retry_pause(launch.misses))
+        };
+        if launch.probe {
+            if resolved {
+                self.probes.remove(&launch.device);
+            } else {
+                let probe = self.probes.entry(launch.device.clone()).or_insert(Probe {
+                    seq: launch.seq,
+                    misses,
+                    until: None,
+                });
+                (probe.misses, probe.until) = (misses, Some(now + pause));
+            }
+        } else {
+            self.by.insert(
+                (launch.device.clone(), launch.seq),
+                Ask {
+                    misses,
+                    until: Some(now + pause),
+                },
+            );
+        }
+        (misses, pause)
     }
 
     /// Forget every ask of `device`.
     pub(crate) fn forget(&mut self, device: &Name) {
         self.by.retain(|(d, _), _| d != device);
+        self.probes.remove(device);
     }
 }
 
@@ -463,6 +893,16 @@ pub(crate) struct Recovered {
 /// Whether `seq` lies in one of `ranges`.
 fn within(ranges: &[(u64, u64)], seq: u64) -> bool {
     ranges.iter().any(|&(a, b)| a <= seq && seq <= b)
+}
+
+/// What of `ranges` is asked now: the first `block` seqs of each range. A range is a maximal
+/// run of seqs neither held nor declared void, so the seq below it is held or void (or none):
+/// the seqs asked are at most `block` above what is held, and move up as it is.
+fn reach(ranges: &[(u64, u64)], block: u64) -> Vec<(u64, u64)> {
+    ranges
+        .iter()
+        .map(|&(a, b)| (a, b.min(a.saturating_add(block - 1))))
+        .collect()
 }
 
 impl Group {
@@ -505,12 +945,17 @@ impl Group {
 
     /// The packet `name` (an entry or a piece) as `source` gives it: the
     /// original packet, which must be named `name`. Nothing is verified.
-    async fn fetch_original(&self, source: &Source, name: &Name) -> Result<Bytes, Miss> {
+    async fn fetch_original(
+        &self,
+        source: &Source,
+        name: &Name,
+        kind: &Kind,
+    ) -> Result<Bytes, Miss> {
         let fetcher = &self.shared.fetcher;
         let wire = match source {
-            Source::Writer => fetcher.once(name.clone()).await?.raw().clone(),
+            Source::Writer => fetcher.once(name.clone(), kind).await?.raw().clone(),
             Source::Relay(holder) => {
-                let wrapper = fetcher.once(held_name(holder, name)).await?;
+                let wrapper = fetcher.once(held_name(holder, name), kind).await?;
                 wrapper.content().cloned().ok_or(Miss::Again)?
             }
         };
@@ -543,7 +988,7 @@ impl Group {
         let host = &self.shared.host;
         let space = &self.space;
         let me = host.device().clone();
-        let window = self.shared.cfg.window.max(1);
+        let block = self.shared.cfg.reserve_block.max(1);
         let now = Instant::now();
 
         // What a notice named is unsigned: it wants nothing of the log. The
@@ -567,6 +1012,14 @@ impl Group {
             }
         }
         per.remove(&me);
+        // An undeclared hole of another device is asked a reservation block at a time: its
+        // writer reserved no more seqs than that at once, and what an entry far above names
+        // proves of the seqs below it is only that they were signed, not that they can be
+        // had. The next block is asked once this one is held (the hole's start moves up) or
+        // a later entry declares it void.
+        for ranges in per.values_mut() {
+            *ranges = reach(ranges, block);
+        }
         let own = self.own_wants(&wants);
         if !own.is_empty() {
             per.insert(me.clone(), own);
@@ -580,26 +1033,21 @@ impl Group {
                 a.until.is_none()
                     || per.get(d).is_some_and(|rs| within(rs, *s))
                     || exact.contains_key(&(d.clone(), *s))
-                    || probes.iter().any(|(pd, ph)| pd == d && ph == s)
             });
             for (device, ranges) in &per {
-                let mut budget = window.saturating_sub(asks.flying(device));
-                for seq in ranges.iter().flat_map(|&(a, b)| a..=b) {
-                    if budget == 0 {
-                        break;
-                    }
-                    if let Some(l) = asks.begin(device, seq, false, None, now, &mut next) {
-                        launches.push(l);
-                        budget -= 1;
-                    }
-                }
+                let window = self.shared.fetcher.window(device);
+                asks.walk(device, ranges, window, now, &mut next, &mut launches);
             }
             for ((device, seq), digest) in &exact {
-                launches.extend(asks.begin(device, *seq, false, Some(*digest), now, &mut next));
+                launches.extend(asks.begin(device, *seq, Some(*digest), now, &mut next));
             }
-            for (device, seq) in &probes {
-                launches.extend(asks.begin(device, *seq, true, None, now, &mut next));
-            }
+            asks.probe(
+                &probes,
+                |d| host.vouched(space, d),
+                now,
+                &mut next,
+                &mut launches,
+            );
         }
         for launch in launches {
             rt::spawn(Arc::clone(self).ask_entry(launch));
@@ -621,8 +1069,13 @@ impl Group {
     /// log's answer: held, or still wanted.
     async fn ask_entry(self: Arc<Self>, launch: Launch) {
         let name = log_name(&launch.device, &self.space, launch.seq);
+        let kind = if launch.probe {
+            Kind::Probe
+        } else {
+            Kind::Walk(launch.device.clone())
+        };
         let wire = match self.source(&launch.device, launch.misses) {
-            Some(source) => self.fetch_original(&source, &name).await.ok(),
+            Some(source) => self.fetch_original(&source, &name, &kind).await.ok(),
             None => {
                 tracing::debug!(%name, "no one to ask for it: this device is the writer and no heard member vouches for the log yet");
                 None
@@ -663,19 +1116,7 @@ impl Group {
                 Taken::Pending(waiting) => tracing::debug!(%name, "not judged yet: {waiting}"),
             }
         }
-        // The counter that names a probe decides nothing, so it is never given
-        // up. After [`FETCH_TRIES`] misses the pause climbs from
-        // [`REFRESH_PAUSE_MAX`] to [`REFRESH_IDLE`] by doubling ([`probe_pause`]): a
-        // real counter whose entry a lossy path lost several asks in a row still
-        // comes within a minute or so, and a forger costs one ask a minute in the
-        // end, as before.
-        let (misses, pause) = if resolved {
-            (0, REFRESH_PAUSE)
-        } else if launch.probe && launch.misses >= FETCH_TRIES {
-            (launch.misses + 1, probe_pause(launch.misses))
-        } else {
-            (launch.misses + 1, retry_pause(launch.misses))
-        };
+        let (misses, pause) = self.asks.lock().end(&launch, resolved, Instant::now());
         tracing::trace!(
             target: TIMELINE,
             device = %self.shared.host.device(),
@@ -683,15 +1124,9 @@ impl Group {
             probe = launch.probe,
             turn = launch.misses,
             resolved,
+            misses,
             pause_ms = pause.as_millis() as u64,
             "ask_end"
-        );
-        self.asks.lock().by.insert(
-            (launch.device, launch.seq),
-            Ask {
-                misses,
-                until: Some(Instant::now() + pause),
-            },
         );
         self.progress.notify_waiters();
         self.wake.notify_one();
@@ -775,7 +1210,8 @@ impl Group {
                 return Gathered::Whole;
             }
             let (mut held, mut absent) = (false, Vec::new());
-            for piece in assembler.next_wanted(self.shared.cfg.window.max(1)) {
+            let window = self.shared.fetcher.window(&blob.id.device);
+            for piece in assembler.next_wanted(window) {
                 match host
                     .held_piece(&self.space, &piece)
                     .map(|wire| assembler.offer(wire))
@@ -791,10 +1227,11 @@ impl Group {
             let Some(source) = self.source(&blob.id.device, turns) else {
                 return Gathered::Stuck { progressed };
             };
+            let kind = Kind::Walk(blob.id.device.clone());
             let arrived = join_all(
                 absent
                     .iter()
-                    .map(|piece| self.fetch_original(&source, piece)),
+                    .map(|piece| self.fetch_original(&source, piece, &kind)),
             )
             .await;
             let mut keep = Vec::new();
@@ -841,7 +1278,7 @@ impl Group {
                 });
             for granter in granters {
                 let name = grant_name(&granter, &ask);
-                let Ok(data) = self.shared.fetcher.once(name.clone()).await else {
+                let Ok(data) = self.shared.fetcher.once(name.clone(), &Kind::Pull).await else {
                     continue;
                 };
                 if *data.name != name {
@@ -909,18 +1346,13 @@ impl Group {
     fn own_complete(&self) -> Option<bool> {
         let host = &self.shared.host;
         let me = host.device();
-        let mut seqs: Vec<u64> = self
+        let seqs: Vec<u64> = self
             .own_wants(&host.missing(&self.space))
             .iter()
             .flat_map(|&(a, b)| a..=b)
             .collect();
-        seqs.extend(
-            self.probes()
-                .into_iter()
-                .find(|(d, _)| d == me)
-                .map(|(_, s)| s),
-        );
-        if seqs.is_empty() {
+        let probed = self.probes().iter().any(|(d, _)| d == me);
+        if seqs.is_empty() && !probed {
             return Some(true);
         }
         let asks = self.asks.lock();
@@ -928,7 +1360,11 @@ impl Group {
             asks.by
                 .get(&(me.clone(), seq))
                 .is_none_or(|ask| ask.misses < FETCH_TRIES)
-        });
+        }) || (probed
+            && asks
+                .probes
+                .get(me)
+                .is_none_or(|probe| probe.misses < FETCH_TRIES));
         (!owed).then_some(false)
     }
 }
@@ -988,5 +1424,264 @@ mod tests {
         rtts.sample(&laptop, Duration::from_millis(40));
         assert!(rtts.rto(&laptop, lifetime) < RTO_INITIAL);
         assert_eq!(rtts.rto(&name("/alice/phone", 7), lifetime), lifetime);
+    }
+
+    /// Stage-4 review FB5. The table of round-trip estimates is capped; what it drops is the
+    /// device asked least recently, not the one whose name sorts first: forged names that
+    /// sort after an honest device's never reset what was measured of it.
+    #[test]
+    fn forged_names_do_not_reset_the_estimate_of_a_device_in_use() {
+        let space: Name = "/alice/32=data/notes".parse().expect("a name");
+        let name = |device: &str, seq: u64| {
+            crate::wire::log_name(&device.parse().expect("a name"), &space, seq)
+        };
+        let lifetime = Duration::from_secs(2);
+        let mut rtts = Rtts::default();
+        let laptop = name("/alice/laptop", 1);
+        rtts.sample(&laptop, Duration::from_millis(40));
+        let measured = rtts.rto(&laptop, lifetime);
+        assert!(measured < RTO_INITIAL);
+        for i in 0..(3 * RTTS_MAX) {
+            // Names that sort after the honest device's (a longer component sorts later).
+            rtts.missed(&name(&format!("/alice/forged-{i}"), 1));
+            // The honest device keeps being asked.
+            assert_eq!(
+                rtts.rto(&laptop, lifetime),
+                measured,
+                "after {i} forged names"
+            );
+        }
+    }
+
+    /// Stage-4 review M3. A device's window starts small, doubles each round the device
+    /// answers, never passes its cap, keeps what a lossy path allows (a third of the asks
+    /// missed answers more than it misses) and falls to the minimum for a device that answers
+    /// nothing, from where an answer brings it up again.
+    #[test]
+    fn a_window_follows_what_a_device_answers() {
+        let cap = 128;
+        let mut w = Window::default();
+        assert_eq!(w.size(cap), WINDOW_INITIAL);
+        for _ in 0..WINDOW_INITIAL {
+            w.answer(cap);
+        }
+        assert_eq!(
+            w.size(cap),
+            2 * WINDOW_INITIAL,
+            "doubled by one round of answers"
+        );
+        for _ in 0..1000 {
+            w.answer(cap);
+        }
+        assert_eq!(w.size(cap), cap, "never past its cap");
+
+        let mut lossy = Window::default();
+        for i in 0..600 {
+            if i % 3 == 0 {
+                lossy.miss(cap);
+            } else {
+                lossy.answer(cap);
+            }
+        }
+        assert_eq!(
+            lossy.size(cap),
+            cap,
+            "a path that loses a third keeps its window"
+        );
+
+        let mut silent = Window::default();
+        for _ in 0..200 {
+            silent.miss(cap);
+        }
+        assert_eq!(
+            silent.size(cap),
+            WINDOW_MIN,
+            "a device that answers nothing"
+        );
+        for _ in 0..32 {
+            silent.answer(cap);
+        }
+        assert!(
+            silent.size(cap) >= 32,
+            "and answers bring it back: {}",
+            silent.size(cap)
+        );
+    }
+
+    /// Stage-4 review M3. One device holds at most half of the node's slots, walks at most
+    /// three quarters, probes an eighth; a grant pull and a probe find a slot whoever floods.
+    #[tokio::test(start_paused = true)]
+    async fn walks_of_one_device_leave_slots_for_other_devices_probes_and_pulls() {
+        let slots = Slots::new(16, 128);
+        let walk = |device: &str| Kind::Walk(device.parse().expect("a name"));
+        let wait = Duration::from_secs(1);
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            held.push(slots.take(&walk("/alice/phone")).await.expect("open"));
+        }
+        assert!(
+            tokio::time::timeout(wait, slots.take(&walk("/alice/phone")))
+                .await
+                .is_err(),
+            "one device holds at most half the slots"
+        );
+        for _ in 0..4 {
+            held.push(slots.take(&walk("/alice/tablet")).await.expect("open"));
+        }
+        assert!(
+            tokio::time::timeout(wait, slots.take(&walk("/alice/watch")))
+                .await
+                .is_err(),
+            "walks hold at most three quarters of the slots"
+        );
+        for _ in 0..2 {
+            held.push(slots.take(&Kind::Probe).await.expect("open"));
+        }
+        assert!(
+            tokio::time::timeout(wait, slots.take(&Kind::Probe))
+                .await
+                .is_err(),
+            "probes hold at most an eighth"
+        );
+        for _ in 0..2 {
+            let pull = tokio::time::timeout(wait, slots.take(&Kind::Pull)).await;
+            assert!(
+                pull.is_ok(),
+                "a pull finds a slot while walks and probes are full"
+            );
+            held.push(pull.expect("in time").expect("open"));
+        }
+        drop(held);
+        assert!(
+            tokio::time::timeout(wait, slots.take(&walk("/alice/phone")))
+                .await
+                .is_ok(),
+            "slots come back when dropped"
+        );
+    }
+
+    /// Stage-4 review M3. A hole no entry declares void is asked a reservation block at a
+    /// time above what is held.
+    #[test]
+    fn an_undeclared_hole_is_asked_one_block_at_a_time() {
+        assert_eq!(
+            reach(&[(1, 999_999_999), (5000, 5002), (7000, 7100)], 1024),
+            vec![(1, 1024), (5000, 5002), (7000, 7100)]
+        );
+    }
+
+    /// Stage-4 review M3. An ask that missed holds its place in the device's window while it
+    /// pauses: the walk does not slide on to new seqs over the ones nothing answers; once the
+    /// pause is over the same seqs are asked again.
+    #[test]
+    fn asks_that_missed_keep_their_place_in_the_window() {
+        let device: Name = "/alice/phone".parse().expect("a name");
+        let mut asks = Asks::default();
+        let (mut next, mut launches) = (None, Vec::new());
+        let began = Instant::now();
+        asks.walk(&device, &[(1, 1000)], 4, began, &mut next, &mut launches);
+        let seqs = |l: &[Launch]| l.iter().map(|l| l.seq).collect::<Vec<_>>();
+        assert_eq!(seqs(&launches), vec![1, 2, 3, 4]);
+        for launch in &launches {
+            asks.end(launch, false, began);
+        }
+        launches.clear();
+        asks.walk(&device, &[(1, 1000)], 4, began, &mut next, &mut launches);
+        assert!(
+            launches.is_empty(),
+            "the missed asks hold the window: {:?}",
+            seqs(&launches)
+        );
+        assert!(
+            next.is_some(),
+            "and the walk looks again when their pause ends"
+        );
+        let later = began + REFRESH_PAUSE_MAX;
+        asks.walk(&device, &[(1, 1000)], 4, later, &mut next, &mut launches);
+        assert_eq!(
+            seqs(&launches),
+            vec![1, 2, 3, 4],
+            "the same seqs are asked again"
+        );
+    }
+
+    /// Stage-4 review M2. The pauses of a probe belong to the device: counters that rise at
+    /// every Sync Interest for 100 s cost the ladder of one entry (asks at 0, 0.25, 0.75,
+    /// 1.75, 5.75 s, …), not an ask per counter.
+    #[test]
+    fn a_probes_ladder_belongs_to_the_device_not_to_the_counter() {
+        let device: Name = "/alice/fake".parse().expect("a name");
+        let mut asks = Asks::default();
+        let began = Instant::now();
+        let (mut count, mut last_misses) = (0, 0);
+        for step in 0..400u64 {
+            let now = began + Duration::from_millis(250 * step);
+            let (mut next, mut launches) = (None, Vec::new());
+            asks.probe(
+                &[(device.clone(), step + 1)],
+                |_| false,
+                now,
+                &mut next,
+                &mut launches,
+            );
+            for launch in launches {
+                assert_eq!(
+                    launch.seq,
+                    step + 1,
+                    "the entry asked is the counter's as it stands"
+                );
+                last_misses = launch.misses;
+                count += 1;
+                asks.end(&launch, false, now);
+            }
+        }
+        assert!(count <= 9, "{count} probes in 100 s of rising counters");
+        assert!(last_misses >= 7, "the ladder climbed: {last_misses}");
+    }
+
+    /// Stage-4 review M2. At most [`PROBES_MAX`] probes of a group are in flight; of the
+    /// devices waiting, a vouched one is asked before the strangers, and a device not asked
+    /// yet before one that missed.
+    #[test]
+    fn probes_in_flight_are_capped_and_the_vouched_come_first() {
+        let real: Name = "/alice/zzz-real".parse().expect("a name");
+        let named: Vec<(Name, u64)> = (0..64)
+            .map(|i| (format!("/alice/fake{i:02}").parse().expect("a name"), 1))
+            .chain([(real.clone(), 1)])
+            .collect();
+        let mut asks = Asks::default();
+        let now = Instant::now();
+        let (mut next, mut launches) = (None, Vec::new());
+        asks.probe(&named, |d| *d == real, now, &mut next, &mut launches);
+        assert_eq!(launches.len(), PROBES_MAX);
+        assert_eq!(launches[0].device, real, "the vouched device first");
+        launches.clear();
+        asks.probe(&named, |d| *d == real, now, &mut next, &mut launches);
+        assert!(
+            launches.is_empty(),
+            "no more while {PROBES_MAX} are in flight"
+        );
+        // One ends unanswered: the next asked is a device never asked, not the one that missed.
+        asks.end(
+            &Launch {
+                device: real.clone(),
+                seq: 1,
+                misses: 0,
+                probe: true,
+                digest: None,
+            },
+            false,
+            now,
+        );
+        asks.probe(
+            &named,
+            |d| *d == real,
+            now + Duration::from_secs(1),
+            &mut next,
+            &mut launches,
+        );
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].misses, 0);
+        assert_ne!(launches[0].device, real);
     }
 }
