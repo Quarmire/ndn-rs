@@ -118,17 +118,44 @@ impl Log {
     }
 
     /// Whether this device is an owner device: its name is under the space's
-    /// owner's and its key is vouched for as the owner's person (the rule
-    /// admission applies to Members and Epoch entries). The refusal says what
-    /// to do.
+    /// owner's, its key is vouched for as the owner's person, and its role is
+    /// `admin` or `member` ([`crate::trust::owner_capable`]): the rule
+    /// admission applies to Members and Epoch entries, so a guest or node
+    /// device of the owner is none. The refusal says what to do.
     pub(crate) fn owner_only(&self) -> Result<(), HeapError> {
-        if wire::owns(&self.space, &self.key) && self.person == *self.fold.owner() {
+        if wire::owns(&self.space, &self.key)
+            && self.person == *self.fold.owner()
+            && self.own_capable
+        {
             Ok(())
         } else {
             Err(HeapError::NotOwner {
                 space: self.space.clone(),
             })
         }
+    }
+
+    /// The judge says `device` stands as an owner device (`capable`) or does
+    /// not: [`crate::trust::owner_capable`], read again (the context that
+    /// governs its key was replaced, or the rule changed). What it signed is
+    /// judged again by the new standing, as when a new entry of it tells.
+    pub(crate) fn restand(&mut self, device: &Name, capable: bool) -> Effects {
+        let mut fx = Effects::default();
+        if *device == self.device {
+            self.own_capable = capable;
+        }
+        let Some(dev) = self.devices.get_mut(device) else {
+            return fx;
+        };
+        if dev.owner_capable == capable {
+            return fx;
+        }
+        dev.owner_capable = capable;
+        let person = dev.person.clone();
+        self.write_ledger(device);
+        self.queue.push(Scope::Persons(BTreeSet::from([person])));
+        self.settle(&mut fx);
+        fx
     }
 
     /// Whether the owner's logs are whole below what this device holds of them: no seq of another
@@ -146,6 +173,7 @@ impl Log {
         let hole = self.devices.iter().find(|(device, dev)| {
             **device != self.device
                 && dev.person == *owner
+                && dev.owner_capable
                 && dev.held.prefix_with(&dev.voids()) < dev.high()
         });
         match hole {
@@ -171,6 +199,16 @@ impl Log {
                 "this device has not seen the space's creation, so it cannot tell whether it may write",
             ));
         };
+        if self.person == *self.fold.owner() && !self.own_capable {
+            return Err(HeapError::NotAllowed {
+                space: self.space.clone(),
+                why: "this device belongs to the owner's namespace but is no owner device (its \
+                      role is not `admin` or `member`: a `guest` or `node` device, or one with \
+                      no role, writes nothing as the owner); write from an `admin` or `member` \
+                      device of the owner"
+                    .into(),
+            });
+        }
         if !self.fold.is_writer(&self.person) {
             self.owner_whole()?;
             return Err(HeapError::NotAllowed {
@@ -258,6 +296,7 @@ impl Log {
             id: &id,
             wire: &packet,
             person: &person,
+            owner_capable: self.own_capable,
             key_digest: self.key_digest,
             link,
             verdict: Ok(&entry),

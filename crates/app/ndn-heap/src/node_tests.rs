@@ -154,6 +154,34 @@ pub(crate) struct Dev {
     pub(crate) keys: Arc<SecurityManager>,
     pub(crate) validator: Arc<Validator>,
     pub(crate) store: Arc<dyn DataStore>,
+    trust: Arc<Trust>,
+}
+
+/// What a world's validators are made of: each namespace's anchor, and every
+/// device's certificate.
+struct Trust {
+    anchors: Vec<(Name, Certificate)>,
+    certs: Vec<Certificate>,
+}
+
+impl Trust {
+    /// A validator over these anchors and certificates; `layered`: each
+    /// namespace's context declares the role layout.
+    fn validator(&self, layered: bool) -> Arc<Validator> {
+        let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
+        for (ns, anchor) in &self.anchors {
+            let mut ctx = SignedTrustContext::hierarchical(ns.clone());
+            if layered {
+                ctx = ctx.schema_authoritative();
+            }
+            assert!(ctx.add_anchor(anchor.clone()));
+            validator.adopt_context(Arc::new(ctx)).unwrap();
+        }
+        for cert in &self.certs {
+            validator.cert_cache().insert(cert.clone());
+        }
+        validator
+    }
 }
 
 /// The devices of one world: each namespace has a root key; each device's key
@@ -196,25 +224,37 @@ pub(crate) async fn world_of(devices: &[&str], ns_of: impl Fn(&Name) -> Name) ->
             .unwrap();
         made.push((name, keys, cert));
     }
+    let trust = Arc::new(Trust {
+        anchors: roots
+            .iter()
+            .map(|(ns, _, _, anchor)| (ns.clone(), anchor.clone()))
+            .collect(),
+        certs: made.iter().map(|(_, _, cert)| cert.clone()).collect(),
+    });
     made.iter()
-        .map(|(name, keys, _)| {
-            let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
-            for (ns, _, _, anchor) in &roots {
-                let ctx = SignedTrustContext::hierarchical(ns.clone());
-                assert!(ctx.add_anchor(anchor.clone()));
-                validator.adopt_context(Arc::new(ctx)).unwrap();
-            }
-            for (_, _, cert) in &made {
-                validator.cert_cache().insert(cert.clone());
-            }
-            Dev {
-                name: name.clone(),
-                keys: Arc::clone(keys),
-                validator,
-                store: Arc::new(MemoryStore::new()),
-            }
+        .map(|(name, keys, _)| Dev {
+            name: name.clone(),
+            keys: Arc::clone(keys),
+            validator: trust.validator(false),
+            store: Arc::new(MemoryStore::new()),
+            trust: Arc::clone(&trust),
         })
         .collect()
+}
+
+impl Dev {
+    /// The same device, keys and store, judging as a namespace that declares the
+    /// role layout does (its contexts' schema is authoritative, spec §2.1): only
+    /// an `admin` or `member` device is an owner device.
+    pub(crate) fn layered(&self) -> Dev {
+        Dev {
+            name: self.name.clone(),
+            keys: Arc::clone(&self.keys),
+            validator: self.trust.validator(true),
+            store: Arc::clone(&self.store),
+            trust: Arc::clone(&self.trust),
+        }
+    }
 }
 
 fn cut(dev: &Dev, image: CrashStore) -> (Dev, Arc<CrashStore>) {
@@ -225,6 +265,7 @@ fn cut(dev: &Dev, image: CrashStore) -> (Dev, Arc<CrashStore>) {
             keys: Arc::clone(&dev.keys),
             validator: Arc::clone(&dev.validator),
             store: Arc::clone(&store) as Arc<dyn DataStore>,
+            trust: Arc::clone(&dev.trust),
         },
         store,
     )
@@ -1005,5 +1046,103 @@ async fn an_interest_during_signing_cannot_get_a_structural_entry_before_its_flu
         node.inner.served(&space(), &dev.name, seq).is_some(),
         "once the flush covering it returned, it is served"
     );
+    node.close().await;
+}
+
+// -- The owner rule: only an `admin` or `member` device of the owner holds its powers (§9.9) ---
+
+/// Small timings, and no wait for a peer that never answers on the counting forwarder.
+fn quick() -> Config {
+    let mut c = cfg();
+    c.lifetime = Duration::from_millis(100);
+    c
+}
+
+/// A space stored under the earlier rule, when every device of the owner's namespace was an
+/// owner device, and a guest device had signed a `Members` entry: at start under the role
+/// layout it is judged once, the entry leaves the fold, and the rule is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_guest_devices_members_entry_stored_under_the_old_rule_is_withdrawn_at_start() {
+    let devs = world(&["/alice/member/laptop", "/alice/guest/bob"]).await;
+    let (laptop, guest) = (&devs[0], &devs[1]);
+    let mallory = n("/mallory");
+
+    // The earlier rule: a namespace with no role layout declared.
+    let (lnode, _) = boot(laptop, quick()).await;
+    let heap = lnode.create(&space(), public()).await.unwrap();
+    let (gnode, _) = boot(guest, quick()).await;
+    let gheap = gnode.open(&space()).await.unwrap();
+    deliver(laptop, &gnode).await;
+    gheap
+        .change(MembersChange {
+            add_writers: vec![mallory.clone()],
+            ..MembersChange::default()
+        })
+        .await
+        .expect("a device of a flat namespace is an owner device");
+    deliver(guest, &lnode).await;
+    assert!(
+        heap.members().writers.contains(&mallory),
+        "precondition: the earlier rule applied the guest's Members entry"
+    );
+    lnode.close().await;
+    gnode.close().await;
+    laptop.store.remove(&Kind::RULE.of(&space()));
+
+    let layered = laptop.layered();
+    let (lnode, _) = boot(&layered, quick()).await;
+    let heap = lnode.space(&space()).expect("the space is held again");
+    assert!(
+        !heap.members().writers.contains(&mallory),
+        "the guest's Members entry is withdrawn by the one judgement at start"
+    );
+    assert_eq!(
+        layered.store.get(&Kind::RULE.of(&space())).as_deref(),
+        Some(&[OWNER_RULE][..]),
+        "and the space is recorded as judged by the rule"
+    );
+    lnode.close().await;
+}
+
+/// A sealed space stored under the earlier rule: a guest device of the owner may hold the key
+/// in force, so an owner device signs a fresh epoch at start, once, and records the rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_owner_device_signs_a_fresh_epoch_for_a_sealed_space_stored_under_the_old_rule() {
+    let devs = world(&["/alice/member/laptop"]).await;
+    let laptop = &devs[0];
+    let (node, _) = boot(laptop, quick()).await;
+    let heap = node.create(&space(), private(&["/bob"])).await.unwrap();
+    let (before, _) = heap.epoch().expect("an epoch is in force");
+    node.close().await;
+    laptop.store.remove(&Kind::RULE.of(&space()));
+
+    let layered = laptop.layered();
+    let (node, _) = boot(&layered, quick()).await;
+    let heap = node.space(&space()).unwrap();
+    let rule = || layered.store.get(&Kind::RULE.of(&space()));
+    for _ in 0..200 {
+        if rule().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        rule().as_deref(),
+        Some(&[OWNER_RULE][..]),
+        "the rule is recorded"
+    );
+    let (now, complete) = heap.epoch().unwrap();
+    assert!(complete);
+    assert!(
+        now.seq > before.seq,
+        "a fresh epoch is in force: {before:?} then {now:?}"
+    );
+    node.close().await;
+
+    // A restart signs none more.
+    let (node, _) = boot(&layered, quick()).await;
+    let heap = node.space(&space()).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(heap.epoch().unwrap().0, now, "no epoch is signed again");
     node.close().await;
 }

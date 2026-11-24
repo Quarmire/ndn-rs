@@ -174,6 +174,7 @@ fn open_with(suspicion: &Arc<Suspicion>, store: &Arc<CrashStore>, space: &Name) 
             space: space.clone(),
             device: me.name.clone(),
             person: me.person.clone(),
+            owner_capable: true,
             signer: Arc::clone(&me.signer) as Arc<dyn Signer>,
             keys: Keys::new(RecipientKey::generate()),
             suspicion: Arc::clone(suspicion),
@@ -194,6 +195,7 @@ fn admit_as(log: &mut Log, p: &Packet, digest: Option<[u8; 32]>, now: u64) -> Ou
         device: p.dev.name.clone(),
         person: p.dev.person.clone(),
         key_digest: digest.unwrap_or_else(|| key_digest(&p.dev)),
+        owner_capable: true,
     };
     log.admit(&p.wire, &data, &v, now, false).0
 }

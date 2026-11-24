@@ -57,6 +57,8 @@ struct Dev {
     name: Name,
     key: Name,
     person: Name,
+    /// What the judge says of the device's standing (`Verified::owner_capable`).
+    owner_capable: bool,
     signer: Arc<Ed25519Signer>,
 }
 
@@ -66,8 +68,16 @@ fn dev(name: &str, person: &str, seed: u8) -> Dev {
         name: n(name),
         key: key.clone(),
         person: n(person),
+        owner_capable: true,
         signer: Arc::new(Ed25519Signer::from_seed(&[seed; 32], key)),
     }
+}
+
+/// A device of its person that holds none of the owner's powers: a `guest`
+/// or a `node` of the role layout.
+fn not_owner_device(mut d: Dev) -> Dev {
+    d.owner_capable = false;
+    d
 }
 
 fn laptop() -> Dev {
@@ -89,6 +99,7 @@ fn verified(d: &Dev) -> Verified {
         device: d.name.clone(),
         person: d.person.clone(),
         key_digest: public_key_digest(&d.signer.public_key_bytes()),
+        owner_capable: d.owner_capable,
     }
 }
 
@@ -227,6 +238,7 @@ fn open_on(store: &Arc<CrashStore>, me: &Dev) -> Rig {
             space: space(),
             device: me.name.clone(),
             person: me.person.clone(),
+            owner_capable: me.owner_capable,
             signer: Arc::clone(&me.signer) as Arc<dyn Signer>,
             keys: Keys::new(RecipientKey::generate()),
             suspicion: Arc::clone(&suspicion),
@@ -1315,6 +1327,7 @@ async fn a_device_that_cannot_read_its_own_ledger_does_not_open_the_space() {
             space: space(),
             device: me.name.clone(),
             person: me.person.clone(),
+            owner_capable: me.owner_capable,
             signer: Arc::clone(&me.signer) as Arc<dyn Signer>,
             keys: Keys::new(RecipientKey::generate()),
             suspicion: Suspicion::open(Arc::clone(&raw)),
@@ -1941,6 +1954,7 @@ async fn a_cold_open_reads_one_marker_per_device_not_one_per_entry() {
             space: space(),
             device: me.name.clone(),
             person: me.person.clone(),
+            owner_capable: me.owner_capable,
             signer: Arc::clone(&me.signer) as Arc<dyn Signer>,
             keys: Keys::new(RecipientKey::generate()),
             suspicion: Suspicion::open(Arc::clone(&raw)),
@@ -2491,5 +2505,236 @@ async fn an_entry_a_cut_readmits_is_wanted_by_its_implicit_digest_until_held() {
         r.log.cut_wants(&[], &[(bob().name, 1, [7; 32])]),
         vec![want([7; 32])],
         "other bytes at the name are not the ones the cut names"
+    );
+}
+
+// -- The owner's devices: only an `admin` or `member` device holds the owner's powers (§9.9) --
+
+fn guest() -> Dev {
+    not_owner_device(dev("/alice/guest/bob", "/alice", 5))
+}
+fn relay() -> Dev {
+    not_owner_device(dev("/alice/node/vps", "/alice", 6))
+}
+fn tablet() -> Dev {
+    dev("/alice/member/tablet", "/alice", 7)
+}
+
+/// A guest or node device of the owner signs no Members and no Epoch entry, and nothing it
+/// writes counts as the owner's implicit write; a member device of the owner still does both.
+#[tokio::test]
+async fn a_guest_or_node_device_of_the_owner_holds_none_of_the_owners_powers() {
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let mallory = n("/mallory");
+
+    let m = Chain::new(&guest()).members(members(None, vec![add(9, "/mallory", Role::Writer)]));
+    assert_eq!(
+        r.admit(&m).outcome,
+        Outcome::Refused(Refusal::NotOwnerDevice)
+    );
+    assert!(
+        !r.log.fold.is_writer(&mallory),
+        "the guest's Members entry is not applied"
+    );
+
+    let e = EpochId {
+        creator: relay().name,
+        seq: 1,
+    };
+    let epoch = Chain::new(&relay()).entry(
+        Body::Epoch(EpochBody {
+            key_check: seal::key_check(&ContentKey::generate(), &space(), &e),
+            audience: vec![n("/alice")],
+        }),
+        vec![],
+    );
+    assert_eq!(
+        r.admit(&epoch).outcome,
+        Outcome::Refused(Refusal::NotOwnerDevice)
+    );
+    assert_eq!(
+        r.log.fold.in_force(),
+        None,
+        "the node's Epoch entry is not applied"
+    );
+
+    let other_guest = not_owner_device(dev("/alice/guest/carl", "/alice", 8));
+    let put = Chain::new(&other_guest).put("/diary", "as the owner");
+    assert_eq!(
+        r.admit(&put).outcome,
+        Outcome::Refused(Refusal::NotOwnerDevice),
+        "a guest device has no implicit owner write"
+    );
+    assert_eq!(r.value("/diary"), None);
+
+    // A member device of the owner still carries both.
+    let mut t = Chain::new(&tablet());
+    r.applied(&t.members(members(None, vec![add(8, "/dave", Role::Writer)])));
+    assert!(r.log.fold.is_writer(&n("/dave")));
+    r.applied(&t.put("/diary", "from the tablet"));
+    assert_eq!(r.value("/diary").as_deref(), Some("from the tablet"));
+}
+
+/// What a device's entries mean follows its standing: a Members entry applied while its
+/// signer stood as a member device is withdrawn when the judge says the device is none, and
+/// returns when it says it is again.
+#[tokio::test]
+async fn a_change_of_a_devices_standing_judges_what_it_signed_again() {
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let mut t = Chain::new(&tablet());
+    r.applied(&t.members(members(None, vec![add(8, "/dave", Role::Writer)])));
+    assert!(r.log.fold.is_writer(&n("/dave")));
+
+    let later = t.put("/x", "1");
+    let data = Data::decode(later.wire.clone()).unwrap();
+    let demoted = Verified {
+        owner_capable: false,
+        ..verified(&tablet())
+    };
+    let (outcome, _) = r.log.admit(&later.wire, &data, &demoted, NOW, false);
+    assert_eq!(outcome, Outcome::Refused(Refusal::NotOwnerDevice));
+    assert!(
+        !r.log.fold.is_writer(&n("/dave")),
+        "the Members entry the device signed as a member device is withdrawn"
+    );
+
+    let again = t.put("/y", "2");
+    let data = Data::decode(again.wire.clone()).unwrap();
+    r.log
+        .admit(&again.wire, &data, &verified(&tablet()), NOW, false);
+    assert!(
+        r.log.fold.is_writer(&n("/dave")),
+        "and returns with the standing"
+    );
+}
+
+/// This device's own standing decides whether it signs the owner's entries; the standing is
+/// kept across a restart.
+#[tokio::test]
+async fn a_guest_device_signs_no_members_or_epoch_entry_and_remembers_it() {
+    let g = guest();
+    let mut r = rig(&g);
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    assert!(matches!(
+        r.log.owner_only(),
+        Err(HeapError::NotOwner { .. })
+    ));
+    assert!(matches!(
+        r.log
+            .sign_members(members(None, vec![add(9, "/mallory", Role::Writer)]), NOW),
+        Err(HeapError::NotOwner { .. })
+    ));
+    assert!(matches!(
+        r.log.put(
+            &n("/diary"),
+            Payload::Inline(Bytes::from_static(b"x")),
+            vec![],
+            NOW
+        ),
+        Err(HeapError::NotAllowed { .. })
+    ));
+
+    // Another device of the owner's, a member one, is held as one across a restart; the
+    // guest's standing is held as none.
+    let mut t = Chain::new(&tablet());
+    r.applied(&t.put("/ok", "1"));
+    let guest_put = Chain::new(&relay()).put("/no", "1");
+    r.admit(&guest_put);
+    r.flusher.flush().await.unwrap();
+    let reopened = open_on(&r.crash(), &g);
+    let standing = |r: &Rig, d: &Dev| r.log.devices.get(&d.name).map(|dev| dev.owner_capable);
+    assert_eq!(standing(&reopened, &tablet()), Some(true));
+    assert_eq!(standing(&reopened, &relay()), Some(false));
+}
+
+/// A writer seals one entry in an epoch no owner device made, to make every reader wait for a
+/// key that can never come: it is refused outright, so nothing is held closed and reads go on.
+/// An epoch of a device that may be an owner device, whose Epoch entry has not arrived, is still
+/// waited for.
+#[tokio::test]
+async fn an_entry_sealed_in_an_epoch_no_owner_device_made_is_refused_not_held_closed() {
+    let s = sealed_space();
+    let sealed_in = |epoch: EpochId| {
+        let name = log_name(&bob().name, &space(), 1);
+        let plain = wire::encode_sealed_plain(&PutBody {
+            path: n("/x"),
+            payload: Payload::Inline(Bytes::from_static(b"v")),
+        })
+        .unwrap();
+        let sealed = seal::seal_payload(&ContentKey::from_bytes(s.key), &name, &plain);
+        sign_entry(
+            &bob(),
+            1,
+            &Entry {
+                prev: None,
+                after: vec![],
+                body: Body::Sealed(SealedBody { epoch, sealed }),
+            },
+        )
+    };
+    let epoch = |creator: &str| EpochId {
+        creator: n(creator),
+        seq: 1 << 40,
+    };
+
+    // Not an owner device by name.
+    let mut r = rig(&carol());
+    r.applied(&s.created);
+    r.applied(&s.epoch_entry);
+    let a = r.admit(&sealed_in(epoch("/eve/phone")));
+    assert_eq!(a.outcome, Outcome::Refused(Refusal::NotOwnerEpoch));
+    assert!(
+        !r.log.has_closed(),
+        "nothing waits for a key that cannot come"
+    );
+    assert!(r.log.get(&n("/x")).is_ok(), "reads go on");
+
+    // A device of the owner's namespace this log holds as no owner device.
+    let mut r = rig(&carol());
+    r.applied(&s.created);
+    r.applied(&s.epoch_entry);
+    let guest_entry = Chain::new(&guest()).put("/g", "1");
+    assert_eq!(
+        r.admit(&guest_entry).outcome,
+        Outcome::Refused(Refusal::NotOwnerDevice)
+    );
+    let a = r.admit(&sealed_in(epoch("/alice/guest/bob")));
+    assert_eq!(a.outcome, Outcome::Refused(Refusal::NotOwnerEpoch));
+    assert!(!r.log.has_closed());
+
+    // An owner device not heard of yet: its Epoch entry may be on its way.
+    let mut r = rig(&carol());
+    r.applied(&s.created);
+    r.applied(&s.epoch_entry);
+    let a = r.admit(&sealed_in(epoch("/alice/laptop")));
+    assert_eq!(a.outcome, Outcome::Closed);
+    assert!(r.log.has_closed());
+}
+
+/// The epochs the closed entries are sealed in are read once and kept, and what moves an entry
+/// to or from closed makes the next read see it.
+#[tokio::test]
+async fn the_epochs_of_closed_entries_are_kept_until_an_entry_moves_to_or_from_closed() {
+    let s = sealed_space();
+    let mut r = rig(&carol());
+    r.applied(&s.created);
+    r.applied(&s.epoch_entry);
+    assert!(r.log.closed_epochs().is_empty());
+    assert_eq!(r.admit(&sealed_put(&s, "/a", "1")).outcome, Outcome::Closed);
+    assert_eq!(
+        r.log.closed_epochs(),
+        BTreeSet::from([s.epoch.clone()]),
+        "a closed entry's epoch is seen at once, the earlier empty read notwithstanding"
+    );
+    r.log
+        .key_arrived(s.epoch.clone(), ContentKey::from_bytes(s.key));
+    assert!(
+        r.log.closed_epochs().is_empty(),
+        "the entry opened: no epoch is waited for"
     );
 }

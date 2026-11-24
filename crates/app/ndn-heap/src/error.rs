@@ -88,6 +88,23 @@ pub enum Refusal {
     /// Its signer is not a writer of the space, by the members entries.
     #[error("its key is not a writer of the space by the members entries; ask the owner to add it")]
     NotMember,
+    /// Its signer is a device of the owner's namespace that is no owner
+    /// device: its role is not `admin` or `member` (spec §1.2).
+    #[error(
+        "its signer is a device of the space owner's namespace that holds none of the owner's \
+         powers: its role is not `admin` or `member` (a `guest`, a `node` relay, any other \
+         role, or no role at all), so it signs no members or epoch entry and writes nothing as \
+         the owner; ask the owner to do it from an `admin` or `member` device"
+    )]
+    NotOwnerDevice,
+    /// It is sealed in an epoch whose creator is no owner device of the space:
+    /// no Epoch entry of the space can name it.
+    #[error(
+        "it is sealed in an epoch whose creator is no owner device of the space, so no Epoch \
+         entry of the space can ever name it and it could never be opened; nothing to do here, \
+         its writer writes it again, sealed in the epoch in force"
+    )]
+    NotOwnerEpoch,
     /// It does not verify: wrong signature, or bytes that do not match its
     /// name (a poisoned cache).
     #[error(
@@ -166,11 +183,14 @@ impl Refusal {
             Refusal::OutsideCut(_)
             | Refusal::Lapsed { .. }
             | Refusal::NotMember
+            | Refusal::NotOwnerDevice
             | Refusal::Suspected { .. }
             | Refusal::Untrusted { .. }
             | Refusal::Fragmented => NextStep::AskOwner,
             Refusal::BadSignature => NextStep::RetryLater,
-            Refusal::Unsealed | Refusal::Sealed | Refusal::Chain => NextStep::None,
+            Refusal::Unsealed | Refusal::Sealed | Refusal::Chain | Refusal::NotOwnerEpoch => {
+                NextStep::None
+            }
         }
     }
 }
@@ -343,6 +363,8 @@ mod tests {
             },
             Refusal::Chain,
             Refusal::Fragmented,
+            Refusal::NotOwnerDevice,
+            Refusal::NotOwnerEpoch,
         ]
     }
 
@@ -358,6 +380,8 @@ mod tests {
             Refusal::Untrusted { .. } => 8,
             Refusal::Chain => 10,
             Refusal::Fragmented => 12,
+            Refusal::NotOwnerDevice => 13,
+            Refusal::NotOwnerEpoch => 14,
         }
     }
 
@@ -421,14 +445,16 @@ mod tests {
                 .map(variant_no)
                 .collect::<BTreeSet<_>>()
                 .len(),
-            10,
+            12,
             "the list covers every refusal"
         );
         let class = |r: Refusal| r.next();
         assert_eq!(class(Refusal::OutsideCut(cut())), NextStep::AskOwner);
         assert_eq!(class(Refusal::NotMember), NextStep::AskOwner);
+        assert_eq!(class(Refusal::NotOwnerDevice), NextStep::AskOwner);
         assert_eq!(class(Refusal::BadSignature), NextStep::RetryLater);
         assert_eq!(class(Refusal::Chain), NextStep::None);
+        assert_eq!(class(Refusal::NotOwnerEpoch), NextStep::None);
         assert_eq!(class(Refusal::Fragmented), NextStep::AskOwner);
         assert_eq!(class(Refusal::Unsealed), NextStep::None);
         assert_eq!(class(Refusal::Sealed), NextStep::None);
@@ -550,6 +576,7 @@ mod tests {
                     Refusal::OutsideCut(_)
                     | Refusal::Lapsed { .. }
                     | Refusal::NotMember
+                    | Refusal::NotOwnerDevice
                     | Refusal::Suspected { .. } => Code::NotMember,
                     Refusal::BadSignature => Code::RetryLater,
                     _ => Code::Refused,
@@ -629,13 +656,14 @@ mod tests {
                 Refusal::OutsideCut(_)
                 | Refusal::Lapsed { .. }
                 | Refusal::NotMember
+                | Refusal::NotOwnerDevice
                 | Refusal::Suspected { .. } => {
                     assert_eq!((code, next), (Code::NotMember, Next::AskOwner), "{why:?}");
                 }
                 Refusal::Untrusted { .. } | Refusal::Fragmented => {
                     assert_eq!((code, next), (Code::Refused, Next::AskOwner), "{why:?}");
                 }
-                Refusal::Unsealed | Refusal::Sealed | Refusal::Chain => {
+                Refusal::Unsealed | Refusal::Sealed | Refusal::Chain | Refusal::NotOwnerEpoch => {
                     assert_eq!((code, next), (Code::Refused, Next::Nothing), "{why:?}");
                 }
             }

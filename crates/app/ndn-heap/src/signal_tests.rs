@@ -63,10 +63,12 @@ struct Authority {
     keys: SecurityManager,
     issuer: Name,
     anchor: Certificate,
+    /// Whether its context declares the role layout.
+    layered: bool,
 }
 
 impl Authority {
-    async fn new(ns: &str) -> Authority {
+    async fn new(ns: &str, layered: bool) -> Authority {
         let ns = n(ns);
         let keys = SecurityManager::new();
         let issuer = keys
@@ -82,12 +84,16 @@ impl Authority {
             keys,
             issuer,
             anchor,
+            layered,
         }
     }
 
     /// Its trust context at `version`, revoking `revoked`.
     fn context(&self, version: u64, revoked: Option<&Name>) -> Arc<SignedTrustContext> {
         let mut ctx = SignedTrustContext::hierarchical(self.ns.clone()).with_version(version);
+        if self.layered {
+            ctx = ctx.schema_authoritative();
+        }
         if let Some(k) = revoked {
             ctx = ctx.with_revocation(k.clone());
         }
@@ -112,6 +118,7 @@ impl Dev {
             device: self.name.clone(),
             person: self.person.clone(),
             key_digest: public_key_digest(&self.signer.public_key().unwrap()),
+            owner_capable: true,
         }
     }
 }
@@ -125,10 +132,21 @@ struct World {
 
 impl World {
     async fn new() -> World {
+        World::build(false).await
+    }
+
+    /// As [`World::new`], with every context declaring the role layout (its
+    /// schema is authoritative): only `admin` and `member` devices are owner
+    /// devices.
+    async fn layered() -> World {
+        World::build(true).await
+    }
+
+    async fn build(layered: bool) -> World {
         let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
         let mut people = Vec::new();
         for ns in ["/alice", "/bob", "/carol", "/rita", "/eve"] {
-            let a = Authority::new(ns).await;
+            let a = Authority::new(ns, layered).await;
             validator.adopt_context(a.context(1, None)).unwrap();
             people.push(a);
         }
@@ -195,11 +213,14 @@ impl World {
         let store = Arc::new(CrashStore::new());
         let raw = Arc::clone(&store) as Arc<dyn DataStore>;
         let flusher = Flusher::spawn(Arc::clone(&raw));
+        let owner_capable =
+            crate::trust::owner_capable(&self.validator.keyring().context_for(&dev.key), &dev.key);
         let log = Log::open(
             Params {
                 space: space(),
                 device: dev.name.clone(),
                 person: dev.person.clone(),
+                owner_capable,
                 signer: Arc::clone(&dev.signer),
                 keys: Keys::new(RecipientKey::generate()),
                 suspicion: Suspicion::open(Arc::clone(&raw)),
@@ -428,6 +449,41 @@ async fn a_spaces_members_are_its_writers_by_person_and_no_stranger() {
         !empty.member(&key_of("/bob/phone")),
         "nothing is a member of a space whose creation is not held"
     );
+}
+
+/// Where the owner's namespace declares the role layout, the owner's person stands for signals
+/// only through its `admin` and `member` devices: a guest or node device of the owner is no
+/// member (it sends no header and its headers are refused), and gets no scope.
+#[tokio::test]
+async fn a_guest_or_node_device_of_the_owner_is_no_member_for_signals() {
+    let world = World::layered().await;
+    let owner = world.seat("/alice/member/laptop").await;
+    let observer = world.seat("/rita/pad").await;
+    let guest = world.seat("/alice/guest/kid").await;
+    let one = owner
+        .members(members(Some(true), vec![add(1, "/bob", Role::Writer)]))
+        .await;
+    owner.relay(&one, &observer);
+    owner.relay(&one, &guest);
+    for (device, member) in [
+        ("/alice/member/laptop", true),
+        ("/alice/admin/phone", true),
+        ("/alice/guest/kid", false),
+        ("/alice/node/vps", false),
+        ("/bob/phone", true),
+    ] {
+        for seat in [&owner, &observer] {
+            assert_eq!(seat.member(&key_of(device)), member, "{device}");
+        }
+    }
+    assert!(
+        matches!(guest.scope(), Err(HeapError::NotAllowed { .. })),
+        "a guest device of the owner gets no scope"
+    );
+    assert!(matches!(
+        guest.header(&RUN),
+        Err(HeapError::NotAllowed { .. })
+    ));
 }
 
 /// Membership is answered from what is held: a removal changes it at the

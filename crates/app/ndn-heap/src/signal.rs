@@ -42,7 +42,7 @@ use crate::node::Node;
 use crate::rt::Instant;
 use crate::seal;
 use crate::space::SpaceInner;
-use crate::trust::Judge;
+use crate::trust::{Judge, owner_capable};
 use crate::wire::{
     self, EpochId, device_of, parse_signal_run_name, signal_run_name, sync_group_of,
 };
@@ -265,6 +265,10 @@ fn standing(log: &Log, judge: &Judge, key: &Name, reads: bool) -> Result<Name, S
     let person = context.namespace();
     let fold = &log.fold;
     if person.is_empty() || !(fold.is_writer(person) || (reads && fold.is_reader(person))) {
+        return Err(not_member());
+    }
+    // The owner's person stands only through its owner devices (`admin` or `member`).
+    if person == fold.owner() && !owner_capable(&context, key) {
         return Err(not_member());
     }
     match context.is_revoked(key) {

@@ -377,7 +377,7 @@ impl SpaceInner {
             repair = !self.follower
                 && log.sealed()
                 && log.owner_only().is_ok()
-                && (!log.fold.complete() || self.revocation_owed(node, log));
+                && (!log.fold.complete() || self.revocation_owed(node, log) || self.rule_owed(log));
         }
         Routed {
             ticket,
@@ -493,11 +493,28 @@ impl SpaceInner {
                 != Some(&revocations_digest(&revoked)[..])
     }
 
+    /// Whether this owner device owes the sealed space a fresh epoch because
+    /// the space was stored under an older owner rule (spec §9.9): a guest
+    /// or node device of the owner may hold the key in force, and would open
+    /// every later write. Owed until the epoch is signed and the rule is
+    /// recorded.
+    fn rule_owed(&self, log: &Log) -> bool {
+        log.rule_stale
+            && !self.follower
+            && log.sealed()
+            && log.fold.create() == Some(false)
+            && log.owner_only().is_ok()
+    }
+
     /// Look again at what the space wants at once, and spawn the epoch a
     /// revocation of a reader's device key owes, if any.
     pub(crate) fn settle(self: &Arc<Self>, node: &Arc<NodeInner>) {
         node.nudge(&self.name);
-        if self.revocation_owed(node, &self.log.lock()) {
+        let owed = {
+            let log = self.log.lock();
+            self.revocation_owed(node, &log) || self.rule_owed(&log)
+        };
+        if owed {
             self.spawn_repair(node);
         }
     }
@@ -524,8 +541,9 @@ impl SpaceInner {
         self.attempt(node, &mut |log| {
             let fold = &log.fold;
             let owed = self.revocation_owed(node, log);
+            let rule = self.rule_owed(log);
             if fold.create() != Some(false)
-                || (fold.complete() && !owed)
+                || (fold.complete() && !owed && !rule)
                 || log.owner_only().is_err()
             {
                 return Ok(None);
@@ -540,6 +558,12 @@ impl SpaceInner {
                     Kind::REVOKED.of(&self.name),
                     Bytes::copy_from_slice(&accounted),
                 );
+                if rule {
+                    // The fresh epoch is the one in force: no key a guest or
+                    // node device of the owner held opens what is written now.
+                    log.rule_stale = false;
+                    node.record_rule(&self.name);
+                }
             }
             Ok(Some(step))
         })

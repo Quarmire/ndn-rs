@@ -116,6 +116,9 @@ pub(crate) struct Params {
     /// This device's person: the namespace of the context that vouches for
     /// its key.
     pub person: Name,
+    /// Whether this device may act as an owner device where its person is
+    /// the space's owner ([`crate::trust::owner_capable`]).
+    pub owner_capable: bool,
     /// The device key; it must sign synchronously.
     pub signer: Arc<dyn Signer>,
     /// This device's keys (its recipient key; epoch keys are added as they
@@ -381,6 +384,15 @@ pub(crate) struct Log {
     pub(crate) space: Name,
     pub(crate) device: Name,
     pub(crate) person: Name,
+    /// Whether this device is an owner device where its person owns the
+    /// space ([`crate::trust::owner_capable`]); the node refreshes it when
+    /// the context that governs the device changes ([`Log::set_own_capable`]).
+    pub(crate) own_capable: bool,
+    /// The space was stored under an older owner rule (spec §9.9) and its
+    /// entries have not all been judged by the current one: the node
+    /// judges them once at start, and the owner devices then sign a fresh
+    /// epoch, since a guest or node device of the owner may hold keys.
+    pub(crate) rule_stale: bool,
     /// This device's key name and the digest of its public key.
     pub(crate) key: Name,
     key_digest: [u8; 32],
@@ -403,6 +415,9 @@ pub(crate) struct Log {
     suspicion: Arc<Suspicion>,
     /// Entries held closed.
     closed: u64,
+    /// The epochs those entries are sealed in, once read ([`Self::closed_epochs`]); cleared
+    /// whenever an entry's status moves to or from closed.
+    closed_in: parking_lot::Mutex<Option<BTreeSet<EpochId>>>,
     /// Re-checks owed.
     queue: Vec<Scope>,
 }
@@ -418,6 +433,7 @@ impl Log {
             space,
             device,
             person,
+            owner_capable,
             signer,
             keys,
             suspicion,
@@ -449,10 +465,13 @@ impl Log {
             devices: BTreeMap::new(),
             kept: BTreeMap::new(),
             closed: 0,
+            closed_in: parking_lot::Mutex::new(None),
             queue: Vec::new(),
             space,
             device,
             person,
+            own_capable: owner_capable,
+            rule_stale: false,
             signer,
             store: Batch::new(store),
             suspicion,
@@ -604,11 +623,16 @@ impl Log {
     }
 
     /// The epochs the entries held closed are sealed in: the keys whose arrival opens them.
-    /// Read from the held packets of the entries whose status says closed, so only as often as a
-    /// read is refused for them.
+    /// Read from the held packets of the entries whose status says closed, once, and kept until
+    /// an entry's status moves to or from closed: a refused read asks for it every time.
     pub(crate) fn closed_epochs(&self) -> BTreeSet<EpochId> {
+        let mut kept = self.closed_in.lock();
+        if let Some(epochs) = &*kept {
+            return epochs.clone();
+        }
         let view = self.view();
-        self.store
+        let epochs: BTreeSet<EpochId> = self
+            .store
             .scan_under(&Kind::STATUS.listing(&self.space), 0)
             .into_iter()
             .filter(|(_, value)| value.first() == Some(&1))
@@ -618,7 +642,9 @@ impl Log {
                 Body::Sealed(sealed) => Some(sealed.epoch),
                 _ => None,
             })
-            .collect()
+            .collect();
+        *kept = Some(epochs.clone());
+        epochs
     }
 
     /// Whether what this device holds closed is a matter of keys it is to be granted, not of an
@@ -760,6 +786,13 @@ impl Log {
             .collect()
     }
 
+    /// Whether the store held entries of any device when this log was opened
+    /// or since: what a rule of the log that changed since the store was
+    /// written has something to judge again.
+    pub(crate) fn has_history(&self) -> bool {
+        !self.devices.is_empty()
+    }
+
     // -- Catch-up -----------------------------------------------------------------
 
     /// Whether an admitted entry of `device` is held: one applied, or held
@@ -803,7 +836,7 @@ impl Log {
         self.own_heard = self.own_heard.max(seen);
         self.devices
             .entry(self.device.clone())
-            .or_insert_with(|| Dev::new(self.person.clone()));
+            .or_insert_with(|| Dev::new(self.person.clone(), self.own_capable));
         let mut fx = Effects::default();
         if seen > self.head() {
             fx.alerts.push(Alert::UnbackedCounter {

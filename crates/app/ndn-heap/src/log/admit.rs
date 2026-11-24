@@ -36,6 +36,7 @@ pub(super) struct Fresh<'a> {
     pub id: &'a EntryRef,
     pub wire: &'a Bytes,
     pub person: &'a Name,
+    pub owner_capable: bool,
     pub key_digest: [u8; 32],
     /// The chain link the entry states (`PREV`, the seq it names); zeros when
     /// the entry cannot be read, so it states nothing.
@@ -51,6 +52,7 @@ struct Loaded {
     entry: Entry,
     key: Name,
     person: Name,
+    owner_capable: bool,
 }
 
 /// How a held entry is judged again ([`Log::reassess`]).
@@ -215,8 +217,10 @@ impl Log {
         matches!(
             self.view().status(&a.id.device, a.id.seq),
             Some(Status::Refused(Refusal::OutsideCut(_)) | Status::Waiting)
-        ) && shape(a.data, a.id.seq)
-            .is_some_and(|(entry, _, _)| self.assess(&a.id, &a.v.person, &a.v.key, &entry).is_ok())
+        ) && shape(a.data, a.id.seq).is_some_and(|(entry, _, _)| {
+            self.assess(&a.id, &a.v.person, a.v.owner_capable, &a.v.key, &entry)
+                .is_ok()
+        })
     }
 
     /// Another copy of an entry held: nothing new, unless what it was refused
@@ -224,10 +228,16 @@ impl Log {
     fn duplicate(&mut self, a: &Arrival<'_>, fx: &mut Effects) -> Outcome {
         let (device, seq) = (&a.id.device, a.id.seq);
         if let Some(dev) = self.devices.get_mut(device)
-            && dev.person != a.v.person
+            && (dev.person != a.v.person || dev.owner_capable != a.v.owner_capable)
         {
+            let capability = dev.owner_capable != a.v.owner_capable;
             dev.person = a.v.person.clone();
+            dev.owner_capable = a.v.owner_capable;
             self.write_ledger(device);
+            if capability {
+                self.queue
+                    .push(Scope::Persons(BTreeSet::from([a.v.person.clone()])));
+            }
         }
         if self
             .view()
@@ -260,7 +270,9 @@ impl Log {
         self.count_gap(&id.device, id.seq, 0, false);
         if let Some((entry, _, _)) = shape(a.data, id.seq)
             && matches!(entry.body, Body::Members(_) | Body::Epoch(_))
-            && self.assess(id, &v.person, &v.key, &entry).is_ok()
+            && self
+                .assess(id, &v.person, v.owner_capable, &v.key, &entry)
+                .is_ok()
         {
             self.set_applied(id, &v.person, &entry, true, fx);
         }
@@ -332,7 +344,9 @@ impl Log {
                     self.equivocated(a, conflict, fx);
                     Err(Status::Refused(Refusal::Chain))
                 }
-                _ => self.assess(id, &v.person, &v.key, entry).map(|()| entry),
+                _ => self
+                    .assess(id, &v.person, v.owner_capable, &v.key, entry)
+                    .map(|()| entry),
             },
         };
         if let Err(Status::Refused(why)) = &verdict {
@@ -362,6 +376,7 @@ impl Log {
             id,
             wire: a.wire,
             person: &v.person,
+            owner_capable: v.owner_capable,
             key_digest: v.key_digest,
             link: stated.unwrap_or_default(),
             verdict,
@@ -427,6 +442,7 @@ impl Log {
         &self,
         id: &EntryRef,
         person: &Name,
+        owner_capable: bool,
         key: &Name,
         entry: &Entry,
     ) -> Result<(), Status> {
@@ -440,8 +456,16 @@ impl Log {
             return Err(Status::Waiting);
         }
         let structural = matches!(entry.body, Body::Members(_) | Body::Epoch(_));
-        // 3. Only an owner device carries Members and Epoch entries.
-        if structural && !(wire::owns(&self.space, key) && person == self.fold.owner()) {
+        let owner = person == self.fold.owner();
+        // 3. The owner's person acts only through its owner devices (an
+        // `admin` or `member` device, [`crate::trust::owner_capable`]): a
+        // guest, a node or a role-less device of the owner writes nothing as
+        // the owner, and only an owner device carries Members and Epoch
+        // entries.
+        if owner && !owner_capable {
+            return refuse(Refusal::NotOwnerDevice);
+        }
+        if structural && !(wire::owns(&self.space, key) && owner) {
             return refuse(Refusal::NotMember);
         }
         // 4. The signer's person writes, or was removed and the entry is
@@ -455,6 +479,11 @@ impl Log {
             Body::Put(_) if create == Some(false) => refuse(Refusal::Unsealed),
             Body::Sealed(_) if create == Some(true) => refuse(Refusal::Sealed),
             Body::Sealed(sealed) => {
+                // An epoch no owner device made has no Epoch entry that can ever name it:
+                // holding the entry closed would have every reader wait for its key for good.
+                if !self.may_make_epochs(&sealed.epoch.creator) {
+                    return refuse(Refusal::NotOwnerEpoch);
+                }
                 if self.keys.key(&self.space, &sealed.epoch).is_none() {
                     return Err(Status::Closed);
                 }
@@ -465,6 +494,22 @@ impl Log {
             }
             Body::Put(_) | Body::Members(_) | Body::Epoch(_) => Ok(()),
         }
+    }
+
+    /// Whether `creator`, the device an epoch id names, can be an owner device of
+    /// the space: its name lies under the owner's, and the log holds it as no
+    /// device of another person or one with no owner standing. A device not
+    /// heard of is judged by its name alone: its Epoch entry may be on its way.
+    fn may_make_epochs(&self, creator: &Name) -> bool {
+        if !wire::device_owns(&self.space, creator.components()) {
+            return false;
+        }
+        if *creator == self.device {
+            return self.person == *self.fold.owner() && self.own_capable;
+        }
+        self.devices
+            .get(creator)
+            .is_none_or(|dev| dev.person == *self.fold.owner() && dev.owner_capable)
     }
 
     /// Whether the entries of `device` signed by `person` are judged by a
@@ -510,12 +555,19 @@ impl Log {
             at: now,
         };
         self.store.insert(Kind::VERIFIED.of(&name), marker.encode());
+        let capability = self.devices.get(device).map(|d| d.owner_capable);
         let dev = self
             .devices
             .entry(device.clone())
-            .or_insert_with(|| Dev::new(f.person.clone()));
+            .or_insert_with(|| Dev::new(f.person.clone(), f.owner_capable));
         dev.person = f.person.clone();
+        dev.owner_capable = f.owner_capable;
         dev.held.insert(seq);
+        // What was held of the device before was judged by the other standing.
+        if capability.is_some_and(|was| was != f.owner_capable) {
+            self.queue
+                .push(Scope::Persons(BTreeSet::from([f.person.clone()])));
+        }
         let status = f.verdict.as_ref().err();
         self.count_gap(device, seq, prev_seq, admitted(status));
         self.set_status(device, seq, None, status);
@@ -574,6 +626,9 @@ impl Log {
     /// Replace the status record of an entry (`old` is what it is now).
     fn set_status(&mut self, device: &Name, seq: u64, old: Option<&Status>, new: Option<&Status>) {
         let closed = |s| u64::from(s == Some(&Status::Closed));
+        if closed(old) != closed(new) {
+            *self.closed_in.get_mut() = None;
+        }
         self.closed = (self.closed + closed(new)).saturating_sub(closed(old));
         let counts = |s| u64::from(!admitted(s));
         if let Some(dev) = self.devices.get_mut(device) {
@@ -838,6 +893,7 @@ impl Log {
             entry,
             key: (*key).clone(),
             person: self.devices.get(device)?.person.clone(),
+            owner_capable: self.devices.get(device)?.owner_capable,
         })
     }
 
@@ -868,7 +924,8 @@ impl Log {
                 {
                     return;
                 }
-                self.assess(&l.id, &l.person, &l.key, &l.entry).err()
+                self.assess(&l.id, &l.person, l.owner_capable, &l.key, &l.entry)
+                    .err()
             }
         };
         if l.status.as_ref().map(Status::code) == new.as_ref().map(Status::code) {

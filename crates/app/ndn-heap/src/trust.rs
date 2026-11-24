@@ -141,6 +141,11 @@ pub(crate) struct Verified {
     /// The digest of the public key that verified the signature, as its
     /// certificate stores it: one verification, so a cut can bind to it.
     pub key_digest: [u8; 32],
+    /// Whether the device may act as an owner device where its person is the
+    /// owner of a space: see [`owner_capable`]. Decided here, once, from the
+    /// context that vouched for the key; the log judges every owner power by
+    /// it (spec §1.2, §9.9).
+    pub owner_capable: bool,
 }
 
 /// The verdict on one packet.
@@ -701,6 +706,14 @@ impl Judge {
             .is_revoked(key)
     }
 
+    /// Whether the device key `key` (or a device name: the role is read from
+    /// the name alike) may act as an owner device, by the context that governs
+    /// it for `space` ([`owner_capable`]).
+    pub(crate) fn owner_capable(&self, key: &Name, space: &Name) -> bool {
+        let view = self.view_for(key, space, true);
+        owner_capable(&view.keyring().context_for(key), key)
+    }
+
     /// The revocations of the context that governs `person` for `space` that
     /// name a key under her namespace: what a reader's lost devices are.
     pub(crate) fn revoked_under(&self, person: &Name, space: &Name) -> Vec<Name> {
@@ -1014,6 +1027,26 @@ fn cut_of(ctx: &SignedTrustContext, key: &Name, device: Name, space: &Name) -> C
     Cut { device, keeps_to }
 }
 
+/// Whether `key`, a key of a device governed by `ctx`, may act as an owner
+/// device where `ctx`'s namespace owns a space: the single predicate every
+/// owner power of the log is judged by (admission of Members and Epoch entries,
+/// the owner's implicit write, the epoch grant, signals, and the owner
+/// device's own signing).
+///
+/// A namespace that declares the role layout (its context's schema is
+/// *authoritative*: the generated namespace schema every `ndn-cert` namespace
+/// carries, signed into the context by the root, so a signed marker and not
+/// the `DataRequiresCut` list an owner may narrow to nothing) has owner
+/// devices only among the keys whose role is `admin` or `member`: a `guest`
+/// (a friend's device for a while), a `node` (a relay), any other role, and a
+/// device with no role at all hold none of the owner's powers (fail closed).
+/// A namespace without the layout (a flat namespace of devices, as small hosts
+/// and tests make) has no roles to tell its devices apart by: every device
+/// of the namespace is an owner device, as before.
+pub(crate) fn owner_capable(ctx: &SignedTrustContext, key: &Name) -> bool {
+    !ctx.schema_is_authoritative() || matches!(ctx.role_of(key), Some(b"admin") | Some(b"member"))
+}
+
 /// Judge `data` by the durable rule of `view`.
 async fn decide(view: &Validator, data: &Data, space: &Name) -> Judged {
     let verdict = view.validate_durable(data).await;
@@ -1041,12 +1074,14 @@ fn accept(view: &Validator, data: &Data, safe: SafeData, key: Option<&Name>) -> 
             why: format!("its key {key} is no key name `<device>/KEY/<id>`"),
         });
     };
-    let person = view.keyring().context_for(&data.name).namespace().clone();
+    let ctx = view.keyring().context_for(&data.name);
+    let person = ctx.namespace().clone();
     Judged::Valid(Verified {
         key: key.clone(),
         device,
         person,
         key_digest,
+        owner_capable: owner_capable(&ctx, key),
     })
 }
 

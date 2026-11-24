@@ -45,7 +45,7 @@ use crate::rt;
 use crate::seal::{self, GrantRefusal, Keys};
 use crate::serve;
 use crate::space::{Follower, Heap, Share, SpaceInner, check_audience};
-use crate::store::Kind;
+use crate::store::{Kind, OWNER_RULE};
 use crate::sync::{HostRef, Net, Taken};
 use crate::trust::{Adopter, Adoption, Judge, Judged};
 use crate::wire::{
@@ -179,6 +179,16 @@ pub(crate) struct NodeInner {
 /// (2).
 const MEMBER: u8 = 1;
 const CARRIER: u8 = 2;
+
+/// What the judge says now of entries it was asked about again.
+#[derive(Default)]
+struct Rejudged {
+    /// Entries it refuses: device, seq, why.
+    refused: Vec<(Name, u64, Refusal)>,
+    /// Each device it accepts entries of, and whether it stands as an owner
+    /// device ([`crate::trust::owner_capable`]).
+    standing: BTreeMap<Name, bool>,
+}
 
 impl Node {
     /// Start the heap layer of `device` (e.g. `/alice/laptop`): sign with the
@@ -554,12 +564,16 @@ impl NodeInner {
     // -- Opening ----------------------------------------------------------------
 
     /// The log of `space` from the store, with the judge told what it lists.
+    /// A space the store holds entries of, written before the current owner
+    /// rule (the one recorded at `rule/<S>`), is marked stale: [`Self::migrate`]
+    /// judges it again once.
     fn open_log(&self, space: &Name) -> Result<Log, HeapError> {
-        let log = Log::open(
+        let mut log = Log::open(
             Params {
                 space: space.clone(),
                 device: self.device.clone(),
                 person: self.ns.clone(),
+                owner_capable: self.judge.owner_capable(self.signer.key_name(), space),
                 suspicion: Arc::clone(&self.suspicion),
                 signer: Arc::clone(&self.signer),
                 keys: Keys::new(self.recipient.clone()),
@@ -568,8 +582,44 @@ impl NodeInner {
             Arc::clone(&self.store),
             Arc::clone(&self.flusher),
         )?;
+        if self.store.get(&Kind::RULE.of(space)).as_deref() != Some(&[OWNER_RULE][..]) {
+            if log.has_history() {
+                log.rule_stale = true;
+            } else {
+                self.record_rule(space);
+            }
+        }
         self.judge.note(space, &SpaceInner::listing(&log));
         Ok(log)
+    }
+
+    /// The space is judged by the current owner rule: say so in the store.
+    pub(crate) fn record_rule(&self, space: &Name) {
+        self.store
+            .insert(Kind::RULE.of(space), Bytes::copy_from_slice(&[OWNER_RULE]));
+        self.flusher.note_write();
+    }
+
+    /// A space stored under an older owner rule (spec §9.9) is judged once by
+    /// the current one: every entry held of the owner's devices is judged
+    /// again, which withdraws what a guest or node device of the owner signed
+    /// (its Members and Epoch entries leave the fold, its writes the register)
+    /// and records each device's standing. An owner device of a sealed space
+    /// then signs a fresh epoch before the rule is recorded (the stale
+    /// device may hold keys: [`SpaceInner::settle`]); any other records it at
+    /// once.
+    async fn migrate(&self, log: &mut Log, follower: bool) {
+        if !log.rule_stale {
+            return;
+        }
+        let owner = log.fold.owner().clone();
+        let names = log.held_names(&owner);
+        let judged = self.rejudged(&log.space, names).await;
+        self.apply_rejudged(log, judged);
+        if follower || !log.sealed() || log.owner_only().is_err() {
+            log.rule_stale = false;
+            self.record_rule(&log.space);
+        }
     }
 
     /// `space` as a member or a carrier, with `opening` held: the one held
@@ -596,7 +646,8 @@ impl NodeInner {
         if self.stopped.load(Ordering::Relaxed) {
             return Err(HeapError::local("the node is stopped"));
         }
-        let log = self.open_log(space)?;
+        let mut log = self.open_log(space)?;
+        self.migrate(&mut log, follower).await;
         self.store.insert(
             Kind::SPACE.of(space),
             Bytes::copy_from_slice(&[if follower { CARRIER } else { MEMBER }]),
@@ -680,17 +731,14 @@ impl NodeInner {
             .filter(|ctx| !ctx.revocations().is_empty())
             .map(|ctx| ctx.namespace().clone())
             .collect();
-        for (log, _) in &mut held {
+        for (log, follower) in &mut held {
             let names: Vec<Name> = revoking
                 .iter()
                 .flat_map(|person| log.held_names(person))
                 .collect();
-            for (device, seq, why) in self.refusals(&log.space, names).await {
-                let fx = log.withdraw(&device, seq, why);
-                if fx.membership {
-                    self.judge.note(&log.space, &SpaceInner::listing(log));
-                }
-            }
+            let judged = self.rejudged(&log.space, names).await;
+            self.apply_rejudged(log, judged);
+            self.migrate(log, *follower).await;
         }
         // What the store holds may be only in the operating system's
         // buffers: it is durable before any of it is published.
@@ -726,11 +774,12 @@ impl NodeInner {
 
     // -- What the judge says later ----------------------------------------------
 
-    /// The entries named that the judge now refuses, by the durable rule:
-    /// device, seq, why. Entries it cannot decide yet, and a lapse (this
-    /// node's clock alone says it), are left as they are.
-    async fn refusals(&self, space: &Name, names: Vec<Name>) -> Vec<(Name, u64, Refusal)> {
-        let mut out = Vec::new();
+    /// What the judge says now of the entries named, by the durable rule: the
+    /// refusals (device, seq, why), and for each device it accepts entries
+    /// of, whether it stands as an owner device. Entries it cannot decide yet,
+    /// and a lapse (this node's clock alone says it), are left as they are.
+    async fn rejudged(&self, space: &Name, names: Vec<Name>) -> Rejudged {
+        let mut out = Rejudged::default();
         for name in names {
             let Some(log_name) = parse_log_name(&name) else {
                 continue;
@@ -741,13 +790,33 @@ impl NodeInner {
             let Ok(data) = Data::decode(wire) else {
                 continue;
             };
-            if let Judged::Refused(why) = self.judge.validate(&data, space).await
-                && !matches!(why, Refusal::Lapsed { .. })
-            {
-                out.push((log_name.device, log_name.seq, why));
+            match self.judge.validate(&data, space).await {
+                Judged::Refused(why) if !matches!(why, Refusal::Lapsed { .. }) => {
+                    out.refused.push((log_name.device, log_name.seq, why));
+                }
+                Judged::Valid(v) => {
+                    out.standing.insert(log_name.device, v.owner_capable);
+                }
+                _ => {}
             }
         }
         out
+    }
+
+    /// Apply what [`Self::rejudged`] says to a log not yet joined (at start).
+    fn apply_rejudged(&self, log: &mut Log, judged: Rejudged) {
+        for (device, seq, why) in judged.refused {
+            let fx = log.withdraw(&device, seq, why);
+            if fx.membership {
+                self.judge.note(&log.space, &SpaceInner::listing(log));
+            }
+        }
+        for (device, capable) in judged.standing {
+            let fx = log.restand(&device, capable);
+            if fx.membership {
+                self.judge.note(&log.space, &SpaceInner::listing(log));
+            }
+        }
     }
 
     /// The entries named that the judge now accepts: device and seq.
@@ -770,21 +839,38 @@ impl NodeInner {
         out
     }
 
-    /// Judge the held entries of `persons` again in `spaces`, and withdraw
-    /// what is refused now.
+    /// Judge the held entries of `persons` again in `spaces`, withdraw what is
+    /// refused now, and read the standing of each device again (an owner
+    /// device, or not: spec §9.9), this device's own included.
     async fn rejudge(self: &Arc<Self>, spaces: Vec<Name>, persons: &[Name]) {
         for space in spaces {
             let Some(held) = self.space_of(&space) else {
                 continue;
             };
+            let routed = {
+                let mut log = held.log.lock();
+                let capable = self.judge.owner_capable(self.signer.key_name(), &space);
+                let fx = log.restand(&self.device, capable);
+                held.route(self, &log, fx, true)
+            };
+            held.finish(self, routed);
             let names: Vec<Name> = {
                 let log = held.log.lock();
                 persons.iter().flat_map(|p| log.held_names(p)).collect()
             };
-            for (device, seq, why) in self.refusals(&space, names).await {
+            let judged = self.rejudged(&space, names).await;
+            for (device, seq, why) in judged.refused {
                 let routed = {
                     let mut log = held.log.lock();
                     let fx = log.withdraw(&device, seq, why);
+                    held.route(self, &log, fx, true)
+                };
+                held.finish(self, routed);
+            }
+            for (device, capable) in judged.standing {
+                let routed = {
+                    let mut log = held.log.lock();
+                    let fx = log.restand(&device, capable);
                     held.route(self, &log, fx, true)
                 };
                 held.finish(self, routed);
@@ -1080,7 +1166,10 @@ impl NodeInner {
         let person = self.person_of(asker);
         let log = held.log.lock();
         let revoked = asker_key.is_some_and(|k| self.judge.key_revoked(k, space));
-        seal::may_grant(&log.fold, &log.keys, space, epoch, &person, revoked)?;
+        let capable = self.judge.owner_capable(asker_key.unwrap_or(asker), space);
+        seal::may_grant(
+            &log.fold, &log.keys, space, epoch, &person, capable, revoked,
+        )?;
         // Under the lock: the entry is held back there, in the same stretch
         // that stores it, so no grant can slip in between.
         if epoch.creator == self.device && !held.publisher.servable(epoch.seq) {

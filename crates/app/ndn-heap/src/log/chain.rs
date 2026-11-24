@@ -169,6 +169,10 @@ pub(super) struct Dev {
     /// The device's person: the namespace of the context that vouched for
     /// its key, as of the last entry taken from it.
     pub person: Name,
+    /// Whether the device may act as an owner device where its person owns
+    /// the space ([`crate::trust::owner_capable`]), as of the last entry
+    /// taken from it.
+    pub owner_capable: bool,
     /// The seqs with a marker: every verified entry, applied or not.
     pub held: Ranges,
     /// The gap statements that count: seq of the admitted, non-equivocal
@@ -181,9 +185,10 @@ pub(super) struct Dev {
 }
 
 impl Dev {
-    pub(super) fn new(person: Name) -> Dev {
+    pub(super) fn new(person: Name, owner_capable: bool) -> Dev {
         Dev {
             person,
+            owner_capable,
             held: Ranges::default(),
             gaps: BTreeMap::new(),
             nonvouching: 0,
@@ -209,6 +214,7 @@ impl Dev {
         out.put_slice(&person);
         put_pairs(&mut out, self.held.0.iter().copied());
         put_pairs(&mut out, self.gaps.iter().map(|(&seq, &prev)| (seq, prev)));
+        out.put_u8(u8::from(self.owner_capable));
         out.freeze()
     }
 
@@ -230,10 +236,14 @@ impl Dev {
                 return None;
             }
         }
+        // The flag follows the pairs; a record from before it was kept (the
+        // rule of spec §9.9 version 0) reads as "owner device", which the
+        // one re-assessment at open settles.
+        let owner_capable = input.first().is_none_or(|&flag| flag != 0);
         Some(Dev {
             held,
             gaps,
-            ..Dev::new(person)
+            ..Dev::new(person, owner_capable)
         })
     }
 }
@@ -271,6 +281,8 @@ impl Status {
             Status::Refused(Refusal::Sealed) => 7,
             Status::Refused(Refusal::Untrusted { .. }) => 8,
             Status::Refused(Refusal::Chain) => 10,
+            Status::Refused(Refusal::NotOwnerDevice) => 12,
+            Status::Refused(Refusal::NotOwnerEpoch) => 13,
             // The rest are never kept as a status (Lapsed and Suspected are
             // not recorded); they read back as the refusal that closes a
             // copy's way in.
@@ -293,6 +305,8 @@ impl Status {
             8 => Status::Refused(Refusal::Untrusted { why: String::new() }),
             10 => Status::Refused(Refusal::Chain),
             11 => Status::Refused(Refusal::BadSignature),
+            12 => Status::Refused(Refusal::NotOwnerDevice),
+            13 => Status::Refused(Refusal::NotOwnerEpoch),
             _ => return None,
         })
     }
@@ -308,6 +322,8 @@ impl Status {
             Status::Refused(why) => matches!(
                 why,
                 Refusal::NotMember
+                    | Refusal::NotOwnerDevice
+                    | Refusal::NotOwnerEpoch
                     | Refusal::OutsideCut(_)
                     | Refusal::Unsealed
                     | Refusal::Sealed

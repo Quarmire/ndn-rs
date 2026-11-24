@@ -53,9 +53,11 @@ MUST NOT depend on any forwarder, cache, repository, relay or sync notice.
 - A **space** `S` is the one unit of sharing, membership, sealing, sync and
   follow. Its name is `<O>/32=data/<c1>[/<c2>…]` (§2); its **owner** is `O`,
   the components before `32=data`. An **owner device** is a device whose name
-  lies under `O` and whose key the trust context of `O` itself validates (§2.1,
-  §3.8 step 6). A space has **writers** and **readers** (persons); the owner is an
-  implicit writer and, unless the space is public, an implicit reader.
+  lies under `O`, whose key the trust context of `O` itself validates, and whose
+  role is `admin` or `member` where `O` declares the role layout (§2.1, §3.8
+  step 6). A space has **writers** and **readers** (persons); the owner is an
+  implicit writer (through its owner devices) and, unless the space is public,
+  an implicit reader.
   A space is **public** when its creation says `ANYONE` (§5), and **sealed**
   otherwise.
 - An **entry** is one Data packet named `<D>/32=log/<S>/seq=<n>` and signed by
@@ -210,15 +212,24 @@ GenericNameComponent (0x08).
 
 The **owner rule.** A key `<D>/KEY/<id>` is a key of an owner device of space
 `S = <O>/32=data/…` only if the components of `O` are a prefix of those of `D`,
-and the trust context that validates the key is `O`'s own (§9). The first half
+the trust context that validates the key is `O`'s own (§9), **and** its role is
+`admin` or `member` where `O` declares the role layout. The first half
 depends on the two names alone, so every node judges it alike in any order; the
 second is the **person** of the key (the namespace of the held context that
-governs the device's name, §9.1), which must be `O` itself, and admission checks both for a
-`Members` or `Epoch` entry (§3.8 step 6). A device under a longer held namespace
+governs the device's name, §9.1), which must be `O` itself; the third is the
+key's **role** (the component after `O` in the device name), judged by the
+governing context and carried with the verdict (`Verified::owner_capable`).
+Admission checks all three for a `Members` or `Epoch` entry (§3.8 step 6). A
+device under a longer held namespace
 is that namespace's device: with `/home` and `/home/bob` held,
 `/home/bob/member/laptop` is a device of `/home/bob`, not of `/home`, although
 `/home` is a prefix of its name, and so it carries no `Members` or `Epoch` entry
-of a space of `/home`.
+of a space of `/home`. **The role layout** is declared by a marker the root
+signs into the context: its schema is *authoritative* (the generated namespace
+schema of every `ndn-cert` namespace). Where it is declared, a `guest`, a `node`,
+any other role and a device with no role are not owner devices; where it is not
+(a flat namespace), every device of `O` is. The `DataRequiresCut` list is not
+the marker: an owner can narrow it to nothing without declaring a flat layout.
 
 ### 2.2 Packets
 
@@ -573,9 +584,14 @@ only through these steps in order. Each refusal says why and what to do
 5. **Chain.** A fork (§3.7) refuses the entry (`Chain`) and raises the alert.
    Entries inside a declared gap are valid orphans and are kept and applied.
 6. **Carrier.** A `Members` or `Epoch` entry MUST be signed by a key whose
-   device lies under the owner's namespace by name (§2.1) **and** whose person
-   (the namespace of the held context that governs its name, §9.1) is the owner;
-   otherwise it is refused (`NotMember`).
+   device lies under the owner's namespace by name (§2.1), whose person
+   (the namespace of the held context that governs its name, §9.1) is the owner,
+   **and** whose role is `admin` or `member` where the owner declares the role
+   layout (`Verified::owner_capable`, §2.1); otherwise it is refused
+   (`NotMember`; `NotOwnerDevice` for a device of the owner that is no owner
+   device). The owner's person writes the same way: an entry of any kind
+   signed by a guest, node or role-less device of the owner is refused
+   (`NotOwnerDevice`), since the owner's implicit write is its owner devices'.
 7. **Membership.** The signer's person `P` is the owner, or is a writer of the
    space (§5), or `P` was removed and the entry is **inside the cut**: there is
    a tip `t` among the removal tips for `P` with `t.device == D`, and the entry
@@ -589,8 +605,12 @@ only through these steps in order. Each refusal says why and what to do
    public, a sealed Put is refused (`Sealed`); known and sealed, a plain Put is
    refused (`Unsealed`); a sealed Put whose epoch key is not held is **held
    closed** (stored, chained, not applied, its path unknown; the node asks for
-   the key, §6.5) and opens when the key arrives; a sealed Put that does not open
-   under the key it names is refused (`BadSignature`). **Until a `CREATE` is
+   the key, §6.5) and opens when the key arrives; a sealed Put whose epoch's
+   creator is no owner device of the space (its name is not under the owner's,
+   or the log holds the device as no owner device, §2.1) is refused
+   (`NotOwnerEpoch`: no Epoch entry can ever name that epoch, and holding it
+   closed would have every reader wait for its key for good); a sealed Put that
+   does not open under the key it names is refused (`BadSignature`). **Until a `CREATE` is
    known** neither is refused for it: a plain Put is applied, a sealed one waits
    as above, and every held entry is judged again when the creation arrives.
 9. **Apply.** The register and the fold take it, and everything is written as
@@ -797,6 +817,7 @@ big-endian, so keys order numerically. Other names are appended as components.
 | `head/<S>` | own `seq` 8 ‖ its signed-region digest 32 (40 octets) | with every own entry |
 | `reserve/<S>` | `R` 8 (big-endian) ‖ clean 1 (0 or 1): 9 octets | at open, at each extension, at clean close |
 | `revoked/<S>` | 32 octets: the digest of the revocations of the readers' devices (§5.3 rule 8) that the last `Epoch` entry this device signed accounted for | after each Epoch entry this device signs |
+| `rule/<S>` | 1 octet: the version of the owner rule (§2.1, §9.9) the space's entries were last judged by here; 1 is the role rule | at the first open of a space with no entries, and after the one judgement at start (and the fresh epoch an owner device of a sealed space signs) of a space stored under an earlier rule |
 | `space/<S>` | 1 octet: 1 a space this node is a member of, 2 a space it only follows (§10) | when the space is created, opened or followed |
 | `structural/<S as TLV component>/<device as TLV component>/<seq 8>` | empty | with a `Members` or `Epoch` entry (start replays only these) |
 | `heads/<S as TLV component>/<SHA-256 of the PATH TLV>` | the `PATH` TLV ‖ `ENTRY_REF`* | with the apply |
@@ -805,8 +826,8 @@ big-endian, so keys order numerically. Other names are appended as components.
 | `equivocal/<entry name>` | the second packet | on equivocation |
 | `suspected/<key name>` | `since` 8 octets, big-endian, ms (`Config.clock`) | when a key is suspected; one record per key, for the whole node: one map shared by every space's log, read once at start |
 | `scoped/<person>` | the adopted trust context of a person (§9.4) | on adoption |
-| `ledger/<S as TLV component>/<device as TLV component>` | what the node holds of one device: the length (2 octets) and the `Name` TLV of its person ‖ the seqs held as a count (4 octets) then `(low 8, high 8)` ranges, ascending, disjoint, non-adjacent ‖ the **counting gap statements** (§3.6) as a count (4 octets) then `(seq 8, prev seq 8)`, ascending; the seqs declared void are derived from them. At most 1,024 ranges and 1,024 gap statements (§3.8) | with every entry taken, and when a gap statement stops or starts counting |
-| `status/<S as TLV component>/<device as TLV component>/<seq 8>` | why a held entry is not applied, one octet, the kind and nothing more: 1 closed, 2 waiting, 3 not readable, 4 `NotMember`, 5 `OutsideCut`, 6 `Unsealed`, 7 `Sealed`, 8 `Untrusted`, 10 `Chain`, 11 any other (read back as `BadSignature`); absent for an applied entry. What a refusal says besides its kind (the seq a cut keeps to, the judge's reason) is told to the host when the refusal is made, and is not stored: nothing reads it back | with the entry |
+| `ledger/<S as TLV component>/<device as TLV component>` | what the node holds of one device: the length (2 octets) and the `Name` TLV of its person ‖ the seqs held as a count (4 octets) then `(low 8, high 8)` ranges, ascending, disjoint, non-adjacent ‖ the **counting gap statements** (§3.6) as a count (4 octets) then `(seq 8, prev seq 8)`, ascending; the seqs declared void are derived from them ‖ one octet, the device's **standing**: 1 an owner device where its person owns the space, 0 not (§2.1; a record without it reads as 1 until the one judgement at start, §9.9). At most 1,024 ranges and 1,024 gap statements (§3.8) | with every entry taken, when a gap statement stops or starts counting, and when the judge says a device's standing changed |
+| `status/<S as TLV component>/<device as TLV component>/<seq 8>` | why a held entry is not applied, one octet, the kind and nothing more: 1 closed, 2 waiting, 3 not readable, 4 `NotMember`, 5 `OutsideCut`, 6 `Unsealed`, 7 `Sealed`, 8 `Untrusted`, 10 `Chain`, 11 any other (read back as `BadSignature`), 12 `NotOwnerDevice`; absent for an applied entry. What a refusal says besides its kind (the seq a cut keeps to, the judge's reason) is told to the host when the refusal is made, and is not stored: nothing reads it back | with the entry |
 
 A record the store holds that cannot be read (wrong length, a clean flag other
 than 0 or 1) is **never taken for an absent one**: a node that cannot tell what
@@ -1312,23 +1333,27 @@ otherwise it is dropped. It unwraps with its recipient key and the grant's name
 as AAD.
 
 **Granter side.** A device `G` answers `<G>/32=grant/<GrantAsk>` **only when all
-five hold**, checked in this order:
+six hold**, checked in this order:
 
 1. a held owner-signed `Epoch` entry names `E` (`EpochNotNamed`);
-2. `audience(E)` contains the asker's **person** — the person of the device
+2. the asker is no guest, node or role-less device of the owner: where the
+   asker's person is the owner, the asking device's role is `admin` or `member`
+   (`NotOwnerDevice`; §2.1, §9.9) — the owner's person is in every audience, but
+   only its `admin` and `member` devices hold the owner's powers;
+3. `audience(E)` contains the asker's **person** — the person of the device
    `D` of the seal key name in the ask (`NotInAudience`);
-3. `readers()` contains that person **now** (`NotReaderNow`): a removed
+4. `readers()` contains that person **now** (`NotReaderNow`): a removed
    reader fails here for every later ask;
-4. `G` holds the epoch's key (`KeyNotHeld`);
-5. the key that signed the asker's seal key packet is **not revoked** by a trust
+5. `G` holds the epoch's key (`KeyNotHeld`);
+6. the key that signed the asker's seal key packet is **not revoked** by a trust
    context `G` holds (`AskerKeyRevoked`): known only once the packet is judged,
    so it is checked after the fetch.
 
-Anything else gets **no answer**, and `G` fetches nothing for it. Conditions 1–4
+Anything else gets **no answer**, and `G` fetches nothing for it. Conditions 1–5
 are decided first, before anything is fetched. Then `G` fetches the seal key
 packet named by the ask — `<D>/32=seal/<pk>` — and verifies it (§6.2: signed by
 a key of `D`, the Content equal to `pk`, one run per seal key, kept once
-verified); all five conditions are checked **again** after the fetch, with the
+verified); all six conditions are checked **again** after the fetch, with the
 key that signed it, since the records may have moved. It answers with the key
 wrapped to `pk` (§6.2) under the **grant's own name** as AAD, signed by its
 device key. One name has one packet while it is kept; a granter keeps its last
@@ -2065,6 +2090,47 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   `/home/bob`: it writes `Put` entries of `/home/32=data/…` if `/home` lists
   `/home/bob` as a writer, and it can **never** carry a `Members` or `Epoch`
   entry of that space, listed or not.
+- **A guest or relay device of the owner holds none of the owner's powers (the
+  owner rule's third half, review H1).** In a namespace that declares the role
+  layout, the owner's person acts only through devices whose role is `admin` or
+  `member`. Before, "owner device" meant a name under `O` and a key `O`'s context
+  validates, so a `guest` device (a friend's, for a weekend) or a `node` relay
+  of the owner could sign `Members` (add itself or a stranger as reader, remove
+  members) and `Epoch` entries, wrote with the owner's implicit write, and was
+  granted the key of every epoch, which defeats sealing against the relay. Now
+  the judge decides it once, from the context that governs the key
+  (`owner_capable` in `Verified`), and the log uses that one predicate for
+  admission step 6, the owner's implicit write (a refused entry says
+  `NotOwnerDevice` and what to do), a device's own signing (`NotOwner`; a put
+  says `NotAllowed`), the owner-log hole check, epoch repair, `change`, the
+  grant (`GrantRefusal::NotOwnerDevice`) and the signal scope. A device with no
+  role at all in a role-layout namespace is no owner device either (fail
+  closed). **The role layout is read from a signed marker, not inferred:** the
+  governing trust context's schema is *authoritative* — the generated namespace
+  schema every namespace `ndn-cert` creates carries, signed into the context by
+  the root and kept by every update. The `DataRequiresCut` list is not used for
+  it: an owner may narrow that list to nothing, which would turn role-less names
+  back into owner devices. A namespace without the marker (a flat namespace of
+  devices, as small hosts and tests make) has no roles to tell devices apart by,
+  and all its devices are owner devices, as before.
+- **Migration.** A space stored under the earlier rule has no `rule/<S>` record
+  (§4.3). At start, the first time, every held entry of the owner's devices is
+  judged again under the new rule: what a guest or node device signed leaves the
+  fold and the register (`Withdrawn`, `NotOwnerDevice`), and each device's
+  standing is stored in its ledger record (a record without the flag reads as an
+  owner device until this judgement runs). An owner device of a sealed space then
+  signs a **fresh epoch** before the record is written (guests may already hold
+  keys of the epochs in force), and a device that cannot sign one records the
+  rule at once. Each owner device that opens the space signs one; they merge as
+  concurrent epochs do (§5.3).
+- **A writer that holds an owner entry above a hole still seals in the fold's
+  epoch (FA6, a residual).** A device that holds a later owner entry above a hole
+  in the owner's log judges whether it may write by the fold it holds (a put
+  never waits on other devices, `p1`) and seals in the epoch that fold names in
+  force: a reader an entry in the hole removes can read what that device writes
+  until the hole is filled and the epoch repaired, as with any removal that has
+  not reached a device yet (`o1`). The removal binds every device that holds it,
+  and no key goes to the removed reader once the removal is held (§6.5).
 
 ## 10. Register and API
 
@@ -2934,10 +3000,12 @@ to 0.40 s, first `get` 0.014 ms, listing 5.4 ms.
 - **What a relay sees.** Names, kinds, writers, seqs, chain links, epoch ids, the
   digests an entry supersedes and sizes; with sealing, not the path or the value
   (§6.7). Pieces show only the ciphertext's size (§8.7).
-- **The owner rule's second half is checked.** A `Members` or `Epoch` carrier
-  must be a device of the owner's *person*: a device under the owner's name
-  whose key a deeper context validates cannot carry them, at admission or when
-  signing (§3.8 step 6, §9.9).
+- **The owner rule's second and third halves are checked.** A `Members` or
+  `Epoch` carrier must be a device of the owner's *person* (a device under the
+  owner's name whose key a deeper context validates cannot carry them) **and**
+  an `admin` or `member` device where the owner declares the role layout (a
+  `guest`, a `node` relay and a role-less device cannot), at admission, when
+  signing, when granting a key and for signals (§2.1, §3.8 step 6, §9.9).
 - **Writers that are not readers** of a sealed space cannot hold a key and cannot
   seal (§5.7, §10.7): their `put` answers `NotAllowed`. A sealed space listing
   more than 256 readers is refused before anything is signed (§10.7).

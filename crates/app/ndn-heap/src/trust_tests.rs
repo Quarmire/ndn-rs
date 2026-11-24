@@ -843,6 +843,63 @@ async fn a_signer_of_a_held_namespace_is_valid_and_named() {
     );
 }
 
+/// In a namespace that declares the role layout (its schema is authoritative: the generated
+/// namespace schema, a marker the root signs), only `admin` and `member` devices are owner
+/// devices; a guest, a node, any other role and a device with no role are not, whatever the
+/// `DataRequiresCut` list says. A flat namespace tells its devices apart by nothing: all are.
+#[test]
+fn only_admin_and_member_devices_are_owner_devices_in_a_role_layout() {
+    let layout = |cut: &[&str]| {
+        let mut ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_version(1)
+            .schema_authoritative();
+        for role in cut {
+            ctx = ctx.with_data_requires_cut(*role);
+        }
+        ctx
+    };
+    let key = |role: &str| n(&format!("/home/bob/{role}/phone/KEY/k1"));
+    for ctx in [
+        layout(&[]),
+        layout(&["guest"]),
+        layout(&["admin", "member", "node", "guest"]),
+    ] {
+        for (role, expected) in [
+            ("admin", true),
+            ("member", true),
+            ("guest", false),
+            ("node", false),
+            ("shared", false),
+            ("phone", false),
+        ] {
+            assert_eq!(owner_capable(&ctx, &key(role)), expected, "{role}");
+        }
+        assert!(
+            !owner_capable(&ctx, &n("/home/bob/phone/KEY/k1")),
+            "a device with no role in a role layout is none, even with the list narrowed to nothing"
+        );
+    }
+    let flat = SignedTrustContext::hierarchical(n("/home/bob")).with_version(1);
+    assert!(owner_capable(&flat, &key("guest")));
+    assert!(owner_capable(&flat, &n("/home/bob/phone/KEY/k1")));
+}
+
+/// The judge decides it once, from the context that governs the key: a verified member device
+/// carries it, and asked by name or key the judge says the same of any device.
+#[tokio::test]
+async fn the_judge_says_whether_a_device_is_an_owner_device() {
+    let (judge, phone) = bob((PAST, u64::MAX), |c| c).await;
+    let v = valid(judge.validate(&bob_entry(1, &phone), &bob_space()).await);
+    assert!(v.owner_capable, "a flat namespace's device");
+
+    let (judge, phone) = bob((PAST, u64::MAX), |c| c.schema_authoritative()).await;
+    let v = valid(judge.validate(&bob_entry(1, &phone), &bob_space()).await);
+    assert!(v.owner_capable, "{DEVICE} is a member device");
+    assert!(judge.owner_capable(&n(PHONE_KEY), &bob_space()));
+    assert!(!judge.owner_capable(&n("/home/bob/guest/phone/KEY/k1"), &bob_space()));
+    assert!(!judge.owner_capable(&n("/home/bob/node/vps"), &bob_space()));
+}
+
 /// A key revoked with a cut refuses what the cut does not accept as outside
 /// the cut, and the cut names the tip it keeps; with no cut it keeps nothing.
 #[tokio::test]

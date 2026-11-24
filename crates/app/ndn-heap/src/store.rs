@@ -41,6 +41,11 @@ mod tests;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Kind(&'static str);
 
+/// The version of the owner rule (spec §9.9): 1 is "only an `admin` or
+/// `member` device of the owner holds the owner's powers"; 0 (no record) judged
+/// every device of the owner's namespace as an owner device.
+pub(crate) const OWNER_RULE: u8 = 1;
+
 impl Kind {
     /// `verified/<entry name>`: that an entry's signature was verified
     /// ([`Marker`]).
@@ -66,6 +71,11 @@ impl Kind {
     /// `revoked/<S>`: the revocations of the readers' devices the last epoch
     /// this device signed accounted for (a 32-octet digest, spec §6.6).
     pub(crate) const REVOKED: Kind = Kind("revoked");
+    /// `rule/<S>`: the version of the owner rule (spec §9.9) the space's
+    /// entries were last judged by here (one octet, [`OWNER_RULE`]). A space
+    /// with entries and no such record, or an older one, is judged once at
+    /// start, and the owner devices sign a fresh epoch.
+    pub(crate) const RULE: Kind = Kind("rule");
     /// `structural/<S>/<device>/<seq 8>`, empty: a Members or Epoch entry.
     /// Start replays only these.
     pub(crate) const STRUCTURAL: Kind = Kind("structural");
