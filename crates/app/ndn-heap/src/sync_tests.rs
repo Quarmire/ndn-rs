@@ -1558,6 +1558,160 @@ async fn a_holder_is_never_asked_for_a_key() {
     );
 }
 
+/// The key whose certificate the toy log's judgement of every entry waits for in the cases
+/// below: the writer is gone, and the only route for the name of its certificate is its dead
+/// link (the validator's own fetch of it has failed).
+const PHONE_KEY: &str = "/alice/phone/KEY/1";
+
+/// A packet a holder gives for the key's certificate: named under the key, with `body`.
+fn certificate(key: &str, body: &[u8]) -> Bytes {
+    DataBuilder::new(n(key).append("ca").append_version(1), body).sign_digest_sha256()
+}
+
+/// What a holder answers: seq 1 of the phone's log and, as a held copy, the certificate
+/// `cert` of the key when it has one.
+fn holder_with(name: &Name, holder: &str, cert: Option<Bytes>) -> Option<Reply> {
+    let (h, original) = parse_held_name(name)?;
+    if h != n(holder) {
+        return None;
+    }
+    if original == n(PHONE_KEY) {
+        return cert.map(|cert| Reply::Data(wrapped(name, cert)));
+    }
+    let log = parse_log_name(&original).filter(|l| l.seq == 1)?;
+    (log.device == n(PHONE)).then(|| Reply::Data(wrapped(name, genuine(PHONE, 1))))
+}
+
+fn certificate_asks(wire: &Wire) -> Vec<Name> {
+    wire.names()
+        .iter()
+        .filter_map(parse_held_name)
+        .filter(|(_, original)| *original == n(PHONE_KEY))
+        .map(|(holder, _)| holder)
+        .collect()
+}
+
+/// A reader that took an entry from a holder, whose judgement waits for the certificate of the
+/// writer's key: the writer is gone and nothing routes the certificate's name, so the
+/// certificate is asked of the holder as a held copy; the entry is then taken. Without a
+/// holder nothing is asked and the entry waits.
+#[tokio::test(start_paused = true)]
+async fn a_certificate_the_judgement_waits_for_is_asked_of_a_holder_as_a_held_copy() {
+    let script = |name: &Name| {
+        holder_with(name, NAS, Some(certificate(PHONE_KEY, b"cert")))
+            .unwrap_or(Reply::Nack(NackReason::NoRoute))
+    };
+    let r = rig_with(Config {
+        holders: vec![n(NAS)],
+        ..Config::default()
+    })
+    .await;
+    r.host.st.lock().waits_for = Some(n(PHONE_KEY));
+    r.wire.script(script);
+    r.group.on_update(notice(PHONE, 1));
+    pass(60).await;
+    assert!(
+        r.host.holds(PHONE, 1),
+        "the chain was completed with the holder's certificate and the entry taken"
+    );
+    assert_eq!(r.host.st.lock().waits_for, None);
+    assert_eq!(
+        certificate_asks(&r.wire),
+        vec![n(NAS)],
+        "one ask, of the holder"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_a_holder_the_certificate_is_asked_of_no_one_and_the_entry_waits() {
+    let r = rig().await;
+    r.host.st.lock().waits_for = Some(n(PHONE_KEY));
+    r.wire.script(|name| {
+        holder_with(name, NAS, Some(certificate(PHONE_KEY, b"cert")))
+            .unwrap_or(Reply::Nack(NackReason::NoRoute))
+    });
+    r.group.on_update(notice(PHONE, 1));
+    pass(60).await;
+    assert!(!r.host.holds(PHONE, 1));
+    assert!(certificate_asks(&r.wire).is_empty());
+}
+
+/// What a holder gives is never believed for saying it: a packet that is no certificate of the
+/// key (another key's), and a copy the node takes and the chain does not stand on (a forgery),
+/// are not the end of the asking; the next source is asked, and the entry is taken when one
+/// gives the certificate.
+#[tokio::test(start_paused = true)]
+async fn a_forged_or_foreign_certificate_from_a_holder_is_refused_and_the_next_is_asked() {
+    const SECOND: &str = "/alice/nas2";
+    const THIRD: &str = "/alice/nas3";
+    let r = rig_with(Config {
+        holders: vec![n(NAS), n(SECOND), n(THIRD)],
+        ..Config::default()
+    })
+    .await;
+    r.host.st.lock().waits_for = Some(n(PHONE_KEY));
+    r.wire.script(|name| {
+        let held = match parse_held_name(name) {
+            Some((h, _)) => h,
+            None => return Reply::Nack(NackReason::NoRoute),
+        };
+        let cert = if held == n(NAS) {
+            Some(certificate(PHONE_KEY, b"forged"))
+        } else if held == n(SECOND) {
+            Some(certificate("/alice/tablet/KEY/1", b"cert"))
+        } else {
+            Some(certificate(PHONE_KEY, b"cert"))
+        };
+        // Only the first holder has the entry; the three have a certificate each.
+        let entry_holder = n(NAS);
+        if held != entry_holder
+            && let Some((_, original)) = parse_held_name(name)
+            && original != n(PHONE_KEY)
+        {
+            return Reply::Nack(NackReason::NoRoute);
+        }
+        let which = if held == n(NAS) {
+            NAS
+        } else if held == n(SECOND) {
+            SECOND
+        } else {
+            THIRD
+        };
+        holder_with(name, which, cert).unwrap_or(Reply::Nack(NackReason::NoRoute))
+    });
+    r.group.on_update(notice(PHONE, 1));
+    pass(60).await;
+    assert!(r.host.holds(PHONE, 1), "the third holder's certificate");
+    assert_eq!(
+        certificate_asks(&r.wire)[..3],
+        [n(NAS), n(SECOND), n(THIRD)],
+        "the holders in turn, in the order configured"
+    );
+    assert_eq!(r.host.st.lock().certs_offered.len(), 3);
+}
+
+/// A certificate that is not in the holder's cache is a miss: the holder Nacks, the entry
+/// waits, and the ask is made again after growing pauses, not once per round of the entry.
+#[tokio::test(start_paused = true)]
+async fn a_certificate_a_holder_does_not_hold_is_a_miss_asked_again_with_growing_pauses() {
+    let r = rig_with(Config {
+        holders: vec![n(NAS)],
+        ..Config::default()
+    })
+    .await;
+    r.host.st.lock().waits_for = Some(n(PHONE_KEY));
+    r.wire
+        .script(|name| holder_with(name, NAS, None).unwrap_or(Reply::Nack(NackReason::NoRoute)));
+    r.group.on_update(notice(PHONE, 1));
+    pass(120).await;
+    assert!(!r.host.holds(PHONE, 1), "no certificate, no judgement");
+    let asks = certificate_asks(&r.wire).len();
+    assert!(
+        (2..=40).contains(&asks),
+        "asked again, with pauses: {asks} asks in 120 s"
+    );
+}
+
 /// A device that joined a group and heard no one asks the group again, after the capped
 /// doubling pauses, not once a group period (half a minute) later: the join announcement, or the
 /// reply a peer made to it, may be what the link lost (p1 at `--faulty --fault-seed 1`: the

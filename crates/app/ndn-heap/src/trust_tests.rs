@@ -849,6 +849,135 @@ async fn a_signer_of_a_held_namespace_is_valid_and_named() {
     );
 }
 
+/// [`bob`] with the chain's certificates not in the cache: the CA's and the phone's key's
+/// certificate are returned for the test to hand over as a holder would.
+async fn bob_bare() -> (Arc<Judge>, Ed25519Signer, Certificate, Certificate) {
+    let root = signer("/home/bob/KEY/root", 70);
+    let ca = signer(CA_KEY, 71);
+    let phone = signer(PHONE_KEY, 72);
+    let anchor = cert(&root, &root, "self", PAST, u64::MAX).await;
+    let ca_cert = cert(&ca, &root, "root", PAST, u64::MAX).await;
+    let leaf = cert(&phone, &ca, "CA", PAST, u64::MAX).await;
+    let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+        .with_ca_endpoint(n("/home/bob/CA"))
+        .with_version(1);
+    ctx.anchors().insert(Arc::clone(&anchor.name), anchor);
+    let keyring = Arc::new(Keyring::new());
+    keyring.adopt(Arc::new(ctx)).unwrap();
+    let validator = Arc::new(Validator::with_keyring(
+        keyring,
+        Arc::new(CertCache::new()),
+        None,
+        5,
+    ));
+    let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
+    let (judge, _) = Judge::new(validator, store, None);
+    (judge, phone, leaf, ca_cert)
+}
+
+fn wire_of(cert: &Certificate) -> Bytes {
+    cert.data_wire().expect("a signed certificate")
+}
+
+/// An entry whose signer's certificates are not held: the first hop of the chain not in the
+/// cache is named; a certificate of another key is not taken for it; the certificates a holder
+/// gives are held unverified and the judgement vouches for them by reaching the anchor, hop by
+/// hop, until the entry is valid.
+#[tokio::test]
+async fn a_chain_is_completed_from_the_certificates_a_holder_gives_for_what_is_missing() {
+    let (judge, phone, leaf, ca) = bob_bare().await;
+    let entry = bob_entry(1, &phone);
+    let space = bob_space();
+    assert!(matches!(
+        judge.validate(&entry, &space).await,
+        Judged::Pending(Waiting::Chain)
+    ));
+    let missing = judge.missing_certificate(&entry, &space).await;
+    assert_eq!(missing, Some(n(PHONE_KEY)), "the signer's key first");
+    assert!(
+        !judge.take_certificate(&entry, &space, &n(PHONE_KEY), wire_of(&ca)),
+        "the CA's certificate is not a certificate of the key asked for"
+    );
+    assert!(
+        !judge.take_certificate(&entry, &space, &n(PHONE_KEY), Bytes::from_static(b"junk")),
+        "a packet that is not a certificate"
+    );
+    assert!(judge.take_certificate(&entry, &space, &n(PHONE_KEY), wire_of(&leaf)));
+    assert_eq!(
+        judge.missing_certificate(&entry, &space).await,
+        Some(n(CA_KEY)),
+        "then the next hop"
+    );
+    assert!(judge.take_certificate(&entry, &space, &n(CA_KEY), wire_of(&ca)));
+    assert_eq!(judge.missing_certificate(&entry, &space).await, None);
+    let v = valid(judge.validate(&entry, &space).await);
+    assert_eq!(v.key, n(PHONE_KEY));
+}
+
+/// A certificate a holder gives is believed for nothing it says: one signed by another key
+/// than the issuer it names is taken as a copy and the walk finds that it does not verify, so
+/// the entry is not valid and the key is still missing; the genuine copy then completes it.
+#[tokio::test]
+async fn a_forged_certificate_from_a_holder_never_makes_an_entry_valid() {
+    let (judge, phone, leaf, ca) = bob_bare().await;
+    let entry = bob_entry(1, &phone);
+    let space = bob_space();
+    let mallory = signer(CA_KEY, 99);
+    let forged = cert(&phone, &mallory, "CA", PAST, u64::MAX).await;
+    assert!(judge.take_certificate(&entry, &space, &n(PHONE_KEY), wire_of(&forged)));
+    assert!(judge.take_certificate(&entry, &space, &n(CA_KEY), wire_of(&ca)));
+    assert!(
+        !matches!(judge.validate(&entry, &space).await, Judged::Valid(_)),
+        "a certificate signed by another key than its issuer's is not vouched for"
+    );
+    assert_eq!(
+        judge.missing_certificate(&entry, &space).await,
+        Some(n(PHONE_KEY)),
+        "the forged copy was dropped: the key is missing as before"
+    );
+    assert!(judge.take_certificate(&entry, &space, &n(PHONE_KEY), wire_of(&leaf)));
+    valid(judge.validate(&entry, &space).await);
+}
+
+/// Only a certificate the validator vouches for is served as a held copy, by a name of the
+/// certificate shape; a certificate fetched and not yet vouched for, and names that are no
+/// certificates, are not.
+#[tokio::test]
+async fn only_a_certificate_the_validator_vouches_for_is_served_as_a_held_copy() {
+    let (judge, _, leaf, _) = bob_bare().await;
+    let key = n(PHONE_KEY);
+    judge.validator.cert_cache().insert_unverified(leaf.clone());
+    assert_eq!(
+        judge.held_certificate(&key),
+        None,
+        "fetched and not vouched for: anyone who was asked may have served it"
+    );
+    judge.validator.cert_cache().insert(leaf.clone());
+    let served = judge.held_certificate(&key).expect("vouched for: served");
+    let packet = Data::decode(served).unwrap();
+    assert_eq!(packet.name, leaf.name);
+    assert_eq!(
+        judge.held_certificate(&leaf.name).map(|w| w.len()),
+        Some(wire_of(&leaf).len()),
+        "by the certificate's own name too"
+    );
+    assert_eq!(
+        judge.held_certificate(&n(DEVICE)),
+        None,
+        "a device is no key"
+    );
+    assert_eq!(
+        judge.held_certificate(&log_name(&n(DEVICE), &bob_space(), 1)),
+        None,
+        "an entry is no certificate"
+    );
+    assert_eq!(
+        judge.held_certificate(&n("/home/bob/member/tablet/KEY/k1")),
+        None,
+        "a key not held"
+    );
+}
+
 /// In a namespace that declares the role layout (its schema is authoritative: the generated
 /// namespace schema, a marker the root signs), only `admin` and `member` devices are owner
 /// devices; a guest, a node, any other role and a device with no role are not, whatever the

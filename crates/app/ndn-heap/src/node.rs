@@ -106,9 +106,11 @@ pub struct Config {
     pub watch_queue: usize,
     /// Devices the host names as places that keep copies of the space's entries and pieces (a
     /// repo follower, a NAS), asked for held copies (`<H>/32=held/…`) after the heard
-    /// members that vouch, within the same eight asks in all (spec §7.4). A holder buys
-    /// availability only: what it gives is verified as if the writer had, it raises no
-    /// head, and it is never asked for a key. This device is skipped. Empty by default.
+    /// members that vouch, within the same eight asks in all (spec §7.4); and for the
+    /// certificates an entry's judgement waits for (§9.1). A holder buys availability only:
+    /// what it gives is verified as if the writer had, a certificate is held unverified until
+    /// a walk vouches for it, it raises no head, and it is never asked for a key. This device
+    /// is skipped. Empty by default.
     pub holders: Vec<Name>,
     /// What the host does so that persons a space lists can be judged
     /// (adopting their trust contexts for the data layer alone).
@@ -1214,6 +1216,34 @@ impl NodeInner {
         device: &Name,
     ) -> Judged {
         self.judge.validate_device_packet(data, device, space).await
+    }
+
+    /// The certificate packet this node's validator vouches for under `name`, for a held
+    /// copy ([`Judge::held_certificate`]).
+    pub(crate) fn held_certificate(&self, name: &Name) -> Option<Bytes> {
+        self.judge.held_certificate(name)
+    }
+
+    /// The certificate the judgement of `wire` waits for and the cache lacks
+    /// ([`Judge::missing_certificate`]).
+    pub(crate) async fn missing_certificate(&self, space: &Name, wire: &Bytes) -> Option<Name> {
+        let data = Data::decode(wire.clone()).ok()?;
+        self.judge.missing_certificate(&data, space).await
+    }
+
+    /// Hold `cert`, given for the `missing` certificate of `wire`'s judgement, as an unverified
+    /// one ([`Judge::take_certificate`]).
+    pub(crate) fn take_certificate(
+        &self,
+        space: &Name,
+        wire: &Bytes,
+        missing: &Name,
+        cert: Bytes,
+    ) -> bool {
+        let Ok(data) = Data::decode(wire.clone()) else {
+            return false;
+        };
+        self.judge.take_certificate(&data, space, missing, cert)
     }
 
     pub(crate) fn key_arrived(

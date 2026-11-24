@@ -61,9 +61,10 @@ use crate::pieces::{self, Assembler, Offered};
 use crate::register::EntryId;
 use crate::rt::{self, Instant};
 use crate::sync::{Group, TIMELINE, Taken};
+use crate::trust::Waiting;
 use crate::wire::{
     ChunksBody, EpochId, GrantAsk, LogName, WireError, grant_name, held_name, log_name,
-    seal_key_name, signed_digest_of,
+    parse_log_name, seal_key_name, signed_digest_of,
 };
 
 /// The pause before asking again for something after `misses` asks for it
@@ -758,6 +759,70 @@ impl Holes {
     }
 }
 
+/// The most hops of a signer's chain asked for as held copies in one pass (the validator's
+/// chain is at most five deep).
+const CHAIN_HOPS: usize = 6;
+
+/// The most certificate names asked of holders and relays at once or pausing on a group.
+const CERT_ASKS_MAX: usize = 64;
+
+/// The certificates a judgement waits for that are asked as held copies ([`Group::complete_chain`]),
+/// by name: one ask of a name at a time however many entries wait for it, and after a miss a
+/// pause that doubles like any ask's ([`retry_pause`]), so that a name nobody serves costs one
+/// round of asks per pause and not one per entry. The names come from entries fetched and not
+/// yet judged, which anyone who is asked may have forged: at most [`CERT_ASKS_MAX`] are kept.
+#[derive(Default)]
+pub(crate) struct CertAsks {
+    by: BTreeMap<Name, CertAsk>,
+}
+
+/// Where the ask of one certificate stands: how many rounds missed in a row, and when it may
+/// be made again (`None`: a round is in flight).
+struct CertAsk {
+    misses: u32,
+    until: Option<Instant>,
+}
+
+impl CertAsks {
+    /// Whether the caller may ask for `name` now; it then owns the round until [`Self::end`].
+    fn claim(&mut self, name: &Name, now: Instant) -> bool {
+        if let Some(ask) = self.by.get_mut(name) {
+            return match ask.until {
+                Some(until) if until <= now => {
+                    ask.until = None;
+                    true
+                }
+                _ => false,
+            };
+        }
+        self.by
+            .retain(|_, ask| ask.until.is_none() || ask.until.is_some_and(|u| u > now));
+        if self.by.len() >= CERT_ASKS_MAX {
+            return false;
+        }
+        self.by.insert(
+            name.clone(),
+            CertAsk {
+                misses: 0,
+                until: None,
+            },
+        );
+        true
+    }
+
+    /// The round for `name` ended; `taken`: it brought a certificate that moved the chain on.
+    fn end(&mut self, name: &Name, taken: bool, now: Instant) {
+        if taken {
+            self.by.remove(name);
+            return;
+        }
+        if let Some(ask) = self.by.get_mut(name) {
+            ask.until = Some(now + retry_pause(ask.misses));
+            ask.misses = ask.misses.saturating_add(1);
+        }
+    }
+}
+
 /// The most probes of one group in flight at once: a group has at most
 /// [`HEARD_MAX`](crate::heard::HEARD_MAX) devices heard, and the probes of devices nothing
 /// vouches for are for names anyone can send, so the others wait their turn (the devices
@@ -1196,6 +1261,85 @@ impl Group {
         }
     }
 
+    /// Hand `wire`, an entry fetched, to the node. When its judgement waits for a certificate
+    /// of its signer's chain that nobody answered ([`Waiting::Chain`]: the validator asked for
+    /// it by name, and its only route may be the writer's dead link), the certificates owed
+    /// are asked of the heard members that vouch and the holders the host configured, as a
+    /// held copy ([`Self::complete_chain`]), and the entry is handed over again.
+    async fn take_completing(&self, wire: Bytes, probe: bool, kind: &Kind) -> Taken {
+        let host = &self.shared.host;
+        let taken = host.take(&self.space, wire.clone(), probe).await;
+        if matches!(taken, Taken::Pending(Waiting::Chain)) && self.complete_chain(&wire, kind).await
+        {
+            return host.take(&self.space, wire, probe).await;
+        }
+        taken
+    }
+
+    /// Ask for the certificates `wire`'s judgement waits for, one hop of the chain at a time
+    /// (at most [`CHAIN_HOPS`]), each of the sources of [`Self::ask_certificate`]. One ask of
+    /// a name at a time on the group, with the back-off of any ask after a miss
+    /// ([`CertAsks`]). Whether the judgement can be tried again: a certificate was taken,
+    /// or none is missing now (another ask brought it).
+    async fn complete_chain(&self, wire: &Bytes, kind: &Kind) -> bool {
+        let host = &self.shared.host;
+        let mut asked: Vec<Name> = Vec::new();
+        for hop in 0..CHAIN_HOPS {
+            let Some(missing) = host.missing_certificate(&self.space, wire).await else {
+                return true;
+            };
+            if asked.contains(&missing) || !self.certs.lock().claim(&missing, Instant::now()) {
+                return hop > 0;
+            }
+            asked.push(missing.clone());
+            let taken = self.ask_certificate(wire, &missing, kind).await;
+            self.certs.lock().end(&missing, taken, Instant::now());
+            if !taken {
+                return hop > 0;
+            }
+        }
+        true
+    }
+
+    /// Ask for the certificate `missing` as a held copy (`<H>/32=held/<missing>`) of each of
+    /// the heard members that vouch (those of which this node holds an unbroken prefix of their
+    /// log leading), then of the configured holders, within `RELAYS_ASKED` in all, as an
+    /// entry is ([`Self::source`]), until one gives a packet the node takes as a certificate
+    /// of that key. What is taken is only held unverified: the judgement vouches for it by
+    /// reaching a trust anchor through it and drops it when it cannot, so a copy that does not
+    /// stand (a forgery) is not the end of the asking: the next source is asked. Whether a
+    /// certificate was taken that moved the chain on.
+    async fn ask_certificate(&self, wire: &Bytes, missing: &Name, kind: &Kind) -> bool {
+        let host = &self.shared.host;
+        let me = host.device();
+        let writer = Data::decode(wire.clone())
+            .ok()
+            .and_then(|data| parse_log_name(&data.name))
+            .map_or_else(|| me.clone(), |log| log.device);
+        let mut sources =
+            (self.heard.lock()).relays(me, &writer, &[], |d| host.standing(&self.space, d));
+        let holders = holders_after(&self.shared.cfg.holders, me, &writer, &sources);
+        sources.extend(holders);
+        for holder in sources {
+            let held = held_name(&holder, missing);
+            let Ok(wrapper) = self.shared.fetcher.once(held, kind, false).await else {
+                continue;
+            };
+            let Some(cert) = wrapper.content().cloned() else {
+                continue;
+            };
+            if !host.take_certificate(&self.space, wire, missing, cert) {
+                tracing::debug!(%holder, %missing, "not a certificate of that key: the next source is asked");
+                continue;
+            }
+            if host.missing_certificate(&self.space, wire).await.as_ref() != Some(missing) {
+                return true;
+            }
+            tracing::debug!(%holder, %missing, "a copy that does not stand in the chain: the next source is asked");
+        }
+        false
+    }
+
     /// Fetch the entry `entry` of this space by its log name and admit it as
     /// any entry that arrives is: the node judges it by the durable rule and
     /// the log takes or refuses it ([`crate::node::NodeInner::take`]); there is
@@ -1226,7 +1370,7 @@ impl Group {
                 seq: entry.seq,
                 digest: signed_digest_of(&data),
             };
-            match self.shared.host.take(&self.space, wire, false).await {
+            match self.take_completing(wire, false, &Kind::Pull).await {
                 Taken::Pending(why) => waiting = Some(why),
                 Taken::Decided { outcome, blobs } => match outcome {
                     Outcome::Applied | Outcome::Closed | Outcome::Waiting | Outcome::Duplicate => {
@@ -1418,7 +1562,7 @@ impl Group {
         let mut resolved = false;
         if let Some(wire) = wire {
             tracing::trace!(target: TIMELINE, %name, "verify_begin");
-            let taken = self.shared.host.take(&self.space, wire, launch.probe).await;
+            let taken = self.take_completing(wire, launch.probe, &kind).await;
             tracing::trace!(target: TIMELINE, %name, "verify_end");
             match taken {
                 Taken::Decided { outcome, blobs } => {

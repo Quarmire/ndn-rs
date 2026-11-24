@@ -28,12 +28,12 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::Data;
-use ndn_security::cert_name::key_name_of;
+use ndn_security::cert_name::{is_cert_name, is_key_name, is_reserved_non_cert, key_name_of};
 use ndn_security::safe_data::TrustPath;
 use ndn_security::self_certifying::{Genesis, in_personal_namespace, personal_namespace_of};
 use ndn_security::{
-    RevocationCut, SafeData, ScopedContext, SignedTrustContext, TrustError, ValidationResult,
-    Validator,
+    Certificate, RevocationCut, SafeData, ScopedContext, SignedTrustContext, TrustError,
+    ValidationResult, Validator, is_full_name,
 };
 use ndn_sync::DataStore;
 use parking_lot::Mutex;
@@ -66,6 +66,10 @@ pub(crate) const SCOPE_PER_SPACE: usize = 64;
 /// node holds them; spaces are served in name order, so the cap falls the same
 /// way whatever order their listings came in.
 pub(crate) const SCOPE_NAMESPACES: usize = 256;
+
+/// The longest certificate packet served as a held copy or taken from one (the packet and
+/// the wrapper that carries it both fit a Data packet).
+pub(crate) const HELD_CERT_MAX: usize = 4096;
 
 // ---- the host's side ---------------------------------------------------------------------------
 
@@ -698,6 +702,74 @@ impl Judge {
             }
             other => other,
         }
+    }
+
+    /// The certificate this node's validator vouches for under `name` (a key name
+    /// `<device>/KEY/<id>` or a certificate name), as the packet its issuer signed, for a
+    /// held copy (spec §7.6): public data any asker's validator checks for itself. Only a
+    /// name of the certificate shape and a certificate a walk vouched for (never one fetched
+    /// and not yet vouched for, which anyone who was asked may have served), within
+    /// [`HELD_CERT_MAX`] octets.
+    pub(crate) fn held_certificate(&self, name: &Name) -> Option<Bytes> {
+        if !(is_key_name(name) || is_cert_name(name)) || is_reserved_non_cert(name) {
+            return None;
+        }
+        let cache = self.validator.cert_cache();
+        if !cache.holds_vouched(name) {
+            return None;
+        }
+        let cert = cache.get(&Arc::new(name.clone()))?;
+        if !cache.holds_vouched(&cert.name) {
+            return None;
+        }
+        cert.data_wire().filter(|wire| wire.len() <= HELD_CERT_MAX)
+    }
+
+    /// The certificate (or key) `data`'s judgement waits for and this node's validator does
+    /// not hold, from its cache alone: the first unresolved hop of the signer's chain. A cut
+    /// manifest packet, named by its full name, is not a certificate and is not named.
+    pub(crate) async fn missing_certificate(&self, data: &Data, space: &Name) -> Option<Name> {
+        let view = self.view_for(&data.name, space, false);
+        match view.validate_durable_cached(data).await {
+            (ValidationResult::Pending, Some(missing)) if !is_full_name(&missing) => {
+                Some((*missing).clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Hold `cert`, a packet a holder gave for the `missing` certificate `data`'s judgement
+    /// waits for, as an unverified certificate: it is trusted by nothing it says, a walk
+    /// vouches for it only by reaching a trust anchor through it and drops it when it
+    /// cannot. Whether it was taken: a packet of the certificate shape that is a
+    /// certificate of the key `missing` names (not another key's, not an NDNCERT decision),
+    /// within [`HELD_CERT_MAX`] octets, and not displacing a vouched certificate.
+    pub(crate) fn take_certificate(
+        &self,
+        data: &Data,
+        space: &Name,
+        missing: &Name,
+        cert: Bytes,
+    ) -> bool {
+        if cert.len() > HELD_CERT_MAX {
+            return false;
+        }
+        let Ok(packet) = Data::decode(cert) else {
+            return false;
+        };
+        let name = &*packet.name;
+        if !name.has_prefix(missing)
+            || is_reserved_non_cert(name)
+            || key_name_of(name) != key_name_of(missing)
+        {
+            return false;
+        }
+        let Ok(cert) = Certificate::decode(&packet) else {
+            return false;
+        };
+        self.view_for(&data.name, space, false)
+            .cert_cache()
+            .insert_unverified(cert)
     }
 
     /// The validator that judges `name` about `space`: for a person's

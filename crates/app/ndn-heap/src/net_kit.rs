@@ -320,6 +320,13 @@ pub(crate) struct Toy {
     pub revoked_keys: BTreeSet<Name>,
     /// The seal keys the grants the toy made were wrapped to.
     pub granted_to: Vec<[u8; 32]>,
+    /// The key whose certificate every entry's judgement waits for, until a certificate
+    /// for it is taken (`take` answers `Pending(Chain)` meanwhile).
+    pub waits_for: Option<Name>,
+    /// The certificates the host serves as held copies, by the key or certificate name asked.
+    pub certs: BTreeMap<Name, Bytes>,
+    /// The certificate packets `take_certificate` was handed, in order.
+    pub certs_offered: Vec<Bytes>,
 }
 
 /// What the network half asks of the node, as the toy host answers it: the
@@ -365,6 +372,9 @@ pub(crate) trait Host: Send + Sync + 'static {
         to: &[u8; 32],
         name: &Name,
     ) -> Option<Bytes>;
+    async fn missing_certificate(&self, space: &Name, wire: &Bytes) -> Option<Name>;
+    fn take_certificate(&self, space: &Name, wire: &Bytes, missing: &Name, cert: Bytes) -> bool;
+    fn held_certificate(&self, name: &Name) -> Option<Bytes>;
 }
 
 /// The toy host.
@@ -456,6 +466,9 @@ impl Host for Toyhost {
         st.taken.push((log.device.clone(), log.seq));
         if probe {
             st.probed.push((log.device.clone(), log.seq));
+        }
+        if st.waits_for.is_some() {
+            return Taken::Pending(crate::trust::Waiting::Chain);
         }
         let digest = crate::wire::signed_digest_of(&data);
         let exact = st
@@ -698,5 +711,35 @@ impl Host for Toyhost {
     ) -> Option<Bytes> {
         self.st.lock().granted_to.push(*to);
         Some(DataBuilder::new(name.clone(), b"a key, wrapped").sign_digest_sha256())
+    }
+
+    async fn missing_certificate(&self, _space: &Name, _wire: &Bytes) -> Option<Name> {
+        self.st.lock().waits_for.clone()
+    }
+
+    /// A packet named under the key whose body is `cert` is the certificate; one whose body
+    /// is `forged` is taken (as an unverified certificate is) and the judgement still waits;
+    /// any other is not taken.
+    fn take_certificate(&self, _space: &Name, _wire: &Bytes, missing: &Name, cert: Bytes) -> bool {
+        let mut st = self.st.lock();
+        st.certs_offered.push(cert.clone());
+        let Ok(data) = Data::decode(cert) else {
+            return false;
+        };
+        if !data.name.has_prefix(missing) {
+            return false;
+        }
+        match data.content().map(|c| c.as_ref()) {
+            Some(b"cert") => {
+                st.waits_for = None;
+                true
+            }
+            Some(b"forged") => true,
+            _ => false,
+        }
+    }
+
+    fn held_certificate(&self, name: &Name) -> Option<Bytes> {
+        self.st.lock().certs.get(name).cloned()
     }
 }

@@ -196,14 +196,14 @@ fn packet(host: &HostRef, name: &Name, only: Option<&Name>) -> Option<Bytes> {
 }
 
 /// What this device answers under its own name (`32=held`) for the packet
-/// `original` of any device: only what the node serves, in a DigestSha256
-/// wrapper.
+/// `original` of any device: only what the node serves, or a certificate its validator
+/// vouches for ([`crate::trust::Judge::held_certificate`]), in a DigestSha256 wrapper.
 fn held_packet(host: &HostRef, me: &Name, name: &Name) -> Option<Bytes> {
     let (holder, original) = parse_held_name(name)?;
     if holder != *me {
         return None;
     }
-    let wire = packet(host, &original, None)?;
+    let wire = packet(host, &original, None).or_else(|| host.held_certificate(&original))?;
     Some(DataBuilder::new(name.clone(), &wire).sign_digest_sha256())
 }
 

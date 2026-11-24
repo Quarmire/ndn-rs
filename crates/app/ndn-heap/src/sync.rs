@@ -252,6 +252,7 @@ impl Net {
             shared: Arc::clone(&self.shared),
             heard: Mutex::new(Heard::default()),
             asks: Mutex::new(Asks::default()),
+            certs: Mutex::new(fetch::CertAsks::default()),
             assembling: Mutex::new(HashSet::new()),
             asking: Mutex::new(BTreeSet::new()),
             wake: Notify::new(),
@@ -319,6 +320,8 @@ pub(crate) struct Group {
     pub(crate) heard: Mutex<Heard>,
     /// The asks in flight or pausing.
     pub(crate) asks: Mutex<Asks>,
+    /// The certificates a judgement waits for that are being asked of holders and relays.
+    pub(crate) certs: Mutex<fetch::CertAsks>,
     /// The values whose pieces are being gathered.
     pub(crate) assembling: Mutex<HashSet<EntryId>>,
     /// The epochs whose key is being asked for.

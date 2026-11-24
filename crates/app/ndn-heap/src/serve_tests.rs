@@ -124,6 +124,28 @@ async fn a_held_copy_is_served_only_if_admitted() {
     );
 }
 
+/// A certificate the host's validator vouches for is served as a held copy too, under the
+/// holder's name and in a DigestSha256 wrapper; one it does not hold is Nacked.
+#[tokio::test(start_paused = true)]
+async fn a_certificate_is_served_as_a_held_copy_only_if_the_host_holds_it() {
+    let s = serving(ME).await;
+    let key = n("/alice/phone/KEY/1");
+    let ask = held_name(&me(), &key);
+    assert!(s.ask(&ask).await.is_none(), "not held: a Nack");
+    let cert =
+        DataBuilder::new(key.clone().append("ca").append_version(1), b"cert").sign_digest_sha256();
+    s.host.st.lock().certs.insert(key.clone(), cert.clone());
+    let got = s.ask(&ask).await.expect("held: served");
+    assert_eq!(got.content().cloned(), Some(cert), "the packet, unchanged");
+    assert_ne!(&*got.name, &key, "answered under the holder's name");
+    assert!(
+        s.ask(&held_name(&me(), &n("/alice/tablet/KEY/1")))
+            .await
+            .is_none(),
+        "another key's certificate is not held"
+    );
+}
+
 /// The pieces of a served entry are served with it, directly and as held;
 /// the pieces of an entry that is not served are not.
 #[tokio::test(start_paused = true)]

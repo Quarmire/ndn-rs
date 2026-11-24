@@ -1696,7 +1696,7 @@ A name under `/localhost` is never served.
 |---|---|
 | `<D>/32=log/<S>/seq=<n>` with `D` this device | its own entry at that seq, if held, verified and not held back (a structural entry not yet flushed, §4.2 rule 3) |
 | `<E>/32=piece/…` with `E` this device's entry | the piece, if the entry is served |
-| `<H>/32=held/<Name TLV>` with `H` this device | the packet named — another device's entry, or a piece — **only if it is held and admitted** (a follower serves what it verified), wrapped as the Content of a DigestSha256 packet, so it carries no claim of having been signed by this device |
+| `<H>/32=held/<Name TLV>` with `H` this device | the packet named — another device's entry, or a piece — **only if it is held and admitted** (a follower serves what it verified), or a **certificate** its validator vouches for (the name is a key name `<device>/KEY/<id>`, answered with the newest certificate of the key, or a certificate name; at most 4,096 octets; one fetched and not yet vouched for by a walk is not served; an NDNCERT decision `…/ndncert-approve/…` is no certificate), wrapped as the Content of a DigestSha256 packet, so it carries no claim of having been signed by this device |
 | `<D>/32=seal/<pk>` with `D` this device and `pk` its recipient public key | its seal key packet |
 | `<G>/32=grant/<ask>` with `G` this device | by §6.5 |
 | `<D>/32=<keyword>/…` with `D` this device and `keyword` registered by an extension | by §10.9: what the extension answers, else Nacked |
@@ -1843,6 +1843,13 @@ nothing a node does; the `put_watch` example records them (§13.8).
   vouched members only), and a device that is not in the list is never asked by this
   rule. A holder that withholds costs one ask in `RELAYS_ASKED` per round, on the same
   capped back-off as any source.
+- **A certificate from a holder is a copy, not a verdict.** What a holder or a relay
+  gives for a missing certificate (§9.1) is held unverified and counts for nothing until a
+  walk reaches a trust anchor through it: a forged or foreign certificate fails the
+  walk and is dropped, never makes an entry count, and costs one ask. The names asked come
+  from entries fetched and not yet judged (which anyone who is asked may have forged), so
+  one round per name at a time per space, 64 names, and the pause of any ask bound what
+  that costs; a holder is asked within `RELAYS_ASKED` and never for a key.
 - **Strangers' entries (L7).** A device certified in a held context that is no
   member has at most one refused entry stored and one alert per device: a
   probe of it (`Host::take(.., probe = true)`) is neither stored nor told when
@@ -1993,6 +2000,26 @@ While a judgement runs the trust layer may change (a context adopted, a version
 that refuses more): the judge keeps a **generation** (the keyring's revocation
 epoch plus the count of person versions that refused more), and a verdict "valid"
 reached while it moved is reached again, up to three times.
+
+**A certificate the judgement waits for, asked as a held copy.** The validator asks for
+a certificate by name through its fetcher, and when that fails the judgement is
+**pending**. That is not the end where the writer is away and the only route for the
+name of its certificate is the writer's own link: when the fetch of an entry that arrived
+(from the writer, a relay or a holder) answers pending, the node asks for what is missing,
+one hop of the chain at a time (at most six), as a held copy `<H>/32=held/<missing>` of the
+heard members that vouch and then of the configured `Config.holders` (§7.4: the same
+order, the same bound of `RELAYS_ASKED`), the missing name being the one the validator
+names from its cache alone (`validate_durable_cached`: the signer's key, then the
+issuer's, …; a cut manifest named by its full name is not a certificate and is not
+asked this way). A packet a source gives is taken **only** if it is a certificate of the
+key asked for (its name under that key, not another key's, not an NDNCERT decision,
+at most 4,096 octets) and then only **held unverified**: the judgement vouches for it
+by reaching a trust anchor through it and drops it when it cannot, so the source is
+believed for nothing it says, a forgery is a copy that does not stand and the next
+source is asked, and a certificate vouched for under the same name is never displaced.
+The entry is then judged again. One round of asks for a name at a time per space,
+however many entries wait for it, and after a round that took nothing the name pauses
+as an ask does (§7.4 back-off); at most 64 names are kept.
 
 ### 9.2 The mapping
 
@@ -2371,7 +2398,7 @@ registered and never under one of the core keywords above.
 | `reserve_block` | 1,024 | seqs one durable reservation covers (§4.5) |
 | `watch_queue` | 4,096 (at least 1) | changes a watcher may leave unread before it lags (§10.4) |
 | `adopter` | none | adopts persons for the spaces that list them (§9.4); with none, their entries wait |
-| `holders` | empty | devices the host names as places that keep copies (a repo follower, a NAS): asked for held copies (`<H>/32=held/…`) of the entries and pieces a reader wants, after the vouched heard members and within the same `RELAYS_ASKED` (8) in all; never granters; never this device (§7.4) |
+| `holders` | empty | devices the host names as places that keep copies (a repo follower, a NAS): asked for held copies (`<H>/32=held/…`) of the entries and pieces a reader wants, and of the certificates a judgement waits for (§9.1), after the vouched heard members and within the same `RELAYS_ASKED` (8) in all; never granters; never this device (§7.4) |
 
 **`start`** gives a device its layer: it signs with the key `keys` holds for
 `device`, keeps the X25519 recipient secret there too (made on the first start,
@@ -3017,6 +3044,7 @@ are zeroed when dropped and never shown by `Debug`.
 |---|---|---|
 | Partition / offline | Reads and writes continue locally under each device's key; the group reconciles when a path returns: what a returning device is missing is fetched by what the log wants. | §4, §7 |
 | Writer offline, and no heard member vouched for here holds the entry | A device the host names in `Config.holders` (a repo follower, a NAS) is asked for a held copy after the vouched relays; the copy is verified as the writer's own, so the holder buys availability only: it can never make an entry count, raise a head or give a key. | §7.4, §7.6, §7.12 |
+| Writer offline, and the certificate its entries' judgement waits for is routable only through the writer | The certificate is asked as a held copy of the heard members that vouch and of the configured holders and taken only as an unverified copy the judgement vouches for by reaching an anchor; the entries are then judged. | §7.6, §9.1, §7.12 |
 | Lost device | The devices that hold its entries keep serving them as held copies; the owner marks its key suspected on the node it revokes from, says when it was lost, and revokes it in the trust context with a cut of what that node first verified before then; the entries left out are listed and any honest one is re-admitted by exact name and digest. | §7.6, §9.5, §9.8 |
 | Compromised key | The revocation cut keeps exactly the entries it lists, by seq and digest, and refuses the rest whatever they claim; the key's seal keys and grants are refused; sealed data re-keys forward. | §9.5, §6 |
 | Bad or lying clock | Never makes an entry accepted: Data is judged without certificate validity periods and a cut, not a date, ends a key; a reader's clock only decides when a lapsed key's entries start being refused until its renewal or its cut. A writer's clock moves only the display time of its markers. | §1.4, §9.3 |

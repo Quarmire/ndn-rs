@@ -110,6 +110,15 @@ impl crate::sync::net_kit::Host for NodeInner {
     ) -> Option<Bytes> {
         NodeInner::grant_packet(self, space, epoch, asker, key, to, name)
     }
+    async fn missing_certificate(&self, space: &Name, wire: &Bytes) -> Option<Name> {
+        NodeInner::missing_certificate(self, space, wire).await
+    }
+    fn take_certificate(&self, space: &Name, wire: &Bytes, missing: &Name, cert: Bytes) -> bool {
+        NodeInner::take_certificate(self, space, wire, missing, cert)
+    }
+    fn held_certificate(&self, name: &Name) -> Option<Bytes> {
+        NodeInner::held_certificate(self, name)
+    }
 }
 
 // -- The world the cases run in ----------------------------------------------------
