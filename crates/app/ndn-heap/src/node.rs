@@ -107,7 +107,7 @@ pub struct Config {
 
 impl Config {
     /// Defaults: SVS's reference timing, the system clock, 2 s Interests, a
-    /// 4 s first look, 32 asks in flight per walk and 256 per node, a 1 s
+    /// 4 s first look, 128 asks in flight per walk and 256 per node, a 1 s
     /// settle, reservations of 1,024 seqs, 4,096 changes a watcher may leave
     /// unread, no adopter.
     pub fn new() -> Config {
@@ -121,7 +121,7 @@ impl Config {
             }),
             lifetime: Duration::from_secs(2),
             first_look: Duration::from_secs(4),
-            window: 32,
+            window: 128,
             in_flight: 256,
             settle: Duration::from_secs(1),
             reserve_block: 1024,

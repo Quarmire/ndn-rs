@@ -149,7 +149,11 @@ async fn one_new_entry_is_one_fetch() {
 /// first and alone, then the rest in a window, each once.
 #[tokio::test(start_paused = true)]
 async fn a_gap_in_the_notice_is_backfilled_in_a_window() {
-    let r = rig().await;
+    let r = rig_with(Config {
+        window: 32,
+        ..Config::new()
+    })
+    .await;
     r.wire.delay(Duration::from_millis(50));
     r.wire.script(|name| match direct(name) {
         Some((d, seq)) if d == n(PHONE) => Reply::Data(genuine(PHONE, seq)),
@@ -179,6 +183,45 @@ async fn a_gap_in_the_notice_is_backfilled_in_a_window() {
         r.wire.peak() > 8,
         "and the window is used: {}",
         r.wire.peak()
+    );
+}
+
+/// o4/o3 under loss: 1,200 entries below a counter, over a path whose round trip is over a
+/// second (a mean of 1.15 s: the faulty profile's delay and block times) and that loses an
+/// Interest or its Data 36 % of the time and forges 3 % of what arrives, are all held within a
+/// minute of virtual time (the case's bound is two, over a path with a longer tail). Entries a
+/// verified tip proves to exist are owed: a miss costs a short doubling pause, never a minute,
+/// and the walk keeps the path full: with the window of 32 asks the same walk took 87 s here.
+#[tokio::test(start_paused = true)]
+async fn a_long_hole_below_a_held_tip_is_repaired_within_a_minute_over_a_lossy_long_path() {
+    let r = rig().await;
+    r.wire.delay(Duration::from_millis(1150));
+    let tick = std::sync::atomic::AtomicU64::new(0);
+    r.wire.script(move |name| match direct(name) {
+        Some((d, seq)) if d == n(PHONE) => {
+            let mut z = tick
+                .fetch_add(0x9E37_79B9_7F4A_7C15, std::sync::atomic::Ordering::Relaxed)
+                .wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            match (z ^ (z >> 31)) % 1000 {
+                0..360 => Reply::Silent,
+                360..392 => Reply::Data(forged(PHONE, seq)),
+                _ => Reply::Data(genuine(PHONE, seq)),
+            }
+        }
+        _ => Reply::Nack(NackReason::NoRoute),
+    });
+    r.group.on_update(notice(PHONE, 1200));
+    let began = tokio::time::Instant::now();
+    while r.host.held_count(PHONE) < 1200 && began.elapsed() < Duration::from_secs(600) {
+        pass(1).await;
+    }
+    let took = began.elapsed();
+    assert!(
+        took <= Duration::from_secs(60),
+        "{} of 1200 held after {took:?}",
+        r.host.held_count(PHONE)
     );
 }
 

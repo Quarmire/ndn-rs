@@ -1500,9 +1500,12 @@ a restart, a lost packet or a refusal changes nothing about what is owed.
   held or void.
 - **The exact entries** a removal cut names that are not held, by their
   signed-region digest (§3.8): the bytes must be those.
-- **Windowing.** At most `Config.window` (32) asks of one device are in flight;
+- **Windowing.** At most `Config.window` (128) asks of one device are in flight;
   they go in seq order, the entry at the highest seq first and alone while it is
-  not held (§7.3).
+  not held (§7.3). The window is sized for a path of over a second's round trip that
+  loses a third of its asks: 1,200 owed entries are held within a minute of virtual
+  time there (with 32 they took 87 s), what a reader of an entry-per-save writer (o4)
+  needs to keep up.
 - **Own entries** are wanted only up to `4 × reserve_block` above the own head
   (§4.8).
 - **Sources.** The ask goes to the **writer** by its own name; after a miss to
@@ -1697,7 +1700,7 @@ limit `PAYLOAD_MAX`).
 A reader gathers the pieces of one value with these rules:
 
 1. It asks for the **manifest nodes first** (each unlocks up to 128 more), then
-   chunks in order, at most `Config.window` (32) at a time, from the writer and
+   chunks in order, at most `Config.window` (128) at a time, from the writer and
    then the heard members (§7.4); the root's digest is the entry's `ROOT`.
 2. It names and accepts a piece **only** if its parent, already held, lists its
    implicit digest, its name is the piece's, a node lists as many digests as its
@@ -2096,7 +2099,7 @@ protocol that frames them like an entry); a run header is signed by
 | `clock` | the system clock, ms since the Unix epoch | the time of a marker's `at` and of a cut bound; display only (§1.4) |
 | `lifetime` | 2 s | Interest lifetime of every fetch (§7.3) |
 | `first_look` | 4 s | how long a removal looks for entries heard of and not yet held (§5.6) |
-| `window` | 32 | asks of one device in flight (§7.4) |
+| `window` | 128 | asks of one device in flight (§7.4) |
 | `in_flight` | 256 (at least `window`) | asks of the whole node in flight (§7.3) |
 | `settle` | 1 s | the wait for the first group vector at an unclean start (§4.8) |
 | `reserve_block` | 1,024 | seqs one durable reservation covers (§4.5) |
