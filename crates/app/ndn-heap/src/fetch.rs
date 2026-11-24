@@ -14,8 +14,9 @@
 //! below it absent, and only once it is held and verified are the holes below
 //! it wanted, asked for in a window ([`Config::window`]), in seq order,
 //! minus what a gap statement declared void. A counter nothing signs
-//! therefore costs [`FETCH_TRIES`] asks and then one ask a minute
-//! ([`REFRESH_IDLE`]), and wants nothing of the log.
+//! therefore costs [`FETCH_TRIES`] asks, then asks after a pause that climbs
+//! from 4 s to a minute ([`probe_pause`]), so a forger's steady cost is one ask
+//! a minute, and wants nothing of the log.
 //!
 //! **Sources.** The writer first, then the heard members vouched for
 //! ([`Heard::relays`]) through `<H>/32=held/<name>`, one after another as the
@@ -102,6 +103,15 @@ pub(crate) fn retry_pause(misses: u32) -> Duration {
     REFRESH_PAUSE
         .saturating_mul(1 << misses.min(8))
         .min(REFRESH_PAUSE_MAX)
+}
+
+/// The pause before a probe is asked again once [`FETCH_TRIES`] asks missed:
+/// [`REFRESH_PAUSE_MAX`] after the last of them, doubled for each further miss, at
+/// most [`REFRESH_IDLE`].
+pub(crate) fn probe_pause(misses: u32) -> Duration {
+    REFRESH_PAUSE_MAX
+        .saturating_mul(1 << misses.saturating_sub(FETCH_TRIES).min(8))
+        .min(REFRESH_IDLE)
 }
 
 /// The round-trip estimate from which an unanswered Interest is expressed
@@ -588,12 +598,15 @@ impl Group {
             }
         }
         // The counter that names a probe decides nothing, so it is never given
-        // up: after [`FETCH_TRIES`] misses an honest writer away for a while
-        // still comes within a minute, and a forger costs one ask a minute.
+        // up. After [`FETCH_TRIES`] misses the pause climbs from
+        // [`REFRESH_PAUSE_MAX`] to [`REFRESH_IDLE`] by doubling ([`probe_pause`]): a
+        // real counter whose entry a lossy path lost several asks in a row still
+        // comes within a minute or so, and a forger costs one ask a minute in the
+        // end, as before.
         let (misses, pause) = if resolved {
             (0, REFRESH_PAUSE)
         } else if launch.probe && launch.misses >= FETCH_TRIES {
-            (launch.misses + 1, REFRESH_IDLE)
+            (launch.misses + 1, probe_pause(launch.misses))
         } else {
             (launch.misses + 1, retry_pause(launch.misses))
         };

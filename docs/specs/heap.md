@@ -1443,7 +1443,9 @@ An update `(D, high)` of a group is handled so:
    here. A dropped name is walked no further.
 4. The log is told nothing of another device's counter (M4): the entry the
    counter names is **probed** when the log neither holds it nor asks for it,
-   alone, `FETCH_TRIES` (3) asks and then one a minute; the holes below it are
+   alone, `FETCH_TRIES` (3) asks and then asks after a pause that climbs from 4 s,
+   doubling, to a minute (a real entry the path lost several asks in a row comes within a
+   minute; a forged counter's steady cost is one ask a minute); the holes below it are
    wanted once it is held and verified. This device's own counter is told
    (`note_own_counter`: `UnbackedCounter` above the head, and the entries within
    `R` wanted). A device nothing vouches for yet costs the same one probe; the
@@ -1630,8 +1632,9 @@ nothing a node does; the `put_watch` example records them (§13.8).
 
 - **Forged notices.** A stranger can name any device at any counter. It costs a
   list of at most 64 names per group, vouched-for devices never displaced, and,
-  per device, one entry probed alone: `FETCH_TRIES` (3) asks, then one ask a
-  minute (liveness: an honest writer away still comes). It raises no head, no
+  per device, one entry probed alone: `FETCH_TRIES` (3) asks, then asks after a pause
+  climbing from 4 s, doubling, to a minute (liveness: an honest writer away still comes;
+  a forged counter's steady cost is one ask a minute). It raises no head, no
   want and no head of `ready()` (a counter wants nothing of the log: M4), ends
   no ask (D17, §4.8), and cannot flip `put`'s `durable` default (`no_peers` is
   decided by vouched devices in the log, not by the unsigned vector).

@@ -386,6 +386,40 @@ async fn a_notice_names_nothing_it_decides() {
     );
 }
 
+/// o3/o4 under loss: a real counter whose entry the path loses five asks in a row (a path that
+/// loses 36 % of the asks does that to one counter in a hundred, and a space has dozens) is
+/// held within a minute, not after a pause of a minute per ask: the pause between asks of a
+/// counter grows from 4 s once [`FETCH_TRIES`] asks missed, to a minute at most, so a forged
+/// counter's steady cost is the same one ask a minute.
+#[tokio::test(start_paused = true)]
+async fn a_counters_entry_the_path_lost_five_asks_in_a_row_is_held_within_a_minute() {
+    let r = rig().await;
+    r.host.hold(PHONE, 1);
+    r.host.st.lock().vouched.insert(n(PHONE));
+    let lost = std::sync::atomic::AtomicUsize::new(0);
+    r.wire.script(move |name| match direct(name) {
+        Some((d, 2)) if d == n(PHONE) => {
+            if lost.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                Reply::Silent
+            } else {
+                Reply::Data(genuine(PHONE, 2))
+            }
+        }
+        _ => Reply::Nack(NackReason::NoRoute),
+    });
+    r.group.on_update(notice(PHONE, 2));
+    let began = tokio::time::Instant::now();
+    while !r.host.holds(PHONE, 2) && began.elapsed() < Duration::from_secs(300) {
+        pass(1).await;
+    }
+    assert!(
+        r.host.holds(PHONE, 2) && began.elapsed() <= Duration::from_secs(60),
+        "held: {}, after {:?}",
+        r.host.holds(PHONE, 2),
+        began.elapsed()
+    );
+}
+
 /// A Sync Interest is unsigned: a forged counter for a device the log
 /// vouches for names an entry and nothing else. It is asked for alone, a
 /// bounded number of times; what lies below it is not asked, nothing is
@@ -454,7 +488,8 @@ async fn a_forged_own_counter_asks_for_the_reserved_range_and_one_probe() {
         own.iter().filter(|s| !(11..=20).contains(*s)).max()
     );
     assert!(own.contains(&1_000_000), "the counter itself is probed");
-    assert!(own.iter().filter(|s| **s == 1_000_000).count() <= 8);
+    // Four asks, then the pause climbs (4, 8, 16, 32 s) to one ask a minute.
+    assert!(own.iter().filter(|s| **s == 1_000_000).count() <= 11);
 }
 
 /// A removed writer that serves other bytes at the seq its cut keeps does
