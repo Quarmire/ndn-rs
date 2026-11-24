@@ -33,7 +33,7 @@ pub(crate) struct ChunksBody {
 /// payload. The order is the order a fetch asks in: nodes (each unlocks more
 /// pieces) before chunks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum PieceKind {
+pub enum PieceKind {
     /// Manifest node `k`, in heap order from the root (0):
     /// `<E>/32=piece/32=manifest/seg=<k>`.
     Manifest(u64),
@@ -43,7 +43,7 @@ pub(crate) enum PieceKind {
 
 /// A parsed piece name.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PieceName {
+pub struct PieceName {
     /// The entry's name, `E`.
     pub entry: Name,
     /// The entry as parsed.
@@ -63,7 +63,9 @@ pub(crate) fn piece_name(entry: &Name, kind: PieceKind) -> Name {
 
 /// Parse `<E>/32=piece/seg=<i>` or `<E>/32=piece/32=manifest/seg=<k>`, `E` an
 /// entry's name.
-pub(crate) fn parse_piece_name(name: &Name) -> Option<PieceName> {
+///
+/// Public: a sibling crate that filters names tells a piece of an entry by it.
+pub fn parse_piece_name(name: &Name) -> Option<PieceName> {
     let comps = name.components();
     let (last, rest) = comps.split_last()?;
     let n = last.as_segment()?;

@@ -75,7 +75,9 @@ fn is_plain(c: &NameComponent) -> bool {
 /// Whether `name` can be a namespace (an owner or a person): not the root,
 /// and only plain components that are not sequence numbers (an entry name
 /// ends in one, so a namespace must not).
-pub(crate) fn is_namespace(name: &Name) -> bool {
+///
+/// Public: a sibling crate judges the persons and owners it is told of by it.
+pub fn is_namespace(name: &Name) -> bool {
     is_namespace_comps(name.components())
 }
 
@@ -132,7 +134,7 @@ pub(crate) fn owns(space: &Name, key: &Name) -> bool {
 
 /// A parsed space name.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SpaceName {
+pub struct SpaceName {
     /// The namespace that owns the space (before `32=data`).
     pub owner: Name,
     /// The 1 to 4 generic components after `32=data`.
@@ -141,7 +143,9 @@ pub(crate) struct SpaceName {
 
 /// Parse `<O>/32=data/<c1>[/<c2>…]`: `O` is a namespace, 1 to 4 generic
 /// components follow the one `32=data`.
-pub(crate) fn parse_space_name(name: &Name) -> Option<SpaceName> {
+///
+/// Public: a sibling crate that filters names reads a space's owner and path by it.
+pub fn parse_space_name(name: &Name) -> Option<SpaceName> {
     let comps = name.components();
     let at = comps.iter().position(|c| is_kw(c, DATA))?;
     let (owner, rest) = (&comps[..at], &comps[at + 1..]);
@@ -185,7 +189,7 @@ pub fn log_name(device: &Name, space: &Name, seq: u64) -> Name {
 
 /// A parsed entry name.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LogName {
+pub struct LogName {
     /// The device whose log it is.
     pub device: Name,
     /// The space the entry is in.
@@ -196,7 +200,9 @@ pub(crate) struct LogName {
 
 /// Parse `<device>/32=log/<space>/seq=<seq>`: the device is everything before
 /// the first `32=log` (a device name has no keyword), the space a space name.
-pub(crate) fn parse_log_name(name: &Name) -> Option<LogName> {
+///
+/// Public: a sibling crate that filters names reads an entry's device and space by it.
+pub fn parse_log_name(name: &Name) -> Option<LogName> {
     let comps = name.components();
     let at = comps.iter().position(|c| is_kw(c, LOG))?;
     let (last, space) = comps[at + 1..].split_last()?;
@@ -244,7 +250,9 @@ pub(crate) fn seal_key_name(device: &Name, public: &[u8; 32]) -> Name {
 }
 
 /// Parse `<device>/32=seal/<public key>`.
-pub(crate) fn parse_seal_key_name(name: &Name) -> Option<(Name, [u8; 32])> {
+///
+/// Public: a sibling crate that filters names tells a seal key's name by it.
+pub fn parse_seal_key_name(name: &Name) -> Option<(Name, [u8; 32])> {
     let (device, public) = parse_keyed(name, SEAL)?;
     Some((device, public.as_ref().try_into().ok()?))
 }
@@ -259,7 +267,7 @@ pub(crate) const SEAL_KEY_PACKET_MAX: usize = 2048;
 /// Data of a few hundred octets), so the granter judges it where it stands and
 /// asks nothing back: the exchange is one Interest and one Data.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct GrantAsk {
+pub struct GrantAsk {
     /// The asker's seal key packet's name, `<D>/32=seal/<public key>`
     /// ([`seal_key_name`]): the name of the packet in [`Self::seal_packet`].
     pub seal_key: Name,
@@ -341,7 +349,9 @@ pub(crate) fn grant_name(granter: &Name, ask: &GrantAsk) -> Name {
 
 /// Parse `<granter>/32=grant/<GrantAsk TLV>`. Only the canonical encoding
 /// parses, so one ask has one name.
-pub(crate) fn parse_grant_name(name: &Name) -> Option<(Name, GrantAsk)> {
+///
+/// Public: a sibling crate that filters names reads the space a grant ask is for by it.
+pub fn parse_grant_name(name: &Name) -> Option<(Name, GrantAsk)> {
     let (granter, value) = parse_keyed(name, GRANT)?;
     let ask = GrantAsk::decode(value.clone()).ok()?;
     (ask.encode() == *value).then_some((granter, ask))
@@ -355,7 +365,9 @@ pub(crate) fn held_name(holder: &Name, original: &Name) -> Name {
 }
 
 /// Parse `<holder>/32=held/<Name TLV>`.
-pub(crate) fn parse_held_name(name: &Name) -> Option<(Name, Name)> {
+///
+/// Public: a sibling crate that filters names unwraps a held copy's name by it.
+pub fn parse_held_name(name: &Name) -> Option<(Name, Name)> {
     let (holder, value) = parse_keyed(name, HELD)?;
     Some((holder, Name::decode_from_tlv(value.clone()).ok()?))
 }
@@ -418,7 +430,7 @@ pub(crate) fn signal_run_name(device: &Name, scope: &Name, run: &[u8; RUN_ID_LEN
 
 /// A parsed signal run header name ([`signal_run_name`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SignalRunName {
+pub struct SignalRunName {
     /// The device whose key signs the header.
     pub device: Name,
     /// The space the run's signals are of.
@@ -431,7 +443,9 @@ pub(crate) struct SignalRunName {
 /// before the first `32=signal` (a device name has no keyword), the scope a
 /// space name, the run a generic component of exactly [`RUN_ID_LEN`] octets.
 /// `None` for any other name.
-pub(crate) fn parse_signal_run_name(name: &Name) -> Option<SignalRunName> {
+///
+/// Public: a sibling crate that filters names reads a run header's space by it.
+pub fn parse_signal_run_name(name: &Name) -> Option<SignalRunName> {
     let comps = name.components();
     let at = comps.iter().position(|c| is_kw(c, SIGNAL))?;
     let [scope @ .., run_kw, run] = &comps[at + 1..] else {

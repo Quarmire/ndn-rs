@@ -30,6 +30,25 @@
 //! this module lets a program build, the node's admission still judges
 //! (signature and trust, membership, the chain, cuts).
 //!
+//! The parsers of the names a device serves ([`parse_space_name`], [`parse_log_name`],
+//! [`parse_piece_name`], [`parse_seal_key_name`], [`parse_grant_name`], [`parse_held_name`],
+//! [`parse_signal_run_name`]) and [`is_namespace`] are public: a sibling crate that filters
+//! packets by name (`ndn-invite`'s folder scope) judges them by the layer's own grammar, never a
+//! copy of it.
+//!
+//! ```
+//! use ndn_foundation_types::Name;
+//! use ndn_heap::wire::{PieceKind, log_name, parse_log_name, parse_piece_name, parse_space_name};
+//!
+//! let space: Name = "/alice/32=data/notes".parse().unwrap();
+//! assert_eq!(parse_space_name(&space).unwrap().owner, "/alice".parse::<Name>().unwrap());
+//! let entry = log_name(&"/alice/laptop".parse().unwrap(), &space, 3);
+//! let log = parse_log_name(&entry).unwrap();
+//! assert_eq!((log.space, log.seq), (space, 3));
+//! let piece: Name = format!("{entry}/32=piece/seg=2").parse().unwrap();
+//! assert_eq!(parse_piece_name(&piece).unwrap().kind, PieceKind::Chunk(2));
+//! ```
+//!
 //! The other submodules (names, the keyword router, pieces, grant, seal-key
 //! and manifest records, the TLV-TYPE registry 0x0600–0x063F, odd critical,
 //! even skippable) are the layer's own.
@@ -52,7 +71,11 @@ pub(crate) use prim::{each, fields, once, read_name};
 pub(crate) use sign::{SignError, sign_entry};
 
 pub use digest::{signed_digest, signed_digest_of};
-pub use names::log_name;
+pub use names::{
+    GrantAsk, LogName, SignalRunName, SpaceName, is_namespace, log_name, parse_grant_name,
+    parse_held_name, parse_log_name, parse_seal_key_name, parse_signal_run_name, parse_space_name,
+};
+pub use pieces::{PieceKind, PieceName, parse_piece_name};
 pub use types::*;
 
 #[cfg(test)]
