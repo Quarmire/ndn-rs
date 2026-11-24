@@ -330,7 +330,11 @@ pub struct Members {
 
 /// A device → seq map: how far a watcher has seen each device.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Frontier(BTreeMap<Name, u64>);
+pub struct Frontier {
+    seen: BTreeMap<Name, u64>,
+    /// Everything held now has been seen: a watch from it tells only what changes.
+    everything: bool,
+}
 
 impl Frontier {
     /// The empty frontier: nothing seen.
@@ -338,14 +342,27 @@ impl Frontier {
         Frontier::default()
     }
 
-    /// The seq seen of `device`, 0 for none.
+    /// Everything the space holds now seen: a watch from it lists no head and reads no
+    /// value, it tells the changes that follow (a watcher that cares for the members
+    /// alone, `ndn-invite`'s grants, does not replay every head of a large space).
+    pub fn everything() -> Frontier {
+        Frontier {
+            seen: BTreeMap::new(),
+            everything: true,
+        }
+    }
+
+    /// The seq seen of `device`, 0 for none (every seq, for [`Self::everything`]).
     pub fn get(&self, device: &Name) -> u64 {
-        self.0.get(device).copied().unwrap_or(0)
+        if self.everything {
+            return u64::MAX;
+        }
+        self.seen.get(device).copied().unwrap_or(0)
     }
 
     /// Say `device` was seen up to `seq`.
     pub fn set(&mut self, device: Name, seq: u64) {
-        self.0.insert(device, seq);
+        self.seen.insert(device, seq);
     }
 }
 

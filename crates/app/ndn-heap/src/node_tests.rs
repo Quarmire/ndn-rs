@@ -444,6 +444,29 @@ async fn a_clean_close_leaves_no_hole_and_no_gap_statement() {
     }
 }
 
+/// A watch from `Frontier::everything` lists no head and tells what follows: a members
+/// change reaches it, the values held before it began do not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watch_from_everything_replays_no_head() {
+    let dev = solo().await;
+    let (node, _) = boot(&dev, cfg()).await;
+    let heap = node.create(&space(), public()).await.unwrap();
+    heap.put(&n("/a"), bytes("one"), PutOptions::default())
+        .await
+        .unwrap();
+    let mut changes = heap.watch(&Frontier::everything()).await.unwrap();
+    let after = heap
+        .put(&n("/b"), bytes("two"), PutOptions::default())
+        .await
+        .unwrap();
+    match next(&mut changes).await {
+        Change::Put(item) => {
+            assert_eq!(item.id, after, "a head held before the watch was replayed")
+        }
+        other => panic!("the first thing told was {other:?}, not the put after the watch began"),
+    }
+}
+
 // -- What a crash takes ------------------------------------------------------------
 
 /// A device over a crash store: the store it holds and a way to the image a
