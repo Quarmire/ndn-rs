@@ -1047,6 +1047,12 @@ impl Heap {
         self.inner.log.lock().members()
     }
 
+    /// Whether this node has seen the space's creation: until then [`Self::members`] lists only the
+    /// owner (named by the space), and whether the space is public is not known.
+    pub fn members_known(&self) -> bool {
+        self.inner.log.lock().fold.create().is_some()
+    }
+
     /// The epoch writers seal in, as this node's fold holds it: its id (the owner device that
     /// signed the Epoch entry, and its seq) and whether it is for exactly the readers. `None` for
     /// a public space, or while no epoch is in force.

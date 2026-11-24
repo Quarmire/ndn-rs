@@ -735,3 +735,19 @@ async fn a_private_space_reports_its_epoch_and_a_public_one_none() {
         .unwrap();
     assert_eq!(open.epoch(), None, "a public space is never sealed");
 }
+
+/// A device that opened a space before its creation reached it lists the owner alone and does not
+/// know the members: `members_known` says so until the creation is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_follower_knows_no_members_until_the_creation_arrives() {
+    let m = mesh(&["/alice/laptop", "/alice/phone"]).await;
+    let (laptop, phone) = (m.boot(0, fast()).await, m.boot(1, fast()).await);
+    let theirs = phone.open(&space()).await.unwrap();
+    assert!(!theirs.members_known(), "nothing was created yet");
+    laptop.create(&space(), public()).await.unwrap();
+    eventually("the phone sees the creation", || async {
+        theirs.members_known()
+    })
+    .await;
+    assert_eq!(theirs.members().readers, Readers::Anyone);
+}
