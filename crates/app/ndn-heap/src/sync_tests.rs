@@ -426,6 +426,37 @@ async fn a_counters_entry_the_path_lost_five_asks_in_a_row_is_held_within_a_minu
     );
 }
 
+/// r5 under loss: a device nothing vouches for that was away for a hundred seconds and speaks
+/// again is asked within the cap of a stranger's ladder (16 s, [`crate::fetch::probe_pause`]),
+/// not after the 64 s the ladder would have climbed to: one lost ask after it came back must
+/// not cost a minute.
+#[tokio::test(start_paused = true)]
+async fn a_stranger_away_for_a_hundred_seconds_is_asked_again_within_sixteen_seconds_of_its_return()
+{
+    let r = rig().await;
+    let began = tokio::time::Instant::now();
+    r.wire.script(move |name| match direct(name) {
+        Some((d, 1)) if d == n(PHONE) => {
+            if began.elapsed() < Duration::from_secs(100) {
+                Reply::Silent
+            } else {
+                Reply::Data(genuine(PHONE, 1))
+            }
+        }
+        _ => Reply::Nack(NackReason::NoRoute),
+    });
+    r.group.on_update(notice(PHONE, 1));
+    while !r.host.holds(PHONE, 1) && began.elapsed() < Duration::from_secs(300) {
+        pass(1).await;
+    }
+    assert!(
+        r.host.holds(PHONE, 1) && began.elapsed() <= Duration::from_secs(125),
+        "held: {}, after {:?}",
+        r.host.holds(PHONE, 1),
+        began.elapsed()
+    );
+}
+
 /// o1/o3/q3 under loss: on a path whose round trip often passes two seconds (the faulty profile's
 /// delay, block and reorder times add to 3 s), an ask that waits two seconds, and half a second of
 /// slack, for its reply misses a reply that comes in three, and an Interest that stays pending
@@ -566,8 +597,8 @@ async fn a_forged_own_counter_asks_for_the_reserved_range_and_one_probe() {
         own.iter().filter(|s| !(11..=20).contains(*s)).max()
     );
     assert!(own.contains(&1_000_000), "the counter itself is probed");
-    // Four asks, then the pause climbs (4, 8, 16, 32 s) to one ask a minute.
-    assert!(own.iter().filter(|s| **s == 1_000_000).count() <= 11);
+    // Four asks, then the pause climbs (4, 8, 16 s) to one ask per 16 s: 17 in 200 s.
+    assert!(own.iter().filter(|s| **s == 1_000_000).count() <= 18);
 }
 
 /// A removed writer that serves other bytes at the seq its cut keeps does

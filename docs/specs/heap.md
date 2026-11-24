@@ -1465,15 +1465,22 @@ An update `(D, high)` of a group is handled so:
    here. A dropped name is walked no further.
 4. The log is told nothing of another device's counter (M4): the entry the
    counter names is **probed** when the log neither holds it nor asks for it,
-   alone, `FETCH_TRIES` (3) asks and then asks after a pause that climbs from 4 s,
-   doubling, to a minute (a real entry the path lost several asks in a row comes within a
-   minute; a forged counter's steady cost is one ask a minute); the holes below it are
-   wanted once it is held and verified. **The ladder belongs to the device**: a
-   higher counter changes the entry the probe names and never its pauses, there is one
-   probe at a time per device, and at most 8 (`PROBES_MAX`) of a group are in flight
-   (the devices with the fewest misses first, vouched ones before strangers, then by name), so
-   counters that rise at every Sync Interest cost one ladder each, not an ask each.
-   A probe that is answered ends the ladder: the device's next counter is asked at
+   alone for a stranger, `FETCH_TRIES` (3) asks and then asks after a pause that climbs
+   from 4 s, doubling, to 16 s (`PROBE_PAUSE_MAX`; r5 under loss: a device away for a minute
+   and back must not wait 64 s after one lost ask; a forged counter's steady cost is one
+   ask per 16 s per name); the holes below it are wanted once it is held and verified.
+   **The ladder belongs to the device**: a higher counter changes the entry the probe
+   names and never its pauses, and at most 8 (`PROBES_MAX`) probes of a group are in
+   flight (the devices with the fewest misses first, vouched ones before strangers, then by
+   name), so counters that rise at every Sync Interest cost one ladder each, not an ask
+   each. A device the log vouches for has up to 4 (`PROBE_FLIGHTS`) of its counters asked
+   at once (a writer that never pauses names a new entry every few milliseconds, and the
+   entry a notice names is often not to be had when asked; o4 under loss): the asks that
+   nothing answered pause a quarter second, 16 in a row (`REFRESH_TRIES`) then a minute,
+   and a packet that took nothing (a forgery) pauses as a want's does, growing; an ask
+   of any of its counters that takes something ends the run. A forged counter for such a
+   device costs 16 asks and then one a minute. A probe that is answered ends the
+   run: the device's next counter is asked at
    once. This device's own counter is told
    (`note_own_counter`: `UnbackedCounter` above the head, and the entries within
    `R` wanted). A device nothing vouches for yet costs the same one probe; the
@@ -1717,10 +1724,12 @@ nothing a node does; the `put_watch` example records them (§13.8).
 
 - **Forged notices.** A stranger can name any device at any counter. It costs a
   list of at most 64 names per group, vouched-for devices never displaced, and,
-  per device, one entry probed alone: `FETCH_TRIES` (3) asks, then asks after a pause
-  climbing from 4 s, doubling, to a minute (liveness: an honest writer away still comes;
-  a forged counter's steady cost is one ask a minute, however often it rises: the
-  ladder is the device's, not the counter's, §7.2). At most 8 probes of a group are in
+  per device, entries probed: of a stranger one at a time, `FETCH_TRIES` (3) asks, then
+  asks after a pause climbing from 4 s, doubling, to 16 s (liveness: a device that was
+  away for a minute and speaks again is asked within 16 s; a forged counter's steady
+  cost is one ask per 16 s per name, however often it rises: the ladder is the device's,
+  not the counter's, §7.2); of a device the log vouches for, see §7.2 item 4.
+  At most 8 probes of a group are in
   flight and at most an eighth of the node's slots hold probes, so counters that rise
   at every Sync Interest of 64 names (M2) take no slot an owed ask or a grant pull
   waits for. It raises no head, no

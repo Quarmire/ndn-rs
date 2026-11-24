@@ -14,12 +14,14 @@
 //! below it absent, and only once it is held and verified are the holes below
 //! it wanted, asked for in a window ([`Window`]: one per device, node-wide, starting small
 //! and following what the device answers, whose places an ask that missed keeps while it
-//! pauses), in seq order, the first [`Config::reserve_block`] seqs of each hole at a time,
+//! pauses), in seq order, the first [`hole_reach`] seqs of each hole at a time,
 //! minus what a gap statement declared void. A counter nothing signs
 //! therefore costs [`FETCH_TRIES`] asks, then asks after a pause that climbs
 //! from 4 s to a minute ([`probe_pause`]), so a forger's steady cost is one ask
 //! a minute however often the counter rises (the ladder is the device's: a higher counter
-//! changes the entry asked, nothing else), and wants nothing of the log. The node's slots
+//! changes the entry asked, nothing else), and wants nothing of the log. The counter of a
+//! device signed data vouches for is paced as a want is ([`retry_pause`]), since it is the
+//! one ask that finds the device's newest entry. The node's slots
 //! are shared by kind ([`Kind`], [`Slots`]), so probes and a flooded walk leave a grant
 //! pull a slot.
 //!
@@ -38,7 +40,7 @@
 //! counter names, probed; once that is held, the holes below it, at most four
 //! reservation blocks above the head.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -115,13 +117,33 @@ pub(crate) fn retry_pause(misses: u32) -> Duration {
         .min(REFRESH_PAUSE_MAX)
 }
 
-/// The pause before a probe is asked again once [`FETCH_TRIES`] asks missed:
-/// [`REFRESH_PAUSE_MAX`] after the last of them, doubled for each further miss, at
-/// most [`REFRESH_IDLE`].
+/// The longest pause between two asks for the counter of a stranger: a forger costs one ask
+/// this often per name, however often its counter rises, and a device that was away and
+/// speaks again is asked within it.
+const PROBE_PAUSE_MAX: Duration = Duration::from_secs(16);
+
+/// The pause before a probe of a stranger is asked again once [`FETCH_TRIES`] asks missed:
+/// [`REFRESH_PAUSE_MAX`] after the last of them, doubled for each further miss, at most
+/// [`PROBE_PAUSE_MAX`].
 pub(crate) fn probe_pause(misses: u32) -> Duration {
     REFRESH_PAUSE_MAX
         .saturating_mul(1 << misses.saturating_sub(FETCH_TRIES).min(8))
-        .min(REFRESH_IDLE)
+        .min(PROBE_PAUSE_MAX)
+}
+
+/// The pause before a counter of a device signed data vouches for is asked again after `misses`
+/// asks of its counters missed in a row: a quarter second, since a writer that never pauses
+/// names a new entry every few milliseconds and the entry a notice names is often not to be
+/// had when it is asked; [`REFRESH_IDLE`] from [`REFRESH_TRIES`] misses on, as a want's asks
+/// are. A forged counter for such a device costs [`REFRESH_TRIES`] asks and then one a minute,
+/// however often it rises: the run of misses is the device's, not the counter's, and one ask
+/// of any counter of it that takes something ends the run.
+pub(crate) fn vouched_pause(misses: u32) -> Duration {
+    if misses >= REFRESH_TRIES {
+        REFRESH_IDLE
+    } else {
+        REFRESH_PAUSE
+    }
 }
 
 /// The round-trip estimate from which an unanswered Interest is expressed
@@ -614,11 +636,18 @@ struct Ask {
 /// asked ([`Self::seq`]) and nothing else, so counters that rise without end (an unsigned
 /// vector costs nothing to send) cost the one ladder, never an ask each.
 struct Probe {
+    /// The newest counter named: the entry the next ask is for.
     seq: u64,
+    /// How many asks of the device's counters missed in a row.
     misses: u32,
-    /// When the next ask may be made (`None`: one is in flight).
-    until: Option<Instant>,
+    /// Before this no ask is made: the pause after a miss.
+    until: Instant,
+    /// The counters asked now.
+    flying: BTreeSet<u64>,
 }
+
+/// The most counters of one vouched device asked at once ([`Asks::probe`]).
+const PROBE_FLIGHTS: usize = 4;
 
 /// The most probes of one group in flight at once: a group has at most
 /// [`HEARD_MAX`](crate::heard::HEARD_MAX) devices heard, and the probes of devices nothing
@@ -700,6 +729,7 @@ impl Asks {
             seq,
             misses,
             probe: false,
+            vouched: true,
             digest,
         }
     }
@@ -792,8 +822,13 @@ impl Asks {
 
     /// The probes to make now, for the entries `named` (a device and the entry its counter
     /// names): the probe of a device not named any more is dropped unless one is in flight,
-    /// the entry a probe asks is the counter's as it stands, and at most [`PROBES_MAX`] are
-    /// in flight. `vouched` says whether signed data vouches for a device.
+    /// the entry a probe asks is the counter's as it stands, at most [`PROBES_MAX`] are in
+    /// flight, and of one device a stranger's one at a time and a vouched device's at most
+    /// [`PROBE_FLIGHTS`] (its counter rises as it writes, and the entry the notice names is
+    /// often not to be had yet when it is asked: a reader that follows a writer that never
+    /// pauses learns where the writer is by many asks of its counters, not by one). Asks of
+    /// a device whose last asks missed wait out their pause ([`Self::end`]). `vouched` says
+    /// whether signed data vouches for a device.
     fn probe(
         &mut self,
         named: &[(Name, u64)],
@@ -803,81 +838,106 @@ impl Asks {
         out: &mut Vec<Launch>,
     ) {
         self.probes
-            .retain(|d, p| p.until.is_none() || named.iter().any(|(n, _)| n == d));
+            .retain(|d, p| !p.flying.is_empty() || named.iter().any(|(n, _)| n == d));
         for (device, high) in named {
             self.probes
                 .entry(device.clone())
                 .or_insert(Probe {
                     seq: *high,
                     misses: 0,
-                    until: Some(now),
+                    until: now,
+                    flying: BTreeSet::new(),
                 })
                 .seq = *high;
         }
-        let mut flying = self.probes.values().filter(|p| p.until.is_none()).count();
+        let mut flying: usize = self.probes.values().map(|p| p.flying.len()).sum();
         let mut due: Vec<(u32, bool, Name)> = Vec::new();
         for (device, probe) in &self.probes {
-            match probe.until {
-                Some(until) if until > now => look_again(next, until - now),
-                Some(_) => due.push((probe.misses, !vouched(device), device.clone())),
-                None => {}
+            let stranger = !vouched(device);
+            let flights = if stranger { 1 } else { PROBE_FLIGHTS };
+            if probe.flying.len() >= flights || probe.flying.contains(&probe.seq) {
+                continue;
+            }
+            if probe.until > now {
+                look_again(next, probe.until - now);
+            } else {
+                due.push((probe.misses, stranger, device.clone()));
             }
         }
         due.sort();
-        for (_, _, device) in due {
+        for (_, stranger, device) in due {
             if flying >= PROBES_MAX {
                 break;
             }
             flying += 1;
             if let Some(probe) = self.probes.get_mut(&device) {
-                probe.until = None;
+                probe.flying.insert(probe.seq);
                 out.push(Launch {
                     seq: probe.seq,
                     misses: probe.misses,
                     device,
                     probe: true,
+                    vouched: !stranger,
                     digest: None,
                 });
             }
         }
     }
 
-    /// The ask of `launch` ended, `resolved` or not: how many asks of it missed in a row now,
-    /// and how long it pauses. A walk's ask pauses by [`retry_pause`] after a miss and
-    /// [`REFRESH_PAUSE`] after what resolved it. A probe, which decides nothing and is never
-    /// given up, climbs from [`REFRESH_PAUSE_MAX`] to [`REFRESH_IDLE`] by doubling
-    /// ([`probe_pause`]) once [`FETCH_TRIES`] asks missed: a real counter whose entry a lossy
-    /// path lost several asks in a row still comes within a minute or so, and a forger costs
-    /// one ask a minute in the end. A probe that resolved is over: the next counter of the
-    /// device is asked at once.
-    fn end(&mut self, launch: &Launch, resolved: bool, now: Instant) -> (u32, Duration) {
+    /// The ask of `launch` ended, `resolved` or not (`answered`: a packet came, whatever the
+    /// node made of it): how many asks of it missed in a row now, and how long it pauses. A
+    /// walk's ask pauses by [`retry_pause`] after a miss and [`REFRESH_PAUSE`] after what
+    /// resolved it. The asks of the counters of a device signed data vouches for miss in a row
+    /// as the device's, not the counter's: any ask of it that took something ends the run. A
+    /// silent miss (nothing came: the path lost it, or the entry is not to be had yet) pauses a
+    /// quarter second ([`vouched_pause`]); a packet that took nothing (a forgery, a copy that
+    /// does not verify) pauses as a want's does, growing. The probe of a stranger, which decides
+    /// nothing and is never given up, climbs from [`REFRESH_PAUSE_MAX`] to [`PROBE_PAUSE_MAX`]
+    /// by doubling ([`probe_pause`]) once [`FETCH_TRIES`] asks missed: a forger costs one ask
+    /// per [`PROBE_PAUSE_MAX`] in the end. A probe that resolved ends the run: the next counter
+    /// of the device is asked at once.
+    fn end(
+        &mut self,
+        launch: &Launch,
+        resolved: bool,
+        answered: bool,
+        now: Instant,
+    ) -> (u32, Duration) {
+        if launch.probe {
+            let probe = self.probes.entry(launch.device.clone()).or_insert(Probe {
+                seq: launch.seq,
+                misses: 0,
+                until: now,
+                flying: BTreeSet::new(),
+            });
+            probe.flying.remove(&launch.seq);
+            if resolved {
+                (probe.misses, probe.until) = (0, now);
+                return (0, REFRESH_PAUSE);
+            }
+            let missed = probe.misses;
+            let pause = if launch.vouched && !answered {
+                vouched_pause(missed)
+            } else if !launch.vouched && missed >= FETCH_TRIES {
+                probe_pause(missed)
+            } else {
+                retry_pause(missed)
+            };
+            (probe.misses, probe.until) = (missed + 1, now + pause);
+            return (missed + 1, pause);
+        }
         let (misses, pause) = if resolved {
             (0, REFRESH_PAUSE)
-        } else if launch.probe && launch.misses >= FETCH_TRIES {
-            (launch.misses + 1, probe_pause(launch.misses))
         } else {
             (launch.misses + 1, retry_pause(launch.misses))
         };
-        if launch.probe {
-            if resolved {
-                self.probes.remove(&launch.device);
-            } else {
-                let probe = self.probes.entry(launch.device.clone()).or_insert(Probe {
-                    seq: launch.seq,
-                    misses,
-                    until: None,
-                });
-                (probe.misses, probe.until) = (misses, Some(now + pause));
-            }
-        } else {
-            self.by.insert(
-                (launch.device.clone(), launch.seq),
-                Ask {
-                    misses,
-                    until: Some(now + pause),
-                },
-            );
-        }
+        self.by.insert(
+            (launch.device.clone(), launch.seq),
+            Ask {
+                misses,
+                until: Some(now + pause),
+            },
+        );
         (misses, pause)
     }
 
@@ -894,8 +954,12 @@ struct Launch {
     seq: u64,
     misses: u32,
     /// An ask of the entry a counter named that the log neither holds nor
-    /// asks for: paced after [`FETCH_TRIES`] misses, never given up.
+    /// asks for: never given up.
     probe: bool,
+    /// Whether signed data vouches for the device ([`Asks::probe`]): the ask of such a device's
+    /// counter is paced as a want of the log is ([`retry_pause`]), not as a stranger's is
+    /// ([`probe_pause`]).
+    vouched: bool,
     /// The signed digest the bytes must have (a removal cut names its
     /// entries by it): other bytes are not handed to the log.
     digest: Option<Pin>,
@@ -1084,7 +1148,7 @@ impl Group {
             }
             asks.probe(
                 &probes,
-                |d| host.vouched(space, d),
+                |d| *d != me && host.vouched(space, d),
                 now,
                 &mut next,
                 &mut launches,
@@ -1134,6 +1198,7 @@ impl Group {
             }
             right
         });
+        let answered = wire.is_some();
         let mut resolved = false;
         if let Some(wire) = wire {
             tracing::trace!(target: TIMELINE, %name, "verify_begin");
@@ -1157,7 +1222,8 @@ impl Group {
                 Taken::Pending(waiting) => tracing::debug!(%name, "not judged yet: {waiting}"),
             }
         }
-        let (misses, pause) = self.asks.lock().end(&launch, resolved, Instant::now());
+        let ended = Instant::now();
+        let (misses, pause) = self.asks.lock().end(&launch, resolved, answered, ended);
         tracing::trace!(
             target: TIMELINE,
             device = %self.shared.host.device(),
@@ -1624,7 +1690,7 @@ mod tests {
         let seqs = |l: &[Launch]| l.iter().map(|l| l.seq).collect::<Vec<_>>();
         assert_eq!(seqs(&launches), vec![1, 2, 3, 4]);
         for launch in &launches {
-            asks.end(launch, false, began);
+            asks.end(launch, false, false, began);
         }
         launches.clear();
         asks.walk(&device, &[(1, 1000)], 4, began, &mut next, &mut launches);
@@ -1667,7 +1733,7 @@ mod tests {
                 .all(|l| l.digest == Some(Pin::Implicit([7; 32])))
         );
         for launch in &launches {
-            asks.end(launch, false, began);
+            asks.end(launch, false, false, began);
         }
         launches.clear();
         asks.walk_exact(&device, &named, 4, began, &mut next, &mut launches);
@@ -1709,11 +1775,122 @@ mod tests {
                 );
                 last_misses = launch.misses;
                 count += 1;
-                asks.end(&launch, false, now);
+                asks.end(&launch, false, false, now);
             }
         }
-        assert!(count <= 9, "{count} probes in 100 s of rising counters");
+        // Asks at 0, 0.25, 0.75, 1.75 s, then every pause of 4, 8, 16, 16 … s ([`probe_pause`]).
+        assert!(count <= 11, "{count} probes in 100 s of rising counters");
         assert!(last_misses >= 7, "the ladder climbed: {last_misses}");
+    }
+
+    /// A device signed data vouches for is a device of the group: the asks for its newest
+    /// entries that nothing answered (the path lost them, or the entry is not to be had yet)
+    /// follow each other a quarter second apart, for [`REFRESH_TRIES`] of them in a row, however
+    /// the counter rises, and then wait a minute; asks that were answered with packets that
+    /// took nothing (forgeries) pause longer each time, as a want's do. A reader that follows a
+    /// writer that never pauses (conformance o4, faulty seeds 1, 4, 6, 9) learned where the
+    /// writer was a minute late otherwise.
+    #[test]
+    fn a_vouched_devices_silent_misses_pause_a_quarter_second_and_forgeries_pause_longer() {
+        let device: Name = "/alice/phone".parse().expect("a name");
+        let times = |answered: bool| {
+            let mut asks = Asks::default();
+            let began = Instant::now();
+            let mut asked = Vec::new();
+            for step in 0..400u64 {
+                let now = began + Duration::from_millis(250 * step);
+                let (mut next, mut launches) = (None, Vec::new());
+                asks.probe(
+                    &[(device.clone(), step + 1)],
+                    |_| true,
+                    now,
+                    &mut next,
+                    &mut launches,
+                );
+                for launch in launches {
+                    asked.push(now - began);
+                    asks.end(&launch, false, answered, now);
+                }
+            }
+            asked
+        };
+        let silent = times(false);
+        assert!(
+            silent[..REFRESH_TRIES as usize]
+                .windows(2)
+                .all(|w| w[1] - w[0] <= Duration::from_millis(500)),
+            "{} silent misses pause a quarter second each: {silent:?}",
+            REFRESH_TRIES
+        );
+        let idle = REFRESH_TRIES as usize + 1;
+        assert!(
+            silent[idle] - silent[idle - 1] >= REFRESH_IDLE,
+            "then a minute: {silent:?}"
+        );
+        let forged = times(true);
+        let gaps: Vec<Duration> = forged.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            gaps.windows(2).all(|g| g[1] >= g[0]) && gaps[3] > gaps[0],
+            "forgeries pause longer each time: {gaps:?}"
+        );
+    }
+
+    /// A writer that never pauses names a higher counter every few milliseconds, and the entry
+    /// a notice names is often not to be had when it is asked: a vouched device's counters are
+    /// asked several at once ([`PROBE_FLIGHTS`], so the reader learns where the writer is by many
+    /// asks, not one at a time: o4 under loss, faulty seeds 1, 4, 6, 9), a stranger's one at a
+    /// time, and a run of asks that missed holds back both.
+    #[test]
+    fn a_vouched_devices_counters_are_asked_several_at_once_and_a_strangers_one() {
+        let device: Name = "/alice/phone".parse().expect("a name");
+        let now = Instant::now();
+        let asked = |vouched: bool| {
+            let mut asks = Asks::default();
+            let mut all = Vec::new();
+            for counter in 1..=20u64 {
+                let (mut next, mut launches) = (None, Vec::new());
+                asks.probe(
+                    &[(device.clone(), counter)],
+                    |_| vouched,
+                    now,
+                    &mut next,
+                    &mut launches,
+                );
+                all.extend(launches.iter().map(|l| l.seq));
+            }
+            all
+        };
+        assert_eq!(asked(true), vec![1, 2, 3, 4], "four counters at once");
+        assert_eq!(asked(false), vec![1]);
+
+        // Asks that missed in a row hold back the next counter, for either.
+        let mut asks = Asks::default();
+        let mut launches = Vec::new();
+        asks.probe(
+            &[(device.clone(), 1)],
+            |_| true,
+            now,
+            &mut None,
+            &mut launches,
+        );
+        asks.end(&launches[0], false, false, now);
+        launches.clear();
+        asks.probe(
+            &[(device.clone(), 2)],
+            |_| true,
+            now,
+            &mut None,
+            &mut launches,
+        );
+        assert!(launches.is_empty(), "the pause after a miss is not over");
+        asks.probe(
+            &[(device.clone(), 2)],
+            |_| true,
+            now + Duration::from_millis(300),
+            &mut None,
+            &mut launches,
+        );
+        assert_eq!(launches.len(), 1, "and then the next counter is asked");
     }
 
     /// Stage-4 review M2. At most [`PROBES_MAX`] probes of a group are in flight; of the
@@ -1745,8 +1922,10 @@ mod tests {
                 seq: 1,
                 misses: 0,
                 probe: true,
+                vouched: true,
                 digest: None,
             },
+            false,
             false,
             now,
         );
