@@ -9,8 +9,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_app::{Connection, Node, ServeGuard};
 use ndn_foundation_types::Name;
+use ndn_packet::Data;
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
-use ndn_packet::{Data, NackReason};
 
 use super::*;
 use crate::node::Config;
