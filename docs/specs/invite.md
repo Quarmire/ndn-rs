@@ -1602,8 +1602,9 @@ two names by the grammar of heap.md §2.3: nothing is looked up and nothing is c
   namespace** (the epoch's creator, or another owner device that holds the key: heap.md §6.5); no other seal key, no other granter;
 - a held copy `<H>/32=held/<Name TLV>` about a name carried by these rules, to the depth of two held names, and not deeper.
 
-Not carried by these predicates: the sync group of the space (the link layer adds the owner's group of the granted space, which the
-heap names, `ndn_heap::wire::sync_group_of(space)`: ndn-link.md §8.7 rule 20, and the namespaces' own groups), certificates and the trust
+Not carried by these predicates: the sync group of the space (the link layer routes the owner's `<O>/32=sync` and filters to the granted
+space's own group, which the heap names, `ndn_heap::wire::sync_group_of(space)`: ndn-link.md §8.7 rules 10 and 20, and §13.3 below; the namespaces'
+own groups are the link layer's too), certificates and the trust
 context (the link layer's: they are the namespaces', not the space's), introductions (the surface's, §13.1), anything that is not a name
 of this layer. `false` for a `space` that is no space name, so a grant for no space carries nothing.
 
@@ -1632,6 +1633,12 @@ writers' devices and keys:
 
 Nothing of a writer outside the space is added: the other writers' entries, pieces and signal headers of the space are carried
 already, whatever device wrote them. A reader-role grant gains nothing by it: the link layer's push scope stays the person's own devices'.
+
+**The space's sync group is the link layer's, in two halves** (ndn-link.md §8.7 rules 10 and 20; the hook is ndn-link's
+`Introductions::sync_group(space)`, answered by `ndn_heap::wire::sync_group_of(space)`, heap.md §2.5). The link layer **routes** the
+owner-wide prefix `<O>/32=sync` over every full link to a granted key (the heap node registers that prefix in the forwarder, and a
+longer route would shadow it), while its **filter** carries only the Sync Interests `<group>/v=N[/…]` of the granted space's own group,
+exactly: not the owner's other spaces, and not a nested space `n/f1` under `n`. The predicates of this section do not decide it.
 
 ### 13.4 What a departure link carries: `departure_carries`
 
