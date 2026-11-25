@@ -2379,6 +2379,15 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   - **Accepted residual:** a key beyond the 16 is not refused its new entries by
     the mark, and only an owner's removal or revocation ends it, as for any
     writer who mints keys.
+- **A grant ask is parsed before it is judged; space names are probed
+  (stage-7 I6, I7).** The seal key packet that names the asker is decoded (at most 2,048
+  octets) and the chain it carries is split (at most 4 certificates and 6,144 octets;
+  the parse stops at the first one over the limit) before the name-level decision,
+  because the asker's identity is that packet's name; nothing is verified or fetched
+  before the decision, and one Interest bounds the work. A space's name is chosen by
+  people and a prober that names `<owner>/32=sync/<name>` learns whether the space
+  exists and, if it does, its devices and entry counts (ndn-link.md §13.6); a space
+  that must not be probed has a random component in its name.
 - **The owner rule's second half is checked.** An owner device is a key whose
   device lies under the owner's namespace by name **and** whose person is the
   owner (§2.1). A `Members` or `Epoch` entry is refused (`NotMember`) unless its
