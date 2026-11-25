@@ -180,9 +180,11 @@ check that a below-tip packet is the entry the key signed in its log. The
 ends decide: a node's data layer (`ndn-heap`) keeps an entry of a tip-cut key
 only if it is a chain ancestor of the tip, and refuses any other (`OutsideCut`).
 An application that reads Data below a tip without the data layer relies on
-the name alone for those names. To bring back an entry above a tip, re-admit
-it by full name ([below](#re-admitting-a-version)); a name the cut accepts
-already is not added again. Old cuts, with runs and a manifest, still decode
+the name alone for those names. To bring back an entry a tip leaves out — one
+above the tip, one at the tip's seq with other bytes, or a kept entry off the
+tip's chain that the file lists as `left_out` — re-admit it by full name
+([below](#re-admitting-a-version)): an exact entry exempts that packet from the
+data layer's chain test. Old cuts, with runs and a manifest, still decode
 and are judged exactly as before; a node too old to know `CutTip` reads a
 tips cut as accepting nothing it names, so it refuses more, never less, until
 it is updated.
@@ -254,9 +256,10 @@ seq or other bytes at the name. Every device that holds or follows them
 then applies them. Refused: a key revoked without a cut
 (`readmit-no-cut`: revoke it with a cut first — which is possible only in
 the version that revokes it), a name without a 32-octet digest or outside
-the key's device log (`readmit-refused`); names already in the cut — also,
-in a [tips cut](#tips-cut), a name below a tip, or the tip with its digest —
-are nothing to sign (`nothing-to-sign`).
+the key's device log (`readmit-refused`); names a range of the cut decides, or
+an exact entry of it lists already, are nothing to sign (`nothing-to-sign`).
+A name below a tip, or at it, is not skipped in a [tips cut](#tips-cut): it is
+added as an exact entry.
 
 ## After a recovery
 

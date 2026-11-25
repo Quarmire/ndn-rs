@@ -517,8 +517,10 @@ refused, and so MUST a revocation cut: this recovery revokes no key.
    ([data-layer.md](data-layer.md) §8.1, §8.4). A tip names the entries
    below it by name: the recovered namespace's data layer keeps an entry
    of that key only if it is a chain ancestor of the tip, as for any tips
-   cut (trust-context.md §3.3.12), and an entry above a tip is
-   re-admitted later by `ndn-fwd readmit`, exact name and digest.
+   cut (trust-context.md §3.3.12), and an entry the tip leaves out (above
+   it, or kept off its chain and listed as left out) is re-admitted later by
+   `ndn-fwd readmit`, exact name and digest, which exempts that packet from
+   the chain test.
 11. The old CA key is revoked (step 8), and a cut never excuses a revoked
    issuer (trust-context.md §6.3). So for every key `N+1` revokes with a cut
    — carried from `N` or added in step 10 — the new CA key must certify
