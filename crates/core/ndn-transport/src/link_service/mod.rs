@@ -246,7 +246,29 @@ pub struct LpLinkService {
     a_lal_feature: Arc<features::AlalFeature>,
 }
 
+/// The most an LpPacket wrap of a bare network packet adds: the LpPacket
+/// header (type, up to a 3-byte length) and the Fragment header (the same).
+const LP_WRAP_OVERHEAD: usize = 8;
+
 impl LpLinkService {
+    /// Run the egress feature pipeline over one framed `wire`.
+    ///
+    /// The features add link-local fields (a congestion mark, trace context, a
+    /// presence name) AFTER the frame was sized to `mtu`. A frame they would
+    /// push over the transport's limit goes out without them: those fields
+    /// are advisory, while a datagram transport cannot send an oversize frame
+    /// at all.
+    fn run_egress(&self, wire: Bytes, ctx: &EgressCtx, mtu: Option<usize>) -> Bytes {
+        let mut frame = OutboundLpFrame::new(wire.clone(), true);
+        for feature in &self.features {
+            feature.on_egress(&mut frame, ctx);
+        }
+        match mtu {
+            Some(mtu) if frame.wire.len() > mtu && wire.len() <= mtu => wire,
+            _ => frame.wire,
+        }
+    }
+
     /// Reserve the sequence numbers one fragmented packet will consume, returning
     /// its `base_seq`.
     ///
@@ -313,13 +335,7 @@ impl LpLinkService {
         let seq = self.reserve_fragment_seqs(payload.len(), mtu);
         ndn_packet::fragment::fragment_packet(payload, mtu, seq)
             .into_iter()
-            .map(|frag| {
-                let mut frame = OutboundLpFrame::new(frag, true);
-                for feature in &self.features {
-                    feature.on_egress(&mut frame, egress_ctx);
-                }
-                frame.wire
-            })
+            .map(|frag| self.run_egress(frag, egress_ctx, Some(mtu)))
             .collect()
     }
 
@@ -418,14 +434,12 @@ impl LinkService for LpLinkService {
                     }
                     return Ok(());
                 }
-                let mut frame = OutboundLpFrame::new(packet, true);
-                for feature in &self.features {
-                    feature.on_egress(&mut frame, &egress_ctx);
-                }
-                return transport.send_bytes(frame.wire).await;
+                let wire = self.run_egress(packet, &egress_ctx, transport.send_mtu());
+                return transport.send_bytes(wire).await;
             }
-            match transport.send_mtu() {
-                Some(mtu) if packet.len() + 4 > mtu => {
+            let mtu = transport.send_mtu();
+            match mtu {
+                Some(mtu) if packet.len() + LP_WRAP_OVERHEAD > mtu => {
                     for wire in self.fragment_for_egress(&packet, mtu, &egress_ctx) {
                         transport.send_bytes(wire).await?;
                     }
@@ -433,11 +447,8 @@ impl LinkService for LpLinkService {
                 }
                 _ => {
                     let wire = ndn_packet::lp::encode_lp_packet(&packet);
-                    let mut frame = OutboundLpFrame::new(wire, true);
-                    for feature in &self.features {
-                        feature.on_egress(&mut frame, &egress_ctx);
-                    }
-                    transport.send_bytes(frame.wire).await
+                    let wire = self.run_egress(wire, &egress_ctx, mtu);
+                    transport.send_bytes(wire).await
                 }
             }
         })
@@ -482,13 +493,10 @@ impl LinkService for LpLinkService {
                 return Ok(());
             }
             let egress_ctx = EgressCtx::new(FaceId(transport.id().0), source);
+            let mtu = transport.send_mtu();
             let mut out = Vec::with_capacity(wires.len());
             for wire in wires {
-                let mut frame = OutboundLpFrame::new(wire.clone(), true);
-                for feature in &self.features {
-                    feature.on_egress(&mut frame, &egress_ctx);
-                }
-                out.push(frame.wire);
+                out.push(self.run_egress(wire.clone(), &egress_ctx, mtu));
             }
             transport.send_batch(&out).await
         })
@@ -542,7 +550,10 @@ impl LinkService for LpLinkService {
                 // the retransmit tick, so recovery costs roughly an RTT instead
                 // of an RTO -- the RFC 6298 floor alone is 200 ms. NFD repairs on
                 // this same path.
-                for wire in self.reliability_feature.take_fast_retransmits() {
+                for wire in self
+                    .reliability_feature
+                    .take_fast_retransmits(transport.send_mtu())
+                {
                     let _ = transport.send_bytes(wire).await;
                 }
                 // Duplicate: its Ack is still queued (the peer retransmitted
@@ -1009,13 +1020,16 @@ mod fragment_reliability_tests {
         );
 
         // The engine's 5 ms tick drains `take_acks` until `None`.
-        let ack = svc.reliability_feature.take_acks().expect("Acks queued");
+        let ack = svc
+            .reliability_feature
+            .take_acks(None)
+            .expect("Acks queued");
         assert_eq!(
             ndn_packet::lp::extract_acks(&ack).1.as_slice(),
             &peer_seqs()[..],
             "one Ack packet must carry every Ack of the burst"
         );
-        assert!(svc.reliability_feature.take_acks().is_none());
+        assert!(svc.reliability_feature.take_acks(None).is_none());
     }
 
     /// An outgoing frame after receipt carries the pending Acks piggybacked,
@@ -1033,7 +1047,7 @@ mod fragment_reliability_tests {
 
         let mut w = ndn_tlv::TlvWriter::new();
         w.write_tlv(0x05, &[0xAB; 100]);
-        let wires = svc.reliability_feature.frame(&w.finish());
+        let wires = svc.reliability_feature.frame(&w.finish(), None);
         svc.send_batch(&tx, &wires, None).await.unwrap();
 
         let sent = tx.sent.lock().unwrap().clone();
@@ -1046,7 +1060,7 @@ mod fragment_reliability_tests {
             "Acks ride the data frame"
         );
         assert!(
-            svc.reliability_feature.take_acks().is_none(),
+            svc.reliability_feature.take_acks(None).is_none(),
             "piggybacked Acks must not be sent again on the tick"
         );
     }
@@ -1103,5 +1117,206 @@ mod fragment_reliability_tests {
             wires.len(),
             "every fragment must be tracked for retransmission"
         );
+    }
+}
+
+/// No frame leaves over the transport's limit as it is NOW. A datagram
+/// transport cannot send one at all (QUIC: "datagram over the path size,
+/// dropped"), and its limit moves: a path MTU black-hole reset takes it back
+/// to the minimum.
+#[cfg(test)]
+mod frame_limit_tests {
+    use super::*;
+    use crate::face::LinkType;
+    use crate::transport::Transport;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A datagram transport with a frame limit that can move. A frame over
+    /// the limit is recorded and dropped, as a QUIC link drops it.
+    struct Moving {
+        limit: AtomicUsize,
+        sent: Mutex<Vec<Bytes>>,
+        dropped: Mutex<Vec<usize>>,
+        inbound: Mutex<VecDeque<Bytes>>,
+    }
+    impl Moving {
+        fn new(limit: usize) -> Self {
+            Self {
+                limit: AtomicUsize::new(limit),
+                sent: Mutex::new(Vec::new()),
+                dropped: Mutex::new(Vec::new()),
+                inbound: Mutex::new(VecDeque::new()),
+            }
+        }
+        fn limit(&self) -> usize {
+            self.limit.load(Ordering::Relaxed)
+        }
+        fn set_limit(&self, limit: usize) {
+            self.limit.store(limit, Ordering::Relaxed);
+        }
+        fn sent(&self) -> Vec<Bytes> {
+            self.sent.lock().unwrap().clone()
+        }
+        fn assert_none_dropped(&self) {
+            let dropped = self.dropped.lock().unwrap().clone();
+            assert!(
+                dropped.is_empty(),
+                "datagram over the path size, dropped: {dropped:?} B frames over the {} B limit",
+                self.limit.load(Ordering::Relaxed)
+            );
+        }
+    }
+    impl Transport for Moving {
+        fn id(&self) -> FaceId {
+            FaceId(21)
+        }
+        fn kind(&self) -> FaceKind {
+            FaceKind::Quic
+        }
+        fn link_type(&self) -> LinkType {
+            LinkType::PointToPoint
+        }
+        fn send_mtu(&self) -> Option<usize> {
+            Some(self.limit.load(Ordering::Relaxed))
+        }
+        async fn send_bytes(&self, wire: Bytes) -> Result<(), FaceError> {
+            if wire.len() > self.limit.load(Ordering::Relaxed) {
+                self.dropped.lock().unwrap().push(wire.len());
+            } else {
+                self.sent.lock().unwrap().push(wire);
+            }
+            Ok(())
+        }
+        async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+            self.inbound
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(FaceError::Closed)
+        }
+    }
+
+    /// A network packet of exactly `len` bytes.
+    fn packet(len: usize) -> Bytes {
+        let mut w = ndn_tlv::TlvWriter::new();
+        // Type 1 byte + a length of 1 byte (under 253) or 3 + the value.
+        let header = if len >= 257 { 4 } else { 2 };
+        w.write_tlv(0x06, &vec![0xAB; len - header]);
+        let wire = w.finish();
+        assert_eq!(wire.len(), len);
+        wire
+    }
+
+    /// A bare packet is wrapped in an LpPacket (8 bytes of headers) when it
+    /// fits, else fragmented. The decision allowed for 4, so a packet of
+    /// the limit minus 4 to 7 bytes was wrapped into a frame 1 to 4 bytes
+    /// over the limit.
+    #[tokio::test]
+    async fn a_packet_that_no_longer_fits_once_wrapped_is_fragmented() {
+        let t = Moving::new(1200);
+        let svc = LpLinkService::new();
+        for len in 1190..=1200 {
+            svc.send(&t, packet(len), None).await.unwrap();
+        }
+        t.assert_none_dropped();
+        assert!(t.sent().iter().all(|w| w.len() <= 1200));
+    }
+
+    /// A feature adds its link-local field after the frame was sized: a
+    /// frame it would push over the limit goes out without the field, one it
+    /// fits in keeps it.
+    #[tokio::test]
+    async fn an_egress_field_that_would_overflow_the_frame_is_left_off() {
+        struct Pad;
+        impl LinkServiceFeature for Pad {
+            fn name(&self) -> &'static str {
+                "pad"
+            }
+            fn on_egress(&self, frame: &mut OutboundLpFrame, _ctx: &EgressCtx) {
+                frame.wire = Bytes::from([&frame.wire[..], &[0u8; 16]].concat());
+            }
+        }
+        let t = Moving::new(1200);
+        let svc = LpLinkService::new().with_extra_feature(Arc::new(Pad));
+
+        // Wraps to exactly the limit: no room for the field.
+        svc.send(&t, packet(1192), None).await.unwrap();
+        // Wraps well under it: the field rides.
+        svc.send(&t, packet(100), None).await.unwrap();
+
+        t.assert_none_dropped();
+        let sent = t.sent();
+        assert_eq!(sent[0].len(), 1200, "the field was left off");
+        assert_eq!(
+            sent[1].len(),
+            ndn_packet::lp::encode_lp_packet(&packet(100)).len() + 16,
+            "the field fit and rode"
+        );
+    }
+
+    /// The send loop frames for the transport's limit as it is, not for the
+    /// face's fragmentation threshold (8800 until something sets it, and
+    /// nothing sets it for a QUIC link): a frame built for 8800 is cut again
+    /// on its way out under fresh TxSequences, leaving the original tracked
+    /// and never sent, to be "retransmitted" later.
+    #[tokio::test]
+    async fn the_send_loop_frames_for_the_transport_limit_and_tracks_what_it_sends() {
+        let t = Moving::new(1200);
+        let svc = LpLinkService::new();
+        svc.reliability_feature.set_enabled(true);
+
+        let wires = svc
+            .reliability_feature
+            .frame(&packet(3000), Some(t.limit()));
+        svc.send_batch(&t, &wires, None).await.unwrap();
+
+        t.assert_none_dropped();
+        let sent = t.sent();
+        assert!(sent.iter().all(|w| w.len() <= 1200));
+        assert_eq!(
+            svc.reliability_feature.unacked_count(),
+            sent.len(),
+            "exactly the frames that went out are tracked for retransmission"
+        );
+    }
+
+    /// A packet fragmented for 1400 loses a fragment and the path's limit has
+    /// fallen to 1200 by the time the receive path repairs it: the repair is
+    /// the packet cut for 1200, not the old fragments.
+    #[tokio::test]
+    async fn a_repair_after_the_transport_limit_fell_fits_the_new_limit() {
+        let t = Moving::new(1400);
+        let svc = LpLinkService::new();
+        svc.reliability_feature.set_enabled(true);
+
+        let big = svc
+            .reliability_feature
+            .frame(&packet(3000), Some(t.limit()));
+        svc.send_batch(&t, &big, None).await.unwrap();
+        // Three frames after it, whose Acks arrive: the big packet is lost.
+        let first_later = svc.reliability_feature.unacked_count() as u64;
+        for _ in 0..3 {
+            let wires = svc.reliability_feature.frame(&packet(100), Some(t.limit()));
+            svc.send_batch(&t, &wires, None).await.unwrap();
+        }
+        t.sent.lock().unwrap().clear();
+        t.set_limit(1200);
+        t.inbound
+            .lock()
+            .unwrap()
+            .push_back(ndn_packet::lp::encode_lp_acks(&[
+                first_later,
+                first_later + 1,
+                first_later + 2,
+            ]));
+
+        svc.recv(&t).await.expect("the Ack frame delivers");
+
+        t.assert_none_dropped();
+        let repairs = t.sent();
+        assert!(!repairs.is_empty(), "the lost packet is repaired at once");
+        assert!(repairs.iter().all(|w| w.len() <= 1200));
     }
 }

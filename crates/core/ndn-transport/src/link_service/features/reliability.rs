@@ -116,15 +116,20 @@ impl ReliabilityFeature {
     /// LP wire bytes due for retransmission. Increments
     /// [`Self::n_lp_resent_packets`].
     ///
+    /// `limit` is the largest frame the transport takes now
+    /// (`Transport::send_mtu`; `None` for a transport with no frame limit): a
+    /// frame built for a larger one is cut again to it, so nothing over the
+    /// transport's limit is ever handed back.
+    ///
     /// NOT gated on `is_enabled`: like [`Self::take_acks`], this is a duty owed
     /// for frames we already put on the wire with a `TxSequence`. Fragmented
     /// egress is tracked via [`Self::frame_fragments`] regardless of the
     /// enabled flag (a lost fragment destroys the whole packet and nothing
     /// below us can repair it), so gating here would strand those frames
     /// un-retransmitted. Returns empty when nothing is tracked.
-    pub fn take_retransmissions(&self) -> Vec<Bytes> {
+    pub fn take_retransmissions(&self, limit: Option<usize>) -> Vec<Bytes> {
         let mut s = self.state.lock().unwrap();
-        let retx = s.check_retransmit();
+        let retx = s.check_retransmit(limit.unwrap_or(usize::MAX));
         if !retx.is_empty() {
             self.n_lp_resent_packets
                 .fetch_add(retx.len() as u64, Ordering::Relaxed);
@@ -137,11 +142,18 @@ impl ReliabilityFeature {
     /// (`LpReliability::on_send`). The single egress framer (the per-face send
     /// loop) calls this — instead of `frame_with_intent` — when reliability is
     /// enabled. Returns the wire frame(s); empty when disabled.
-    pub fn frame(&self, payload: &[u8]) -> Vec<Bytes> {
+    ///
+    /// `limit` is the largest frame the transport takes now: no frame is
+    /// built over it, whatever the face's fragmentation threshold is (see
+    /// `LpReliability::on_send_within`).
+    pub fn frame(&self, payload: &[u8], limit: Option<usize>) -> Vec<Bytes> {
         if !self.is_enabled() {
             return Vec::new();
         }
-        self.state.lock().unwrap().on_send(payload)
+        self.state
+            .lock()
+            .unwrap()
+            .on_send_within(payload, limit.unwrap_or(usize::MAX))
     }
 
     /// Fragment `payload` to `mtu` for reliable egress: every fragment gets its
@@ -157,21 +169,23 @@ impl ReliabilityFeature {
     ///
     /// NOT gated on `is_enabled` -- see [`Self::take_retransmissions`].
     pub fn frame_fragments(&self, payload: &[u8], mtu: usize) -> Vec<Bytes> {
-        let mut s = self.state.lock().unwrap();
-        s.set_mtu(mtu);
-        s.on_send(payload)
+        self.state.lock().unwrap().on_send_at(payload, mtu)
     }
 
     /// Standalone Ack frame for received reliable frames that no outgoing
     /// frame has piggybacked yet, pumped on the engine's 5 ms idle-Ack tick
     /// (NFD's `idleAckTimerPeriod`). Carries as many pending Acks as fit in
-    /// the MTU; call until `None` to drain them all.
+    /// the MTU and in `limit`, the largest frame the transport takes now; call
+    /// until `None` to drain them all.
     ///
     /// NOT gated on `is_enabled`: see [`Self::on_ingress`]. Acking is a
     /// receiver-side duty owed to whoever sent us a TxSequence, independent of
     /// whether WE transmit reliably.
-    pub fn take_acks(&self) -> Option<Bytes> {
-        self.state.lock().unwrap().flush_acks()
+    pub fn take_acks(&self, limit: Option<usize>) -> Option<Bytes> {
+        self.state
+            .lock()
+            .unwrap()
+            .flush_acks(limit.unwrap_or(usize::MAX))
     }
 
     /// Feed inbound wire bytes so peer Acks clear tracked entries and received
@@ -183,9 +197,13 @@ impl ReliabilityFeature {
     }
 
     /// Frames that ack ordering has declared lost, ready to resend immediately
-    /// (see `LpReliability::take_fast_retransmits`).
-    pub fn take_fast_retransmits(&self) -> Vec<Bytes> {
-        self.state.lock().unwrap().take_fast_retransmits()
+    /// (see `LpReliability::take_fast_retransmits`); `limit` as for
+    /// [`Self::take_retransmissions`].
+    pub fn take_fast_retransmits(&self, limit: Option<usize>) -> Vec<Bytes> {
+        self.state
+            .lock()
+            .unwrap()
+            .take_fast_retransmits(limit.unwrap_or(usize::MAX))
     }
 
     /// Frames resent early by the fast-retransmit path.
@@ -272,20 +290,20 @@ mod tests {
         let receiver = ReliabilityFeature::new();
         // receiver deliberately left DISABLED
 
-        let wires = sender.frame(b"hello");
+        let wires = sender.frame(b"hello", None);
         assert!(!wires.is_empty(), "enabled sender frames reliably");
 
         // receiver must queue an Ack even though it is disabled
         receiver.note_receive(&wires[0]);
         let ack = receiver
-            .take_acks()
+            .take_acks(None)
             .expect("a disabled receiver still owes the sender an Ack");
 
         // and that Ack must clear the sender's unacked entry, so nothing is
         // due for retransmission
         sender.note_receive(&ack);
         assert!(
-            sender.take_retransmissions().is_empty(),
+            sender.take_retransmissions(None).is_empty(),
             "Ack from a disabled receiver must clear the sender's backlog"
         );
     }
@@ -296,11 +314,11 @@ mod tests {
         // sending reliably stays opt-in.
         let f = ReliabilityFeature::new();
         assert!(
-            f.frame(b"x").is_empty(),
+            f.frame(b"x", None).is_empty(),
             "disabled face must not frame reliably"
         );
         assert!(
-            f.take_retransmissions().is_empty(),
+            f.take_retransmissions(None).is_empty(),
             "disabled face must not retransmit its own traffic"
         );
     }
@@ -341,12 +359,12 @@ mod tests {
         // Canonical egress framing: each `frame` call assigns a TxSequence and
         // buffers the wire for retransmission.
         for _ in 0..3 {
-            let frames = f.frame(&bare_interest());
+            let frames = f.frame(&bare_interest(), None);
             assert_eq!(frames.len(), 1, "small packet → one reliable frame");
         }
 
         thread::sleep(Duration::from_millis(20));
-        let retx = f.take_retransmissions();
+        let retx = f.take_retransmissions(None);
         assert!(!retx.is_empty(), "retransmissions must fire after RTO");
         assert!(
             f.n_lp_resent_packets() >= retx.len() as u64,
@@ -361,10 +379,10 @@ mod tests {
         // just never frames or retransmits its own traffic.
         let f = ReliabilityFeature::new();
         // Disabled: `frame` returns nothing and tracks nothing.
-        assert!(f.frame(&bare_interest()).is_empty());
+        assert!(f.frame(&bare_interest(), None).is_empty());
 
         thread::sleep(Duration::from_millis(20));
-        let retx = f.take_retransmissions();
+        let retx = f.take_retransmissions(None);
         assert!(retx.is_empty(), "disabled feature must not retransmit");
         assert_eq!(f.n_lp_resent_packets(), 0);
     }

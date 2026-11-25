@@ -65,7 +65,7 @@ fn canonical_core_recovers_loss() {
 
     // Receiver Acks what it got; sender clears those, leaving only frame 1.
     let ack = receiver
-        .flush_acks()
+        .flush_acks(usize::MAX)
         .expect("receiver must Ack received frames");
     sender.on_receive(&ack);
     assert_eq!(
@@ -76,7 +76,7 @@ fn canonical_core_recovers_loss() {
 
     // After the RTO, the sender retransmits exactly the dropped frame.
     std::thread::sleep(std::time::Duration::from_millis(5));
-    let retx = sender.check_retransmit();
+    let retx = sender.check_retransmit(usize::MAX);
     assert_eq!(retx.len(), 1, "only the dropped frame is retransmitted");
     assert!(
         has_tx_sequence(&retx[0]),
@@ -86,7 +86,7 @@ fn canonical_core_recovers_loss() {
     // The retransmission gets through; the receiver Acks it; sender drains.
     receiver.on_receive(&retx[0]);
     let ack = receiver
-        .flush_acks()
+        .flush_acks(usize::MAX)
         .expect("receiver Acks the recovered frame");
     sender.on_receive(&ack);
     assert_eq!(
@@ -104,7 +104,7 @@ fn feature_frame_emits_tx_sequence() {
     let feature = ReliabilityFeature::with_config(fast_config());
     feature.set_enabled(true);
 
-    let frames = feature.frame(&fake_packet(7));
+    let frames = feature.frame(&fake_packet(7), None);
     assert_eq!(frames.len(), 1, "small packet → one reliable frame");
     assert!(
         has_tx_sequence(&frames[0]),

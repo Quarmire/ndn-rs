@@ -146,8 +146,32 @@ impl ReliabilityConfig {
     }
 }
 
+/// The network packet a multi-fragment group carries, kept while any of its
+/// fragments is unacknowledged so a retransmission can cut it again for a
+/// smaller frame limit ([`LpReliability::reframe`]).
+struct Group {
+    /// TxSequence of the first fragment; fragment `i` has `first_tx + i`.
+    first_tx: u64,
+    count: u64,
+    /// The whole network packet, as handed to `on_send`.
+    packet: Bytes,
+}
+
+/// What a due retransmission sends.
+enum Resend {
+    /// The frame as it was built.
+    Wire(Bytes),
+    /// The frame is over the transport's limit now: its packet is cut again.
+    Reframe,
+    /// Retried `max_retries` times already.
+    GiveUp,
+}
+
 struct UnackedEntry {
     wire: Bytes,
+    /// The group this frame is one fragment of; `None` for a packet that
+    /// went out whole (its payload is read back out of `wire`).
+    group: Option<Arc<Group>>,
     first_sent: Instant,
     last_sent: Instant,
     retx_count: u8,
@@ -330,9 +354,24 @@ impl LpReliability {
     /// most of the time. Acks that do not fit stay queued for the next frame
     /// or the idle-Ack flush.
     pub fn on_send(&mut self, pkt: &[u8]) -> Vec<Bytes> {
+        self.on_send_at(pkt, self.mtu)
+    }
+
+    /// [`Self::on_send`] with no frame over `limit` bytes: the face's
+    /// fragmentation threshold, or the largest frame its transport takes
+    /// right now when that is smaller (a QUIC link's datagram size follows
+    /// the path and can fall below what the face was framed for).
+    pub fn on_send_within(&mut self, pkt: &[u8], limit: usize) -> Vec<Bytes> {
+        self.on_send_at(pkt, self.mtu.min(limit))
+    }
+
+    /// [`Self::on_send`] fragmenting to exactly `mtu` for this call, whatever
+    /// the face's configured threshold: the fragment size of a transport that
+    /// states its own frame size when it is asked to send.
+    pub fn on_send_at(&mut self, pkt: &[u8], mtu: usize) -> Vec<Bytes> {
         let now = self.clock.now();
 
-        let payload_cap = self.mtu.saturating_sub(FRAG_OVERHEAD);
+        let payload_cap = mtu.saturating_sub(FRAG_OVERHEAD);
         if payload_cap == 0 {
             return vec![];
         }
@@ -354,6 +393,16 @@ impl LpReliability {
         // until the 5 s timeout swept it.
         let net_seq = self.next_seq;
         self.next_seq += frag_count as u64;
+
+        // One copy of the packet per fragmented send, shared by its fragments'
+        // entries: a retransmission after the frame limit fell cuts it again.
+        let group = (frag_count > 1).then(|| {
+            Arc::new(Group {
+                first_tx: self.next_tx_seq,
+                count: frag_count as u64,
+                packet: Bytes::copy_from_slice(pkt),
+            })
+        });
 
         let mut wires = Vec::with_capacity(frag_count);
         for i in 0..frag_count {
@@ -383,6 +432,7 @@ impl LpReliability {
                 tx_seq,
                 UnackedEntry {
                     wire: wire.clone(),
+                    group: group.clone(),
                     first_sent: now,
                     last_sent: now,
                     retx_count: 0,
@@ -546,7 +596,10 @@ impl LpReliability {
     /// the frame's TxSequence (see [`Self::on_receive`] on why this port keys
     /// duplicate suppression on TxSequence where NFD re-stamps it), so Karn's
     /// check still excludes these from RTT sampling via `is_retx`.
-    pub fn take_fast_retransmits(&mut self) -> Vec<Bytes> {
+    ///
+    /// `limit` is the largest frame the transport takes now: a repair held in a
+    /// larger frame is cut again to it ([`Self::reframe`]), never sent over.
+    pub fn take_fast_retransmits(&mut self, limit: usize) -> Vec<Bytes> {
         if self.fast_retx_candidates.is_empty() {
             return Vec::new();
         }
@@ -555,24 +608,37 @@ impl LpReliability {
         let candidates = std::mem::take(&mut self.fast_retx_candidates);
         let mut wires = Vec::with_capacity(candidates.len());
         for seq in candidates {
-            let give_up = match self.unacked.get_mut(&seq) {
-                // Already acked or evicted between detection and now.
+            let next = match self.unacked.get_mut(&seq) {
+                // Already acked, evicted, or recut with its group between
+                // detection and now.
                 None => continue,
-                Some(entry) if entry.retx_count >= self.max_retries => true,
+                Some(entry) if entry.retx_count >= self.max_retries => Resend::GiveUp,
                 Some(entry) => {
                     entry.last_sent = now;
                     entry.retx_count += 1;
                     entry.is_retx = true;
                     entry.n_greater_seq_acks = 0;
                     entry.evidence_floor = next_tx_seq;
-                    wires.push(entry.wire.clone());
-                    self.fast_retx += 1;
-                    false
+                    if entry.wire.len() > limit {
+                        Resend::Reframe
+                    } else {
+                        Resend::Wire(entry.wire.clone())
+                    }
                 }
             };
-            if give_up {
-                self.unacked.remove(&seq);
-                self.rto_expirations += 1;
+            match next {
+                Resend::GiveUp => {
+                    self.unacked.remove(&seq);
+                    self.rto_expirations += 1;
+                }
+                Resend::Wire(wire) => {
+                    wires.push(wire);
+                    self.fast_retx += 1;
+                }
+                Resend::Reframe => {
+                    wires.extend(self.reframe(seq, limit));
+                    self.fast_retx += 1;
+                }
             }
         }
         wires
@@ -603,7 +669,11 @@ impl LpReliability {
     }
 
     /// Returns wire packets due for retransmission.
-    pub fn check_retransmit(&mut self) -> Vec<Bytes> {
+    ///
+    /// `limit` is the largest frame the transport takes now. A frame framed
+    /// for a larger one (the path's datagram size fell since) is not resent
+    /// as it is: its packet is cut again to `limit` ([`Self::reframe`]).
+    pub fn check_retransmit(&mut self, limit: usize) -> Vec<Bytes> {
         let now = self.clock.now();
         let rto = std::time::Duration::from_micros(self.rto_us);
         let mut retx = Vec::new();
@@ -627,12 +697,18 @@ impl LpReliability {
         let next_tx_seq = self.next_tx_seq;
         let mut wires = Vec::with_capacity(retx.len().min(self.max_retx_per_tick));
         for seq in retx.into_iter().take(self.max_retx_per_tick) {
-            if let Some(entry) = self.unacked.get_mut(&seq) {
-                entry.last_sent = now;
-                entry.retx_count += 1;
-                entry.is_retx = true;
-                entry.n_greater_seq_acks = 0;
-                entry.evidence_floor = next_tx_seq;
+            // Gone when a sibling fragment's recut took its group.
+            let Some(entry) = self.unacked.get_mut(&seq) else {
+                continue;
+            };
+            entry.last_sent = now;
+            entry.retx_count += 1;
+            entry.is_retx = true;
+            entry.n_greater_seq_acks = 0;
+            entry.evidence_floor = next_tx_seq;
+            if entry.wire.len() > limit {
+                wires.extend(self.reframe(seq, limit));
+            } else {
                 wires.push(entry.wire.clone());
             }
         }
@@ -640,14 +716,67 @@ impl LpReliability {
         wires
     }
 
+    /// Cut the packet frame `seq` belongs to again, to frames of at most
+    /// `limit` bytes, for a retransmission after the frame limit fell below
+    /// the size the frame was built for.
+    ///
+    /// A fragment cannot be split on its own (the receiver reassembles by
+    /// `Sequence - FragIndex` and `FragCount`), so the whole packet goes out
+    /// again as a new group with fresh Sequence and TxSequences, and the old
+    /// group's frames stop being tracked: an Ack for one of them names
+    /// nothing and is ignored. The new frames carry the old frame's retry
+    /// count, so a packet is not retried past `max_retries` by being recut.
+    /// A peer that had reassembled the old group already (only its Acks were
+    /// lost) gets the packet twice; one that had not drops the old partial
+    /// group at its reassembly timeout.
+    ///
+    /// Empty when the limit is too small to frame anything; the packet is
+    /// then given up (counted in `rto_expirations`).
+    fn reframe(&mut self, seq: u64, limit: usize) -> Vec<Bytes> {
+        let Some(entry) = self.unacked.get(&seq) else {
+            return Vec::new();
+        };
+        let retx_count = entry.retx_count;
+        let (first, count, packet) = match &entry.group {
+            Some(group) => (group.first_tx, group.count, group.packet.clone()),
+            None => match ndn_packet::lp::LpPacket::decode(entry.wire.clone())
+                .ok()
+                .and_then(|lp| lp.fragment)
+            {
+                Some(packet) => (seq, 1, packet),
+                None => {
+                    self.unacked.remove(&seq);
+                    self.rto_expirations += 1;
+                    return Vec::new();
+                }
+            },
+        };
+        for old in first..first + count {
+            self.unacked.remove(&old);
+        }
+        let start = self.next_tx_seq;
+        let wires = self.on_send_at(&packet, limit);
+        if wires.is_empty() {
+            self.rto_expirations += 1;
+        }
+        let floor = self.next_tx_seq;
+        for (_, entry) in self.unacked.range_mut(start..) {
+            entry.is_retx = true;
+            entry.retx_count = retx_count;
+            entry.evidence_floor = floor;
+        }
+        wires
+    }
+
     /// One standalone Ack packet carrying as many pending Acks as fit in the
-    /// MTU; `None` when none are pending. Anything that does not fit stays
-    /// queued, so the idle-Ack pump calls this until it returns `None`.
-    pub fn flush_acks(&mut self) -> Option<Bytes> {
+    /// MTU, and in `limit`, the largest frame the transport takes now; `None`
+    /// when none are pending. Anything that does not fit stays queued, so the
+    /// idle-Ack pump calls this until it returns `None`.
+    pub fn flush_acks(&mut self, limit: usize) -> Option<Bytes> {
         if self.pending_acks.is_empty() {
             return None;
         }
-        let room = self.mtu.saturating_sub(ACK_PACKET_OVERHEAD);
+        let room = self.mtu.min(limit).saturating_sub(ACK_PACKET_OVERHEAD);
         let mut acks = self.drain_acks(room, usize::MAX);
         if acks.is_empty() {
             // An MTU too small for even one Ack: send one anyway rather than
@@ -821,7 +950,7 @@ mod tests {
         let wires = sender.on_send(&small_packet());
         receiver.on_receive(&wires[0]);
 
-        let ack_pkt = receiver.flush_acks();
+        let ack_pkt = receiver.flush_acks(usize::MAX);
         assert!(ack_pkt.is_some());
     }
 
@@ -856,7 +985,7 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        let retx = rel.check_retransmit();
+        let retx = rel.check_retransmit(usize::MAX);
         assert_eq!(retx.len(), 1);
         assert_eq!(rel.unacked_count(), 1);
     }
@@ -880,7 +1009,7 @@ mod tests {
 
         // Nothing is overdue: the RTO floor is 200 ms and no time has passed.
         assert!(
-            rel.check_retransmit().is_empty(),
+            rel.check_retransmit(usize::MAX).is_empty(),
             "precondition: the RTO path must not be what repairs this"
         );
 
@@ -890,11 +1019,11 @@ mod tests {
             receiver.on_receive(wire);
         }
         let acks = receiver
-            .flush_acks()
+            .flush_acks(usize::MAX)
             .expect("receiver must ack what it got");
         rel.on_receive(&acks);
 
-        let repairs = rel.take_fast_retransmits();
+        let repairs = rel.take_fast_retransmits(usize::MAX);
         let seqs: Vec<Option<u64>> = repairs.iter().map(|w| extract_acks(w).0).collect();
         assert_eq!(
             seqs,
@@ -922,8 +1051,8 @@ mod tests {
         let mut repairs = Vec::new();
         for wire in &sent[1..] {
             rx.on_receive(wire);
-            tx.on_receive(&rx.flush_acks().unwrap());
-            repairs.extend(tx.take_fast_retransmits());
+            tx.on_receive(&rx.flush_acks(usize::MAX).unwrap());
+            repairs.extend(tx.take_fast_retransmits(usize::MAX));
         }
         repairs
     }
@@ -946,7 +1075,7 @@ mod tests {
         assert_eq!(seqs, vec![Some(0)], "frame 0 is resent exactly once");
 
         assert!(!rx.on_receive(&repairs[0]), "the copy is not a duplicate");
-        tx.on_receive(&rx.flush_acks().unwrap());
+        tx.on_receive(&rx.flush_acks(usize::MAX).unwrap());
         assert_eq!(rx.duplicate_frames(), 0);
         assert_eq!(
             tx.rto_expirations(),
@@ -972,10 +1101,10 @@ mod tests {
             let wire = tx.on_send(&small_packet())[0].clone();
             rx.on_receive(&wire);
         }
-        tx.on_receive(&rx.flush_acks().unwrap());
+        tx.on_receive(&rx.flush_acks(usize::MAX).unwrap());
 
         let again: Vec<Option<u64>> = tx
-            .take_fast_retransmits()
+            .take_fast_retransmits(usize::MAX)
             .iter()
             .map(|w| extract_acks(w).0)
             .collect();
@@ -1008,7 +1137,7 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        let retx = rel.check_retransmit();
+        let retx = rel.check_retransmit(usize::MAX);
         assert_eq!(retx.len(), 3, "the per-tick cap still applies");
 
         let seqs: Vec<Option<u64>> = retx.iter().map(|w| extract_acks(w).0).collect();
@@ -1032,12 +1161,12 @@ mod tests {
         let _wires = rel.on_send(&small_packet());
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        let retx = rel.check_retransmit();
+        let retx = rel.check_retransmit(usize::MAX);
         assert_eq!(retx.len(), 1);
 
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        let retx = rel.check_retransmit();
+        let retx = rel.check_retransmit(usize::MAX);
         assert!(retx.is_empty());
         assert_eq!(rel.unacked_count(), 0);
     }
@@ -1060,7 +1189,7 @@ mod tests {
         rel.on_receive(&encode_lp_acks(&[1 << 40, 1 << 40, 1 << 40, 5, 6, 1000]));
         assert_eq!(rel.unacked_count(), 5, "no frame was acked");
         assert!(
-            rel.take_fast_retransmits().is_empty(),
+            rel.take_fast_retransmits(usize::MAX).is_empty(),
             "acks of TxSequences never sent declared frames lost"
         );
 
@@ -1069,7 +1198,7 @@ mod tests {
         assert_eq!(rel.unacked_count(), 4);
         rel.on_receive(&encode_lp_acks(&[4, 4, 4, 4]));
         assert!(
-            rel.take_fast_retransmits().is_empty(),
+            rel.take_fast_retransmits(usize::MAX).is_empty(),
             "repeats of an ack declared the frames below it lost"
         );
         assert_eq!(rel.unacked_count(), 4);
@@ -1115,7 +1244,7 @@ mod tests {
     #[test]
     fn flush_acks_returns_none_when_empty() {
         let mut rel = LpReliability::new(1400);
-        assert!(rel.flush_acks().is_none());
+        assert!(rel.flush_acks(usize::MAX).is_none());
     }
 
     #[test]
@@ -1191,12 +1320,15 @@ mod tests {
         for seq in 0..10 {
             rel.on_receive(&reliable_frame(seq));
         }
-        let one = rel.flush_acks().expect("Acks pending");
+        let one = rel.flush_acks(usize::MAX).expect("Acks pending");
         assert_eq!(
             extract_acks(&one).1.as_slice(),
             &(0..10).collect::<Vec<_>>()[..]
         );
-        assert!(rel.flush_acks().is_none(), "one packet carried them all");
+        assert!(
+            rel.flush_acks(usize::MAX).is_none(),
+            "one packet carried them all"
+        );
 
         // A backlog larger than one MTU splits, losing nothing.
         for seq in 0..1000u64 {
@@ -1204,7 +1336,7 @@ mod tests {
         }
         let mut packets = 0;
         let mut acked = 0;
-        while let Some(p) = rel.flush_acks() {
+        while let Some(p) = rel.flush_acks(usize::MAX) {
             assert!(p.len() <= MTU, "{} > MTU", p.len());
             acked += extract_acks(&p).1.len();
             packets += 1;
@@ -1405,20 +1537,169 @@ mod tests {
         rel.on_send(&small_packet());
 
         clock.advance_ms(199);
-        assert!(rel.check_retransmit().is_empty(), "RTO not yet elapsed");
-        clock.advance_ms(1);
-        assert_eq!(rel.check_retransmit().len(), 1, "resent once RTO elapses");
         assert!(
-            rel.check_retransmit().is_empty(),
+            rel.check_retransmit(usize::MAX).is_empty(),
+            "RTO not yet elapsed"
+        );
+        clock.advance_ms(1);
+        assert_eq!(
+            rel.check_retransmit(usize::MAX).len(),
+            1,
+            "resent once RTO elapses"
+        );
+        assert!(
+            rel.check_retransmit(usize::MAX).is_empty(),
             "the resend restarts its RTO"
         );
         clock.advance_ms(200);
         assert!(
-            rel.check_retransmit().is_empty(),
+            rel.check_retransmit(usize::MAX).is_empty(),
             "retries exhausted: give up"
         );
         assert_eq!(rel.rto_expirations(), 1);
         assert_eq!(rel.unacked_count(), 0);
+    }
+
+    /// Reassemble the packet in `frames` the way the engine's decode stage does.
+    fn reassemble(frames: &[Bytes]) -> Option<Bytes> {
+        use ndn_packet::fragment::ReassemblyBuffer;
+        use ndn_packet::lp::extract_fragment;
+
+        let mut rb = ReassemblyBuffer::default();
+        let mut done = None;
+        for w in frames {
+            let h = extract_fragment(w).expect("fragment header present");
+            let base = h
+                .sequence
+                .checked_sub(h.frag_index)
+                .expect("Sequence >= FragIndex");
+            if let Some(pkt) = rb.process(
+                0,
+                base,
+                h.frag_index,
+                h.frag_count,
+                Bytes::copy_from_slice(&w[h.frag_start..h.frag_end]),
+            ) {
+                done = Some(pkt);
+            }
+        }
+        done
+    }
+
+    /// A QUIC link's datagram size can fall below the size its frames were
+    /// built for (path MTU black-hole recovery resets it to the minimum). A
+    /// repair resent as built is then over the path's size and the datagram
+    /// layer drops it: a frame lost, "datagram over the path size, dropped".
+    /// The repair must be the same packet cut to the limit of NOW.
+    #[test]
+    fn a_fast_retransmit_is_cut_again_when_the_frame_limit_fell() {
+        let packet: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let mut tx = LpReliability::from_config(1400, ReliabilityConfig::wifi());
+        let mut rx = LpReliability::new(1400);
+
+        let group = tx.on_send(&packet);
+        assert_eq!(group.len(), 3, "the packet goes out as three fragments");
+        assert!(
+            group.iter().any(|w| w.len() > 1200),
+            "precondition: a fragment built for 1400 is over the limit below"
+        );
+        // Three later frames arrive, so the group below them is declared lost.
+        for _ in 0..3 {
+            let wire = tx.on_send(&small_packet())[0].clone();
+            rx.on_receive(&wire);
+        }
+        tx.on_receive(&rx.flush_acks(usize::MAX).unwrap());
+
+        let limit = 1200;
+        let repairs = tx.take_fast_retransmits(limit);
+        assert!(!repairs.is_empty(), "the lost group is repaired");
+        for w in &repairs {
+            assert!(
+                w.len() <= limit,
+                "a {} B repair over the {limit} B frame limit",
+                w.len()
+            );
+        }
+        assert_eq!(
+            reassemble(&repairs).expect("the repairs reassemble"),
+            Bytes::from(packet),
+            "the repair is the same packet"
+        );
+        assert_eq!(
+            tx.unacked_count(),
+            repairs.len(),
+            "the old group is no longer tracked, the new one is"
+        );
+    }
+
+    /// The same for a packet that went out whole and is resent on its RTO: it
+    /// no longer fits one frame, so it is fragmented; a recut does not
+    /// restart the retry count.
+    #[test]
+    fn an_rto_retransmit_is_cut_again_when_the_frame_limit_fell() {
+        let clock = Arc::new(ManualClock {
+            base: Instant::now(),
+            offset_us: std::sync::atomic::AtomicU64::new(0),
+        });
+        let mut tx = LpReliability::from_config(
+            1400,
+            ReliabilityConfig {
+                rto_strategy: RtoStrategy::Fixed { rto_us: 200_000 },
+                max_retries: 1,
+                ..Default::default()
+            },
+        );
+        tx.set_clock(Arc::clone(&clock) as Arc<dyn Now>);
+        let packet: Vec<u8> = (0..1300u32).map(|i| (i % 251) as u8).collect();
+        let whole = tx.on_send(&packet);
+        assert_eq!(whole.len(), 1, "precondition: it goes out whole");
+        assert!(whole[0].len() > 1200, "precondition: over the limit below");
+
+        clock.advance_ms(200);
+        let limit = 1200;
+        let repairs = tx.check_retransmit(limit);
+        assert!(repairs.len() > 1, "cut into several frames");
+        for w in &repairs {
+            assert!(
+                w.len() <= limit,
+                "a {} B repair over the {limit} B frame limit",
+                w.len()
+            );
+        }
+        assert_eq!(
+            reassemble(&repairs).expect("the repairs reassemble"),
+            Bytes::from(packet)
+        );
+
+        clock.advance_ms(200);
+        assert!(
+            tx.check_retransmit(limit).is_empty(),
+            "retries are counted across the recut: the packet is given up"
+        );
+        assert_eq!(tx.unacked_count(), 0);
+    }
+
+    /// A burst received between two ticks leaves hundreds of Acks owed. They
+    /// go out in packets that fit the transport's limit, none of them lost:
+    /// the face's own threshold (the default is 8800) is not what a QUIC
+    /// datagram takes.
+    #[test]
+    fn standalone_acks_are_split_to_the_frame_limit() {
+        let mut rx = LpReliability::new(8800);
+        for seq in 0..1000u64 {
+            rx.on_receive(&reliable_frame(seq));
+        }
+        let limit = 1200;
+        let mut acked = 0;
+        while let Some(p) = rx.flush_acks(limit) {
+            assert!(
+                p.len() <= limit,
+                "a {} B Ack packet over the {limit} B limit",
+                p.len()
+            );
+            acked += extract_acks(&p).1.len();
+        }
+        assert_eq!(acked, 1000, "every Ack is sent");
     }
 }
 
@@ -1458,7 +1739,7 @@ mod duplicate_suppression_tests {
         assert_eq!(rel.duplicate_frames(), 2);
 
         // Every arrival queued an Ack, duplicates included.
-        let acks = rel.flush_acks().expect("Acks queued");
+        let acks = rel.flush_acks(usize::MAX).expect("Acks queued");
         let (_tx, list) = extract_acks(&acks);
         assert_eq!(
             list.iter().filter(|&&a| a == TX).count(),

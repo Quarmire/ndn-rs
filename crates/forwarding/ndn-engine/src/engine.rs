@@ -1280,7 +1280,10 @@ pub(crate) async fn run_face_sender(
                         && h.next_hop_face_id.is_none()
                         && h.cache_policy.is_none();
                     let wires = if plain {
-                        lp_reliability_feature.as_ref().unwrap().frame(&first.0)
+                        lp_reliability_feature
+                            .as_ref()
+                            .unwrap()
+                            .frame(&first.0, face.transport.send_mtu())
                     } else {
                         vec![frame_with_intent(
                             &first.0,
@@ -1345,7 +1348,10 @@ pub(crate) async fn run_face_sender(
                 if let Some(feature) = lp_reliability_feature.as_ref() {
                     // Retransmissions keep the original 50 ms cadence.
                     if tick_count.is_multiple_of(RETX_TICKS) {
-                        for wire in feature.take_retransmissions() {
+                        // The limit is read now, not at framing: a path's frame
+                        // size can fall between the two (a QUIC link's datagram
+                        // size does), and a retransmission goes out as it is.
+                        for wire in feature.take_retransmissions(face.transport.send_mtu()) {
                             if let Err(e) = face.send_bytes(wire).await
                                 && handle_send_error(e)
                             {
@@ -1358,7 +1364,7 @@ pub(crate) async fn run_face_sender(
                     // as few packets as the MTU allows -- normally one. The recv
                     // path no longer Acks per frame; this tick and `on_send`'s
                     // piggybacking are the only Ack emitters.
-                    while let Some(ack) = feature.take_acks() {
+                    while let Some(ack) = feature.take_acks(face.transport.send_mtu()) {
                         let _ = face.send_bytes(ack).await;
                     }
                 }
