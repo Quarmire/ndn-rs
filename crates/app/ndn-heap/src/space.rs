@@ -262,6 +262,10 @@ pub(crate) struct SpaceInner {
     /// For each granted key the last sweep could not judge, how many sweeps in a row it has
     /// stayed undecided ([`PENDING_SWEEPS_MAX`]): in memory only, so a restart counts again.
     pending: Mutex<BTreeMap<Name, u32>>,
+    /// When this owner device last signed an epoch because keys of readers' devices were lost,
+    /// by this node's clock ([`LOSS_EPOCH_INTERVAL_MS`]): in memory only, so a restart allows
+    /// one more.
+    last_loss_epoch: Mutex<Option<u64>>,
 }
 
 /// The most standing alerts a space keeps for watchers that begin later.
@@ -284,6 +288,17 @@ pub(crate) const GRANTEES_PER_PERSON: usize = 32;
 /// the default `lapse_sweep`) cannot vouch for that key any more, and a key nobody can vouch
 /// for is re-keyed, never trusted by default.
 pub(crate) const PENDING_SWEEPS_MAX: u32 = 5;
+
+/// The shortest time between two epochs an owner device signs because keys of readers'
+/// devices are lost (revoked, suspected or lapsed), in ms by this node's clock: ten minutes.
+/// Every epoch makes each reader device ask again, and nothing else bounds how often one
+/// reader can lose keys (she mints a key and forks it, or a certificate lapses: spec §9.8,
+/// §9.9). The losses that come inside the interval stay owed, are folded into one epoch (it
+/// accounts for all those known when it is signed) and are rotated away when the interval ends,
+/// never dropped. A cost bound, not a verdict: nothing is accepted or refused by it; a key
+/// lost during the interval holds the key in force for at most that long after this node knows
+/// of it. The mark of the last such epoch is kept in memory: a restart allows one more.
+pub(crate) const LOSS_EPOCH_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
 /// A signing step run under the lock: `None` when there is nothing to sign.
 type Sign<'a> = &'a mut (dyn FnMut(&mut Log) -> Result<Option<Step>, HeapError> + Send);
@@ -347,6 +362,7 @@ impl SpaceInner {
             refused: Mutex::new(VecDeque::new()),
             lapsed: Mutex::new(BTreeSet::new()),
             pending: Mutex::new(BTreeMap::new()),
+            last_loss_epoch: Mutex::new(None),
         }
     }
 
@@ -536,11 +552,28 @@ impl SpaceInner {
     }
 
     /// Whether this owner device owes the sealed space an epoch because a key
-    /// of a reader's device is lost (spec §6.6, §9.8): revoked, or suspected here. It changes
-    /// no member, but the lost device holds the key in force and would open every
-    /// later write. Owed while the lost keys known here are not those the last
-    /// epoch this device signed accounted for (`revoked/<S>`).
+    /// of a reader's device is lost (spec §6.6, §9.8): revoked, suspected here or lapsed
+    /// ([`Self::loss_debt`]), and the last epoch signed for lost keys is at least
+    /// [`LOSS_EPOCH_INTERVAL_MS`] old (§9.9): inside the interval the debt waits, whole, to be
+    /// folded into the one epoch that follows it.
     fn loss_owed(&self, node: &NodeInner, log: &Log) -> bool {
+        self.loss_debt(node, log) && self.loss_epoch_due(node.now())
+    }
+
+    /// Whether an epoch for lost keys may be signed at `now`: none was signed in the last
+    /// [`LOSS_EPOCH_INTERVAL_MS`]. A clock that went back before the last one allows it, so the
+    /// bound never holds a lost key un-rotated for longer than the interval.
+    fn loss_epoch_due(&self, now: u64) -> bool {
+        self.last_loss_epoch
+            .lock()
+            .is_none_or(|last| now < last || now - last >= LOSS_EPOCH_INTERVAL_MS)
+    }
+
+    /// Whether a key of a reader's device is lost and no epoch signed here accounts for it: it
+    /// changes no member, but the lost device holds the key in force and would open every later
+    /// write. Owed while the lost keys known here are not those the last epoch this device
+    /// signed accounted for (`revoked/<S>`), or a granted device's certificate lapsed.
+    fn loss_debt(&self, node: &NodeInner, log: &Log) -> bool {
         if self.follower
             || !log.sealed()
             || log.fold.create() != Some(false)
@@ -735,6 +768,9 @@ impl SpaceInner {
                     Bytes::copy_from_slice(&accounted),
                 );
                 self.forget_lapsed(node);
+                if owed {
+                    *self.last_loss_epoch.lock() = Some(now);
+                }
                 if rule {
                     // The fresh epoch is the one in force: no key a guest or
                     // node device of the owner held opens what is written now.

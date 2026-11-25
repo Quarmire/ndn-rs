@@ -479,6 +479,86 @@ async fn suspecting_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_
     assert_eq!(heap.inner.log.lock().fold.epochs().len(), 2);
 }
 
+/// Stage-7 L6: lost keys of one person's devices (a burst of keys each marked suspected, as
+/// an insider who mints keys and forks each one makes) owe the space at most one epoch per
+/// `LOSS_EPOCH_INTERVAL_MS`: the first loss is rotated at once, the later ones inside the
+/// interval stay owed and are folded into the one epoch that follows when the interval has
+/// passed, and that epoch accounts for all of them, so no more is owed. The interval runs by
+/// the node's clock, moved here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_of_lost_keys_owes_one_epoch_per_interval() {
+    let devs = world(&["/alice/laptop", "/bob/phone"]).await;
+    let skew = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut config = cfg();
+    config.lapse_sweep = Duration::from_millis(100);
+    let clock = Arc::clone(&skew);
+    let real = Arc::clone(&config.clock);
+    config.clock = Arc::new(move || {
+        crate::error::Timestamp(real().0 + clock.load(std::sync::atomic::Ordering::SeqCst))
+    });
+    let (node, _) = boot(&devs[0], config).await;
+    let heap = node.create(&space(), private(&["/bob"])).await.unwrap();
+    let epochs = |heap: &Heap| heap.inner.log.lock().fold.epochs().len();
+    let key = |i: u32| n(&format!("/bob/d{i}")).append("KEY").append("1");
+    let wait_for = |want: usize| {
+        let heap = &heap;
+        async move {
+            for _ in 0..100 {
+                if epochs(heap) >= want {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("no epoch {want} was signed");
+        }
+    };
+    assert_eq!(epochs(&heap), 1);
+
+    // The first loss is rotated at once.
+    node.suspect(&key(1), crate::error::Timestamp(1)).unwrap();
+    wait_for(2).await;
+
+    // A burst inside the interval owes one more, not one for each key.
+    for i in 2..=5 {
+        node.suspect(&key(i), crate::error::Timestamp(1)).unwrap();
+    }
+    let owed = heap.inner.repair_epoch(&node.inner).await.unwrap();
+    assert!(
+        owed.is_none(),
+        "a second epoch for lost keys was signed inside the interval: lost keys may owe at most \
+         one epoch per LOSS_EPOCH_INTERVAL_MS, the rest folded into it"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(epochs(&heap), 2, "no epoch inside the interval");
+
+    // The interval ends: one epoch accounts for the whole burst, and it is not owed again.
+    skew.fetch_add(LOSS_EPOCH_INTERVAL_MS, std::sync::atomic::Ordering::SeqCst);
+    wait_for(3).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(epochs(&heap), 3, "one epoch for the four keys");
+    assert!(
+        heap.inner
+            .repair_epoch(&node.inner)
+            .await
+            .unwrap()
+            .is_none(),
+        "the epoch accounts for every key lost before it"
+    );
+
+    // A loss after it starts a new interval.
+    node.suspect(&key(6), crate::error::Timestamp(1)).unwrap();
+    assert!(
+        heap.inner
+            .repair_epoch(&node.inner)
+            .await
+            .unwrap()
+            .is_none(),
+        "a loss inside the next interval waits for its end"
+    );
+    skew.fetch_add(LOSS_EPOCH_INTERVAL_MS, std::sync::atomic::Ordering::SeqCst);
+    wait_for(4).await;
+}
+
 /// Stage-7 L1 (carried chain), end to end over real nodes: the asker's node gives the chain of
 /// its signing key from its validator, and a granter whose validator holds none of it (and
 /// has no fetcher) judges the asker's seal key packet with it, where without it the packet
@@ -593,6 +673,86 @@ async fn a_reader_devices_lapse_makes_an_owner_device_sign_a_new_epoch_once() {
     let heap = node.open(&space()).await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(heap.inner.log.lock().fold.epochs().len(), 2);
+}
+
+/// Stage-7 L6: the interval between epochs for lost keys covers the epochs a lapse owes too.
+/// A key suspected signs the first epoch at once; the lapse of the phone's certificate that
+/// follows inside the interval stays owed and is rotated when the interval has passed, not
+/// before. The certificate of Bob's phone lasts four seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lapse_inside_the_interval_of_a_loss_epoch_waits_for_its_end() {
+    let devs = crate::node::tests::world_with(
+        &["/alice/member/laptop", "/bob/member/phone"],
+        |name| Name::from_components(name.components()[..1].iter().cloned()),
+        |name| {
+            if name.has_prefix(&n("/bob")) {
+                4_000
+            } else {
+                365 * 24 * 3600 * 1000
+            }
+        },
+    )
+    .await;
+    let skew = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut config = cfg();
+    config.lapse_sweep = Duration::from_millis(100);
+    let clock = Arc::clone(&skew);
+    let real = Arc::clone(&config.clock);
+    config.clock = Arc::new(move || {
+        crate::error::Timestamp(real().0 + clock.load(std::sync::atomic::Ordering::SeqCst))
+    });
+    let (node, _) = boot(&devs[0].layered(), config).await;
+    let heap = node.create(&space(), private(&["/bob"])).await.unwrap();
+    let epochs = |heap: &Heap| heap.inner.log.lock().fold.epochs().len();
+    let first = heap.inner.log.lock().fold.in_force().expect("an epoch");
+    let (key, ask) = grant_ask_of(&node, &devs[1], &first, [9; 32]);
+    node.inner.note_grantee(&space(), &key, &ask).unwrap();
+
+    node.suspect(
+        &n("/bob/member/stolen").append("KEY").append("1"),
+        crate::error::Timestamp(1),
+    )
+    .unwrap();
+    for _ in 0..100 {
+        if epochs(&heap) == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(epochs(&heap), 2, "the suspicion is rotated at once");
+
+    // The phone's certificate lapses and a sweep sees it.
+    let mut seen = false;
+    for _ in 0..150 {
+        if !heap.inner.lapsed.lock().is_empty() {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(seen, "a sweep finds the lapsed certificate");
+    assert!(
+        heap.inner
+            .repair_epoch(&node.inner)
+            .await
+            .unwrap()
+            .is_none(),
+        "an epoch for a lapse was signed inside the interval of the one for the suspicion"
+    );
+    assert_eq!(epochs(&heap), 2);
+
+    skew.fetch_add(LOSS_EPOCH_INTERVAL_MS, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..100 {
+        if epochs(&heap) == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        epochs(&heap),
+        3,
+        "the lapse is rotated once the interval ends"
+    );
 }
 
 /// The ask a device's host sends for `epoch` of the test space: its seal key packet for
@@ -886,7 +1046,12 @@ async fn bobs_tablet_asks_bobs_phone(
     Result<(), crate::seal::GrantRefusal>,
     Result<(), crate::seal::GrantRefusal>,
 ) {
-    let devs = world(&["/alice/member/laptop", "/bob/member/phone", "/bob/member/tablet"]).await;
+    let devs = world(&[
+        "/alice/member/laptop",
+        "/bob/member/phone",
+        "/bob/member/tablet",
+    ])
+    .await;
     let roles: Vec<_> = if layered {
         devs.iter().map(|d| d.layered()).collect()
     } else {
@@ -898,7 +1063,11 @@ async fn bobs_tablet_asks_bobs_phone(
     let (epoch, key) = {
         let log = heap.inner.log.lock();
         let epoch = log.fold.in_force().expect("an epoch");
-        let key = log.keys.key(&space(), &epoch).expect("the creator's key").clone();
+        let key = log
+            .keys
+            .key(&space(), &epoch)
+            .expect("the creator's key")
+            .clone();
         (epoch, key)
     };
     let (phone, _) = boot(pick(1), cfg()).await;

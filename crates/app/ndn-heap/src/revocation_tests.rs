@@ -737,3 +737,69 @@ async fn unsuspect_lifts_the_mark_and_a_non_key_is_refused() {
     assert!(suspicion.since(&bob().key).is_none());
     assert!(!suspicion.lift(&bob().key));
 }
+
+/// Equivocation marks keys on its own, so they are bounded per person
+/// (`SUSPECTS_PER_PERSON`): a person who mints keys and forks each one fills her
+/// own allowance and no more of the map, other persons' keys are still marked,
+/// the host's own `mark` is never refused, and lifting marks makes room again.
+#[tokio::test]
+async fn automatic_suspicions_are_bounded_per_person() {
+    let store = Arc::new(CrashStore::new());
+    let suspicion = suspicion_of(&store);
+    let bob = n("/bob");
+    let key = |i: usize| n(&format!("/bob/phone/KEY/{i}"));
+    for i in 0..SUSPECTS_PER_PERSON {
+        suspicion.mark_new(&key(i), &bob, Timestamp(1));
+        assert!(suspicion.since(&key(i)).is_some(), "key {i} is marked");
+    }
+    let over = key(SUSPECTS_PER_PERSON);
+    suspicion.mark_new(&over, &bob, Timestamp(2));
+    assert!(
+        suspicion.since(&over).is_none(),
+        "past the allowance: not marked"
+    );
+    assert_eq!(suspicion.keys().len(), SUSPECTS_PER_PERSON);
+
+    let carol = n("/carol/phone/KEY/1");
+    suspicion.mark_new(&carol, &n("/carol"), Timestamp(3));
+    assert!(suspicion.since(&carol).is_some(), "another person's key");
+
+    suspicion.mark(&over, Timestamp(4)).unwrap();
+    assert!(
+        suspicion.since(&over).is_some(),
+        "the host marks past the allowance"
+    );
+
+    // Two marks go (the host's own counts too): there is room for one more.
+    assert!(suspicion.lift(&key(0)) && suspicion.lift(&key(1)));
+    let fresh = n("/bob/tablet/KEY/1");
+    suspicion.mark_new(&fresh, &bob, Timestamp(5));
+    assert!(suspicion.since(&fresh).is_some(), "room after a lift");
+}
+
+/// A person who mints keys and forks each one is told for every fork (`Evidence`, the
+/// equivocation alert), and has `SUSPECTS_PER_PERSON` of the keys marked, no more.
+#[tokio::test]
+async fn a_burst_of_equivocating_keys_of_one_person_marks_no_more_than_the_allowance() {
+    let store = Arc::new(CrashStore::new());
+    let suspicion = suspicion_of(&store);
+    let mut log = found_with(&suspicion, &store, &notes(), &["/bob"]);
+    let forks = SUSPECTS_PER_PERSON + 2;
+    for i in 0..forks {
+        let device = dev(&format!("/bob/d{i}"), "/bob", "1", 40 + i as u8);
+        let first = Chain::new(device.clone(), notes()).put_at(1, "/a", "one");
+        let second = Chain::new(device.clone(), notes()).put_at(1, "/a", "two");
+        applied(&mut log, &first, 1_000);
+        assert_eq!(
+            admit_as(&mut log, &second, None, 2_000),
+            Outcome::Evidence,
+            "fork {i} is told"
+        );
+        assert_eq!(
+            suspicion.since(&device.key).is_some(),
+            i < SUSPECTS_PER_PERSON,
+            "key {i}"
+        );
+    }
+    assert_eq!(suspicion.keys().len(), SUSPECTS_PER_PERSON);
+}

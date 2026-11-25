@@ -2316,7 +2316,9 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   accounted for, and a restart owes nothing more. The mark is checked when it is
   made (`suspect`) and when a call's effects report an equivocation (§3.7).
   Suspicion is **this node's** mark: only an owner device that holds it owes the
-  epoch; the other owner devices owe it once the key is revoked (§9.7).
+  epoch; the other owner devices owe it once the key is revoked (§9.7). The epochs
+  for lost keys are at most one per 10 minutes per space, and an equivocation marks
+  at most 16 keys of one person (§9.9).
 
 ### 9.9 Threat notes
 

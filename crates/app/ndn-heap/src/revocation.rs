@@ -318,6 +318,15 @@ pub(crate) fn refused_by_revocation(logs: &[&Log], key: &Name) -> Vec<Name> {
     out
 }
 
+/// The most keys of one person this node marks suspected by itself (an equivocation, spec
+/// §3.7), the host's own marks and the person's earlier ones counted. A person has a handful of
+/// devices, and each mark of a reader's key owes the space an epoch (§9.8), so one who mints
+/// keys and forks each of them may not grow the map, or the epochs, without bound: past the
+/// allowance the equivocation is told (`Alert::Equivocation`) and nothing more is marked. A
+/// revocation of a marked key ends its mark and frees its place; removing the person ends the
+/// cause.
+pub(crate) const SUSPECTS_PER_PERSON: usize = 16;
+
 /// The keys this node marks suspected (see the module docs): one map for the
 /// device, shared by every space's log, and kept at `suspected/<key>` so it
 /// survives a restart.
@@ -363,21 +372,34 @@ impl Suspicion {
         Ok(())
     }
 
-    /// [`Self::mark`] for a key the log verified, unless it is marked already
-    /// (the first mark is the one that counts).
-    pub(crate) fn mark_new(&self, key: &Name, since: Timestamp) {
-        self.set(key.clone(), since, false);
+    /// [`Self::mark`] for a key the log verified of `person`, unless it is marked already
+    /// (the first mark is the one that counts) or `person`'s keys marked here, the host's
+    /// own included, are [`SUSPECTS_PER_PERSON`] already. Whether the key is marked now.
+    pub(crate) fn mark_new(&self, key: &Name, person: &Name, since: Timestamp) -> bool {
+        let mut marks = self.marks.lock();
+        if marks.contains_key(key) {
+            return true;
+        }
+        if marks.keys().filter(|k| k.has_prefix(person)).count() >= SUSPECTS_PER_PERSON {
+            return false;
+        }
+        self.insert(&mut marks, key.clone(), since);
+        true
     }
 
     fn set(&self, key: Name, since: Timestamp, replace: bool) {
         let mut marks = self.marks.lock();
         if replace || !marks.contains_key(&key) {
-            self.store.insert(
-                Kind::SUSPECTED.of(&key),
-                Bytes::copy_from_slice(&since.0.to_be_bytes()),
-            );
-            marks.insert(key, since);
+            self.insert(&mut marks, key, since);
         }
+    }
+
+    fn insert(&self, marks: &mut BTreeMap<Name, Timestamp>, key: Name, since: Timestamp) {
+        self.store.insert(
+            Kind::SUSPECTED.of(&key),
+            Bytes::copy_from_slice(&since.0.to_be_bytes()),
+        );
+        marks.insert(key, since);
     }
 
     /// Lift the mark of `key`: new entries of it are taken again. Whether

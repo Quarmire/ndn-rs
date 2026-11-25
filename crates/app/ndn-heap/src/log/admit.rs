@@ -209,13 +209,24 @@ impl Log {
     }
 
     /// The device of `id` signed two packets at `seq` (one name, or a chain
-    /// that forks there): told to the host, and its key suspected.
+    /// that forks there): told to the host, and its key suspected, unless its
+    /// person's allowance of automatic marks is spent
+    /// ([`crate::revocation::SUSPECTS_PER_PERSON`]): then it is told and nothing is marked.
     fn equivocated(&self, a: &Arrival<'_>, seq: u64, fx: &mut Effects) {
         fx.alerts.push(Alert::Equivocation {
             device: a.id.device.clone(),
             seq,
         });
-        self.suspicion.mark_new(&a.v.key, Timestamp(a.now));
+        if !self
+            .suspicion
+            .mark_new(&a.v.key, &a.v.person, Timestamp(a.now))
+        {
+            tracing::warn!(
+                space = %self.space, key = %a.v.key, person = %a.v.person,
+                "equivocation told, key not marked: its person has as many suspected keys as an \
+                 automatic mark allows (remove the person, or revoke a marked key)"
+            );
+        }
     }
 
     /// A suspected key's new entries are not taken, unless the owner's cut
