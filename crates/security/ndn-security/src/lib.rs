@@ -91,10 +91,10 @@ pub use signer::{
 };
 pub use signing_info::{SignatureInfoOverrides, SignerSelection, SigningInfo};
 pub use trust_context::{
-    AdvertisedRelay, ContextExplanation, CutRange, EnrollmentHint, KeyRole, LinkPolicy,
+    AdvertisedRelay, ContextExplanation, CutRange, CutTip, EnrollmentHint, KeyRole, LinkPolicy,
     OpenContextError, RevocationCut, SchemaBlob, SchemaFormat, SignedTrustContext,
     SignedTrustContextError, SigningPair, anchor_fingerprint, context_namespace_of, dryrun_orphans,
-    public_key_digest, sync_group,
+    public_key_digest, signed_region_digest, sync_group,
 };
 pub use trust_schema::{
     NamePattern, PatternComponent, PatternParseError, SchemaGate, SchemaMatch, SchemaRule,

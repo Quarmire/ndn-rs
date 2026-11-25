@@ -3492,6 +3492,209 @@ mod tests {
             }
         }
 
+        /// A cut for the phone's notes log with one tip: entry 5, whose
+        /// signed region is `tip`'s, bound to the Ed25519 phone key.
+        fn tip_cut(tip: &Data) -> RevocationCut {
+            let mut cut = RevocationCut::new(n(PHONE));
+            cut.set_key_digest(phone_key_digest());
+            cut.add_tip(&log_prefix("notes"), 5, crate::signed_region_digest(tip));
+            cut
+        }
+
+        /// Stage 10: a cut names one tip per log instead of a manifest of
+        /// every entry. Below the tip's number Data is accepted by name, the
+        /// tip's number only with the tip's signed-region digest, above it
+        /// not by the tip; the cut's key digest still binds the public key.
+        #[tokio::test]
+        async fn a_cut_with_tips_accepts_below_the_tip_by_name() {
+            let phone = signer(PHONE, 72);
+            let tip_entry = signed(log_name("notes", 5), b"the tip", &phone);
+            let bob = bob(u64::MAX, (PAST, u64::MAX), true, |c| {
+                c.with_revocation(n(PHONE))
+                    .with_revocation_cut(tip_cut(&tip_entry))
+            })
+            .await;
+
+            // Below the tip: by name, whatever the bytes.
+            for seq in [0, 1, 4] {
+                let below = signed(log_name("notes", seq), b"anything", &bob.phone);
+                assert!(
+                    valid(&bob.validator.validate_durable(&below).await),
+                    "seq {seq}"
+                );
+                assert!(
+                    valid(&bob.validator.validate_durable_cached(&below).await.0),
+                    "seq {seq}, cache only"
+                );
+            }
+
+            // The tip itself: only the entry the digest names.
+            assert!(valid(&bob.validator.validate_durable(&tip_entry).await));
+            assert!(valid(
+                &bob.validator.validate_durable_cached(&tip_entry).await.0
+            ));
+            let thief = signed(log_name("notes", 5), b"another entry", &bob.phone);
+            for result in [
+                bob.validator.validate_durable(&thief).await,
+                bob.validator.validate_durable_cached(&thief).await.0,
+            ] {
+                assert_eq!(revoked_key(&result), Some(n(PHONE)), "{result:?}");
+            }
+
+            // Above the tip, in another log, below it with an extra
+            // component, the log's own name: refused, and not "pending a
+            // manifest" — this cut has none.
+            for outside in [
+                log_name("notes", 6),
+                log_name("notes", 1_000),
+                log_name("photos", 1),
+                log_name("notes", 2).append("x"),
+                log_prefix("notes"),
+            ] {
+                let data = signed(outside.clone(), b"v", &bob.phone);
+                let (result, missing) = bob.validator.validate_durable_cached(&data).await;
+                assert_eq!(
+                    revoked_key(&result),
+                    Some(n(PHONE)),
+                    "{outside}: {result:?}"
+                );
+                assert_eq!(missing, None, "{outside}: no manifest to wait for");
+            }
+
+            // The key digest still binds: another public key certified
+            // under the phone's key name earns nothing below the tip.
+            let other = signer(PHONE, 99);
+            let ca = signer(CA, 71);
+            let recertified = cert(&other, &ca, "CA2", FUTURE, u64::MAX).await;
+            bob.validator.cert_cache().insert(decoded(&recertified));
+            let forged = signed(log_name("notes", 2), b"v", &other);
+            for result in [
+                bob.validator.validate_durable(&forged).await,
+                bob.validator.validate_durable_cached(&forged).await.0,
+            ] {
+                assert_eq!(revoked_key(&result), Some(n(PHONE)), "{result:?}");
+            }
+
+            // Above the tip a cut's ranges still decide (here by name).
+            let mut ranged = tip_cut(&tip_entry);
+            ranged.add_run(&log_prefix("notes"), 8, 9);
+            let bob = bob_with(ranged).await;
+            let in_run = signed(log_name("notes", 8), b"v", &bob.phone);
+            assert!(valid(&bob.validator.validate_durable(&in_run).await));
+            let between = signed(log_name("notes", 6), b"v", &bob.phone);
+            let result = bob.validator.validate_durable(&between).await;
+            assert_eq!(revoked_key(&result), Some(n(PHONE)), "{result:?}");
+        }
+
+        /// [`bob`] with the phone revoked and `cut` as its cut.
+        async fn bob_with(cut: RevocationCut) -> Bob {
+            bob(u64::MAX, (PAST, u64::MAX), true, |c| {
+                c.with_revocation(n(PHONE)).with_revocation_cut(cut)
+            })
+            .await
+        }
+
+        /// The same ECDSA P-256 entry twice: as signed, and with the
+        /// signature's `s` replaced by `n - s` (the high-S form a relay can
+        /// make without the key). Both verify; the signed region is shared.
+        fn with_high_s_copy(
+            by: &crate::EcdsaP256Signer,
+            name: Name,
+            content: &[u8],
+        ) -> (Data, Data) {
+            use p256_ecdsa::ecdsa::Signature;
+            let build = |flip: bool| {
+                let wire = ndn_packet::encode::DataBuilder::new(name.clone(), content).sign_sync(
+                    SignatureType::SignatureSha256WithEcdsa,
+                    Some(by.key_name()),
+                    |region| {
+                        // The signer does not promise either form: take the
+                        // low-S one as the original, `n - s` as the copy.
+                        let signed = Signature::from_der(&by.sign_sync(region).unwrap()).unwrap();
+                        let low = signed.normalize_s().unwrap_or(signed);
+                        if !flip {
+                            return Bytes::copy_from_slice(low.to_der().as_bytes());
+                        }
+                        let (r, s) = low.split_scalars();
+                        let high = Signature::from_scalars(r.to_bytes(), (-*s).to_bytes()).unwrap();
+                        assert!(high.normalize_s().is_some(), "now high-S");
+                        Bytes::copy_from_slice(high.to_der().as_bytes())
+                    },
+                );
+                Data::decode(wire).unwrap()
+            };
+            (build(false), build(true))
+        }
+
+        /// Residual L10: a relay's high-S copy of an ECDSA entry has the
+        /// same signed region and another implicit digest. A manifest cut
+        /// lists implicit digests and refuses the copy; a tip cut names the
+        /// signed region, so the copy is the same signed object.
+        #[tokio::test]
+        async fn a_high_s_copy_of_the_tip_entry_is_accepted_by_a_tip_cut() {
+            let phone = crate::EcdsaP256Signer::from_seed(&[72; 32], n(PHONE)).unwrap();
+            let public_key = phone.public_key().unwrap();
+            let ca = signer(CA, 71);
+            let leaf = crate::manager::encode_cert_data(
+                &n(PHONE).append("CA3").append_version(1),
+                &public_key,
+                &ca,
+                PAST,
+                u64::MAX,
+            )
+            .await
+            .unwrap();
+            let (original, copy) = with_high_s_copy(&phone, log_name("notes", 5), b"the tip");
+            assert_eq!(original.signed_region(), copy.signed_region());
+            assert_ne!(original.sig_value(), copy.sig_value());
+            assert_ne!(original.implicit_digest(), copy.implicit_digest());
+            assert_eq!(
+                crate::signed_region_digest(&original),
+                crate::signed_region_digest(&copy)
+            );
+            let key_digest = crate::public_key_digest(&public_key);
+
+            // The old form: a manifest of implicit digests lists the original.
+            let manifest = notes_manifest(&[&original]);
+            let mut old_form = RevocationCut::new(n(PHONE));
+            old_form.set_key_digest(key_digest);
+            old_form.add_run(&log_prefix("notes"), 5, 5);
+            old_form.set_manifest(manifest.root.clone()).unwrap();
+            let old = bob_with(old_form).await;
+            old.validator.cert_cache().insert(decoded(&leaf));
+            let _fetches = serve_on_fetch(&old.validator, manifest.packets[0].clone());
+            assert!(valid(&old.validator.validate_durable(&original).await));
+            for result in [
+                old.validator.validate_durable(&copy).await,
+                old.validator.validate_durable_cached(&copy).await.0,
+            ] {
+                assert_eq!(
+                    revoked_key(&result),
+                    Some(n(PHONE)),
+                    "the manifest cut refuses the copy: {result:?}"
+                );
+            }
+
+            // The tip form: the signed-region digest covers both.
+            let mut tipped = RevocationCut::new(n(PHONE));
+            tipped.set_key_digest(key_digest);
+            tipped.add_tip(
+                &log_prefix("notes"),
+                5,
+                crate::signed_region_digest(&original),
+            );
+            let new = bob_with(tipped).await;
+            new.validator.cert_cache().insert(decoded(&leaf));
+            for data in [&original, &copy] {
+                assert!(valid(&new.validator.validate_durable(data).await));
+                assert!(valid(&new.validator.validate_durable_cached(data).await.0));
+            }
+            // Other bytes at the tip's name stay refused.
+            let (other, _) = with_high_s_copy(&phone, log_name("notes", 5), b"not the tip");
+            let result = new.validator.validate_durable(&other).await;
+            assert_eq!(revoked_key(&result), Some(n(PHONE)), "{result:?}");
+        }
+
         /// F2: under `DataRequiresCut guest`, Data of a guest key is
         /// accepted while a certificate of the key that verifies it is valid
         /// by the reader's clock, refused as revoked once it lapsed, and

@@ -2,7 +2,9 @@
 //!
 //! Provisional block `0x0410–0x041F` in the app-defined range (`>= 0x0400`),
 //! above `ndn-packet`'s `REFLEXIVE_NAME = 0x0402` with `0x0403–0x040F` as
-//! headroom, continued in `0x0420–0x042F` once every even number of the
+//! headroom (two of its even numbers, [`CUT_TIP`] 0x0404 and
+//! [`CUT_TIP_DIGEST`] 0x0406, are sub-TLVs of a [`REVOCATION_CUT`]), continued
+//! in `0x0420–0x042F` once every even number of the
 //! first block was taken ([`ADVERTISED_RELAY`] and its sub-TLVs). Not LP
 //! (`0x500`), not management (`0xD0`), not NDNCERT (`0x81–0xAF`). Flagged
 //! for a future NDN TLV-registry submission.
@@ -20,7 +22,7 @@
 //!   context is meaningless, so a node that can't parse them must reject it.
 //! - Additive → **even**: [`CA_ENDPOINT`], [`ENROLLMENT_HINT`],
 //!   [`REVOCATION`], [`KEY_ROLE`], [`LINK_POLICY`], [`ADVERTISED_RELAY`],
-//!   [`REVOCATION_CUT`] (with [`CUT_KEY_DIGEST`] and [`CUT_MANIFEST`]),
+//!   [`REVOCATION_CUT`] (with [`CUT_KEY_DIGEST`], [`CUT_MANIFEST`] and [`CUT_TIP`]),
 //!   [`DATA_REQUIRES_CUT`]. An old node skips an unknown one and still
 //!   validates with the anchors + schema it does understand (an old node
 //!   that skips a [`REVOCATION_CUT`] keeps the all-or-nothing Revocation:
@@ -129,8 +131,8 @@ pub const RELAY_PREFERENCE: u64 = 0x0426;
 /// Where a revoked key's authority over Data stopped
 /// ([`RevocationCut`](super::RevocationCut)), repeatable, at most one per
 /// key: the revoked key's `Name` (`0x07`), then at most one
-/// [`CUT_KEY_DIGEST`], at most one [`CUT_MANIFEST`], then [`CUT_RANGE`] and
-/// [`CUT_EXACT`] entries. Written right after the [`REVOCATION`] entries.
+/// [`CUT_KEY_DIGEST`], at most one [`CUT_MANIFEST`], then [`CUT_RANGE`],
+/// [`CUT_EXACT`] and [`CUT_TIP`] entries. Written right after the [`REVOCATION`] entries.
 /// Non-critical (even): an old node skips it and refuses everything the
 /// revoked key signed. A malformed one rejects the context.
 pub const REVOCATION_CUT: u64 = 0x0428;
@@ -163,6 +165,26 @@ pub const CUT_KEY_DIGEST: u64 = 0x0430;
 /// accepted only when the manifest lists its bytes. Non-critical (even): a
 /// node that skips it reads the ranges by name only, as cuts were before it.
 pub const CUT_MANIFEST: u64 = 0x0432;
+
+/// In [`REVOCATION_CUT`], at most one per prefix, after every [`CUT_EXACT`],
+/// in ascending canonical order of prefixes: the tip of one log the cut
+/// accepts up to — a prefix `Name` (`0x07`, a log `<D>/32=log/<S>`), one
+/// SequenceNumNameComponent (`0x3A`, shortest form) and a
+/// [`CUT_TIP_DIGEST`]. Data named the prefix plus a sequence number below
+/// the tip's is accepted by name; the tip's own sequence number only with
+/// the signed-region digest the tip carries; above it, not by the tip. A
+/// cut may name one tip per log instead of a manifest of every entry.
+/// Non-critical (even), numbered below the trust-context block: an old
+/// node skips it and reads a cut that accepts nothing it names, so it
+/// refuses more, never less.
+pub const CUT_TIP: u64 = 0x0404;
+
+/// In [`CUT_TIP`]: exactly 32 octets, the SHA-256 of the signed region
+/// (Name through SignatureInfo, without the SignatureValue) of the tip's
+/// entry, so another signature value over the same signed region (a
+/// relay's high-S ECDSA copy) is the same object
+/// ([`signed_region_digest`](super::signed_region_digest)).
+pub const CUT_TIP_DIGEST: u64 = 0x0406;
 
 /// A device role whose keys' Data needs a cut once their certificate
 /// lapsed, repeatable: the UTF-8 role name (the name component right after

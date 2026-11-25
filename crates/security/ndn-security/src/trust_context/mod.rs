@@ -702,6 +702,21 @@ impl CutRange {
     }
 }
 
+/// The tip of one log in a [`RevocationCut`] ([`tlv::CUT_TIP`]): Data named
+/// `prefix` plus a sequence number below `seq` is accepted by name, the
+/// entry at `seq` only when its signed region hashes to `digest`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CutTip {
+    /// The log prefix (`<D>/32=log/<S>`).
+    pub prefix: Name,
+    /// The sequence number of the tip entry.
+    pub seq: u64,
+    /// SHA-256 of the tip entry's signed region
+    /// ([`signed_region_digest`]), not of its whole wire: another signature
+    /// value over the same region is the same signed object.
+    pub digest: [u8; 32],
+}
+
 /// Where a revoked key's authority over Data stopped ([`tlv::REVOCATION_CUT`]):
 /// the packets the key signed that stay accepted although a Revocation
 /// entry covers the key. Everything else the key signed is refused.
@@ -728,9 +743,18 @@ impl CutRange {
 /// adoption whose cut accepts less than before is revoking, see
 /// [`Keyring`](crate::Keyring)).
 ///
+/// With tips ([`tlv::CUT_TIP`], [`tips`](Self::tips)) the cut names one
+/// `(log prefix, seq, signed-region digest)` per log instead of a manifest
+/// of every entry: Data named a tip's prefix plus a sequence number below
+/// the tip's is accepted by name ([`tip_seq`](Self::tip_seq)), the tip's own
+/// number only with the tip's digest. Bytes below a tip are not bound here:
+/// the ends (the data layer) bind them by chain ancestry of the tip, which
+/// a forwarder's cache re-check cannot.
+///
 /// Kept canonical: ranges by prefix (NDN canonical order), one per prefix,
-/// runs merged; exact entries in canonical order without duplicates. The
-/// same cut therefore always encodes to the same bytes.
+/// runs merged; exact entries in canonical order without duplicates; tips
+/// by prefix, one per prefix. The same cut therefore always encodes to the
+/// same bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RevocationCut {
     key: Name,
@@ -738,6 +762,7 @@ pub struct RevocationCut {
     manifest: Option<Name>,
     ranges: Vec<CutRange>,
     exact: Vec<Name>,
+    tips: Vec<CutTip>,
 }
 
 /// The SHA-256 of a public key as a certificate carries it
@@ -747,6 +772,15 @@ pub struct RevocationCut {
 pub fn public_key_digest(public_key: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(public_key).into()
+}
+
+/// The SHA-256 of `data`'s signed region (Name through SignatureInfo, the
+/// SignatureValue excluded) — the digest a cut's [`CutTip`] carries. A
+/// relay's high-S copy of an ECDSA entry has the same signed region and
+/// so the same digest, though not the same implicit digest.
+pub fn signed_region_digest(data: &ndn_packet::Data) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data.signed_region()).into()
 }
 
 impl RevocationCut {
@@ -759,6 +793,7 @@ impl RevocationCut {
             manifest: None,
             ranges: Vec::new(),
             exact: Vec::new(),
+            tips: Vec::new(),
         }
     }
 
@@ -854,6 +889,21 @@ impl RevocationCut {
         }
     }
 
+    /// Name the tip of the log `prefix`: its entry `seq` has signed-region
+    /// digest `digest` ([`signed_region_digest`]). Data below `seq` is then
+    /// accepted by name. A second tip for one prefix replaces the first.
+    pub fn add_tip(&mut self, prefix: &Name, seq: u64, digest: [u8; 32]) {
+        let tip = CutTip {
+            prefix: prefix.clone(),
+            seq,
+            digest,
+        };
+        match self.tips.binary_search_by(|t| t.prefix.cmp(prefix)) {
+            Ok(i) => self.tips[i] = tip,
+            Err(i) => self.tips.insert(i, tip),
+        }
+    }
+
     /// The revoked key this cut is for.
     pub fn key(&self) -> &Name {
         &self.key
@@ -869,18 +919,38 @@ impl RevocationCut {
         &self.exact
     }
 
+    /// The tips, by prefix in canonical order.
+    pub fn tips(&self) -> &[CutTip] {
+        &self.tips
+    }
+
+    /// The tip of the log `prefix`, if the cut has one.
+    pub fn tip_for(&self, prefix: &Name) -> Option<&CutTip> {
+        self.tips
+            .binary_search_by(|t| t.prefix.cmp(prefix))
+            .ok()
+            .map(|i| &self.tips[i])
+    }
+
+    /// The tip naming the Data `name` and its sequence number: `name` is a
+    /// tip's prefix plus one minimally encoded SequenceNumNameComponent.
+    /// The caller decides: below the tip's number accepts by name, at it
+    /// only the tip's digest does, above it the tip says nothing.
+    pub fn tip_seq(&self, name: &Name) -> Option<(&CutTip, u64)> {
+        let (prefix, seq) = split_seq(name)?;
+        let i = self
+            .tips
+            .binary_search_by(|t| t.prefix.components().iter().cmp(prefix.iter()))
+            .ok()?;
+        Some((&self.tips[i], seq))
+    }
+
     /// The range naming the Data `name` and its sequence number: `name` is
     /// a range's prefix plus one minimally encoded SequenceNumNameComponent
     /// whose value lies in a run. By name only: with a
     /// [`manifest`](Self::manifest), the bytes must also be listed there.
     pub fn range_seq(&self, name: &Name) -> Option<(&CutRange, u64)> {
-        let (last, prefix) = name.components().split_last()?;
-        let seq = last.as_sequence_num()?;
-        // A non-minimal encoding names other Data than the one the producer
-        // counted.
-        if *last != NameComponent::sequence_num(seq) {
-            return None;
-        }
+        let (prefix, seq) = split_seq(name)?;
         let i = self
             .ranges
             .binary_search_by(|r| r.prefix.components().iter().cmp(prefix.iter()))
@@ -901,21 +971,27 @@ impl RevocationCut {
 
     /// Whether the cut accepts the Data named `name` whose implicit digest
     /// (SHA-256 of its whole wire) is `digest`, as far as the cut alone can
-    /// tell: an exact entry lists it, or a range names it and the cut has
-    /// no [`manifest`](Self::manifest) (with one, only the manifest can say;
+    /// tell: an exact entry lists it, a tip is above its number
+    /// ([`tip_seq`](Self::tip_seq): by name; the tip's own number needs the
+    /// signed-region digest, which this does not see, so it answers
+    /// `false` there), or a range names it and the cut has no
+    /// [`manifest`](Self::manifest) (with one, only the manifest can say;
     /// this answers `false`). The [`key_digest`](Self::key_digest) is not
     /// checked here: it needs the verifying public key. The durable walk
     /// applies every binding ([`Validator::validate_durable`](crate::Validator::validate_durable)).
     pub fn accepts(&self, name: &Name, digest: &[u8; 32]) -> bool {
         self.accepts_exactly(name, digest)
+            || self.tip_seq(name).is_some_and(|(tip, seq)| seq < tip.seq)
             || (self.manifest.is_none() && self.range_seq(name).is_some())
     }
 
     /// Whether this cut accepts everything `earlier` (a cut of the same key
     /// in an earlier version) accepts: the same key digest and manifest,
-    /// every run of `earlier` inside a run of the same prefix here, and
-    /// every exact entry of `earlier` here. A version whose cut does not is
-    /// revoking ([`Keyring`](crate::Keyring)).
+    /// every run of `earlier` inside a run of the same prefix here, every
+    /// exact entry of `earlier` here, and for every tip of `earlier` a tip
+    /// of the same prefix here at the same number with the same digest or
+    /// at a higher one. A version whose cut does not is revoking
+    /// ([`Keyring`](crate::Keyring)).
     pub fn covers(&self, earlier: &RevocationCut) -> bool {
         self.key == earlier.key
             && self.key_digest == earlier.key_digest
@@ -937,6 +1013,11 @@ impl RevocationCut {
                 .exact
                 .iter()
                 .all(|name| self.exact.binary_search(name).is_ok())
+            && earlier.tips.iter().all(|old| {
+                self.tip_for(&old.prefix).is_some_and(|new| {
+                    new.seq > old.seq || (new.seq == old.seq && new.digest == old.digest)
+                })
+            })
     }
 
     /// The cut as its [`tlv::REVOCATION_CUT`] TLV.
@@ -968,6 +1049,13 @@ impl RevocationCut {
         for name in &self.exact {
             w.write_tlv(tlv::CUT_EXACT, &name.encode_to_tlv());
         }
+        for tip in &self.tips {
+            w.write_nested(tlv::CUT_TIP, |w| {
+                w.write_raw(&tip.prefix.encode_to_tlv());
+                w.write_tlv(ndn_packet::tlv_type::SEQUENCE_NUM, &nni(tip.seq));
+                w.write_tlv(tlv::CUT_TIP_DIGEST, &tip.digest);
+            });
+        }
     }
 
     /// Decode one [`tlv::REVOCATION_CUT`] TLV (and nothing after it). Entries
@@ -977,8 +1065,11 @@ impl RevocationCut {
     /// SequenceNumNameComponents with first <= last, an exact name not ending
     /// in a 32-octet ImplicitSha256DigestComponent, a key digest that is not
     /// 32 octets, a manifest that is not one Name ending in a 32-octet
-    /// ImplicitSha256DigestComponent, a second key digest or manifest, an
-    /// unknown critical element. Unknown non-critical elements are skipped.
+    /// ImplicitSha256DigestComponent, a tip that is not a Name, a
+    /// SequenceNumNameComponent in shortest form and a 32-octet
+    /// [`tlv::CUT_TIP_DIGEST`], a second tip for one prefix, a second key
+    /// digest or manifest, an unknown critical element. Unknown non-critical
+    /// elements are skipped.
     pub fn decode(wire: &[u8]) -> Result<Self, SignedTrustContextError> {
         let (t, value, rest) = read_tlv(wire)?;
         if t != tlv::REVOCATION_CUT {
@@ -1061,6 +1152,13 @@ impl RevocationCut {
                     }
                     cut.set_manifest(decode_name(name)?)?;
                 }
+                tlv::CUT_TIP => {
+                    let tip = decode_tip(v)?;
+                    if cut.tip_for(&tip.prefix).is_some() {
+                        return Err(SignedTrustContextError::DuplicateField("CutTip"));
+                    }
+                    cut.add_tip(&tip.prefix, tip.seq, tip.digest);
+                }
                 other if is_critical(other) => {
                     return Err(SignedTrustContextError::UnknownCritical(other));
                 }
@@ -1099,6 +1197,49 @@ fn decode_run(value: &[u8]) -> Result<(u64, u64), SignedTrustContextError> {
         return Err(bad());
     }
     Ok((first, last))
+}
+
+/// A [`tlv::CUT_TIP`] value: a prefix `Name`, one SequenceNumNameComponent
+/// in shortest form, and a [`tlv::CUT_TIP_DIGEST`] of exactly 32 octets,
+/// nothing more.
+fn decode_tip(value: &[u8]) -> Result<CutTip, SignedTrustContextError> {
+    let bad = || {
+        SignedTrustContextError::BadField(
+            "CutTip (it must be a prefix Name, one SequenceNumNameComponent in shortest form \
+             and a CutTipDigest of exactly 32 octets, nothing more)",
+        )
+    };
+    let (t, prefix, rest) = read_tlv(value).map_err(|_| bad())?;
+    if t != ndn_packet::tlv_type::NAME {
+        return Err(bad());
+    }
+    let prefix = decode_name(prefix)?;
+    let (t, v, rest) = read_tlv(rest).map_err(|_| bad())?;
+    let component = NameComponent::new(t, Bytes::copy_from_slice(v));
+    let seq = component.as_sequence_num().ok_or_else(bad)?;
+    if component != NameComponent::sequence_num(seq) {
+        return Err(bad());
+    }
+    let (t, digest, rest) = read_tlv(rest).map_err(|_| bad())?;
+    if t != tlv::CUT_TIP_DIGEST || !rest.is_empty() {
+        return Err(bad());
+    }
+    let digest = <[u8; 32]>::try_from(digest).map_err(|_| bad())?;
+    Ok(CutTip {
+        prefix,
+        seq,
+        digest,
+    })
+}
+
+/// `name` as the components before its last one and that last one's
+/// sequence number, which must be a SequenceNumNameComponent in shortest
+/// form: a longer encoding names other Data than the one the producer
+/// counted.
+fn split_seq(name: &Name) -> Option<(&[NameComponent], u64)> {
+    let (last, prefix) = name.components().split_last()?;
+    let seq = last.as_sequence_num()?;
+    (*last == NameComponent::sequence_num(seq)).then_some((prefix, seq))
 }
 
 /// Whether `name` ends in an ImplicitSha256DigestComponent of 32 octets.
@@ -3282,6 +3423,8 @@ mod tests {
             tlv::CUT_EXACT,
             tlv::CUT_KEY_DIGEST,
             tlv::CUT_MANIFEST,
+            tlv::CUT_TIP,
+            tlv::CUT_TIP_DIGEST,
             tlv::DATA_REQUIRES_CUT,
             tlv::MANIFEST_NODE,
             tlv::MANIFEST_RANGE,
@@ -3291,6 +3434,208 @@ mod tests {
         ] {
             assert!(!is_critical(t), "{t:#06x} must be even (non-critical)");
         }
+    }
+
+    /// A CutTip value written by hand: the prefix Name, `seq` as a
+    /// SequenceNumNameComponent of one octet, the CutTipDigest.
+    fn tip_value(prefix: &Name, seq: u8, d: &[u8; 32]) -> Vec<u8> {
+        let mut v = prefix.encode_to_tlv().to_vec();
+        v.extend([0x3A, 0x01, seq]);
+        v.extend(tlv_bytes(tlv::CUT_TIP_DIGEST, d));
+        v
+    }
+
+    #[test]
+    fn cut_tips_round_trip_in_canonical_order_and_replace_per_prefix() {
+        let snapshot = log_prefix(&[]);
+        let notes = log_prefix(&["notes"]);
+        let photos = log_prefix(&["photos"]);
+        let mut a = RevocationCut::new(n(PHONE_KEY));
+        a.add_tip(&photos, 4, digest(3));
+        a.add_tip(&snapshot, 1, digest(1));
+        a.add_tip(&notes, 6, digest(9));
+        // A second tip for one prefix replaces the first.
+        a.add_tip(&notes, 7, digest(2));
+        let prefixes: Vec<&Name> = a.tips().iter().map(|t| &t.prefix).collect();
+        assert_eq!(prefixes, [&snapshot, &notes, &photos]);
+        assert_eq!(
+            a.tip_for(&notes),
+            Some(&CutTip {
+                prefix: notes.clone(),
+                seq: 7,
+                digest: digest(2)
+            })
+        );
+        assert_eq!(a.tip_for(&n("/home/bob")), None);
+        assert_eq!(RevocationCut::decode(&a.encode()).unwrap(), a);
+
+        // Insertion order does not change the bytes.
+        let mut b = RevocationCut::new(n(PHONE_KEY));
+        b.add_tip(&notes, 7, digest(2));
+        b.add_tip(&photos, 4, digest(3));
+        b.add_tip(&snapshot, 1, digest(1));
+        assert_eq!(a.encode(), b.encode());
+
+        // A decoder accepts any order and keeps the canonical form.
+        let tip =
+            |p: &Name, s: u8, d: u8| tlv_bytes(tlv::CUT_TIP, &tip_value(p, s, &digest(d))).to_vec();
+        let value = [
+            n(PHONE_KEY).encode_to_tlv().to_vec(),
+            tip(&photos, 4, 3),
+            tip(&snapshot, 1, 1),
+            tip(&notes, 7, 2),
+        ]
+        .concat();
+        let shuffled = RevocationCut::decode(&tlv_bytes(tlv::REVOCATION_CUT, &value)).unwrap();
+        assert_eq!(shuffled.encode(), a.encode());
+
+        // Tips are written after every exact entry, and a context carries
+        // them verbatim into the next version.
+        a.readmit(
+            notes
+                .clone()
+                .append_sequence_num(9)
+                .append_implicit_digest(digest(0)),
+        )
+        .unwrap();
+        let wire = a.encode();
+        let exact_at = wire
+            .windows(3)
+            .position(|w| w == [0xFD, 0x04, 0x2E])
+            .unwrap();
+        let tip_at = wire.windows(3).position(|w| w == [0xFD, 0x04, 0x04]);
+        assert!(exact_at < tip_at.unwrap());
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_revocation(n(PHONE_KEY))
+            .with_revocation_cut(a.clone());
+        let content = ctx.encode_content();
+        let next = SignedTrustContext::decode_content(&content, 2).unwrap();
+        assert_eq!(next.revocation_cut(&n(PHONE_KEY)), Some(&a));
+        assert_eq!(next.with_version(3).encode_content(), content);
+    }
+
+    /// A cut without tips encodes as before (T8–T10 pin the bytes), a
+    /// cut with tips is the same bytes with the tips appended, and a node
+    /// that does not know the tip number skips it and reads a cut that
+    /// accepts nothing: it refuses more, never less.
+    #[test]
+    fn a_cut_with_tips_and_no_manifest_decodes_in_an_old_node_as_refusing() {
+        let notes = log_prefix(&["notes"]);
+        let key = n(PHONE_KEY).encode_to_tlv().to_vec();
+        let key_digest = tlv_bytes(tlv::CUT_KEY_DIGEST, &digest(0x40)).to_vec();
+        let wire = |tip_type: u64| {
+            tlv_bytes(
+                tlv::REVOCATION_CUT,
+                &[
+                    key.clone(),
+                    key_digest.clone(),
+                    tlv_bytes(tip_type, &tip_value(&notes, 7, &digest(0x60))).to_vec(),
+                ]
+                .concat(),
+            )
+        };
+
+        let mut without = RevocationCut::new(n(PHONE_KEY));
+        without.set_key_digest(digest(0x40));
+        assert_eq!(
+            without.encode(),
+            tlv_bytes(
+                tlv::REVOCATION_CUT,
+                &[key.clone(), key_digest.clone()].concat()
+            ),
+            "no tips: no new bytes"
+        );
+        let mut with = without.clone();
+        with.add_tip(&notes, 7, digest(0x60));
+        assert_eq!(with.encode(), wire(tlv::CUT_TIP));
+        assert_eq!(tlv::CUT_TIP, 0x0404);
+
+        // The old node: the tip sub-TLV is an unassigned even number.
+        let old = RevocationCut::decode(&wire(0x0408)).unwrap();
+        assert!(old.tips().is_empty() && old.ranges().is_empty() && old.exact().is_empty());
+        assert_eq!(old.manifest(), None);
+        assert_eq!(old.key_digest(), Some(&digest(0x40)));
+        let new = RevocationCut::decode(&wire(tlv::CUT_TIP)).unwrap();
+        assert_eq!(new, with);
+        for seq in [0, 3, 6, 7, 8] {
+            let name = notes.clone().append_sequence_num(seq);
+            assert!(!old.accepts(&name, &digest(0x60)), "old node: seq {seq}");
+            assert!(old.tip_seq(&name).is_none());
+            assert_eq!(
+                new.accepts(&name, &digest(0x60)),
+                seq < 7,
+                "new node, by name: seq {seq}"
+            );
+        }
+
+        // In a context, the old node refuses what the new node accepts below the tip.
+        let base = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_revocation(n(PHONE_KEY))
+            .encode_content();
+        let read = |tip_type: u64| {
+            SignedTrustContext::decode_content(&with_fields(&base, &[wire(tip_type)]), 1).unwrap()
+        };
+        let below = notes.clone().append_sequence_num(3);
+        assert!(read(0x0408).refuses_data(&n(PHONE_KEY), &below, &digest(1)));
+        assert!(!read(tlv::CUT_TIP).refuses_data(&n(PHONE_KEY), &below, &digest(1)));
+    }
+
+    #[test]
+    fn covers_never_accepts_less_with_tips() {
+        let notes = log_prefix(&["notes"]);
+        let photos = log_prefix(&["photos"]);
+        let tipped = |seq: u64, d: u8| {
+            let mut c = RevocationCut::new(n(PHONE_KEY));
+            c.add_tip(&notes, seq, digest(d));
+            c
+        };
+        let earlier = tipped(7, 1);
+        assert!(earlier.covers(&earlier));
+        assert!(
+            tipped(8, 2).covers(&earlier),
+            "a higher tip accepts what the lower one did, its entry by name now"
+        );
+        assert!(!tipped(6, 1).covers(&earlier), "a tip lowered");
+        assert!(!tipped(7, 2).covers(&earlier), "a tip's digest changed");
+        assert!(
+            !RevocationCut::new(n(PHONE_KEY)).covers(&earlier),
+            "a tip dropped"
+        );
+        let mut other = RevocationCut::new(n(PHONE_KEY));
+        other.add_tip(&photos, 99, digest(1));
+        assert!(!other.covers(&earlier), "a tip of another prefix only");
+
+        let mut both = tipped(7, 1);
+        both.add_tip(&photos, 5, digest(4));
+        assert!(both.covers(&earlier), "a tip added");
+        assert!(!earlier.covers(&both), "a tip of the later cut dropped");
+
+        // Tips beside the older parts: those rules are unchanged.
+        let ranged = t8_cut();
+        let mut ranged_tipped = ranged.clone();
+        ranged_tipped.add_tip(&notes, 20, digest(5));
+        assert!(ranged_tipped.covers(&ranged));
+        assert!(!ranged.covers(&ranged_tipped));
+        let shrunk = {
+            let mut c = RevocationCut::new(n(PHONE_KEY));
+            c.add_run(&notes, 1, 2);
+            c.add_tip(&notes, 20, digest(5));
+            c
+        };
+        assert!(!shrunk.covers(&ranged_tipped), "a run shrunk");
+
+        // Re-admission by an exact entry stays allowed.
+        let mut readmitted = earlier.clone();
+        readmitted
+            .readmit(
+                notes
+                    .clone()
+                    .append_sequence_num(9)
+                    .append_implicit_digest(digest(0)),
+            )
+            .unwrap();
+        assert!(readmitted.covers(&earlier));
+        assert!(!earlier.covers(&readmitted));
     }
 
     #[test]
@@ -3518,6 +3863,59 @@ mod tests {
         assert!(cut.accepts(&in_range, &digest(0x77)));
     }
 
+    /// The cut of trust-context.md §11 T11: tips instead of a manifest. Key
+    /// `/home/bob/member/phone/KEY/k1` bound to the key digest `404142…5f`;
+    /// CutExact `/home/bob/member/phone/32=log/notes/seq=9` with the digest
+    /// `000102…1f`; CutTip `/home/bob/member/phone/32=log` seq 1 with the
+    /// signed-region digest `202122…3f`; CutTip
+    /// `/home/bob/member/phone/32=log/notes` seq 7 with `606162…7f`.
+    fn t11_cut() -> RevocationCut {
+        let mut cut = RevocationCut::new(n(PHONE_KEY));
+        cut.set_key_digest(digest(0x40));
+        cut.readmit(
+            log_prefix(&["notes"])
+                .append_sequence_num(9)
+                .append_implicit_digest(digest(0)),
+        )
+        .unwrap();
+        cut.add_tip(&log_prefix(&["notes"]), 7, digest(0x60));
+        cut.add_tip(&log_prefix(&[]), 1, digest(0x20));
+        cut
+    }
+
+    /// T11: the tips come after the CutExact entries, in canonical order of
+    /// their prefixes; the cut round-trips and accepts below each tip by name.
+    #[test]
+    fn spec_vector_t11_cut_with_tips() {
+        let cut = t11_cut();
+        let wire = cut.encode();
+        assert_eq!(
+            hex(&wire),
+            "fd0428fd013907230804686f6d650803626f6208066d656d626572080570686f\
+             6e6508034b455908026b31fd043020404142434445464748494a4b4c4d4e4f50\
+             5152535455565758595a5b5c5d5e5ffd042e4d074b0804686f6d650803626f62\
+             08066d656d626572080570686f6e6520036c6f6708056e6f7465733a01090120\
+             000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
+             fd040448071f0804686f6d650803626f6208066d656d626572080570686f6e65\
+             20036c6f673a0101fd040620202122232425262728292a2b2c2d2e2f30313233\
+             3435363738393a3b3c3d3e3ffd04044f07260804686f6d650803626f6208066d\
+             656d626572080570686f6e6520036c6f6708056e6f7465733a0107fd04062060\
+             6162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f"
+        );
+        let back = RevocationCut::decode(&wire).unwrap();
+        assert_eq!(back, cut);
+        assert_eq!(back.tips().len(), 2);
+        assert_eq!(back.manifest(), None);
+        let notes = log_prefix(&["notes"]);
+        assert!(back.accepts(&notes.clone().append_sequence_num(6), &digest(5)));
+        assert!(!back.accepts(&notes.clone().append_sequence_num(7), &digest(0x60)));
+        assert!(!back.accepts(&notes.clone().append_sequence_num(8), &digest(5)));
+        assert!(!back.accepts(&log_prefix(&[]).append_sequence_num(1), &digest(0x20)));
+        assert!(back.accepts(&log_prefix(&[]).append_sequence_num(0), &digest(5)));
+        // An exact entry still re-admits one version above the tip.
+        assert!(back.accepts(&notes.append_sequence_num(9), &digest(0)));
+    }
+
     /// T9: the key digest and the manifest come right after the key Name,
     /// before the ranges; they round-trip, and a range of a cut with a
     /// manifest accepts nothing by name alone.
@@ -3719,6 +4117,8 @@ mod tests {
         let run = |parts: &[Vec<u8>]| tlv_bytes(tlv::CUT_RUN, &parts.concat()).to_vec();
         let range = |parts: &[Vec<u8>]| tlv_bytes(tlv::CUT_RANGE, &parts.concat()).to_vec();
         let exact = |name: Name| tlv_bytes(tlv::CUT_EXACT, &name.encode_to_tlv()).to_vec();
+        let tip = |parts: &[Vec<u8>]| tlv_bytes(tlv::CUT_TIP, &parts.concat()).to_vec();
+        let tip_digest = |d: &[u8]| tlv_bytes(tlv::CUT_TIP_DIGEST, d).to_vec();
         let cut = |parts: &[Vec<u8>]| tlv_bytes(tlv::REVOCATION_CUT, &parts.concat());
         let good_run = run(&[seq(&[1]), seq(&[2])]);
         let in_notes = |s: u64| log_prefix(&["notes"]).append_sequence_num(s);
@@ -3847,6 +4247,84 @@ mod tests {
                     key.clone(),
                     tlv_bytes(tlv::CUT_MANIFEST, &manifest_name().encode_to_tlv()).to_vec(),
                     tlv_bytes(tlv::CUT_MANIFEST, &manifest_name().encode_to_tlv()).to_vec(),
+                ])],
+            ),
+            (
+                "two tips for one prefix",
+                vec![cut(&[
+                    key.clone(),
+                    tip(&[notes.clone(), seq(&[7]), tip_digest(&[1; 32])]),
+                    tip(&[notes.clone(), seq(&[8]), tip_digest(&[2; 32])]),
+                ])],
+            ),
+            (
+                "tip digest of 31 octets",
+                vec![cut(&[
+                    key.clone(),
+                    tip(&[notes.clone(), seq(&[7]), tip_digest(&[1; 31])]),
+                ])],
+            ),
+            (
+                "tip digest of 33 octets",
+                vec![cut(&[
+                    key.clone(),
+                    tip(&[notes.clone(), seq(&[7]), tip_digest(&[1; 33])]),
+                ])],
+            ),
+            (
+                "tip without a digest",
+                vec![cut(&[key.clone(), tip(&[notes.clone(), seq(&[7])])])],
+            ),
+            (
+                "tip digest of another type",
+                vec![cut(&[
+                    key.clone(),
+                    tip(&[
+                        notes.clone(),
+                        seq(&[7]),
+                        tlv_bytes(tlv::CUT_KEY_DIGEST, &[1; 32]).to_vec(),
+                    ]),
+                ])],
+            ),
+            (
+                "tip with an element after its digest",
+                vec![cut(&[
+                    key.clone(),
+                    tip(&[
+                        notes.clone(),
+                        seq(&[7]),
+                        tip_digest(&[1; 32]),
+                        tlv_bytes(0x0408, &[]).to_vec(),
+                    ]),
+                ])],
+            ),
+            (
+                "tip without a prefix Name",
+                vec![cut(&[key.clone(), tip(&[seq(&[7]), tip_digest(&[1; 32])])])],
+            ),
+            (
+                "tip sequence number not in shortest form",
+                vec![cut(&[
+                    key.clone(),
+                    tip(&[notes.clone(), seq(&[0, 7]), tip_digest(&[1; 32])]),
+                ])],
+            ),
+            (
+                "tip sequence number not a NonNegativeInteger",
+                vec![cut(&[
+                    key.clone(),
+                    tip(&[notes.clone(), seq(&[0, 0, 7]), tip_digest(&[1; 32])]),
+                ])],
+            ),
+            (
+                "tip number not a SequenceNumNameComponent",
+                vec![cut(&[
+                    key.clone(),
+                    tip(&[
+                        notes.clone(),
+                        tlv_bytes(0x32, &[7]).to_vec(),
+                        tip_digest(&[1; 32]),
+                    ]),
                 ])],
             ),
             (

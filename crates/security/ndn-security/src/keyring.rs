@@ -274,8 +274,9 @@ impl std::fmt::Debug for Keyring {
 /// - the key of each cut of `old` whose key `new` still revokes and whose
 ///   cut in `new` does not accept everything the old one did
 ///   ([`RevocationCut::covers`](crate::RevocationCut::covers): the cut
-///   removed, a range or run shrunk, an exact entry dropped, its key digest
-///   or manifest changed, added or removed);
+///   removed, a range or run shrunk, an exact entry dropped, a tip dropped,
+///   lowered or changed at its number, its key digest or manifest changed,
+///   added or removed);
 /// - `/<ns>/<role>` for each DataRequiresCut role `new` lists that `old`
 ///   did not (that role's lapsed keys now need a cut).
 ///

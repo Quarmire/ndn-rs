@@ -12,7 +12,9 @@ use crate::TrustError;
 use crate::cert_cache::{CertCache, Certificate};
 use crate::cert_name::{is_cert_name, is_reserved_non_cert, key_name_of};
 use crate::cut_manifest::{CutManifests, ManifestLookup};
-use crate::trust_context::{RevocationCut, SignedTrustContext, public_key_digest};
+use crate::trust_context::{
+    RevocationCut, SignedTrustContext, public_key_digest, signed_region_digest,
+};
 use crate::verifier::{VerifyOutcome, verify_public_key_signature};
 
 /// How far up a chain [`chain_clear`] follows; a longer chain is not known
@@ -57,6 +59,24 @@ fn cut_admits(
     if cut.accepts_exactly(&packet.name, &digest) {
         return Admit::Yes;
     }
+    // A tip: below its number by name, at it only the signed object it
+    // names (another signature value over the same signed region is that
+    // object), above it nothing (ranges and manifest, if the cut has them,
+    // decide). What lies below a tip is bound by the ends, through the
+    // chain ancestry of the tip, never here: this check holds one packet.
+    if let Some((tip, seq)) = cut.tip_seq(&packet.name) {
+        match seq.cmp(&tip.seq) {
+            std::cmp::Ordering::Less => return Admit::Yes,
+            std::cmp::Ordering::Equal => {
+                return if signed_region_digest(packet) == tip.digest {
+                    Admit::Yes
+                } else {
+                    Admit::No
+                };
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
     let Some((range, seq)) = cut.range_seq(&packet.name) else {
         return Admit::No;
     };
@@ -78,7 +98,10 @@ fn cut_admits(
 /// - Revoked (the locator or the verifying certificate): without a cut,
 ///   refused; with one, the cut decides alone ([`RevocationCut`]: its key
 ///   digest must match `verifying`'s public key, an exact entry or a range
-///   accepts it, and with a manifest the manifest lists its bytes).
+///   accepts it, with a manifest the manifest lists its bytes, and a tip
+///   accepts by name below its number and the tip entry itself by its
+///   signed-region digest — what lies below a tip is bound by the data
+///   layer's chain ancestry of the tip, which one packet cannot show here).
 /// - Not revoked, of a device role listed in DataRequiresCut: accepted only
 ///   while a certificate of the key with `verifying`'s public key is valid
 ///   at `now` (the reader's clock, which can only refuse): `verifying`
