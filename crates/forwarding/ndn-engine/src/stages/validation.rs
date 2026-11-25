@@ -166,8 +166,10 @@ impl PendingQueue {
 /// key's role is listed in DataRequiresCut); a key's authority ends by a
 /// revocation in the trust context, and a key revoked with a cut keeps the
 /// packets its cut accepts (bound to its public key and, with a manifest,
-/// to the listed bytes). (Signed Interests and commands stay live: they are
-/// judged elsewhere, against now.)
+/// to the listed bytes; with tips, accepted by name below a tip and the tip
+/// entry by its signed-region digest — what lies below a tip is bound by
+/// the data layer's chain test, not here). (Signed Interests and commands
+/// stay live: they are judged elsewhere, against now.)
 ///
 /// A cut-manifest packet the verdict needs is handled exactly as a missing
 /// certificate: the walk names it (its full name), the Data is parked and

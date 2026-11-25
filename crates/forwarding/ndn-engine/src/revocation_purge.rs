@@ -16,15 +16,25 @@
 //! key verifies it — ends at an anchor (or a certificate with no issuer
 //! above it) without passing a revoked issuer or certificate; its signer is
 //! not revoked, or revoked with a cut that accepts it (key digest, ranges,
-//! manifest, exact entries), and is no lapsed key whose role needs a cut;
-//! and it is no certificate the context revokes — except a certificate of a
-//! key revoked *with* a cut, kept because the Data the cut accepts needs it
-//! to verify. Data whose chain cannot be followed that far (or whose cut's
+//! manifest, tips, exact entries), and is no lapsed key whose role needs a
+//! cut; and it is no certificate the context revokes — except a certificate
+//! of a key revoked *with* a cut, kept because the Data the cut accepts needs
+//! it to verify. Data whose chain cannot be followed that far (or whose cut's
 //! manifest is not held) is not served either — after a restart the cache
 //! holds only this node's own certificates, not those of other devices or
 //! their CA — but evicted, so the next Interest fetches it and validation
 //! judges it afresh. A context that revokes nothing and lists no role
 //! needing a cut leaves every entry clear.
+//!
+//! A cut that names tips (instead of a manifest of every entry) is judged
+//! the same way, one packet at a time: Data of the revoked key above a tip's
+//! sequence number, and other bytes at the tip's own name, are purged; the
+//! tip entry itself (by its signed-region digest) and Data below the tip
+//! (by name) are kept. The forwarder cannot bind the bytes below a tip —
+//! that takes the tip's chain of `PREV` links, which one cached packet does
+//! not carry — so it keeps by name what the cut accepts by name, and the
+//! ends decide: the data layer keeps an entry of a tip-cut key only if it is
+//! a chain ancestor of the tip (else `OutsideCut`).
 //!
 //! Correctness rests on data, not on timing. Every entry `CsInsertStage`
 //! admits carries the keyring's
@@ -140,8 +150,8 @@ pub(crate) async fn recheck(
 
 /// Whether the Data in `wire` decodes and the durable re-check
 /// ([`ndn_security::chain_clear`]) holds for it under `ctx`: the same rule
-/// the validation stage applies to its signer (cut, key digest, manifest,
-/// DataRequiresCut), each hop resolved to the cached certificate that
+/// the validation stage applies to its signer (cut, key digest, manifest or
+/// tips, DataRequiresCut), each hop resolved to the cached certificate that
 /// verifies it.
 fn known_clear(ctx: &SignedTrustContext, certs: &CertCache, wire: &Bytes) -> bool {
     Data::decode(wire.clone()).is_ok_and(|data| ndn_security::chain_clear(ctx, certs, &data))
@@ -206,7 +216,12 @@ mod tests {
 
         /// A Data packet this key signed, as it reaches the validation stage.
         fn data(&self, name: &str) -> PacketContext {
-            let wire = DataBuilder::new(n(name), b"photo")
+            self.data_with(name, b"photo")
+        }
+
+        /// [`Self::data`] with `content`.
+        fn data_with(&self, name: &str, content: &[u8]) -> PacketContext {
+            let wire = DataBuilder::new(n(name), content)
                 .freshness(Duration::from_secs(60))
                 .sign_sync(
                     SignatureType::SignatureEd25519,
@@ -776,5 +791,71 @@ mod tests {
             !node.serves(UNLISTED).await,
             "an in-range entry not listed is not"
         );
+    }
+
+    /// A cut that names a tip (and no manifest): the CS re-check keeps the
+    /// cached Data of the revoked key below the tip's number (accepted by
+    /// name) and the tip entry itself (its signed-region digest), and
+    /// purges the Data above the tip and other bytes at the tip's name. The
+    /// forwarder cannot bind the bytes below the tip; the data layer's
+    /// chain test does.
+    #[tokio::test]
+    async fn a_tip_cut_purges_cached_data_above_the_tip_and_keeps_below_it() {
+        const BELOW: &str = "/home/bob/member/d/notes/seq=2";
+        const AT_TIP: &str = "/home/bob/member/d/notes/seq=3";
+        const ABOVE: &str = "/home/bob/member/d/notes/seq=5";
+        let root = Key::new("/home/bob/KEY/0", 10);
+        let ca = Key::new("/home/bob/CA/KEY/9", 11);
+        let d = Key::new("/home/bob/member/d/KEY/4", 12);
+        let keyring = Arc::new(Keyring::new());
+        keyring.adopt(context(&[&root], 1, &[])).unwrap();
+        let certs = Arc::new(CertCache::new());
+        certs.insert(ca.certified_by(&root));
+        certs.insert(d.certified_by(&ca));
+        let node = Node::with_certs(
+            Arc::clone(&keyring),
+            Arc::new(LruCs::new(1 << 20)),
+            true,
+            Arc::clone(&certs),
+        );
+        let at_tip = d.data(AT_TIP);
+        let tip_digest =
+            ndn_security::signed_region_digest(&Data::decode(at_tip.raw_bytes.clone()).unwrap());
+        // Other bytes at the tip's name: the same name, other content.
+        let forged_wire = d.data_with(AT_TIP, b"forged").raw_bytes;
+        let (below_wire, above_wire) = (d.data(BELOW).raw_bytes, d.data(ABOVE).raw_bytes);
+        node.receive(d.data(BELOW)).await;
+        node.receive(at_tip).await;
+        node.receive(d.data(ABOVE)).await;
+        assert!(node.serves(BELOW).await && node.serves(AT_TIP).await && node.serves(ABOVE).await);
+
+        let mut cut = ndn_security::RevocationCut::new(d.name.clone());
+        cut.add_tip(&n("/home/bob/member/d/notes"), 3, tip_digest);
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_ca_endpoint(n("/home/bob/CA"))
+            .with_version(2)
+            .with_revocation(d.name.clone())
+            .with_revocation_cut(cut);
+        assert!(ctx.add_anchor(root.anchor()));
+        keyring.adopt_update(Arc::new(ctx)).unwrap();
+
+        let held = keyring.context_for(&n(BELOW));
+        assert!(known_clear(&held, &certs, &below_wire), "below the tip");
+        assert!(
+            !known_clear(&held, &certs, &forged_wire),
+            "other bytes at the tip's name"
+        );
+        assert!(!known_clear(&held, &certs, &above_wire), "above the tip");
+        assert!(node.serves(BELOW).await, "Data below the tip is kept");
+        assert!(node.serves(AT_TIP).await, "the tip entry itself is kept");
+        assert!(!node.serves(ABOVE).await, "Data above the tip is purged");
+        assert_eq!(node.stamp(ABOVE).await, None, "and evicted, not parked");
+        // Validation judges the same way: a tip needs no manifest, so nothing
+        // below it waits on one.
+        node.validated(d.data(BELOW)).await;
+        assert!(matches!(
+            node.validation.process(d.data(ABOVE)).await,
+            Action::Refuse(_, ndn_packet::Refusal::Revoked)
+        ));
     }
 }
