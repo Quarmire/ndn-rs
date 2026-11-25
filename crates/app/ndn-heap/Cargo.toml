@@ -15,6 +15,9 @@ ndn-tlv      = { workspace = true, features = ["std"] }
 ndn-app      = { workspace = true }
 ndn-security = { workspace = true }
 ndn-sync     = { workspace = true }
+# The routing header of a channel frame (`ndn_transport::side_header`) is the
+# first ten octets of the heap's frame header.
+ndn-transport = { workspace = true }
 bytes        = { workspace = true, features = ["std"] }
 thiserror    = { workspace = true }
 async-trait  = { workspace = true }
@@ -22,6 +25,8 @@ futures      = { workspace = true }
 parking_lot  = { workspace = true }
 sha2         = { workspace = true }
 hkdf         = { workspace = true }
+# The checkpoint hash of a sent frame above 2,048 octets (channel.md).
+blake3       = { workspace = true }
 # Signal keys (spec §11) are zeroed when dropped.
 zeroize      = "1"
 getrandom    = { workspace = true }
@@ -34,10 +39,21 @@ tokio-util   = { workspace = true }
 ndn-packet = { workspace = true, features = ["std"] }
 # `rt`: the store's flush runs on the blocking pool (`spawn_blocking`).
 tokio      = { workspace = true, features = ["sync", "time", "rt"] }
+# The channel frame seal: AES-256-GCM and ChaCha20-Poly1305 through `ring`,
+# which does not build for wasm32-unknown-unknown.
+ring       = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ndn-packet = { workspace = true, features = ["std-wasm"] }
+# The same two AEADs, same wire format, from RustCrypto where `ring` is absent.
+aes-gcm           = { version = "0.10", default-features = false, features = ["aes"] }
+chacha20poly1305  = { version = "0.10", default-features = false }
 tokio      = { workspace = true, features = ["sync"] }
+
+# Native tests check `ring`'s frames against RustCrypto's: the wasm32 seal.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+aes-gcm           = { version = "0.10", default-features = false, features = ["aes"] }
+chacha20poly1305  = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }

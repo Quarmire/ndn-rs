@@ -1,0 +1,879 @@
+//! The messages of a `DATA` frame: the plaintext the frame's AEAD seals.
+//!
+//! ```text
+//! message = flags (1) | [original sequence (varint)]  if STANDING or REPLAYED
+//!           | name id (varint) | [name length (varint) | name octets]  if NAMED
+//!           | [stand seconds (varint)]  if STAND | length (varint) | payload
+//! flags:  bit 0 NAMED     the full name rides here
+//!         bit 1 STAND     the sender lets this emission stand
+//!         bit 2 STANDING  a replay of a standing value after a session start
+//!         bit 3 REPLAYED  a `Window` replay
+//!         bits 4-6        reserved, zero
+//!         bit 7 PAD       the octet 0x80, then zero octets to the end
+//! ```
+//!
+//! [`MessageWriter`] appends messages into the frame's single buffer and
+//! seals it in place; [`Messages`] walks an opened frame's plaintext and hands
+//! each payload out as a slice of it, without copying. Both enforce the
+//! limits of [`super::limits`], so a writer never builds what a reader
+//! refuses.
+
+// Nothing outside the codec's tests calls this until the channel writer and
+// receiver (stage 3, part 2) are wired; that change removes this attribute.
+#![allow(dead_code)]
+
+use bytes::{BufMut, Bytes};
+
+use super::aead::FrameCipher;
+use super::frame::{FrameBuf, FrameError};
+use super::limits::{MESSAGE_MAX, MESSAGES_PER_FRAME, NAME_MAX, NAMES_PER_CHANNEL};
+use super::varint;
+use ndn_transport::SideClass;
+
+/// Flag: the message carries its name (a bind, or a datagram that may overtake
+/// its bind).
+pub(crate) const NAMED: u8 = 0x01;
+/// Flag: the sender lets this emission stand.
+pub(crate) const STAND: u8 = 0x02;
+/// Flag: a replay of a standing value; an original sequence follows the flags.
+pub(crate) const STANDING: u8 = 0x04;
+/// Flag: a `Window` replay; an original sequence follows the flags.
+pub(crate) const REPLAYED: u8 = 0x08;
+/// The padding octet: a receiver stops parsing here and requires every octet
+/// after it to be zero.
+pub(crate) const PAD: u8 = 0x80;
+
+const RESERVED: u8 = 0x70;
+
+/// Where a replayed message first went out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// A standing value replayed after a session start; its original sequence.
+    Standing(u64),
+    /// A `Window` replay; its original sequence.
+    Replayed(u64),
+}
+
+impl Origin {
+    const fn flag(self) -> u8 {
+        match self {
+            Origin::Standing(_) => STANDING,
+            Origin::Replayed(_) => REPLAYED,
+        }
+    }
+
+    const fn sequence(self) -> u64 {
+        match self {
+            Origin::Standing(s) | Origin::Replayed(s) => s,
+        }
+    }
+}
+
+/// Why a message, or the plaintext around it, is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum MessageError {
+    /// The plaintext ends inside a message.
+    #[error("the frame ends inside a message (its {what}): drop the frame")]
+    Truncated { what: &'static str },
+    /// Reserved flag bits, STANDING and REPLAYED together, or PAD with other
+    /// bits.
+    #[error(
+        "message flags {flags:#04x} are not valid (bits 4-6 are reserved, STANDING and REPLAYED exclude each other, PAD stands alone): drop the frame"
+    )]
+    Flags { flags: u8 },
+    /// A name id outside 1 to 4,096.
+    #[error("name id {id} is outside 1 to {NAMES_PER_CHANNEL}: drop the frame")]
+    NameId { id: u64 },
+    /// A name over 255 octets.
+    #[error("a name of {len} octets is over the {NAME_MAX} octet limit: shorten the path")]
+    NameTooLong { len: usize },
+    /// A payload over the message limit.
+    #[error(
+        "a message of {len} octets is over the limit of {max}: split it or raise the session's message limit (at most {MESSAGE_MAX})"
+    )]
+    TooLarge { len: usize, max: usize },
+    /// A number a varint cannot hold, or a sequence at or above 2^63.
+    #[error("the {what} is too large to encode: re-key the channel")]
+    Overflow { what: &'static str },
+    /// The frame header says `expected` messages and the plaintext holds
+    /// `found`.
+    #[error("the frame counts {expected} messages and holds {found}: drop the frame")]
+    Count { expected: usize, found: usize },
+    /// After the messages, octets that are not padding.
+    #[error("{octets} octets follow the last message and are not padding: drop the frame")]
+    Trailing { octets: usize },
+    /// A PAD flag followed by a non-zero octet.
+    #[error("padding has a non-zero octet at {at}: drop the frame")]
+    Padding { at: usize },
+}
+
+/// A message to be written.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OutMessage<'a> {
+    /// The name id, 1 to 4,096.
+    pub name_id: u64,
+    /// The name's octets (the Name TLV's value) when the message is `NAMED`.
+    pub name: Option<&'a [u8]>,
+    /// Seconds the emission stands for, when it does.
+    pub stand_secs: Option<u64>,
+    /// Set when the message replays an earlier one.
+    pub origin: Option<Origin>,
+    /// The payload.
+    pub payload: &'a [u8],
+}
+
+impl<'a> OutMessage<'a> {
+    /// A bare message: an id and a payload.
+    pub(crate) fn new(name_id: u64, payload: &'a [u8]) -> Self {
+        Self {
+            name_id,
+            name: None,
+            stand_secs: None,
+            origin: None,
+            payload,
+        }
+    }
+
+    /// Checks the message against the codec's limits and `max_message` and
+    /// returns the octets it takes.
+    pub(crate) fn encoded_len(&self, max_message: usize) -> Result<usize, MessageError> {
+        if !(1..=NAMES_PER_CHANNEL).contains(&self.name_id) {
+            return Err(MessageError::NameId { id: self.name_id });
+        }
+        let mut n = 1 + varint::len(self.name_id).expect("an id is at most 4,096");
+        if let Some(origin) = self.origin {
+            n += varint::len(origin.sequence()).ok_or(MessageError::Overflow {
+                what: "original sequence",
+            })?;
+        }
+        if let Some(name) = self.name {
+            if name.len() > NAME_MAX {
+                return Err(MessageError::NameTooLong { len: name.len() });
+            }
+            n += 1 + name.len() + usize::from(name.len() > 0x3f);
+        }
+        if let Some(secs) = self.stand_secs {
+            n += varint::len(secs).ok_or(MessageError::Overflow {
+                what: "stand seconds",
+            })?;
+        }
+        let max = max_message.min(MESSAGE_MAX);
+        if self.payload.len() > max {
+            return Err(MessageError::TooLarge {
+                len: self.payload.len(),
+                max,
+            });
+        }
+        Ok(
+            n + varint::len(self.payload.len() as u64).expect("a payload is at most 16 MiB")
+                + self.payload.len(),
+        )
+    }
+
+    fn flags(&self) -> u8 {
+        let mut flags = 0;
+        if self.name.is_some() {
+            flags |= NAMED;
+        }
+        if self.stand_secs.is_some() {
+            flags |= STAND;
+        }
+        if let Some(origin) = self.origin {
+            flags |= origin.flag();
+        }
+        flags
+    }
+
+    /// Appends the message to `buf`. The caller has checked it with
+    /// [`encoded_len`](Self::encoded_len) and that `buf` has room.
+    fn write(&self, buf: &mut impl BufMut) -> Result<(), varint::Overflow> {
+        buf.put_u8(self.flags());
+        if let Some(origin) = self.origin {
+            varint::write(buf, origin.sequence())?;
+        }
+        varint::write(buf, self.name_id)?;
+        if let Some(name) = self.name {
+            varint::write(buf, name.len() as u64)?;
+            buf.put_slice(name);
+        }
+        if let Some(secs) = self.stand_secs {
+            varint::write(buf, secs)?;
+        }
+        varint::write(buf, self.payload.len() as u64)?;
+        buf.put_slice(self.payload);
+        Ok(())
+    }
+}
+
+/// Why a message was not appended to a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum WriteError {
+    /// The frame has no room for this message: seal it and start another (or,
+    /// when the frame is empty, send the message on the stream). Nothing was
+    /// written.
+    #[error("the frame has {room} octets of room and the message needs {need}")]
+    Full { need: usize, room: usize },
+    /// The frame already holds 255 messages: seal it and start another.
+    /// Nothing was written.
+    #[error("the frame holds the most messages it can (255)")]
+    CountFull,
+    /// The message breaks a limit of the codec; it is never sendable as given.
+    #[error(transparent)]
+    Invalid(#[from] MessageError),
+}
+
+/// Builds one `DATA` frame: messages appended into the frame's one buffer,
+/// then sealed in place.
+#[derive(Debug)]
+pub(crate) struct MessageWriter {
+    frame: FrameBuf,
+    count: usize,
+    max_message: usize,
+}
+
+impl MessageWriter {
+    /// A writer for a frame on `class` of `channel` at `key_epoch` (low octet)
+    /// whose first message has sequence `seq0`.
+    ///
+    /// `limit` is the frame's whole size at most (the datagram room the
+    /// carrier gave, or the stream frame limit), `capacity` the octets to
+    /// allocate up front. A frame is **two allocations** whatever its size and
+    /// message count (the buffer, and the shared header `Bytes` adds when the
+    /// buffer is frozen) provided `capacity` is at least its final size, as it
+    /// is when the writer is sized to the room. `max_message` bounds a payload.
+    pub(crate) fn new(
+        class: SideClass,
+        channel: u64,
+        key_epoch: u8,
+        seq0: u64,
+        limit: usize,
+        capacity: usize,
+        max_message: usize,
+    ) -> Result<Self, FrameError> {
+        Ok(Self {
+            frame: FrameBuf::new(
+                class,
+                ndn_transport::SideKind::Data,
+                channel,
+                key_epoch,
+                seq0,
+                limit,
+                capacity,
+            )?,
+            count: 0,
+            max_message,
+        })
+    }
+
+    /// Octets of messages the frame can still take.
+    pub(crate) fn room(&self) -> usize {
+        self.frame.room()
+    }
+
+    /// Messages written so far.
+    pub(crate) fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether no message was written.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The sequence the next message takes.
+    pub(crate) fn next_seq(&self) -> u64 {
+        self.frame.seq0() + self.count as u64
+    }
+
+    /// Appends `message`, or says why not and writes nothing.
+    pub(crate) fn push(&mut self, message: &OutMessage<'_>) -> Result<(), WriteError> {
+        let need = message.encoded_len(self.max_message)?;
+        if self.count == MESSAGES_PER_FRAME {
+            return Err(WriteError::CountFull);
+        }
+        let room = self.frame.room();
+        if need > room {
+            return Err(WriteError::Full { need, room });
+        }
+        message
+            .write(self.frame.plaintext_mut())
+            .map_err(|_| MessageError::Overflow { what: "message" })?;
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Pads the frame to 46 octets if it is shorter, seals it in place under
+    /// `cipher` and returns it. Fails when no message was written.
+    pub(crate) fn seal(self, cipher: &FrameCipher) -> Result<Bytes, FrameError> {
+        let count = u8::try_from(self.count).expect("push stops at 255 messages");
+        self.frame.seal(cipher, count)
+    }
+}
+
+/// A message read from an opened frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Message {
+    /// The message's sequence: the frame's `seq0` plus its index.
+    pub seq: u64,
+    /// The name id.
+    pub name_id: u64,
+    /// The name's octets, when the message was `NAMED`.
+    pub name: Option<Bytes>,
+    /// Seconds the emission stands for, when it does.
+    pub stand_secs: Option<u64>,
+    /// Set when the message replays an earlier one.
+    pub origin: Option<Origin>,
+    /// The payload, a slice of the opened frame.
+    pub payload: Bytes,
+}
+
+/// The messages of an opened `DATA` frame, in order. After the last, the
+/// iterator checks that only padding remains and yields one error if not; after
+/// any error it ends.
+#[derive(Debug)]
+pub(crate) struct Messages {
+    data: Bytes,
+    pos: usize,
+    seq: u64,
+    count: usize,
+    seen: usize,
+    max_message: usize,
+    done: bool,
+}
+
+impl Messages {
+    /// The `count` messages of `plaintext`, the first with sequence `seq0`.
+    pub(crate) fn new(plaintext: Bytes, seq0: u64, count: usize, max_message: usize) -> Self {
+        Self {
+            data: plaintext,
+            pos: 0,
+            seq: seq0,
+            count,
+            seen: 0,
+            max_message: max_message.min(MESSAGE_MAX),
+            done: false,
+        }
+    }
+
+    fn varint(&mut self, what: &'static str) -> Result<u64, MessageError> {
+        let (value, n) =
+            varint::read(&self.data[self.pos..]).ok_or(MessageError::Truncated { what })?;
+        self.pos += n;
+        Ok(value)
+    }
+
+    fn take(&mut self, len: usize, what: &'static str) -> Result<Bytes, MessageError> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .filter(|&end| end <= self.data.len())
+            .ok_or(MessageError::Truncated { what })?;
+        let out = self.data.slice(self.pos..end);
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn message(&mut self) -> Result<Message, MessageError> {
+        let flags = *self
+            .data
+            .get(self.pos)
+            .ok_or(MessageError::Truncated { what: "flags" })?;
+        if flags & PAD != 0 {
+            if flags != PAD {
+                return Err(MessageError::Flags { flags });
+            }
+            return Err(MessageError::Count {
+                expected: self.count,
+                found: self.seen,
+            });
+        }
+        if flags & RESERVED != 0 || flags & (STANDING | REPLAYED) == (STANDING | REPLAYED) {
+            return Err(MessageError::Flags { flags });
+        }
+        self.pos += 1;
+        let origin = if flags & STANDING != 0 {
+            Some(Origin::Standing(self.sequence()?))
+        } else if flags & REPLAYED != 0 {
+            Some(Origin::Replayed(self.sequence()?))
+        } else {
+            None
+        };
+        let name_id = self.varint("name id")?;
+        if !(1..=NAMES_PER_CHANNEL).contains(&name_id) {
+            return Err(MessageError::NameId { id: name_id });
+        }
+        let name = if flags & NAMED != 0 {
+            let len = self.varint("name length")?;
+            if len > NAME_MAX as u64 {
+                return Err(MessageError::NameTooLong { len: len as usize });
+            }
+            Some(self.take(len as usize, "name")?)
+        } else {
+            None
+        };
+        let stand_secs = if flags & STAND != 0 {
+            Some(self.varint("stand seconds")?)
+        } else {
+            None
+        };
+        let len = self.varint("payload length")?;
+        if len > self.max_message as u64 {
+            return Err(MessageError::TooLarge {
+                len: usize::try_from(len).unwrap_or(usize::MAX),
+                max: self.max_message,
+            });
+        }
+        let payload = self.take(len as usize, "payload")?;
+        Ok(Message {
+            seq: self.seq,
+            name_id,
+            name,
+            stand_secs,
+            origin,
+            payload,
+        })
+    }
+
+    fn sequence(&mut self) -> Result<u64, MessageError> {
+        self.varint("original sequence")
+    }
+}
+
+impl Iterator for Messages {
+    type Item = Result<Message, MessageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        if self.seen == self.count {
+            self.done = true;
+            return check_padding(&self.data[self.pos..]).err().map(Err);
+        }
+        match self.message() {
+            Ok(m) => {
+                self.seen += 1;
+                self.seq += 1;
+                Some(Ok(m))
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+/// Checks the octets after a frame's content: none, or the PAD octet and
+/// zeros. A sealed frame shorter than 46 octets is padded inside its
+/// plaintext with exactly this, so the tag is at the end.
+pub(crate) fn check_padding(rest: &[u8]) -> Result<(), MessageError> {
+    match rest.split_first() {
+        None => Ok(()),
+        Some((&PAD, zeros)) => match zeros.iter().position(|&b| b != 0) {
+            None => Ok(()),
+            Some(at) => Err(MessageError::Padding { at: 1 + at }),
+        },
+        Some(_) => Err(MessageError::Trailing { octets: rest.len() }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chan::aead::Aead;
+    use crate::chan::key::ChannelKey;
+    use crate::chan::limits::{
+        FRAME_OVERHEAD, MESSAGE_DEFAULT, SEQUENCE_LIMIT, STREAM_FRAME_DEFAULT,
+    };
+    use proptest::prelude::*;
+
+    fn cipher() -> FrameCipher {
+        FrameCipher::new(
+            &ChannelKey::from_bytes([9; 32]).frame_key(77, 0),
+            Aead::Aes256Gcm,
+        )
+    }
+
+    fn plaintext_of(msgs: &[OutMessage<'_>]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for m in msgs {
+            m.encoded_len(MESSAGE_DEFAULT).unwrap();
+            m.write(&mut buf).unwrap();
+        }
+        buf
+    }
+
+    fn read_all(plain: Vec<u8>, seq0: u64, count: usize) -> Result<Vec<Message>, MessageError> {
+        Messages::new(Bytes::from(plain), seq0, count, MESSAGE_DEFAULT).collect()
+    }
+
+    /// The bytes a 3-octet-overhead message has, written out.
+    #[test]
+    fn a_small_message_takes_three_octets_of_overhead() {
+        let payload = [0xaa; 5];
+        let m = OutMessage::new(1, &payload);
+        assert_eq!(m.encoded_len(MESSAGE_DEFAULT), Ok(8));
+        assert_eq!(
+            plaintext_of(&[m]),
+            [0x00, 0x01, 0x05, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa]
+        );
+        // Larger ids and payloads take four to five.
+        let big = vec![0u8; 100];
+        let m = OutMessage::new(100, &big);
+        assert_eq!(m.encoded_len(MESSAGE_DEFAULT), Ok(1 + 2 + 2 + 100));
+    }
+
+    #[test]
+    fn every_flag_and_field_reads_back_as_written() {
+        let name = b"\x08\x01a\x08\x01b";
+        let all = OutMessage {
+            name_id: 4_096,
+            name: Some(name),
+            stand_secs: Some(300),
+            origin: Some(Origin::Replayed(1 << 40)),
+            payload: b"payload",
+        };
+        let standing = OutMessage {
+            origin: Some(Origin::Standing(9)),
+            name: None,
+            stand_secs: None,
+            ..all
+        };
+        let plain = plaintext_of(&[all, standing]);
+        assert_eq!(plain[0], NAMED | STAND | REPLAYED);
+        assert_eq!(
+            all.encoded_len(MESSAGE_DEFAULT).unwrap()
+                + standing.encoded_len(MESSAGE_DEFAULT).unwrap(),
+            plain.len()
+        );
+        let got = read_all(plain, 1_000, 2).unwrap();
+        assert_eq!(got[0].seq, 1_000);
+        assert_eq!(got[1].seq, 1_001);
+        assert_eq!(got[0].name_id, 4_096);
+        assert_eq!(got[0].name.as_deref(), Some(&name[..]));
+        assert_eq!(got[0].stand_secs, Some(300));
+        assert_eq!(got[0].origin, Some(Origin::Replayed(1 << 40)));
+        assert_eq!(&got[0].payload[..], b"payload");
+        assert_eq!(got[1].origin, Some(Origin::Standing(9)));
+        assert_eq!(got[1].name, None);
+        assert_eq!(got[1].stand_secs, None);
+    }
+
+    proptest! {
+        #[test]
+        fn a_message_round_trips(
+            id in 1u64..=4_096,
+            name in proptest::option::of(proptest::collection::vec(any::<u8>(), 0..=255)),
+            stand in proptest::option::of(0u64..=varint::MAX),
+            origin in proptest::option::of((any::<bool>(), 0u64..=varint::MAX)),
+            payload in proptest::collection::vec(any::<u8>(), 0..300),
+            seq0 in 0u64..(SEQUENCE_LIMIT - 1),
+        ) {
+            let origin = origin.map(|(standing, s)| if standing { Origin::Standing(s) } else { Origin::Replayed(s) });
+            let m = OutMessage { name_id: id, name: name.as_deref(), stand_secs: stand, origin, payload: &payload };
+            let plain = plaintext_of(&[m]);
+            prop_assert_eq!(m.encoded_len(MESSAGE_DEFAULT).unwrap(), plain.len());
+            let got = read_all(plain, seq0, 1).unwrap();
+            prop_assert_eq!(got.len(), 1);
+            prop_assert_eq!(got[0].seq, seq0);
+            prop_assert_eq!(got[0].name_id, id);
+            prop_assert_eq!(got[0].name.as_deref(), name.as_deref());
+            prop_assert_eq!(got[0].stand_secs, stand);
+            prop_assert_eq!(got[0].origin, origin);
+            prop_assert_eq!(&got[0].payload[..], &payload[..]);
+        }
+
+        /// A frame of several messages, sealed and opened through the writer.
+        #[test]
+        fn a_frame_of_messages_round_trips_through_seal_and_open(
+            payloads in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..200), 1..40),
+            seq0 in 0u64..1_000_000,
+        ) {
+            let cipher = cipher();
+            let mut w = MessageWriter::new(SideClass::Datagram, 77, 0, seq0, 9_000, 9_000, MESSAGE_DEFAULT).unwrap();
+            for (i, p) in payloads.iter().enumerate() {
+                w.push(&OutMessage::new(1 + (i as u64 % 64), p)).unwrap();
+            }
+            let frame = w.seal(&cipher).unwrap();
+            let opened = crate::chan::frame::open(&cipher, frame, 9_000).unwrap();
+            prop_assert_eq!(opened.header().count as usize, payloads.len());
+            let got: Vec<Message> = opened.messages(MESSAGE_DEFAULT).unwrap().collect::<Result<_, _>>().unwrap();
+            prop_assert_eq!(got.len(), payloads.len());
+            for (i, (m, p)) in got.iter().zip(&payloads).enumerate() {
+                prop_assert_eq!(m.seq, seq0 + i as u64);
+                prop_assert_eq!(&m.payload[..], &p[..]);
+            }
+        }
+
+        /// No plaintext, however mangled, panics the reader; it reads or errs.
+        #[test]
+        fn arbitrary_plaintext_never_panics_the_reader(
+            plain in proptest::collection::vec(any::<u8>(), 0..400),
+            count in 0usize..300,
+        ) {
+            let mut n = 0;
+            for r in Messages::new(Bytes::from(plain), 5, count, 64) {
+                if r.is_err() { break; }
+                n += 1;
+                prop_assert!(n <= count);
+            }
+        }
+    }
+
+    #[test]
+    fn a_malformed_plaintext_is_refused_and_says_why() {
+        let table: &[(&[u8], usize, MessageError)] = &[
+            (&[], 1, MessageError::Truncated { what: "flags" }),
+            (&[0x00], 1, MessageError::Truncated { what: "name id" }),
+            (
+                &[0x00, 0x01],
+                1,
+                MessageError::Truncated {
+                    what: "payload length",
+                },
+            ),
+            (
+                &[0x00, 0x01, 0x03, 1, 2],
+                1,
+                MessageError::Truncated { what: "payload" },
+            ),
+            (&[0x00, 0x00, 0x00], 1, MessageError::NameId { id: 0 }),
+            (
+                &[0x00, 0x7f, 0xff, 0x00],
+                1,
+                MessageError::NameId { id: 16_383 },
+            ),
+            (&[0x10, 0x01, 0x00], 1, MessageError::Flags { flags: 0x10 }),
+            (&[0x70, 0x01, 0x00], 1, MessageError::Flags { flags: 0x70 }),
+            (
+                &[0x0c, 0x00, 0x01, 0x00],
+                1,
+                MessageError::Flags { flags: 0x0c },
+            ),
+            (&[0x81, 0x01, 0x00], 1, MessageError::Flags { flags: 0x81 }),
+            (
+                &[0x01, 0x01, 0x40],
+                1,
+                MessageError::Truncated {
+                    what: "name length",
+                },
+            ),
+            // a name of 256 octets
+            (
+                &[0x01, 0x01, 0x41, 0x00],
+                1,
+                MessageError::NameTooLong { len: 256 },
+            ),
+            // a payload over the limit the reader was given (64)
+            (
+                &[0x00, 0x01, 0x41, 0x00],
+                1,
+                MessageError::TooLarge { len: 256, max: 64 },
+            ),
+            // padding where a message was owed
+            (
+                &[0x80, 0x00],
+                1,
+                MessageError::Count {
+                    expected: 1,
+                    found: 0,
+                },
+            ),
+            // an original sequence a varint cannot hold is never read; a truncated one is
+            (
+                &[0x04, 0x40],
+                1,
+                MessageError::Truncated {
+                    what: "original sequence",
+                },
+            ),
+            // one message where two were counted
+            (
+                &[0x00, 0x01, 0x00],
+                2,
+                MessageError::Truncated { what: "flags" },
+            ),
+            // octets after the last message that are not padding
+            (
+                &[0x00, 0x01, 0x00, 0x00],
+                1,
+                MessageError::Trailing { octets: 1 },
+            ),
+            (
+                &[0x00, 0x01, 0x00, 0x80, 0x00, 0x01],
+                1,
+                MessageError::Padding { at: 2 },
+            ),
+        ];
+        for (plain, count, want) in table {
+            let got: Result<Vec<_>, _> =
+                Messages::new(Bytes::copy_from_slice(plain), 0, *count, 64).collect();
+            assert_eq!(got.as_ref().err(), Some(want), "{plain:02x?}");
+        }
+    }
+
+    #[test]
+    fn padding_is_the_pad_octet_then_zeros_and_nothing_else() {
+        assert_eq!(check_padding(&[]), Ok(()));
+        assert_eq!(check_padding(&[PAD]), Ok(()));
+        assert_eq!(check_padding(&[PAD, 0, 0, 0]), Ok(()));
+        assert_eq!(
+            check_padding(&[PAD, 0, 1]),
+            Err(MessageError::Padding { at: 2 })
+        );
+        assert_eq!(
+            check_padding(&[0x00]),
+            Err(MessageError::Trailing { octets: 1 })
+        );
+        assert_eq!(
+            check_padding(&[0x81, 0]),
+            Err(MessageError::Trailing { octets: 2 })
+        );
+    }
+
+    #[test]
+    fn the_limits_hold_in_the_writer() {
+        let big = vec![0u8; 65];
+        assert_eq!(
+            OutMessage::new(1, &big).encoded_len(64),
+            Err(MessageError::TooLarge { len: 65, max: 64 })
+        );
+        assert_eq!(
+            OutMessage::new(0, b"").encoded_len(64),
+            Err(MessageError::NameId { id: 0 })
+        );
+        assert_eq!(
+            OutMessage::new(4_097, b"").encoded_len(64),
+            Err(MessageError::NameId { id: 4_097 })
+        );
+        let name = [b'x'; 256];
+        let mut m = OutMessage::new(1, b"");
+        m.name = Some(&name);
+        assert_eq!(
+            m.encoded_len(64),
+            Err(MessageError::NameTooLong { len: 256 })
+        );
+        m.name = Some(&name[..255]);
+        assert!(m.encoded_len(64).is_ok());
+        let mut m = OutMessage::new(1, b"");
+        m.stand_secs = Some(varint::MAX + 1);
+        assert_eq!(
+            m.encoded_len(64),
+            Err(MessageError::Overflow {
+                what: "stand seconds"
+            })
+        );
+        let mut m = OutMessage::new(1, b"");
+        m.origin = Some(Origin::Standing(varint::MAX + 1));
+        assert_eq!(
+            m.encoded_len(64),
+            Err(MessageError::Overflow {
+                what: "original sequence"
+            })
+        );
+        // The session's limit never exceeds 16 MiB.
+        let huge = vec![0u8; MESSAGE_MAX + 1];
+        assert!(matches!(
+            OutMessage::new(1, &huge).encoded_len(usize::MAX),
+            Err(MessageError::TooLarge {
+                max: MESSAGE_MAX,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_writer_stops_at_its_room_and_at_255_messages_and_writes_nothing_when_it_refuses() {
+        let mut w = MessageWriter::new(SideClass::Datagram, 1, 0, 0, 100, 100, 64).unwrap();
+        let p = [1u8; 40];
+        assert_eq!(w.room(), 100 - FRAME_OVERHEAD);
+        w.push(&OutMessage::new(1, &p)).unwrap(); // 43 octets
+        let room = w.room();
+        assert_eq!(room, 100 - FRAME_OVERHEAD - 43);
+        assert_eq!(
+            w.push(&OutMessage::new(1, &p)),
+            Err(WriteError::Full { need: 43, room })
+        );
+        assert_eq!(w.room(), room);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w.next_seq(), 1);
+
+        let mut w = MessageWriter::new(
+            SideClass::Stream,
+            1,
+            0,
+            10,
+            STREAM_FRAME_DEFAULT,
+            4_096,
+            MESSAGE_DEFAULT,
+        )
+        .unwrap();
+        for _ in 0..MESSAGES_PER_FRAME {
+            w.push(&OutMessage::new(1, b"")).unwrap();
+        }
+        assert_eq!(w.push(&OutMessage::new(1, b"")), Err(WriteError::CountFull));
+        assert_eq!(w.next_seq(), 10 + 255);
+        let frame = w.seal(&cipher()).unwrap();
+        assert_eq!(frame[19], 255);
+        assert!(matches!(
+            MessageWriter::new(SideClass::Datagram, 1, 0, 0, 100, 100, 64)
+                .unwrap()
+                .seal(&cipher()),
+            Err(FrameError::Count { .. })
+        ));
+    }
+
+    /// The 64 B path: building and sealing a frame allocates a fixed number of
+    /// times (the frame buffer, and the shared header `Bytes` adds when the
+    /// buffer is frozen) whatever the number of messages; reading it allocates
+    /// at most once. Nothing is allocated per message.
+    #[test]
+    fn a_frame_allocates_a_fixed_number_of_times_whatever_the_number_of_64_octet_messages() {
+        use crate::chan::alloc_probe::count_allocations;
+        let cipher = cipher();
+        let payload = [0x5a; 64];
+        let build = |messages: usize| {
+            count_allocations(|| {
+                let mut w = MessageWriter::new(
+                    SideClass::Datagram,
+                    77,
+                    0,
+                    0,
+                    1_200,
+                    1_200,
+                    MESSAGE_DEFAULT,
+                )
+                .unwrap();
+                for _ in 0..messages {
+                    w.push(&OutMessage::new(1, &payload)).unwrap();
+                }
+                w.seal(&cipher).unwrap()
+            })
+        };
+        let (_, one) = build(1);
+        let (frame, fourteen) = build(14);
+        assert_eq!(
+            one, fourteen,
+            "allocations of a frame of 1 and of 14 messages"
+        );
+        assert_eq!(
+            fourteen, 2,
+            "the buffer and the frozen buffer's shared header"
+        );
+        let (n, read) = count_allocations(|| {
+            let opened = crate::chan::frame::open(&cipher, frame, 1_200).unwrap();
+            let mut n = 0;
+            for m in opened.messages(MESSAGE_DEFAULT).unwrap() {
+                assert_eq!(m.unwrap().payload.len(), 64);
+                n += 1;
+            }
+            n
+        });
+        assert_eq!(n, 14);
+        assert!(
+            read <= 1,
+            "opening and reading 14 messages allocated {read} times"
+        );
+    }
+}

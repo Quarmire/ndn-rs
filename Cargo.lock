@@ -1819,8 +1819,11 @@ dependencies = [
 name = "ndn-heap"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "async-trait",
+ "blake3",
  "bytes",
+ "chacha20poly1305",
  "futures",
  "getrandom 0.2.17",
  "hkdf 0.13.0",
@@ -1833,8 +1836,10 @@ dependencies = [
  "ndn-security",
  "ndn-sync",
  "ndn-tlv",
+ "ndn-transport",
  "parking_lot",
  "proptest",
+ "ring",
  "sha2 0.11.0",
  "tempfile",
  "thiserror",
