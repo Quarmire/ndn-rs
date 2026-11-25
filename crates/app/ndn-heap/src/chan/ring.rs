@@ -10,10 +10,6 @@
 //! Nothing here verifies anything: writing the ring is the sender's part, and
 //! a checkpoint that signs it is a later stage's.
 
-// Nothing calls this until checkpoints (stage 5) read the ring; that stage
-// removes this attribute.
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::collections::vec_deque::Drain;
 
@@ -77,33 +73,39 @@ impl SentFrames {
     }
 
     /// Frames held.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.frames.len()
     }
 
     /// Whether no frame is held.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
 
     /// The frames held, oldest first.
+    #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &(u64, [u8; HASH_LEN])> {
         self.frames.iter()
     }
 
     /// Frames pushed out unrecorded by a checkpoint since the last
     /// [`take_forgotten`](Self::take_forgotten).
+    #[allow(dead_code)] // stage 5: a checkpoint says how many frames it no longer covers
     pub(crate) fn forgotten(&self) -> u64 {
         self.forgotten
     }
 
     /// Reads and clears the forgotten count (a checkpoint reports it).
+    #[allow(dead_code)] // stage 5: a checkpoint reports the frames the ring forgot
     pub(crate) fn take_forgotten(&mut self) -> u64 {
         std::mem::take(&mut self.forgotten)
     }
 
     /// Removes and yields the frames held, oldest first (what a checkpoint
     /// covers). The ring keeps its storage.
+    #[allow(dead_code)] // stage 5: a checkpoint signs the frames the ring holds
     pub(crate) fn drain(&mut self) -> Drain<'_, (u64, [u8; HASH_LEN])> {
         self.frames.drain(..)
     }

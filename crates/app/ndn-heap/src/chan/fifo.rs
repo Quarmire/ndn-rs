@@ -58,12 +58,6 @@ impl<T> Fifo<T> {
         self.bytes
     }
 
-    /// Whether nothing is queued.
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
     /// Queued entries.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {

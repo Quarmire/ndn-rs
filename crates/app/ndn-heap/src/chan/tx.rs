@@ -197,6 +197,13 @@ struct State {
     sent: SentFrames,
     scratch: Vec<(u64, u64)>,
     ended: bool,
+    /// The channel's `END` is queued on the stream: the lane sends what waits, then it, under the
+    /// key in force when the channel ended, and goes idle. (`ended` alone means nothing more is
+    /// sent.)
+    ending: bool,
+    /// `ending` was set where the stream's writer could not be spawned (the state's lock is held
+    /// by the emission): the emission spawns it once the lock is released.
+    end_kick: bool,
 }
 
 impl State {
@@ -252,6 +259,21 @@ impl State {
                 }
                 Ok(used)
             }
+        }
+    }
+
+    /// The datagram lane's waiting messages are lost, counted: the channel ended and sends no
+    /// more of them. The stream's `END` still goes.
+    fn lose_latest(&mut self, stats: &TxStats) {
+        for _ in self.latest.drain_all() {
+            stats.lost_closed.bump();
+        }
+    }
+
+    /// The stream lane's `big` messages are lost, counted, as [`Self::lose_latest`].
+    fn lose_big(&mut self, stats: &TxStats) {
+        for _ in self.big.drain_all() {
+            stats.lost_closed.bump();
         }
     }
 
@@ -373,6 +395,8 @@ impl TxChannel {
                 sent: SentFrames::new(),
                 scratch: Vec::new(),
                 ended: false,
+                ending: false,
+                end_kick: false,
             }),
             room: Notify::new(),
             drain_requested: AtomicU64::new(0),
@@ -455,6 +479,61 @@ impl TxChannel {
         }
     }
 
+    /// The channel ended with `key` in force (a close, its space's end, its sequence limit):
+    /// what waits on the stream is written, then one `CONTROL END` frame sealed under `key`, and
+    /// the channel sends nothing more. Best effort, and it never waits: the frame goes out from
+    /// the stream's writer task, and is not sent when the carrier has no stream, when no receiver
+    /// holds the channel, or when `key` is not this channel's.
+    pub(crate) fn end(self: &Arc<Self>, key: &SendKey) {
+        let stream = self.slot.get().is_some_and(|c| c.has_stream());
+        let spawn = {
+            let mut st = self.state.lock();
+            self.queue_end(&mut st, key, stream);
+            std::mem::take(&mut st.end_kick)
+        };
+        if spawn {
+            self.spawn_stream();
+        }
+    }
+
+    /// Wait until the stream lane's writer has nothing left to write (after an [`Self::end`],
+    /// the `END` is out or could not be): the caller bounds the wait.
+    pub(crate) async fn flushed(&self) {
+        loop {
+            let notified = {
+                let st = self.state.lock();
+                if !st.stream_writing {
+                    return;
+                }
+                self.room.notified()
+            };
+            notified.await;
+        }
+    }
+
+    /// Mark the channel ended and queue its `END` (see [`Self::end`]), under the lock. When the
+    /// stream's writer must be spawned, `end_kick` says so: the caller spawns it once the lock
+    /// is released.
+    fn queue_end(&self, st: &mut State, key: &SendKey, stream: bool) {
+        if st.ending {
+            return;
+        }
+        st.ended = true;
+        let heard = self.live.receivers.load(Ordering::Acquire) > 0;
+        if !stream || !heard || key.id != self.id || st.next_seq >= SEQ_END {
+            return;
+        }
+        // The key in force when the channel ended, not the one this sender last refreshed to.
+        st.cipher = Arc::new(FrameCipher::new(&key.frame_key, self.aead));
+        st.key_epoch = key.key_epoch;
+        st.ending = true;
+        st.control(&Control::End);
+        if !st.stream_writing {
+            st.stream_writing = true;
+            st.end_kick = true;
+        }
+    }
+
     /// Emit `payload` at `path` (relative to the space).
     ///
     /// Returns when the message is queued: at once for `Latest` and for `Drop`; for `Block`, when
@@ -473,9 +552,17 @@ impl TxChannel {
         loop {
             let (kick, waiting) = {
                 let mut st = self.state.lock();
-                match self.enqueue(&mut st, path, payload, opts, now, carrier.as_ref())? {
+                let step = self.enqueue(&mut st, path, payload, opts, now, carrier.as_ref());
+                let end = std::mem::take(&mut st.end_kick);
+                // Created under the lock: a wake-up between the lock and the wait is not lost.
+                let waiting = matches!(step, Ok(Step::Wait)).then(|| self.room.notified());
+                drop(st);
+                if end {
+                    self.spawn_stream();
+                }
+                match step? {
                     Step::Done(kick) => (kick, None),
-                    Step::Wait => (Kick::default(), Some(self.room.notified())),
+                    Step::Wait => (Kick::default(), waiting),
                 }
             };
             match waiting {
@@ -535,6 +622,10 @@ impl TxChannel {
         let routed = carrier.filter(|_| self.live.receivers.load(Ordering::Acquire) > 0);
         let stand_secs = opts.stand.map(|d| d.as_secs().max(1));
         if st.next_seq + SEQ_HEADROOM >= SEQ_END {
+            // The last sequences are kept for this: the channel ends, and says so on the stream.
+            if let Some(key) = self.keys.current() {
+                self.queue_end(st, &key, carrier.is_some_and(|c| c.has_stream()));
+            }
             st.ended = true;
             self.keys.exhausted();
             return Err(EmitError::SequenceExhausted.into());
@@ -899,7 +990,11 @@ impl TxChannel {
         let mut st = self.state.lock();
         self.refresh_key(&mut st);
         if st.ended {
-            st.lose_pending(&self.stats);
+            if st.ending {
+                st.lose_latest(&self.stats);
+            } else {
+                st.lose_pending(&self.stats);
+            }
             st.datagram_writing = false;
             drop(st);
             self.room.notify_waiters();
@@ -1147,7 +1242,7 @@ impl TxChannel {
         let _ = carrier;
         let mut st = self.state.lock();
         self.refresh_key(&mut st);
-        if st.ended {
+        if st.ended && !st.ending {
             st.lose_pending(&self.stats);
             st.stream_writing = false;
             drop(st);
@@ -1231,6 +1326,14 @@ impl TxChannel {
                 }
             }
             Head::Nothing => {
+                if st.ending {
+                    // The FIFO and the `END` after it are written; what only `big` held is lost.
+                    st.lose_big(&self.stats);
+                    st.stream_writing = false;
+                    drop(st);
+                    self.room.notify_waiters();
+                    return StreamPack::Idle;
+                }
                 st.big.prune_front();
                 let Some(head) = st.big.iter().next().map(|p| p.seq) else {
                     st.stream_writing = false;

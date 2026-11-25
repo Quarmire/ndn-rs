@@ -243,6 +243,7 @@ impl FrameBuf {
     }
 
     /// The sequence of the frame's first message.
+    #[cfg(test)]
     pub(crate) fn seq0(&self) -> u64 {
         self.seq0
     }
@@ -342,6 +343,7 @@ pub(crate) struct Opened {
 
 impl Opened {
     /// The frame's header.
+    #[cfg(test)]
     pub(crate) fn header(&self) -> &Header {
         &self.header
     }
@@ -349,11 +351,6 @@ impl Opened {
     /// The plaintext, with any padding still on its end.
     pub(crate) fn plaintext(&self) -> &Bytes {
         &self.plaintext
-    }
-
-    /// The plaintext, with any padding still on its end.
-    pub(crate) fn into_plaintext(self) -> Bytes {
-        self.plaintext
     }
 
     /// The messages of a `DATA` frame, each payload a slice of this frame's

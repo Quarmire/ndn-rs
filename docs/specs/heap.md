@@ -935,7 +935,9 @@ entry's key check (§6.2); otherwise it is dropped.
    with no hole (the first seq is `own head + 1`) states nothing.
 4. **Clean close.** `Node::close` refuses new puts, drains the publisher,
    flushes, writes `reserve/<S> = (own head, clean 1)` for every open space
-   whose next seq is `own head + 1`, flushes again and stops its tasks. The next
+   whose next seq is `own head + 1`, flushes again, ends the node's live channels
+   (each sends its `END` on the stream, best effort, for at most 500 ms:
+   channel.md §13.11) and stops its tasks. The next
    start is clean. A space that started unclean and has signed nothing since
    keeps its `R` above the head (an earlier run may have shown those seqs), so
    its next start is unclean again. `Node::shutdown` (what `Drop` calls) stops

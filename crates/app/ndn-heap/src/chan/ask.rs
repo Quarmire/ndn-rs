@@ -259,90 +259,103 @@ impl NodeInner {
             .space_of(space)
             .filter(|s| !s.follower)
             .ok_or_else(|| not_ready(space, "the space is no longer open here as a member"))?;
-        let log = held.log.lock();
-        // 3. The sender is a writer now.
-        if let Err(why) = standing(&log, &self.judge, &key, Who::Writer) {
-            return Err(ChanError::SenderNotWriter {
-                sender: sender.clone(),
-                space: space.clone(),
-                why: format!("{why:?}"),
-            });
-        }
-        // 4. A refusal is the sender's word.
-        let record = match answer {
-            Answer::Refusal(r) => {
-                return Err(ChanError::Refused {
+        let (session, replay) = {
+            let log = held.log.lock();
+            // 3. The sender is a writer now.
+            if let Err(why) = standing(&log, &self.judge, &key, Who::Writer) {
+                return Err(ChanError::SenderNotWriter {
                     sender: sender.clone(),
-                    code: r.code,
-                    text: r.text,
-                    retry_ms: r.retry_ms,
+                    space: space.clone(),
+                    why: format!("{why:?}"),
                 });
             }
-            Answer::Session(record) => *record,
-        };
-        if record.sender != *sender || record.space != *space || record.mode != mode {
-            return Err(bad_answer(
-                sender,
-                "the session is not for the sender, space and mode that were asked",
-            ));
-        }
-        // 5. The epoch.
-        if log.sealed() {
-            let in_force = log.fold.in_force();
-            if record.audience_epoch != in_force {
-                let known = record
-                    .audience_epoch
-                    .as_ref()
-                    .is_some_and(|e| log.fold.epoch_body(e).is_some());
-                return Err(ChanError::Refused {
-                    sender: sender.clone(),
-                    code: if known {
-                        super::wire::RefusalCode::StaleEpoch
-                    } else {
-                        super::wire::RefusalCode::NotReady
-                    },
-                    text: if known {
-                        "the sender judged this device by an epoch that is no longer in force \
-                         here: it has not caught up with the record; ask again in a moment"
-                            .into()
-                    } else {
-                        "the sender judged this device by an epoch this device does not hold \
-                         yet: wait for the record that carries it, then ask again"
-                            .into()
-                    },
-                    retry_ms: if known { 1000 } else { 2000 },
-                });
-            }
-        }
-        // 6. The key.
-        let channel_key =
-            unwrap_session_key(self, &record, name).map_err(|why| bad_answer(sender, why))?;
-        // 7. Installed.
-        let judged_at = (generation, log.fold.version().load(Ordering::SeqCst));
-        let now = Instant::now();
-        let existing = self.chan.sessions.get(record.id).filter(|s| {
-            s.ended().is_none() && s.space() == space && s.sender() == sender && s.mode() == mode
-        });
-        let session = match existing {
-            Some(session) => {
-                session.renewed(&record, channel_key, key, judged_at, now);
-                session
-            }
-            None => {
-                let session = Arc::new(RecvSession::new(
-                    &record,
-                    channel_key,
-                    key,
-                    Arc::clone(&self.judge),
-                    log.fold.version(),
-                    judged_at,
-                    now,
+            // 4. A refusal is the sender's word.
+            let record = match answer {
+                Answer::Refusal(r) => {
+                    return Err(ChanError::Refused {
+                        sender: sender.clone(),
+                        code: r.code,
+                        text: r.text,
+                        retry_ms: r.retry_ms,
+                    });
+                }
+                Answer::Session(record) => *record,
+            };
+            if record.sender != *sender || record.space != *space || record.mode != mode {
+                return Err(bad_answer(
+                    sender,
+                    "the session is not for the sender, space and mode that were asked",
                 ));
-                self.chan.sessions.insert(Arc::clone(&session));
-                session
             }
+            // 5. The epoch.
+            if log.sealed() {
+                let in_force = log.fold.in_force();
+                if record.audience_epoch != in_force {
+                    let known = record
+                        .audience_epoch
+                        .as_ref()
+                        .is_some_and(|e| log.fold.epoch_body(e).is_some());
+                    return Err(ChanError::Refused {
+                        sender: sender.clone(),
+                        code: if known {
+                            super::wire::RefusalCode::StaleEpoch
+                        } else {
+                            super::wire::RefusalCode::NotReady
+                        },
+                        text: if known {
+                            "the sender judged this device by an epoch that is no longer in force \
+                         here: it has not caught up with the record; ask again in a moment"
+                                .into()
+                        } else {
+                            "the sender judged this device by an epoch this device does not hold \
+                         yet: wait for the record that carries it, then ask again"
+                                .into()
+                        },
+                        retry_ms: if known { 1000 } else { 2000 },
+                    });
+                }
+            }
+            // 6. The key.
+            let channel_key =
+                unwrap_session_key(self, &record, name).map_err(|why| bad_answer(sender, why))?;
+            // 7. Installed.
+            let judged_at = (generation, log.fold.version().load(Ordering::SeqCst));
+            let now = Instant::now();
+            let existing = self.chan.sessions.get(record.id).filter(|s| {
+                s.ended().is_none()
+                    && s.space() == space
+                    && s.sender() == sender
+                    && s.mode() == mode
+            });
+            let (session, replay) = match existing {
+                Some(session) => {
+                    session.renewed(&record, channel_key, key, judged_at, now);
+                    (session, None)
+                }
+                None => {
+                    let session = Arc::new(RecvSession::new(
+                        &record,
+                        channel_key,
+                        key,
+                        Arc::clone(&self.judge),
+                        log.fold.version(),
+                        judged_at,
+                        now,
+                    ));
+                    // Frames of this channel that reached this device before its session did are
+                    // held; from here they are taken in first, in the order they arrived, and a frame
+                    // that arrives meanwhile queues behind them.
+                    let replay = self.chan.rx.begin_replay(record.id);
+                    self.chan.sessions.insert(Arc::clone(&session));
+                    (session, Some(replay))
+                }
+            };
+            self.chan.stats.installed.bump();
+            (session, replay)
         };
-        self.chan.stats.installed.bump();
+        if let Some(replay) = replay {
+            self.chan_replay_held(session.id(), replay).await;
+        }
         Ok(session)
     }
 }

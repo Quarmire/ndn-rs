@@ -444,8 +444,10 @@ impl Node {
     }
 
     /// Stop cleanly: refuse new puts, drain the publishers, flush, record
-    /// each space's head as a clean close, flush, stop. The next start has no
-    /// hole and says nothing.
+    /// each space's head as a clean close, flush, end the live channels the
+    /// node sends on (each tells its receivers with an `END` frame on its
+    /// stream, best effort, for at most half a second), stop. The next start
+    /// has no hole and says nothing.
     ///
     /// It returns when every task of the node has ended (the recovery of a
     /// space's own entries, the fetches, the announcements, the answers, the
@@ -481,6 +483,9 @@ impl Node {
                 tracing::warn!("a space was not closed cleanly: {e}");
             }
         }
+        // The channels this device sends on end with an `END` each, written before the tasks
+        // that write them are stopped (best effort, bounded: a stuck stream does not hold close).
+        inner.chan_end_all().await;
         inner.shutdown();
         inner.ended().await;
     }

@@ -120,10 +120,13 @@ pub(crate) mod carrier {
     /// The link's unidirectional stream.
     pub(crate) const STREAM: u8 = 2;
     /// Frame bytes through any face.
+    #[allow(dead_code)] // wire vocabulary: stage 4's faces offer it
     pub(crate) const FACE_BYTES: u8 = 3;
     /// A raw L2 face.
+    #[allow(dead_code)] // wire vocabulary: stage 4's L2 face offers it
     pub(crate) const L2: u8 = 4;
     /// A shared-memory ring.
+    #[allow(dead_code)] // wire vocabulary: a stage 4+ shared-memory face offers it
     pub(crate) const RING: u8 = 5;
 }
 

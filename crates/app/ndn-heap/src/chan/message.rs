@@ -120,6 +120,7 @@ pub(crate) struct OutMessage<'a> {
 
 impl<'a> OutMessage<'a> {
     /// A bare message: an id and a payload.
+    #[cfg(test)]
     pub(crate) fn new(name_id: u64, payload: &'a [u8]) -> Self {
         Self {
             name_id,
@@ -262,6 +263,7 @@ impl MessageWriter {
     }
 
     /// Octets of messages the frame can still take.
+    #[cfg(test)]
     pub(crate) fn room(&self) -> usize {
         self.frame.room()
     }
@@ -277,6 +279,7 @@ impl MessageWriter {
     }
 
     /// The sequence the next message takes.
+    #[cfg(test)]
     pub(crate) fn next_seq(&self) -> u64 {
         self.frame.seq0() + self.count as u64
     }

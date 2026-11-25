@@ -252,6 +252,15 @@ impl Channel {
         self.live.key_epoch.store(self.key_epoch, Ordering::Release);
     }
 
+    fn send_key(&self) -> SendKey {
+        SendKey {
+            id: self.id,
+            key_epoch: self.key_epoch,
+            frame_key: self.key.frame_key(self.id, self.key_epoch),
+            live: Arc::clone(&self.live),
+        }
+    }
+
     fn admitted(&self, receiver: &Receiver, rekeyed: bool, fresh: bool) -> Admitted {
         Admitted {
             id: self.id,
@@ -269,6 +278,18 @@ impl Channel {
 impl Drop for Channel {
     fn drop(&mut self) {
         self.live.closed.store(true, Ordering::Release);
+    }
+}
+
+/// A channel taken out of the table that is not over yet: its key is still the one in force, so
+/// the sender can seal the `END` frame under it. Dropping it ends the channel: it is marked
+/// closed ([`Live::closed`]) and the key is zeroed.
+pub(crate) struct Ended(Channel);
+
+impl Ended {
+    /// The id and the key in force when the channel was taken out.
+    pub(crate) fn key(&self) -> SendKey {
+        self.0.send_key()
     }
 }
 
@@ -362,25 +383,13 @@ impl Channels {
             channel.empty_since = Some(now);
             table.channels.insert(at.clone(), channel);
         }
-        let channel = &table.channels[&at];
-        Ok(SendKey {
-            id: channel.id,
-            key_epoch: channel.key_epoch,
-            frame_key: channel.key.frame_key(channel.id, channel.key_epoch),
-            live: Arc::clone(&channel.live),
-        })
+        Ok(table.channels[&at].send_key())
     }
 
     /// The id, key epoch and frame key of the channel of `(space, mode)`, if there is one.
     pub(crate) fn current(&self, space: &Name, mode: ChannelMode) -> Option<SendKey> {
         let table = self.table.lock();
-        let channel = table.channels.get(&(space.clone(), mode))?;
-        Some(SendKey {
-            id: channel.id,
-            key_epoch: channel.key_epoch,
-            frame_key: channel.key.frame_key(channel.id, channel.key_epoch),
-            live: Arc::clone(&channel.live),
-        })
+        Some(table.channels.get(&(space.clone(), mode))?.send_key())
     }
 
     /// The modes of the channels of `space`.
@@ -414,6 +423,7 @@ impl Channels {
     }
 
     /// The receivers of the channels of `space`: `(mode, device, key that signed its ask)`.
+    #[cfg(test)]
     pub(crate) fn receivers(&self, space: &Name) -> Vec<(ChannelMode, Name, Name)> {
         let table = self.table.lock();
         let mut out = Vec::new();
@@ -564,18 +574,17 @@ impl Channels {
         false
     }
 
-    /// End the channel of `(space, mode)`: its key is dropped (zeroed) and every receiver's next
-    /// ask is a new channel's.
-    pub(crate) fn close(&self, space: &Name, mode: ChannelMode) -> bool {
-        self.table
-            .lock()
-            .channels
-            .remove(&(space.clone(), mode))
-            .is_some()
+    /// Take the channel of `(space, mode)` out of the table: every receiver's next ask is a new
+    /// channel's. The channel's key stays in force, for the `END` frame to be sealed under, until
+    /// the returned [`Ended`] is dropped, which marks the channel closed and zeroes the key.
+    /// `None` when there was no such channel.
+    pub(crate) fn close(&self, space: &Name, mode: ChannelMode) -> Option<Ended> {
+        let channel = self.table.lock().channels.remove(&(space.clone(), mode))?;
+        Some(Ended(channel))
     }
 
-    /// End every channel of `space`.
-    pub(crate) fn close_space(&self, space: &Name) -> Vec<ChannelMode> {
+    /// Take every channel of `space` out of the table, as [`Self::close`] does one.
+    pub(crate) fn close_space(&self, space: &Name) -> Vec<(ChannelMode, Ended)> {
         let mut table = self.table.lock();
         let modes: Vec<ChannelMode> = table
             .channels
@@ -583,18 +592,23 @@ impl Channels {
             .filter(|(s, _)| s == space)
             .map(|(_, m)| *m)
             .collect();
-        for mode in &modes {
-            table.channels.remove(&(space.clone(), *mode));
-        }
         modes
+            .into_iter()
+            .filter_map(|mode| {
+                let channel = table.channels.remove(&(space.clone(), mode))?;
+                Some((mode, Ended(channel)))
+            })
+            .collect()
     }
 
     /// How many channels the sender keeps.
+    #[cfg(test)]
     pub(crate) fn count(&self) -> usize {
         self.table.lock().channels.len()
     }
 
     /// How many receivers the channel of `(space, mode)` keeps.
+    #[cfg(test)]
     pub(crate) fn receiver_count(&self, space: &Name, mode: ChannelMode) -> usize {
         self.table
             .lock()

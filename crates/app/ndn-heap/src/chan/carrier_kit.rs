@@ -139,11 +139,6 @@ impl Link {
         })
     }
 
-    /// A link with the default behaviour.
-    pub(crate) fn plain() -> Arc<Link> {
-        Link::new(LinkConfig::default())
-    }
-
     /// What the link counted.
     pub(crate) fn stats(&self) -> LinkStats {
         self.state.lock().stats.clone()
@@ -156,11 +151,6 @@ impl Link {
         if !full {
             self.run_ready();
         }
-    }
-
-    /// The path's datagram size is now `max`.
-    pub(crate) fn set_datagram_max(&self, max: usize) {
-        self.state.lock().cfg.datagram_max = max;
     }
 
     /// The next datagram is refused `TooLarge`, and the path's size is `max` from then on: the

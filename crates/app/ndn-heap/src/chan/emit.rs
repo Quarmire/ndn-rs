@@ -20,8 +20,11 @@ use super::verbs::{EmitError, EmitOptions};
 use super::wire::{ChanAsk, ChannelMode};
 use crate::error::HeapError;
 use crate::node::NodeInner;
-use crate::rt::Instant;
+use crate::rt::{self, Instant};
 use crate::space::Heap;
+
+/// How long the close of a node waits for its channels' `END` frames to be written.
+const END_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Where a channel's key comes from: the node's table.
 struct NodeKeys {
@@ -95,6 +98,50 @@ impl NodeInner {
         // The table's own copy of the next sequence is what a re-key at the limit is decided on.
         self.chan.channels.note_seq(&ask.space, ask.mode, terms.seq);
         terms
+    }
+
+    /// End the channel of `(space, mode)`: its receivers are sent an `END` on the stream, sealed
+    /// under the key in force (best effort; it never waits), and it answers no ask again.
+    /// Returns whether there was a channel. The node ends channels by [`Self::chan_close_space`]
+    /// (its device is no writer of the space) and [`Self::chan_end_all`]; a channel ends by
+    /// itself at its sequence limit.
+    #[cfg(test)]
+    pub(crate) fn chan_close(&self, space: &Name, mode: ChannelMode) -> bool {
+        let Some(ended) = self.chan.channels.close(space, mode) else {
+            return false;
+        };
+        if let Some(tx) = self.chan.tx.get(space, mode) {
+            tx.end(&ended.key());
+        }
+        true
+    }
+
+    /// End every channel of `space` as [`Self::chan_close`] ends one; returns the senders that
+    /// were told to.
+    pub(crate) fn chan_close_space(&self, space: &Name) -> Vec<Arc<TxChannel>> {
+        let mut told = Vec::new();
+        for (mode, ended) in self.chan.channels.close_space(space) {
+            if let Some(tx) = self.chan.tx.get(space, mode) {
+                tx.end(&ended.key());
+                told.push(tx);
+            }
+        }
+        told
+    }
+
+    /// This device's channels end with the node: each sends its `END` (what waits on a stream is
+    /// written first). Returns when the frames are written, or after [`END_WAIT`]: a stream that
+    /// takes none does not hold the node's close.
+    pub(crate) async fn chan_end_all(&self) {
+        let mut told = Vec::new();
+        for space in self.chan.channels.spaces() {
+            told.extend(self.chan_close_space(&space));
+        }
+        let _ = rt::timeout(
+            END_WAIT,
+            futures::future::join_all(told.iter().map(|tx| tx.flushed())),
+        )
+        .await;
     }
 }
 

@@ -97,11 +97,6 @@ impl FrameCipher {
         }
     }
 
-    /// The AEAD this cipher seals and opens with.
-    pub(crate) fn aead(&self) -> Aead {
-        self.aead
-    }
-
     /// Encrypts `buf` in place and returns the tag over `aad` and the
     /// ciphertext. `nonce` must never repeat under this key.
     pub(crate) fn seal_detached(

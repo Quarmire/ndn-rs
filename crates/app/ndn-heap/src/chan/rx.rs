@@ -4,7 +4,8 @@
 //! **Before any cryptography**, each costs at most a length test, a header parse or one lookup:
 //! a frame under 46 octets or over the largest any session may grant; a marker, version, kind or
 //! class that is not assigned; a count or sequence the kind does not allow; a channel id this
-//! device holds no session of; a frame over the limit that session grants for its class; a
+//! device holds no session of (the frame is **held**, copied, and taken in when a session of that
+//! id is installed: [`rx_hold`](super::rx_hold)); a frame over the limit that session grants for its class; a
 //! `Reliable` or `Window` frame on a datagram; a session whose sender no longer stands (the
 //! generation check: **the first frame after the node holds the removing record is refused**, the
 //! session ends and the `Items` are told); a key epoch the session does not hold (no AEAD attempt:
@@ -42,8 +43,9 @@ use super::latest::Pair;
 use super::limits::{MIN_FRAME_LEN, STREAM_FRAME_DEFAULT, STREAM_FRAME_MAX, message_limit_for};
 use super::message::{Message, Origin};
 use super::replay::{Replay, ReplayWindow};
+use super::rx_hold::{Full, Hold};
 use super::rx_names::{Held, Names, Seen};
-use super::sessions::{EndReason, RecvSession, Unknown};
+use super::sessions::{EndReason, RecvSession, RecvSessions, Unknown};
 use super::verbs::{Emitted, Got, Kind, LiveEnd};
 use super::wire::ChannelMode;
 use crate::host::NodeHandle;
@@ -127,6 +129,11 @@ pub(crate) struct RxStats {
     pub(crate) no_sink: Counter,
     /// Sessions ended by the receiver (a removed sender, the sender's `END`).
     pub(crate) ended: Counter,
+    /// Frames of a channel id this device holds no session of that were dropped because the hold
+    /// was full (64 frames or 512 KiB).
+    pub(crate) held_unknown_full: Counter,
+    /// Frames of an unknown channel id that were held 2 s without a session coming: dropped.
+    pub(crate) held_unknown_expired: Counter,
 }
 
 /// Why a frame was not delivered. Every reason is counted ([`crate::chan::hub::Stats`]).
@@ -185,6 +192,10 @@ pub enum Delivery {
     /// The session ended with this frame: the sender no longer stands, or said `END`. The frame is
     /// not delivered, and every `Items` of the space is told.
     Ended(EndReason),
+    /// A frame of a channel id this device holds no session of: kept at most 2 s for the session
+    /// to be installed (it is the session Data that tells the channel's key; the frame is not
+    /// decrypted and decides nothing), then dropped.
+    Held,
 }
 
 /// The octets of `name` as a Name TLV's value.
@@ -351,12 +362,6 @@ impl ChannelRx {
     #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
         self.state.lock().names.held()
-    }
-
-    /// Names bound now.
-    #[cfg(test)]
-    pub(crate) fn bound(&self) -> usize {
-        self.state.lock().names.len()
     }
 
     fn sweep(&self, rx: &Receivers, stats: &RxStats, now: Instant) {
@@ -811,6 +816,13 @@ pub(crate) struct Receivers {
     generation: AtomicU64,
     /// Messages held for an unbound id across the channels: nothing to sweep while it is zero.
     held: AtomicUsize,
+    /// Frames of channels with no session, held for one (see [`rx_hold`](super::rx_hold)).
+    unknown: Mutex<UnknownHold>,
+    /// How many frames `unknown` holds: nothing to sweep while it is zero.
+    unknown_frames: AtomicUsize,
+    /// How many channels have held frames being taken in: no frame is looked up against a
+    /// session without this being read.
+    replaying: AtomicUsize,
 }
 
 impl Receivers {
@@ -878,6 +890,7 @@ impl Receivers {
     /// ended or was replaced is ended here too (the receiver is told the moment a frame comes;
     /// this is for a session that ends without one).
     pub(crate) fn sweep(&self, node: &NodeInner, now: Instant) {
+        self.sweep_unknown(&node.chan.stats.rx, now);
         let all: Vec<Arc<ChannelRx>> = self.channels.lock().values().cloned().collect();
         for ch in all {
             ch.sweep(self, &node.chan.stats.rx, now);
@@ -898,6 +911,7 @@ impl Receivers {
 
     /// Sweep the hold of every channel if anything is held: what an `Items` poll does.
     pub(crate) fn sweep_held_if_any(&self, stats: &RxStats, now: Instant) {
+        self.sweep_unknown(stats, now);
         if self.held.load(Ordering::Acquire) == 0 {
             return;
         }
@@ -913,6 +927,125 @@ impl Receivers {
             sink.close();
         }
     }
+
+    /// A session of channel `id` is about to be installed: frames of the id queue behind the
+    /// held ones until the returned guard is dropped (the replay is over).
+    pub(crate) fn begin_replay(&self, id: u64) -> Draining<'_> {
+        let mut unknown = self.unknown.lock();
+        unknown.replaying.push(id);
+        self.replaying
+            .store(unknown.replaying.len(), Ordering::Release);
+        Draining { rx: self, id }
+    }
+
+    /// Whether frames of `id` queue behind a replay now.
+    fn replaying(&self, id: u64) -> bool {
+        self.replaying.load(Ordering::Acquire) > 0 && self.unknown.lock().replaying.contains(&id)
+    }
+
+    /// Hold a frame of channel `channel`, which no session takes frames of now. `None`: a
+    /// session of it was installed since (and no replay is under way), so the frame is taken
+    /// the usual way.
+    fn hold_unknown(
+        &self,
+        sessions: &RecvSessions,
+        channel: u64,
+        frame: &Bytes,
+        ingress: u64,
+        stats: &RxStats,
+        now: Instant,
+    ) -> Option<Delivery> {
+        let mut unknown = self.unknown.lock();
+        if !unknown.replaying.contains(&channel) && sessions.get(channel).is_some() {
+            return None;
+        }
+        let expired = unknown.hold.sweep(now);
+        let kept = unknown.hold.hold(channel, frame, ingress, now);
+        self.unknown_frames
+            .store(unknown.hold.size().0, Ordering::Release);
+        drop(unknown);
+        for _ in 0..expired {
+            stats.held_unknown_expired.bump();
+        }
+        Some(match kept {
+            Ok(()) => Delivery::Held,
+            Err(Full) => {
+                stats.held_unknown_full.bump();
+                Delivery::Dropped(Dropped::UnknownChannel)
+            }
+        })
+    }
+
+    /// The frames held for `id`, swept first; `None` when none is left, and then the replay of
+    /// `id` is over (the channel takes frames directly).
+    fn take_unknown(
+        &self,
+        id: u64,
+        stats: &RxStats,
+        now: Instant,
+    ) -> Option<Vec<super::rx_hold::Held>> {
+        let mut unknown = self.unknown.lock();
+        let expired = unknown.hold.sweep(now);
+        let batch = unknown.hold.take(id);
+        if batch.is_empty() {
+            unknown.replaying.retain(|&r| r != id);
+            self.replaying
+                .store(unknown.replaying.len(), Ordering::Release);
+        }
+        self.unknown_frames
+            .store(unknown.hold.size().0, Ordering::Release);
+        drop(unknown);
+        for _ in 0..expired {
+            stats.held_unknown_expired.bump();
+        }
+        (!batch.is_empty()).then_some(batch)
+    }
+
+    /// Drop the held frames past their time: counted.
+    fn sweep_unknown(&self, stats: &RxStats, now: Instant) {
+        if self.unknown_frames.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut unknown = self.unknown.lock();
+        let expired = unknown.hold.sweep(now);
+        self.unknown_frames
+            .store(unknown.hold.size().0, Ordering::Release);
+        drop(unknown);
+        for _ in 0..expired {
+            stats.held_unknown_expired.bump();
+        }
+    }
+
+    /// How many frames of unknown channels are held, and their octets (a test asks).
+    #[cfg(test)]
+    pub(crate) fn unknown_held(&self) -> (usize, usize) {
+        self.unknown.lock().hold.size()
+    }
+}
+
+/// What frames of a channel queue behind while its held frames are taken in: dropping it ends
+/// the replay.
+pub(crate) struct Draining<'a> {
+    rx: &'a Receivers,
+    id: u64,
+}
+
+impl Drop for Draining<'_> {
+    fn drop(&mut self) {
+        let mut unknown = self.rx.unknown.lock();
+        unknown.replaying.retain(|&r| r != self.id);
+        self.rx
+            .replaying
+            .store(unknown.replaying.len(), Ordering::Release);
+    }
+}
+
+/// What a node holds of frames of channels it has no session of: the hold, and the channels
+/// whose held frames are being taken in.
+#[derive(Default)]
+struct UnknownHold {
+    hold: Hold,
+    replaying: Vec<u64>,
 }
 
 impl NodeInner {
@@ -932,12 +1065,59 @@ impl NodeInner {
             Ok(header) => header,
             Err(error) => return self.refuse(error),
         };
-        let Some(session) = self.chan.sessions.get(header.channel) else {
-            stats.unknown_channel.bump();
-            return Delivery::Dropped(Dropped::UnknownChannel);
-        };
-        let channel = self.chan.rx.channel_for(&session, self);
-        channel.receive(self, header, frame, ingress, now).await
+        let rx = &self.chan.rx;
+        loop {
+            let known = self.chan.sessions.get(header.channel);
+            // A session whose held frames are being taken in is not yet taking frames: a frame
+            // that arrives meanwhile queues behind them, so the order of arrival is kept.
+            if let Some(session) = known.filter(|_| !rx.replaying(header.channel)) {
+                let channel = rx.channel_for(&session, self);
+                return channel.receive(self, header, frame, ingress, now).await;
+            }
+            let unknown = self.chan.sessions.get(header.channel).is_none();
+            if let Some(delivery) = rx.hold_unknown(
+                &self.chan.sessions,
+                header.channel,
+                &frame,
+                ingress,
+                stats,
+                now,
+            ) {
+                if unknown {
+                    stats.unknown_channel.bump();
+                }
+                return delivery;
+            }
+        }
+    }
+
+    /// A session of channel `id` was installed (`replay` was begun before it was): the frames
+    /// held for it are taken in, in the order they arrived, then later ones that queued behind
+    /// them, until none is left; only then does the channel take frames directly.
+    pub(crate) async fn chan_replay_held(&self, id: u64, replay: Draining<'_>) {
+        let stats = &self.chan.stats.rx;
+        loop {
+            let now = Instant::now();
+            let Some(batch) = self.chan.rx.take_unknown(id, stats, now) else {
+                break;
+            };
+            for held in batch {
+                let Some(session) = self.chan.sessions.get(id) else {
+                    break;
+                };
+                if held.frame.len() < MIN_FRAME_LEN {
+                    continue;
+                }
+                let Ok(header) = Header::decode(&held.frame) else {
+                    continue;
+                };
+                let channel = self.chan.rx.channel_for(&session, self);
+                channel
+                    .receive(self, header, held.frame, held.ingress, now)
+                    .await;
+            }
+        }
+        drop(replay);
     }
 
     /// Count a frame whose header is refused.
@@ -979,8 +1159,10 @@ impl NodeHandle {
     /// id of the face it came over, kept for the evidence of checkpoints.
     ///
     /// The node does the peel-time work (docs/specs/channel.md, The receiver): a frame that is
-    /// short, over its limit, malformed, of a channel it holds no session of, a repeat, or under
-    /// a key epoch it does not hold costs no cryptography; a frame of a session whose sender
+    /// short, over its limit, malformed, a repeat, or under a key epoch it does not hold costs
+    /// no cryptography; a frame of a channel it holds no session of is **held** (a copy, at
+    /// most 64 frames and 512 KiB in all, 2 s each: [`Delivery::Held`]) and taken in, in order,
+    /// when a session of that channel is installed; a frame of a session whose sender
     /// no longer stands is refused and the session ends; the first AEAD attempt is the first
     /// cryptography; messages go to the `Items` of the space.
     ///

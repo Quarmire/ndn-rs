@@ -26,9 +26,9 @@ use tokio::sync::Notify;
 use super::answer::ChanAnswer;
 use super::channels::Channels;
 use super::rx::{Receivers, RxStats};
-use super::tx::Tx;
 use super::sessions::{EndReason, RecvSessions};
 use super::standing::{Who, gate, standing};
+use super::tx::Tx;
 use super::wire::Announce;
 use crate::node::NodeInner;
 use crate::rt::{self, Instant};
@@ -55,6 +55,7 @@ impl Counter {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub(crate) fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
@@ -345,7 +346,7 @@ impl NodeInner {
     /// done.
     pub(crate) fn chan_rejudge(&self, space: &Name, now: Instant) -> super::channels::Rejudged {
         let Some(held) = self.space_of(space).filter(|s| !s.follower) else {
-            self.chan.channels.close_space(space);
+            self.chan_close_space(space);
             return Default::default();
         };
         let log = held.log.lock();
@@ -354,7 +355,7 @@ impl NodeInner {
             log.fold.version().load(Ordering::SeqCst),
         );
         if gate(&log, &self.judge, Who::Writer, "channels").is_err() {
-            self.chan.channels.close_space(space);
+            self.chan_close_space(space);
             return Default::default();
         }
         let sealed = log.sealed();

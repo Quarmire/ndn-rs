@@ -65,7 +65,7 @@ struct Decoder {
 enum Seen {
     Data {
         class: SideClass,
-        seq0: u64,
+
         count: u8,
         messages: Vec<Message>,
     },
@@ -94,7 +94,7 @@ impl Decoder {
                 }
                 Seen::Data {
                     class: header.class,
-                    seq0: header.seq0,
+
                     count: header.count,
                     messages,
                 }
@@ -982,7 +982,7 @@ async fn a_sender_with_no_receiver_sends_nothing_and_keeps_what_a_joiner_needs()
 
 #[tokio::test]
 async fn the_last_sequence_ends_the_channel_cleanly() {
-    let rig = rig(ChannelMode::Latest, LinkConfig::default());
+    let mut rig = rig(ChannelMode::Latest, LinkConfig::default());
     rig.tx.set_next_seq(SEQ_END - 8);
     let latest = EmitOptions::latest();
     let mut last = Ok(());
@@ -1010,6 +1010,100 @@ async fn the_last_sequence_ends_the_channel_cleanly() {
         ),
         "an ended channel takes nothing: the caller makes another"
     );
+    // The channel said so on the stream: after what it bound, one END, in the sequences kept
+    // for it.
+    settle(&rig.tx).await;
+    let seen = stream(&mut rig);
+    let ends: Vec<u64> = controls(&seen)
+        .into_iter()
+        .filter_map(|(seq, c)| matches!(c, Control::End).then_some(seq))
+        .collect();
+    assert_eq!(ends.len(), 1, "exactly one END on the stream: {seen:?}");
+    assert!(ends[0] < SEQ_END, "the END took a sequence below the limit");
+    assert!(
+        matches!(controls(&seen).last(), Some((_, Control::End))),
+        "and it is the last thing on the stream"
+    );
+}
+
+/// The `END` of a channel is sealed under the key in force when it ended, whatever key the sender
+/// had last refreshed to: a close takes the key before the channel's own copy is gone.
+#[tokio::test]
+async fn the_end_is_sealed_under_the_key_given_when_the_channel_ended() {
+    let rig = rig(ChannelMode::Reliable, LinkConfig::default());
+    let newer = ChannelKey::random().frame_key(CHANNEL, 1);
+    let key = SendKey {
+        id: CHANNEL,
+        key_epoch: 1,
+        frame_key: newer.clone(),
+        live: Arc::clone(&rig.live),
+    };
+    rig.tx.end(&key);
+    settle(&rig.tx).await;
+    let frames = rig.link.take_stream();
+    assert_eq!(frames.len(), 1, "one END frame");
+    let cipher = FrameCipher::new(&newer, Aead::preferred());
+    let opened = frame::open(&cipher, frames[0].clone(), STREAM_FRAME_MAX)
+        .expect("the END opens under the key given when the channel ended");
+    assert_eq!(opened.header().key_epoch, 1);
+    assert_eq!(
+        Control::decode(opened.plaintext()).unwrap(),
+        Control::End,
+        "and it says END"
+    );
+    // A second end says nothing more, and an emission is refused as a channel that ended.
+    rig.tx.end(&key);
+    settle(&rig.tx).await;
+    assert!(rig.link.take_stream().is_empty(), "END is sent once");
+    assert!(matches!(
+        rig.tx
+            .emit(&name(1), &Bytes::new(), &EmitOptions::reliable(), rig.t0)
+            .await,
+        Err(Refused::Gone)
+    ));
+}
+
+/// Nobody to tell, no stream to tell it on, or a key of another channel: no `END` goes, and the
+/// channel is over all the same.
+#[tokio::test]
+async fn no_end_is_sent_with_no_receiver_no_stream_or_a_foreign_key() {
+    let rig_with = |cfg: LinkConfig| rig(ChannelMode::Latest, cfg);
+    // No receiver holds the channel.
+    let quiet = rig_with(LinkConfig::default());
+    quiet.live.receivers.store(0, Ordering::SeqCst);
+    quiet.tx.end(&quiet.keys.key);
+    settle(&quiet.tx).await;
+    assert!(quiet.link.take_stream().is_empty(), "no receiver, no END");
+    // The carrier has no stream.
+    let datagram_only = rig_with(LinkConfig {
+        has_stream: false,
+        ..LinkConfig::default()
+    });
+    datagram_only.tx.end(&datagram_only.keys.key);
+    settle(&datagram_only.tx).await;
+    assert!(
+        datagram_only.link.take_stream().is_empty(),
+        "no stream, no END"
+    );
+    // A key of another channel is not this channel's to seal under.
+    let foreign = rig_with(LinkConfig::default());
+    let other = SendKey {
+        id: CHANNEL + 1,
+        ..foreign.keys.key.clone()
+    };
+    foreign.tx.end(&other);
+    settle(&foreign.tx).await;
+    assert!(
+        foreign.link.take_stream().is_empty(),
+        "another channel's key"
+    );
+    for r in [&quiet, &datagram_only, &foreign] {
+        assert!(matches!(
+            r.tx.emit(&name(1), &Bytes::new(), &EmitOptions::latest(), r.t0)
+                .await,
+            Err(Refused::Gone)
+        ));
+    }
 }
 
 // ---- the invariant ---------------------------------------------------------------------------

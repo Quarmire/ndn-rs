@@ -469,15 +469,16 @@ async fn junk_is_dropped_before_any_cryptography() {
             padded(fx.frame_max() + 1),
             Dropped::Oversize,
         ),
-        (
-            "a channel nobody holds",
-            patched(5, genuine[5] ^ 0xff),
-            Dropped::UnknownChannel,
-        ),
     ];
     for (what, frame, why) in cases {
         assert_eq!(fx.deliver(frame).await, Delivery::Dropped(why), "{what}");
     }
+    // A channel nobody holds is kept for the session that may be coming, and is opened by no one.
+    assert_eq!(
+        fx.deliver(patched(5, genuine[5] ^ 0xff)).await,
+        Delivery::Held,
+        "a channel nobody holds"
+    );
     assert_eq!(
         fx.stats().aead_attempts.get(),
         0,
@@ -975,7 +976,7 @@ async fn a_senders_end_ends_the_session_and_tells_the_items_after_what_is_queued
     assert_eq!(
         fx.deliver(fx.data(SideClass::Datagram, 3, &[msg(1, b"after")]))
             .await,
-        Delivery::Dropped(Dropped::UnknownChannel)
+        Delivery::Held
     );
 }
 
@@ -1082,7 +1083,7 @@ async fn the_items_are_told_a_sender_was_removed_whichever_pass_notices_first() 
         }
         // The node's own pass judged the sender between two frames: the session is gone, the
         // frame finds no session. The `Items` are told either way.
-        Delivery::Dropped(Dropped::UnknownChannel) => {}
+        Delivery::Held => {}
         other => panic!("the first frame after the removal must be refused, not {other:?}"),
     }
     let refused_seq = seq - 1;
@@ -1108,7 +1109,7 @@ async fn the_items_are_told_a_sender_was_removed_whichever_pass_notices_first() 
     assert_eq!(
         fx.deliver(fx.data(SideClass::Datagram, seq, &[msg(1, b"after")]))
             .await,
-        Delivery::Dropped(Dropped::UnknownChannel)
+        Delivery::Held
     );
 }
 
@@ -1179,7 +1180,7 @@ async fn the_first_frame_after_a_removal_is_refused_and_the_items_say_not_a_memb
     assert_eq!(
         fx.deliver(fx.data(SideClass::Datagram, 3, &[msg(1, b"after")]))
             .await,
-        Delivery::Dropped(Dropped::UnknownChannel)
+        Delivery::Held
     );
 }
 
@@ -1649,4 +1650,339 @@ async fn a_datagram_that_overtakes_its_bind_carries_its_name() {
         w.carol().inner.chan.stats.rx.hellos.get() >= 1,
         "the stream said hello"
     );
+}
+
+// -- The sender's END ------------------------------------------------------------------------------
+
+/// Hand `carol` what `link` holds (the datagrams first, then the stream) until the `Items` say the
+/// live part ended, and return what they yielded: `m<first octet>` for a message, the notice for
+/// the end.
+async fn until_ended(link: &Link, carol: &Node, items: &mut Items) -> Vec<String> {
+    let started = std::time::Instant::now();
+    let mut told = Vec::new();
+    loop {
+        while let Some(frame) = link.pop_datagram() {
+            carol.deliver_frame(frame, 1).await;
+        }
+        while let Some(frame) = link.pop_stream() {
+            carol.deliver_frame(frame, 1).await;
+        }
+        while let Some(Some(item)) = items.next().now_or_never() {
+            match item {
+                Ok(got) => told.push(format!("m{}", got.bytes[0])),
+                Err(GetNotice::LiveEnded(LiveEnd::Ended { writer, reason })) => {
+                    told.push(format!("ended {writer} {reason:?}"));
+                    return told;
+                }
+                Err(other) => panic!("{other:?}"),
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the live part did not end within 5 s of the sender's close (the sender sent no END); \
+             told so far: {told:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// What a close of bob's channel of `mode` says to a receiver: what was sent first, then the end.
+async fn a_close_is_told_after_the_queued_messages(mode: ChannelMode, opts: EmitOptions) {
+    let w = wire(LinkConfig::default()).await;
+    let mut items = w.items(GetOptions::default());
+    w.join(mode).await;
+    let bob = w.bob();
+    for i in 0..3u8 {
+        bob.emit(&n(&format!("/m/{i}")), Bytes::from(vec![i]), opts)
+            .await
+            .unwrap();
+    }
+    assert!(w.rig.nodes[1].inner.chan_close(&space(), mode));
+    let told = until_ended(&w.link, w.carol(), &mut items).await;
+    assert_eq!(
+        told,
+        ["m0", "m1", "m2", "ended /bob/phone Closed"],
+        "the messages first, then the end with its reason"
+    );
+    assert!(
+        w.carol().inner.chan.sessions.all().is_empty(),
+        "the receiver's session is gone"
+    );
+    assert!(w.carol().inner.chan.stats.rx.controls.get() >= 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_latest_channel_ends_the_receivers_live_part_after_its_messages() {
+    a_close_is_told_after_the_queued_messages(ChannelMode::Latest, EmitOptions::latest()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_reliable_channel_ends_the_receivers_live_part_after_its_messages() {
+    a_close_is_told_after_the_queued_messages(ChannelMode::Reliable, EmitOptions::reliable()).await;
+}
+
+/// Every channel of a space ends with one `END` each (a device that is no writer any more ends
+/// its channels of the space).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_a_space_ends_each_of_its_channels_with_an_end() {
+    let w = wire(LinkConfig::default()).await;
+    let mut latest = w.items(GetOptions::default());
+    w.join(ChannelMode::Latest).await;
+    w.join(ChannelMode::Reliable).await;
+    w.rig.nodes[1].inner.chan_close_space(&space());
+    let told = until_ended(&w.link, w.carol(), &mut latest).await;
+    assert_eq!(told, ["ended /bob/phone Closed"]);
+    let started = std::time::Instant::now();
+    while !w.carol().inner.chan.sessions.all().is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a channel of the space got no END"
+        );
+        while let Some(frame) = w.link.pop_stream() {
+            w.carol().deliver_frame(frame, 1).await;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Closing the sender's node tells its receivers, returns, and leaves no task behind: `close`
+/// returns once every task of the node has ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_the_senders_node_ends_its_channels_with_end_and_returns() {
+    let mut w = wire(LinkConfig::default()).await;
+    let mut items = w.items(GetOptions::default());
+    w.join(ChannelMode::Reliable).await;
+    let bob = w.bob();
+    for i in 0..2u8 {
+        bob.emit(&n("/m"), Bytes::from(vec![i]), EmitOptions::reliable())
+            .await
+            .unwrap();
+    }
+    drop(bob);
+    let node = w.rig.nodes.remove(1);
+    tokio::time::timeout(Duration::from_secs(10), node.close())
+        .await
+        .expect("close returns when every task of the node has ended, END or not");
+    let told = until_ended(&w.link, &w.rig.nodes[1], &mut items).await;
+    assert_eq!(told, ["m0", "m1", "ended /bob/phone Closed"]);
+}
+
+// -- Frames that overtake the session --------------------------------------------------------------
+
+/// The sender queues `HELLO`, the binds, the standing values and the window's replay when it builds
+/// the session Data, and the stream carries them on its own path: they can reach the receiver
+/// before it has installed the session. A `Window` joiner that lost them has lost them for good (a
+/// stream frame cannot be asked for again), so the receiver holds the frames of a channel it holds
+/// no session of yet, and takes them in order when the session is installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stream_frames_that_overtake_the_session_are_not_lost_to_a_window_joiner() {
+    use ndn_packet::{Data, Interest};
+
+    use super::answer::ChanAnswer;
+    use super::wire::{ChanAsk, carrier};
+
+    let w = wire(LinkConfig::default()).await;
+    let bob = w.bob();
+    let opts = EmitOptions::window(super::verbs::Window::DEFAULT);
+    for i in 0..3u8 {
+        bob.emit(&n("/chat"), Bytes::from(vec![b'w', i]), opts)
+            .await
+            .unwrap();
+    }
+    bob.emit(
+        &n("/who"),
+        Bytes::from_static(b"here"),
+        opts.standing(Duration::from_secs(30)),
+    )
+    .await
+    .unwrap();
+    let mut items = w.items(GetOptions::default());
+
+    // Carol's ask, answered by Bob; the Data is not handed to Carol yet.
+    let (bob_node, carol) = (&w.rig.nodes[1], w.carol());
+    let ask = ChanAsk {
+        space: space(),
+        prefix: Name::root(),
+        mode: ChannelMode::Window,
+        recipient: carol.recipient().public(),
+        carriers: vec![carrier::DATAGRAM, carrier::STREAM],
+        lifetime: 3600,
+        epoch: None,
+        since: None,
+        chain: carol.inner.signer_chain(),
+    };
+    let wire_ask = carol
+        .inner
+        .sign_ask(bob_node.name(), &ask.encode().unwrap())
+        .unwrap();
+    let interest = Interest::decode(wire_ask).unwrap();
+    let name = (*interest.name).clone();
+    let generation = carol.inner.judge.generation();
+    let ChanAnswer::Data(answer) = bob_node.inner.chan_answer(&interest).await else {
+        panic!("a member's ask is answered");
+    };
+    let data = Data::decode(answer).unwrap();
+
+    // What Bob queued with the answer reaches Carol first.
+    let sender = bob_node
+        .inner
+        .chan
+        .tx
+        .get(&space(), ChannelMode::Window)
+        .expect("bob's sender of the channel");
+    let started = std::time::Instant::now();
+    while !sender.is_idle() {
+        assert!(started.elapsed() < Duration::from_secs(5), "bob wrote it");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let mut early = 0;
+    while let Some(frame) = w.link.pop_stream() {
+        carol.deliver_frame(frame, 1).await;
+        early += 1;
+    }
+    assert!(
+        early >= 3,
+        "hello, the binds, the standing bracket and the replay: {early} frames"
+    );
+    assert!(
+        queued(&mut items).is_empty(),
+        "no session yet: nothing delivered"
+    );
+
+    // The session Data arrives.
+    carol
+        .inner
+        .chan_take_answer(
+            &space(),
+            bob_node.name(),
+            ChannelMode::Window,
+            &name,
+            data,
+            generation,
+        )
+        .await
+        .expect("the session is installed");
+    let mut got: Vec<(String, Vec<u8>)> = queued(&mut items)
+        .into_iter()
+        .map(|g| (g.path.to_string(), g.bytes.to_vec()))
+        .collect();
+    got.sort();
+    got.dedup();
+    assert_eq!(
+        got,
+        [
+            ("/chat".to_string(), vec![b'w', 0]),
+            ("/chat".to_string(), vec![b'w', 1]),
+            ("/chat".to_string(), vec![b'w', 2]),
+            ("/who".to_string(), b"here".to_vec()),
+        ],
+        "the joiner got the window's replay and the standing value that came before its session"
+    );
+    assert!(items.hello_seen(), "and the HELLO");
+    let stats = &carol.inner.chan.stats.rx;
+    assert_eq!(
+        (
+            stats.held_unknown_full.get(),
+            stats.held_unknown_expired.get()
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        carol.inner.chan.rx.unknown_held(),
+        (0, 0),
+        "the hold is empty"
+    );
+}
+
+/// The hold of frames of an unknown channel is bounded in frames, in octets and in time, and a
+/// frame of a session this device holds never goes into it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn frames_of_an_unknown_channel_are_held_in_bounds_and_expire() {
+    let fx = latest().await;
+    let genuine = fx.data(SideClass::Datagram, 1, &[named(1, A, b"x")]);
+    let channel = |id: u64, len: usize| {
+        let mut v = genuine.to_vec();
+        v[3..11].copy_from_slice(&id.to_be_bytes());
+        v.resize(len.max(v.len()), 0);
+        Bytes::from(v)
+    };
+    let (stats, rx) = (fx.stats(), &fx.carol().inner.chan.rx);
+    let t0 = Instant::now();
+
+    // 64 frames are held; the 65th is dropped and counted.
+    for id in 1..=64u64 {
+        assert_eq!(
+            fx.deliver_at(channel(id, 0), t0).await,
+            Delivery::Held,
+            "frame {id}"
+        );
+    }
+    assert_eq!(rx.unknown_held().0, 64);
+    assert_eq!(
+        fx.deliver_at(channel(65, 0), t0).await,
+        Delivery::Dropped(Dropped::UnknownChannel)
+    );
+    assert_eq!(stats.held_unknown_full.get(), 1);
+    assert_eq!(rx.unknown_held().0, 64, "the hold did not grow");
+    assert_eq!(stats.aead_attempts.get(), 0, "a held frame is never opened");
+
+    // A frame of the session this device holds is not held: it is taken.
+    assert!(matches!(
+        fx.deliver_at(genuine.clone(), t0 + Duration::from_secs(1))
+            .await,
+        Delivery::Delivered { .. }
+    ));
+    assert_eq!(rx.unknown_held().0, 64);
+
+    // Past 2 s each is dropped and counted, swept by the next frame.
+    let later = t0 + Duration::from_secs(3);
+    assert_eq!(fx.deliver_at(channel(100, 0), later).await, Delivery::Held);
+    assert_eq!(stats.held_unknown_expired.get(), 64);
+    assert_eq!(rx.unknown_held().0, 1);
+
+    // The octets are bounded too: 512 KiB in all.
+    let fresh = later + Duration::from_secs(10);
+    assert_eq!(fx.deliver_at(channel(101, 0), fresh).await, Delivery::Held);
+    let mut kept = 1;
+    for id in 200..300u64 {
+        if fx.deliver_at(channel(id, 10_000), fresh).await == Delivery::Held {
+            kept += 1;
+        }
+    }
+    let (frames, octets) = rx.unknown_held();
+    assert_eq!(frames, kept);
+    assert!(
+        octets <= 512 * 1024,
+        "{octets} octets held: the bound is 512 KiB"
+    );
+    assert!(
+        (50..=53).contains(&kept),
+        "about 52 frames of 10,000 octets fit: {kept}"
+    );
+}
+
+/// While the frames held for a session are taken in, a frame that arrives queues behind them: the
+/// channel takes frames directly only once the held ones are in, so the order of arrival is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_that_arrives_while_held_frames_are_taken_in_queues_behind_them() {
+    let mut fx = latest().await;
+    let (node, channel) = (std::sync::Arc::clone(&fx.carol().inner), fx.info.channel);
+    let rx = &node.chan.rx;
+    let replay = rx.begin_replay(channel);
+    assert_eq!(
+        fx.deliver(fx.data(SideClass::Datagram, 1, &[named(1, A, b"after")]))
+            .await,
+        Delivery::Held,
+        "queued behind the replay, though the session is held"
+    );
+    assert!(nothing(&mut fx.items), "and not delivered yet");
+    node.chan_replay_held(channel, replay).await;
+    assert_eq!(payload(&next(&mut fx.items).await.unwrap()), b"after");
+    assert_eq!(rx.unknown_held(), (0, 0));
+    // The replay is over: frames are taken directly again.
+    assert!(matches!(
+        fx.deliver(fx.data(SideClass::Datagram, 2, &[msg(1, b"direct")]))
+            .await,
+        Delivery::Delivered { .. }
+    ));
 }

@@ -93,16 +93,21 @@ pub(crate) struct Terms {
     /// The largest frame on a datagram carrier.
     pub(crate) frame_max: u64,
     /// The carriers on offer.
+    #[allow(dead_code)] // stage 4: the side table routes by the carriers a session offers
     pub(crate) carriers: Vec<CarrierOffer>,
     /// The name ids bound so far.
     pub(crate) table: Vec<Bind>,
     /// The checkpoint period in milliseconds.
+    #[allow(dead_code)] // stage 5: checkpoints are taken at the period the sender announced
     pub(crate) ckpt_ms: u64,
     /// `Window` mode: what is replayed.
+    #[allow(dead_code)]
+    // recorded from the signed session; a later stage's `Window` verbs read it
     pub(crate) window: Option<Window>,
     /// The next sequence the sender will use, when it answered.
     pub(crate) seq: u64,
     /// The audience epoch the sender judged this device by.
+    #[allow(dead_code)] // recorded from the signed session; later stages judge by it
     pub(crate) audience: Option<EpochId>,
 }
 
@@ -249,6 +254,7 @@ impl RecvSession {
     }
 
     /// The key epoch of the key held now.
+    #[cfg(test)]
     pub(crate) fn key_epoch(&self) -> u32 {
         self.state.lock().current.epoch
     }
@@ -500,18 +506,6 @@ impl RecvSessions {
     /// Drop the session of channel `id`.
     pub(crate) fn remove(&self, id: u64) {
         self.store.lock().by_id.remove(&id);
-    }
-
-    /// End and drop every session of `space` (this device left it).
-    pub(crate) fn end_space(&self, space: &Name, why: &EndReason) {
-        let mut store = self.store.lock();
-        store.by_id.retain(|_, s| {
-            let keep = s.space != *space;
-            if !keep {
-                s.end(why.clone());
-            }
-            keep
-        });
     }
 
     /// End and drop each session past its lifetime and grace at `now`; returns their ids.
