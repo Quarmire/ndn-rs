@@ -3237,6 +3237,13 @@ signal is **one space**. The clock and sequence reservation of signals, and the
 admission of a run header (the certificate fetches it may cost), belong to the
 transport, not to this layer.
 
+**The channel, which replaces signals, is specified in [channel.md](channel.md)** and is
+built beside them: its setup by signed NDN (`<device>/32=chan/<digest>`), its frames and its
+receiver and sender are in `ndn-heap`'s `chan` module, and the same membership rule
+(§11.1: `standing`, shared with this section's gate) judges who may send and receive. Signals
+and their gate stay until the verbs of the channel replace them; this section is kept as it
+is until then.
+
 ### 11.1 Members
 
 A **member** of a space, for signals, is a key of a device whose **person** is a
