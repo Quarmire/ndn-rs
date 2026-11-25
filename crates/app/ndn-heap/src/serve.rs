@@ -262,7 +262,7 @@ async fn seal_key_verified(
     }
     match shared
         .host
-        .validate_device_packet(&ask.space, &data, asker)
+        .validate_asker_packet(&ask.space, &data, asker)
         .await
     {
         Judged::Valid(v) => Ok(v.key),
@@ -270,7 +270,7 @@ async fn seal_key_verified(
             "the asker's seal key packet is refused ({why}); a key is granted only to a device the trust context vouches for now: the asker's next round asks again"
         )),
         Judged::Pending(waiting) => Err(format!(
-            "the asker's seal key packet cannot be judged yet: {waiting}; the asker's next round asks again"
+            "the asker's seal key packet cannot be judged from what this node holds ({waiting}); a grant ask makes this node fetch nothing (spec 6.5): the chain reaches it with the entries or signals of the asker's person that it judges, or from the host that seeds its certificates; the asker asks another device of the space, and asks this one again once the chain is held"
         )),
     }
 }

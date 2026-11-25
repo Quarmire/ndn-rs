@@ -1218,6 +1218,17 @@ impl NodeInner {
         self.judge.validate_device_packet(data, device, space).await
     }
 
+    /// [`Self::validate_device_packet`] for the packet of a grant ask: nothing is fetched
+    /// ([`Judge::validate_asker_packet`]).
+    pub(crate) async fn validate_asker_packet(
+        &self,
+        space: &Name,
+        data: &Data,
+        device: &Name,
+    ) -> Judged {
+        self.judge.validate_asker_packet(data, device, space).await
+    }
+
     /// The certificate packet this node's validator vouches for under `name`, for a held
     /// copy ([`Judge::held_certificate`]).
     pub(crate) fn held_certificate(&self, name: &Name) -> Option<Bytes> {

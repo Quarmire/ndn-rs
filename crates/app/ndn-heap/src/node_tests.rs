@@ -84,6 +84,9 @@ impl crate::sync::net_kit::Host for NodeInner {
     async fn validate_device_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged {
         NodeInner::validate_device_packet(self, space, data, device).await
     }
+    async fn validate_asker_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged {
+        NodeInner::validate_asker_packet(self, space, data, device).await
+    }
     fn key_arrived(&self, space: &Name, epoch: &EpochId, name: &Name, content: Bytes) -> bool {
         NodeInner::key_arrived(self, space, epoch, name, content)
     }

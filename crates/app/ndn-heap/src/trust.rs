@@ -679,7 +679,7 @@ impl Judge {
     /// when fetched again.
     pub(crate) async fn validate(&self, data: &Data, space: &Name) -> Judged {
         let view = self.view_for(&data.name, space, false);
-        decide(&view, data, space).await
+        decide(&view, data, space, true).await
     }
 
     /// Judge `data`, a packet signed by a device key that is not about a
@@ -694,8 +694,31 @@ impl Judge {
         device: &Name,
         space: &Name,
     ) -> Judged {
+        self.device_packet(data, device, space, true).await
+    }
+
+    /// [`Self::validate_device_packet`] for the packet a grant ask carries, from the
+    /// certificates this node holds alone: it sends no Interest (spec §6.5: a granter sends
+    /// none for any ask, so a stranger's asks cannot make it fetch). A signer whose chain is
+    /// not held is [`Judged::Pending`] (`Waiting::Chain`) and is not fetched for.
+    pub(crate) async fn validate_asker_packet(
+        &self,
+        data: &Data,
+        device: &Name,
+        space: &Name,
+    ) -> Judged {
+        self.device_packet(data, device, space, false).await
+    }
+
+    async fn device_packet(
+        &self,
+        data: &Data,
+        device: &Name,
+        space: &Name,
+        fetch: bool,
+    ) -> Judged {
         let view = self.view_for(&data.name, space, true);
-        match decide(&view, data, space).await {
+        match decide(&view, data, space, fetch).await {
             Judged::Valid(v) if v.device != *device => {
                 tracing::debug!(name = %data.name, key = %v.key, "not verified: it is signed by a key of another device than the one its name is under");
                 Judged::Refused(Refusal::BadSignature)
@@ -1148,9 +1171,15 @@ pub(crate) fn owner_capable(ctx: &SignedTrustContext, key: &Name) -> bool {
     !ctx.schema_is_authoritative() || matches!(ctx.role_of(key), Some(b"admin") | Some(b"member"))
 }
 
-/// Judge `data` by the durable rule of `view`.
-async fn decide(view: &Validator, data: &Data, space: &Name) -> Judged {
-    let verdict = view.validate_durable(data).await;
+/// Judge `data` by the durable rule of `view`: with `fetch`, a certificate or cut manifest the
+/// walk lacks is fetched through the validator's fetcher; without, only what is held counts and
+/// a missing hop makes the verdict `Pending`.
+async fn decide(view: &Validator, data: &Data, space: &Name, fetch: bool) -> Judged {
+    let verdict = if fetch {
+        view.validate_durable(data).await
+    } else {
+        view.validate_durable_cached(data).await.0
+    };
     let key = data.sig_info().and_then(|s| s.key_locator_name());
     match verdict {
         ValidationResult::Valid(safe) => accept(view, data, *safe, key.as_deref()),

@@ -852,6 +852,14 @@ async fn a_signer_of_a_held_namespace_is_valid_and_named() {
 /// [`bob`] with the chain's certificates not in the cache: the CA's and the phone's key's
 /// certificate are returned for the test to hand over as a holder would.
 async fn bob_bare() -> (Arc<Judge>, Ed25519Signer, Certificate, Certificate) {
+    bob_bare_fetching(None).await
+}
+
+/// [`bob_bare`] whose validator has a certificate fetcher that counts, in `fetched`, every
+/// certificate it is asked for and answers none.
+async fn bob_bare_fetching(
+    fetched: Option<Arc<std::sync::atomic::AtomicUsize>>,
+) -> (Arc<Judge>, Ed25519Signer, Certificate, Certificate) {
     let root = signer("/home/bob/KEY/root", 70);
     let ca = signer(CA_KEY, 71);
     let phone = signer(PHONE_KEY, 72);
@@ -864,12 +872,19 @@ async fn bob_bare() -> (Arc<Judge>, Ed25519Signer, Certificate, Certificate) {
     ctx.anchors().insert(Arc::clone(&anchor.name), anchor);
     let keyring = Arc::new(Keyring::new());
     keyring.adopt(Arc::new(ctx)).unwrap();
-    let validator = Arc::new(Validator::with_keyring(
-        keyring,
-        Arc::new(CertCache::new()),
-        None,
-        5,
-    ));
+    let cache = Arc::new(CertCache::new());
+    let fetcher = fetched.map(|count| {
+        let fetch: ndn_security::FetchFn = Arc::new(move |_name| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::ready(Err(ndn_security::FetchMiss::Unanswered)))
+        });
+        Arc::new(ndn_security::CertFetcher::new(
+            Arc::clone(&cache),
+            fetch,
+            Duration::from_secs(1),
+        ))
+    });
+    let validator = Arc::new(Validator::with_keyring(keyring, cache, fetcher, 5));
     let store: Arc<dyn DataStore> = Arc::new(MemoryStore::new());
     let (judge, _) = Judge::new(validator, store, None);
     (judge, phone, leaf, ca_cert)
@@ -1108,6 +1123,68 @@ async fn a_key_lapsed_by_this_clock_is_lapsed() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// Stage-7 M1 on a real validator: the seal key packet of a device whose certificate ended
+/// is refused as lapsed with the dates, a refusal only the clock gives, which is what a
+/// granter that judges the asker's packet at every ask gets once the certificate ended.
+#[tokio::test]
+async fn a_lapsed_devices_seal_key_packet_is_refused_as_lapsed() {
+    let (judge, phone) = bob((PAST, EXPIRED), |c| c.with_data_requires_cut("member")).await;
+    let packet = signed(seal_key_name(&n(DEVICE), &[9; 32]), &phone);
+    match judge
+        .validate_device_packet(&packet, &n(DEVICE), &bob_space())
+        .await
+    {
+        Judged::Refused(Refusal::Lapsed { not_after, now }) => {
+            assert_eq!(not_after.0, EXPIRED / 1_000_000);
+            assert!(now > not_after);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Stage-7 L1: judging the packet of a grant ask sends no Interest (spec §6.5: the granter
+/// sends none for any ask). A signer whose chain the node does not hold is `Pending(Chain)`,
+/// not fetched for; once the chain is held the packet is judged. Judging as a fetching
+/// judge does asks the fetcher, which shows the counter counts.
+#[tokio::test]
+async fn judging_the_packet_of_a_grant_ask_fetches_no_certificate() {
+    let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (judge, phone, leaf, ca) = bob_bare_fetching(Some(Arc::clone(&fetched))).await;
+    let packet = signed(seal_key_name(&n(DEVICE), &[9; 32]), &phone);
+    let judged = judge
+        .validate_asker_packet(&packet, &n(DEVICE), &bob_space())
+        .await;
+    assert!(
+        matches!(judged, Judged::Pending(Waiting::Chain)),
+        "a signer whose chain is not held waits: {judged:?}"
+    );
+    let calls = fetched.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        calls, 0,
+        "the grant ask made the granter fetch {calls} certificate(s)"
+    );
+
+    judge.validator.cert_cache().insert(ca);
+    judge.validator.cert_cache().insert(leaf);
+    valid(
+        judge
+            .validate_asker_packet(&packet, &n(DEVICE), &bob_space())
+            .await,
+    );
+    assert_eq!(fetched.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // Control: a judge that may fetch asks the fetcher for what it lacks.
+    let (other, phone, ..) = bob_bare_fetching(Some(Arc::clone(&fetched))).await;
+    let packet = signed(seal_key_name(&n(DEVICE), &[9; 32]), &phone);
+    other
+        .validate_device_packet(&packet, &n(DEVICE), &bob_space())
+        .await;
+    assert!(
+        fetched.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the fetching judge fetches, so the counter counts"
+    );
 }
 
 /// An issuer above the signer revoked: nothing a cut can excuse, so the entry

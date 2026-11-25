@@ -357,6 +357,7 @@ pub(crate) trait Host: Send + Sync + 'static {
     fn owed_keys(&self, space: &Name) -> Vec<EpochId>;
     fn seal_public(&self) -> [u8; 32];
     async fn validate_device_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged;
+    async fn validate_asker_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged;
     fn key_arrived(&self, space: &Name, epoch: &EpochId, name: &Name, content: Bytes) -> bool;
     fn generation(&self) -> u64;
     fn may_grant(
@@ -671,6 +672,10 @@ impl Host for Toyhost {
             key_digest: [0; 32],
             owner_capable: true,
         })
+    }
+
+    async fn validate_asker_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged {
+        self.validate_device_packet(space, data, device).await
     }
 
     fn key_arrived(&self, _space: &Name, epoch: &EpochId, name: &Name, _content: Bytes) -> bool {

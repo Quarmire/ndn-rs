@@ -1363,9 +1363,14 @@ seven hold**, checked in this order:
 Anything else gets **no answer**, and `G` sends no Interest for any ask: the
 exchange is one Interest and one Data. Conditions 1–5 are decided first, from the
 ask's names alone, before the packet in it is decoded. Then `G` decodes the seal
-key packet the ask carries — `<D>/32=seal/<pk>` — and verifies it (§6.2: signed
-by a key of `D`, chained to `D`'s person's trust context as any packet of a
-device is, the Content equal to `pk`; nothing about it is kept); all seven
+key packet the ask carries — `<D>/32=seal/<pk>` — and verifies it **from the
+certificates `G` holds alone** (§6.2: signed by a key of `D`, chained to `D`'s
+person's trust context as any packet of a device is, the Content equal to `pk`;
+nothing about it is kept). A signer whose chain `G` does not hold is not
+fetched for: the ask gets no answer, and the asker asks another device of the
+space (up to 8, above) and this one again once `G` holds the chain, which it
+learns from the entries and signals of `D`'s person that it judges (§7.6, §9.1)
+or from the host that seeds its certificates. All seven
 conditions are checked **again** after the judging, with the key that signed it,
 since the records may have moved. It answers with the key wrapped to `pk` (§6.2) under the
 **grant's own name** as AAD, signed by its device key. `pk` is the key of the
@@ -1457,6 +1462,9 @@ inside the sealed body.
   no signature check (conditions 1–4 are checked first, from the names alone),
   and one that passes them for a real reader's device costs at most one
   judging of a packet of at most 2,048 octets, under the per-asker bound of 32.
+  That judging is from held certificates only (stage-7 L1): asks naming made-up
+  keys of a reader's person (`/bob/x<i>/KEY/k`) cannot make `G` send an
+  Interest toward that person, one out per Interest in, whatever names they use.
 
 ## 7. Sync and fetch
 
