@@ -39,7 +39,7 @@ use super::channels::{Admitted, Asker, Cap};
 use super::key::ChannelKey;
 use super::standing::{Who, gate, standing};
 use super::wire::{
-    ASK_MAX, CarrierOffer, ChanAsk, ChannelMode, RefusalCode, RefusalRecord, SessionRecord, Window,
+    ASK_MAX, CarrierOffer, ChanAsk, RefusalCode, RefusalRecord, SessionRecord, Window,
     carrier,
 };
 use crate::error::HeapError;
@@ -193,6 +193,9 @@ impl NodeInner {
                 params: Bytes::new(),
             })
             .collect();
+        // What the sender says of itself (its name table, its window, its frame size and next
+        // sequence), and the frames that follow the session on the stream, queued now.
+        let terms = self.chan_tx_welcome(ask, admitted);
         let mut session = SessionRecord {
             id: admitted.id,
             sender: self.device.clone(),
@@ -203,13 +206,13 @@ impl NodeInner {
             wrap: Bytes::new(),
             aead: Aead::preferred(),
             carriers,
-            table: Vec::new(),
+            table: terms.table,
             ckpt_ms: CKPT_MS,
-            window: (ask.mode == ChannelMode::Window).then_some(WINDOW),
+            window: terms.window,
             lifetime: admitted.lifetime,
             audience_epoch: admitted.audience.clone(),
-            frame_max: FRAME_MAX,
-            seq: admitted.seq,
+            frame_max: terms.frame_max,
+            seq: terms.seq,
             certs: self.judge.chain_of(self.signer.key_name()),
         };
         // A session over its limit (counted with the wrapped key it will carry) gives up the

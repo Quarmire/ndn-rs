@@ -16,6 +16,8 @@
 //! it does not hold asks again, and is given the current key if the sender still answers it.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ndn_foundation_types::Name;
@@ -79,6 +81,17 @@ impl Receiver {
     }
 }
 
+/// What the frame layer reads on every emission, without the table's lock or a key derivation.
+#[derive(Default)]
+pub(crate) struct Live {
+    /// How many receivers the channel has now.
+    pub(crate) receivers: AtomicUsize,
+    /// The key epoch (whole) frames are sealed under now.
+    pub(crate) key_epoch: AtomicU32,
+    /// The channel ended: it was closed or expired, or its space ended it.
+    pub(crate) closed: AtomicBool,
+}
+
 /// One channel: one sender, one space, one mode, one key at a time.
 pub(crate) struct Channel {
     id: u64,
@@ -96,6 +109,8 @@ pub(crate) struct Channel {
     last_announce: Option<Instant>,
     /// Since when the channel has had no receiver.
     empty_since: Option<Instant>,
+    /// What the frame layer reads on every emission.
+    live: Arc<Live>,
 }
 
 /// What a receiver is given.
@@ -115,6 +130,8 @@ pub(crate) struct Admitted {
     pub(crate) lifetime: u64,
     /// Whether this ask re-keyed the channel.
     pub(crate) rekeyed: bool,
+    /// Whether the asker's device was not a receiver of the channel before this ask.
+    pub(crate) fresh: bool,
 }
 
 /// Which cap a refused ask hit.
@@ -145,6 +162,8 @@ pub(crate) struct SendKey {
     pub(crate) key_epoch: u32,
     /// The key frames of this channel are sealed under now.
     pub(crate) frame_key: FrameKey,
+    /// What the frame layer reads without the table's lock.
+    pub(crate) live: Arc<Live>,
 }
 
 /// What a re-judging did to one space's channels.
@@ -222,6 +241,7 @@ impl Channel {
             judged_at,
             last_announce: None,
             empty_since: None,
+            live: Arc::new(Live::default()),
         }
     }
 
@@ -229,9 +249,10 @@ impl Channel {
     fn rekey(&mut self) {
         self.key = ChannelKey::random();
         self.key_epoch = self.key_epoch.wrapping_add(1);
+        self.live.key_epoch.store(self.key_epoch, Ordering::Release);
     }
 
-    fn admitted(&self, receiver: &Receiver, rekeyed: bool) -> Admitted {
+    fn admitted(&self, receiver: &Receiver, rekeyed: bool, fresh: bool) -> Admitted {
         Admitted {
             id: self.id,
             key_epoch: self.key_epoch,
@@ -240,7 +261,14 @@ impl Channel {
             audience: self.audience.clone(),
             lifetime: receiver.lifetime.as_secs(),
             rekeyed,
+            fresh,
         }
+    }
+}
+
+impl Drop for Channel {
+    fn drop(&mut self) {
+        self.live.closed.store(true, Ordering::Release);
     }
 }
 
@@ -307,7 +335,11 @@ impl Channels {
             .receivers
             .insert(asker.device.clone(), receiver.clone());
         channel.empty_since = None;
-        Ok(channel.admitted(&receiver, renewal))
+        channel
+            .live
+            .receivers
+            .store(channel.receivers.len(), Ordering::Release);
+        Ok(channel.admitted(&receiver, renewal, known.is_none()))
     }
 
     /// Make the channel of `(space, mode)` if there is none (the sender's own start, before
@@ -335,6 +367,7 @@ impl Channels {
             id: channel.id,
             key_epoch: channel.key_epoch,
             frame_key: channel.key.frame_key(channel.id, channel.key_epoch),
+            live: Arc::clone(&channel.live),
         })
     }
 
@@ -346,6 +379,7 @@ impl Channels {
             id: channel.id,
             key_epoch: channel.key_epoch,
             frame_key: channel.key.frame_key(channel.id, channel.key_epoch),
+            live: Arc::clone(&channel.live),
         })
     }
 
@@ -426,6 +460,10 @@ impl Channels {
                 channel.receivers.remove(device);
                 out.dropped.push((*mode, device.clone()));
             }
+            channel
+                .live
+                .receivers
+                .store(channel.receivers.len(), Ordering::Release);
             let epoch_moved = audience.is_some_and(|a| channel.audience.as_ref() != Some(a));
             if !gone.is_empty() || epoch_moved {
                 if audience.is_some() {
@@ -464,6 +502,10 @@ impl Channels {
                 lapsed.push((space.clone(), *mode, device));
                 channel.rekey();
             }
+            channel
+                .live
+                .receivers
+                .store(channel.receivers.len(), Ordering::Release);
             if channel.receivers.is_empty() {
                 let since = *channel.empty_since.get_or_insert(now);
                 if now.saturating_duration_since(since) >= Duration::from_secs(LIFETIME_DEFAULT) {
