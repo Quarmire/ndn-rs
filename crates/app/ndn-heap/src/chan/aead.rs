@@ -15,10 +15,6 @@
 //! 32 octets of the [`FrameKey`] it came from are zeroed, and a
 //! [`FrameCipher`] should live no longer than its session.
 
-// Nothing outside the codec's tests calls this until the channel writer and
-// receiver (stage 3, part 2) are wired; that change removes this attribute.
-#![allow(dead_code)]
-
 use super::key::FrameKey;
 use super::limits::TAG_LEN;
 

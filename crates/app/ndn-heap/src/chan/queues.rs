@@ -260,6 +260,7 @@ pub(crate) enum Item {
 
 impl Item {
     /// The sequence the item took.
+    #[cfg(test)]
     pub(crate) fn seq(&self) -> u64 {
         match self {
             Item::Data(p) => p.seq,

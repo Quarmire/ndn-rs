@@ -38,14 +38,14 @@ use crate::host::NodeHandle;
 
 /// The future of a [`Carrier::send_stream`].
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) type CarrierFuture<'a, T> = futures::future::BoxFuture<'a, T>;
+pub type CarrierFuture<'a, T> = futures::future::BoxFuture<'a, T>;
 /// The future of a [`Carrier::send_stream`].
 #[cfg(target_arch = "wasm32")]
-pub(crate) type CarrierFuture<'a, T> = futures::future::LocalBoxFuture<'a, T>;
+pub type CarrierFuture<'a, T> = futures::future::LocalBoxFuture<'a, T>;
 
 /// Why a carrier did not take a frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CarrierRefused {
+pub enum CarrierRefused {
     /// The link has enough queued ahead (the headroom rule): try again when [`Carrier::on_ready`]
     /// calls back.
     Full,
@@ -59,7 +59,7 @@ pub(crate) enum CarrierRefused {
 }
 
 /// A link's way to send a channel frame.
-pub(crate) trait Carrier: Send + Sync {
+pub trait Carrier: Send + Sync {
     /// The largest datagram frame the path takes now; 0 if the carrier has no datagram class.
     fn datagram_max(&self) -> usize;
 
@@ -105,7 +105,7 @@ impl CarrierSlot {
 impl NodeHandle {
     /// Install the carrier every channel frame of every channel is sent to: the node's fixed route
     /// until the forwarder's side table routes frames. A second call replaces the first.
-    pub(crate) fn attach_carrier(&self, carrier: Arc<dyn Carrier>) {
+    pub fn attach_carrier(&self, carrier: Arc<dyn Carrier>) {
         self.inner.chan.tx.carrier.set(carrier);
     }
 }

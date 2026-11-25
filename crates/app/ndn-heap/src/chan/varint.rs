@@ -5,10 +5,6 @@
 //! The encoder is minimal. The decoder accepts a longer encoding than the
 //! value needs (RFC 9000 allows it) and never reads past the slice.
 
-// Nothing outside the codec's tests calls this until the channel writer and
-// receiver (stage 3, part 2) are wired; that change removes this attribute.
-#![allow(dead_code)]
-
 use bytes::BufMut;
 
 /// The largest value a varint holds: 2^62 - 1.

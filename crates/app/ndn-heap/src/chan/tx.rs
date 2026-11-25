@@ -314,7 +314,7 @@ enum Done {
     /// The control frame at the head of the FIFO.
     Control,
     /// The first items of the FIFO.
-    Fifo(usize),
+    Fifo,
     /// Messages of `big`, as `(id, sequence)`.
     Big(Vec<(u64, u64)>),
 }
@@ -331,7 +331,6 @@ enum StreamPack {
         packed: Packed,
         /// `true`: the frame is the first items of the FIFO; `false`: messages of `big`.
         from_fifo: bool,
-        items: usize,
     },
     Idle,
     Gone,
@@ -386,11 +385,6 @@ impl TxChannel {
         })
     }
 
-    /// The channel's id.
-    pub(crate) fn id(&self) -> u64 {
-        self.id
-    }
-
     /// Whether the writer gate was passed under the judges' state as it is now: the trust
     /// generation `generation` and the space's fold version, read without a lock.
     pub(crate) fn gate_valid(&self, generation: u64) -> bool {
@@ -407,17 +401,13 @@ impl TxChannel {
         self.gate_set.store(true, Ordering::Release);
     }
 
-    /// The channel's mode.
-    pub(crate) fn mode(&self) -> ChannelMode {
-        self.mode
-    }
-
     /// What the channel reads without a lock.
     pub(crate) fn live(&self) -> &Arc<Live> {
         &self.live
     }
 
     /// The next sequence the channel will use.
+    #[cfg(test)]
     pub(crate) fn next_seq(&self) -> u64 {
         self.state.lock().next_seq
     }
@@ -1075,12 +1065,11 @@ impl TxChannel {
                 StreamPack::Data {
                     mut packed,
                     from_fifo,
-                    items,
                 } => {
                     let (count, seq0) = (packed.writer.len(), packed.seq0);
                     let scratch = std::mem::take(&mut packed.scratch);
                     let done = if from_fifo {
-                        Done::Fifo(items)
+                        Done::Fifo
                     } else {
                         Done::Big(scratch)
                     };
@@ -1117,7 +1106,7 @@ impl TxChannel {
         let window_mode = self.mode == ChannelMode::Window && sent.is_some();
         match done {
             Done::Control => st.fifo.finish(|_| {}),
-            Done::Fifo(_) => {
+            Done::Fifo => {
                 let window = st.window;
                 let mut held = Vec::new();
                 st.fifo.finish(|item| {
@@ -1239,7 +1228,6 @@ impl TxChannel {
                         scratch: Vec::new(),
                     },
                     from_fifo: true,
-                    items,
                 }
             }
             Head::Nothing => {
@@ -1288,7 +1276,6 @@ impl TxChannel {
                         scratch,
                     },
                     from_fifo: false,
-                    items: 0,
                 }
             }
         }
@@ -1521,10 +1508,5 @@ impl Tx {
         let made = make();
         *slot = Some(Arc::clone(&made));
         made
-    }
-
-    /// Forget the senders of `space`.
-    pub(crate) fn forget_space(&self, space: &Name) {
-        self.channels.write().remove(space);
     }
 }

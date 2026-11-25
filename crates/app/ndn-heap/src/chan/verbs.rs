@@ -9,7 +9,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 
-use super::limits;
 use super::sessions::EndReason;
 use super::wire::ChannelMode;
 use crate::error::NextStep;
@@ -265,15 +264,6 @@ impl EmitError {
     pub(crate) fn latest_blocks() -> Self {
         EmitError::FixRequest {
             why: "Latest never blocks; a newer emission replaces an older one. Use Reliable".into(),
-        }
-    }
-
-    /// A message over the message limit.
-    pub(crate) fn message_too_large(size: usize) -> Self {
-        EmitError::TooLarge {
-            what: "message",
-            size,
-            max: limits::MESSAGE_DEFAULT,
         }
     }
 }

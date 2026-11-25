@@ -34,11 +34,13 @@ pub(crate) struct History {
 
 impl History {
     /// Messages held.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.items.len()
     }
 
     /// Payload octets held.
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
@@ -112,11 +114,13 @@ pub(crate) struct Standing {
 
 impl Standing {
     /// Names standing (some may have expired and not been purged yet).
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.by_name.len()
     }
 
     /// Payload octets standing.
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }

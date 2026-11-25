@@ -91,7 +91,10 @@ impl NodeInner {
         };
         let version = held.log.lock().fold.version();
         let tx = self.chan_tx_for(&ask.space, ask.mode, &key, version);
-        tx.welcome(admitted.fresh, ask.since, Instant::now())
+        let terms = tx.welcome(admitted.fresh, ask.since, Instant::now());
+        // The table's own copy of the next sequence is what a re-key at the limit is decided on.
+        self.chan.channels.note_seq(&ask.space, ask.mode, terms.seq);
+        terms
     }
 }
 

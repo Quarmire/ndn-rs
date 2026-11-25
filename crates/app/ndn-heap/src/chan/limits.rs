@@ -4,11 +4,6 @@
 //! what a receiver would refuse, and a receiver refuses what the writer would
 //! never build.
 
-// Nothing outside the codec's tests uses every constant until the channel
-// writer and receiver (stage 3, part 2) are wired; that change removes this
-// attribute.
-#![allow(dead_code)]
-
 pub(crate) use ndn_transport::side_header::MIN_FRAME_LEN;
 
 /// Octets of a sealed frame's header: marker, version/class/kind, channel id

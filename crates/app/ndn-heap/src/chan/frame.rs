@@ -35,10 +35,6 @@
 //! with [`PAD`](super::message::PAD) and zero octets, the shortest padding
 //! that reaches 46, so the tag stays at the end.
 
-// Nothing outside the codec's tests calls this until the channel writer and
-// receiver (stage 3, part 2) are wired; that change removes this attribute.
-#![allow(dead_code)]
-
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use ndn_transport::side_header::{self, HeaderError, SideHeader};
 use ndn_transport::{SideClass, SideKind};

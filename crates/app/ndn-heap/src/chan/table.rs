@@ -109,6 +109,7 @@ pub(crate) struct Table {
 
 impl Table {
     /// How many ids are live.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.live
     }

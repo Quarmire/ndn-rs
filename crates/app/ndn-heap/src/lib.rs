@@ -42,6 +42,7 @@ mod test_kit;
 mod trust;
 
 pub use crate::chan::error::ChanError;
+pub use crate::chan::carrier::{Carrier, CarrierFuture, CarrierRefused};
 pub use crate::chan::items::Items;
 pub use crate::chan::rx::{Delivery, Dropped};
 pub use crate::chan::sessions::{ChannelInfo, EndReason};

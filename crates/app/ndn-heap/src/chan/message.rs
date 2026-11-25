@@ -18,10 +18,6 @@
 //! limits of [`super::limits`], so a writer never builds what a reader
 //! refuses.
 
-// Nothing outside the codec's tests calls this until the channel writer and
-// receiver (stage 3, part 2) are wired; that change removes this attribute.
-#![allow(dead_code)]
-
 use bytes::{BufMut, Bytes};
 
 use super::aead::FrameCipher;

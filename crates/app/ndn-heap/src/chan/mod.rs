@@ -6,8 +6,13 @@
 //! Stage 2 (the setup) and stage 3 (frames and batching) live here: the
 //! session key ([`key`]) is shared by both, each stage adds its own modules.
 //!
-//! The setup and the frame layer are consumed by the verbs (`emit`, `get`) of stage 6: until then
-//! the crate's own tests are their only caller, so the module allows `dead_code`.
+//! Items that only tests call, or that checkpoints (stage 5) and the verbs over kept values
+//! (stage 6) will, are why the module still allows `dead_code`: `FrameCipher::aead`,
+//! `FrameBuf::seq0`, `Opened::{header, into_plaintext}`, `OutMessage::new`,
+//! `MessageWriter::{room, next_seq}`, `Channels::{receivers, count, receiver_count}`,
+//! `RecvSession::{key_epoch, end_space}`, the fields of the session's `Terms` and `Counter::get`.
+//! The sender's own files (`tx`, `queues`, `table`, `history`, `carrier`, `emit`, `verbs`,
+//! `control`) have none.
 #![allow(dead_code)]
 
 pub(crate) mod aead;
