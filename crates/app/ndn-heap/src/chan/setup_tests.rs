@@ -493,6 +493,12 @@ async fn a_removed_receiver_is_not_answered_and_the_channel_rekeys() {
     let heap = shared(&rig, share, change).await;
     let (alice, bob, carol) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
     bob.ask_channel(&space(), alice.name()).await.unwrap();
+    let bobs = bob
+        .inner
+        .chan
+        .sessions
+        .find(&space(), alice.name(), ChannelMode::Latest)
+        .expect("bob holds a session");
     let first = carol.ask_channel(&space(), alice.name()).await.unwrap();
     assert_eq!(first.key_epoch, 0);
     let table = &alice.inner.chan.channels;
@@ -504,7 +510,8 @@ async fn a_removed_receiver_is_not_answered_and_the_channel_rekeys() {
     })
     .await
     .unwrap();
-    // The owner holds the removal: the channel re-keys and bob is dropped, in one call.
+    // The removal re-keys at once and drops bob; the epoch the removal owes moves the audience
+    // (a second cause, a second re-key), so the key epoch is at least 1, not exactly 1.
     eventually("the channel is re-keyed and bob dropped", || {
         table
             .current(&space(), ChannelMode::Latest)
@@ -512,26 +519,60 @@ async fn a_removed_receiver_is_not_answered_and_the_channel_rekeys() {
             && table.receiver_count(&space(), ChannelMode::Latest) == 1
     })
     .await;
+    assert_eq!(
+        table.receivers(&space()),
+        vec![(
+            ChannelMode::Latest,
+            carol.name().clone(),
+            carol.writer().clone()
+        )],
+        "carol, who still stands, was kept through the removal"
+    );
     // Bob's ask is Nacked: his own node may not even send it by now, so it is signed raw.
     let strangers = alice.inner.chan.stats.strangers.get();
     let (wire, _) = signed_ask(bob, alice, &ask_of(bob, ChannelMode::Latest));
     assert!(nacked(fetch(bob, wire).await, NackReason::NoRoute));
     assert_eq!(alice.inner.chan.stats.strangers.get(), strangers + 1);
-    // Carol is given the new key, without a second re-key.
+    // Carol asks once the two nodes hold the same epoch in force (a sender on a newer epoch
+    // than the asker's answers NotReady: wait for the record); she is given the key as it is.
+    eventually("carol holds the epoch alice has in force", || {
+        in_force_of(carol) == in_force_of(alice)
+    })
+    .await;
     let again = carol.ask_channel(&space(), alice.name()).await.unwrap();
-    let now_epoch = table
-        .current(&space(), ChannelMode::Latest)
-        .unwrap()
-        .key_epoch;
-    assert_eq!((again.channel, again.key_epoch), (first.channel, now_epoch));
-    assert!(
-        now_epoch >= 1
-            && now_epoch
-                == table
-                    .current(&space(), ChannelMode::Latest)
-                    .unwrap()
-                    .key_epoch
+    let key = table.current(&space(), ChannelMode::Latest).unwrap();
+    assert_eq!(
+        (again.channel, again.key_epoch),
+        (first.channel, key.key_epoch)
     );
+    // Two causes, so one or two re-keys (one when the owner's epoch had arrived before the
+    // removal was judged), and none without a cause: the key epoch stays where it is.
+    assert!((1..=2).contains(&key.key_epoch), "{}", key.key_epoch);
+    tokio::time::sleep(super::hub::TICK * 4).await;
+    let later = table.current(&space(), ChannelMode::Latest).unwrap();
+    assert_eq!(later.key_epoch, key.key_epoch, "nothing moved it again");
+    // The removed receiver holds a session that opens nothing sealed after the re-key; carol's
+    // opens the frames of the current key.
+    let now = Instant::now();
+    assert!(
+        bobs.frame_key(key.key_epoch as u8, now).is_none(),
+        "bob's old session opens frames of the new key epoch"
+    );
+    assert!(
+        carol
+            .inner
+            .chan
+            .sessions
+            .get(again.channel)
+            .and_then(|s| s.frame_key(key.key_epoch as u8, now))
+            .is_some()
+    );
+}
+
+fn in_force_of(node: &Node) -> Option<crate::wire::EpochId> {
+    node.inner
+        .space_of(&space())
+        .and_then(|held| held.log.lock().fold.in_force())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -593,23 +634,7 @@ async fn a_revoked_senders_session_is_dropped_when_the_trust_generation_moves() 
     assert!(session.is_current());
 
     // Carol adopts a version of /bob's trust context that revokes bob's key.
-    let validator = &carol.inner.judge.validator;
-    let held = validator
-        .keyring()
-        .contexts()
-        .into_iter()
-        .find(|c| *c.namespace() == n("/bob"))
-        .expect("the namespace's context");
-    let next = ndn_security::SignedTrustContext::hierarchical(n("/bob"))
-        .with_version(2)
-        .with_revocation(bob.writer().clone());
-    for anchor in held.anchors().iter() {
-        next.add_anchor(anchor.value().clone());
-    }
-    validator
-        .keyring()
-        .adopt_update(Arc::new(next))
-        .expect("adopted");
+    revoke_at(carol, &n("/bob"), bob.writer());
 
     assert!(!session.is_current(), "the generation moved");
     assert!(
@@ -617,6 +642,86 @@ async fn a_revoked_senders_session_is_dropped_when_the_trust_generation_moves() 
         "bob's key is revoked: he no longer stands"
     );
     assert!(carol.inner.chan.sessions.get(info.channel).is_none());
+}
+
+/// `node`'s keyring adopts version 2 of `person`'s trust context, which revokes `key`.
+fn revoke_at(node: &Node, person: &Name, key: &Name) {
+    let validator = &node.inner.judge.validator;
+    let held = validator
+        .keyring()
+        .contexts()
+        .into_iter()
+        .find(|c| c.namespace() == person)
+        .expect("the namespace's context");
+    let next = ndn_security::SignedTrustContext::hierarchical(person.clone())
+        .with_version(2)
+        .with_revocation(key.clone());
+    for anchor in held.anchors().iter() {
+        next.add_anchor(anchor.value().clone());
+    }
+    validator
+        .keyring()
+        .adopt_update(Arc::new(next))
+        .expect("adopted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_receivers_key_rekeys_the_channel_and_drops_it_with_no_change_of_members() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
+    let (share, change) = public_with(&["/bob"], &["/carol"]);
+    shared(&rig, share, change).await;
+    let (alice, bob, carol) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
+    bob.ask_channel(&space(), alice.name()).await.unwrap();
+    let first = carol.ask_channel(&space(), alice.name()).await.unwrap();
+    assert_eq!(first.key_epoch, 0);
+    let table = &alice.inner.chan.channels;
+    assert_eq!(table.receiver_count(&space(), ChannelMode::Latest), 2);
+    let members = || {
+        let held = alice.inner.space_of(&space()).unwrap();
+        let log = held.log.lock();
+        (log.fold.writers(), log.fold.readers())
+    };
+    let (record, generation) = (members(), alice.inner.judge.generation());
+
+    // Alice adopts a context that revokes carol's key. The record of the space says nothing new.
+    revoke_at(alice, &n("/carol"), carol.writer());
+    assert_ne!(
+        alice.inner.judge.generation(),
+        generation,
+        "the trust generation moved"
+    );
+    assert_eq!(members(), record, "and the members did not");
+    eventually("carol is dropped and the channel re-keyed", || {
+        table
+            .current(&space(), ChannelMode::Latest)
+            .is_some_and(|k| k.key_epoch >= 1)
+            && table.receiver_count(&space(), ChannelMode::Latest) == 1
+    })
+    .await;
+    assert_eq!(
+        table.receivers(&space()),
+        vec![(
+            ChannelMode::Latest,
+            bob.name().clone(),
+            bob.writer().clone()
+        )],
+        "bob, whose key stands, is kept"
+    );
+    assert_eq!(
+        members(),
+        record,
+        "no member changed: only the revocation did it"
+    );
+    // Carol's ask, signed by the revoked key, is Nacked as a stranger's is: no key that stands
+    // signed it, and no signature was walked.
+    let (strangers, walks) = (
+        alice.inner.chan.stats.strangers.get(),
+        alice.inner.judge.interest_walks(),
+    );
+    let (wire, _) = signed_ask(carol, alice, &ask_of(carol, ChannelMode::Latest));
+    assert!(nacked(fetch(carol, wire).await, NackReason::NoRoute));
+    assert_eq!(alice.inner.chan.stats.strangers.get(), strangers + 1);
+    assert_eq!(alice.inner.judge.interest_walks(), walks);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -786,30 +891,28 @@ async fn a_writers_announce_makes_a_listening_member_ask_once() {
         .inner
         .chan
         .channels
-        .open(&space(), ChannelMode::Latest, None, judged, now)
+        .open(
+            &space(),
+            ChannelMode::Latest,
+            in_force_of(alice),
+            judged,
+            now,
+        )
         .unwrap();
     // Carol wants live data of the space; bob does not.
     let _listening = carol.inner.chan_listen(&space());
     alice.inner.chan_announce(&space()).await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
     let s = &carol.inner.chan.stats;
-    assert!(
+    eventually("carol asked once and holds the session", || {
         carol
             .inner
             .chan
             .sessions
             .find(&space(), alice.name(), ChannelMode::Latest)
-            .is_some(),
-        "carol: heard {} strangers {} ignored {} announce_asks {} asked {} installed {}; alice sent {}",
-        s.announces_heard.get(),
-        s.announce_strangers.get(),
-        s.announce_ignored.get(),
-        s.announce_asks.get(),
-        s.asked.get(),
-        s.installed.get(),
-        alice.inner.chan.stats.announces_sent.get()
-    );
-    assert_eq!(carol.inner.chan.stats.announce_asks.get(), 1);
+            .is_some()
+    })
+    .await;
+    assert_eq!((s.announce_asks.get(), s.asked.get()), (1, 1));
     eventually("bob heard it", || {
         bob.inner.chan.stats.announces_heard.get() >= 1
     })

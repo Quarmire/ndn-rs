@@ -59,9 +59,10 @@ pub enum ChanError {
     },
     /// The sender is busy or cannot judge the ask yet.
     #[error(
-        "{sender} cannot answer this ask now (it is over its rate for this device, or it lacks \
-         a certificate of this device's chain): ask again later; the ask carries this device's \
-         chain, so enrol the device if the sender keeps saying so"
+        "{sender} cannot answer this ask now (it is over its rate for this device, it lacks a \
+         certificate of this device's chain, or it saw this very ask before): ask again later, \
+         signed afresh; the ask carries this device's chain, so enrol the device if the sender \
+         keeps saying so"
     )]
     Busy {
         /// The device asked.

@@ -342,13 +342,17 @@ impl NodeInner {
             return Default::default();
         }
         let sealed = log.sealed();
+        // A sealed space may hold no epoch in force for a moment: the removal of a reader reached
+        // the record before the owner's new epoch did (the old epoch's holders are no longer all
+        // readers). Then nobody can be judged against an audience, and a receiver that still
+        // stands is kept; the epoch that arrives is judged when it does.
         let audience = if sealed { log.fold.in_force() } else { None };
         let members = audience.as_ref().map(|e| log.fold.audience(e));
         let stands = |_device: &Name, key: &Name| {
             let Ok(person) = standing(&log, &self.judge, key, Who::Listed) else {
                 return false;
             };
-            !sealed || members.as_ref().is_some_and(|m| m.contains(&person))
+            members.as_ref().is_none_or(|m| m.contains(&person))
         };
         self.chan
             .channels

@@ -397,6 +397,11 @@ impl Channels {
     /// `judged_at` and the audience epoch `audience` now in force: `keep` says which of them
     /// stand. The others are dropped and the channel is re-keyed at once; a channel whose
     /// audience epoch moved is re-keyed too. Every channel of the space then holds `judged_at`.
+    ///
+    /// `audience` is `None` for a public space, and for a sealed one with no epoch in force at
+    /// this instant (a removal reached the record before the owner's new epoch did): that says
+    /// nothing of the audience, so no channel counts it as moved; the epoch that arrives next
+    /// is a move, and re-keys again.
     pub(crate) fn rejudged(
         &self,
         space: &Name,
@@ -421,9 +426,11 @@ impl Channels {
                 channel.receivers.remove(device);
                 out.dropped.push((*mode, device.clone()));
             }
-            let epoch_moved = channel.audience.as_ref() != audience;
+            let epoch_moved = audience.is_some_and(|a| channel.audience.as_ref() != Some(a));
             if !gone.is_empty() || epoch_moved {
-                channel.audience = audience.cloned();
+                if audience.is_some() {
+                    channel.audience = audience.cloned();
+                }
                 channel.rekey();
                 out.rekeyed.push(*mode);
             }

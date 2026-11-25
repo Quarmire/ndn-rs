@@ -128,6 +128,51 @@ fn a_dropped_receiver_rekeys_the_channel_at_once_and_a_moved_audience_epoch_does
 }
 
 #[test]
+fn a_sealed_space_with_no_epoch_in_force_moves_no_audience_and_drops_only_who_no_longer_stands() {
+    let table = Channels::default();
+    let t0 = Instant::now();
+    let (bob, bob_key) = (n("/bob/phone"), n("/bob/phone/KEY/1"));
+    let (carol, carol_key) = (n("/carol/tablet"), n("/carol/tablet/KEY/1"));
+    let old = EpochId {
+        creator: n("/alice/laptop"),
+        seq: 1,
+    };
+    for (device, key) in [(&bob, &bob_key), (&carol, &carol_key)] {
+        table
+            .admit(
+                &space(),
+                ChannelMode::Latest,
+                &ask(device, key, 3600),
+                Some(old.clone()),
+                (1, 1),
+                t0,
+            )
+            .unwrap();
+    }
+
+    // Bob left the record and the owner's next epoch is not here yet: bob is dropped and the
+    // key moves once; carol stands, so she stays, and the channel keeps the epoch it had.
+    let done = table.rejudged(&space(), (2, 2), None, t0, |device, _| *device != bob);
+    assert_eq!(done.dropped, vec![(ChannelMode::Latest, bob.clone())]);
+    assert_eq!(done.rekeyed, vec![ChannelMode::Latest]);
+    assert_eq!(table.receiver_count(&space(), ChannelMode::Latest), 1);
+
+    // Judged again with the gap still open and nobody gone: nothing moves.
+    let done = table.rejudged(&space(), (3, 3), None, t0, |_, _| true);
+    assert_eq!(done, Rejudged::default());
+
+    // The epoch arrives: the audience moved, which re-keys the second time (its own cause).
+    let new = EpochId {
+        creator: n("/alice/laptop"),
+        seq: 2,
+    };
+    let done = table.rejudged(&space(), (4, 4), Some(&new), t0, |_, _| true);
+    assert_eq!((done.dropped.len(), done.rekeyed.len()), (0, 1));
+    let key = table.current(&space(), ChannelMode::Latest).unwrap();
+    assert_eq!(key.key_epoch, 2);
+}
+
+#[test]
 fn a_receiver_that_does_not_renew_is_dropped_after_its_lifetime_and_grace_and_the_channel_rekeys() {
     let table = Channels::default();
     let t0 = Instant::now();
