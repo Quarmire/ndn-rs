@@ -876,6 +876,78 @@ async fn a_members_admin_or_member_device_is_granted_the_epoch_key() {
     }
 }
 
+/// Alice's private space, read by Bob. Bob's phone is a reader device that holds the epoch key
+/// in force (its owner device, Alice's laptop, granted it); what it answers when Bob's tablet,
+/// a `member` device of Bob's, asks it for the key, by the names alone and with the key that
+/// signed the tablet's seal key packet known. `layered`: the namespaces declare the role layout.
+async fn bobs_tablet_asks_bobs_phone(
+    layered: bool,
+) -> (
+    Result<(), crate::seal::GrantRefusal>,
+    Result<(), crate::seal::GrantRefusal>,
+) {
+    let devs = world(&["/alice/member/laptop", "/bob/member/phone", "/bob/member/tablet"]).await;
+    let roles: Vec<_> = if layered {
+        devs.iter().map(|d| d.layered()).collect()
+    } else {
+        Vec::new()
+    };
+    let pick = |i: usize| if layered { &roles[i] } else { &devs[i] };
+    let (alice, _) = boot(pick(0), cfg()).await;
+    let heap = alice.create(&space(), private(&["/bob"])).await.unwrap();
+    let (epoch, key) = {
+        let log = heap.inner.log.lock();
+        let epoch = log.fold.in_force().expect("an epoch");
+        let key = log.keys.key(&space(), &epoch).expect("the creator's key").clone();
+        (epoch, key)
+    };
+    let (phone, _) = boot(pick(1), cfg()).await;
+    let theirs = phone.open(&space()).await.unwrap();
+    deliver(&devs[0], &phone).await;
+    assert!(
+        theirs.inner.log.lock().key_arrived(epoch.clone(), key).0,
+        "the phone holds the epoch key"
+    );
+    let tablet = &devs[2];
+    let key = tablet.name.clone().append("KEY").append("1");
+    (
+        phone.inner.may_grant(&space(), &epoch, &tablet.name, None),
+        phone
+            .inner
+            .may_grant(&space(), &epoch, &tablet.name, Some(&key)),
+    )
+}
+
+/// Stage-7 L7: in a space whose readers' namespaces declare the role layout, a reader device that
+/// is no owner device grants no key: it keeps no record of the devices it grants to, so no
+/// device would rotate the epoch when their certificates lapse. The refusal says why and
+/// what to do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_device_that_is_no_owner_device_grants_no_key_in_a_role_layout_space() {
+    let (by_name, by_key) = bobs_tablet_asks_bobs_phone(true).await;
+    assert_eq!(
+        by_name,
+        Err(crate::seal::GrantRefusal::GranterNotOwnerDevice),
+        "a reader device that keeps no record of its grants handed out the epoch key"
+    );
+    assert_eq!(by_key, by_name);
+    let said = by_name.unwrap_err().to_string();
+    assert!(
+        said.contains("owner") && said.contains("ask"),
+        "it says why and what to do: {said}"
+    );
+}
+
+/// Stage-7 L7: a flat namespace has no signed role layout, so the rule does not apply (an
+/// accepted residual, spec §9.9): a reader device still hands the key to another device of
+/// the same person (the conformance worlds' namespaces are flat).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_device_still_grants_the_key_in_a_flat_namespace() {
+    let (by_name, by_key) = bobs_tablet_asks_bobs_phone(false).await;
+    assert_eq!(by_name, Ok(()), "by name");
+    assert_eq!(by_key, Ok(()), "by key");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_owner_device_signs_the_epoch_a_members_entry_of_another_leaves_incomplete() {
     let devs = world(&["/alice/laptop", "/alice/phone"]).await;

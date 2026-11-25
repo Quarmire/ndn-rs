@@ -422,6 +422,16 @@ pub(crate) enum GrantRefusal {
          with a new one"
     )]
     AskerKeySuspected,
+    /// This device is a reader's device that holds the key and is no owner device, asked by a
+    /// device of a namespace with the role layout.
+    #[error(
+        "this device holds the epoch's key but is no owner device of the space, and the \
+         asking device's namespace has the role layout, so its certificate can lapse: only an \
+         owner device keeps the record of the devices it grants a key to, so that a lapse owes \
+         the space a new epoch, and a key this device gave would be rotated by no one; ask \
+         one of the owner's `admin` or `member` devices (the epoch's creator first)"
+    )]
+    GranterNotOwnerDevice,
 }
 
 /// Whether the key of `epoch` of `space` may be granted to a device of

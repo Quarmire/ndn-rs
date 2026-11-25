@@ -1323,6 +1323,11 @@ impl NodeInner {
         self.judge.generation()
     }
 
+    /// Whether this device may give `asker` (of `asker_key` once its packet is judged) the key
+    /// of `epoch` of `space`: [`seal::may_grant`], and one more condition of the node's: where the
+    /// asker's namespace declares the role layout (its certificate can lapse), only an owner
+    /// device of the sealed space gives a key, so that every key given is tracked by a device
+    /// that owes the epoch when it lapses ([`Self::note_grantee`], spec §6.5, stage-7 L7).
     pub(crate) fn may_grant(
         &self,
         space: &Name,
@@ -1339,6 +1344,13 @@ impl NodeInner {
         seal::may_grant(
             &log.fold, &log.keys, space, epoch, &person, capable, revoked, suspected,
         )?;
+        let asker_device = asker_key.unwrap_or(asker);
+        if log.sealed()
+            && (held.follower || !log.tracks_grantees())
+            && self.judge.role_layout(asker_device, space)
+        {
+            return Err(GrantRefusal::GranterNotOwnerDevice);
+        }
         // Under the lock: the entry is held back there, in the same stretch
         // that stores it, so no grant can slip in between.
         if epoch.creator == self.device && !held.publisher.servable(epoch.seq) {

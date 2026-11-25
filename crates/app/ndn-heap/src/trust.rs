@@ -891,6 +891,16 @@ impl Judge {
         owner_capable(&view.keyring().context_for(key), key)
     }
 
+    /// Whether the trust context that governs `device` for `space` declares the role layout
+    /// (its schema is authoritative, [`owner_capable`]): where it does, the device's key is of
+    /// a role, and a role's certificate may lapse.
+    pub(crate) fn role_layout(&self, device: &Name, space: &Name) -> bool {
+        self.view_for(device, space, true)
+            .keyring()
+            .context_for(device)
+            .schema_is_authoritative()
+    }
+
     /// The revocations of the context that governs `person` for `space` that
     /// name a key under her namespace: what a reader's lost devices are.
     pub(crate) fn revoked_under(&self, person: &Name, space: &Name) -> Vec<Name> {

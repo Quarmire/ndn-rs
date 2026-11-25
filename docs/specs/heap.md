@@ -1443,8 +1443,17 @@ node cannot vouch for that key any more, and a key nobody can vouch for is
 re-keyed rather than trusted. The epoch is signed once for the devices owed at the
 time, they leave the record, and a device that renews asks again and is granted
 the new epoch. The epoch signed on the lapse is owed on the clock and the
-certificates **this owner device** holds: a lapse that another node's clock sees,
-or a device it never granted a key to, owes nothing here.
+certificates **this owner device** holds: a lapse that another node's clock sees
+owes nothing here. **Only an owner device gives a key** where the asker's
+namespace declares the role layout (stage-7 L7, `GranterNotOwnerDevice`): a reader's
+device that holds the key but is no owner device keeps no record, so a key it gave
+would be rotated by no device when the asker's certificate lapsed; it refuses, says
+so and tells the asker to ask an owner's `admin` or `member` device, the epoch's
+creator first (the reader side asks the others in turn). **Accepted residual:** in a
+flat namespace (no signed role layout) a reader device still hands the key on, and
+that key is tracked by no owner device: it is rotated only when a change of members
+or a loss owes an epoch. A flat namespace tells its devices apart by no role, which
+is also why the grant has no role rule there (§2.1).
 
 Why the exchange is one: an ask that made the granter fetch the asker's seal key
 packet put two exchanges inside one Interest lifetime (the ask, the granter's
@@ -2340,6 +2349,34 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   and a mark made on one owner device does not reach the others, so a thief of a
   reader's key is still granted by owner and reader devices that have not marked it
   until the revocation reaches them.
+- **Lost keys cannot force epochs without limit (stage-7 L6).** Every epoch makes
+  each reader device ask again and the log keeps it for good, and an admitted
+  reader who is also a writer can lose keys at will: she mints a key and has it
+  sign two entries at one seq (each equivocation suspects that key), or issues
+  short-lived certificates (each lapse). Three bounds, all cost bounds, none a
+  verdict:
+  - **One epoch per 10 minutes.** An owner device signs at most one epoch per space
+    for lost keys (revoked, suspected or lapsed, §6.6, §9.8) per
+    `LOSS_EPOCH_INTERVAL_MS` = 10 minutes by its clock. The losses that fall inside
+    the interval stay owed, are folded into the one epoch that follows it (it
+    accounts for every key lost when it is signed, `revoked/<S>`) and are rotated
+    when the interval ends, picked up by the next sweep (`lapse_sweep`, 60 s): a
+    lost key is never left un-rotated, it holds the key in force for at most
+    10 minutes more after the node knows of it. Ten minutes bound a burst to 144
+    epochs a day for a space and still leave a thief's reading short. An epoch for
+    a change of members is not delayed by it, and takes the debts into account
+    when it is signed. The time of the last such epoch is in memory: a restart
+    allows one more.
+  - **16 automatic suspicions per person.** An equivocation of a key marks it
+    (§3.7) while fewer than 16 keys of its person are marked here, the host's own
+    marks counted (`SUSPECTS_PER_PERSON`); past that the equivocation is still told
+    (`Equivocation`, both packets kept) and nothing more is marked, so neither the
+    map nor the epochs it owes grow with her keys. A person who forks that many
+    keys is removed by the owner, whose removal cut judges all her entries (§9.6);
+    a revocation of a marked key frees its place.
+  - **Accepted residual:** a key beyond the 16 is not refused its new entries by
+    the mark, and only an owner's removal or revocation ends it, as for any
+    writer who mints keys.
 - **The owner rule's second half is checked.** An owner device is a key whose
   device lies under the owner's namespace by name **and** whose person is the
   owner (§2.1). A `Members` or `Epoch` entry is refused (`NotMember`) unless its
@@ -2382,13 +2419,15 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   are now granted to her `admin` and `member` devices only, and so are signals
   (§6.5 condition 2, §11.1). Her guest and node devices still **write** where the
   record admits her (the entries are the person's, §3.8) and are told, by the
-  refusal, to read from an `admin` or `member` device. What remains: a key
-  already granted stays known to the device until the next epoch; a lapse is
-  judged by each node's clock, so an owner device owes the rotation only on the
-  clock and the certificates it holds and only for the devices it granted keys to
-  (a key another device granted is rotated when that device's owner device sees
-  the lapse, or on any other change of members); a flat namespace has no roles
-  to tell devices apart by, and is as before.
+  refusal, to read from an `admin` or `member` device. Every key given in such a
+  namespace is given by an owner device, which records it (§6.5, stage-7 L7), and
+  the record keeps the carried chain and is bounded per person (N1, N2). What
+  remains: a key already granted stays known to the device until the next epoch;
+  a lapse is judged by each node's clock, so an owner device owes the rotation only
+  on the clock and the certificates it holds (carried with the ask and stored with
+  the record) and only for the devices it granted keys to; a grantee it cannot
+  judge for 5 sweeps in a row owes the epoch too; a flat namespace has no roles to
+  tell devices apart by, and is as before.
 - **A node serves any certificate it vouched for (accepted residual, review
   I3).** `<D>/32=held/<certificate name>` answers a certificate its validator
   vouched for (§7.6, `Judge::held_certificate`), which lets a prober who names
