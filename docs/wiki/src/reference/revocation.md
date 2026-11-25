@@ -74,7 +74,8 @@ into, the runs of its log entries that stay valid
 (`<device>/32=log/<collection>/seq=<n>`, and `<device>/32=log/seq=<n>` for
 snapshots), the digest of the key's public key (`CutKeyDigest`), and the
 full name of a **manifest** (`CutManifest`) listing the implicit digest of
-every entry the runs cover. Every other packet of the key — a later entry,
+every entry the runs cover — or, instead of runs and a manifest, one **tip**
+per log (`CutTip`, [below](#tips-cut)). Every other packet of the key — a later entry,
 a backdated one, an entry at an accepted seq in another collection, other
 bytes at an accepted name, its summaries — is refused, and so is anything
 a certificate of the key's name with another public key would verify.
@@ -139,14 +140,52 @@ never what a summary only listed, and never what it first saw later.
 A thief's writes the root verified before the time you give stay valid,
 so give the earliest moment the phone may have been out of your hands.
 
-A cut is added only in the version that revokes its key, and its runs, key
-digest and manifest never change afterwards; a cut for a key the version
+A cut is added only in the version that revokes its key, and its runs, tips,
+key digest and manifest never change afterwards; a cut for a key the version
 does not newly revoke, one listing a name outside the key's device log
 `<device>/32=log`, a new cut without a key digest, or one with runs and no
-manifest is refused (`cut-refused`). The root device serves the manifest
-from the moment it publishes the version, and every node that keeps the
-trust context fetches and serves it too; a reader fetches the in-cut
-entries by full name from it, so only the honest bytes can answer.
+manifest is refused (`cut-refused`; a cut of tips needs no manifest). The
+root device serves a manifest from the moment it publishes the version, and
+every node that keeps the trust context fetches and serves it too; a reader
+fetches the in-cut entries by full name from it, so only the honest bytes can
+answer. A cut of tips has no manifest to serve.
+
+<a id="tips-cut"></a>**Tips cut.** A cut may name each log by one tip instead
+of a manifest of every entry. Make it with `--tips` (the same `cut` verb, in
+`ndn-heap`):
+
+```sh
+ndn-heap cut /home/rv/member/phone/KEY/4c60a77af0f3ce14 phone.cut --held-before <ms> --tips
+ndn-fwd revoke /home/rv/member/phone/KEY/4c60a77af0f3ce14 --cut phone.cut --lost <ms> -c root.toml
+```
+
+`--held-before` and `--upto` bound the cut as before. For each log (space)
+of the key the cut names one tip (`<device>/32=log/<space>`, the seq, the
+SHA-256 of the entry's signed region): the **highest kept entry whose chain
+below it is wholly kept** — each entry names its predecessor by signed
+digest, and the root device must hold and keep every one of them. The kept
+entries that are not on that chain are listed as left out, like those the
+bound excludes, for you to look at; `revoke` prints them as `left_out`. The
+cut file holds the cut TLV with its tips and no manifest packets, so `revoke`,
+`end-keys`, `recover --cut` and `readmit` take it unchanged.
+
+What the cut accepts: an entry of the key at a seq below a tip, by name; the
+tip itself only with its signed-region digest; nothing above a tip.
+Because the digest is of the signed region, not the whole packet, a relay's
+high-S copy of an ECDSA entry (the same signature with `s` replaced by `n−s`
+also verifies) is accepted too, where a manifest, which lists whole-packet
+digests, refuses it: a tips cut closes that gap. A tip binds names, not bytes
+below it: the validator and a forwarder's cache hold one packet and cannot
+check that a below-tip packet is the entry the key signed in its log. The
+ends decide: a node's data layer (`ndn-heap`) keeps an entry of a tip-cut key
+only if it is a chain ancestor of the tip, and refuses any other (`OutsideCut`).
+An application that reads Data below a tip without the data layer relies on
+the name alone for those names. To bring back an entry above a tip, re-admit
+it by full name ([below](#re-admitting-a-version)); a name the cut accepts
+already is not added again. Old cuts, with runs and a manifest, still decode
+and are judged exactly as before; a node too old to know `CutTip` reads a
+tips cut as accepting nothing it names, so it refuses more, never less, until
+it is updated.
 
 **Validity periods.** Data is judged without the validity period of any
 certificate: the certificate proves the key was authorized, the cut proves
@@ -210,13 +249,14 @@ as `revoke` does and prints `namespace`, `key`, one `readmitted = <name>`
 per name (`(already)` for one the cut holds), `trust_context = vN -> vN+1`
 and `handed_over`. It signs `N+1` adding those names, digest included, to
 the key's cut (`ndn_cert::bump_context_readmitting`).
-Only those bytes at those names come back: never a range, a neighbouring
+Only those bytes at those names come back: never a range, a tip, a neighbouring
 seq or other bytes at the name. Every device that holds or follows them
 then applies them. Refused: a key revoked without a cut
 (`readmit-no-cut`: revoke it with a cut first — which is possible only in
 the version that revokes it), a name without a 32-octet digest or outside
-the key's device log (`readmit-refused`); names already in the cut are
-nothing to sign (`nothing-to-sign`).
+the key's device log (`readmit-refused`); names already in the cut — also,
+in a [tips cut](#tips-cut), a name below a tip, or the tip with its digest —
+are nothing to sign (`nothing-to-sign`).
 
 ## After a recovery
 
@@ -275,8 +315,8 @@ The command, before asking for any secret:
 3. Keys the held version revokes already are not added again; when it
    revokes all of them, nothing is signed and the command says so.
    With `--cut`, the file must hold one `RevocationCut` whose key is one of
-   the keys this version newly revokes, with a key digest, a complete
-   manifest when it has runs, and a bound no later than the loss time
+   the keys this version newly revokes, with a key digest, its manifest
+   when it has runs (a cut of tips needs none), and a bound no later than the loss time
    answered (`cut-refused` otherwise, `why` saying which).
 4. When a daemon listens on the management socket, checks it uses the same
    PIB (`security/identity-status` `pib_path=`).
@@ -374,8 +414,9 @@ still reaches what is cached, through a stamp on each entry:
   (`Keyring::revocation_epoch`, moved after the new version is in force).
   A version revokes something when it revokes a new key name, and also
   when it accepts less than the version before: a cut removed or shrunk, a
-  re-admitted name dropped, a cut's key digest or manifest added, removed
-  or changed, or a role newly listed in `DataRequiresCut`. The
+  re-admitted name dropped, a tip dropped, lowered or changed, a cut's key
+  digest or manifest added, removed or changed, or a role newly listed in
+  `DataRequiresCut`. The
   validation stage reads the count before it validates a Data packet, and the
   CS insert stage stores it with the entry.
 - On every CS hit, the lookup compares the entry's stamp with the current
@@ -387,7 +428,9 @@ still reaches what is cached, through a stamp on each entry:
   a trust anchor without passing a revoked key or certificate — except that
   the key that signed the entry itself may be revoked when the held
   context's cut of that key accepts the entry (the same durable rule a
-  fresh validation applies, key digest and manifest included) — and it is
+  fresh validation applies, key digest and manifest or tips included: below
+  a tip by name, which the data layer binds to the tip by chain ancestry
+  where the cache cannot) — and it is
   no certificate of a key
   revoked without a cut. Certificates of a key revoked with a cut are kept,
   for the in-cut Data. Validity periods are not checked: an expired
@@ -461,8 +504,8 @@ and follows the stored context again when it next starts.
 | Part | Where |
 |---|---|
 | Revocation check in the chain walk (prefix match) | `ndn_security::SignedTrustContext::is_revoked`, `validator/chain.rs` |
-| Durable walk for Data (no validity periods but `DataRequiresCut`'s refusal; the signing key excused in its cut when key digest and manifest agree) | `ndn_security::Validator::{validate_durable, validate_durable_cached}`; `SignedTrustContext::{refuses_data, revocation_cut, revocation_cuts, with_revocation_cut, data_requires_cut, requires_cut_for}`; `ndn_security::{RevocationCut, CutRange, public_key_digest, chain_clear}`; manifests `ndn_security::cut_manifest` (`CutManifests`, `build`, `lookup`); keys to end `ndn_cert::ending_keys`, `ndn_namespace::root::end_keys` |
-| Making a cut | `ndn_data::Device::{revocation_cut, suspect, unsuspect, suspected}`, `ndn_data::{CutBound, CutProposal}`; the cut file `ndn_cert::CutFile` (`ndn-cert/src/cut_file.rs`); host verbs `suspect`, `unsuspect`, `cut` (`ndn-tools/src/data.rs`); refused versions to re-admit: `ndn_data::Device::refused_by_revocation` |
+| Durable walk for Data (no validity periods but `DataRequiresCut`'s refusal; the signing key excused in its cut when key digest and manifest or tips agree) | `ndn_security::Validator::{validate_durable, validate_durable_cached}`; `SignedTrustContext::{refuses_data, revocation_cut, revocation_cuts, with_revocation_cut, data_requires_cut, requires_cut_for}`; `ndn_security::{RevocationCut, CutRange, CutTip, public_key_digest, chain_clear}`, tips `RevocationCut::{add_tip, tips, tip_for}`; manifests `ndn_security::cut_manifest` (`CutManifests`, `build`, `lookup`); keys to end `ndn_cert::ending_keys`, `ndn_namespace::root::end_keys` |
+| Making a cut | `ndn_data::Device::{revocation_cut, suspect, unsuspect, suspected}`, `ndn_data::{CutBound, CutProposal}`; the cut file `ndn_cert::CutFile` (`ndn-cert/src/cut_file.rs`); host verbs `suspect`, `unsuspect`, `cut` (`ndn-tools/src/data.rs`); refused versions to re-admit: `ndn_data::Device::refused_by_revocation`; a tips cut: `ndn_heap::CutBound { tips: true, .. }`, `ndn_heap::Node::revocation_cut`, `ndn-heap cut … --tips` |
 | Re-admission | `ndn_namespace::root::readmit::{plan, readmit}`; `ndn_cert::{readmissions_to_add, bump_context_readmitting, device_log_of, split_full_name}`; CLI `ndn-fwd readmit` |
 | Re-certifying cut keys after a recovery | `ndn_cert::{recertify_cut_keys, recertify_cut_keys_in_pib}`, `RecoveredNamespace::{recertified, record_recertified}`; `ndn_namespace::root::recover::recertify`; CLI `ndn-fwd recertify` |
 | Key name of a certificate name | `ndn_cert::key_name_of` |

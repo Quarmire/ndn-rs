@@ -29,8 +29,10 @@ version by version when the newest is not signed by an anchor of the version
 it holds (a recovery installed a new root in between; see
 [catching up](./context-updates.md#catching-up-across-versions)). A node
 keeping a version also fetches, stores and serves the manifest packets of
-its cuts (`ndn_namespace::cut_manifests`), so a reader can check an in-cut
-entry's bytes when the root device is offline.
+its cuts that have a manifest (`ndn_namespace::cut_manifests`), so a reader
+can check an in-cut entry's bytes when the root device is offline. A cut that
+names [tips](./revocation.md#tips-cut) and no manifest has no such packets:
+it is wholly inside the context Data.
 
 The metadata Content carries no segment fields: a context is one Data packet.
 `ndn_app::rdr::MetaData` encodes and decodes both this Name-only form and the
