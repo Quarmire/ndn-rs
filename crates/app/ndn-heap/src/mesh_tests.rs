@@ -28,6 +28,9 @@ mod net;
 #[path = "host_tests.rs"]
 mod host;
 
+#[path = "mesh_durable_tests.rs"]
+mod durable_default;
+
 /// Devices on one forwarder; the sync group of every namespace is carried.
 struct Mesh {
     engine: ForwarderEngine,

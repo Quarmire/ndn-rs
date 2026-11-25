@@ -973,6 +973,24 @@ entry's key check (§6.2); otherwise it is dropped.
   structural change (`change`, `create`) always returns after the
   flush that covers it; the entry is then free for the publisher to release
   (§4.6).
+
+  **A reader that has announced itself is not a peer here, and `no_peers` does not count it.**
+  The default exists for one case: a power cut loses the window, and the device's own
+  lost entries come back from a peer that holds them (§4.8). That peer is a device the log
+  vouches for, since recovery asks only the heard members whose signed entries are held
+  (§7.4 `source`, the `relays` of §7.2), and the device holds nothing signed by a reader
+  that never writes: the reader's announcement is a counter of 0 in an unsigned vector (a
+  device at counter 0 is not even kept as heard), which anyone can send under any name, and
+  that it fetches the writer's entries is no evidence either (the fetch is an anonymous
+  Interest; whether the fetcher stores and serves what it got is unsaid). Counting such a
+  device would make a lone writer non-durable on the word of a forged or silent name, and
+  the entries lost at a power cut would be ones nobody that recovery asks holds. So the
+  lone writer's default `put` keeps its flush (about 1.8 ms at 1 KiB on the ladder's
+  disk), and returns without it once another device's admitted entry is held — the writer
+  has then a vouched peer of the kind recovery asks. A host
+  that accepts the window with only readers around passes `durable: Some(false)`; the
+  announcement of the entry never waits for the flush either way (§4.6), so the flush
+  is in the `put` call and not in the time a reader needs to see the value.
 - **`Node::flush()`** waits for a flush covering everything written so far and
   returns the sticky error if there is one.
 - **`Node::close`** and **`Node::shutdown`** are §4.5, rule 4.
