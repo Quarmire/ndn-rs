@@ -175,8 +175,11 @@ impl Link {
         self.state.lock().ready.len()
     }
 
-    /// The next datagram, as the receiver sees it (after loss, duplication and reordering).
+    /// The next datagram, as the receiver sees it (after loss, duplication and reordering). The
+    /// callbacks the sender asked for are made first, as a carrier's writer task makes them
+    /// whether or not anything arrives (a datagram lost on the way must not stall the sender).
     pub(crate) fn pop_datagram(&self) -> Option<Bytes> {
+        self.run_ready();
         let frame = self.state.lock().datagrams.pop_front();
         if frame.is_some() {
             self.run_ready();
@@ -291,18 +294,9 @@ impl Carrier for Link {
         })
     }
 
+    /// Served by the next `pop_datagram` or `set_full(false)` that finds room, never from inside
+    /// this call: a carrier's writer task calls the closure, not the emitter that asked.
     fn on_ready(&self, drain: Box<dyn FnOnce() + Send>) {
-        let now = {
-            let mut st = self.state.lock();
-            if st.has_room() {
-                Some(drain)
-            } else {
-                st.ready.push(drain);
-                None
-            }
-        };
-        if let Some(drain) = now {
-            drain();
-        }
+        self.state.lock().ready.push(drain);
     }
 }

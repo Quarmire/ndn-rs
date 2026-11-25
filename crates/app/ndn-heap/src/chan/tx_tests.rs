@@ -178,6 +178,7 @@ async fn settle(tx: &Arc<TxChannel>) {
         if tx.is_idle() {
             return;
         }
+        tx.call_back();
         tokio::task::yield_now().await;
     }
     panic!("the channel did not go idle: {} waiting", tx.pending());
@@ -318,6 +319,67 @@ async fn one_message_leaves_alone_when_idle_and_messages_pack_when_busy() {
     assert!(
         counts[..counts.len() - 1].iter().all(|c| *c > 1),
         "a busy writer packs: {counts:?}"
+    );
+}
+
+/// An emitter that does not stop between two emissions (a loop) must not make a frame of one for
+/// each: the first leaves at once, the carrier is asked to call back, and the rest wait for that
+/// call and leave together. (An idle link keeps its one-message latency; a loop gets the batch.)
+#[tokio::test]
+async fn emissions_made_back_to_back_leave_in_one_frame_behind_the_first() {
+    let mut rig = rig(
+        ChannelMode::Latest,
+        LinkConfig {
+            datagram_capacity: 1_000_000,
+            ..LinkConfig::default()
+        },
+    );
+    let latest = EmitOptions::latest();
+    prebind(&mut rig, 0..14).await;
+    for i in 0..14 {
+        send(&rig, &name(i), &[7u8; 64], &latest, at(&rig, 10)).await;
+    }
+    assert_eq!(
+        rig.link.queued_datagrams(),
+        1,
+        "the first left inline; the other 13 wait for the carrier to call back"
+    );
+    assert_eq!(rig.link.waiting_drains(), 1, "one call back is asked for");
+    let seen = datagrams(&mut rig);
+    assert_eq!(
+        data_counts(&seen),
+        [1, 13],
+        "the first alone, then the rest in one frame"
+    );
+    assert_eq!(rig.link.waiting_drains(), 0);
+    // And after the carrier called back, the next emission is a first again: inline.
+    send(&rig, &name(0), &[7u8; 64], &latest, at(&rig, 11)).await;
+    assert_eq!(rig.link.queued_datagrams(), 1);
+    assert_eq!(data_counts(&datagrams(&mut rig)), [1]);
+}
+
+/// The cost of an emission is bounded by what the design says: the path is hashed once by the
+/// name table, not once to find the id and again to use it.
+#[tokio::test]
+async fn an_emission_hashes_its_path_once() {
+    let mut rig = rig(
+        ChannelMode::Latest,
+        LinkConfig {
+            datagram_capacity: 1_000_000,
+            ..LinkConfig::default()
+        },
+    );
+    let latest = EmitOptions::latest();
+    prebind(&mut rig, 0..1).await;
+    let before = rig.tx.table_lookups();
+    for k in 0..10 {
+        send(&rig, &name(0), &[7u8; 64], &latest, at(&rig, 10 + k)).await;
+        settle(&rig.tx).await;
+    }
+    assert_eq!(
+        rig.tx.table_lookups() - before,
+        10,
+        "one hash of the path for each of 10 emissions"
     );
 }
 
@@ -1239,8 +1301,12 @@ struct Void {
 impl Void {
     /// The carrier is ready: call the drains it was given.
     fn fire(&self) {
-        let ready = std::mem::take(&mut *self.ready.lock());
-        for drain in ready {
+        // Those waiting now: a drain that asks again (the carrier is full again) waits for the
+        // next call, and the lock is not held while a drain runs.
+        let waiting = self.ready.lock().len();
+        for _ in 0..waiting {
+            let next = self.ready.lock().pop();
+            let Some(drain) = next else { break };
             drain();
         }
     }
@@ -1307,18 +1373,21 @@ async fn the_64_byte_latest_path_allocates_nothing_per_message_beyond_the_frame(
         tx.emit(&path, &payload, &latest, rig.t0 + Duration::from_secs(i))
             .await
             .unwrap();
+        void.fire();
     }
     for _ in 0..50 {
         tokio::task::yield_now().await;
     }
     let now = rig.t0 + Duration::from_secs(100);
     // One message, idle: one frame, which is two allocations (its buffer, and the shared header
-    // `Bytes` that freezing it adds): nothing for the message, the queue, the ring or the seal.
+    // `Bytes` that freezing it adds), and one for the call back it asks of the carrier (the box
+    // of its closure): nothing for the message, the queue, the ring or the seal.
     let (_, one) = count_allocations(|| poll_once(tx.emit(&path, &payload, &latest, now)).unwrap());
     assert_eq!(
-        one, 2,
-        "an idle 64 B message allocates exactly its frame (2)"
+        one, 3,
+        "an idle 64 B message allocates exactly its frame (2) and its call back (1)"
     );
+    void.fire();
     // A busy writer: 14 distinct names wait while the carrier is full, then leave in one frame:
     // still two allocations for all 14 messages.
     let names: Vec<Name> = (10..24).map(name).collect();

@@ -485,6 +485,11 @@ impl TxChannel {
     /// the stream's writer task, and is not sent when the carrier has no stream, when no receiver
     /// holds the channel, or when `key` is not this channel's.
     pub(crate) fn end(self: &Arc<Self>, key: &SendKey) {
+        // What waits for the carrier's call back goes now: a close is told after the messages
+        // that were emitted before it.
+        if let Some(carrier) = self.slot.get() {
+            self.drain_from_carrier(&carrier);
+        }
         let stream = self.slot.get().is_some_and(|c| c.has_stream());
         let spawn = {
             let mut st = self.state.lock();
@@ -747,7 +752,8 @@ impl TxChannel {
         }
 
         // Nothing can refuse the emission now.
-        let used = match st.table.touch(path, now) {
+        // The id `peek` read under this same lock: the path is not hashed again.
+        let used = match peeked.and_then(|(id, _, _)| st.table.touch_id(id, now)) {
             Some(used) => used,
             None => {
                 let octets = fresh_octets.unwrap_or_else(|| table::name_octets(path));
@@ -880,7 +886,17 @@ impl TxChannel {
             }
             let mut packed = match self.pack_datagram(carrier, shrunk) {
                 Pack::Frame(p) => p,
-                Pack::Idle | Pack::Gone => return,
+                Pack::Gone => return,
+                Pack::Idle => {
+                    // An emitter wrote and nothing else waits: the emissions that follow without
+                    // the emitter stopping (a loop) must not each be a frame of one. They queue
+                    // behind a call back the carrier makes from its own writer task, and leave
+                    // together. The first of a burst keeps the idle link's latency.
+                    if inline && frames > 0 {
+                        self.request_drain(carrier);
+                    }
+                    return;
+                }
             };
             let count = packed.writer.len();
             let seq0 = packed.seq0;
@@ -1525,6 +1541,21 @@ impl TxChannel {
             && !st.stream_writing
     }
 
+    /// The carrier calls back, as its writer task does (a test stands in for that task).
+    #[cfg(test)]
+    pub(crate) fn call_back(self: &Arc<Self>) {
+        if let Some(carrier) = self.slot.get() {
+            let generation = self.slot.generation();
+            let _ = self.drain_requested.compare_exchange(
+                generation,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.drain_from_carrier(&carrier);
+        }
+    }
+
     /// Messages waiting in the queues (a test asks).
     #[cfg(test)]
     pub(crate) fn pending(&self) -> usize {
@@ -1542,6 +1573,12 @@ impl TxChannel {
     #[cfg(test)]
     pub(crate) fn names(&self) -> usize {
         self.state.lock().table.len()
+    }
+
+    /// How many times the name table hashed a name (a test asks).
+    #[cfg(test)]
+    pub(crate) fn table_lookups(&self) -> u64 {
+        self.state.lock().table.lookups()
     }
 }
 
@@ -1573,7 +1610,7 @@ pub(crate) struct Tx {
     pub(crate) carrier: Arc<CarrierSlot>,
     /// What the frame layer counted.
     pub(crate) stats: Arc<TxStats>,
-    channels: parking_lot::RwLock<std::collections::HashMap<Name, [Option<Arc<TxChannel>>; 3]>>,
+    channels: parking_lot::RwLock<super::FastMap<Name, [Option<Arc<TxChannel>>; 3]>>,
 }
 
 fn index(mode: ChannelMode) -> usize {

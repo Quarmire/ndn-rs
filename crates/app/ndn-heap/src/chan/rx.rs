@@ -22,7 +22,7 @@
 //! handed in. No timer task runs: the hold is swept by frames, by `Items` polls and by the node's
 //! maintenance pass.
 
-use std::collections::HashMap;
+use super::FastMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -810,7 +810,7 @@ impl ChannelRx {
 /// What a node's receiver holds: the channels it takes frames of and the `Items` it pushes to.
 #[derive(Default)]
 pub(crate) struct Receivers {
-    channels: Mutex<HashMap<u64, Arc<ChannelRx>>>,
+    channels: Mutex<FastMap<u64, Arc<ChannelRx>>>,
     sinks: Mutex<Vec<Arc<Sink>>>,
     /// Moves whenever `sinks` does, so a channel knows its cached list is stale.
     generation: AtomicU64,

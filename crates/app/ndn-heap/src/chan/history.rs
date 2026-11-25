@@ -3,7 +3,7 @@
 //!
 //! Both are pure state; every operation takes the instant it happens at.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -108,7 +108,7 @@ pub(crate) enum StandFull {
 /// The last emission of each name that stood, until its lifetime passes.
 #[derive(Default)]
 pub(crate) struct Standing {
-    by_name: HashMap<Bytes, Stood>,
+    by_name: super::FastMap<Bytes, Stood>,
     bytes: usize,
 }
 
@@ -183,6 +183,10 @@ impl Standing {
 
     /// The last emission of `name` did not stand: nothing of it stands any more.
     pub(crate) fn clear(&mut self, name: &[u8]) {
+        // Nothing stands for most paths: such an emission hashes nothing here.
+        if self.by_name.is_empty() {
+            return;
+        }
         if let Some(gone) = self.by_name.remove(name) {
             self.bytes -= gone.payload.len();
         }

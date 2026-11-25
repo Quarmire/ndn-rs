@@ -40,6 +40,11 @@ pub(crate) mod varint;
 pub(crate) mod verbs;
 pub(crate) mod wire;
 
+/// The map of the per-message paths. A path, an id or a name is hashed on every message and
+/// SipHash took a fifth of the sender's CPU; `foldhash` is seeded per map, as SipHash is, and the
+/// keys are the device's own or were authenticated before they were inserted.
+pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
+
 #[cfg(test)]
 mod setup_tests;
 

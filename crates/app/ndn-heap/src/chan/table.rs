@@ -12,7 +12,7 @@
 //!
 //! The table is pure state: every operation takes the instant it happens at.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -98,13 +98,16 @@ pub(crate) struct Bound {
 /// The table.
 #[derive(Default)]
 pub(crate) struct Table {
-    by_name: HashMap<Name, u64>,
+    by_name: super::FastMap<Name, u64>,
     /// Index = id; slot 0 is never used.
     entries: Vec<Option<Entry>>,
     live: usize,
     /// Ids freed, oldest first.
     free: VecDeque<u64>,
     last_sweep: Option<Instant>,
+    /// Hashes of a name made by this table (a test counts them).
+    #[cfg(test)]
+    lookups: std::sync::atomic::AtomicU64,
 }
 
 impl Table {
@@ -118,10 +121,24 @@ impl Table {
         self.entries.get_mut(id as usize)?.as_mut()
     }
 
+    /// The id `name` is bound to: the table's one hash of a name.
+    fn id_of(&self, name: &Name) -> Option<u64> {
+        #[cfg(test)]
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.by_name.get(name).copied()
+    }
+
+    /// How many times the table hashed a name (a test asks).
+    #[cfg(test)]
+    pub(crate) fn lookups(&self) -> u64 {
+        self.lookups.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// What [`Self::touch`] would answer for `name` at `now`, changing nothing: the id, whether
     /// the message would carry the name, and the octets of the name.
     pub(crate) fn peek(&self, name: &Name, now: Instant) -> Option<(u64, bool, usize)> {
-        let id = *self.by_name.get(name)?;
+        let id = self.id_of(name)?;
         let entry = self.entries.get(id as usize)?.as_ref()?;
         let early = now.saturating_duration_since(entry.bound_at) < BIND_WINDOW;
         Some((id, entry.named_left > 0 || early, entry.octets.len()))
@@ -130,7 +147,12 @@ impl Table {
     /// The id of `name` if it is bound, marked used at `now`, and whether this message carries the
     /// name.
     pub(crate) fn touch(&mut self, name: &Name, now: Instant) -> Option<Use> {
-        let id = *self.by_name.get(name)?;
+        let id = self.id_of(name)?;
+        self.touch_id(id, now)
+    }
+
+    /// [`Self::touch`] for an id that was just read from [`Self::peek`] under the same lock.
+    pub(crate) fn touch_id(&mut self, id: u64, now: Instant) -> Option<Use> {
         let entry = self.entry_mut(id)?;
         entry.last_used = now;
         let early = now.saturating_duration_since(entry.bound_at) < BIND_WINDOW;

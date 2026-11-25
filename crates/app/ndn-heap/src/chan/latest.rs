@@ -15,7 +15,11 @@
 //!   in [`Coalescing::take_missed`]: that is local overload, and the consumer is told it was
 //!   behind (`Lagged`). Replacing a message of a pair is not counted: coalescing is the mode.
 
-use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::VecDeque;
+
+use super::FastMap;
 
 /// The most pairs queued at once per `Items`.
 pub(crate) const PAIRS_MAX: usize = 4_096;
@@ -52,7 +56,7 @@ struct Slot<T> {
 
 /// The queue.
 pub(crate) struct Coalescing<T> {
-    slots: HashMap<Pair, Slot<T>>,
+    slots: FastMap<Pair, Slot<T>>,
     /// The pairs with a queued message, oldest first. Each appears once.
     order: VecDeque<Pair>,
     max: usize,
@@ -63,7 +67,7 @@ impl<T> Coalescing<T> {
     /// An empty queue of at most `max` pairs.
     pub(crate) fn new(max: usize) -> Self {
         Self {
-            slots: HashMap::new(),
+            slots: FastMap::default(),
             order: VecDeque::new(),
             max: max.max(1),
             missed: 0,

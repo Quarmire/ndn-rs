@@ -13,7 +13,7 @@
 //! A frame under a key epoch the session does not hold calls [`RecvSessions::unknown_epoch`], which
 //! says whether to ask the sender again: at most once a second per sender.
 
-use std::collections::HashMap;
+use super::FastMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -441,8 +441,8 @@ pub(crate) enum Unknown {
 
 #[derive(Default)]
 struct Store {
-    by_id: HashMap<u64, Arc<RecvSession>>,
-    asked_for_epoch: HashMap<Name, Instant>,
+    by_id: FastMap<u64, Arc<RecvSession>>,
+    asked_for_epoch: FastMap<Name, Instant>,
 }
 
 /// The sessions this device holds as a receiver.
