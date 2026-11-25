@@ -401,6 +401,29 @@ pub type Adopting<'a> = futures::future::LocalBoxFuture<'a, Result<(), String>>;
 /// device's anchor link, adopt another person's, dial the inviter, and tell its link
 /// layer of grants, departures and joined spaces. Adopting a namespace for one
 /// space alone is the node's ([`ndn_heap::Adopter`]), not the host's here.
+///
+/// # Ownership
+///
+/// Who holds whom, so that a host written the natural way keeps nothing alive:
+///
+/// - [`Invites`](crate::Invites) hold the host **strongly** (`Invites::start`'s `Arc<dyn Host>`),
+///   and the node's judge may hold it too, as its [`ndn_heap::Adopter`]. The host is therefore
+///   alive for as long as the invitations or the node are.
+/// - The host holds what it forwards to (a link layer's hints, a forwarder's handle): those must
+///   not hold the invitations or the node back. `ndn_link::LinkHints` holds its links
+///   **weakly**, and the links hold the invitations' [`Surface`](crate::Surface) (the invitations'
+///   state held weakly), so the host may keep its hints in a field written after the links start
+///   (`Intro.hints = LinkHints::new(links.clone())`) and no chain leads from the links back to
+///   the host, the invitations or the node. A host that keeps its own handle on the invitations
+///   or on a [`ndn_heap::NodeHandle`] holds the node, and so its store, for as long as it lives:
+///   keep a `Weak`, or drop the host after the node is closed.
+/// - The invitations hold the node through a [`ndn_heap::NodeHandle`] (the store stays locked
+///   while any handle lives) and keep their tasks on the node ([`ndn_heap::NodeHandle::spawn`]):
+///   [`ndn_heap::Node::close`] ends those, and returns once they have ended. After it returns,
+///   dropping the last of the invitations and the host releases the store; nothing else of
+///   them runs.
+/// - A call into a host whose links are gone fails closed and says why (`ndn_link::LinkHints`
+///   refuses a dial with "the device's links are closed", gives no hint, installs no grant).
 pub trait Host: Send + Sync {
     /// The signed trust-context Data of this device's namespace, whole, as the host
     /// adopted it (what an inline anchor link carries).
