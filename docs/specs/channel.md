@@ -1,6 +1,6 @@
 # Channel: ephemeral live data over a space
 
-- **Status:** stage 2 built: the setup (names, the ask, the session, judging at both ends, renewal, re-keying, ending, the announce, limits and refusals, the setup TLVs and their vectors). Stage 3 part 1 built: the frame (§11: header, key schedule and seal, messages, kinds, limits, short frames on L2, vectors, threat notes). Batching, the name-id table's use, the modes and the receiver's replay window are added with the rest of stage 3; fan-out in stage 4; checkpoints in stage 5. Where a later stage's text is not here yet, it is not specified yet, and nothing in this file says how it will be.
+- **Status:** stage 2 built: the setup (names, the ask, the session, judging at both ends, renewal, re-keying, ending, the announce, limits and refusals, the setup TLVs and their vectors). Stage 3 part 1 built: the frame (§11: header, key schedule and seal, messages, kinds, limits, short frames on L2, vectors, threat notes). The receiver is built (§12: the order of checks before any cryptography, the replay window, the generation check, key epochs, the name table and its 50 ms hold, `HELLO`, standing values, the queues per mode and the gap rule, `Items`, limits, threat notes); the writer's batching and the modes' sender side are added with the rest of stage 3; fan-out in stage 4; checkpoints in stage 5. Where a later stage's text is not here yet, it is not specified yet, and nothing in this file says how it will be.
 - **Implementation:** `ndn-heap`, module `chan` (`ndn-rs/crates/app/ndn-heap/src/chan/`): `wire.rs` (the records), `answer.rs` (the sender judges), `ask.rs` (the receiver asks and judges), `channels.rs` (the sender's table), `sessions.rs` (the receiver's store), `hub.rs` (the node's state, the announce, the maintenance task), `standing.rs` (membership, shared with signals).
 - **Scope:** an ephemeral **channel**: one device of a writer of a space sends live data (presence, a cursor, a drag) to the devices of the space's readers and writers, without making an entry. This file specifies how a channel is **set up** between two devices by signed NDN: who is answered, how a key reaches only the devices that may hold it, how a session ends, is renewed and is re-keyed; and the **frame** (§11) that carries the data once it is set up: the header, the key schedule and the seal, the messages, the limits and the short-frame rule for raw L2 faces. It builds on [heap.md](heap.md) (names §2, the members record §5, epochs and audiences §6, the lapsed rule §9.3) and uses ndn-link's carrier ([ndn-link.md](ndn-link.md)) for what comes after setup.
 
@@ -421,3 +421,118 @@ Nonce `02000000 1122334455667788`. Frame, 57 octets:
 - **Key material in memory.** The frame key and `K` are zeroed when dropped. `ring` and RustCrypto do not zero their expanded key schedules; a prepared cipher lives no longer than its session.
 - **Length.** A frame's length is visible to a relay. A sender that must hide a message's length pads (§11.3 allows a longer pad).
 - **A malformed frame never panics the receiver.** Every refusal of §11.1 and §11.4 returns an error; the property tests feed arbitrary octets to the opener, the message reader and the routing-header parser.
+
+## 12. The receiver
+
+What a device does with the frames of the sessions it holds as a receiver (§3.4), from the octets the host read to the `Items` of a `live` call (§12.7). Implementation: `ndn-heap`, `chan` (`rx.rs` the frame path, `replay.rs`, `rx_names.rs`, `latest.rs` and `fifo.rs` the queues, `items.rs`).
+
+The host hands the node one whole frame at a time (a datagram, or one frame of the stream) with an opaque id of the face it came over (`NodeHandle::deliver_frame(frame, ingress)`; the id is kept for the evidence of checkpoints, stage 5). Frames of one channel are taken one at a time and in the order they were handed over; frames of different channels do not wait for each other. No timer task runs for the receiver: what must expire is swept by the next frame of the channel, by a poll of an `Items`, and by the node's maintenance pass.
+
+### 12.1 What is checked, in this order
+
+Each row costs at most the work it names, and **a frame that fails a row costs nothing below it**. Rows 1 to 10 are before any cryptography; row 11 is the first.
+
+| # | Check | Refusal (counted) |
+|---|---|---|
+| 1 | at least 46 octets (§11.3) | `short` |
+| 2 | at most 16 MiB + 1 KiB, the largest frame any session may grant (§11.6) | `oversize` |
+| 3 | the header parses (§11.1): marker `0x00` (`marker`), version 1 (`version`), a kind that is assigned, sealed and on its class (`kind`: an unassigned kind, `CHECKPOINT` or `CONTROL` on a datagram, an `UP`), a `count` the kind allows (`count`), a `seq0` and last sequence below 2^63 (`sequence`) | the counter named |
+| 4 | a session of this channel id is held | `unknown_channel` |
+| 5 | the frame is within the limit of its class: a datagram at most the session's `S_FRAME_MAX` (at least 46, at most 16 MiB + 1 KiB), a stream frame at most the larger of 1 MiB + 1 KiB and `S_FRAME_MAX` (§11.6) | `oversize` |
+| 6 | a `Reliable` or `Window` channel's data comes on the stream | `wrong_class` |
+| 7 | **back pressure:** a stream data frame of a `Reliable` or `Window` channel waits while an `Items` that blocks (§12.6) has a full queue | none: the host's read of the stream waits |
+| 8 | the **generation check** (§12.3): the sender still stands | `not_member`, and the session ends |
+| 9 | the session holds the key epoch the header names (§12.3) | `unknown_epoch` (and `epoch_limited`, `epoch_asks`) |
+| 10 | the replay window has not seen `seq0` and has not passed it (§12.2) | `replayed`, `too_old` |
+| 11 | one AEAD attempt under the key of that epoch | `unauthentic`, counted with every attempt in `aead_attempts` |
+| 12 | the tag verified: `seq0` is marked seen (§12.2) | |
+| 13 | the messages parse as a whole, or the `CONTROL` record does (§11.4, §11.5) | `malformed`; nothing of the frame is delivered |
+
+A refused frame changes nothing but a counter, except row 8, which ends the session. Every counter is in the node's channel statistics (`Stats.rx`), and a test reads them: *a flood of junk costs a length test, a header parse or a lookup, never an AEAD attempt.*
+
+### 12.2 The replay window
+
+Each channel has a window of the last **4,096 frame sequences** and a bitmap beside the highest `seq0` marked. Frames are keyed by `seq0`: every frame takes at least one sequence and `seq0` rises for the life of a channel (§11.2), so two frames never share one, and a repeated `seq0` is a repeated frame.
+
+- **Check before the AEAD.** A `seq0` the bitmap has set is `replayed`; one at least 4,096 below the highest is `too_old` (the window cannot say whether it was seen). Both are dropped before any cryptography: a flood of copies of a genuine frame costs a comparison each.
+- **Mark after the AEAD.** `seq0` is marked only once a frame of that sequence **authenticated**. A forged copy of a genuine frame (the same header, an octet of the body changed) fails the AEAD, marks nothing and so cannot burn the genuine `seq0`. A genuine frame that arrives after a forged copy is delivered.
+- **Within a frame** the messages are numbered `seq0` + index (§11.4); the window is not asked about them.
+- **Across sessions** a replayed frame fails the AEAD: a key is fresh for every session and every re-key (§11.2).
+- No clock is read.
+
+### 12.3 The generation check and the key epoch
+
+- **Generation.** A session holds the pair `(trust generation, the space's fold version)` it was judged under, and every frame compares it with the node's by two atomic loads (`is_current`). When either moved, the receiver judges the sender again **before** the frame is looked at further, offline and synchronously: the sender must still be a writer by the entries held and this device a member (§3.6). If it fails, the session ends with `NotMember` and is dropped, the `Items` are told (§12.7), and **the frame is refused**. So the first frame after the node holds the record that removes the sender is refused; frames the sender sent before the record arrived were delivered. The node's maintenance pass makes the same judgement when it runs; whichever notices first ends the session, and later frames find no session (`unknown_channel`).
+- **Key epoch.** The header carries the low octet of the key epoch. The session holds the key of the epoch last given and, for 5 s after the receiver first saw the next epoch, the key before it (§3.6). A frame under an octet the session does not hold is **not tried**: it costs a lookup. The sender is asked again for the session (§3.6), **at most once a second per sender**; frames that arrive meanwhile are dropped (`unknown_epoch`, of which `epoch_limited` did not ask). Nothing is guessed.
+- **Frame limits** and the AEAD are those the session's last answer set.
+
+### 12.4 The name table at the receiver
+
+Each channel has a table from name id to name, filled by the session's table (§3.2), by `BIND` records on the stream, and by `NAMED` messages (the id is bound by the message), emptied by `UNBIND`.
+
+- A `BIND` or a `NAMED` message that binds an id to the octets it already has changes nothing and decodes nothing. Another name replaces the old one and is **another binding** of the id: what is queued under the old binding is not mistaken for the new name's.
+- An id outside 1 to 4,096, or octets that are not a Name's components, are refused (`bad_bind`).
+- **A datagram can overtake the stream.** A message whose bare id the table does not know is **held for 50 ms**. If the bind arrives inside that time (a `BIND` or a `NAMED` message of the id), the message is delivered after it, in the order it was held. If the bind arrives at 50 ms or later, or never, the message is **dropped and counted** (`unknown_name`). At most **64 messages are held per channel**: one that finds 64 held is dropped at once (`hold_full`, and `unknown_name`). A bind that arrives late drops what it finds held instead of delivering it, so the outcome does not depend on when the sweep ran. The hold is swept by the next frame of the channel, by an `Items` poll and by the node's maintenance pass, never by a timer.
+
+### 12.5 `HELLO`, `END` and standing values
+
+- **`HELLO`** records the sequence the sender says its next message takes, and tells every `Items` that takes the channel that **the path works** (`Items::hello_seen`); stage 6's `NoPath` rule reads it. In `Reliable` and `Window` it is also where the receiver's stream begins (§12.6).
+- **`END`** ends the session (`Closed`): the `Items` are told once what they hold has been read, and later frames find no session.
+- **Standing values.** The messages between `STANDING_BEGIN` and `STANDING_END` carry the `STANDING` flag and the original sequence (§11.4). Each is delivered as an emission whose `seq` is the **original** sequence and whose `stands` is its stand seconds (what is left of the stated lifetime). A `STANDING` message outside the bracket is dropped (`standing_stray`). In `Latest` the original sequence is also what a message is compared by (§12.6): a standing value older than a live message of its name is not delivered.
+
+### 12.6 Modes at the receiver
+
+| | `Latest` | `Reliable` | `Window` |
+|---|---|---|---|
+| Frames | datagrams, and the stream for what does not fit one | the stream only | the stream only |
+| Queue | **coalescing:** the newest message per (channel, name binding), a FIFO of the names that have one, at most **4,096 pairs** per `Items` | a FIFO of at most **1 MiB** (`queue_bytes`) per `Items` | as `Reliable` |
+| A newer message of a name | replaces the queued older one in its place | queued after it | queued after it |
+| An older or repeated sequence of a name | dropped, even after the newer was read | n/a | n/a |
+| A gap in `seq0` | none noticed | `Lagged { missed }` in its place | `Lagged { missed }` in its place, and the sender is asked again from the first missing sequence |
+| Queue full | the oldest pair is evicted and counted: `Lagged` | `Block` (default): the stream is not taken until there is room; `Drop`: the oldest messages are discarded and a `Lagged` stands in their place | as `Reliable` |
+
+- **The gap rule.** In `Reliable` and `Window` each stream frame must start where the last one ended: `seq0` equals the previous `seq0` plus the sequences it took (its `count`, or one for a `CONTROL` or `CHECKPOINT` frame). A frame that starts later says that many sequences are missing, and every `Items` that takes the channel is told **in the place** the messages are missing, before the frame's own messages. `missed` counts sequences (a control record takes one like a message does). Where the stream begins is the `seq0` of a first frame that is a `HELLO`; otherwise the sequence the session's answer named (`S_SEQ`), so that frames lost between the answer and the first frame are not silent either. A frame that starts earlier than expected does not move the expectation back.
+- **`Window` asks again.** On a gap the receiver asks the sender for the session again with `ASK_SINCE` = the first missing sequence (a full signed ask, §3.1), at most once a second and never while one is in flight; the sender replays what its window holds from there as `REPLAYED` messages on the stream, under new frame sequences. If the window no longer holds the range, the new session's `S_SEQ` says so and the `Lagged` stands.
+- **`REPLAYED` messages** carry the original sequence. One whose original was **already delivered** is dropped (`duplicates`); one that was not is delivered as an emission whose `seq` is the original. The receiver keeps the delivered sequences as at most 64 ranges; when a new range would pass the bound, the two oldest are joined, which counts the gap between them as delivered: a replay of a message that old is dropped, never repeated.
+- **Coalescing and the bound.** A message is queued under the key (channel, name id, binding). The newest sequence of a key is kept after its message is read, so an older message that arrives later is dropped; those records are forgotten when there are 8,192 of them, so what is forgotten is a name quiet for thousands of other names' messages. A new name when 4,096 are queued evicts the oldest queued name: that is this consumer being slow, and it is told (`Lagged`), unlike a replacement, which is the mode.
+- **The FIFO's bound.** A queued message weighs its payload plus 64 octets, so a flood of empty messages is bounded too. With `Block` the bound is checked before a stream frame is taken, so the queue can pass it by the one frame in hand and never by more. With `Drop` messages are discarded from the front until the new one fits (a message larger than the bound is taken when the queue is empty).
+
+### 12.7 `Items`
+
+`Heap::live(Select, GetOptions)` returns an `Items`, a `Stream` of `Result<Got, GetNotice>` (`GetOptions::kept`, `trust` and the kept values are stage 5 and 6; `live` refuses `Live::Off` and `Trust::Verified`, and a follower).
+
+- **Creating it does no I/O.** It takes every message of every session of the space this device holds, in the modes it joined (`Modes`), whose path matches `Select::Path` (exactly) or `Select::Prefix`. While it exists, this device is *listening* to the space (§9): announces of writers' channels make it ask. Asking a sender for a session is the caller's (`NodeHandle::ask_channel_in`) until the verbs of stage 6 do it.
+- **`Got`** carries the path (relative to the space), the payload (a slice of the opened frame: **no copy**), the writer's person and device, and `Kind::Emitted { seq, stands }`.
+- **Order.** Within a channel as §12.6. Across channels, the order messages were queued in.
+- **Notices.** `Lagged { missed }` as above. `LiveEnded(Ended { writer, reason })` when a session ends (`NotMember` when the sender no longer stands, `Closed` for an `END`, `Lapsed`, `Left`), told **after** the messages queued before it; a session replaced by a newer one of the same sender and mode is not told, since the `Items` simply goes on with the new one. `Retracted` is raised by checkpoints (stage 5).
+- **`next_batch(&mut Vec<Got>) -> usize`** moves everything queued that is an item into the buffer, under one lock, with no wake per item and no allocation when the buffer has room; it stops before a notice (the next `next()` yields it) and never waits.
+- **Back pressure** (§12.6) is applied by the receiver before it takes a stream frame, so it reaches the sender through the stream's flow control. An `Items` that is never read stalls the stream of a `Reliable` or `Window` channel with `Block`; dropping it frees the stream.
+- **Dropping an `Items`** cancels its sink: nothing more is queued for it. The stream ends when the node stops.
+
+### 12.8 Limits and counters of the receiver
+
+| What | Limit | Over it |
+|---|---|---|
+| Frame | 46 octets to 16 MiB + 1 KiB; per class as §12.1 row 5 | `short`, `oversize`, dropped before cryptography |
+| Replay window | 4,096 frame sequences per channel | `replayed`, `too_old`, before the AEAD |
+| Asks for an unknown key epoch | once a second per sender | `epoch_limited`, dropped untried |
+| Messages held for an unbound id | 64 per channel, 50 ms | `hold_full`, `unknown_name` |
+| Names per channel | 4,096 | refused (`bad_bind`) |
+| `Latest` queue | 4,096 names per `Items` | the oldest name evicted, `Lagged` |
+| `Reliable`/`Window` queue | 1 MiB per `Items` (+ 64 octets a message) | back pressure, or the oldest dropped and `Lagged` |
+| Delivered original sequences kept for `REPLAYED` | 64 ranges per channel | the two oldest joined |
+| `Window` re-asks | once a second per channel, one in flight | the gap stands as `Lagged` until the next |
+| Cost of a frame | one allocation, whatever its message count; none per message; `next_batch` none | |
+
+The counters (each a `u64`, in `Stats.rx`): `frames`, `short`, `marker`, `version`, `kind`, `truncated`, `count`, `sequence`, `oversize`, `unknown_channel`, `wrong_class`, `not_member`, `unknown_epoch`, `epoch_limited`, `epoch_asks`, `replayed`, `too_old`, `aead_attempts`, `unauthentic`, `malformed`, `accepted`, `messages`, `unknown_name`, `name_held`, `hold_full`, `bad_bind`, `standing_stray`, `duplicates`, `gaps`, `reasks`, `controls`, `hellos`, `checkpoints`, `no_sink`, `ended`.
+
+### 12.9 Threat notes for the receiver
+
+- **A flood of junk.** A frame that is short, oversize, malformed, of a channel this device holds no session of, a repeat, below the replay window, or under a key epoch it does not hold costs a length test, a header parse or one lookup. None reaches the AEAD (`aead_attempts` proves it). A flood under a key epoch the session does not hold also makes no more than one ask a second per sender.
+- **A forged frame of a held channel** costs one AEAD attempt and is refused (`unauthentic`); it burns no sequence, so it cannot make the receiver drop the genuine frame that follows (§12.2). The attempts are bounded by what the link delivers; the replay window drops copies of a genuine frame before the attempt.
+- **A forged copy of a genuine `seq0`** is the same: refused by the tag, marks nothing.
+- **A held-back bare id cannot grow memory.** At most 64 messages per channel are held, for 50 ms; the 65th is dropped at once; the number of channels is bounded by the sessions (§6).
+- **A key holder** can seal frames the receiver accepts (§11.8): it can send a `BIND` that renames an id, a `STANDING` bracket, an `END`, a gap, a `HELLO`. Each is bounded as above (the table has 4,096 ids, the hold 64 messages, the delivered ranges 64) and none changes who the sender is: attributing frames to the sender's device is the work of signed checkpoints (stage 5).
+- **A removed sender** is refused at the first frame after this device holds the removing record (§12.3). Frames it sealed before the record arrived were delivered; frames sealed with the old key by a holder after the re-key fail the AEAD.
+- **A slow consumer** cannot make memory grow without bound: 4,096 names, or 1 MiB (plus the frame in hand), per `Items`. With `Block` it stalls the stream of a `Reliable` or `Window` channel (the sender is told by flow control); with `Drop`, or in `Latest`, it is told it lagged.
+- **Clocks.** No decision about who is a member or what is genuine rests on a clock. The 50 ms hold and the one-second limits are counted on the receiver's monotonic clock and decide only what is kept for a moment and how often a sender is asked.
