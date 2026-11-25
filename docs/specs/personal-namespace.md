@@ -124,9 +124,11 @@ unattended. A relay never holds the root.
 - **Revocation** — context revocation list (authoritative, root-signed) and
   CA revocation set (immediate, CA-signed REVOKE). Beside a revoked key, the
   context may carry its **revocation cut** (TLV `RevocationCut`, 0x0428,
-  **have**, slice 5): the exact log entries of the key that stay valid as
+  **have**, slice 5): the log entries of the key that stay valid as
   Data — those the root first verified before the owner's stated loss
   time — bound to the key's public key by digest and to their bytes by a
+  manifest of every entry, or, per log, by one **tip** (the last entry
+  kept, by its seq and the digest of its signed region) instead of a
   manifest, plus later exact re-admissions (name and implicit digest)
   (trust-context.md §3.3.12, data-layer.md §8.1, §8.2). Data is judged by
   revocations and cuts, never accepted because of a certificate's validity
@@ -360,16 +362,37 @@ On the root device: `ndn-fwd revoke /<ns>/<role>/<dev> [--cut <file>]
    layer holds verified and **first verified before that moment**, per
    collection (`ndn_data::Device::revocation_cut` with a `CutBound`; the
    host's `cut <key> <file>`), with the digest of the key's public key and
-   a manifest binding each listed entry's bytes. The file also records the
+   a manifest binding each listed entry's bytes, or, with `--tips`, one
+   tip per log and no manifest (below). The file also records the
    bound used and the entries left out. `revoke` refuses a cut file made
    without a bound or bounded later than the answered loss time, and
    prints the entries left out: the owner re-admits the honest ones one by
    one (step 3). A thief's writes the root verified before the stated time
    stay valid, so the earliest honest answer is the safe one. Without a
    cut, every packet the key signed is refused; with one, exactly the
-   entries it lists stay valid, with the bytes its manifest lists, and
+   entries it lists stay valid, with the bytes its manifest lists (with a
+   tips cut, the entries below its tips, below), and
    everything else the key signed — later entries, backdated ones, other
    bytes at a listed name, its summaries — is refused (data-layer.md §8.1).
+   **Tips cut** (`ndn-heap cut <key> <file> --held-before <ms> --tips`,
+   then `ndn-fwd revoke <key> --cut <file> --lost <ms>`; `CutBound.tips`,
+   `Node::revocation_cut`): per log of the key the cut names one tip, the
+   highest entry the bound keeps whose whole chain below it (each entry
+   names its predecessor by signed digest) the root device holds and
+   keeps, by its seq and the digest of its signed region, and no manifest:
+   one small cut however long the logs are, with nothing to fetch or
+   serve. A packet of the key below a tip is accepted by name, the tip
+   entry only with its signed-region digest — so a relay's high-S ECDSA
+   copy of it, the same signed object, is accepted too, which a manifest
+   (it lists the whole packet's digest) refuses (residual L10 of heap.md,
+   closed) — and nothing above a tip. The validator and a forwarder's
+   cache hold one packet and cannot bind the bytes below a tip, so the
+   ends decide: the data layer keeps an entry of a tip-cut key only if it
+   is a chain ancestor of the tip, else refuses it (`OutsideCut`). The
+   kept entries off the tip's chain are listed in the file as left out
+   with the rest. A cut can still be made in the manifest form, and cuts
+   made so before still decode and are judged as before
+   (trust-context.md §3.3.12).
 1. Context bump, in the CLI: version `N+1` lists the device's key names as
    revoked, signed by the root key unlocked there for that one signature,
    and is handed to the daemon of the same PIB (`security/context-update`,
@@ -385,7 +408,7 @@ On the root device: `ndn-fwd revoke /<ns>/<role>/<dev> [--cut <file>]
    the new version refuses that Data. Data the key signed that its cut
    accepts is kept and forwarded, and so are the certificates of a key
    revoked with a cut, which in-cut Data needs to verify, and the cut's
-   manifest, which every node keeping the context fetches and serves; a
+   manifest (a tips cut has none), which every node keeping the context fetches and serves; a
    reader that applied a version the cut refuses withdraws it, and so does
    one holding Data whose issuer the version revokes (data-layer.md §8.3).
 2. CA, following the signed version: whenever a node running the namespace
@@ -402,8 +425,12 @@ On the root device: `ndn-fwd revoke /<ns>/<role>/<dev> [--cut <file>]
    edits nobody had seen, and the entries `revoke` printed as left out by
    the loss time — is reported by the devices that refused it with its full
    name and digest; the owner runs `ndn-fwd readmit <key> <full-name>…`,
-   which signs `N+1` adding those exact names to the cut. Never a range: a
-   neighbouring seq or other bytes at that name stay out.
+   which signs `N+1` adding those exact names to the cut. Never a range
+   or a tip: a neighbouring seq or other bytes at that name stay out. A
+   tips cut takes exact entries too, for what its tips do not accept:
+   entries above a tip's seq (a name the cut accepts already, below a tip
+   or the tip with its digest, is left out of the addition, and none left
+   is `nothing-to-sign`).
 Gap: revoking from an admin device other than the root device (the root key
 signs the bump, so the command runs where the root key is).
 
@@ -498,7 +525,8 @@ through a relay, say): `ndn-fwd recover --kit words|<file>|yubikey
    compromise stay valid), made by this device's data layer from what it
    holds verified, bounded by when the root was lost (data-layer.md §8.1,
    §8.4); a cut of any other key, a cut with `destroyed`, two cuts for one
-   key, an unbounded cut, or one without a key digest or manifest are
+   key, an unbounded cut, or one without a key digest, or with ranges and
+   without a manifest (a cut of tips needs none) are
    refused (`cut-refused`). Since `compromised` revokes the old CA key, an
    issuer no cut excuses, the new CA must certify again every key the
    recovered context revokes with a cut, from a certificate of it this PIB
@@ -550,7 +578,8 @@ kept serves only the versions held since.
    signs (fail closed) until the key is revoked with a cut. The guest's
    key is then **lapsed**, a key to end: every root command, `ndn-fwd
    status` (`ending_key = <key> (lapsed at <time>)`, with the data host's
-   `cut <key> <file> --held-before <time>` to make its cut) and the admin
+   `cut <key> <file> --held-before <time>` to make its cut, `--tips` for a
+   tips cut) and the admin
    TUI's "Keys to end" list it. The owner makes that cut on the root
    device and runs `ndn-fwd end-keys --cut <file>…`, which signs one
    version revoking every key to end that has a cut bounded at its end,
