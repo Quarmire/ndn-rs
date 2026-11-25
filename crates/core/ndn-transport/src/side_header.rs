@@ -427,6 +427,33 @@ mod tests {
         }
     }
 
+    /// The vectors of channel.md: a routing header and the `UP` record.
+    #[test]
+    fn the_golden_routing_header_and_up_records() {
+        fn hex(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        let id = 0x0102_0304_0506_0708;
+        let h = SideHeader::new(SideClass::Datagram, SideKind::Data, id).unwrap();
+        assert_eq!(hex(&h.encode()), "00200102030405060708");
+        let h = SideHeader::new(SideClass::Stream, SideKind::Control, id).unwrap();
+        assert_eq!(hex(&h.encode()), "00320102030405060708");
+        let keep = UpRecord { id, op: UpOp::Keep }.encode();
+        assert_eq!(
+            hex(&keep),
+            "00240102030405060708010000000000000000000000000000000000000000000000000000000000000000000000"
+        );
+        let unsub = UpRecord {
+            id,
+            op: UpOp::Unsub,
+        }
+        .encode();
+        assert_eq!(
+            hex(&unsub),
+            "00240102030405060708020000000000000000000000000000000000000000000000000000000000000000000000"
+        );
+    }
+
     #[test]
     fn an_up_record_is_46_octets_and_round_trips() {
         for (op, code) in [(UpOp::Keep, 1u8), (UpOp::Unsub, 2)] {
