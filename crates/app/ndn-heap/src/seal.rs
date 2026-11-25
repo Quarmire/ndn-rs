@@ -438,6 +438,7 @@ pub(crate) enum GrantRefusal {
 /// lapsed, is the judge's, at the packet. Forward only: a removed reader fails
 /// (4) for every later ask, a revoked device key fails (6). Pure; first
 /// failure named.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn may_grant(
     fold: &Fold,
     keys: &Keys,
