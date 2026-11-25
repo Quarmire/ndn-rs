@@ -41,10 +41,13 @@ mod tests;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Kind(&'static str);
 
-/// The version of the owner rule (spec §9.9): 1 is "only an `admin` or
-/// `member` device of the owner holds the owner's powers"; 0 (no record) judged
-/// every device of the owner's namespace as an owner device.
-pub(crate) const OWNER_RULE: u8 = 1;
+/// The version of the owner rule (spec §9.9): 2 is "only an `admin` or `member` device of the
+/// owner holds the owner's powers, only an `admin` or `member` device of a reader is granted
+/// an epoch key, and an owner device tracks the devices it grants keys to" (stage 7; a space
+/// stored under 1 may hold keys given to a reader's guest or node device and to devices no
+/// owner device tracks, so it gets a fresh epoch at start); 1 is the first half alone; 0
+/// (no record) judged every device of the owner's namespace as an owner device.
+pub(crate) const OWNER_RULE: u8 = 2;
 
 impl Kind {
     /// `verified/<entry name>`: that an entry's signature was verified

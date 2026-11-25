@@ -1221,3 +1221,43 @@ async fn an_owner_device_signs_a_fresh_epoch_for_a_sealed_space_stored_under_the
     assert_eq!(heap.epoch().unwrap().0, now, "no epoch is signed again");
     node.close().await;
 }
+
+/// Stage-7 I5: a sealed space stored under rule 1 (before the stage-7 grant rules: guest and
+/// node devices of readers were granted keys, and no grantee was tracked) is judged again at
+/// start under rule 2: an owner device signs a fresh epoch, once, and records rule 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sealed_space_stored_under_rule_one_gets_a_fresh_epoch_at_start() {
+    let devs = world(&["/alice/member/laptop"]).await;
+    let laptop = &devs[0];
+    let (node, _) = boot(laptop, quick()).await;
+    let heap = node.create(&space(), private(&["/bob"])).await.unwrap();
+    let (before, _) = heap.epoch().expect("an epoch is in force");
+    node.close().await;
+    // What the store held before rule 2.
+    laptop
+        .store
+        .insert(Kind::RULE.of(&space()), Bytes::from_static(&[1]));
+
+    let layered = laptop.layered();
+    let (node, _) = boot(&layered, quick()).await;
+    let heap = node.space(&space()).unwrap();
+    let rule = || layered.store.get(&Kind::RULE.of(&space()));
+    for _ in 0..200 {
+        if rule().as_deref() == Some(&[2][..]) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        rule().as_deref(),
+        Some(&[2][..]),
+        "a space stored under rule 1 is not judged again under rule 2"
+    );
+    let (now, complete) = heap.epoch().unwrap();
+    assert!(complete);
+    assert!(
+        now.seq > before.seq,
+        "a fresh epoch is in force: {before:?} then {now:?}"
+    );
+    node.close().await;
+}

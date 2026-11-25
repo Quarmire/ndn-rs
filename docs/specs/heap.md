@@ -830,7 +830,7 @@ big-endian, so keys order numerically. Other names are appended as components.
 | `head/<S>` | own `seq` 8 ‖ its signed-region digest 32 (40 octets) | with every own entry |
 | `reserve/<S>` | `R` 8 (big-endian) ‖ clean 1 (0 or 1): 9 octets | at open, at each extension, at clean close |
 | `revoked/<S>` | 32 octets: the digest of the revocations of the readers' devices (§5.3 rule 8) and the keys of them this node suspects (§9.8) that the last `Epoch` entry this device signed accounted for | after each Epoch entry this device signs |
-| `rule/<S>` | 1 octet: the version of the owner rule (§2.1, §9.9) the space's entries were last judged by here; 1 is the role rule | at the first open of a space with no entries, and after the one judgement at start (and the fresh epoch an owner device of a sealed space signs) of a space stored under an earlier rule |
+| `rule/<S>` | 1 octet: the version of the owner rule (§2.1, §9.9) the space's entries were last judged by here; 2 is the current rule (1: the role rule alone, before the stage-7 grant rules) | at the first open of a space with no entries, and after the one judgement at start (and the fresh epoch an owner device of a sealed space signs) of a space stored under an earlier rule |
 | `granted/<S>/<person>/<key>` (each as a TLV component) | the grant ask (§6.5: the seal key packet and the certificate chain it carried, at most 2,048 + 6,144 octets) of a device of `<person>` this owner device granted an epoch key of the sealed space to, by the key that signed the packet; at most 32 a person | before the grant is answered, and again only if the ask differs; removed when the epoch signed for the device's lapse is, when `<person>` no longer reads the space (at the change and at each sweep), and when the key is revoked (at each sweep) |
 | `space/<S>` | 1 octet: 1 a space this node is a member of, 2 a space it only follows (§10) | when the space is created, opened or followed |
 | `joined/<S>` | 1 octet, 1, then the 32-octet signed-region digest of each `Members` entry held that removes the device's person: an offer's answer admitted this device to the space and the fold does not list its person yet (§10.9); while it stands, a refusal for want of a listing is a wait | at `note_joined`, when the fold does not list the person; removed when it does, and when a removal of her arrives that it does not name |
@@ -2438,14 +2438,18 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   vouched copies are served (a holder's copy enters only as unverified and
   through the normal walk, so a returned certificate is never accepted outside
   validation). Nothing is added; the note is the record.
-- **Migration.** A space stored under the earlier rule has no `rule/<S>` record
-  (§4.3). At start, the first time, every held entry of the owner's devices is
+- **Migration.** A space stored under an earlier rule has no `rule/<S>` record, or
+  one below the current rule (2; stage-7 I5: rule 1 had the role rule alone, and
+  keys given before the grant rules to a member's guest or node device, or by a
+  device no owner device tracked, stay valid until some unrelated rotation). At
+  start, the first time, every held entry of the owner's devices is
   judged again under the new rule: what a guest or node device signed leaves the
   fold and the register (`Withdrawn`, `NotOwnerDevice`), and each device's
   standing is stored in its ledger record (a record without the flag reads as an
   owner device until this judgement runs). An owner device of a sealed space then
   signs a **fresh epoch** before the record is written (guests may already hold
-  keys of the epochs in force), and a device that cannot sign one records the
+  keys of the epochs in force, and no earlier grantee has a lapse record), and a
+  device that cannot sign one records the
   rule at once. Each owner device that opens the space signs one; they merge as
   concurrent epochs do (§5.3).
 - **A writer that holds an owner entry above a hole still seals in the fold's
