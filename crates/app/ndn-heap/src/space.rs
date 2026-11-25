@@ -1097,6 +1097,36 @@ impl Heap {
         self.inner.log.lock().fold.create().is_some()
     }
 
+    /// Whether this device is an owner device of the space: its name is under the owner's, its
+    /// key is vouched for as the owner's person and its role is `admin` or `member` (a guest or
+    /// node device of the owner is none), the standing [`Self::change`] needs. `Err` is the
+    /// [`HeapError::NotOwner`] a `change` would answer, with its next step: use a device of the
+    /// owner that is one. A host that hands out something only an owner device can make good
+    /// (an offer) asks first, so it never shows what cannot be used.
+    pub fn owner_device(&self) -> Result<(), HeapError> {
+        self.inner.log.lock().owner_only()
+    }
+
+    /// Whether the run before this node opened the space left it without a clean close (a stop
+    /// the node did not make, or an image copied while it ran): a fixed fact of this open, which
+    /// a restored old copy of the store can also show. A host that keeps its own notes beside
+    /// the space reads it as: those notes may be older than what peers hold of this device.
+    pub fn started_unclean(&self) -> bool {
+        self.inner.log.lock().unclean()
+    }
+
+    /// Whether this node raised [`Alert::RolledBack`] for the space and keeps it standing: an
+    /// entry under this device's own name lies above what it reserved, so the store here is an
+    /// old image or a copy of it. A host that keeps its own notes beside the space reads it as:
+    /// those notes may be older than what peers hold of this device.
+    pub fn rolled_back(&self) -> bool {
+        self.inner
+            .standing
+            .lock()
+            .iter()
+            .any(|alert| matches!(alert, Alert::RolledBack { .. }))
+    }
+
     /// The epoch writers seal in, as this node's fold holds it: its id (the owner device that
     /// signed the Epoch entry, and its seq) and whether it is for exactly the readers. `None` for
     /// a public space, or while no epoch is in force.
