@@ -466,7 +466,7 @@ hex>` from 8 random bytes, all GenericNameComponents.
 `N+1` starts as the content of `N`: anchors, schema, CA endpoints,
 enrollment hint, revocations, revocation cuts, DataRequiresCut roles, link
 policy and key roles. Every revocation cut of `N` whose key a revocation
-covers is carried verbatim, its key digest, manifest, ranges and
+covers is carried verbatim, its key digest, manifest, ranges, tips and
 re-admitted names alike ([trust-context.md](trust-context.md) §3.3.12); an
 orphan cut, whose key no revocation covers, has no effect and is dropped.
 Then:
@@ -504,13 +504,21 @@ refused, and so MUST a revocation cut: this recovery revokes no key.
    that fails, reporting it with why (ndn-rs: `dropped_cut = <key>:
    <reason>`).
 10. A revocation cut the operator gives (`--cut <file>`, the
-   `RevocationCut` TLV `0x0428` with its manifest) is added for its key.
+   `RevocationCut` TLV `0x0428` with its manifest, or with its tips, one
+   `CutTip` per log and no manifest) is added for its key.
    The recovery MUST refuse the whole recovery if the cut's key is not one
    step 8 newly revokes (a key `N` revokes already keeps the cut `N` has,
    or none), if two cuts name one key, or if the cut has no key digest, or
-   has ranges and no manifest. The cut lists what the recovering device
-   first verified of that key before the old root was lost
-   ([data-layer.md](data-layer.md) §8.1, §8.4).
+   has ranges and no manifest (a cut that names tips alone needs none: it
+   is carried as the file holds it, the cut TLV verbatim, and no manifest
+   packet is stored or served for it). The cut lists what the recovering
+   device first verified of that key before the old root was lost, entry
+   by entry or, per log, by the tip the device's data layer chose
+   ([data-layer.md](data-layer.md) §8.1, §8.4). A tip names the entries
+   below it by name: the recovered namespace's data layer keeps an entry
+   of that key only if it is a chain ancestor of the tip, as for any tips
+   cut (trust-context.md §3.3.12), and an entry above a tip is
+   re-admitted later by `ndn-fwd readmit`, exact name and digest.
 11. The old CA key is revoked (step 8), and a cut never excuses a revoked
    issuer (trust-context.md §6.3). So for every key `N+1` revokes with a cut
    — carried from `N` or added in step 10 — the new CA key must certify
