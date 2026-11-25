@@ -487,6 +487,63 @@ async fn a_sealed_space_ask_outside_the_audience_gets_a_signed_refusal_that_says
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ask_naming_an_epoch_the_sender_does_not_have_in_force_is_refused_stale_or_not_ready() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
+    let share = Share {
+        readers: Readers::Persons(vec![n("/bob"), n("/carol")]),
+        writers: vec![n("/bob")],
+    };
+    let heap = shared(&rig, share, None).await;
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    let first = in_force_of(alice).expect("an epoch in force");
+    // Removing a reader writes a new epoch: the first one is older than the one in force.
+    heap.change(MembersChange {
+        remove: vec![n("/carol")],
+        ..MembersChange::default()
+    })
+    .await
+    .unwrap();
+    eventually("alice has a newer epoch in force", || {
+        in_force_of(alice).is_some_and(|e| e != first)
+    })
+    .await;
+    let ask_with = |epoch| ChanAsk {
+        epoch,
+        ..ask_of(bob, ChannelMode::Latest)
+    };
+    let refusal = |answer: ChanAnswer| {
+        let ChanAnswer::Data(wire) = answer else {
+            panic!("a signed refusal, not a Nack");
+        };
+        let data = Data::decode(wire).unwrap();
+        match Answer::decode(data.content().unwrap().clone()) {
+            Ok(Answer::Refusal(r)) => r,
+            other => panic!("a refusal: {other:?}"),
+        }
+    };
+    let answer = |ask: ChanAsk| async move {
+        let (_, interest) = signed_ask(bob, alice, &ask);
+        alice.inner.chan_answer(&interest).await
+    };
+    // An epoch alice has never seen: she has not caught up, ask again soon.
+    let unknown = crate::wire::EpochId {
+        creator: n("/alice/laptop"),
+        seq: 9999,
+    };
+    let r = refusal(answer(ask_with(Some(unknown))).await);
+    assert_eq!((r.code, r.retry_ms), (RefusalCode::StaleEpoch, 1000));
+    // One she has seen and moved on from: the asker is the one behind.
+    let r = refusal(answer(ask_with(Some(first))).await);
+    assert_eq!((r.code, r.retry_ms), (RefusalCode::NotReady, 2000));
+    // The epoch in force is answered with a session.
+    assert!(matches!(
+        answer(ask_with(in_force_of(alice))).await,
+        ChanAnswer::Data(_)
+    ));
+    assert_eq!(alice.inner.chan.stats.refused.get(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_removed_receiver_is_not_answered_and_the_channel_rekeys() {
     let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
     let (share, change) = public_with(&["/bob"], &["/carol"]);
@@ -573,6 +630,65 @@ fn in_force_of(node: &Node) -> Option<crate::wire::EpochId> {
     node.inner
         .space_of(&space())
         .and_then(|held| held.log.lock().fold.in_force())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_receiver_of_a_public_space_rekeys_the_channel_once_for_the_removal_alone() {
+    let rig = rig(&["/alice/laptop", "/bob/phone"]).await;
+    let (share, change) = public_with(&["/bob"], &[]);
+    let heap = shared(&rig, share, change).await;
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    bob.ask_channel(&space(), alice.name()).await.unwrap();
+    let table = &alice.inner.chan.channels;
+    assert_eq!(table.receiver_count(&space(), ChannelMode::Latest), 1);
+
+    heap.change(MembersChange {
+        remove: vec![n("/bob")],
+        ..MembersChange::default()
+    })
+    .await
+    .unwrap();
+    // A public space writes no epoch: the removal is the only cause, so exactly one re-key.
+    eventually("the channel is re-keyed and bob dropped", || {
+        table.receiver_count(&space(), ChannelMode::Latest) == 0
+    })
+    .await;
+    tokio::time::sleep(super::hub::TICK * 4).await;
+    let key = table.current(&space(), ChannelMode::Latest).unwrap();
+    assert_eq!(
+        key.key_epoch, 1,
+        "one removal, one re-key, and nothing else"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_asker_over_its_rate_is_nacked_congestion_after_standing_and_before_any_signature() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/dave/pc"]).await;
+    let (share, change) = public_with(&["/bob"], &[]);
+    shared(&rig, share, change).await;
+    let (alice, bob, dave) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
+    let stats = &alice.inner.chan.stats;
+    let mut nacks = Vec::new();
+    for _ in 0..30 {
+        let (_, interest) = signed_ask(bob, alice, &ask_of(bob, ChannelMode::Latest));
+        if let ChanAnswer::Nack(reason) = alice.inner.chan_answer(&interest).await {
+            nacks.push(reason);
+        }
+    }
+    assert!(!nacks.is_empty(), "a burst of 30 asks is over 4 a second");
+    assert!(
+        nacks.iter().all(|r| *r == NackReason::Congestion),
+        "{nacks:?}"
+    );
+    assert_eq!(stats.throttled.get() as usize, nacks.len());
+    // A stranger is told nothing of the rate: his Nack is the stranger's, and costs no walk.
+    let walks = alice.inner.judge.interest_walks();
+    let (_, interest) = signed_ask(dave, alice, &ask_of(dave, ChannelMode::Latest));
+    assert!(matches!(
+        alice.inner.chan_answer(&interest).await,
+        ChanAnswer::Nack(NackReason::NoRoute)
+    ));
+    assert_eq!(alice.inner.judge.interest_walks(), walks);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
