@@ -88,8 +88,8 @@ dialer                                              listener
 2. ALPN ([RFC 7301]): the dialer MUST offer exactly the protocol ID `ndn-link/1` (ASCII, 10 bytes: `6e 64 6e 2d 6c 69 6e 6b 2f 31`). The listener MUST select it, and MUST fail any handshake that does not offer it. ndn-rs listeners speak no other protocol on a link socket.
 3. The dialer MUST NOT send SNI. ndn-rs uses the internal server name `ndn-link`, which nothing checks and which is not sent. Listeners MUST NOT depend on SNI.
 4. Session resumption and 0-RTT MUST NOT be used. Each link proves its keys with a full handshake. ndn-rs listeners issue no session tickets and accept no early data; ndn-rs dialers disable resumption.
-5. Both sides MUST advertise the `max_datagram_frame_size` transport parameter ([RFC 9221]) with a non-zero value. ndn-rs advertises 65535. A side whose peer does not support datagrams closes the link with code 0x15 (Protocol) before sending its verdict (§5.4).
-6. Streams: each side MUST allow its peer at most one bidirectional stream (`initial_max_streams_bidi` = 1) and SHOULD allow no unidirectional streams (`initial_max_streams_uni` = 0); ndn-rs sends exactly these values. Only the dialer opens a stream (§5.1).
+5. Both sides MUST advertise the `max_datagram_frame_size` transport parameter ([RFC 9221]) with a non-zero value. ndn-rs advertises 65535. A side whose peer does not support datagrams closes the link with code 0x15 (Protocol) before sending its verdict (§5.4). The datagram payloads carry NDNLPv2 frames (§9) and, between devices that agreed to (§5.1, `ChannelCaps`), channel frames, told apart by their first octet (§9 item 7); both share the connection's send buffer and its one congestion controller.
+6. Streams: each side MUST allow its peer at most one bidirectional stream (`initial_max_streams_bidi` = 1) and, **at the handshake**, no unidirectional streams (`initial_max_streams_uni` = 0); ndn-rs sends exactly these values, so a peer that opens a unidirectional stream before the verdict is refused by QUIC, and nothing about channels costs a link a byte before it. Only the dialer opens a stream (§5.1). **After the verdict**, a side whose hello and whose peer's hello both carried `ChannelCaps` (§5.1) and whose own admission carries channel frames (§9 item 8) raises the limit to exactly one (`MAX_STREAMS`, ndn-rs `Connection::set_max_concurrent_uni_streams(1)`), and no other side does: a link with a peer that did not advertise the capability, or one this side does not carry channels on, still has no unidirectional stream. The one stream each direction then has carries channel frames only (§9 item 7); NDN packets never travel on a stream (§4.1 item 4).
 7. Timers (ndn-rs values; other implementations SHOULD use the same):
 
    | Parameter | Value | Note |
@@ -99,6 +99,8 @@ dialer                                              listener
    | Dial handshake timeout | 5 s | a dial with no completed handshake by then fails; QUIC ignores ICMP, so this is the only fast failure for an address where nothing listens |
    | Direct path: `max_idle_timeout` offered by its dialer | 8 000 ms | the connection takes the smaller offer, so it applies to both sides; a dead direct path is noticed within it and its traffic falls back to the relay (§14.7). The listener of a direct path offers 8 000 ms too |
    | Direct path: keep-alive of its dialer | every 2 s | keeps the NAT mappings of both sides open (the listener's ACKs refresh its side) |
+
+   Channel frames add no timer: they ride the connection's own keep-alive, idle timeout and congestion control.
 
 8. Cipher suites and key exchange are those of the rustls *ring* provider. Suites: `TLS_AES_256_GCM_SHA384`, `TLS_AES_128_GCM_SHA256`, `TLS_CHACHA20_POLY1305_SHA256`. Groups: X25519, secp256r1, secp384r1. An implementation MUST support at least `TLS_AES_128_GCM_SHA256` together with X25519 or secp256r1.
 
@@ -152,7 +154,7 @@ The handshake proves one thing only: the peer holds the private half of the key 
 1. After the handshake, the dialer opens the first client-initiated bidirectional stream (stream ID 0). This is the **control stream**.
 2. Each direction of the control stream carries, in this order: one LinkHello, one LinkVerdict, then, for as long as the link is up, zero or more of the messages of §5.5–§5.7 and §5.9 (ObservedAddress both ways; Reachability from a device to a relay; Presence from a relay to a device; Departure from an inviter to a person it let go of a folder), in any order. Each message is one complete TLV with no other framing.
 3. A side finishes (FIN) its sending half when the link ends, or earlier once it sends nothing more. A receiver MUST NOT expect a FIN before the link is up. After the verdict, a receiver reads further messages: it MUST ignore a message of an unrecognized TLV-TYPE that is even and greater than 31, and SHOULD close the link with 0x15 (Protocol) on any other unrecognized type (ndn-rs does). A side that stops reading after the verdict (an implementation before ObservedAddress) only loses those messages; its peer's writes then fail, and the peer stops sending them. Every message defined after the verdict has an even TLV-TYPE above 31, so a receiver that predates it skips it.
-4. NDN packets never travel on a stream (§9).
+4. NDN packets never travel on a stream (§9). This stays true with channel frames (§9 item 7): the one unidirectional stream a link may have after the verdict (§3.1 item 6) carries channel frames only, never an NDNLPv2 frame or an NDN packet, and a side never writes a frame there that does not start with the channel marker.
 
 ### 4.2 Reading a message
 
@@ -178,7 +180,8 @@ All TLV-TYPEs are in the application range (types above 252, written as 3-byte V
 | 0x0448 | PresentDevice | Presence | Name, KeyDigest |
 | 0x044A | KeyDigest | PresentDevice | 32 bytes: a key fingerprint (§3.3) |
 | 0x044C | Departure | control stream, after the verdict, inviter → the person it let go | Name (the folder), Name (the members record's log entry) (§5.9) |
-| 0x0450 | LinkHello | control stream, message 1 | LinkVersion, Data*, Membership*, Follows?, DirectPath? |
+| 0x044E | ChannelCaps | LinkHello | 1 byte, a bit set: bit 0 = channel frames, version 1 (§5.2, §9 item 7) |
+| 0x0450 | LinkHello | control stream, message 1 | LinkVersion, Data*, Membership*, Follows?, DirectPath?, ChannelCaps |
 | 0x0451 | LinkVersion | LinkHello | 1 byte: the protocol version, `0x01` |
 | 0x0452 | LinkVerdict | control stream, message 2 | EnrollmentLink? |
 | 0x0453 | (unassigned) | — | — |
@@ -191,7 +194,7 @@ All TLV-TYPEs are in the application range (types above 252, written as 3-byte V
 | 0x06 | Data | LinkHello, Membership | a certificate Data packet, whole |
 | 0x07 | Name | EnrollmentLink, Presence, PresentDevice, Departure, Follows | a Name: a namespace (EnrollmentLink, Presence), a device (PresentDevice), a folder and a log entry (Departure) or a space's sync group (Follows) |
 
-The other numbers of 0x0440–0x045F are unassigned. **Gap note:** 0x044C was unassigned until round 7, when the `Departure` message took it (§5.9); 0x044E stays unassigned, and 0x0453 stays unassigned beside the verdict's number; 0x0456 was unassigned until the re-founding's relay fix, when the hello's `Follows` took it (§5.10, [Decision 42](#20-decisions)). A message or field added so needs no new LinkVersion (it stays 1): it is an even type above 31, so a receiver that predates it skips it (§4.1 rule 3). The punch messages of §14 use 0x0460–0x046C ([§14.3](#143-the-punch-interest-and-its-answer)).
+The other numbers of 0x0440–0x045F are unassigned. **Gap note:** 0x044C was unassigned until round 7, when the `Departure` message took it (§5.9); 0x044E was unassigned until the channel carrier, when the hello's `ChannelCaps` took it (§5.2); 0x0453 stays unassigned beside the verdict's number; 0x0456 was unassigned until the re-founding's relay fix, when the hello's `Follows` took it (§5.10, [Decision 42](#20-decisions)). A message or field added so needs no new LinkVersion (it stays 1): it is an even type above 31, so a receiver that predates it skips it (§4.1 rule 3). The punch messages of §14 use 0x0460–0x046C ([§14.3](#143-the-punch-interest-and-its-answer)).
 
 ### 5.2 LinkHello (0x0450)
 
@@ -202,9 +205,11 @@ LinkHello      = LINK-HELLO-TYPE TLV-LENGTH
                  *Membership       ; §5.8
                  [Follows]         ; §5.10
                  [DirectPath]
+                 ChannelCaps
 LinkVersion    = LINK-VERSION-TYPE TLV-LENGTH(=1) %x01
 Certificate    = Data              ; NDN Certificate Format v2 Data packet
 DirectPath     = DIRECT-PATH-TYPE TLV-LENGTH(=8) 8OCTET
+ChannelCaps    = CHANNEL-CAPS-TYPE TLV-LENGTH(=1) OCTET   ; bit 0 = channel frames v1; other bits 0
 Follows        = FOLLOWS-TYPE TLV-LENGTH 1*Name   ; each a space's sync group, §5.10
 ```
 
@@ -217,7 +222,8 @@ Follows        = FOLLOWS-TYPE TLV-LENGTH 1*Name   ; each a space's sync group, �
 - A sender with no certificate for its link key (a device not enrolled anywhere, linked by expected fingerprint or on an enrollment link) sends no certificate.
 - After the certificates come the sender's memberships (§5.8): one per namespace it is a member of with a key other than its link key, at most `MEMBERSHIPS_MAX` = 8. A sender that links for its enrollment only (§8.2), or that dials a short code's first contact with no key to expect (§13.3A, until the link is made again holding the party's namespace), sends neither certificates nor memberships.
 - Follows (§5.10): a device that follows spaces tells a peer it uses as a relay the **exact sync group** of each — `<owner>/32=sync/<space>`, as the layer above names it, not the namespace and not the owner's whole group `<owner>/32=sync` — at most `FOLLOWS_MAX` = 32, in name order. The host says which spaces the device follows; `ndn-link` knows no spaces and derives none from the trust contexts it holds (a context names a namespace, which names every space of it). A sender that links for its enrollment only, a direct path's dialer, a peer that is no relay of this device's, and a device that follows no space send no Follows. ndn-rs writes it after the memberships and before DirectPath.
-- DirectPath: the dialer of a direct path MUST send the session of its punch (§14.6); a listener that punches the dialer's key now sends the session of that punch (of the one it began last, when it runs several). Otherwise it is absent. ndn-rs writes it last.
+- DirectPath: the dialer of a direct path MUST send the session of its punch (§14.6); a listener that punches the dialer's key now sends the session of that punch (of the one it began last, when it runs several). Otherwise it is absent. ndn-rs writes it after Follows.
+- ChannelCaps (0x044E): a sender MUST include it, one byte, with bit 0 set when it carries channel frames (§9 item 7) and all other bits clear. It is always sent, so a hello is never without it; a peer that predates it sends none. ndn-rs writes it last. A side MUST NOT send a channel frame, or grant a unidirectional stream (§3.1 item 6), to a peer whose hello did not carry it with bit 0 set; sending the field says only that this side *can* carry channel frames, and whether it does on this link is its admission's (§9 item 8).
 - How ndn-fwd builds the chain: it takes its newest currently valid certificate under the current key name. It then repeatedly takes the newest currently valid certificate under the key name in the previous certificate's KeyLocator (the certificate name without its last two components). It stops at a self-signed certificate (KeyLocator names the certificate's own key), at a certificate it does not keep, at a certificate already in the chain, or at **8 certificates in total**. A self-signed root that ndn-fwd keeps is therefore included as the last element.
 - The root at the end: a sender SHOULD end the chain with its namespace's self-signed root certificate, so that a relay that does not hold the namespace can check the chain offline against it (§7.1, §15.2). When the chain the host keeps does not end in a self-signed certificate, `ndn-link` appends the anchor of the held trust context that the last certificate's issuer names, if there is one. A hello therefore carries at most 9 certificates: the leaf and at most 8 issuers, which is what a receiver uses ([Decision 2](#20-decisions)). Punch messages carry the same chain (§14.3).
 
@@ -229,6 +235,7 @@ Follows        = FOLLOWS-TYPE TLV-LENGTH 1*Name   ; each a space's sync group, �
   - Membership (0x045C): decoded as §5.8 says (a malformed one makes the hello malformed) and appended to the membership list. Its certificates are not parsed at this stage. A receiver that predates memberships ignores them, as any even type above 31, and admits the sender by its link key's certificate alone.
   - Any other even type above 31: ignored.
   - DirectPath (0x045A): the value MUST be exactly 8 bytes; any other length makes the hello malformed.
+  - ChannelCaps (0x044E): the value MUST be exactly one byte; any other length makes the hello malformed. A hello with none (a peer that predates the field) is read as no capability; bits this receiver does not know are ignored.
   - Any other type (odd, or 0–31): malformed.
 - If no version is present, the hello is malformed.
 - If the version is present and ≠ 1, the receiver MUST NOT admit the link. ndn-rs logs that the peer speaks a different version and asks the user to update the older device.
@@ -268,7 +275,7 @@ EnrollmentLink = ENROLLMENT-LINK-TYPE TLV-LENGTH
    - The deadline also bounds the decision: a side SHOULD send its verdict within `MESSAGE_DEADLINE` of receiving the peer's hello, because the peer is already waiting.
    - If the peer closes the connection instead of sending a verdict, the reason is the peer's close reason.
 4. **Up.** The link is up once a side has written its verdict and read the peer's.
-   - From then on it carries NDN packets (§9). A side MUST NOT send NDN datagrams before this point.
+   - From then on it carries NDN packets (§9) and, when both sides advertised and admitted them, channel frames (§9 item 7). A side MUST NOT send NDN datagrams, or channel frames, before this point; no unidirectional stream is granted before it (§3.1 item 6).
    - Datagrams that arrive before this point are buffered by the QUIC stack (ndn-rs: quinn's own queue of a connection, 1.25 MB to receive and 1 MiB to send, deliberately not larger: datagrams flow before the verdict from any dialer whose key the handshake proves, so a larger queue is memory a stranger may fill, 64 handshakes and 1,024 links over) and delivered once the face starts reading.
    - The link socket's own buffers are asked to be 4 MiB each way (`LINK_SOCKET_BUFFER`, on every socket the endpoint uses, a host-bound one and a rebind's included; the kernel grants up to its `rmem_max` / `wmem_max`, and an endpoint whose request was cut says so once in its log). A window of the data layer's pieces (128 Data of 4,096 bytes, fragmented) reaches a device as some 600 datagrams in a burst, and the kernel's default of 208 KiB holds about 90: what it drops there is lost without any Nack, and costs its asker a re-expression timer (the ladder's 1 MiB put→watch showed it: 50 to 100 datagrams lost per series of 270 runs, `RcvbufErrors` of the host).
 5. **Duplicate check.** After the link is up, the duplicate-link rule (§11) may close it at once with 0x01 (Replaced).
@@ -746,10 +753,11 @@ A **grant** says: *the device holding link key K may link here, as a person of t
     - the names under the person's own devices (the identities the link was admitted by);
     - the sync groups (`<ns>/32=sync`), trust contexts (`<ns>/32=trust-context`) and key and certificate names of the grant's namespaces, and the trust context and key and certificate names of the folder's namespace: public by design (a hello already carries the chain; the group carries no data). **The folder's own sync group is not the namespace's:** with an `ndn-heap` node, the Sync Interests (`<group>/v=N`, the version component, then what the sync protocol appends) of the one group `Introductions::sync_group(folder)` gives the folder (rule 20), exactly: not the owner's other spaces' groups, and not the group of a space nested in the folder (`<O>/32=data/n/f1` under `n`: its group name extends `n`'s with a generic component, never a version);
     - the sync group (`<W>/32=sync`), trust context (`<W>/32=trust-context`) and key and certificate names (`…/KEY/<key-id>[/<issuer>[/<version>]]`) of the namespace `W` of **every other writer** the space's members in force list (`Introductions::writer_namespaces(folder)`, read live at every packet; the folder's own namespace excluded, it is the entry's): public by the same reasoning, and what lets a member validate the other writer's device certificate and learn her devices from her sync notices (rule 13);
-    - what this device's introductions carry (`Introductions::carries`, §8.6): a person may ask again; and
+    - what this device's introductions carry (`Introductions::carries`, §8.6): a person may ask again;
+    - the asks of a channel to a device of the folder's owner namespace, `<device>/32=chan/…` (the channel layer names its setup under the sender's device name), and the session answered under such a name: the device's name is plain components under the folder's namespace, then the keyword `32=chan`. The link layer judges this itself, so a device with no `Introductions` carries them too: the setup is signed NDN judged at its two ends, and what it opens is a channel the link carries under the fair share of §9 item 9; and
     - the names of the entry's folder as the layer above names them (`Introductions::grant_carries(folder, name)`; for an `ndn-invite` device `Surface::grant_carries`, which is `folder_carries` or `writer_carries` over the **namespaces** of the writers the space's fold lists *now* (`Surface::writer_namespaces`, a person's namespace matched whole, so a writer below a broader namespace unlocks only her own), invite.md §13.2, §13.3): the log entries, pieces and piece manifest nodes of the space whatever device wrote them, the signal run headers of the space, the seal keys (`<W>/<role>/<device>/32=seal/<key>`) of the devices of the space's own owner namespace and the grant asks of the space to a device of it (those of the listed writers' devices by `writer_carries`), and a held copy `<H>/32=held/<Name TLV>` about a name so carried (rule 13).
 
-    Nothing else this device serves by name crosses: a **public space other than the folder's own** (the layer answers a public space's entries by name to whoever asks) is not answered over a grant link. A device with no invitations (no `Introductions` given) carries the grant's namespaces' public names and the folder namespace's trust context and key names (the first two kinds), no group of the folder, and no folder. **What stays public by the layer's model:** the folder's sync group carries "device D moved" and nothing else; the members entries and the entries of a public space are signed, not sealed, and a person given the folder reads them (heap.md §6.1). Unsealed data of the folder itself is the folder's, and readable by whoever the link carries it to. The person can also no longer use this device's forwarder to reach other peers' names: an Interest outside the names above is Nacked at the link.
+    Nothing else this device serves by name crosses: a **public space other than the folder's own** (the layer answers a public space's entries by name to whoever asks) is not answered over a grant link. A device with no invitations (no `Introductions` given) carries the grant's namespaces' public names and the folder namespace's trust context and key names (the first two kinds) and the channel asks above, no group of the folder, and no folder. **What stays public by the layer's model:** the folder's sync group carries "device D moved" and nothing else; the members entries and the entries of a public space are signed, not sealed, and a person given the folder reads them (heap.md §6.1). Unsealed data of the folder itself is the folder's, and readable by whoever the link carries it to. The person can also no longer use this device's forwarder to reach other peers' names: an Interest outside the names above is Nacked at the link.
 
     With **no** live entry, a link the key's entries admitted carries the names of the departure only (§8.8), from that packet on, whether or not it has been narrowed or closed yet. With entries live, it carries **besides** their names the record names of every departure mark of the key in force (§8.8 rule 10): the folder of an entry ended by a record while another stands.
 11. **A link whose grant ends during its handshake is closed.** The entries are read when the hello is judged and the link is registered after the verdicts (up to `MESSAGE_DEADLINE`); the close that ends an entry only finds links already registered. So a link a grant admitted is looked up against the table again once registered, and closed (0x19, naming the entry ended last of its key) when no live entry of its key admits any identity it was admitted by. The entry leaves the table before the close looks for links, and the link enters the table before the lookup, so either the close finds the link or the lookup finds the entry gone: a person who always has a handshake in flight (or stalls one past the date) keeps no link.
@@ -861,6 +869,22 @@ ndn-rs `ndn-invite` (`grants_tests`, `mirror_tests`, `surface_tests` in `crates/
 4. **Receiving.** A receiver MUST accept LpPackets with or without TxSequence, Sequence, FragIndex and FragCount, and MUST reassemble fragments keyed by `Sequence − FragIndex`. It SHOULD also accept a datagram that is a bare Interest or Data TLV; the enrollment-link scope does.
 5. Other NDNLPv2 fields follow the ndn-rs NDNLPv2 implementation for non-local faces. Examples are Nack 0x0320 / NackReason 0x0321, PitToken 0x62, and CongestionMark. A link face is a non-local face, so it never carries LocalFields.
 6. **Trust.** A link face is a **validated** face whatever its remote address, a peer on the same host (a loopback address) included: the forwarder validates the Data that arrives on it and caches only Data that passed (trust-context.md §6.6). A link is never a program face; a program of the same host that wants the program standing uses a Unix socket or shared memory. Threat: any process of any user on the host can open a loopback link, so what comes over it is no more believed than what a stranger sends. A served namespace carried in transit (§15.7) stays unvalidated and uncached, as before.
+7. **Channel frames.** A *channel frame* is not an NDN packet: its first octet is `0x00` (the **marker**). TLV-TYPE 0 is not assigned, so no Interest, Data, Nack or LpPacket starts with it and no NDN decoder accepts it: **a datagram whose first octet is 0x00 is a channel frame, never NDN.** Between two devices whose hellos both carried `ChannelCaps` bit 0 (§5.2), on a link this side's admission carries (item 8):
+   - **Datagram carrier.** A channel frame is the payload of one DATAGRAM frame, at most the connection's current maximum datagram payload (item 2). A longer one is refused by its sender, never fragmented (ndn-rs: `SideRefused::TooLarge`, naming the limit now); a writer cuts its frames to the limit the face reports (`side_frame_max`). A receiver that reads a datagram starting with 0x00 returns it unchanged to its caller **before** the link's scope, rate limits and NDNLPv2 reliability see it: it is no LpPacket, owes no Ack, takes no token of the scope's buckets and is never answered with a Nack (a Nack answers an Interest). On a link that does not carry channel frames, or whose peer did not advertise them, the datagram is dropped and counted (`refused`) and the link stays up.
+   - **Headroom rule.** A sender hands a channel datagram to QUIC only while at most 128 KiB (`QUEUE_MAX`) of datagrams wait in the connection's send buffer (`queued` = the buffer's size less the room it has left; the buffer is quinn's own 1 MiB, `DATAGRAM_SEND_BUFFER`), so a channel frame waits behind at most that much NDN traffic (a millisecond at 1 Gbit/s), and it never makes the stack drop an older NDN datagram to find room. A non-blocking sender (`forward_side`) refuses the frame over it (`Full`, counted `sink_full`); a blocking one (`send_side`) yields to the runtime and looks again, then every millisecond. 64 KiB, one GSO batch of the link socket, left the driver an empty queue between batches and cost a saturating 1 KiB publisher 8 % against raw datagrams; 128 KiB did not.
+   - **Stream carrier.** One unidirectional stream per direction, opened by its sender on its first stream-class frame (it waits for the peer to grant it, §3.1 item 6), carries records `length (4 octets, big-endian) | frame`. A frame starts with 0x00 and has at least one and at most 1 MiB (`STREAM_FRAME_MAX`) octets; it is delivered to the face's reader in order, unchanged. A reader that finds a record of no octets, or one that does not start with 0x00, counts it `dropped_malformed`, stops the stream (STOP_SENDING) and grants no other: the link stays up. A record longer than 1 MiB is more than this side granted: it closes the link with 0x15 (Protocol), counted too. A write blocks on the stream's flow control (counted `stream_blocked`); the non-blocking path queues at most 4 MiB (`STREAM_QUEUE_MAX`) in front of the stream's writer and refuses `Full` past it, and frames written in the same write as an earlier one are counted `coalesced`. A stream that ended or was stopped is not opened again on that link. A reader holds at most 4 MiB of received frames for its caller; past it the stream is not read and QUIC flow control slows the peer. No frame that does not start with 0x00 is ever written to it.
+   - **One connection.** Both carriers use the link's own QUIC connection, its keep-alive and its one congestion controller; a channel opens no socket, no second connection and no extra reader of the connection's datagrams (the face's own reader returns channel frames like any frame). The host sees a link only as a face: no connection, key, address or `FaceId`-to-connection map is exported.
+8. **Which links carry channel frames.** Each side decides for the link it admits, with its scope (§7.3), as a policy (`ChannelPolicy { carry, quota }`). A link that is not carried sends no channel frame, grants its peer no stream and drops and counts the frames its peer sends, **without closing** the link:
+
+   | Link | Channel frames |
+   |---|---|
+   | The peer is an `admin`, `member` or `node` of a namespace this device holds a certificate in, on a full link | carried, **no quota**: the link's congestion control decides |
+   | The peer is a `guest` of that namespace (§15.3) | not carried (a guest is no member of a space) |
+   | A grant link (§8.7) | carried, under the fair share of item 9; the asks of a channel to the devices of the folder's owner namespace (`<device>/32=chan/…`) are among the names the link carries (§8.7 rule 5) |
+   | An enrollment link (§8.1), an introduction link (§8.6), a departure link (§8.8), a stranger a relay serves under quotas (§15.3), a peer admitted by its expected key alone (no certificate shown), a link dialled from an introduction code to a party that shows no certificate (§13.3) | not carried |
+   | A device of another namespace this device serves without limits, or a relay of another namespace this device follows (§15.4) | carried as a forwarder: it routes frames of routes installed on it and judges none |
+
+9. **The quota is a fair share.** The bytes a link carries each way as channel frames are held to a **fair share** of a pool when its policy has one, never to a fixed ceiling per member (ndn-rs `FairShare { capacity, floor, interval }`, in `ndn-face-quic`): no ceiling applies to one member alone; a share applies only when several links of the namespace are active at once. The pool is `FAIR_CAPACITY` = 128 MiB/s by default (an operator's ceiling that protects the serving device, not a per-member cap) and gives link *i* a token bucket at `clamp(capacity / max(1, active), floor, capacity)` bytes per second, where `active` is the number of the namespace's links that passed, or tried to pass, a channel frame in the last `interval` (1 s); `floor` is 256 KiB/s. The rate is recomputed once per `interval`; the burst is one second's worth; the two directions have buckets of their own. A lone member therefore has the whole pool, two active members half each, and an idle member costs the others nothing. A frame longer than the burst waits for a full bucket and is then charged whole, so the average is the rate. Over its bucket a received datagram is dropped and counted (`dropped_over_quota`, and no Nack is sent); a received stream frame is not dropped (that would break the channel's order) but waited for, and QUIC's flow control slows the peer; a blocking sender waits for its tokens and a non-blocking one is refused `Full`, counted too. The pool of a grant link's namespace is shared by its grant links on this device. Replacing the grant link's `GRANT_BYTES` and `GRANT_ANSWERED` ceilings (§15.3) by this rule is a later change.
 
 ## 10. Routes
 
@@ -1362,7 +1386,7 @@ A relay's link is, in addition, wanted only while the relay is chosen or retried
 
 ### 16.2 Idle close and the Asleep close
 
-A device checks each link it keeps: an on-demand link every `idle` / 4, clamped to 250 ms – 30 s; other links every 60 s; and at once when the host changes something. *Activity* is the NDN datagrams sent or received on the link (QUIC DATAGRAM frames); keep-alive PINGs and control-stream messages are not activity, so keep-alives do not hold an idle link open. The device closes the link:
+A device checks each link it keeps: an on-demand link every `idle` / 4, clamped to 250 ms – 30 s; other links every 60 s; and at once when the host changes something. *Activity* is the NDN datagrams and the channel datagrams sent or received on the link (QUIC DATAGRAM frames), and the octets of channel frames on its stream in either direction (ndn-rs `LinkHandle::side_stats`, §9 item 7); keep-alive PINGs and control-stream messages are not activity, so keep-alives do not hold an idle link open. A link another device dialled here with no activity for `quiet_close` is closed with **0x02** (Idle), unless the host's forwarder routes to its face — an NDN route, or a *side route* (`FaceSink::side_routes`: the routes the forwarder holds for channel frames; zero for a forwarder that has none) — or the link carries a namespace in transit (§15.7); a link this device dialled is its mode's own. The device closes the link:
 
 - with **0x05** (Asleep), when an `on-demand` link is not asked for, the host is not active, and the link carried no datagram for `idle` (the close comes within one check after that);
 - with **0x05**, when an `off` link is no longer asked for;
@@ -1515,6 +1539,24 @@ The state is written at four places and nowhere else: a link or direct path comi
 - The words of a peer's close are the peer's: a hostile peer chooses the text of its own `link-closed-by-peer` reason, and it can put anything in it: line breaks and escape sequences that forge a log line or repaint a terminal, bidirectional controls that reorder what a screen shows, zero-width characters that hide words, a page of persuasion. Two layers make it safe to show, and a host still MUST show it as text, never as markup or a command. (1) `ndn-face-quic` hands up no raw close text: the text of a close (`LinkError::Refused`) and of a transport close (the sentence of `LinkError::Connect`) have gone through `sanitize_peer_text` — every control character (C0, DEL, C1) and invisible character (the bidirectional controls U+061C, U+200E–200F, U+202A–202E, U+2066–2069, the zero-width characters U+200B–200D, U+2060–206F, U+FEFF, U+00AD, U+180E, the interlinear annotation marks and the tag characters) removed, every run of whitespace (the line and paragraph separators included) collapsed to one space, the ends trimmed, and the whole at most `PEER_TEXT_MAX` = 512 characters, a longer text ending in `…` within that bound — so the log lines and details built from it carry one bounded line of printable text. (2) A watcher does the same to every sentence and parameter of a reason, whatever its source, **before** it scrubs addresses (an address with an invisible character in it is still an address), and bounds each at `WATCH_TEXT_MAX` = 1024 characters, again ending in `…`.
 - The table is bounded (§17A.2), so peers cannot grow it by dialling with many keys, a code's hint naming many keys, or flapping; a flood of keys evicts the entries of dead peers before those of live links, and a live peer that was evicted is shown again by its next change.
 - No wire TLV is added or changed (the registry of §5.1 is unchanged).
+
+### 17A.5 The side path's counters
+
+`Links::report()` gives each device's link a `LinkStatus` (§14.10); it carries `side: SideStats`, the counters of the channel frames (§9 item 7) of the link's paths together (those of a path that is gone are gone with it; a device that is not linked has zeros). Counters only: no address, no key, no name. Nothing on the wire changes for it (the field `ChannelCaps` of §5.2 is the only addition of the channel carrier).
+
+| Field | Counts |
+|---|---|
+| `datagram_tx_frames`, `datagram_tx_bytes` | channel datagrams sent, and their octets |
+| `datagram_rx_frames`, `datagram_rx_bytes` | channel datagrams received and delivered, and their octets |
+| `stream_tx_frames`, `stream_tx_bytes` | channel frames written to the stream, and their octets (without the record's 4-octet prefix) |
+| `stream_rx_frames`, `stream_rx_bytes` | channel frames read from the stream, and their octets |
+| `coalesced` | stream frames written in the same write as an earlier one |
+| `dropped_over_quota` | received datagrams dropped, and frames `forward_side` refused as `Full`, for the link's fair share (§9 item 9) |
+| `dropped_malformed` | stream records of no octets, over 1 MiB, or not starting with 0x00 (§9 item 7) |
+| `stream_blocked` | stream writes that found no flow-control credit and waited |
+| `sink_full` | frames `forward_side` refused because the send buffer or the stream's queue had no room |
+| `refused` | frames refused because the link does not carry channel frames or the peer lacks the capability: those sent, and those received and dropped |
+| `queued_peak` | the most octets that waited in the connection's datagram send buffer when a channel datagram was handed to it (always under `QUEUE_MAX`, §9 item 7) |
 
 ## 17B. The fault layer
 
@@ -1754,6 +1796,11 @@ impl Links {
 | `ENROLLMENT_ANSWERS` | burst 512, 128 per s | §8.2 |
 | scope fragment memory | 32 packets per direction | §8.3 |
 | `DATAGRAM_FLOOR` | 1100 bytes | §9 |
+| `ChannelCaps` | TLV-TYPE 0x044E, one byte; bit 0 = channel frames v1 | §5.2 |
+| channel marker | first octet `0x00` | §9 item 7 |
+| `QUEUE_MAX` / `DATAGRAM_SEND_BUFFER` | 128 KiB of channel-datagram headroom / the connection's 1 MiB datagram send buffer | §9 item 7 |
+| `STREAM_FRAME_MAX` / `STREAM_QUEUE_MAX` | 1 MiB per channel stream frame / 4 MiB queued in front of the stream's writer (and 4 MiB held for a face's reader) | §9 item 7 |
+| `FAIR_CAPACITY` / `FAIR_FLOOR` / `FAIR_INTERVAL` | 128 MiB/s pool / 256 KiB/s least for an active link / 1 s window | §9 item 9 |
 | fragment overhead reserve | 50 bytes | §9 |
 | `max_datagram_frame_size` advertised | 65 535 | §3.1 |
 | handshake limits | 64 / 4 per IP / 8 refusals within 60 s → 60 s | §13.2 |
@@ -1880,24 +1927,25 @@ The same leaf as one string:
 06fd0117073f0804686f6d6508066d656d626572080570686f6e6508034b455908103131313231333134313531363137313808074e444e4345525436080000019b76daa8001414180800000000000000021908000000000036ee80152c302a300506032b65700321008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c164e1b01051c1f071d0804686f6d6508034b4559081030313032303330343035303630373038fd00fd26fd00fe0f323032363031303154303030303030fd00ff0f32303237303130315430303030303017405c22d990715a0d13c850565825fbc35afcf87aec2c8d39922f2046ee4c2004a6d286c8c4214af762cb62ff6f8d5d99b268a79d3d91221c5e469100460a539f01
 ```
 
-### 19.4 LinkHello with no certificate (9 B)
+### 19.4 LinkHello with no certificate (14 B)
 
 ```
-fd0450 05        LinkHello, length 5
+fd0450 0a        LinkHello, length 10
   fd0451 01 01   LinkVersion = 1
+  fd044e 01 01   ChannelCaps = bit 0 (channel frames v1)
 ```
-`fd045005fd04510101`
+`fd04500afd04510101fd044e0101`
 
-### 19.5 LinkHello with leaf and root (559 B)
+### 19.5 LinkHello with leaf and root (564 B)
 
 ```
-fd0450 fd0229    LinkHello, length 553
+fd0450 fd022e    LinkHello, length 558
   fd0451 01 01   LinkVersion = 1
   <leaf, 283 B, 19.3>
   <root, 265 B, 19.3>
 ```
 
-The wire is `fd0450fd0229fd04510101` ‖ leaf ‖ root (5 + 283 + 265 = 553). A receiver whose key is the TLS key of 19.1 passes step 3 of §7.1: the leaf's Content SPKI reduces to the raw key `8a88…6f5c`. The chain ends in the namespace's self-signed root, the form §5.2 asks for.
+The wire is `fd0450fd022efd04510101` ‖ leaf ‖ root ‖ `fd044e0101` (5 + 283 + 265 + 5 = 558). A receiver whose key is the TLS key of 19.1 passes step 3 of §7.1: the leaf's Content SPKI reduces to the raw key `8a88…6f5c`. The chain ends in the namespace's self-signed root, the form §5.2 asks for. The hello ends with ChannelCaps (19.4); a hello without it (a sender that predates the field) is read as no capability.
 
 ### 19.6 LinkVerdict, full link (4 B)
 
@@ -1976,14 +2024,15 @@ Field breakdown of the fragment:
 
 ObservedAddress for 192.0.2.7:6363: `fd045806c000020718db`. The UDP address `[2001:db8::1]:443`: `20010db800000000000000000000000101bb` (18 B). An IPv4-mapped `[::ffff:192.0.2.7]:6363` is written `c000020718db`.
 
-### 19.13 LinkHello of a direct-path dialer with no certificate, session 01…08 (21 B)
+### 19.13 LinkHello of a direct-path dialer with no certificate, session 01…08 (26 B)
 
 ```
-fd0450 11              LinkHello, length 17
+fd0450 16              LinkHello, length 22
   fd0451 01 01         LinkVersion = 1
   fd045a 08 0102030405060708   DirectPath
+  fd044e 01 01         ChannelCaps
 ```
-`fd045011fd04510101fd045a080102030405060708`
+`fd045016fd04510101fd045a080102030405060708fd044e0101`
 
 ### 19.14 Punch name and probe
 
@@ -2105,17 +2154,18 @@ Line breaks and spaces carry no meaning. The hex is the encoder's output, assert
 
 ### 19.21 LinkHello with Follows
 
-A hello with no certificate that follows the groups `/a/32=sync/x` and `/b/c/32=sync/y/z`, 47 bytes: the header (`fd 04 50`, TLV-LENGTH 43), LinkVersion, then Follows (`fd 04 56`, TLV-LENGTH 34) with the 14-byte Name `/a/32=sync/x` (components `08 01 61`, the keyword `20 04 73 79 6e 63`, `08 01 78`) and the 20-byte Name `/b/c/32=sync/y/z`:
+A hello with no certificate that follows the groups `/a/32=sync/x` and `/b/c/32=sync/y/z`, 52 bytes: the header (`fd 04 50`, TLV-LENGTH 48), LinkVersion, then Follows (`fd 04 56`, TLV-LENGTH 34) with the 14-byte Name `/a/32=sync/x` (components `08 01 61`, the keyword `20 04 73 79 6e 63`, `08 01 78`) and the 20-byte Name `/b/c/32=sync/y/z`, then ChannelCaps:
 
 ```
-fd04502b
+fd045030
   fd04510101
   fd045622
     070c 0801 61 2004 73796e63 0801 78
     0712 0801 62 0801 63 2004 73796e63 0801 79 0801 7a
+  fd044e0101
 ```
 
-Without the breaks: `fd04502bfd04510101fd045622070c080161200473796e630801780712080162080163200473796e6308017908017a`. The hex is the encoder's output, asserted literally by `a_hello_follows_is_even_names_and_an_older_receiver_skips_it` (Q/message.rs). `a_hello_follows_is_bounded` asserts that a Follows of more than 32 Names is read as its first 32 and that a sender names no more. `a_hello_follows_names_exact_groups_and_refuses_what_is_not_one` asserts that a namespace (`/a`), the owner's whole group (`/a/32=sync`), a group with an empty owner, with more than 4 components after the keyword, with another keyword or a non-generic component in it, and one of more than 13 components are refused (0x15), as are the root, a value with no Name and a TLV that is not a Name inside it, that an unknown even type above 31 beside it is skipped, and that a sender leaves such names out rather than make its own hello malformed.
+Without the breaks: `fd045030fd04510101fd045622070c080161200473796e630801780712080162080163200473796e6308017908017afd044e0101`. The hex is the encoder's output, asserted literally by `a_hello_follows_is_even_names_and_an_older_receiver_skips_it` (Q/message.rs); `a_hello_carries_channel_caps_and_an_older_hello_has_none` asserts 19.4, that a hello of an older sender (no field) reads as no capability, that bits this side does not know are kept, and that a field of any length but one is malformed. `a_hello_follows_is_bounded` asserts that a Follows of more than 32 Names is read as its first 32 and that a sender names no more. `a_hello_follows_names_exact_groups_and_refuses_what_is_not_one` asserts that a namespace (`/a`), the owner's whole group (`/a/32=sync`), a group with an empty owner, with more than 4 components after the keyword, with another keyword or a non-generic component in it, and one of more than 13 components are refused (0x15), as are the root, a value with no Name and a TLV that is not a Name inside it, that an unknown even type above 31 beside it is skipped, and that a sender leaves such names out rather than make its own hello malformed.
 
 ## 20. Decisions
 
@@ -2144,7 +2194,7 @@ These points were open when this spec was first written. Each was decided, and c
 21. **Namespaces a relay does not hold are checked against the root in the hello** (§7.1 R1–R7, §15.2). Fetching their trust contexts would need a route before the link is up, and an operator configures a root key fingerprint far more easily than a trust context. The cost is stated: revocations of such a namespace cannot be checked, and its link policy is not applied. An operator who needs them holds the namespace's trust context.
 22. **One root per namespace name** (§15.3). A relay routes served devices by name, so two namespaces of one name, or one under a held namespace, cannot both be served; the first root holds the name while any of its links lives.
 23. **Relay preference by rank** (§15.6). Route costs follow the rank in the whole order, not among the linked ones, so costs do not change when another relay links or drops; of equal preference the person's choice (`user`) comes before the namespace's. A relay that is no longer needed is closed with 0x06 so that the relay's log says it was not a fault.
-24. **Idle is measured in NDN datagrams** (§16.2). Keep-alives and control messages do not count, so an on-demand link closes when its traffic stops, whatever its keep-alive. The close is 0x05, so the other side's log says the device went to sleep by choice; a relay counts the device asleep after any end of its last path, a broken one included (§17.2).
+24. **Idle is measured in datagrams and channel stream bytes** (§16.2). Keep-alives and control messages do not count, so an on-demand link closes when its traffic stops, whatever its keep-alive; the NDN datagrams, the channel datagrams and the octets of channel frames on the stream do. The close is 0x05, so the other side's log says the device went to sleep by choice; a relay counts the device asleep after any end of its last path, a broken one included (§17.2).
 25. **Waiting Interests go out past the forwarder** (§16.3, §17.3). The forwarder already sent them to the waiting face and keeps their pending entries; sending them over the link's face directly needs no second forwarding decision, and the Data that comes back matches the pending entries by name.
 26. **Held Interests and wakes live in memory, bounded** (§17). A relay keeps no state for sleeping devices across restarts; devices register on every link, so a restart costs one relink. The notifier gets the device's name, key and token and a count, never Interest names, and at most one wake per 30 s per device, so a stream of Interests cannot become a stream of pushes.
 27. **Presence travels on the control stream** (§14.8), not as signed records or in a sync group: the stream is authenticated by the link's handshake and admission, reaches only the members the relay admitted, filtered per role, says who is linked now, and costs nothing while nothing changes. Presence never carries addresses.
