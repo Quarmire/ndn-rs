@@ -34,12 +34,15 @@ use ndn_security::{Signer, Validator};
 use sha2::Sha256;
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
+use crate::chan::standing::{
+    NO_RECORD, Unstanding, Who, gate as chan_gate, standing as chan_standing,
+};
 use crate::error::HeapError;
 use crate::host::NodeHandle;
 use crate::log::Log;
 use crate::seal;
 use crate::space::SpaceInner;
-use crate::trust::{Judge, owner_capable};
+use crate::trust::Judge;
 use crate::wire::{
     self, EpochId, device_of, parse_signal_run_name, signal_run_name, sync_group_of,
 };
@@ -55,10 +58,6 @@ pub const KEY_ID_LEN: usize = 8;
 
 /// The octets of a signal run's id: a run header's last name component.
 pub const RUN_ID_LEN: usize = wire::RUN_ID_LEN;
-
-/// Why nothing about a space is decided here yet.
-const NO_RECORD: &str = "its creation, the owner's first members entry, is not held here yet; \
-                         follow the space (watch it) so the owner's entries arrive, then ask again";
 
 // -- What the transport is given ---------------------------------------------------------
 
@@ -252,33 +251,15 @@ pub enum SignalRefusal {
 /// node's own for a person it holds, else the view adopted for the person while
 /// a listing of the space names her as a writer or a reader.
 fn standing(log: &Log, judge: &Judge, key: &Name, reads: bool) -> Result<Name, SignalRefusal> {
-    let not_member = || SignalRefusal::NotMember {
-        scope: log.space.clone(),
-        key: key.clone(),
-    };
-    if device_of(key).is_none() {
-        return Err(not_member());
-    }
-    let view = judge.view_for(key, &log.space, true);
-    let context = view.keyring().context_for(key);
-    let person = context.namespace();
-    let fold = &log.fold;
-    if person.is_empty() || !(fold.is_writer(person) || (reads && fold.is_reader(person))) {
-        return Err(not_member());
-    }
-    // A person stands only through its `admin` and `member` devices, where its namespace
-    // declares the role layout: a `guest` or a `node` relay device of a member is no member
-    // for signals, as none is for the owner (spec §9.9).
-    if !owner_capable(&context, key) {
-        return Err(not_member());
-    }
-    if context.is_revoked(key) {
-        return Err(SignalRefusal::BadSignature { key: key.clone() });
-    }
-    if log.suspected(key) {
-        return Err(SignalRefusal::Suspected { key: key.clone() });
-    }
-    Ok(person.clone())
+    let who = if reads { Who::Reader } else { Who::Writer };
+    chan_standing(log, judge, key, who).map_err(|why| match why {
+        Unstanding::NotMember => SignalRefusal::NotMember {
+            scope: log.space.clone(),
+            key: key.clone(),
+        },
+        Unstanding::Revoked => SignalRefusal::BadSignature { key: key.clone() },
+        Unstanding::Suspected => SignalRefusal::Suspected { key: key.clone() },
+    })
 }
 
 /// [`NodeHandle::signal_member`] over one space.
@@ -289,36 +270,12 @@ pub(crate) fn signal_member(log: &Log, judge: &Judge, scope: &Name, key: &Name) 
 /// This device may use signals over the space: its creation is held and this
 /// device's key is a writer of it, or, when `reads`, a reader.
 fn own_gate(log: &Log, judge: &Judge, reads: bool) -> Result<(), HeapError> {
-    if log.fold.create().is_none() {
-        return Err(HeapError::NotReady {
-            name: log.space.clone(),
-            why: NO_RECORD.into(),
-        });
-    }
-    let (why, next) = match standing(log, judge, &log.key, reads) {
-        Ok(_) => return Ok(()),
-        Err(SignalRefusal::BadSignature { .. }) => (
-            "the trust context governing this device's key revokes it",
-            "ask the owner to add this device's person to the space",
-        ),
-        Err(SignalRefusal::Suspected { .. }) => (
-            "this device's key is marked suspected here",
-            "unsuspect it if it is safe, or enrol this device with a new key",
-        ),
-        Err(_) if reads => (
-            "this device is neither a writer nor a reader of it by the entries held",
-            "ask the owner to add this device's person to the space",
-        ),
-        Err(_) => (
-            "this device is no writer of it by the entries held",
-            "ask the owner to add this device's person to the space",
-        ),
-    };
-    tracing::debug!(space = %log.space, key = %log.key, "signals refused: {why}");
-    Err(HeapError::NotAllowed {
-        space: log.space.clone(),
-        why: format!("{why}; {next}"),
-    })
+    chan_gate(
+        log,
+        judge,
+        if reads { Who::Reader } else { Who::Writer },
+        "signals",
+    )
 }
 
 // -- The scope and the header ------------------------------------------------------------

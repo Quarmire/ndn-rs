@@ -32,9 +32,9 @@
 //!
 //! The parsers of the names a device serves ([`parse_space_name`], [`parse_log_name`],
 //! [`parse_piece_name`], [`parse_seal_key_name`], [`parse_grant_name`], [`parse_held_name`],
-//! [`parse_signal_run_name`]) and [`is_namespace`] are public: a sibling crate that filters
-//! packets by name (`ndn-invite`'s folder scope) judges them by the layer's own grammar, never a
-//! copy of it.
+//! [`parse_signal_run_name`], [`parse_chan_name`]) and [`is_namespace`] are public: a sibling
+//! crate that filters packets by name (`ndn-invite`'s folder scope) judges them by the layer's
+//! own grammar, never a copy of it.
 //!
 //! ```
 //! use ndn_foundation_types::Name;
@@ -67,16 +67,20 @@ pub(crate) use digest::*;
 pub(crate) use names::*;
 pub(crate) use pieces::*;
 pub use prim::WireError;
-pub(crate) use prim::{each, fields, once, read_name};
+pub(crate) use prim::{
+    each, fields, once, only, read_array, read_epoch_id, read_name, read_nni, write_epoch_id,
+    write_nni,
+};
 pub(crate) use sign::{SignError, sign_entry};
 
 pub use digest::{signed_digest, signed_digest_of};
 pub use names::ASKER_CHAIN_MAX;
 pub(crate) use names::ASKER_CHAIN_OCTETS_MAX;
 pub use names::{
-    GrantAsk, LogName, SignalRunName, SpaceName, grant_name, held_name, is_namespace, log_name,
-    parse_grant_name, parse_held_name, parse_log_name, parse_seal_key_name, parse_signal_run_name,
-    parse_space_name, seal_key_name, signal_run_name, sync_group_of,
+    GrantAsk, LogName, SignalRunName, SpaceName, chan_ask_name, chan_prefix, grant_name, held_name,
+    is_namespace, log_name, parse_chan_name, parse_grant_name, parse_held_name, parse_log_name,
+    parse_seal_key_name, parse_signal_run_name, parse_space_name, seal_key_name, signal_run_name,
+    sync_group_of,
 };
 pub use pieces::{PieceKind, PieceName, parse_piece_name, piece_name};
 pub use types::*;

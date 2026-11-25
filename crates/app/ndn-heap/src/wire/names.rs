@@ -13,6 +13,8 @@
 //! | grant | `<G>/32=grant/<GrantAsk TLV>` |
 //! | held copy | `<H>/32=held/<Name TLV of the original>` |
 //! | sync group | `<O>/32=sync/<c1>[/<c2>…]` |
+//! | channel ask and session | `<D>/32=chan/<ParametersSha256Digest>` |
+//! | channel announce | `<sync group>/32=chan/<ParametersSha256Digest>` |
 //!
 //! Every name parses one way: `D`, `O`, `G` and `H` have no keyword component,
 //! so the first keyword ends them; a seal key's and a grant's last component
@@ -32,17 +34,18 @@ const LOG: &[u8] = b"log";
 const SEAL: &[u8] = b"seal";
 const GRANT: &[u8] = b"grant";
 const HELD: &[u8] = b"held";
+const CHAN: &[u8] = b"chan";
 pub(super) const PIECE: &[u8] = b"piece";
 pub(super) const MANIFEST: &[u8] = b"manifest";
 const SYNC: &[u8] = ndn_security::trust_context::SYNC_GROUP_KEYWORD;
 
 /// Every keyword the layer's own names carry: a space (`data`), an entry
 /// (`log`), its pieces (`piece`, `manifest`), a seal key, a grant, a held copy
-/// (`seal`, `grant`, `held`), a sync group (`sync`) and a signal run
+/// (`seal`, `grant`, `held`), a sync group (`sync`), a channel ask (`chan`) and a signal run
 /// (`signal`, `run`). The sibling surface refuses an extension that claims one
 /// of them ([`crate::host`]).
 pub(crate) const CORE_KEYWORDS: &[&[u8]] = &[
-    DATA, LOG, SEAL, GRANT, HELD, PIECE, MANIFEST, SYNC, SIGNAL, RUN,
+    DATA, LOG, SEAL, GRANT, HELD, PIECE, MANIFEST, SYNC, CHAN, SIGNAL, RUN,
 ];
 
 /// The most components a space name has after its `32=data`.
@@ -446,6 +449,8 @@ pub(crate) enum Served {
     Seal,
     /// `<granter>/32=grant/<ask>`.
     Grant,
+    /// `<device>/32=chan/<ParametersSha256Digest>`: a channel ask, answered by a session.
+    Chan,
 }
 
 /// Which [`Served`] name `name` can be, by one look: each kind's parser takes
@@ -458,8 +463,90 @@ pub(crate) fn served_kind(name: &Name) -> Option<Served> {
         HELD => Some(Served::Held),
         SEAL => Some(Served::Seal),
         GRANT => Some(Served::Grant),
+        CHAN => Some(Served::Chan),
         _ => None,
     }
+}
+
+/// The octets of a channel ask's parameters digest: the last component of its name.
+const CHAN_DIGEST_LEN: usize = 32;
+
+/// `<device>/32=chan`: what a channel ask is named under before its parameters digest is
+/// appended (an Interest with ApplicationParameters gets that component from its encoder).
+///
+/// Public: a sibling crate's cases name a channel ask as the layer does.
+pub fn chan_prefix(device: &Name) -> Name {
+    device.clone().append_component(kw(CHAN))
+}
+
+/// The device of `<device>/32=chan`, the name an ask is made under before its digest: `None` for
+/// any other name.
+pub(crate) fn parse_chan_prefix(name: &Name) -> Option<Name> {
+    let (last, device) = name.components().split_last()?;
+    (is_kw(last, CHAN) && is_device_comps(device)).then(|| name_of(device))
+}
+
+/// A channel ask's name, and the name of the session that answers it:
+/// `<device>/32=chan/<ParametersSha256Digest>`, `device` the device that answers.
+///
+/// Public: a sibling crate's cases name a channel ask as the layer does.
+pub fn chan_ask_name(device: &Name, digest: &[u8; 32]) -> Name {
+    chan_prefix(device).append_component(NameComponent::new(
+        tlv_type::PARAMETERS_SHA256,
+        Bytes::copy_from_slice(digest),
+    ))
+}
+
+/// Parse `<device>/32=chan/<ParametersSha256Digest>`: `device` is everything before the first
+/// `32=chan` (a device name, so it holds no keyword), exactly one component follows, and it is a
+/// ParametersSha256DigestComponent of 32 octets. Nothing else parses.
+///
+/// Public: a sibling crate that filters names tells a channel ask by it.
+pub fn parse_chan_name(name: &Name) -> Option<(Name, [u8; 32])> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| is_kw(c, CHAN))?;
+    let [digest] = &comps[at + 1..] else {
+        return None;
+    };
+    if !is_device_comps(&comps[..at]) || digest.typ != tlv_type::PARAMETERS_SHA256 {
+        return None;
+    }
+    let digest = <[u8; CHAN_DIGEST_LEN]>::try_from(digest.value.as_ref()).ok()?;
+    Some((name_of(&comps[..at]), digest))
+}
+
+/// The announce of a channel: `<sync group of the space>/32=chan/<ParametersSha256Digest>`: the
+/// ask's shape under the group instead of a device.
+#[cfg(test)]
+pub(crate) fn chan_announce_name(group: &Name, digest: &[u8; 32]) -> Name {
+    chan_ask_name(group, digest)
+}
+
+/// Parse an announce, `<sync group>/32=chan/<ParametersSha256Digest>`: the sync group of a
+/// space (`<O>/32=sync/<c1>[/<c2>…]`, `O` a namespace and one to four generic components after
+/// the keyword) and its digest. Which space the group is of is the node's to say.
+pub(crate) fn parse_chan_announce_name(name: &Name) -> Option<(Name, [u8; 32])> {
+    let comps = name.components();
+    let [group @ .., chan, digest] = comps else {
+        return None;
+    };
+    if !is_kw(chan, CHAN) || digest.typ != tlv_type::PARAMETERS_SHA256 {
+        return None;
+    }
+    let sync = group.iter().position(|c| is_kw(c, SYNC))?;
+    let rest = &group[sync + 1..];
+    let plain_rest = rest
+        .iter()
+        .all(|c| c.typ == tlv_type::GENERIC_NAME_COMPONENT);
+    if !is_namespace_comps(&group[..sync])
+        || rest.is_empty()
+        || rest.len() > SPACE_REST_MAX
+        || !plain_rest
+    {
+        return None;
+    }
+    let digest = <[u8; CHAN_DIGEST_LEN]>::try_from(digest.value.as_ref()).ok()?;
+    Some((name_of(group), digest))
 }
 
 /// The first keyword of `name`: what a device's names are routed by, since

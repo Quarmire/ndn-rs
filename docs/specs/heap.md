@@ -250,6 +250,7 @@ device.
 | seal key of device `D` | `<D>/32=seal/<public key>`, the last component 32 octets | one `SEAL_KEY` TLV (§6.2) | a key of device `D` |
 | grant | `<G>/32=grant/<GrantAsk TLV>`, the last component one GenericNameComponent holding the `GRANT_ASK` TLV, which carries the asker's seal key packet and the certificates of its signer chain | one `GRANT` TLV (§6.5) | a key of the granter `G` |
 | held copy | `<H>/32=held/<Name TLV of the original>`, the last component one GenericNameComponent | the complete wire of the original packet | DigestSha256 |
+| channel ask and session (never stored; [channel.md](channel.md)) | `<D>/32=chan/<ParametersSha256Digest>`, exactly one component after the keyword, a ParametersSha256DigestComponent of 32 octets | the ask's ApplicationParameters (a `CHAN_ASK`) go in the Interest; the Data's Content is a `CHAN_SESSION` or a `CHAN_REFUSAL` | the Interest by a key of the asker's device, the Data by a key of device `D` |
 | signal run header (§11; never stored, served or fetched) | `<D>/32=signal/<S>/32=run/<run id>`, the run id one GenericNameComponent of 16 octets | the run's body | a key of device `D` |
 | sync group | `<O>/32=sync/<c1>[/<c2>…]` | State Vector Sync Interests and Data (§7) | as `ndn-sync` |
 
@@ -306,6 +307,10 @@ Every name parses one way, and a node MUST refuse a name that does not parse.
 - **Signal run header.** `D` is the components before the first `32=signal` (a
   device name); the last component is a GenericNameComponent of exactly 16
   octets, the next-to-last `32=run`; what lies between is a space name (§11).
+- **Channel ask.** `D` is the components before the first `32=chan` (a device name); exactly one
+  component follows, a ParametersSha256DigestComponent of 32 octets. Nothing else parses (no
+  component, two, a generic one, a digest of another length). The announce of a channel has the
+  same two components under a sync group instead of a device ([channel.md](channel.md) §9).
 - **Sync group.** `<O>/32=sync` followed by the 1 to 4 components of a space's
   rest (§2.5).
 
@@ -322,6 +327,7 @@ name is none of these. If it is a keyword:
 | `held` | a held copy |
 | `seal` | a seal key packet |
 | `grant` | a grant answer |
+| `chan` | a channel session or a signed refusal ([channel.md](channel.md)) |
 | any other, **registered by an extension** (§10.9) | that extension's answer |
 | any other | not served |
 

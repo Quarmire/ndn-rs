@@ -415,6 +415,11 @@ fn the_keyword_router_names_each_served_kind_in_one_look() {
         seal_key_name(&device, &[9; 32]),
         grant_name(&device, &ask(&space)),
         held_name(&device, &log),
+        chan_ask_name(&device, &[3; 32]),
+        // A chan keyword with no digest, or with a generic component, is routed to the setup and
+        // parses to nothing there.
+        n("/alice/laptop/32=chan"),
+        n("/alice/laptop/32=chan/x"),
         held_name(&device, &n("/bob/phone/32=log/bob/32=data/x/seq=1")),
         // Misplaced keywords: one after another, a lone keyword, a keyword
         // the layer does not use, the marker of a space.
@@ -443,6 +448,8 @@ fn the_keyword_router_names_each_served_kind_in_one_look() {
             Some(Served::Held)
         } else if parse_seal_key_name(name).is_some() {
             Some(Served::Seal)
+        } else if parse_chan_name(name).is_some() {
+            Some(Served::Chan)
         } else if parse_log_name(name).is_some() || parse_piece_name(name).is_some() {
             Some(Served::Log)
         } else {
@@ -455,13 +462,14 @@ fn the_keyword_router_names_each_served_kind_in_one_look() {
         Served::Seal => parse_seal_key_name(name).map(|_| Served::Seal),
         Served::Log => (parse_log_name(name).is_some() || parse_piece_name(name).is_some())
             .then_some(Served::Log),
+        Served::Chan => parse_chan_name(name).map(|_| Served::Chan),
     };
     let mut seen = std::collections::BTreeSet::new();
     for name in &names {
         assert_eq!(routed(name), chain(name), "{name}");
         seen.extend(chain(name).map(|k| format!("{k:?}")));
     }
-    assert_eq!(seen.len(), 4, "the table reaches every route: {seen:?}");
+    assert_eq!(seen.len(), 5, "the table reaches every route: {seen:?}");
     // The one look is the first keyword and nothing else.
     assert_eq!(served_kind(&log), Some(Served::Log));
     assert_eq!(served_kind(&held_name(&device, &log)), Some(Served::Held));
@@ -487,6 +495,8 @@ fn every_keyword_the_layers_names_carry_is_a_core_keyword() {
         held_name(&device, &log),
         sync_group_of(&space).unwrap(),
         signal_run_name(&device, &space, &[3; RUN_ID_LEN]),
+        chan_ask_name(&device, &[4; 32]),
+        chan_announce_name(&sync_group_of(&space).unwrap(), &[5; 32]),
     ];
     let mut seen = std::collections::BTreeSet::new();
     for name in &names {
@@ -689,5 +699,75 @@ fn signal_run_names_round_trip_and_refuse_what_they_are_not() {
         n("/alice/laptop/32=signal/alice/32=data/chat/room").append(run),
     ] {
         assert_eq!(parse_signal_run_name(&bad), None, "{bad}");
+    }
+}
+
+/// `<device>/32=chan/<digest>` has exactly one component after the keyword, a
+/// ParametersSha256DigestComponent of 32 octets, and nothing else parses: the router sends such
+/// a name to the channel setup and the announce under a sync group to no device.
+#[test]
+fn a_chan_name_is_one_digest_under_a_device_and_nothing_else_parses() {
+    let device = n("/alice/laptop");
+    let digest = [9u8; 32];
+    let name = chan_ask_name(&device, &digest);
+    let comps = name.components();
+    assert_eq!(comps.len(), 4, "device, device, the keyword, the digest");
+    assert_eq!(comps[2], kw(b"chan"));
+    assert_eq!(
+        comps[3].typ,
+        ndn_foundation_types::tlv_type::PARAMETERS_SHA256
+    );
+    assert_eq!(parse_chan_name(&name), Some((device.clone(), digest)));
+    assert_eq!(served_kind(&name), Some(Served::Chan));
+    assert_eq!(chan_prefix(&device), n("/alice/laptop/32=chan"));
+
+    let with = |c: NameComponent| chan_prefix(&device).append_component(c);
+    let digest_component = |v: &[u8]| {
+        NameComponent::new(
+            ndn_foundation_types::tlv_type::PARAMETERS_SHA256,
+            Bytes::copy_from_slice(v),
+        )
+    };
+    for bad in [
+        // no component after the keyword, two, or one that is no parameters digest
+        chan_prefix(&device),
+        name.clone().append("more"),
+        with(generic("digest")),
+        with(NameComponent::new(
+            ndn_foundation_types::tlv_type::IMPLICIT_SHA256,
+            Bytes::copy_from_slice(&digest),
+        )),
+        // a digest of 31 or 33 octets
+        with(digest_component(&digest[..31])),
+        with(digest_component(&[9; 33])),
+        // a device with a keyword, with a digest, or none at all
+        chan_ask_name(&n("/alice/32=held/laptop"), &digest),
+        chan_ask_name(&device.clone().append_implicit_digest([1; 32]), &digest),
+        chan_ask_name(&Name::root(), &digest),
+        // another keyword
+        n("/alice/laptop/32=grant").append_component(digest_component(&digest)),
+    ] {
+        assert_eq!(parse_chan_name(&bad), None, "{bad}");
+    }
+    // The announce is the same shape under a sync group, and no device's ask.
+    let group = sync_group_of(&n("/alice/32=data/chat/room")).unwrap();
+    let announce = chan_announce_name(&group, &digest);
+    assert_eq!(parse_chan_name(&announce), None);
+    assert_eq!(
+        parse_chan_announce_name(&announce),
+        Some((group.clone(), digest))
+    );
+    assert_eq!(
+        parse_chan_announce_name(&name),
+        None,
+        "a device's ask is no announce"
+    );
+    for bad in [
+        chan_announce_name(&n("/alice/laptop"), &digest),
+        chan_announce_name(&n("/alice/32=sync"), &digest),
+        chan_announce_name(&n("/alice/32=sync/a/b/c/d/e"), &digest),
+        group.clone().append("x"),
+    ] {
+        assert_eq!(parse_chan_announce_name(&bad), None, "{bad}");
     }
 }
