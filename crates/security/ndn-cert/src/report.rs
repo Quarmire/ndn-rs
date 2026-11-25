@@ -841,13 +841,24 @@ pub mod code {
 
     // --- transit (security/transit)
 
-    /// The namespace asked to carry in transit is not a self-certifying
-    /// one (`/user/<0xA1: 32 bytes>`): only a person's namespace, adopted
-    /// by a local app for one scope of its own, is carried for it; any
-    /// other is adopted on the node, or served by a link. Params:
-    /// `namespace`.
+    /// The name asked to be marked is neither a self-certifying namespace
+    /// (`/user/<0xA1: 32 bytes>`), nor an introduction's prefix
+    /// (`<device>/32=intro`, `<device>/32=hint`), nor a followed space's sync
+    /// group (`<owner>/32=sync/<space>`, one to four components after the
+    /// keyword): only a person's namespace, adopted by a local app for one
+    /// scope of its own, is carried for it, and only a space group a host
+    /// follows is told to the relays; any other namespace is adopted on the
+    /// node, or served by a link. Params: `namespace`, `why`? (for a name
+    /// with a `32=sync` keyword: what it lacks of a group).
     pub const TRANSIT_NOT_PERSONAL: RefusalCode =
         RefusalCode::new("transit-not-personal", 400, false, NextStep::FixRequest);
+    /// A mark of a followed space group would make the node follow more
+    /// space groups than a link's hello can tell a relay: the groups every
+    /// local app holds a mark on are told together, whole or not at all.
+    /// Release a space no longer followed. Params: `namespace` (the group
+    /// asked), `followed` (distinct groups that would be followed), `max`.
+    pub const TRANSIT_FOLLOWS_FULL: RefusalCode =
+        RefusalCode::new("transit-follows-full", 409, false, NextStep::FixRequest);
     /// `security/transit` from a local user who is neither an operator of
     /// this node nor a member of a group given the transit capability
     /// (`[security] transit_groups`). Params: `uid`, `daemon_uid`,

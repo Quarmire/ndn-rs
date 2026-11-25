@@ -199,8 +199,11 @@ pub mod verb {
     /// the Interests pending for it, caches none of it, and runs its sync
     /// group with the multicast strategy. The keyring is never touched. Each
     /// command is one mark; [`TRANSIT_RELEASE`] in `Flags` takes one back,
-    /// and the namespace leaves transit with its last mark. Authorized like
-    /// [`CONTEXT_ADOPT`].
+    /// and the namespace leaves transit with its last mark. A name with the
+    /// keyword `32=sync` is a followed space's sync group
+    /// (`<owner>/32=sync/<space>`): its mark carries nothing in transit and
+    /// has the daemon tell the relays it uses that the app follows the space
+    /// (ndn-link.md §5.10). Authorized like [`CONTEXT_ADOPT`].
     pub const TRANSIT: &[u8] = b"transit";
     /// `security/transit` flag bit: take one mark back instead of adding one.
     pub const TRANSIT_RELEASE: u64 = 1;

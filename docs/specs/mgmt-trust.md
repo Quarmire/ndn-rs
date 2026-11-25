@@ -241,7 +241,10 @@ that does not hold it, so the namespace's Data reaches the app, which
 validates every packet itself. It carries as well the two prefixes of an
 introduction, `<device>/32=intro` and `<device>/32=hint`, for a data host that
 joins by a code (invite.md §12.1): the offer and the hint record are signed by
-a namespace the joiner's forwarder does not hold until the join ends.
+a namespace the joiner's forwarder does not hold until the join ends. A third
+name a mark takes carries nothing in transit: the **sync group of a space an
+app follows**, `<owner>/32=sync/<space>`, which has the daemon tell the relays
+its links use that the device follows the space (ndn-link.md §5.10).
 
 - **Who may mark.** The transit gate: on the local management socket, by
   the kernel's peer credentials, a local operator (as for every trust
@@ -257,12 +260,30 @@ a namespace the joiner's forwarder does not hold until the join ends.
   `/user/<0xA1: 32 bytes>` (trust-context.md §4.5), or exactly an
   introduction's prefix: a device name (one or more components, none a
   keyword or a digest) followed by the one keyword `intro` or `hint`
-  (`<device>/32=intro`, `<device>/32=hint`; invite.md §2.3). Any other is
+  (`<device>/32=intro`, `<device>/32=hint`; invite.md §2.3), or exactly a
+  followed space's sync group (below). Any other is
   refused (`transit-not-personal`): such a namespace is adopted on the node
   from its anchor link, or carried by the link that serves its devices
   ([ndn-link.md](ndn-link.md) §15.7). An introduction's prefix runs no sync
   group action (it has none); a namespace the node holds is validated
   whatever the marks say, as for a person's namespace.
+- **A followed space's group.** A name with the keyword `32=sync`:
+  `<owner>/32=sync/<space>`, a non-empty owner namespace, the keyword and one
+  to four generic components (the space's name under its owner; heap.md §2.5,
+  `ndn_heap::wire::sync_group_of`). The data host that follows the space marks
+  it, and **the groups all faces mark are what the daemon's links tell the
+  relays they use**, in the hello (ndn-link.md §5.10, `Links::set_followed_groups`):
+  the relay routes exactly those groups to this device, so another space of
+  the same owner is not routed. The mark carries nothing in transit and runs
+  no action of the engine's; the daemon holds the owner's trust context or
+  not as it does, and `held` says which. A name with the keyword that is no
+  group (the namespace's whole group `<owner>/32=sync`, which is the prefix of
+  every space of the owner, or a name of another shape) is refused
+  (`transit-not-personal`, naming what it lacks); a mark that would make the
+  node follow more groups than a hello names (32) is refused whole
+  (`transit-follows-full`); a node that runs no QUIC links refuses it
+  (`links-not-running`). A face's followed groups end with the face, like
+  its other marks, and the relays are told the smaller set.
 - **Marks, counted, owned by the face that asked.** Each command is one
   mark; Flags `TRANSIT_RELEASE` takes one back. Each mark is owned by the
   management face the command arrived on (an internally generated command
@@ -298,7 +319,8 @@ a namespace the joiner's forwarder does not hold until the join ends.
 
 | code | status | retry | next | params | meaning |
 |---|---|---|---|---|---|
-| `transit-not-personal` | 400 | no | fix-request | `namespace` | the name is neither a self-certifying namespace nor an introduction's prefix (`<device>/32=intro`, `<device>/32=hint`); adopt it on the node, or let a link carry it |
+| `transit-not-personal` | 400 | no | fix-request | `namespace`, `why`? (a name with `32=sync`) | the name is neither a self-certifying namespace, an introduction's prefix (`<device>/32=intro`, `<device>/32=hint`) nor a followed space's sync group (`<owner>/32=sync/<space>`); adopt it on the node, or let a link carry it |
+| `transit-follows-full` | 409 | no | fix-request | `namespace` (the group asked), `followed`, `max` | the mark would make the node follow more space groups than a link's hello names (32): release a space no longer followed |
 | `transit-not-permitted` | 403 | no | fix-local | `uid`, `daemon_uid`, `groups`, `transit_groups` (`, `-separated; empty: none) | the caller is a local user who is neither an operator nor in a transit group |
 
 **Threat note: who may mark, and what a local app then receives.** Only a

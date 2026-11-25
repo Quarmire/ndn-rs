@@ -1022,18 +1022,24 @@ impl MgmtClient {
     /// namespace `namespace` (`/user/<0xA1: …>`), which this app adopted for
     /// one scope of its own alone, or an introduction's prefix
     /// (`<device>/32=intro`, `<device>/32=hint`) for the length of a join, in
-    /// transit (`carry`: one mark more), or
-    /// to take one mark back (`!carry`). While a mark is held the daemon,
-    /// not holding the namespace, forwards its Data unvalidated to the
-    /// Interests pending for it and caches none of it: the app validates
-    /// every packet itself. The mark is owned by this client's connection:
-    /// only it takes the mark back, and the daemon releases every mark it
-    /// holds when it closes — keep the client open as long as the marks are
-    /// needed. Local operators and members of the daemon's transit groups
-    /// only (the transit gate). Answered at once. A refusal
-    /// (`transit-not-personal`, the gate's) is
-    /// [`ForwarderError::Command`] carrying a structured refusal
-    /// ([`crate::trust_refusal_in`]).
+    /// transit (`carry`: one mark more), or to take one mark back
+    /// (`!carry`). While a mark is held the daemon, not holding the
+    /// namespace, forwards its Data unvalidated to the Interests pending for
+    /// it and caches none of it: the app validates every packet itself. A
+    /// third name a mark takes is a **followed space's sync group**,
+    /// `<owner>/32=sync/<space>` (`ndn_heap::wire::sync_group_of`): the data
+    /// host that follows the space says so, and the daemon tells the relays
+    /// it uses, in its links' hellos, to route exactly that group to it
+    /// (ndn-link.md §5.10); that mark carries nothing in transit, and the
+    /// daemon refuses more groups than a hello names
+    /// (`transit-follows-full`) or a name that is no group, saying why. The
+    /// mark is owned by this client's connection: only it takes the mark
+    /// back, and the daemon releases every mark it holds when it closes —
+    /// keep the client open as long as the marks are needed. Local
+    /// operators and members of the daemon's transit groups only (the
+    /// transit gate). Answered at once. A refusal (`transit-not-personal`,
+    /// the gate's) is [`ForwarderError::Command`] carrying a structured
+    /// refusal ([`crate::trust_refusal_in`]).
     pub async fn security_transit(
         &self,
         namespace: &Name,
