@@ -440,7 +440,7 @@ async fn reliable_with_drop_leaves_a_gap_and_says_congested_when_nothing_can_be_
 
     // A frame in flight cannot be dropped: with the stream stalled and a 1 MiB message in it,
     // another one that does not fit is refused, with when to try again.
-    let mut rig = self::rig(
+    let rig = self::rig(
         ChannelMode::Reliable,
         LinkConfig {
             stream_window: 1_000,
@@ -1074,8 +1074,8 @@ async fn a_message_pending_is_always_eventually_written_or_counted_dropped() {
                 rng ^= rng << 13;
                 rng ^= rng >> 7;
                 rng ^= rng << 17;
-                link.set_full(rng % 3 == 0);
-                if rng % 5 == 0 {
+                link.set_full(rng.is_multiple_of(3));
+                if rng.is_multiple_of(5) {
                     received.lock().extend(link.take_datagrams());
                 }
                 std::thread::yield_now();

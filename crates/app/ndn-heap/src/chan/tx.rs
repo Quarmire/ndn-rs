@@ -1263,16 +1263,11 @@ impl TxChannel {
                 };
                 let mut scratch = std::mem::take(&mut st.scratch);
                 scratch.clear();
-                let mut expect = head;
-                for p in st.big.iter() {
-                    if p.seq != expect {
-                        break;
-                    }
-                    if writer.push(&p.out()).is_err() {
+                for (expect, p) in (head..).zip(st.big.iter()) {
+                    if p.seq != expect || writer.push(&p.out()).is_err() {
                         break;
                     }
                     scratch.push((p.id, p.seq));
-                    expect += 1;
                 }
                 if scratch.is_empty() {
                     // Nothing in the head fits (never expected): drop it.
@@ -1352,53 +1347,62 @@ impl TxChannel {
                     });
                 }
             }
-            let standing = st.standing.replay(now);
-            if !standing.is_empty() && room(&st, 2 + standing.len() as u64 * 2) {
-                st.control(&Control::StandingBegin);
-                for (stood, left) in standing {
-                    if let Some(used) = self.replay_binding(&mut st, &stood.name, now) {
-                        let seq = st.take_seq();
-                        self.stats.replayed.bump();
-                        st.fifo.push(Item::Data(Pending {
-                            seq,
-                            id: used.id,
-                            name: used.octets,
-                            named: true,
-                            stand: Some(left),
-                            origin: Some(Origin::Standing(stood.seq)),
-                            payload: stood.payload,
-                            repacked: false,
-                            at: now,
-                            inflight: false,
-                        }));
-                    }
+        }
+        // What is replayed names itself, but its names are bound first, so the brackets of the
+        // standing values hold messages and nothing else.
+        let mut standing = Vec::new();
+        if fresh {
+            for (stood, left) in st.standing.replay(now) {
+                if let Some(used) = self.replay_binding(&mut st, &stood.name, now) {
+                    standing.push((stood, left, used));
                 }
-                st.control(&Control::StandingEnd);
             }
         }
+        let mut replay = Vec::new();
         if replay_window {
-            let w = st.window;
-            let held = st.history.since(since, &w, now);
-            for h in held {
-                if !room(&st, 2) {
-                    break;
+            let window = st.window;
+            for held in st.history.since(since, &window, now) {
+                if let Some(used) = self.replay_binding(&mut st, &held.name, now) {
+                    replay.push((held, used));
                 }
-                if let Some(used) = self.replay_binding(&mut st, &h.name, now) {
-                    let seq = st.take_seq();
-                    self.stats.replayed.bump();
-                    st.fifo.push(Item::Data(Pending {
-                        seq,
-                        id: used.id,
-                        name: used.octets,
-                        named: true,
-                        stand: None,
-                        origin: Some(Origin::Replayed(h.seq)),
-                        payload: h.payload,
-                        repacked: false,
-                        at: now,
-                        inflight: false,
-                    }));
-                }
+            }
+        }
+        if !standing.is_empty() && room(&st, 2 + standing.len() as u64) {
+            st.control(&Control::StandingBegin);
+            for (stood, left, used) in standing {
+                let seq = st.take_seq();
+                self.stats.replayed.bump();
+                st.fifo.push(Item::Data(Pending {
+                    seq,
+                    id: used.id,
+                    name: used.octets,
+                    named: true,
+                    stand: Some(left),
+                    origin: Some(Origin::Standing(stood.seq)),
+                    payload: stood.payload,
+                    repacked: false,
+                    at: now,
+                    inflight: false,
+                }));
+            }
+            st.control(&Control::StandingEnd);
+        }
+        if room(&st, replay.len() as u64 + 1) {
+            for (held, used) in replay {
+                let seq = st.take_seq();
+                self.stats.replayed.bump();
+                st.fifo.push(Item::Data(Pending {
+                    seq,
+                    id: used.id,
+                    name: used.octets,
+                    named: true,
+                    stand: None,
+                    origin: Some(Origin::Replayed(held.seq)),
+                    payload: held.payload,
+                    repacked: false,
+                    at: now,
+                    inflight: false,
+                }));
             }
         }
         let kick = self.kicks(&mut st);
