@@ -130,7 +130,7 @@ unattended. A relay never holds the root.
   manifest of every entry, or, per log, by one **tip** (the last entry
   kept, by its seq and the digest of its signed region) instead of a
   manifest, plus later exact re-admissions (name and implicit digest)
-  (trust-context.md §3.3.12, data-layer.md §8.1, §8.2). Data is judged by
+  (trust-context.md §3.3.12, heap.md §9.5). Data is judged by
   revocations and cuts, never accepted because of a certificate's validity
   period; a role the context lists in DataRequiresCut (every role, in a
   context `ndn-fwd init` makes) is refused once its certificate lapsed
@@ -350,8 +350,8 @@ On the root device: `ndn-fwd revoke /<ns>/<role>/<dev> [--cut <file>]
 [--lost <when>]` (or a key or certificate name) (**have**; see
 `docs/wiki/src/reference/revocation.md`):
 0. Suspect and cut (slice 5): as soon as the owner notices the loss, they
-   mark the key **suspected** on the root device (the `ndn-data` host's
-   `suspect <key>`; `ndn_data::Device::suspect`): the root's data layer
+   mark the key **suspected** on the root device (the `ndn-heap` host's
+   `suspect <key>`; `ndn_heap::Node::suspect`, heap.md §9.8): the root's data layer
    then takes no new entry of that key, so it stops verifying what a thief
    writes. The revoke flow asks in plain words **"When did you lose it?"**
    (a prompt when interactive, `--lost <when>` otherwise — RFC 3339, `<n>
@@ -360,7 +360,7 @@ On the root device: `ndn-fwd revoke /<ns>/<role>/<dev> [--cut <file>]
    was marked suspected. The
    cut (`<file>`) lists the log entries of that key the root device's data
    layer holds verified and **first verified before that moment**, per
-   collection (`ndn_data::Device::revocation_cut` with a `CutBound`; the
+   space (`ndn_heap::Node::revocation_cut` with a `CutBound`; the
    host's `cut <key> <file>`), with the digest of the key's public key and
    a manifest binding each listed entry's bytes, or, with `--tips`, one
    tip per log and no manifest (below). The file also records the
@@ -373,7 +373,7 @@ On the root device: `ndn-fwd revoke /<ns>/<role>/<dev> [--cut <file>]
    entries it lists stay valid, with the bytes its manifest lists (with a
    tips cut, the entries below its tips, below), and
    everything else the key signed — later entries, backdated ones, other
-   bytes at a listed name, its summaries — is refused (data-layer.md §8.1).
+   bytes at a listed name — is refused (heap.md §9.5).
    **Tips cut** (`ndn-heap cut <key> <file> --held-before <ms> --tips`,
    then `ndn-fwd revoke <key> --cut <file> --lost <ms>`; `CutBound.tips`,
    `Node::revocation_cut`): per log of the key the cut names one tip, the
@@ -410,7 +410,7 @@ On the root device: `ndn-fwd revoke /<ns>/<role>/<dev> [--cut <file>]
    revoked with a cut, which in-cut Data needs to verify, and the cut's
    manifest (a tips cut has none), which every node keeping the context fetches and serves; a
    reader that applied a version the cut refuses withdraws it, and so does
-   one holding Data whose issuer the version revokes (data-layer.md §8.3).
+   one holding Data whose issuer the version revokes (heap.md §9.7).
 2. CA, following the signed version: whenever a node running the namespace
    CA keeps a version (handed over, refreshed, adopted) and when the CA
    starts, the CA marks every certificate it issued that the version revokes
@@ -525,8 +525,8 @@ through a relay, say): `ndn-fwd recover --kit words|<file>|yubikey
    `compromised`, `--cut <file>` adds the cut of a key the recovery newly
    revokes (the old admin device's key, say: its entries up to the
    compromise stay valid), made by this device's data layer from what it
-   holds verified, bounded by when the root was lost (data-layer.md §8.1,
-   §8.4); a cut of any other key, a cut with `destroyed`, two cuts for one
+   holds verified, bounded by when the root was lost (heap.md §9.5);
+   a cut of any other key, a cut with `destroyed`, two cuts for one
    key, an unbounded cut, or one without a key digest, or with ranges and
    without a manifest (a cut of tips needs none) are
    refused (`cut-refused`). Since `compromised` revokes the old CA key, an
@@ -620,8 +620,8 @@ and `ndn-fwd renew`; mobile `NdnEngine::renew_certificate` /
 `certificate_validity`; see the wiki's reference/renewal.md). Renewal keeps
 the key, so the device's data continues: what it signed under the old
 certificate and under the new one verifies alike, also after the old one
-expired, since Data is judged without validity periods (data-layer.md
-§8.4). Rotating to a new device key is a new enrollment (invite or admin
+expired, since Data is judged without validity periods (heap.md
+§9.3). Rotating to a new device key is a new enrollment (invite or admin
 approval) (**gap**: no rotation-by-renewal): the new key is a new writer.
 The CA allows one key per device identity, so once it enrolls the new key
 the old one is **replaced**, a key to end, listed as in F9 (`ending_key =

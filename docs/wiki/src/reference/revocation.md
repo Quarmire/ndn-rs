@@ -20,8 +20,8 @@ request ([the CA follows the trust context](#the-ca-follows-the-trust-context)).
 
 Design: `docs/specs/personal-namespace.md`, flows F4 (lose a member device)
 and F5 (lose an admin device); the cut and how Data is judged:
-`docs/specs/trust-context.md` §3.3.12 and §6.3, `docs/specs/data-layer.md`
-§8.
+`docs/specs/trust-context.md` §3.3.12 and §6.3, `docs/specs/heap.md`
+§9.5.
 
 ## Unlocking the root
 
@@ -88,7 +88,7 @@ writes like any others until then. So the cut lists what the root device's
 data layer **first verified before the moment you lost the device** —
 never what a summary only listed, and never what it first saw later.
 
-1. As soon as you notice, mark the key suspected in the ndn-data host on
+1. As soon as you notice, mark the key suspected in the `ndn-heap` host on
    the root device. The root then takes no new entry of that key (entries
    it holds stay), and the moment is recorded:
 
@@ -217,7 +217,7 @@ ending_key     = /home/rv/guest/ann/KEY/91c0… (lapsed at 2026-11-01T12:00:00Z)
 cut /home/rv/guest/ann/KEY/91c0… ann.cut --held-before 2026-11-01T12:00:00Z
 ```
 
-Make each cut with the line shown (in the ndn-data host on the root
+Make each cut with the line shown (in the `ndn-heap` host on the root
 device), then end them all in one version:
 
 ```sh
@@ -508,7 +508,7 @@ and follows the stored context again when it next starts.
 |---|---|
 | Revocation check in the chain walk (prefix match) | `ndn_security::SignedTrustContext::is_revoked`, `validator/chain.rs` |
 | Durable walk for Data (no validity periods but `DataRequiresCut`'s refusal; the signing key excused in its cut when key digest and manifest or tips agree) | `ndn_security::Validator::{validate_durable, validate_durable_cached}`; `SignedTrustContext::{refuses_data, revocation_cut, revocation_cuts, with_revocation_cut, data_requires_cut, requires_cut_for}`; `ndn_security::{RevocationCut, CutRange, CutTip, public_key_digest, chain_clear}`, tips `RevocationCut::{add_tip, tips, tip_for}`; manifests `ndn_security::cut_manifest` (`CutManifests`, `build`, `lookup`); keys to end `ndn_cert::ending_keys`, `ndn_namespace::root::end_keys` |
-| Making a cut | `ndn_data::Device::{revocation_cut, suspect, unsuspect, suspected}`, `ndn_data::{CutBound, CutProposal}`; the cut file `ndn_cert::CutFile` (`ndn-cert/src/cut_file.rs`); host verbs `suspect`, `unsuspect`, `cut` (`ndn-tools/src/data.rs`); refused versions to re-admit: `ndn_data::Device::refused_by_revocation`; a tips cut: `ndn_heap::CutBound { tips: true, .. }`, `ndn_heap::Node::revocation_cut`, `ndn-heap cut … --tips` |
+| Making a cut | `ndn_heap::Node::{revocation_cut, suspect, unsuspect, suspected}`, `ndn_heap::{CutBound, CutProposal}`; the cut file `ndn_cert::CutFile` (`ndn-cert/src/cut_file.rs`); host verbs `suspect`, `unsuspect`, `cut` (the `ndn-heap` tool, `binaries/tooling/ndn-tools/src/heap.rs` in ndn-fwd); refused entries to re-admit: `ndn_heap::Node::refused_by_revocation`; a tips cut: `ndn_heap::CutBound { tips: true, .. }`, `ndn-heap cut … --tips` |
 | Re-admission | `ndn_namespace::root::readmit::{plan, readmit}`; `ndn_cert::{readmissions_to_add, bump_context_readmitting, device_log_of, split_full_name}`; CLI `ndn-fwd readmit` |
 | Re-certifying cut keys after a recovery | `ndn_cert::{recertify_cut_keys, recertify_cut_keys_in_pib}`, `RecoveredNamespace::{recertified, record_recertified}`; `ndn_namespace::root::recover::recertify`; CLI `ndn-fwd recertify` |
 | Key name of a certificate name | `ndn_cert::key_name_of` |

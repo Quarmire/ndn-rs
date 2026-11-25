@@ -9,7 +9,7 @@
 > trust contexts, certificates, SafeBags and delegations are specified elsewhere.
 > **Reference implementation:** `ndn-rs/crates/security/ndn-trust-envelope/src/lib.rs`
 > (codec). Consumers: `ndn-rs/crates/security/ndn-cert` (anchor and invite links, file kits),
-> `ndn-rs/crates/app/ndn-data` (introduction codes, `Device::join`)
+> `ndn-rs/crates/app/ndn-invite` (introduction codes, `Invites::join`)
 > and `ndn-mobile/crates/ndn-boltffi/src/trust.rs` (mobile parser). For file:line references
 > see [Appendix A](#appendix-a-code-references-non-normative).
 
@@ -26,7 +26,7 @@ Related specs:
 - [recovery-kit.md](recovery-kit.md): the file recovery kit, which is a `bag` envelope.
 - [ndn-link.md](ndn-link.md): links. A device usually needs one before it can fetch a context
   that an envelope only points to.
-- [data-layer.md](data-layer.md) §19: the introduction an `intro` envelope carries the code of.
+- [invite.md](invite.md): the introduction an `intro` envelope carries the code of.
 - [local-refusal.md](local-refusal.md): refusals a device may see while adopting.
 - The design and flows (F1 create, F2 add a device, F7/F8 recovery kit, F9 share) are in
   [personal-namespace.md](personal-namespace.md).
@@ -85,7 +85,7 @@ in a URI is a routing hint that MUST match the `Kind` TLV (§5.2); the TLV is au
 | `recovery` | `4` | in | A recovery bundle (public history, no private keys) | restore (mobile) |
 | `bag` | `5` | in | A password-encrypted SafeBag and its key name; for a recovery kit also the namespace and expected fingerprint | key migration; file recovery kit (F7, F8) |
 | `capability` | `6` | out | A scoped, expiring capability request or grant | pairing (F9) |
-| `intro` | `7` | in | The inviter's namespace and expected fingerprint, a one-use offer's name and secret, the inviter's link hint, relay hints | join a folder by a code ([data-layer.md](data-layer.md) §19) |
+| `intro` | `7` | in | The inviter's namespace and expected fingerprint, a one-use offer's name and secret, the inviter's link hint, relay hints | join a space by a code ([invite.md](invite.md) §8) |
 
 The kind token is the lowercase ASCII string in the first column. The code is the one-byte
 value of the `Kind` TLV (§4.2). Codes `0` and `8`–`255` are unassigned. A parser MUST reject
@@ -119,7 +119,7 @@ trust-context range `0x0410`–`0x041F`. The types have meaning only inside an e
 | `0x0475` | Offer | in Body | NDN name string: the offer record's name, `<D>/keyword=log/<F>/seq=<n>` (the canonical text of the data layer's keyword `32=log`, §4.4). **Read only**: a producer writes OfferWire (`0x0492`) | intro (old links) |
 | `0x0476` | RelayHint | in Body, repeatable | NDN name string: the device name of a relay that reaches the inviter. **Read only**: a producer writes RelayWire (`0x0494`) | intro (old links) |
 | `0x0477` | Secret | in Body | exactly 16 bytes: the offer's secret | intro |
-| `0x0478` | LinkHint | in Body | octets: the inviter's link hint — its device key and where to dial it — as [data-layer.md](data-layer.md) §19.2 encodes it (TLVs 0x05B0, 0x05B2, [README](README.md#tlv-type-numbers)); this format carries them and judges none of them. Even type: a reader that does not know it skips it | intro (optional) |
+| `0x0478` | LinkHint | in Body | octets: the inviter's link hint — its device key and where to dial it — as [invite.md](invite.md) §6.1 encodes it (TLVs 0x05B0, 0x05B2, [README](README.md#tlv-type-numbers)); this format carries them and judges none of them. Even type: a reader that does not know it skips it | intro (optional) |
 | `0x0479`–`0x0480` | — | — | unassigned | — |
 | `0x0481` | Version | in Body | u64 (§4.4) | anchor: context version |
 | `0x0482` | Wire | in Body | opaque bytes | anchor: legacy unsigned context Content; delegation: signed delegation; recovery: bundle; bag: SafeBag |
@@ -184,7 +184,7 @@ Further producer rules:
   cryptographically secure RNG, fresh for every offer (`INTRO_SECRET_LEN`). LinkHint, when
   present, comes once, after Secret. RelayWire elements keep their order: the relays the
   inviter's trust context advertises, in its order, at most the producer's policy allows
-  (data-layer.md §19.2: `IntroPolicy::code_relays`, 2 by default), and never more than
+  (invite.md §6.2: `IntroPolicy::code_relays`, 2 by default), and never more than
   `HINT_RELAYS_MAX` (8, §6.5). The names MUST be
   canonical NDN URIs (§4.4), which the wire form reads back as exactly these strings: a
   producer MUST NOT encode an introduction whose names are not (`Introduction::check` says
@@ -391,12 +391,12 @@ Producer rules:
   keeping the longest prefix of them that fits (`TrustEnvelope::qr_uri`); NamespaceWire,
   AnchorFingerprint, OfferWire and Secret are never dropped, and LinkHint is kept whole. A
   LinkHint that still does not fit is shortened by its maker, who knows its encoding
-  (data-layer.md §19.2: candidates from the end, then the hint), and `qr_uri` then answers for
+  (invite.md §6.2: candidates from the end, then the hint), and `qr_uri` then answers for
   the shorter one; the maker also caps the candidates and relays it offers by policy before
-  this (data-layer.md §19.2). `qr_uri` writes at most `HINT_RELAYS_MAX` relays (§6.5), answers
+  this (invite.md §6.2). `qr_uri` writes at most `HINT_RELAYS_MAX` relays (§6.5), answers
   `None` for an introduction whose link hint is over `LINK_HINT_MAX`, and `None` for one whose
   names fail `Introduction::check`. A joiner without hints reaches the inviter through its own
-  namespace's relays ([data-layer.md](data-layer.md) §19.3).
+  namespace's relays ([invite.md](invite.md) §8.2).
 - Other kinds have no fallback: the producer refuses to render them, as it refuses an
   `intro` that does not fit without relay hints and a link hint.
 
@@ -464,7 +464,7 @@ envelope: a parser of the forms of §5.2 refuses it, and a consumer that takes a
 text starting with `/` as words.
 
 **Checked words** (`words::encode_checked`, `words::decode_checked`) are the second codec, for
-the **short introduction code** (data-layer.md §19.2; the short code is a one-line text, not an
+the **short introduction code** (invite.md §6.3; the short code is a one-line text, not an
 envelope: a parser of the forms of §5.2 refuses it, and a consumer tells it from the 24-word
 form by its word count). They carry a payload of any length ≡ 4 (mod 11) octets (4, 15, 26,
 37, 48, …) with a 12-bit checksum that also covers a **bound text** the caller chooses (the
@@ -486,7 +486,7 @@ short code binds the inviter's device name and first contact):
   bound to cannot be changed or mistyped unseen.
 - **Strength.** The checksum catches a typo, it does not authenticate: it has no key, and
   anyone can compute it. A wrong word, or two words swapped, passes with probability
-  2⁻¹² (measured, data-layer.md §19.2).
+  2⁻¹² (measured, invite.md §6.3).
 
 The 24-word codec above is unchanged, and the words form of an `intro` is still read.
 
@@ -604,9 +604,9 @@ Why these bounds:
   (about 2 KB for `/home/bob`, 8800 octets at most), a SafeBag or kit bag about 1 KB, a
   recovery bundle (public history) 128 contexts of 2 KB, the longest version walk of
   [recovery-kit.md](recovery-kit.md). A QR code holds at most 2331 characters (§5.6).
-- The relay limit is the data layer's `HINT_RELAYS_MAX` ([data-layer.md](data-layer.md) §19):
-  one value in both. An introduction names at most 2 relays by policy (§4.3).
-- The link hint is opaque here; its limit is far above the data layer's encoding (a 32-octet
+- The relay limit is `HINT_RELAYS_MAX`, this crate's constant, which `ndn-invite` imports for its hint records
+  ([invite.md](invite.md) §7.1): one value in both. An introduction names at most 2 relays by policy (§4.3).
+- The link hint is opaque here; its limit is far above the encoding of [invite.md](invite.md) §6.1 (a 32-octet
   key and at most 8 candidates, about 220 octets) and keeps what a decoder copies bounded.
 
 A producer MUST NOT write an envelope over a limit. `qr_uri` writes at most `HINT_RELAYS_MAX`
@@ -704,30 +704,31 @@ The envelope layer adds no checks for these kinds:
 
 These payload formats are outside this spec (§10, Q14).
 
-### 7.5 `intro` (join a folder by a code)
+### 7.5 `intro` (join a space by a code)
 
-`ndn_data::Device::join` applies the following, then the exchange of
-[data-layer.md](data-layer.md) §19.3:
+`ndn_invite::Invites::join` applies the following, then the exchange of
+[invite.md](invite.md) §8.2:
 
-1. Offer MUST parse as an NDN Name that is a data-layer log entry of a folder,
-   `<D>/32=log/<F>/seq=<n>`; `D` is the device it asks. An offer of the joiner's own namespace
-   is refused. A **short code** is no envelope and carries no Offer: its offer is the one the
-   inviter's signed hint record names, checked as data-layer.md §19.3 says.
+1. Offer MUST parse as an NDN Name of an offer, `<D>/32=intro/32=offer/<id>` (invite.md §2.2; a link
+   made for the old data layer names a log entry instead and is refused, invite.md §6.2); `D` is the
+   device it asks. An offer of the joiner's own namespace is refused (invite.md §8.1). A **short code**
+   is no envelope and carries no Offer: its offer is the one the inviter's signed hint record names,
+   checked as invite.md §8.3 says.
 2. Namespace, when present, MUST parse as a Name; the inviter's trust context the answer
    carries MUST root exactly it, and in any case a prefix of `D`.
 3. AnchorFingerprint is the expected fingerprint: the inviter's context MUST be signed by an
    anchor whose fingerprint equals it (in the words form, whose first 16 octets equal the 16
    given, §5.8; in a short code of a named namespace, whose keyed fingerprint — the first 10
    octets of HMAC-SHA256 under the code's secret over the anchor's whole fingerprint — equals
-   the 10 given, data-layer.md §19.2). The consumer adopts that context through its host only once
+   the 10 given, invite.md §6.4). The consumer adopts that context through its host only once
    the answer proves the Secret and is signed by `D` under that anchor.
 4. Secret is used only to derive the offer's proof key (and, for a short code, its hint
    token); it is never sent, logged or kept.
 5. RelayWire (and the old RelayHint) elements are reachability hints: the joiner's Interests
    carry them as their ForwardingHint, and nothing they say is trusted.
 6. LinkHint is a reachability hint too: its key is what the joiner's dial proves, its
-   addresses are where to try, and nothing in it is trusted for anything else (data-layer.md
-   §19.7). One that does not read is ignored, and the join goes on without it.
+   addresses are where to try, and nothing in it is trusted for anything else (invite.md
+   §18). One that does not read is ignored, and the join goes on without it.
 
 ## 8. Test vectors
 

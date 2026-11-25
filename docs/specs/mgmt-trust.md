@@ -236,7 +236,7 @@ YubiKey PIV support (`operation` = `yubikey`).
 
 `security/transit` carries a person's namespace **in transit** for a local
 app that adopted it for one scope of its own alone (trust-context.md
-§4.5.7; a data-layer device's folders, data-layer.md §6.3), on a forwarder
+§4.5.7; a `ndn-heap` node's spaces, heap.md §9.4), on a forwarder
 that does not hold it, so the namespace's Data reaches the app, which
 validates every packet itself. It carries as well the two prefixes of an
 introduction, `<device>/32=intro` and `<device>/32=hint`, for a data host that
@@ -292,7 +292,7 @@ its links use that the device follows the space (ndn-link.md §5.10).
   transit (ndn-rs `TransitPrefixes`, with a link's), so it is in transit
   while any reason holds, and the first and the last run the action the
   links' run — its sync group `<ns>/32=sync` runs with the multicast
-  strategy meanwhile (data-layer.md §12). Two scopes adopting one
+  strategy meanwhile (heap.md §2.5, §7.9). Two scopes adopting one
   namespace hold two marks; one releasing keeps the other's. A release
   with no mark of its face held changes nothing: it never takes another
   face's mark, nor a link's reason.
@@ -343,7 +343,7 @@ validates end to end — the data layer judges each packet of the namespace
 with its scoped context, and every other path refuses the namespace as
 one not held (trust-context.md §4.5.6 note 4). A forged copy that answers
 a pending Interest first costs the app a fetch, which it asks again
-(data-layer.md §17.1), never a wrong answer. Nothing reaches beyond the
+(heap.md §7.4), never a wrong answer. Nothing reaches beyond the
 node's own apps: the Data answers only Interests pending here, and none of
 it enters the Content Store, so no later requester, local or remote, is
 served it from this node.
@@ -1019,8 +1019,8 @@ change is published once, by the code that made it: a version kept is told
 by the keeping (whichever way it came), an enrollment by the installation of
 its certificate, a request ended by what ended it (the CA's answer, its
 expiry, a failed issuance). A version is stored in the PIB before its
-`context-updated` is published, so a subscriber on the same host (the
-ndn-data host follows trust contexts this way, without polling the PIB)
+`context-updated` is published, so a subscriber on the same host (a
+host built on `ndn-namespace` follows trust contexts this way, without polling the PIB)
 reads the stored version once on the event; a version the daemon could
 not store is not there, and the next event or resync brings the
 subscriber up to date.
@@ -1045,7 +1045,7 @@ the host's: it is served under `/localhost` (the forwarder answers no
 remote face for a `/localhost` name) and under no `/localhop` name. This
 is the stream `ndn_app::IpcConnection::routes` follows, so the data layer
 on a daemon announces its sync group when a link for it comes up
-([data-layer.md](data-layer.md) §12, "A face comes up"); the client
+([heap.md](heap.md) §7.7, "Face up"); the client
 takes the resync of its first request as the stream's number to follow
 from and a later one as lost events. The `register`/`unregister`
 events were a text line before this stream was JSON like the others;

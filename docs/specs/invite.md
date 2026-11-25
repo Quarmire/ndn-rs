@@ -2,15 +2,15 @@
 
 - **Status:** Normative. The introductions of `ndn-invite`: a stranger who holds
   only a code joins a [heap](heap.md) space, with no second gesture by the owner
-  and no prior trust either way. It carries over the protocol of
-  [data-layer.md](data-layer.md) §19 (offer, code, ask, answer, proofs, short
+  and no prior trust either way. It carries over the protocol of the former
+  data layer's §19 ([history/data-layer-remainder.md](history/data-layer-remainder.md): offer, code, ask, answer, proofs, short
   codes, hint records, grants, departures) onto the space of `ndn-heap`, and
   changes three things: an offer is **no longer a log entry** (§5), the
   inviter's effect on the space is **one `Heap::change`** whose entry the answer
   names (§9.4), and a joiner is told it may write only when it holds the entry
   that admitted it (§8.5). The TLV numbers and the wire of the exchange are kept
   (§16); the labels of the cryptography are renamed (§4.5). The formats are
-  incompatible with `ndn-data`'s only in those labels, the offer's name and the
+  incompatible with the removed `ndn-data`'s only in those labels, the offer's name and the
   answer's `ADMITTED` field (§20).
 - **Scope:** the exchange between an **inviter**'s device and a **joiner**'s
   device; what the inviter's device keeps and signs; the code's three forms; the
@@ -119,9 +119,9 @@ joiner's waits are bounds on how long it waits, never reasons for a verdict
   offers.
 - **No offers in the log.** A space's log holds the membership the offer made,
   never the offer or its use (§5).
-- **No migration.** An `ndn-data` offer, code state or grant note is not read:
+- **No migration.** An offer, code state or grant note of the removed `ndn-data` is not read:
   state lives under `/localhost/ndn-invite/` (§15) and a code made by
-  `ndn-data` (whose labels differ, §4.5) is refused as one that does not check.
+  `ndn-data` (whose labels differed, §4.5) is refused as one that does not check.
 - **No custody of the code.** The device keeps no secret (§5.2); a lost code is
   a closed offer and a new one.
 - **No authentication of refusals.** A refusal on the wire denies, never admits
@@ -312,9 +312,9 @@ A short code adds two derivations and one checksum.
 ### 4.5 Labels
 
 The labels are ASCII. The five that bind a proof to a protocol, and the ones that
-bind a key or a tag to a code, are renamed from `ndn-data/intro/…/1` to
-`ndn-invite/intro/…/1`: a proof, tag or commitment made for the old crate never
-verifies here, and one made here never verifies there.
+bind a key or a tag to a code, were renamed from `ndn-data/intro/…/1` to
+`ndn-invite/intro/…/1`: a proof, tag or commitment made by the removed `ndn-data`
+never verifies here.
 
 | Use | Label |
 |---|---|
@@ -535,7 +535,7 @@ RelayHint 0x0476) are read, never written.
 
 The offer's name in a link is the new one, `<D>/32=intro/32=offer/<id>`, in the same
 `IntroOfferWire` field: the envelope carries a `Name` and assumes nothing of its
-shape (trust-envelope.md §4.3). A link made by `ndn-data` names a log entry
+shape (trust-envelope.md §4.3). A link made by the removed `ndn-data` named a log entry
 (`<D>/32=log/<F>/seq=<n>`): the joiner reads a code whose offer is no `<device>/32=intro/32=offer/<id>` as a
 `BadRequest` (the offer's name is no offer's; check the code), before anything is dialled (§8.1).
 
@@ -1065,7 +1065,7 @@ removals held when it was made, so the removal of the earlier invitation does no
 bound of §8.5 with `NotReady` naming that the members do not list this device's person, and a `put` made meanwhile is
 `NotReady` rather than `AskOwner`. Only a removal the note did not name, arriving while no `ADD` of the person stands (an
 admission undone before this device ever saw it listed), ends the note and makes the refusal `NotAllowed` again. This differs
-from data-layer.md §19.3 step 6, whose note let go at a record of the admission's revision or later that left the device out
+from the former data layer (§19.3 step 6 of history/data-layer-remainder.md), whose note let go at a record of the admission's revision or later that left the device out
 (§20): a removed joiner is told to retry, not to ask the owner, and a new offer is what admits it again.
 
 ## 9. Answering
@@ -1277,7 +1277,7 @@ trait Host {                      // the grant part (§12)
 }
 ```
 
-The field names `folder` and `Departure::record` are kept from `ndn-data` so that ndn-link's code, which
+The field names `folder` and `Departure::record` were kept from the removed `ndn-data` so that ndn-link's code, which
 names them, compiles with a changed import only; here `folder` is a **space** and `record` the log name
 of a members **entry** (§11). The host's side of every call is §12.
 
@@ -1405,7 +1405,7 @@ of a members **entry** (§11). The host's side of every call is §12.
 
 ## 11. Departures and mirror grants
 
-Rules 14, 15, 17 and 18 continue the numbering of §10 (the numbers of data-layer.md §19.8's rules, kept so that a test or a
+Rules 14, 15, 17 and 18 continue the numbering of §10 (the numbers of the rules of §19.8 of the former data layer, history/data-layer-remainder.md, kept so that a test or a
 note can cite one number for one rule). Rule 16, the co-writers, is the surface's and is §13.3.
 
 14. **A person let go is told: the departure mark.** When a held members entry ends a grant by leaving the person out (rule 7), and
@@ -1759,7 +1759,7 @@ no reservation: a lost write is a lost answer, which is the joiner's retry (§1.
 
 ### 16.1 TLV-TYPE numbers
 
-The crate keeps **every number of §19 of data-layer.md** (README registry, [README.md](README.md#tlv-type-numbers)):
+The crate kept **every number of §19 of the former data layer** (history/data-layer-remainder.md; README registry, [README.md](README.md#tlv-type-numbers)):
 the even and odd rules of that spec stand. Odd numbers are critical: a decoder refuses a record holding one it
 does not know. Even numbers are skippable and reserved for additive fields. The odd numbers of the block are
 odd for the same reasons as there: a reader passing over `INTRO_OFFER` would take an offer for nothing; one
@@ -1789,7 +1789,7 @@ read only by a device that implements this specification.
 | 0x0576 | `SEAL_KEY` | 32 octets: X25519 public key |
 | 0x057C | `EPHEMERAL_KEY` | 32 octets: the sealer's X25519 public key for this ask |
 
-The names are this crate's spelling of the numbers of data-layer.md §16.2 (`IntroOffer`, `IntroUsed`, `IntroAsk`,
+The names are this crate's spelling of the numbers of the former data layer's §16.2 (`IntroOffer`, `IntroUsed`, `IntroAsk`,
 `IntroAnswer`, `Role`, `Tries`, `IntroRefused`, `Credentials`, `Revision`, `KeepUntil`, `Nonce`, `Asker`, `Proof`,
 `Digest`, `Writer`, `Ciphertext`, `SealKey`, `EphemeralKey`); the numbers do not change.
 
@@ -1813,10 +1813,10 @@ Data `<D>/32=hint/<token>` (§2.1), with the same reader rule.
 
 ### 16.3 The numbers the block does not use
 
-The README's rows 0x0561–0x056F and 0x05B0–0x05BC now point to this specification as well as to data-layer.md §19, which
-stays as the specification of the old crate until it moves (README). The shared numbers of §16.1 (0x052A, 0x0526 inside it, 0x052E, 0x0531, 0x053B,
-0x053F, 0x055E, 0x0568, 0x0574, 0x0576, 0x057C) are the data layer's, reused here as they were; none is renumbered. A decoder
-of this crate and a decoder of `ndn-data` read the same bytes for them; they differ in the labels of the proofs (§4.5), in
+The README's rows 0x0520–0x057F (only the numbers §16.1 lists; the rest of that block is retired and MUST NOT be reused) and 0x05B0–0x05BF point to this specification. The
+shared numbers of §16.1 (0x052A, 0x0526 inside it, 0x052E, 0x0531, 0x053B,
+0x053F, 0x055E, 0x0568, 0x0574, 0x0576, 0x057C) were the former data layer's, reused here as they were; none is renumbered. A decoder
+of this crate and a decoder of the removed `ndn-data` read the same bytes for them; they differ in the labels of the proofs (§4.5), in
 the offer's name and in `ADMITTED`'s shape (§20).
 
 ### 16.4 Wire rules
@@ -1900,7 +1900,7 @@ host that cannot give a link when it must, a store that cannot make the offer du
 
 ## 18. Threat notes
 
-Each note of data-layer.md §19.7 is carried over, adapted where the design changed; the notes the redesign adds come
+Each note of §19.7 of the former data layer (history/data-layer-remainder.md) is carried over, adapted where the design changed; the notes the redesign adds come
 first, and the ones that changed say so.
 
 ### 18.1 What the redesign changes
@@ -2161,8 +2161,8 @@ first, and the ones that changed say so.
 
 ## 19. Conformance
 
-The cases i1–i26 of heap.md §13.5 run on both providers (the old `ndn-data` and this crate, over `ndn-heap`); each keeps its
-id. The rules above that a case guards, and the tests this crate names for them:
+The cases i1–i26 of heap.md §13.5 run over `ndn-heap` with this crate: the conformance suite has one provider, and each case keeps the id it had when the suite also ran the removed `ndn-data`.
+The rules above that a case guards, and the tests this crate names for them:
 
 | Case | Property | Rules |
 |---|---|---|
@@ -2202,9 +2202,9 @@ The new tests this crate adds for what changed: `an_offer_is_served_as_an_extens
 `a_later_rollback_closes_the_offers_made_since_the_first` (§5.4, §18.2) and
 `a_stop_between_using_and_the_members_change_closes_the_offer_at_the_next_start` (§5.4, §9.3, §18.1).
 
-## 20. Differences from data-layer §19
+## 20. Differences from the former data layer's §19
 
-What changed from [data-layer.md](data-layer.md) §19, which stays as the specification of the `ndn-data` crate until it moves.
+What changed from §19 of the former data layer ([history/data-layer-remainder.md](history/data-layer-remainder.md)), the specification of the removed `ndn-data` crate.
 Everything not listed here is carried over as written (with `folder` read as `space`, `Introducer` as `Host`, `Device` as `Invites`,
 `DataError::Introduction` as `InviteError::Refused`).
 
@@ -2240,5 +2240,5 @@ Everything not listed here is carried over as written (with `folder` read as `sp
 | §19.2 the surface carries `<D>/32=intro/…` | §13.1 only the ask's digest form `<D>/32=intro/<ParametersSha256Digest>`, the offer's own name and the hint token | no bare prefix or other name under `32=intro` crosses |
 | §19.3 the joiner's forwarder carried the offer as a `32=held` DigestSha256 wrapper | §12.1 the host carries `<D>/32=intro` and `<D>/32=hint` in transit from the first contact; the offer and hint records are signed by `D` | the offer is no wrapper any more, so the forwarder cannot validate it before the inviter's anchor is adopted |
 
-Other specifications still describe the old crate where they name its pieces (ndn-link.md §13.3A names the introduction's prefixes
-as three names and the `Introducer` trait; data-layer.md §19 as a whole): they stay as the specification of `ndn-data` until it moves.
+Other specifications named the old crate's pieces where they spoke of the introductions (ndn-link.md §13.3A named the introduction's prefixes
+as three names and the `Introducer` trait; §19 of the former data layer as a whole): they now name this crate's pieces, and the former text is kept in history/data-layer-remainder.md.

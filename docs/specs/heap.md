@@ -2,9 +2,10 @@
 
 - **Status:** Normative. The data layer of `ndn-heap`: spaces, entries and
   their chains, membership as an operation fold, seals and grants, durability
-  by sequence reservation, and the names and TLVs that carry them. It replaces
-  [data-layer.md](data-layer.md) (`ndn-data`) for the `ndn-heap` crate. The two
-  formats are incompatible (TLV block 0x0600–0x063F, store prefix
+  by sequence reservation, and the names and TLVs that carry them. It replaced
+  the former data layer (`ndn-data`, removed from the workspace; its
+  specification is kept in [history/](history/)) in the `ndn-heap` crate. The two
+  formats were incompatible (TLV block 0x0600–0x063F, store prefix
   `/localhost/ndn-heap/`); no `ndn-data` space or store is migrated.
 - **Scope:** the data model every file, database and exchange of a group of
   people shares: a **space** with its members, the **entries** its writers sign,
@@ -2221,7 +2222,7 @@ the spaces that list her. It goes into no keyring the node judges by.
   adopted a context (§9.7).
 
 Named, non-self-certifying namespaces (`/alice`) are never adopted this way; the
-host holds them (`Introducer::adopt`, in `ndn-invite`).
+host holds them (`Host::adopt`, in `ndn-invite`).
 
 ### 9.5 Revocation cuts
 
@@ -3342,11 +3343,11 @@ without `durable`, a restored image, a failing disk — are the matrix of §4.9.
 
 ## 13. Conformance
 
-The conformance suite is `ndn-data-conformance` in ndn-sim. Each case has an id,
+The conformance suite is `ndn-data-conformance` in ndn-sim (the crate keeps its name). Each case has an id,
 a title, the **property it guards** and a body written once over a neutral
 trait (`Spaces`: `create`, `change`, `members`, `put`, `get`, `watch`, `open`,
-with plain data types, and per-provider hooks for crashes, images, keys and the
-network); the same body runs on every provider. A case MUST NOT be weakened to
+with plain data types, and hooks for crashes, images, keys and the
+network); the suite has one provider, over `ndn-heap` (it had two while the former `ndn-data` ran beside it, and the ids are those of that time). A case MUST NOT be weakened to
 pass: a failure is a defect of the implementation, or a mistaken re-expression
 of the case, and is corrected there. Every case also runs over lossy and
 reordering networks (seeds 0 to 39, `--faulty`), and the faulty runs are
@@ -3359,7 +3360,7 @@ tests of the `ndn-heap` crate that already hold it (names as in the crate; "suit
 only" says the case is shown by the suite alone). A property the layer no longer
 has is said so.
 
-### 13.1 The core cases (both providers)
+### 13.1 The core cases
 
 | Case | Property | Crate tests |
 |---|---|---|
@@ -3428,7 +3429,7 @@ dropped, a start from the image), `image`, `restore` and `block_flush`.
 | q8 | An epoch a held epoch replaces is never in force, whatever the order of the creators' names, and returns when the replacing entry is withdrawn | `an_epoch_a_held_epoch_replaces_is_never_in_force_whatever_their_order`, `withdrawing_an_epoch_equals_never_having_seen_it`, `only_a_put_or_an_epoch_names_what_it_supersedes` |
 | q9 | A reader's device whose key is revoked is granted no key and the epoch it held goes out of force: an owner device signs one new epoch that replaces it, a restart none more; a granter's kept seal key and grant never outlive a revocation | `may_grant_refuses_each_condition_and_names_which`, `an_asker_with_a_revoked_key_gets_no_grant`, `a_reader_device_with_a_revoked_key_is_refused_every_grant`, `a_kept_seal_key_and_grant_are_not_served_after_the_judge_moves`, `revoking_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_once` |
 
-### 13.4 Signals (with the signal transport, one provider)
+### 13.4 Signals (with the signal transport)
 
 The transport that carries signals (`ndn-surface`) owns most of these; this layer
 owns the gate (§11): who is a member, the signal keys, admission of a header,
@@ -3457,12 +3458,12 @@ only.
 | e18 | A member whose clock stepped back across a restart is heard again | suite only; the clock is not in this layer (§11) |
 | e19 | A crash loop and a corrected clock leave a member's signal clock at real time | suite only; the clock is not in this layer (§11) |
 
-### 13.5 Invitations (with `ndn-invite`, both providers)
+### 13.5 Invitations (with `ndn-invite`)
 
 The protocol of an invitation (offers, secrets, proofs, short codes) is
 `ndn-invite`'s and uses this layer through `change`, `Change::Members`, `open`
-and `ready`, and the grant pull. The cases keep their ids and run on both
-providers; this layer's own tests of the part they use are named, and the rest
+and `ready`, and the grant pull. The cases keep their ids; this layer's own
+tests of the part they use are named, and the rest
 is suite only.
 
 | Case | Property | Crate tests |
@@ -3506,9 +3507,9 @@ is suite only.
 ### 13.7 What a conforming implementation shows
 
 An implementation conforms when every case of §13.1 to §13.5 that applies to it
-passes on it, clean and under each faulty seed, with the same body as on every
-other provider, and the differential of the shared cases (§13.1) shows no id
-whose status differs from the other provider's. Every property of §1.6 is held
+passes on it, clean and under each faulty seed, with the same body for every
+implementation (a second provider, run beside this one, shows no id whose status
+differs from this one's). Every property of §1.6 is held
 by named crate tests (§14.2) and shown again by cases of this section; a case
 that fails where its crate tests pass is a missing crate test, added first.
 
@@ -3685,7 +3686,7 @@ and every even number of the block are free.
 
 Name keywords this specification owns (KeywordNameComponent, TLV-TYPE 0x20): `data`,
 `log`, `piece`, `manifest`, `seal`, `grant`, `held`, `sync`, `signal`, `run` (§2, §11). The numbers
-that the deletions of the previous design freed (inside 0x0520–0x057F, and
-0x05C0–0x05FE) stay quarantined, so no stale `ndn-data` packet ever decodes as
+that the deletions of the former data layer freed (inside 0x0520–0x057F, except the numbers
+`invite.md` lists, and 0x05C0–0x05FE) stay quarantined, so no stale `ndn-data` packet ever decodes as
 new content; the block 0x0640–0x0653 belongs to the custodian remote signer of
 `ndn-security`, not to this specification.

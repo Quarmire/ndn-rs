@@ -514,7 +514,7 @@ refused, and so MUST a revocation cut: this recovery revokes no key.
    packet is stored or served for it). The cut lists what the recovering
    device first verified of that key before the old root was lost, entry
    by entry or, per log, by the tip the device's data layer chose
-   ([data-layer.md](data-layer.md) §8.1, §8.4). A tip names the entries
+   ([heap.md](heap.md) §9.5). A tip names the entries
    below it by name: the recovered namespace's data layer keeps an entry
    of that key only if it is a chain ancestor of the tip, as for any tips
    cut (trust-context.md §3.3.12), and an entry the tip leaves out (above

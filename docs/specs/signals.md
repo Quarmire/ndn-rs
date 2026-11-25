@@ -2,14 +2,14 @@
 
 - **Status:** Draft (round 4)
 - **Scope:** *Signals*: presence, cursors, drags at 60 Hz, live unsigned edits and game input exchanged between the members of a folder or collection. A signal is never a version, never stored and never cached. This spec defines:
-  - who may send and receive (the members record, through the gate of [data-layer.md](data-layer.md) §20);
+  - who may send and receive (the members of the space, through the gate of [heap.md](heap.md) §11);
   - run keys and run headers;
   - the packet: its body, its run signature and its seal;
   - the push into the namespaces' sync groups, and the local leg over shared memory;
   - what a receiver checks, in order, and what it delivers;
   - limits, errors, the wire format and threat notes.
-- **Implementation:** the gate is `ndn_data::signal` (ndn-rs `crates/app/ndn-data`). Everything else is `ndn_surface::signal`, feature `signals` (ndn-ext `crates/surface/ndn-surface`). No forwarder, link or trust-context library treats signals specially.
-- **Related specs:** [data-layer.md](data-layer.md) (members §6, §6.1, §6.3; seals §9; sync groups §12; the gate §20), [ndn-link.md](ndn-link.md) (relays and transit §15.7), [trust-context.md](trust-context.md) (revocations).
+- **Implementation:** the gate is `ndn_heap::Node`'s six signal calls (ndn-rs `crates/app/ndn-heap`, [heap.md](heap.md) §11); it replaced the gate of the removed `ndn-data` crate. Everything else is `ndn_surface::signal`, feature `signals` (ndn-ext `crates/surface/ndn-surface`). No forwarder, link or trust-context library treats signals specially.
+- **Related specs:** [heap.md](heap.md) (the space and its members §5, adoption of persons §9.4, seals §6, the sync group §2.5 and §7.1, the gate §11), [ndn-link.md](ndn-link.md) (relays and transit §15.7), [trust-context.md](trust-context.md) (revocations).
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 ([RFC 2119], [RFC 8174]) when, and only when, they appear in all capitals, as shown here.
 
@@ -19,14 +19,14 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 | Term | Meaning |
 |---|---|
-| scope | A folder or a collection of the data layer. Its members record in force governs its signals. |
-| member | For signals: a device whose key a writer prefix of the scope's record in force covers, or which the record's audience admits, and whose key no trust context it holds revokes ([data-layer.md](data-layer.md) §20). |
+| scope | A space of [heap.md](heap.md) (formerly a folder or a collection of the old data layer). Its members, as the node folds them, govern its signals. |
+| member | For signals: a device whose key belongs to a person who is a writer of the space (the owner always is), and whose key no trust context it holds revokes and the node does not mark suspected ([heap.md](heap.md) §11.1). |
 | sender | The device key that signed a run's header: `/<ns>/<…device>/KEY/<id>`. |
 | run | One sender's signals in one scope under one ephemeral Ed25519 **run key**, from its header's `RunStart` until its `RunNotAfter`. |
 | run header | A Data packet, signed by the device key, binding the run key, the run's start and end and its local ring (§3). |
 | packet | One signal or a batch of signals, signed by the run key, sealed in a sealed scope (§4). It travels as the ApplicationParameters of a push Interest (§5) and as a frame on the run's ring (§6). |
-| signal key | A sealed scope's key for signals: derived from the content key of the scope's epoch inside the data layer ([data-layer.md](data-layer.md) §20). |
-| group | A namespace's sync group `<O>/32=sync` ([data-layer.md](data-layer.md) §12). |
+| signal key | A sealed space's key for signals: derived from the content key of the space's epoch inside the data layer ([heap.md](heap.md) §11.4). |
+| group | A namespace's sync group `<O>/32=sync`; a space's group is that name followed by the space's components ([heap.md](heap.md) §2.5). |
 | address | An application-defined label within a sender's signals, such as `cursor`, `presence` or `drag/<element>`. A newer signal for an address replaces the older one. |
 
 ## 2. Model
@@ -51,7 +51,7 @@ A header alone doesn't prove that its signer holds that key. Every reader of a r
 ### 3.2 The run header
 
 The run header is a Data packet:
-- **Name:** `<device>/32=signal/<scope>/32=run/<RunId>`: `<device>` the device name of the signing key, then the KeywordNameComponent `signal`, the scope's components, the KeywordNameComponent `run`, and a GenericNameComponent of the 16 RunId octets. Like every packet the data layer signs (a log entry is `<device>/32=log/<subject>/…`), it is named under its signer's device, since a validator picks the trust context, schema and anchors by the packet's name. For a self-certifying member adopted for the folder, the folder's scoped view judges it, as it judges that member's log entries about the folder ([data-layer.md](data-layer.md) §6.3);
+- **Name:** `<device>/32=signal/<scope>/32=run/<RunId>`: `<device>` the device name of the signing key, then the KeywordNameComponent `signal`, the scope's components, the KeywordNameComponent `run`, and a GenericNameComponent of the 16 RunId octets. Like every packet the data layer signs (a log entry is `<device>/32=log/<subject>/…`), it is named under its signer's device, since a validator picks the trust context, schema and anchors by the packet's name. For a self-certifying member adopted for the folder, the folder's scoped view judges it, as it judges that member's log entries about the folder ([heap.md](heap.md) §9.4);
 - **Content:** a RunHeaderBody (§11);
 - **Signature:** by the sender's device key, as the data layer signs its own packets. No FreshnessPeriod.
 
@@ -61,7 +61,7 @@ The body binds:
 - `RunNotAfter`: when the run ends, in ms since the Unix epoch, at most 24 h after the run opened;
 - `LocalRing` (optional): the 32-octet secret of the run's local ring (§6).
 
-The device key signs the header only while the device is a member of the scope ([data-layer.md](data-layer.md) §20). The header is never published under its name and never answered for. It travels only inside packets (§4).
+The device key signs the header only while the device is a member of the scope ([heap.md](heap.md) §11.1, §11.2). The header is never published under its name and never answered for. It travels only inside packets (§4).
 
 The run header's name is the **only** place a scope's Name travels in a signal (§4.1): every later packet names its scope by a digest of it. A receiver learns a run's scope from this device-signed header, so the header binds the RunId to the scope. The header, with its signer's key name twice (in its name and its KeyLocator), MUST fit a packet of its own, which bounds a scope's name (§4.3).
 
@@ -111,7 +111,7 @@ The header rides in a run's first packet, and again in the first packet sent onc
 ### 4.2 The seal
 
 In a sealed scope the packet is a **SignalSealed** instead:
-- `KeyId`: the 8-octet id of the signal key used ([data-layer.md](data-layer.md) §20);
+- `KeyId`: the 8-octet id of the signal key used ([heap.md](heap.md) §11.4);
 - `SealNonce`: 24 random octets;
 - `Ciphertext`: XChaCha20-Poly1305 under the signal key and the nonce, over the plaintext `SignalBody [SignalPadding]`, with AAD `"ndn-signal/2"` followed by the KeyId octets, its 16-octet tag appended.
 
@@ -277,7 +277,7 @@ A run's own signals are never delivered to its own process: the forwarder never 
 
 ## 11. Wire format
 
-TLV-TYPE numbers 0x0580–0x05AF ([README.md](README.md#tlv-type-numbers)). Every number is even: a decoder MUST skip an unknown even TLV inside these records and MUST refuse an unknown odd one, as in [data-layer.md](data-layer.md) §16.2. Numbers are NonNegativeInteger as in NDN.
+TLV-TYPE numbers 0x0580–0x05AF ([README.md](README.md#tlv-type-numbers)). Every number is even: a decoder MUST skip an unknown even TLV inside these records and MUST refuse an unknown odd one, as in [heap.md](heap.md) §3.4. Numbers are NonNegativeInteger as in NDN.
 
 | Type | Name | Value |
 |---|---|---|
@@ -451,7 +451,7 @@ ndn-surface's tests cover the local leg over shared memory and one link between 
 
 ## 15. Decisions
 
-- **Push into the sync groups, not a new prefix.** The groups already reach every member's devices through every relay with no configuration ([data-layer.md](data-layer.md) §12). A second per-namespace prefix would need the same routes, strategy choices and transit lifecycle added to the link and trust-context libraries. Sharing the group costs each SVS face a parse of the signal Interests it ignores, and each signal receiver a parse of the Sync Interests it ignores.
+- **Push into the sync groups, not a new prefix.** The groups already reach every member's devices through every relay with no configuration ([heap.md](heap.md) §2.5, §7.1). A second per-namespace prefix would need the same routes, strategy choices and transit lifecycle added to the link and trust-context libraries. Sharing the group costs each SVS face a parse of the signal Interests it ignores, and each signal receiver a parse of the Sync Interests it ignores.
 - **An asymmetric run key, not a shared one.** A symmetric key shared with the receivers would let any member forge any other's signals (ndf-rs, REPLY-to-ndn-workspace-1 §E). Signing every packet with the device key would make a chain walk per sender and expose the device key to a 60 Hz signing loop. A run key costs one Ed25519 signature per packet.
 - **Sign, then seal.** A relay then sees no sender identity, and a member can't strip and re-sign another's packet without its run key.
 - **XChaCha20-Poly1305 with random nonces.** One signal key serves every sender of an epoch, and an epoch can last months. A 24-octet random nonce keeps collisions negligible at any packet count.

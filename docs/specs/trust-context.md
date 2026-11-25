@@ -600,7 +600,7 @@ packet that does not decode lists nothing, so the packets it would list
 are refused. The cut never reads a date, a sequence number's meaning or a
 validity period; which names a range lists is the producer's business
 (the data layer bounds them by the root's own observation,
-[data-layer.md](data-layer.md) §8.1).
+[heap.md](heap.md) §9.5).
 
 **Tips.** A tip names a log by its last entry instead of listing every
 entry. Every `P` + `s` below `t` is accepted by name; the tip's own name only
@@ -618,7 +618,7 @@ range accepts, besides its CutExact entries, only names under its tips.
 A tip binds names below it, not bytes. The validator (§6.3) accepts a
 packet below a tip by name when it verifies under the key (and the cut's
 CutKeyDigest, if any, matches): it holds one packet, never the log. The ends
-bind the bytes: the data layer ([data-layer.md](data-layer.md)) accepts an
+bind the bytes: the data layer ([heap.md](heap.md) §9.5) accepts an
 entry below a tip only when it lies in the chain ancestry of the tip (each
 entry names its predecessors by signed digest), which a node holding one
 packet cannot check. A forwarder's Content Store re-check (§6.3) shares the
@@ -704,8 +704,8 @@ every cut it holds (§7.3).
    is (rule 2), never made anew.
 5. MAY name a log by a CutTip instead of ranges: the tip is the last entry
    of the log the root itself verified before the moment the owner gives as
-   the loss of the key (as for ranges, [data-layer.md](data-layer.md)
-   §8.1), with its sequence number and its signed-region digest. A cut
+   the loss of the key (as for ranges, [heap.md](heap.md)
+   §9.5), with its sequence number and its signed-region digest. A cut
    that names logs by tips alone needs no CutManifest; a cut that also has
    a CutRange still needs its CutManifest (rule 4). A later version
    carries every tip verbatim (rule 2): a tip is never lowered, raised,
@@ -714,7 +714,7 @@ every cut it holds (§7.3).
 
 Which packets a range lists is not judged here; the data layer's producer
 lists only packets the root itself verified before the moment the owner
-gives as the loss of the key ([data-layer.md](data-layer.md) §8.1), so that
+gives as the loss of the key ([heap.md](heap.md) §9.5), so that
 a thief's writes after the theft are not in the cut.
 
 A node adopting a version does not check rules 1, 2 and 4 against the
@@ -1138,7 +1138,7 @@ CLI adopting into the PIB with no daemon running (`ndn-fwd adopt`, ndn-cert
 checked by §4.5.2 alone, and the adoption says so
 (`LinkAdoption::offline_genesis`, `LinkAdoption::OFFLINE_GENESIS_NOTE`:
 "adopted from the link's own version 1 without checking the network; …").
-An introduction never takes it alone ([data-layer.md](data-layer.md) §19).
+An introduction never takes it alone ([invite.md](invite.md) §8.2).
 A namespace already held moves on only by the continuity rule, from a link
 as from anywhere (§5.1).
 Adopting a held `/user/<h>` by name again is a refresh of it (§8.2): the
@@ -1177,7 +1177,7 @@ ndn-rs:
   (`AdoptRefusal::NotFromGenesis`). A held namespace is never changed here.
 - Every adoption path — anchor links and envelopes, `adopt_with_tofu`,
   invite enrollment, stored copies, introductions
-  ([data-layer.md](data-layer.md) §19) — reaches the namespace through it.
+  ([invite.md](invite.md) §8) — reaches the namespace through it.
   A fingerprint a link, envelope or invite carries for a self-certifying
   namespace is ignored, not compared: the genesis decides. An invite to a
   held self-certifying namespace is not compared with its fingerprint
@@ -1345,9 +1345,9 @@ These are refused before anything is written:
    expectation (§4.4), so it can be adopted by name; and a DigestSha256
    packet, which names no signer and vouches for nothing, so it passes
    integrity-only as under every name — the namespace's metadata pointer,
-   whose versions are each checked from the genesis, and a device's
-   wrapped `32=held` answers, through which a stranger fetches an offer
-   before it trusts the inviter ([data-layer.md](data-layer.md) §19), are
+   whose versions are each checked from the genesis, and an introduction's
+   answer to an ask, through which a stranger learns whether it was admitted
+   before it trusts the inviter ([invite.md](invite.md) §2.1, §9), are
    such packets, and their consumers check what they carry.
 5. **No position bound.** The 128-position bound of §5.4 does not apply to
    a self-certifying namespace's walks — a refresh, a sync update, an
@@ -1375,15 +1375,15 @@ These are refused before anything is written:
    keyring's own `contexts()` — refuses it as note 4 says, and a held
    context of the namespace always wins over it, never replaced. Where a
    forwarder carries such a namespace in transit for the scope's holder,
-   it vouches for and caches none of it (data-layer.md §6.2, "Scope
+   it vouches for and caches none of it (the view of heap.md §9.4; the note on this exposure is in history/data-layer-remainder.md §6.2, "Scope
    leaks").
 
 #### 4.5.7 Adopted for one scope
 
 A holder may adopt a self-certifying namespace by name for one scope of
-its own alone — the data layer adopts every self-certifying writer a
-folder's members record lists, to judge that folder's data
-(data-layer.md §6.3) — without the node trusting it anywhere else.
+its own alone — a `ndn-heap` node adopts every self-certifying writer a
+space's members listing names, to judge that space's data
+(heap.md §9.4) — without the node trusting it anywhere else.
 
 - The adoption is §4.5.3's (genesis fetched and checked, the newest
   reached by continuity, a validating forwarder told to expect the
@@ -1408,7 +1408,7 @@ folder's members record lists, to judge that folder's data
   older version, or that number with other content, is refused as §5.1
   refuses one for a held namespace; the refusal says which version was
   reached before and to reach a device or relay serving it, and the holder
-  asks again later (data-layer.md §6.3).
+  asks again later (heap.md §9.4).
 - A holder apart from its forwarder — an app beside a daemon — cannot
   tell the forwarder's validator to expect the versions: it has the
   forwarder carry the namespace in transit first (mgmt-trust.md
@@ -1427,7 +1427,7 @@ folder's members record lists, to judge that folder's data
   a view, with the same certificate cache, fetcher, chain depth and
   refusals; the validator it is made from, and every user of its keyring,
   keep refusing the namespace (`PersonalNamespaceNotHeld`). Which packets
-  a view judges is the holder's rule (data-layer.md §6.3).
+  a view judges is the holder's rule (heap.md §9.4).
 - A view walks every packet it judges to the anchors of the context
   judging it, whatever the posture of the validator it is made from: one
   made from an `accept-signed` validator — a forwarder's, which an
@@ -1740,7 +1740,7 @@ keeps, forwards or hands it to an application:
 - a forwarder's data path: validation of arriving Data, including Data
   parked while a certificate or a manifest packet is fetched; the content
   store's re-check after a revoking adoption; the purge on adoption (§5.1);
-- the data layer ([data-layer.md](data-layer.md) §8): every entry taken,
+- the data layer ([heap.md](heap.md) §9.7): every entry taken,
   re-judged on a revoking adoption and on restore;
 - an application's verified fetch through ndn-app (`Consumer::fetch_verified`,
   the verified segmented fetch, `object(..).verify(..)`), which all verify
@@ -2044,7 +2044,7 @@ user on the host can open such a face (a listener is a network socket, not
 a file with an owner), so any process could feed the content store: a
 forged Data for a name was cached and then answered every later Interest
 for it, from every consumer of the forwarder — including another user's —
-so a device never saw the genuine packet (data-layer.md §18.1; the case
+so a device never saw the genuine packet (the faulty profile of history/data-layer-remainder.md §18.1; the case
 was met by a member's own loopback face). A second hole was the same in
 Unix form: the face socket is world-connectable (`0666`), and every peer
 the kernel identified was a program, so another user's process could
@@ -2188,12 +2188,12 @@ inside which the Interest is expressed again with a fresh nonce every
 pending, so a late answer to it counts. An ask nothing answered is asked
 again, at most **3** such asks; an ask answered `bad-signature` is asked
 again at once; at most **8** asks in all. Then the fetch ends with no
-answer (a refresh's **Unreachable**). On the faulty network of
-data-layer.md §18.1 an ask goes unanswered under one time in twenty and
+answer (a refresh's **Unreachable**). On
+the conformance suite's faulty network (`--faulty`, heap.md §13; its profile is recorded in history/data-layer-remainder.md §18.1) an ask goes unanswered under one time in twenty and
 three asks under one in ten thousand, while a path that is down costs a
 fetch three lifetimes (some 15 s) — before this rule, eight asks of one
 Interest each, some 36 s, which outlasted a person waiting at a recovery
-screen for the question that nothing answered (data-layer.md §17.1). A
+screen for the question that nothing answered (heap.md §7.4). A
 command to a CA (parameters or a signature) is never asked again behind
 its caller's back.
 
@@ -2407,7 +2407,7 @@ through from it. Only verified versions may feed the Behind rule (§8.2).
   writes valid for good. The data layer's producer therefore lists only
   entries the root device itself first verified before the moment the
   owner gives as the loss, and stops taking new entries of a key the owner
-  marks suspected ([data-layer.md](data-layer.md) §8.1). Residual: a
+  marks suspected ([heap.md](heap.md) §9.5, §9.8). Residual: a
   thief's writes the root verified before that moment stay accepted, so
   the moment should be the earliest the owner can name. That moment and
   the times of first verification are both read on the root device's own
@@ -2419,7 +2419,7 @@ through from it. Only verified versions may feed the Behind rule (§8.2).
   neither, nor by a forwarder that met the thief's copy first. A cut made
   before manifests binds names only: there, a node that holds the honest
   packet keeps both and reports the equivocation (the data layer does,
-  [data-layer.md](data-layer.md) invariant 2), and a node holding neither
+  [heap.md](heap.md) §1.3 invariant 2, §3.7), and a node holding neither
   may take whichever answers first; that residual remains for such cuts
   only. Withholding manifest packets delays acceptance (the packet stays
   pending) and never makes a node accept other bytes.
@@ -3143,7 +3143,7 @@ may move.
 - `mod.rs:1116-1128` derived native blob; `:1135-1138` anchor_fingerprint; `:1142-1156` context_namespace_of; `:1193-1236` open_signed (name equality `:1203`, signer must be own anchor `:1212-1215`, public-key sig types `:1219-1224`); `:1238-1254` open_received (signer valid now `:1250`); `:1302-1304` is_critical; `:1307-1319` read_tlv (trailing bytes ignored); `:1321-1332` key_identity (generic `KEY` only).
 - Revocation cuts (by symbol; the line numbers above predate them): `tlv.rs` REVOCATION_CUT 0x0428, CUT_RANGE 0x042A, CUT_RUN 0x042C, CUT_EXACT 0x042E; `RevocationCut::{new, add_seq, add_run, readmit, accepts, encode, decode}`, `CutRange`; `SignedTrustContext::{with_revocation_cut, revocation_cuts, revocation_cut, refuses_data}`; encode_content writes the cuts after the Revocation entries; decode_content rejects a malformed cut and a second cut for one key; tests `spec_vector_t8_revocation_cut`, `spec_vector_t2_is_unchanged`.
 - Cut key digest, manifest and DataRequiresCut (by symbol): `tlv.rs` CUT_KEY_DIGEST 0x0430, CUT_MANIFEST 0x0432, DATA_REQUIRES_CUT 0x0434, MANIFEST_NODE 0x0436 and the MANIFEST_* children 0x0438–0x043E; `RevocationCut::{set_key_digest, key_digest, set_manifest, manifest, range_seq, accepts_exactly, covers}` (`accepts` admits a range only when the cut has no manifest: fails closed); `ndn_security::public_key_digest` (SHA-256 of `Certificate::public_key` as stored); `SignedTrustContext::{with_data_requires_cut, without_data_requires_cut, data_requires_cut, role_of, requires_cut_for, without_revocation_cuts}`.
-- `ndn-rs/crates/security/ndn-security/src/cut_manifest.rs`: `manifest_prefix`, `build` (→ `BuiltManifest { root, packets }`, root first), `build_under` (the same tree, its packets named `<prefix>/seg=<i>`: the data layer's removal cuts name theirs under the members record, `<R>/32=cut`, data-layer.md §8), `parse`, `children`, `CutManifests::{new, insert, contains, get, lookup, missing}`, `ManifestLookup::{Listed, NotListed, Missing}`, `MAX_PACKET_SIZE` 8000, `FRESHNESS` 1 h; held in `CertCache::cut_manifests` / `Validator::cut_manifests`; fetched by `CertFetcher::fetch_missing` (a certificate or a full-name manifest packet, `ndn_security::is_full_name`).
+- `ndn-rs/crates/security/ndn-security/src/cut_manifest.rs`: `manifest_prefix`, `build` (→ `BuiltManifest { root, packets }`, root first), `build_under` (the same tree, its packets named `<prefix>/seg=<i>`: the removal cuts of the former data layer named theirs under the members record, `<R>/32=cut`; `ndn-heap` makes removal cuts as tips, heap.md §9.6), `parse`, `children`, `CutManifests::{new, insert, contains, get, lookup, missing}`, `ManifestLookup::{Listed, NotListed, Missing}`, `MAX_PACKET_SIZE` 8000, `FRESHNESS` 1 h; held in `CertCache::cut_manifests` / `Validator::cut_manifests`; fetched by `CertFetcher::fetch_missing` (a certificate or a full-name manifest packet, `ndn_security::is_full_name`).
 - `ndn-rs/crates/security/ndn-security/src/validator/`: `Validator::{validate_durable, validate_durable_cached}` (the walk without validity periods but DataRequiresCut's refusal; the depth-0 revocation excused in the key's cut when the key digest and the manifest agree, §6.3), `Validator::can_resolve_durable` (manifest full names too); `ndn_security::chain_clear` (the content store's durable re-check, shared with the validator); `TrustError::Revoked { name, why }` with `TrustError::{REVOKED, REVOKED_OUTSIDE_CUT}`, and `TrustError::Lapsed { name, not_after, now }` for a lapsed key; `Unverified::{verify, verify_live}` (`unverified.rs`).
 - `ndn-rs/crates/security/ndn-security/src/validator/chain.rs` (§6.5): `Validator::walk_to_anchor` (one more walk after a refused copy, or after dropping certificates an earlier walk fetched, when fetching; `Pending` naming a refused copy when cache-only), `walk_once` with `reached_anchor` (admits the unverified certificates verified up to the anchor), `bad_signature` / `forged` (a signature failing under a key vouched for condemns the signed bytes; under an unverified one the walk goes on with it as the `Suspect`), `unvouched` (a walk not reaching an anchor drops what it took; a cache-only walk waiting on a fetch that has not failed, `CertFetcher::failed_recently`, keeps it), `durable_cached` (vouched for first), and the refused-certificate memory skipping `InvalidSignature` (`validate_chain_inner`); `CertCache::{insert, insert_unverified, evict}` and the crate's `resolve`, `get_any`, `all_by_kind`, `admit`, `drop_unverified` (`cert_cache.rs`: two kinds, a copy matched by its signed bytes and signature value); `CertFetcher::do_fetch` holds what it fetches unverified.
 - §4.5.6 note 4 and §4.5.7, anchors under every profile: `Validator::anchor_required` (`validator/mod.rs`: a person's names, under `accept_signed` too), `Validator::scoped_view` (always requires anchors); ndn-engine `resolve_security_profile` (`builder.rs`: the accept-signed validator's chain depth is the default's, 5).
