@@ -282,6 +282,114 @@ async fn a_reader_device_whose_key_is_suspected_here_is_refused_every_grant() {
     );
 }
 
+/// Stage-7 L5 through the whole sequence of a stolen tablet in a sealed space (the e2e scenario
+/// `stolen`): an owner device, a second honest device and a device that writes, whose key the
+/// owner then suspects. The owner device signs a new epoch; its own `put` seals in it at once,
+/// and the honest device's `put` answers `NotReady` (retry) until the new epoch's key is
+/// granted to it, then seals in the new epoch; each reads what the other wrote. Nothing here
+/// refuses an honest device: only the suspected key is refused grants by the node that marked
+/// it (the other devices do not know the mark until the revocation reaches them, §9.9).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn honest_devices_write_in_a_sealed_space_after_a_key_is_suspected() {
+    let m = mesh(&["/alice/laptop", "/alice/tab", "/alice/phone"]).await;
+    let laptop = m.boot(0, fast()).await;
+    let heap = laptop.create(&space(), private(&[])).await.unwrap();
+    let tab = m.boot(1, fast()).await;
+    let phone = m.boot(2, fast()).await;
+    let (tabs, phones) = (
+        tab.open(&space()).await.unwrap(),
+        phone.open(&space()).await.unwrap(),
+    );
+    let first = heap.inner.log.lock().fold.in_force().expect("an epoch");
+    // The device that writes holds the key in force and writes before the report.
+    for _ in 0..200 {
+        if tabs.holds_epoch_key() && phones.holds_epoch_key() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        tabs.holds_epoch_key() && phones.holds_epoch_key(),
+        "both devices hold the first epoch's key before the report"
+    );
+    phones
+        .put(&n("/trip"), bytes("flight at nine"), durable(true))
+        .await
+        .unwrap();
+    eventually("the laptop reads the phone's note", || async {
+        has(&heap, "/trip", "flight at nine").await
+    })
+    .await;
+
+    // The owner reports the phone lost.
+    laptop
+        .suspect(
+            &m.devs[2].name.clone().append("KEY").append("1"),
+            Timestamp(1),
+        )
+        .unwrap();
+    let second = {
+        let mut found = None;
+        for _ in 0..200 {
+            let now = heap.inner.log.lock().fold.in_force();
+            if let Some(e) = now.filter(|e| *e != first) {
+                found = Some(e);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        found.expect("the owner device signs a new epoch for the suspected key")
+    };
+
+    // The owner seals in the new epoch at once.
+    heap.put(&n("/owner"), bytes("laptop writes"), PutOptions::default())
+        .await
+        .unwrap();
+    // The second honest device hears of the new epoch (a put before it does seals in the old
+    // one, which the suspected device holds: the host waits for the epoch, as the conformance
+    // cases wait for the key).
+    eventually("the tab hears the new epoch", || async {
+        tabs.epoch().map(|(e, _)| e) == Some(second.clone())
+    })
+    .await;
+
+    // The second honest device: `NotReady` (retry) while the key is not here, then it writes.
+    let mut written = None;
+    for _ in 0..200 {
+        match tabs
+            .put(
+                &n("/memo"),
+                bytes("bring the charger"),
+                PutOptions::default(),
+            )
+            .await
+        {
+            Ok(id) => {
+                written = Some(id);
+                break;
+            }
+            Err(e @ HeapError::NotReady { .. }) => assert!(e.retry(), "{e}"),
+            Err(e) => panic!("an honest device's put answered {e:?}, not NotReady or success"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    written.expect("the honest device is granted the new epoch's key and writes");
+    assert!(tabs.holds_epoch_key());
+    assert_eq!(
+        tabs.epoch().map(|(e, _)| e),
+        Some(second.clone()),
+        "it writes in the new epoch"
+    );
+    eventually("the laptop reads what the tab wrote", || async {
+        has(&heap, "/memo", "bring the charger").await
+    })
+    .await;
+    eventually("the tab reads what the laptop wrote", || async {
+        has(&tabs, "/owner", "laptop writes").await
+    })
+    .await;
+}
+
 /// Two owner devices each remove a different reader at the same time; each
 /// repairs the epoch it sees incomplete, and the space ends with one complete
 /// epoch on both.
