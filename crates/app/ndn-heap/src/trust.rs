@@ -27,13 +27,13 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
-use ndn_packet::Data;
+use ndn_packet::{Data, Interest};
 use ndn_security::cert_name::{is_cert_name, is_key_name, is_reserved_non_cert, key_name_of};
 use ndn_security::safe_data::TrustPath;
 use ndn_security::self_certifying::{Genesis, in_personal_namespace, personal_namespace_of};
 use ndn_security::{
-    Certificate, RevocationCut, SafeData, ScopedContext, SignedTrustContext, TrustError,
-    ValidationResult, Validator, is_full_name,
+    Certificate, InterestValidationOutcome, RevocationCut, SafeData, ScopedContext,
+    SignedTrustContext, TrustError, ValidationResult, Validator, is_full_name,
 };
 use ndn_sync::DataStore;
 use parking_lot::Mutex;
@@ -43,7 +43,10 @@ use tokio::sync::mpsc;
 use crate::error::{Cut, Refusal, Timestamp};
 use crate::rt::{self, Instant, Tasks};
 use crate::store::{Kind, Link};
-use crate::wire::{ASKER_CHAIN_MAX, ASKER_CHAIN_OCTETS_MAX, device_of, log_prefix, parse_log_name};
+use crate::wire::{
+    ASKER_CHAIN_MAX, ASKER_CHAIN_OCTETS_MAX, chan_ask_name, device_of, log_prefix, parse_chan_name,
+    parse_log_name,
+};
 
 /// The first pause before a person the host could not adopt is asked again;
 /// it doubles on each refusal, up to [`SCOPE_PAUSE_MAX`].
@@ -178,6 +181,18 @@ pub(crate) enum Judged {
     /// It is refused, for the reason given.
     Refused(Refusal),
     /// It is neither: the judgement waits.
+    Pending(Waiting),
+}
+
+/// The verdict on one signed Interest ([`Judge::validate_interest`]): who signed it is the
+/// caller's, from the KeyLocator the verdict is about.
+#[derive(Debug)]
+pub(crate) enum InterestJudged {
+    /// The signature verifies by a chain to the trust anchors of the signer's context.
+    Valid,
+    /// It is refused, for the reason given.
+    Refused(Refusal),
+    /// The signer's chain is not held here and not carried: the judgement waits.
     Pending(Waiting),
 }
 
@@ -602,6 +617,9 @@ pub(crate) struct Judge {
     /// How many person adoptions so far refused more than the version before
     /// them: what a keyring's own revocation epoch counts for its contexts.
     scoped_revocations: AtomicU64,
+    /// How many signature walks of signed Interests the judge has made ([`Self::validate_interest`]):
+    /// what a test reads to show an Interest that was refused before its signature cost none.
+    interest_walks: AtomicU64,
     /// The adoptions the host is asked for, and the pauses before asking again.
     tasks: Arc<Tasks>,
 }
@@ -639,6 +657,7 @@ impl Judge {
             scopes: Mutex::new(scopes),
             events,
             scoped_revocations: AtomicU64::new(0),
+            interest_walks: AtomicU64::new(0),
             tasks: Tasks::new(),
         });
         // The listener runs on the adopting thread: it only releases what the
@@ -776,6 +795,88 @@ impl Judge {
             }
         }
         judged
+    }
+
+    /// Judge `interest`, an ask `<responder>/32=chan/<digest>` signed by `key`, a key of another
+    /// device, for `space`: the same walk as [`Self::validate_asker_packet`] makes for the Data
+    /// of a grant ask (the live rule: an Interest is signed now, so a certificate must be valid
+    /// now), from the certificates held and `chain`, the certificates the ask carries (at most
+    /// [`ASKER_CHAIN_MAX`], each handed to the validator only as an **unverified** copy for the
+    /// hop it answers and dropped again if the walk did not vouch for the whole chain). Nothing is
+    /// fetched. The signer is judged by the context of its **own** device, not of the name the
+    /// Interest is under (that is the responder's): the signer's person decides the schema and the
+    /// anchors. Each signature walk is counted ([`Self::interest_walks`]).
+    pub(crate) async fn validate_interest(
+        &self,
+        space: &Name,
+        interest: &Interest,
+        key: &Name,
+        chain: &[Bytes],
+    ) -> InterestJudged {
+        let (Some(device), Some((_, digest))) = (device_of(key), parse_chan_name(&interest.name))
+        else {
+            return InterestJudged::Refused(Refusal::BadSignature);
+        };
+        // The name the signer's context is chosen by: the same ask, as if under the asker.
+        let as_asker = chan_ask_name(&device, &digest);
+        let view = self.view_for(&as_asker, space, true);
+        let mut taken = Vec::new();
+        let mut outcome = None;
+        for _ in 0..=chain.len().min(ASKER_CHAIN_MAX) {
+            self.interest_walks.fetch_add(1, Ordering::Relaxed);
+            let (verdict, missing) = view.validate_interest_cached_as(interest, &as_asker).await;
+            let InterestValidationOutcome::Pending = verdict else {
+                outcome = Some(verdict);
+                break;
+            };
+            let Some(missing) = missing.filter(|m| !is_full_name(m)) else {
+                break;
+            };
+            let Some(cert) = chain
+                .iter()
+                .find_map(|carried| Self::certificate_for(&missing, carried))
+            else {
+                break;
+            };
+            if !view.cert_cache().insert_unverified(cert.clone()) {
+                break;
+            }
+            taken.push(cert);
+        }
+        let judged = match outcome {
+            Some(InterestValidationOutcome::Valid) => InterestJudged::Valid,
+            Some(InterestValidationOutcome::Invalid(e)) => {
+                tracing::debug!(%key, "signed Interest not verified: {e}");
+                InterestJudged::Refused(match e {
+                    TrustError::InvalidSignature
+                    | TrustError::InvalidKey
+                    | TrustError::UnsupportedSignatureType { .. }
+                    | TrustError::NotPublicKeySignature { .. }
+                    | TrustError::CertNotFound { .. }
+                    | TrustError::KeyStore(_)
+                    | TrustError::NoSigningIdentity { .. } => Refusal::BadSignature,
+                    other => Refusal::Untrusted {
+                        why: other.to_string(),
+                    },
+                })
+            }
+            Some(InterestValidationOutcome::Pending) | None => {
+                InterestJudged::Pending(Waiting::Chain)
+            }
+        };
+        if !matches!(judged, InterestJudged::Valid) {
+            for cert in &taken {
+                view.cert_cache().drop_unverified(cert);
+            }
+        }
+        judged
+    }
+
+    /// How many signature walks of signed Interests this judge made: the cost a stranger's ask
+    /// must not have.
+    #[cfg(test)]
+    pub(crate) fn interest_walks(&self) -> u64 {
+        self.interest_walks.load(Ordering::Relaxed)
     }
 
     /// The certificates of `key` and of its issuers, leaf first, as far as this node's

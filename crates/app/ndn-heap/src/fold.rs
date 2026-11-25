@@ -18,6 +18,8 @@
 //! the incremental form computes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ndn_foundation_types::Name;
 
@@ -132,6 +134,9 @@ pub struct Fold {
     carriers: BTreeMap<EntryRef, MembersBody>,
     facts: Facts,
     epochs: BTreeMap<EpochId, Epoch>,
+    /// Moves every time an entry changes what the fold says. Shared, so that a channel session
+    /// compares it with one atomic load and no lock of the log ([`Self::version`]).
+    version: Arc<AtomicU64>,
 }
 
 impl Fold {
@@ -143,12 +148,25 @@ impl Fold {
             carriers: BTreeMap::new(),
             facts: Facts::default(),
             epochs: BTreeMap::new(),
+            version: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// The space owner.
     pub fn owner(&self) -> &Name {
         &self.owner
+    }
+
+    /// The counter that moves whenever the fold changes ([`Self::apply_members`],
+    /// [`Self::apply_epoch`], [`Self::withdraw_members`], [`Self::withdraw_epoch`] each move it when
+    /// they change what is held). A reader that cached it with a verdict and reads the same
+    /// value again holds the same fold: one atomic load, no lock.
+    pub(crate) fn version(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.version)
+    }
+
+    fn moved(&self) {
+        self.version.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Takes in the Members entry `carrier` (its signed-region digest is the
@@ -160,6 +178,7 @@ impl Fold {
         }
         self.facts.absorb(carrier, body);
         self.carriers.insert(carrier.clone(), body.clone());
+        self.moved();
     }
 
     /// Takes in the Epoch entry that made `id`; its `after` names the epochs
@@ -180,6 +199,7 @@ impl Fold {
             .is_none_or(|held| new.rank() < held.rank())
         {
             self.epochs.insert(id, new);
+            self.moved();
         }
     }
 
@@ -194,13 +214,18 @@ impl Fold {
             facts.absorb(c, body);
         }
         self.facts = facts;
+        self.moved();
         true
     }
 
     /// Drops the epoch `id` (the entry that made it, whichever copy). Returns
     /// whether it was known.
     pub fn withdraw_epoch(&mut self, id: &EpochId) -> bool {
-        self.epochs.remove(id).is_some()
+        let known = self.epochs.remove(id).is_some();
+        if known {
+            self.moved();
+        }
+        known
     }
 
     /// Whether the Add `id` still stands. A Remove of an Add naming the owner

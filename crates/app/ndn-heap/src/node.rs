@@ -36,6 +36,7 @@ use ndn_security::{SecurityManager, Signer, Validator};
 use ndn_sync::{DataStore, StoreOp, SvsConfig};
 use parking_lot::{Mutex, RwLock};
 
+use crate::chan::hub::{Chan, ChanPort};
 use crate::error::{HeapError, Refusal, Timestamp};
 use crate::fold::Readers;
 use crate::host::NodeHandle;
@@ -206,6 +207,9 @@ pub(crate) struct NodeInner {
     pub(crate) tasks: Arc<Tasks>,
     /// What waits for the network half to have ended: taken by [`NodeInner::ended`].
     net_end: Mutex<Option<NetEnd>>,
+    /// What the node keeps of channels: its channels as a sender, its sessions as a receiver
+    /// ([`crate::chan`]).
+    pub(crate) chan: Chan,
 }
 
 /// What the store says of a space opened before: a member (1) or a carrier
@@ -309,6 +313,7 @@ impl Node {
             serving: Mutex::new(None),
             tasks: Tasks::new(),
             net_end: Mutex::new(None),
+            chan: Chan::new(),
         });
         let node = Node {
             inner: Arc::clone(&inner),
@@ -320,6 +325,11 @@ impl Node {
             conn,
             transport.sync,
         );
+        // The network half asks the node, once it is whole, for the answers to channel asks.
+        let _ = net
+            .shared
+            .chan
+            .set(Arc::downgrade(&inner) as Weak<dyn ChanPort>);
         *inner.net_end.lock() = Some(net.end());
         *inner.net.write() = Some(net);
         // From here a failure drops `node`, which stops what was started.
@@ -330,6 +340,9 @@ impl Node {
         inner
             .tasks
             .spawn(NodeInner::lapse_task(Arc::downgrade(&inner)));
+        inner
+            .tasks
+            .spawn(NodeInner::chan_task(Arc::downgrade(&inner)));
         inner.tasks.spawn(NodeInner::failure_task(
             Arc::downgrade(&inner),
             Arc::clone(&inner.flusher),
@@ -571,7 +584,7 @@ impl Drop for Node {
 // -- Inside ------------------------------------------------------------------------
 
 impl NodeInner {
-    fn arc(&self) -> Arc<NodeInner> {
+    pub(crate) fn arc(&self) -> Arc<NodeInner> {
         self.me
             .upgrade()
             .expect("the node is alive while it is used")
@@ -648,6 +661,7 @@ impl NodeInner {
             return;
         }
         self.tasks.stop();
+        self.chan_stop();
         self.judge.stop();
         self.flusher.stop();
         if let Some(net) = self.net.write().take() {
@@ -1095,6 +1109,9 @@ impl NodeInner {
             if inner.stopped.load(Ordering::Relaxed) {
                 break;
             }
+            // A trust context adopted may revoke a key a channel's receiver or sender stands
+            // by: the channels judge again at once.
+            inner.chan.wake();
             inner.on_adoption(event).await;
         }
     }

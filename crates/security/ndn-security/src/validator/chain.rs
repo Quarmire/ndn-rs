@@ -385,6 +385,76 @@ impl Validator {
         }
     }
 
+    /// Validate a signed Interest that was **not** signed for a name under the signer's own
+    /// identity, by the **live** rule, using only certificates already held (as
+    /// [`Self::validate_chain_cached`] does for Data): nothing is fetched, and a hop whose
+    /// certificate is not held is `(Pending, Some(missing))`, for the caller to supply or
+    /// retry. `context_name` is the name the signer's trust context, schema and anchors are
+    /// chosen by and the signer is authorised for, in place of the Interest's own name: a
+    /// request is named under the device that answers it (`<responder>/32=chan/<digest>`),
+    /// and the signer is another person's device, which a context chosen by that name would
+    /// refuse. The caller passes a name under the signer's own device. Counters bump as for
+    /// [`Self::validate_chain`].
+    pub async fn validate_interest_cached_as(
+        &self,
+        interest: &Interest,
+        context_name: &Name,
+    ) -> (InterestValidationOutcome, Option<Arc<Name>>) {
+        let invalid = |e| (InterestValidationOutcome::Invalid(e), None);
+        if let Some(refused) = self.unheld_person(context_name, false) {
+            return invalid(refused);
+        }
+        let (Some(sig_info), Some(signed_region), Some(sig_value)) = (
+            interest.sig_info(),
+            interest.signed_region(),
+            interest.sig_value(),
+        ) else {
+            return invalid(TrustError::InvalidSignature);
+        };
+        if sig_info.sig_type == SignatureType::DigestSha256 {
+            return invalid(not_public_key("DigestSha256 (0)", DIGEST_NO_SIGNER));
+        }
+        if let Some(refused) = self.unanchored(context_name) {
+            return invalid(refused);
+        }
+        let first_key: Arc<Name> = match &sig_info.key_locator {
+            Some(KeyLocator::Name(n)) => Arc::new((**n).clone()),
+            Some(KeyLocator::KeyDigest(digest)) => {
+                match self.cert_cache.get_by_key_digest(digest) {
+                    Some(cert) => Arc::clone(&cert.name),
+                    None => return (InterestValidationOutcome::Pending, None),
+                }
+            }
+            None => return invalid(TrustError::InvalidSignature),
+        };
+        let outcome = match self
+            .walk_to_anchor(
+                context_name,
+                first_key,
+                &signed_region,
+                sig_value,
+                sig_info.sig_type,
+                false,
+                None,
+                false,
+                false,
+            )
+            .await
+        {
+            WalkOutcome::Trusted(..) => (InterestValidationOutcome::Valid, None),
+            WalkOutcome::Pending(missing) | WalkOutcome::RefusedCopy(missing) => {
+                (InterestValidationOutcome::Pending, Some(missing))
+            }
+            WalkOutcome::Invalid(e) => invalid(e),
+        };
+        match &outcome.0 {
+            InterestValidationOutcome::Valid => self.bump_verified(),
+            InterestValidationOutcome::Invalid(_) => self.bump_rejected(),
+            InterestValidationOutcome::Pending => {}
+        }
+        outcome
+    }
+
     /// Shared chain-walk core for the Data and signed-Interest paths: starting
     /// from `(first_signed_region, first_sig_value)` signed by `first_key`, walk
     /// cert → issuer until a trust anchor of the context governing

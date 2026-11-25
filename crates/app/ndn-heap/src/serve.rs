@@ -34,7 +34,7 @@
 //! out.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 use ndn_app::Responder;
@@ -44,6 +44,8 @@ use ndn_packet::{Data, Interest, NackReason};
 use ndn_security::cert_name::{is_cert_name, is_key_name, key_name_of};
 use parking_lot::Mutex;
 
+use crate::chan::answer::{ChanAnswer, no_cache};
+use crate::chan::hub::ChanPort;
 use crate::limit::Counts;
 use crate::seal::seal_key_matches;
 use crate::sync::{HostRef, Net, Shared};
@@ -149,6 +151,14 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
             }
             None
         }
+        // `<D>/32=chan/<digest>`: a channel ask, judged and answered by the node (channel.md).
+        Some(Served::Chan) => {
+            if let Some(port) = shared.chan.get().and_then(Weak::upgrade) {
+                shared.tasks.clone().spawn(chan(port, interest, responder));
+                return;
+            }
+            None
+        }
         // `<D>/KEY/<id>` (or a certificate of that key): the certificate a validator asks for
         // by the KeyLocator of this device's entries. The device answers for its own chain
         // and for nothing else of the kind ([`own_key_name`]).
@@ -167,6 +177,20 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
         },
     };
     reply(&name, responder, packet).await;
+}
+
+/// Answer a channel ask (channel.md): the node judges it in the order the spec gives and answers
+/// a signed session, a signed refusal or a Nack, so no ask is left to time out. Whatever it
+/// answers is never cached (`CachePolicy = NoCache`).
+async fn chan(port: Arc<dyn ChanPort>, interest: Interest, responder: Responder) {
+    let name = (*interest.name).clone();
+    let sent = match port.answer(interest).await {
+        ChanAnswer::Data(wire) => responder.respond_bytes(no_cache(&wire)).await,
+        ChanAnswer::Nack(reason) => responder.nack(reason).await,
+    };
+    if let Err(e) = sent {
+        tracing::debug!(%name, "channel answer not sent: {e}");
+    }
 }
 
 /// Whether `name` is under `/localhost`: never served.

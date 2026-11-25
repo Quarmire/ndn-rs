@@ -14,6 +14,7 @@
 mod rt;
 pub mod wire;
 
+mod chan;
 mod error;
 mod face_up;
 mod fetch;
@@ -40,6 +41,9 @@ mod sync;
 mod test_kit;
 mod trust;
 
+pub use crate::chan::error::ChanError;
+pub use crate::chan::sessions::{ChannelInfo, EndReason};
+pub use crate::chan::wire::{ChannelMode, RefusalCode};
 pub use crate::error::{Cut, HeapError, NextStep, Refusal, Timestamp};
 pub use crate::fold::Readers;
 pub use crate::log::{Alert, Change, Frontier, Members};

@@ -433,6 +433,9 @@ impl SpaceInner {
         let mut repair = false;
         if fx.membership {
             node.judge.note(&self.name, &Self::listing(log));
+            // The channels of this space judge their receivers (and the sender itself) again
+            // at once, and announce.
+            node.chan.wake();
             node.release_joined(log);
             // A reader removed from the space ends the records of her devices at once.
             self.forget_non_readers(node, log);

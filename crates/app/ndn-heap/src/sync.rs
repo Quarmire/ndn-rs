@@ -10,8 +10,8 @@
 //! answers what the log says it may serve.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 use futures::FutureExt;
@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::chan::hub::PortCell;
 use crate::error::HeapError;
 use crate::face_up::FaceUp;
 use crate::fetch::{self, Asks, Fetcher};
@@ -38,7 +39,7 @@ use crate::reserve::FlushSink;
 use crate::rt::Tasks;
 use crate::serve::Granting;
 use crate::trust::Waiting;
-use crate::wire::{EpochId, parse_space_name, sync_group_of};
+use crate::wire::{EpochId, parse_chan_announce_name, parse_space_name, sync_group_of};
 
 /// The `tracing` target of the timeline events (level `trace`): the few
 /// seams a put crosses on its way to another device's watch, each named by
@@ -89,6 +90,9 @@ pub(crate) struct Shared {
     /// The tasks of the half: the groups', the pumps', the announcement's and the server's
     /// (one per Interest answered). Stopped with the half.
     pub(crate) tasks: Arc<Tasks>,
+    /// What answers a channel ask and hears a channel announce: the node, set once it is whole
+    /// (empty on the toy host of the tests, whose asks are Nacked).
+    pub(crate) chan: PortCell,
 }
 
 // -- The node's one network half ------------------------------------------------------------------------
@@ -143,6 +147,7 @@ impl Net {
         let svs_ended = svs.ended();
         let tasks = Tasks::new();
         let stop = CancellationToken::new();
+        let chan: PortCell = Arc::default();
         {
             let sync = Arc::clone(&sync);
             tasks.spawn(async move {
@@ -154,11 +159,21 @@ impl Net {
             });
         }
         {
-            let sync = Arc::clone(&sync);
+            let (sync, chan) = (Arc::clone(&sync), Arc::clone(&chan));
             tasks.spawn(async move {
                 while let Some(packet) = sync.recv().await {
-                    if Interest::decode(packet.clone()).is_ok() && in_tx.send(packet).await.is_err()
-                    {
+                    let Ok(interest) = Interest::decode(packet.clone()) else {
+                        continue;
+                    };
+                    // A channel announce rides the sync group's name but is no Sync Interest: the
+                    // driver never sees it, whatever it would make of it.
+                    if parse_chan_announce_name(&interest.name).is_some() {
+                        if let Some(port) = chan.get().and_then(Weak::upgrade) {
+                            port.heard(&interest);
+                        }
+                        continue;
+                    }
+                    if in_tx.send(packet).await.is_err() {
                         break;
                     }
                 }
@@ -196,6 +211,7 @@ impl Net {
             grants: Granting::default(),
             extensions: Extensions::default(),
             tasks,
+            chan,
         });
         Arc::new(Net {
             shared,
@@ -320,6 +336,12 @@ impl Net {
         if let Some(group) = self.group(space) {
             group.nudge();
         }
+    }
+
+    /// Send `wire`, an Interest of a space's sync group that is no Sync Interest (a channel
+    /// announce), out of the node's sync face.
+    pub(crate) async fn send_sync(&self, wire: Bytes) -> Result<(), ndn_app::AppError> {
+        self.sync.send(wire).await
     }
 
     /// Stop the driver, every group, every task and the announcement at once. Idempotent.
