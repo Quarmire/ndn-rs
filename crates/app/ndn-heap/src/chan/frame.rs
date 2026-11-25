@@ -550,6 +550,10 @@ mod tests {
             assert_eq!(frame[11..19], SEQ0.to_be_bytes());
             assert_eq!(frame[19], 2);
             let opened = open(&cipher(aead), frame, 1_200).unwrap();
+            assert_eq!(
+                hex(opened.plaintext()),
+                "00010568656c6c6f01020308016106776f726c6421"
+            );
             let got: Vec<Message> = opened
                 .messages(MESSAGE_DEFAULT)
                 .unwrap()
