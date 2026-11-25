@@ -249,4 +249,33 @@ mod tests {
             assert_eq!(face.recv_bytes().await.unwrap(), test_pkt(i));
         }
     }
+
+    /// The default `send_side` is right for an in-process face: it pushes the
+    /// frame through the same channel, inline, byte-identical, whatever the
+    /// class; the face has no MTU, so nothing is `TooLarge`.
+    #[tokio::test]
+    async fn a_side_frame_reaches_the_handle_unchanged() {
+        use ndn_transport::{SIDE_MARKER, SideClass};
+
+        let (face, handle) = InProcFace::new(FaceId(5), 4);
+        assert_eq!(face.side_frame_max(), 65_536);
+        for (class, fill) in [(SideClass::Datagram, 1u8), (SideClass::Stream, 2u8)] {
+            let mut v = vec![fill; 100_000];
+            v[0] = SIDE_MARKER;
+            let frame = Bytes::from(v);
+            face.send_side(frame.clone(), class).await.unwrap();
+            let got = handle.recv_tagged().await.unwrap();
+            assert_eq!(got.wire, frame);
+            assert_eq!(got.source_face, None);
+        }
+        // The handle's frames reach the face's reader as is.
+        let up = Bytes::from_static(&[SIDE_MARKER, 0x20, 7]);
+        handle.send(up.clone()).await.unwrap();
+        assert_eq!(face.recv_bytes().await.unwrap(), up);
+        // No non-blocking path yet: `forward_side` is `Unsupported` here.
+        assert_eq!(
+            face.forward_side(up, SideClass::Datagram),
+            Err(ndn_transport::SideRefused::Unsupported)
+        );
+    }
 }

@@ -13,6 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::face::{FaceAddr, FaceError, FaceId, FaceKind, FacePersistency, FaceTrust, LinkType};
+use crate::side::{SideClass, SideRefused};
 
 /// Why a `Transport::set_send_mtu` call failed.
 ///
@@ -124,6 +125,48 @@ pub trait Transport: Send + Sync + 'static {
         None
     }
 
+    /// Send one side frame (see [`crate::side`]) on the carrier `class` asks
+    /// for. The frame is sent as is: no LP header, no fragmentation, no
+    /// reliability. The default sends it through
+    /// [`send_bytes`](Transport::send_bytes) when it fits
+    /// [`send_mtu`](Transport::send_mtu) and refuses it
+    /// [`TooLarge`](SideRefused::TooLarge) otherwise; `class` is ignored.
+    /// A transport with more than one carrier (QUIC datagram and stream)
+    /// overrides this.
+    fn send_side(
+        &self,
+        frame: Bytes,
+        class: SideClass,
+    ) -> impl Future<Output = Result<(), SideRefused>> + Send {
+        let _ = class;
+        async move {
+            let max = self.send_mtu().unwrap_or(usize::MAX);
+            if frame.len() <= max {
+                self.send_bytes(frame).await.map_err(Into::into)
+            } else {
+                Err(SideRefused::TooLarge {
+                    size: frame.len(),
+                    max,
+                })
+            }
+        }
+    }
+
+    /// Hand one side frame to the carrier without ever waiting. A transport
+    /// with a bounded queue or a non-blocking send overrides this; the
+    /// default is [`Unsupported`](SideRefused::Unsupported). The forwarder's
+    /// fan-out calls this from its reader task, so an override must neither
+    /// block nor await.
+    fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        let _ = (frame, class);
+        Err(SideRefused::Unsupported)
+    }
+
+    /// The longest side frame [`send_side`](Transport::send_side) accepts.
+    fn side_frame_max(&self) -> usize {
+        self.send_mtu().unwrap_or(65_536)
+    }
+
     fn send_bytes(&self, wire: Bytes) -> impl Future<Output = Result<(), FaceError>> + Send;
 
     /// Send a burst of already-framed datagrams to the same peer in one shot.
@@ -217,6 +260,13 @@ pub trait ErasedTransport: Send + Sync + 'static {
     fn local_uri(&self) -> Option<String>;
     fn link_type(&self) -> LinkType;
     fn send_mtu(&self) -> Option<usize>;
+    fn send_side(
+        &self,
+        frame: Bytes,
+        class: SideClass,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SideRefused>> + Send + '_>>;
+    fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused>;
+    fn side_frame_max(&self) -> usize;
 
     fn send_bytes(
         &self,
@@ -283,6 +333,19 @@ impl<T: Transport> ErasedTransport for T {
     }
     fn send_mtu(&self) -> Option<usize> {
         Transport::send_mtu(self)
+    }
+    fn send_side(
+        &self,
+        frame: Bytes,
+        class: SideClass,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SideRefused>> + Send + '_>> {
+        Box::pin(Transport::send_side(self, frame, class))
+    }
+    fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        Transport::forward_side(self, frame, class)
+    }
+    fn side_frame_max(&self) -> usize {
+        Transport::side_frame_max(self)
     }
 
     fn send_bytes(
@@ -420,5 +483,133 @@ mod tests {
             erased.set_persistency(FacePersistency::Permanent),
             Err(PersistencyError::NotSupported),
         );
+    }
+
+    /// Records every `send_bytes` and answers with a fixed MTU.
+    struct Recorder {
+        mtu: Option<usize>,
+        sent: std::sync::Mutex<Vec<Bytes>>,
+        fail: Option<fn() -> FaceError>,
+    }
+    impl Recorder {
+        fn new(mtu: Option<usize>) -> Self {
+            Self {
+                mtu,
+                sent: std::sync::Mutex::new(Vec::new()),
+                fail: None,
+            }
+        }
+    }
+    impl Transport for Recorder {
+        fn id(&self) -> FaceId {
+            FaceId(0)
+        }
+        fn kind(&self) -> FaceKind {
+            FaceKind::Internal
+        }
+        fn send_mtu(&self) -> Option<usize> {
+            self.mtu
+        }
+        async fn send_bytes(&self, w: Bytes) -> Result<(), FaceError> {
+            if let Some(fail) = self.fail {
+                return Err(fail());
+            }
+            self.sent.lock().unwrap().push(w);
+            Ok(())
+        }
+        async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+            Err(FaceError::Closed)
+        }
+    }
+
+    fn marked(len: usize) -> Bytes {
+        let mut v = vec![0xA5; len];
+        v[0] = crate::side::SIDE_MARKER;
+        Bytes::from(v)
+    }
+
+    /// A frame that fits the MTU reaches `send_bytes` byte-identical, with no
+    /// LP wrap; one over the MTU is refused `TooLarge` and nothing is sent.
+    /// The class changes nothing.
+    #[tokio::test]
+    async fn send_side_sends_what_fits_as_is_and_refuses_the_rest() {
+        let t = Recorder::new(Some(100));
+        for class in [SideClass::Datagram, SideClass::Stream] {
+            let frame = marked(100);
+            Transport::send_side(&t, frame.clone(), class)
+                .await
+                .unwrap();
+            assert_eq!(t.sent.lock().unwrap().pop().unwrap(), frame);
+
+            assert_eq!(
+                Transport::send_side(&t, marked(101), class).await,
+                Err(SideRefused::TooLarge {
+                    size: 101,
+                    max: 100
+                })
+            );
+            assert!(t.sent.lock().unwrap().is_empty());
+        }
+
+        let erased: &dyn ErasedTransport = &t;
+        erased
+            .send_side(marked(7), SideClass::Datagram)
+            .await
+            .unwrap();
+        assert_eq!(t.sent.lock().unwrap().pop().unwrap(), marked(7));
+        assert_eq!(
+            erased.send_side(marked(101), SideClass::Stream).await,
+            Err(SideRefused::TooLarge {
+                size: 101,
+                max: 100
+            })
+        );
+    }
+
+    /// A transport with no MTU (a stream) accepts any length.
+    #[tokio::test]
+    async fn send_side_without_an_mtu_has_no_limit() {
+        let t = Recorder::new(None);
+        Transport::send_side(&t, marked(200_000), SideClass::Datagram)
+            .await
+            .unwrap();
+        assert_eq!(t.sent.lock().unwrap().len(), 1);
+    }
+
+    /// A `send_bytes` failure is reported as the matching refusal.
+    #[tokio::test]
+    async fn send_side_maps_a_send_failure_to_a_refusal() {
+        let mut t = Recorder::new(None);
+        t.fail = Some(|| FaceError::Closed);
+        assert_eq!(
+            Transport::send_side(&t, marked(10), SideClass::Datagram).await,
+            Err(SideRefused::Closed)
+        );
+        t.fail = Some(|| FaceError::Full);
+        assert_eq!(
+            Transport::send_side(&t, marked(10), SideClass::Stream).await,
+            Err(SideRefused::Full)
+        );
+    }
+
+    /// `forward_side` never blocks and, by default, is unsupported; the frame is
+    /// not sent by another path. `side_frame_max` follows the MTU.
+    #[test]
+    fn forward_side_and_side_frame_max_defaults() {
+        let t = Recorder::new(Some(1452));
+        assert_eq!(
+            Transport::forward_side(&t, marked(10), SideClass::Datagram),
+            Err(SideRefused::Unsupported)
+        );
+        assert!(t.sent.lock().unwrap().is_empty());
+        assert_eq!(Transport::side_frame_max(&t), 1452);
+        assert_eq!(Transport::side_frame_max(&Recorder::new(None)), 65_536);
+
+        let erased: &dyn ErasedTransport = &t;
+        assert_eq!(
+            erased.forward_side(marked(10), SideClass::Stream),
+            Err(SideRefused::Unsupported)
+        );
+        assert_eq!(erased.side_frame_max(), 1452);
     }
 }

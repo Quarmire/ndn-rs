@@ -6,7 +6,7 @@ use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
 use crate::{
     FaceError, FaceId, FaceKind, FacePersistency, FaceTrust, MtuError, PeerCredentials,
-    PersistencyError, Transport,
+    PersistencyError, SideClass, SideRefused, Transport,
 };
 
 /// Generic stream-based `Transport` over any async read/write pair with a
@@ -122,6 +122,20 @@ where
         Err(MtuError::NotSupported)
     }
 
+    /// A TLV-framed byte stream cannot carry a side frame. The codec finds the
+    /// end of a frame from its first octets read as a TLV header, and a side
+    /// frame's first octets are not one (the marker is TLV-TYPE 0, the next
+    /// octet a version/class/kind byte read as a length): written as is, it
+    /// would put the reader out of step with the stream and corrupt the NDN
+    /// packets behind it. So it is refused, whatever its size.
+    async fn send_side(&self, _frame: Bytes, _class: SideClass) -> Result<(), SideRefused> {
+        Err(SideRefused::NotCarried)
+    }
+
+    fn side_frame_max(&self) -> usize {
+        0
+    }
+
     /// Persistency is a face-table hint only — destruction is driven by I/O
     /// error for stream faces (matches NFD).
     fn set_persistency(&self, _persistency: FacePersistency) -> Result<(), PersistencyError> {
@@ -134,5 +148,42 @@ where
 
     fn trust(&self) -> FaceTrust {
         self.trust
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SIDE_MARKER, TlvCodec};
+    use tokio::io::AsyncReadExt;
+
+    /// A stream face refuses a side frame and writes nothing: the octets of a
+    /// refused frame never reach the stream, so the NDN packet after it is
+    /// framed as before.
+    #[tokio::test]
+    async fn a_stream_face_carries_no_side_frame_and_writes_nothing() {
+        let (near, mut far) = tokio::io::duplex(1024);
+        let (r, w) = tokio::io::split(near);
+        let face = StreamFace::new(FaceId(1), FaceKind::Tcp, None, None, r, w, TlvCodec);
+
+        let frame = Bytes::from_static(&[SIDE_MARKER, 0x20, 1, 2, 3]);
+        for class in [SideClass::Datagram, SideClass::Stream] {
+            assert_eq!(
+                Transport::send_side(&face, frame.clone(), class).await,
+                Err(SideRefused::NotCarried)
+            );
+        }
+        assert_eq!(Transport::side_frame_max(&face), 0);
+        assert_eq!(
+            Transport::forward_side(&face, frame, SideClass::Datagram),
+            Err(SideRefused::Unsupported)
+        );
+
+        // The next packet is the first octets on the stream.
+        let pkt = Bytes::from_static(&[0x05, 0x01, 0xAB]);
+        Transport::send_bytes(&face, pkt.clone()).await.unwrap();
+        let mut got = [0u8; 3];
+        far.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got[..], &pkt[..]);
     }
 }

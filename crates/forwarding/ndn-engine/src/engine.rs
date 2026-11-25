@@ -84,6 +84,13 @@ pub struct FaceCounters {
     pub in_nacks: AtomicU64,
     /// NFD `NOutNacks`: Nacks sent on this face.
     pub out_nacks: AtomicU64,
+    /// Side frames (first octet [`ndn_transport::SIDE_MARKER`]) received on
+    /// this face. The face reader peels them before the NDN pipeline, so they
+    /// are in no other counter: not `in_drops`, not a malformed packet, not
+    /// a PIT entry.
+    pub in_side_frames: AtomicU64,
+    /// Octets of the side frames counted in `in_side_frames`.
+    pub in_side_bytes: AtomicU64,
 }
 
 /// NDNLPv2 framing intent for one outbound packet. Produced by the

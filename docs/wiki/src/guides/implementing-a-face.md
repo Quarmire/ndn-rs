@@ -89,6 +89,38 @@ also provides defaulted hooks you may override: `send_batch` (a
 address), `send_mtu` / `set_send_mtu` (link MTU and LP fragmentation
 threshold), and `set_persistency`.
 
+### Side frames: `send_side`, `forward_side`, `side_frame_max`
+
+A frame whose **first octet is `0x00`** (`ndn_transport::SIDE_MARKER`) is not
+an NDN packet: TLV-TYPE 0 is unassigned, so no Interest, Data, Nack or
+NDNLPv2 packet starts with it, and every NDN decoder rejects it. It is a
+*side frame*, for a protocol that rides on a face next to NDN (the channel
+of the heap crate is the first). `Face::send_side(frame, class)` hands one to
+the transport **without the link service**: no LP header, no fragmentation, no
+reliability, no scope judge. `SideClass` says `Datagram` or `Stream`.
+
+`Transport` defaults are right for most faces: `send_side` sends a frame that
+fits `send_mtu()` through `send_bytes` as is and refuses a longer one
+(`SideRefused::TooLarge`; nothing is fragmented), ignoring the class;
+`forward_side` (a synchronous send that never waits) is `Unsupported`;
+`side_frame_max()` is `send_mtu()` or 65,536. Override them only when the
+default is wrong: a transport with a second carrier (QUIC's stream), a
+transport whose limit is not `send_mtu` (a ring slot; the smallest phy of a
+multi-phy radio), or a transport that cannot carry the frame at all. A
+TLV-framed byte stream (`StreamFace`) cannot: the codec would read the
+marker as a TLV header and lose its place in the stream, so it answers
+`NotCarried`.
+
+On receipt `LpLinkService::recv` returns a marked frame unchanged, before any
+reliability bookkeeping, and the engine's face reader peels it right after
+`recv_bytes_with_addr()`, before LP detection and the bounded pipeline
+channel: it never reaches the PIT, a spawned task, `in_drops` or the
+malformed-packet count. Until a side route table exists the reader counts it
+per face (`FaceCounters::in_side_frames`, `in_side_bytes`) and drops it.
+Ethernet pads a payload under 46 octets and a receiver sees the padding, so a
+side frame on an Ethernet face must be self-delimiting or at least 46 octets
+(the stage-3 channel codec is bound by this).
+
 ### `FaceKind` vs `FacePersistency`
 
 `FaceKind` classifies the **link**; the engine uses it to pick a

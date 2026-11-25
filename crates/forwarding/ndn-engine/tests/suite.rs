@@ -57,6 +57,8 @@ mod rejected_interest_pit;
 mod reliable_face_nack;
 #[path = "self_learning.rs"]
 mod self_learning;
+#[path = "side_frames.rs"]
+mod side_frames;
 #[path = "simultaneous_interests.rs"]
 mod simultaneous_interests;
 #[path = "traceroute_responder.rs"]

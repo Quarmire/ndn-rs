@@ -11,7 +11,7 @@ use futures::future::BoxFuture;
 use tokio::sync::{Mutex, mpsc};
 
 use ndn_packet::{Data, Interest, NackReason, lp::encode_lp_nack};
-use ndn_transport::{FaceError, FaceId, FaceKind, FaceTrust, Transport};
+use ndn_transport::{FaceError, FaceId, FaceKind, FaceTrust, SideClass, SideRefused, Transport};
 
 const RESP_QUEUE_CAP: usize = 64;
 
@@ -86,6 +86,16 @@ impl Transport for CallbackFace {
             .send(response)
             .await
             .map_err(|_| FaceError::Closed)
+    }
+
+    /// A callback answers Interests; it carries no side frames. Said so, rather
+    /// than reporting a frame the callback would silently discard as sent.
+    async fn send_side(&self, _frame: Bytes, _class: SideClass) -> Result<(), SideRefused> {
+        Err(SideRefused::NotCarried)
+    }
+
+    fn side_frame_max(&self) -> usize {
+        0
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
@@ -281,5 +291,22 @@ mod tests {
             .collect();
         assert!(names.contains(&name_a));
         assert!(names.contains(&name_b));
+    }
+
+    #[tokio::test]
+    async fn callback_face_carries_no_side_frame() {
+        use ndn_transport::SIDE_MARKER;
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&called);
+        let face = CallbackFace::from_fn(FaceId(11), move |_| {
+            seen.store(true, std::sync::atomic::Ordering::Relaxed);
+            None
+        });
+        let frame = Bytes::from_static(&[SIDE_MARKER, 0x20, 1, 2]);
+        assert_eq!(
+            face.send_side(frame, SideClass::Datagram).await,
+            Err(SideRefused::NotCarried)
+        );
+        assert!(!called.load(std::sync::atomic::Ordering::Relaxed));
     }
 }

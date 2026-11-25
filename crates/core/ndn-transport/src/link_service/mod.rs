@@ -511,6 +511,13 @@ impl LinkService for LpLinkService {
             // awaited, rather than surfacing a frame the caller must re-drop.
             let (wire, addr) = loop {
                 let (wire, addr, radio_id) = transport.recv_bytes_with_meta().await?;
+                // A side frame (`crate::side`) is not an NDN packet: it carries no
+                // LP header, so it has no TxSequence to ack, no fragment to
+                // reassemble and nothing a feature could read. It goes up
+                // unchanged, before any reliability bookkeeping.
+                if wire.first() == Some(&crate::side::SIDE_MARKER) {
+                    break (wire, addr);
+                }
                 let ingress_ctx = IngressCtx::new(FaceId(transport.id().0));
                 let inbound = InboundLpFrame::with_meta(wire.clone(), addr.clone(), radio_id);
                 // Driven here, not via the feature pipeline, because the duplicate
@@ -1063,6 +1070,72 @@ mod fragment_reliability_tests {
             svc.reliability_feature.take_acks(None).is_none(),
             "piggybacked Acks must not be sent again on the tick"
         );
+    }
+
+    /// Counts the frames a feature's ingress hook is shown.
+    struct IngressSpy(Arc<std::sync::atomic::AtomicUsize>);
+    impl LinkServiceFeature for IngressSpy {
+        fn name(&self) -> &'static str {
+            "ingress-spy"
+        }
+        fn on_ingress(&self, _frame: &InboundLpFrame, _ctx: &IngressCtx) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A frame whose first octet is the side marker is not an NDN packet: the
+    /// link service returns it unchanged and before any bookkeeping. No feature
+    /// sees it, no reliability state is touched, no Ack is queued and nothing
+    /// is sent; the next real LP frame is still tracked as before.
+    #[tokio::test]
+    async fn a_marked_frame_passes_the_link_service_unchanged() {
+        // Octets after the marker that an LP parser would take for a
+        // TxSequence header, to show the marker alone decides.
+        let marked =
+            Bytes::from_static(&[crate::side::SIDE_MARKER, 0x64, 0x08, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let reliable =
+            ndn_packet::lp::encode_lp_reliable(&[0x05, 0x01, 0xAB], PEER_TX_SEQ, None, &[]);
+        let tx = Inbound::new([marked.clone(), reliable]);
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let svc = LpLinkService::new().with_extra_feature(Arc::new(IngressSpy(Arc::clone(&seen))));
+        svc.reliability_feature.set_enabled(true);
+
+        let frame = svc.recv(&tx).await.expect("marked frame delivers");
+        assert_eq!(
+            frame.wire, marked,
+            "a marked frame comes back byte-identical"
+        );
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no feature's on_ingress sees a marked frame"
+        );
+        assert!(
+            svc.reliability_feature.take_acks(None).is_none(),
+            "no Ack is queued for a marked frame"
+        );
+        assert!(tx.sent.lock().unwrap().is_empty(), "nothing is sent");
+
+        let frame = svc.recv(&tx).await.expect("LP frame delivers");
+        assert_ne!(frame.wire.first(), Some(&crate::side::SIDE_MARKER));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let ack = svc
+            .reliability_feature
+            .take_acks(None)
+            .expect("the LP frame is acked as before");
+        assert_eq!(
+            ndn_packet::lp::extract_acks(&ack).1.as_slice(),
+            &[PEER_TX_SEQ]
+        );
+    }
+
+    /// The passthrough service of a local face returns a marked frame as is.
+    #[tokio::test]
+    async fn a_marked_frame_passes_the_passthrough_service_unchanged() {
+        let marked = Bytes::from_static(&[crate::side::SIDE_MARKER, 0x20, 9, 9, 9]);
+        let tx = Inbound::new([marked.clone()]);
+        let frame = PassthroughLinkService.recv(&tx).await.unwrap();
+        assert_eq!(frame.wire, marked);
     }
 
     /// Every fragment of an over-MTU packet MUST carry a `TxSequence`.

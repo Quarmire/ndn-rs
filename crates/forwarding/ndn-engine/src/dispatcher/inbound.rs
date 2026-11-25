@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
 use ndn_packet::lp::is_lp_packet;
-use ndn_transport::{FaceAddr, FaceError, FaceKind, FacePersistency};
+use ndn_transport::{FaceAddr, FaceError, FaceKind, FacePersistency, SIDE_MARKER};
 
 use crate::observability::targets as t;
 
@@ -84,6 +84,26 @@ pub(crate) async fn run_face_reader(
         };
         match result {
             Ok((raw, src_addr)) => {
+                // A side frame (`ndn_transport::side`) is not an NDN packet: peel it
+                // here, with one comparison, before LP detection and before the
+                // bounded pipeline channel, so it never costs a PIT entry, a spawned
+                // task, an `in_drops` count or a malformed-packet verdict. The engine
+                // has no side route table yet, so the frame is counted per face and
+                // dropped; the place a route table's `on_frame` goes is here.
+                if raw.first() == Some(&SIDE_MARKER) {
+                    if let Some(state) = face_states.get(&face_id) {
+                        state
+                            .counters
+                            .in_side_frames
+                            .fetch_add(1, Ordering::Relaxed);
+                        state
+                            .counters
+                            .in_side_bytes
+                            .fetch_add(raw.len() as u64, Ordering::Relaxed);
+                    }
+                    debug!(target: t::FACE_SYSTEM, face=%face_id, len=raw.len(), "face-reader: side frame has no route, dropped");
+                    continue;
+                }
                 trace!(target: t::FACE_SYSTEM, face=%face_id, len=raw.len(), "face-reader: recv");
                 // Reliability Ack-consumption for socket faces runs inside
                 // `link_service.recv` (the feature's `on_ingress`).

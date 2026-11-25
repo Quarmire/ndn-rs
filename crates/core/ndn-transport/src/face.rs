@@ -4,6 +4,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::link_service::{LinkService, default_link_service_for_kind};
+use crate::side::{SideClass, SideRefused};
 use crate::transport::{ErasedTransport, PeerCredentials, Transport};
 
 /// Format an IP-based FaceUri with the spec-correct family suffix:
@@ -529,6 +530,25 @@ impl Face {
         self.link_service.send(&*self.transport, pkt, None).await
     }
 
+    /// Send one side frame (see [`crate::side`]) on the transport **without**
+    /// the link service: no LP header, no fragmentation, no reliability, no
+    /// scope judge. Over [`side_frame_max`](Face::side_frame_max) it is
+    /// refused, never split.
+    pub async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        self.transport.send_side(frame, class).await
+    }
+
+    /// Hand one side frame to the transport without waiting (see
+    /// [`Transport::forward_side`]).
+    pub fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        self.transport.forward_side(frame, class)
+    }
+
+    /// The longest side frame [`send_side`](Face::send_side) accepts.
+    pub fn side_frame_max(&self) -> usize {
+        self.transport.side_frame_max()
+    }
+
     /// Send tagged with its originating face id. Passthrough routes the tag
     /// through the in-process tag-bag; LpLinkService drops it for now.
     pub async fn send_bytes_with_source(
@@ -655,5 +675,66 @@ mod tests {
             FaceScope::NonLocal
         );
         assert_eq!(resolve_scope(FaceKind::WebRtc, None), FaceScope::NonLocal);
+    }
+
+    /// A side frame sent through a `Face` reaches the transport as is, with the
+    /// link service nowhere on the path: an LP service that would wrap and
+    /// fragment a packet at this MTU leaves it alone, and one over the limit
+    /// is refused rather than fragmented.
+    #[tokio::test]
+    async fn face_send_side_bypasses_the_link_service() {
+        use crate::{LpLinkService, SIDE_MARKER, SideClass, SideRefused};
+        use std::sync::Mutex;
+
+        struct Wire {
+            sent: Mutex<Vec<Bytes>>,
+        }
+        impl Transport for Wire {
+            fn id(&self) -> FaceId {
+                FaceId(3)
+            }
+            fn kind(&self) -> FaceKind {
+                FaceKind::Udp
+            }
+            fn send_mtu(&self) -> Option<usize> {
+                Some(120)
+            }
+            async fn send_bytes(&self, w: Bytes) -> Result<(), FaceError> {
+                self.sent.lock().unwrap().push(w);
+                Ok(())
+            }
+            async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+                Err(FaceError::Closed)
+            }
+        }
+
+        let wire = Arc::new(Wire {
+            sent: Mutex::new(Vec::new()),
+        });
+        let face = Face::new(wire.clone(), Arc::new(LpLinkService::new()));
+        assert_eq!(face.side_frame_max(), 120);
+
+        let mut fits = vec![0x77; 120];
+        fits[0] = SIDE_MARKER;
+        let fits = Bytes::from(fits);
+        face.send_side(fits.clone(), SideClass::Datagram)
+            .await
+            .unwrap();
+        assert_eq!(*wire.sent.lock().unwrap(), vec![fits]);
+
+        let mut over = vec![0x77; 121];
+        over[0] = SIDE_MARKER;
+        assert_eq!(
+            face.send_side(Bytes::from(over), SideClass::Stream).await,
+            Err(SideRefused::TooLarge {
+                size: 121,
+                max: 120
+            })
+        );
+        assert_eq!(wire.sent.lock().unwrap().len(), 1, "nothing else was sent");
+        assert_eq!(
+            face.forward_side(Bytes::from_static(&[SIDE_MARKER]), SideClass::Datagram),
+            Err(SideRefused::Unsupported)
+        );
     }
 }
