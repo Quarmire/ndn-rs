@@ -10,6 +10,7 @@
 //! A child of `offer_tests`: it uses its `Inviter`.
 
 use bytes::Bytes;
+use ndn_heap::{Readers, Share};
 use ndn_packet::encode::DataBuilder;
 use ndn_security::confidentiality::{ContentKey, wrap_ck_to};
 
@@ -761,4 +762,125 @@ async fn alice_offer_again(alice: &Inviter) -> (Name, [u8; SECRET_LEN]) {
         panic!("an offer's link is an introduction link");
     };
     (code.offer, intro.secret)
+}
+
+// ---- I2: only an owner device that holds the creation shows a code ----------------------------------
+
+fn offer_of(laptop: &Device) -> Offer {
+    Offer {
+        role: Role::Writer,
+        until: Timestamp(laptop.node.now().0 + 3_600_000),
+        tries: 3,
+    }
+}
+
+/// Of a space owned by `/alice`, a `guest` or `node` device of hers (in a namespace that
+/// declares the role layout) that holds the space is no owner device: `Heap::change` refuses
+/// it, so a code it showed would admit nobody and its joiner would meet silence. `offer`
+/// refuses before anything is made or shown, says to use an owner device, and leaves nothing
+/// behind: no offer is held, none is stored, none is served. A member device of the same
+/// namespace is an owner device and makes its offer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_guest_or_relay_device_makes_no_offer() {
+    let net = Net::new().await;
+    let cancel = CancellationToken::new();
+    let alice = Person::with_roles("/alice");
+    let start_on = |device: &'static str| {
+        Setup::new(&alice, device)
+            .config(fast())
+            .on(&net, &cancel)
+            .start()
+    };
+    let laptop = start_on("/alice/member/laptop").await;
+    let guests = [
+        start_on("/alice/guest/phone").await,
+        start_on("/alice/node/vps").await,
+    ];
+    let space = notebook();
+    laptop
+        .node
+        .create(
+            &space,
+            Share {
+                readers: Readers::Persons(vec![n("/alice")]),
+                writers: vec![n("/alice")],
+            },
+        )
+        .await
+        .unwrap();
+    for guest in &guests {
+        for (from, to) in [(&laptop, guest), (guest, &laptop)] {
+            let k = key(&from.name);
+            let public = from.keys.get_signer_sync(&k).unwrap().public_key().unwrap();
+            to.validator
+                .cert_cache()
+                .insert(alice.certify(&k, &public).await);
+        }
+        let heap = guest.node.open(&space).await.unwrap();
+        for _ in 0..300 {
+            if heap.members_known() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            heap.members_known(),
+            "precondition: {} never held the creation",
+            guest.name
+        );
+        let got = guest.invites.offer(&space, offer_of(guest)).await;
+        let Err(err) = got else {
+            panic!("{} was given a code to show: {got:?}", guest.name);
+        };
+        assert!(
+            matches!(err, InviteError::Heap(ndn_heap::HeapError::NotOwner { .. })),
+            "{} was refused with {err:?}, not as no owner device",
+            guest.name
+        );
+        assert_eq!(
+            err.next(),
+            ndn_heap::NextStep::UseOwnerDevice,
+            "the refusal does not say to use an owner device"
+        );
+        assert!(
+            guest.invites.inner().state.lock().offers.is_empty(),
+            "{} holds an offer it must not make",
+            guest.name
+        );
+        assert!(
+            store::list(guest.store.as_ref(), &store::offer_listing()).is_empty(),
+            "{} stored an offer it must not make",
+            guest.name
+        );
+    }
+    laptop
+        .invites
+        .offer(&space, offer_of(&laptop))
+        .await
+        .expect("a member device of the owner makes an offer");
+}
+
+/// A space this device has open but whose creation it has not seen cannot be offered: until
+/// the creation is held it is not known whether the space is public or who it lists, and
+/// nothing is judged by what is not held. The refusal is `NotReady`: the same call can
+/// succeed once the creation arrived.
+#[tokio::test]
+async fn a_space_whose_creation_is_not_held_makes_no_offer() {
+    let alice = Person::new("/alice");
+    let laptop = start(&alice, "/alice/laptop").await;
+    let heap = laptop.node.open(&notebook()).await.unwrap();
+    assert!(!heap.members_known(), "precondition: no creation is held");
+    let got = laptop.invites.offer(&notebook(), offer_of(&laptop)).await;
+    let Err(err) = got else {
+        panic!("a code was shown for a space whose creation is not held: {got:?}");
+    };
+    assert!(
+        matches!(err, InviteError::NotReady { .. }),
+        "refused with {err:?}, not as not ready"
+    );
+    assert!(err.retry(), "the refusal does not say to try again");
+    assert!(
+        laptop.invites.inner().state.lock().offers.is_empty(),
+        "an offer was held"
+    );
 }

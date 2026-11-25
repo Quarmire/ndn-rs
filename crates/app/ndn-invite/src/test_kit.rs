@@ -178,13 +178,37 @@ impl Person {
         root: &Name,
         relays: Vec<ndn_security::AdvertisedRelay>,
     ) -> Person {
+        Person::build(ns, mgr, root, relays, false)
+    }
+
+    /// `ns` rooted in a key of its own whose namespace declares the role layout
+    /// (`<ns>/<role>/<device>`, its schema authoritative): only its `admin` and `member`
+    /// devices are owner devices of a space it owns; a `guest` or `node` device is none.
+    pub(crate) fn with_roles(ns: &str) -> Person {
+        let mgr = SecurityManager::new();
+        let root = mgr
+            .generate_ed25519(n(ns).append("KEY").append("ns"))
+            .unwrap();
+        Person::build(ns, &mgr, &root, Vec::new(), true)
+    }
+
+    fn build(
+        ns: &str,
+        mgr: &SecurityManager,
+        root: &Name,
+        relays: Vec<ndn_security::AdvertisedRelay>,
+        roles: bool,
+    ) -> Person {
         let signer = mgr.get_signer_sync(root).unwrap();
         let anchor = mgr
             .issue_self_signed(root, signer.public_key().unwrap(), VALIDITY_MS)
             .unwrap();
-        let ctx = SignedTrustContext::hierarchical(n(ns))
+        let mut ctx = SignedTrustContext::hierarchical(n(ns))
             .with_version(1)
             .with_relays(relays);
+        if roles {
+            ctx = ctx.schema_authoritative();
+        }
         assert!(ctx.add_anchor(anchor));
         let signed = ctx.sign_into_data(signer.as_ref()).unwrap().raw().clone();
         Person {

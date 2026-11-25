@@ -397,9 +397,13 @@ did not make: an ask of it gets no answer (§9.2 step 4, §18).
 1. MUST refuse an `S` that is no space name or that is not open here (`BadRequest`: create it or open it, then offer
    it), an `S` of another namespace (`NotOwner`, from the heap), `tries` = 0 or an expiry already past by its clock
    (`BadRequest`), and a host whose anchor is not this namespace's signed trust context with a chain to this device's key
-   (`Local`: fix the host's enrollment). Whether this device is an **owner device** of `S` (heap.md §2.1) is not read at
-   `offer`: it is `Heap::change`'s to judge at the answer (§9.4), where a device that is not one admits no one and
-   answers nothing.
+   (`Local`: fix the host's enrollment). MUST also refuse, before anything is made or shown, an `S` whose creation this
+   device has not seen (`Heap::members_known`; `NotReady`: the same call can succeed once the creation is held) and a
+   device that is not an **owner device** of `S` (heap.md §2.1: its name under the owner's, its key vouched for as the
+   owner's person, its role `admin` or `member`; `Heap::owner_device`): `NotOwner` from the heap, next step
+   `UseOwnerDevice` — a `guest` or `node` device (a phone lent for a weekend, a relay) shows no code, since the
+   members entry that admits a joiner is `Heap::change`'s and only an owner device signs it (§9.4). A code from such a
+   device would admit nobody and leave its joiner with silence. Nothing is stored or served on a refusal.
 2. Draws a fresh 16-octet secret and a fresh 16-octet id from the device's entropy (`InviteConfig::entropy`, the operating
    system's by default), wraps the proof key (and, for a short code, the hint token) into its store, signs the offer
    through `Node::sign_packet`, and keeps it.
@@ -1182,7 +1186,8 @@ the answer as `ADMITTED` (§16.1): the id `Heap::change` returned, which is the 
 or the Epoch entry it owed a sealed space, which follows it in the same log (heap.md §10.9). It says which entry admitted the
 joiner: the joiner waits for exactly that entry (§8.5), so it never returns before it is applied here, and an entry that raced it
 (another owner device's entry, a removal) cannot be taken for it. The inviter's `change` is subject to heap.md §10.3: `NotOwner`
-from a device that is not an owner device (`offer` does not read this, §5.3), `Refused` from a revoked or suspected key, `Local`
+from a device that is not an owner device (`offer` refuses such a device first, §5.3, so what is left is a device that stopped
+being one after its offer was made), `Refused` from a revoked or suspected key, `Local`
 from the disk.
 When it fails, the device drops `using/<id>`, signs nothing more, and gives no answer (a Nack): the joiner's retry is
 judged again.

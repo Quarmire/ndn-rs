@@ -45,8 +45,12 @@ impl Invites {
     ///
     /// [`InviteError::BadRequest`] for a space this node does not have open, an offer
     /// that allows no wrong try or expires already; [`InviteError::Heap`] with
-    /// `NotOwner` for a space of another namespace; [`InviteError::Local`] when the
-    /// host gives no anchor or the notes cannot be made durable.
+    /// `NotOwner` (next step: use an owner device) for a space of another namespace
+    /// and for a device that is no owner device of the space — a `guest` or `node`
+    /// device of the owner, which could not add a joiner — so that no code is shown that
+    /// admits nobody; [`InviteError::NotReady`] while this device has not seen the
+    /// space's creation; [`InviteError::Local`] when the host gives no anchor or the
+    /// notes cannot be made durable.
     pub async fn offer(&self, space: &Name, offer: Offer) -> Result<Code, InviteError> {
         self.inner.make_offer(space, offer).await
     }
@@ -131,14 +135,29 @@ impl Inner {
                     .into(),
             });
         }
-        if self.node.space(space).is_none() {
-            return Err(InviteError::BadRequest {
+        let heap = self
+            .node
+            .space(space)
+            .ok_or_else(|| InviteError::BadRequest {
                 why: format!(
                     "{space} is not open on this device: create it (Node::create) or open it \
                      (Node::open), then offer it"
                 ),
+            })?;
+        // What a code of this device can do is decided by the space's creation and by this
+        // device's standing in it, so both are known before a code is shown: a joiner
+        // answered by a device that cannot admit it would meet silence (spec §5.3).
+        if !heap.members_known() {
+            return Err(InviteError::NotReady {
+                name: space.clone(),
+                why: "this device has not seen the space's creation, so it does not know who \
+                      the space lists or whether it is public"
+                    .into(),
             });
         }
+        // Only an owner device (an `admin` or `member` device of the owner) signs the members
+        // entry that admits a joiner: a guest or a node device of the owner shows no code.
+        heap.owner_device()?;
         let credentials = crate::credentials::credentials(&self.node, &*self.host)?;
         let own = open_credentials(&credentials)
             .await
