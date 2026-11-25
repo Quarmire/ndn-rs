@@ -36,7 +36,26 @@ struct Mesh {
 }
 
 async fn mesh(devices: &[&str]) -> Mesh {
-    let devs = world(devices).await;
+    mesh_of(world(devices).await, devices).await
+}
+
+/// [`mesh`] where each device holds only its own certificate and fetches the others' by
+/// name over the forwarder, as a device on a network does (a certificate fetcher on each
+/// validator, and nothing else started: no host serves a certificate).
+async fn mesh_apart(devices: &[&str]) -> Mesh {
+    let m = mesh_of(super::tests::world_apart(devices).await, devices).await;
+    for dev in &m.devs {
+        let fetcher = ndn_app::engine_cert_fetcher(
+            &m.engine,
+            dev.validator.cert_cache_arc(),
+            CancellationToken::new(),
+        );
+        assert!(dev.validator.set_cert_fetcher(fetcher).is_ok());
+    }
+    m
+}
+
+async fn mesh_of(devs: Vec<Dev>, devices: &[&str]) -> Mesh {
     let (engine, shutdown) = EngineBuilder::new(Default::default())
         .build()
         .await
@@ -562,4 +581,73 @@ async fn follow_stores_and_serves_but_publishes_no_vector_entry_and_reads_nothin
     })
     .await;
     follower.close().await;
+}
+
+/// A third person's entries are judged through the space alone: nothing is started by the
+/// hosts to serve certificates (no `OwnCertificates`, no holder), and each device holds only
+/// its own certificate. Bob reads what Carol wrote, so Carol's node answered for the
+/// certificate of its signing key by name, as the node of any writer does by default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_third_person_is_trusted_through_the_space_alone() {
+    let m = mesh_apart(&["/alice/laptop", "/bob/laptop", "/carol/laptop"]).await;
+    let (alice, bob, carol) = (
+        m.boot(0, fast()).await,
+        m.boot(1, fast()).await,
+        m.boot(2, fast()).await,
+    );
+    alice
+        .create(
+            &space(),
+            Share {
+                readers: Readers::Anyone,
+                writers: vec![n("/bob"), n("/carol")],
+            },
+        )
+        .await
+        .unwrap();
+    let (bobs, carols) = (
+        bob.open(&space()).await.unwrap(),
+        carol.open(&space()).await.unwrap(),
+    );
+    let mut written = None;
+    let mut last = String::from("no attempt");
+    for _ in 0..300 {
+        match carols
+            .put(&n("/c"), bytes("from carol"), PutOptions::default())
+            .await
+        {
+            Ok(id) => {
+                written = Some(id);
+                break;
+            }
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let id = match written {
+        Some(id) => id,
+        None => {
+            let creation = log_name(alice.name(), &space(), 1);
+            let why = carol
+                .fetch_entry(&creation)
+                .await
+                .map(|_| "held")
+                .map_err(|e| e.to_string());
+            panic!(
+                "carol could not write within 15 s: {last}; her fetch of alice's creation: {why:?}"
+            );
+        }
+    };
+    let carol_entry = log_name(carol.name(), &space(), id.seq);
+    for _ in 0..300 {
+        if has(&bobs, "/c", "from carol").await {
+            return;
+        }
+        last = match bob.fetch_entry(&carol_entry).await {
+            Ok(_) => String::from("fetched, not applied yet"),
+            Err(e) => e.to_string(),
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("bob did not read carol's entry within 15 s; his last try said: {last}");
 }

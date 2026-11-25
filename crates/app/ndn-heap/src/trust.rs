@@ -826,6 +826,31 @@ impl Judge {
         cert.data_wire().filter(|wire| wire.len() <= HELD_CERT_MAX)
     }
 
+    /// The certificate under `name` (a key name or a certificate name) that belongs to this
+    /// device's own chain: its signing key `key` (any certificate of it the validator holds,
+    /// the newest for the key name) and the issuers up the chain as far as the validator holds
+    /// them ([`Self::chain_of`]), as the packet each issuer signed. What the node answers by
+    /// default (the certificate any validator that meets the device's entries asks for by the
+    /// KeyLocator, and the issuers it then needs), vouched for by a walk or not (a lone device
+    /// never walks its own chain). Nothing else: a certificate of a key outside the chain is
+    /// not served here, so the node is no certificate server for others.
+    pub(crate) fn own_certificate(&self, key: &Name, name: &Name) -> Option<Bytes> {
+        if !(is_key_name(name) || is_cert_name(name)) || is_reserved_non_cert(name) {
+            return None;
+        }
+        if key_name_of(name) == *key {
+            let cert = self.validator.cert_cache().get(&Arc::new(name.clone()))?;
+            if key_name_of(&cert.name) != *key {
+                return None;
+            }
+            return cert.data_wire().filter(|wire| wire.len() <= HELD_CERT_MAX);
+        }
+        self.chain_of(key).into_iter().find(|wire| {
+            Data::decode(wire.clone())
+                .is_ok_and(|d| *d.name == *name || key_name_of(&d.name) == *name)
+        })
+    }
+
     /// The certificate (or key) `data`'s judgement waits for and this node's validator does
     /// not hold, from its cache alone: the first unresolved hop of the signer's chain. A cut
     /// manifest packet, named by its full name, is not a certificate and is not named.

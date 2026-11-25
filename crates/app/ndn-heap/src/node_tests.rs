@@ -232,6 +232,27 @@ pub(crate) async fn world_with(
     ns_of: impl Fn(&Name) -> Name,
     validity: impl Fn(&Name) -> u64,
 ) -> Vec<Dev> {
+    world_built(devices, ns_of, validity, false).await
+}
+
+/// [`world`] where each device's validator holds the anchors and its own certificate only,
+/// as a device's does on a network: every other certificate it needs is fetched by name.
+pub(crate) async fn world_apart(devices: &[&str]) -> Vec<Dev> {
+    world_built(
+        devices,
+        |name| Name::from_components(name.components()[..1].iter().cloned()),
+        |_| 365 * 24 * 3600 * 1000,
+        true,
+    )
+    .await
+}
+
+async fn world_built(
+    devices: &[&str],
+    ns_of: impl Fn(&Name) -> Name,
+    validity: impl Fn(&Name) -> u64,
+    apart: bool,
+) -> Vec<Dev> {
     let mut roots: Vec<(Name, SecurityManager, Name, Certificate)> = Vec::new();
     for d in devices {
         let ns = ns_of(&n(d));
@@ -261,20 +282,31 @@ pub(crate) async fn world_with(
             .unwrap();
         made.push((name, keys, cert));
     }
-    let trust = Arc::new(Trust {
-        anchors: roots
-            .iter()
-            .map(|(ns, _, _, anchor)| (ns.clone(), anchor.clone()))
-            .collect(),
+    let anchors: Vec<(Name, Certificate)> = roots
+        .iter()
+        .map(|(ns, _, _, anchor)| (ns.clone(), anchor.clone()))
+        .collect();
+    let everyone = Arc::new(Trust {
+        anchors: anchors.clone(),
         certs: made.iter().map(|(_, _, cert)| cert.clone()).collect(),
     });
     made.iter()
-        .map(|(name, keys, _)| Dev {
-            name: name.clone(),
-            keys: Arc::clone(keys),
-            validator: trust.validator(false),
-            store: Arc::new(MemoryStore::new()),
-            trust: Arc::clone(&trust),
+        .map(|(name, keys, cert)| {
+            let trust = if apart {
+                Arc::new(Trust {
+                    anchors: anchors.clone(),
+                    certs: vec![cert.clone()],
+                })
+            } else {
+                Arc::clone(&everyone)
+            };
+            Dev {
+                name: name.clone(),
+                keys: Arc::clone(keys),
+                validator: trust.validator(false),
+                store: Arc::new(MemoryStore::new()),
+                trust,
+            }
         })
         .collect()
 }
@@ -410,6 +442,55 @@ pub(crate) async fn deliver(from: &Dev, to: &Node) -> usize {
         }
     }
     taken
+}
+
+// -- Certificates ------------------------------------------------------------------
+
+/// A node answers for its own certificate whether or not a walk vouched for it (a lone device
+/// never walks its own chain), and for no other certificate it merely holds: Bob's is held at
+/// Alice's node unverified (as a certificate fetched is, until a walk reaches an anchor
+/// through it), and is not hers to serve (spec §7.6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_serves_its_own_certificate_and_no_other_it_merely_holds() {
+    let devs = world_apart(&["/alice/laptop", "/bob/laptop"]).await;
+    let key = n("/alice/laptop/KEY/1");
+    let bobs_key = n("/bob/laptop/KEY/1");
+    let cache = devs[0].validator.cert_cache();
+    let own = cache.remove(&key).expect("alice holds her own certificate");
+    assert!(
+        cache.insert_unverified(own),
+        "held, and vouched for by no walk"
+    );
+    let bobs = devs[1]
+        .validator
+        .cert_cache()
+        .get(&Arc::new(bobs_key.clone()))
+        .expect("bob holds his own certificate");
+    assert!(cache.insert_unverified(bobs));
+    assert!(!cache.holds_vouched(&key) && !cache.holds_vouched(&bobs_key));
+
+    let (alice, _) = boot(&devs[0], cfg()).await;
+    let wire = alice
+        .inner
+        .held_certificate(&key)
+        .expect("the node answers for the certificate of its own key");
+    let cert = Data::decode(wire).unwrap();
+    assert_eq!(
+        ndn_security::cert_name::key_name_of(&cert.name),
+        key,
+        "it is a certificate of that key"
+    );
+    assert!(
+        alice.inner.held_certificate(&bobs_key).is_none(),
+        "another device's certificate, held and not vouched for, is not served"
+    );
+    assert!(
+        alice
+            .inner
+            .held_certificate(&n("/alice/laptop/KEY/2"))
+            .is_none(),
+        "a key of the device's name that the node does not sign with is not served"
+    );
 }
 
 // -- Restart -----------------------------------------------------------------------

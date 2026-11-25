@@ -326,7 +326,9 @@ name is none of these. If it is a keyword:
 | any other | not served |
 
 The parser of the kind still judges the name; the router only chooses which
-parser to run. A node MUST NOT serve any other name, and MUST NOT serve a
+parser to run. A node MUST NOT serve any other name, except its **own key** `<D>/KEY/<id>`
+and the certificates of that key (§7.6), which it answers whatever the keyword rule says (a
+device name holds `KEY` as a plain component: such a name has no keyword), and MUST NOT serve a
 name under `/localhost`. The keywords above, and `data`, `piece`, `manifest`,
 `sync`, `signal` and `run` (the other keywords this layer's names carry), are
 **core**: an extension MUST NOT be given an Interest under one (§10.9).
@@ -1809,13 +1811,33 @@ A name under `/localhost` is never served.
 |---|---|
 | `<D>/32=log/<S>/seq=<n>` with `D` this device | its own entry at that seq, if held, verified and not held back (a structural entry not yet flushed, §4.2 rule 3) |
 | `<E>/32=piece/…` with `E` this device's entry | the piece, if the entry is served |
-| `<H>/32=held/<Name TLV>` with `H` this device | the packet named — another device's entry, or a piece — **only if it is held and admitted** (a follower serves what it verified), or a **certificate** its validator vouches for (the name is a key name `<device>/KEY/<id>`, answered with the newest certificate of the key, or a certificate name; at most 4,096 octets; one fetched and not yet vouched for by a walk is not served; an NDNCERT decision `…/ndncert-approve/…` is no certificate), wrapped as the Content of a DigestSha256 packet, so it carries no claim of having been signed by this device |
+| `<H>/32=held/<Name TLV>` with `H` this device | the packet named — another device's entry, or a piece — **only if it is held and admitted** (a follower serves what it verified), or a **certificate** its validator vouches for (the name is a key name `<device>/KEY/<id>`, answered with the newest certificate of the key, or a certificate name; at most 4,096 octets; one fetched and not yet vouched for by a walk is not served; an NDNCERT decision `…/ndncert-approve/…` is no certificate), or a certificate of **this device's own chain** (below), wrapped as the Content of a DigestSha256 packet, so it carries no claim of having been signed by this device |
+| `<D>/KEY/<id>`, or a certificate name `<D>/KEY/<id>/<issuer>/<version>`, with `D` this device | the certificate of this device's own signing key (the newest for the key name), as its issuer signed it, **whether a walk vouched for it or not** (a device that never judged its own chain has none vouched); a name of another key is Nacked |
 | `<D>/32=seal/<pk>` with `D` this device and `pk` its recipient public key | its seal key packet |
 | `<G>/32=grant/<ask>` with `G` this device | by §6.5 |
 | `<D>/32=<keyword>/…` with `D` this device and `keyword` registered by an extension | by §10.9: what the extension answers, else Nacked |
 
 An entry is served from the entry's own record: held and verified, and either
 applied or held closed; one refused, waiting or unreadable is not served.
+
+**A node serves its own certificates, by default.** The validator that meets a device's
+entries asks for the certificate of the key that signed them by name (its KeyLocator,
+`<D>/KEY/<id>`), and the route to `<D>` leads to the device. So every node answers that
+name with the certificate of its own signing key, and answers the `32=held` row with the
+certificates of its **own chain**: the certificates of its signing key and the issuers
+above them as far as its validator holds them (the chain it carries in a grant ask, §6.5:
+at most 4 (`ASKER_CHAIN_MAX`) certificates, each at most 4,096 octets, at most 6,144 in all).
+Nothing starts it: it is part of serving the device's name, begun with the node and
+ended when the node stops (`close`, `shutdown`, §4.7), and no host starts a certificate
+server for it. It is bounded to the node's own chain: it answers nothing for another key's
+certificate that it merely holds (those a walk vouched for are served only as held copies, by
+the row above, never by the key name), a name outside `<D>/KEY/…` is not answered as a
+certificate, an NDNCERT decision is none, and what the node serves is public data a verifier
+checks for itself. A node is therefore **no general certificate server**: it never answers for
+a name that is not its own, and the only certificates of others it gives are those its
+validator vouched for, as held copies. A reader that finds the certificate of an entry's
+signer missing asks the writer's own chain last, as a held copy, after the heard members that
+vouch and the configured holders (§9.1).
 
 A place that keeps copies and signs nothing of the space (a repo follower, a NAS) answers
 the `32=held` row alone. No reader vouches for it, so none asks it by itself: a reader
@@ -2123,7 +2145,8 @@ name of its certificate is the writer's own link: when the fetch of an entry tha
 (from the writer, a relay or a holder) answers pending, the node asks for what is missing,
 one hop of the chain at a time (at most six), as a held copy `<H>/32=held/<missing>` of the
 heard members that vouch and then of the configured `Config.holders` (§7.4: the same
-order, the same bound of `RELAYS_ASKED`), the missing name being the one the validator
+order, the same bound of `RELAYS_ASKED`) and last of the writer itself, which answers for
+its own chain (§7.6), the missing name being the one the validator
 names from its cache alone (`validate_durable_cached`: the signer's key, then the
 issuer's, …; a cut manifest named by its full name is not a certificate and is not
 asked this way). A packet a source gives is taken **only** if it is a certificate of the

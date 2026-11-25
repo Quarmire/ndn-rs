@@ -1303,7 +1303,8 @@ impl Group {
 
     /// Ask for the certificate `missing` as a held copy (`<H>/32=held/<missing>`) of each of
     /// the heard members that vouch (those of which this node holds an unbroken prefix of their
-    /// log leading), then of the configured holders, within `RELAYS_ASKED` in all, as an
+    /// log leading), then of the configured holders, within `RELAYS_ASKED` in all, then of the
+    /// writer, which answers for its own chain (a relay that is away costs it nothing), as an
     /// entry is ([`Self::source`]), until one gives a packet the node takes as a certificate
     /// of that key. What is taken is only held unverified: the judgement vouches for it by
     /// reaching a trust anchor through it and drops it when it cannot, so a copy that does not
@@ -1320,6 +1321,12 @@ impl Group {
             (self.heard.lock()).relays(me, &writer, &[], |d| host.standing(&self.space, d));
         let holders = holders_after(&self.shared.cfg.holders, me, &writer, &sources);
         sources.extend(holders);
+        // The writer answers for its own chain as a held copy (a node serves the certificates
+        // of its signing key and its issuers, [`crate::trust::Judge::own_certificate`]): asked
+        // last, so that a writer that is away costs the relays nothing.
+        if writer != *me {
+            sources.push(writer.clone());
+        }
         for holder in sources {
             let held = held_name(&holder, missing);
             let Ok(wrapper) = self.shared.fetcher.once(held, kind, false).await else {

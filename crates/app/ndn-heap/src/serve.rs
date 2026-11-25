@@ -41,6 +41,7 @@ use ndn_app::Responder;
 use ndn_foundation_types::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Data, Interest, NackReason};
+use ndn_security::cert_name::{is_cert_name, is_key_name, key_name_of};
 use parking_lot::Mutex;
 
 use crate::limit::Counts;
@@ -149,6 +150,10 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
             }
             None
         }
+        // `<D>/KEY/<id>` (or a certificate of that key): the certificate a validator asks for
+        // by the KeyLocator of this device's entries. The device answers for its own chain
+        // and for nothing else of the kind ([`own_key_name`]).
+        None if own_key_name(&me, &name) && !is_local(&name) => host.held_certificate(&name),
         // A keyword no core kind owns: the extension that registered it, if one did, answers
         // (its own task, as a grant's: it may sign and wait); anything else is Nacked.
         None => match shared.extensions.answering(&me, &name) {
@@ -170,6 +175,15 @@ fn is_local(name: &Name) -> bool {
     name.components()
         .first()
         .is_some_and(|c| c.value.as_ref() == b"localhost")
+}
+
+/// Whether `name` is a key name `<device>/KEY/<id>`, or a certificate name of that key, of
+/// `device` itself: the one place a node answers by name for a certificate, and it only
+/// answers with its own chain ([`crate::trust::Judge::own_certificate`]).
+fn own_key_name(device: &Name, name: &Name) -> bool {
+    (is_key_name(name) || is_cert_name(name))
+        && name.has_prefix(device)
+        && key_name_of(name).len() == device.len() + 2
 }
 
 async fn reply(name: &Name, responder: Responder, packet: Option<Bytes>) {

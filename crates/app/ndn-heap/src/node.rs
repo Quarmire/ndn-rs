@@ -1292,10 +1292,13 @@ impl NodeInner {
         self.judge.chain_of(self.signer.key_name())
     }
 
-    /// The certificate packet this node's validator vouches for under `name`, for a held
-    /// copy ([`Judge::held_certificate`]).
+    /// The certificate packet this node answers under `name` for a held copy or for its own
+    /// key: one its validator vouches for ([`Judge::held_certificate`]), or one of this
+    /// device's own chain ([`Judge::own_certificate`]).
     pub(crate) fn held_certificate(&self, name: &Name) -> Option<Bytes> {
-        self.judge.held_certificate(name)
+        self.judge
+            .held_certificate(name)
+            .or_else(|| self.judge.own_certificate(self.signer.key_name(), name))
     }
 
     /// The certificate the judgement of `wire` waits for and the cache lacks
