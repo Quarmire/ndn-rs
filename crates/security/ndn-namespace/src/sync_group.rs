@@ -1,6 +1,6 @@
 //! Each held namespace's sync group on this device's forwarder:
 //! `<ns>/32=sync` ([`ndn_security::sync_group`]), where the namespace's
-//! devices say what they wrote (`docs/specs/data-layer.md` §12). Not the
+//! devices say what they wrote (`docs/specs/heap.md` §2.5). Not the
 //! trust-context group of [`crate::sync`].
 //!
 //! A forwarder holding a namespace's trust context runs the namespace's

@@ -82,7 +82,7 @@ const T_DEVICE_NAME: u64 = 0x0474; // invite: the device name the inviter sugges
 const T_OFFER: u64 = 0x0475; // intro: the offer record's name
 const T_RELAY_HINT: u64 = 0x0476; // intro: a relay that reaches the inviter (repeatable)
 const T_SECRET: u64 = 0x0477; // intro: the offer's secret
-const T_LINK_HINT: u64 = 0x0478; // intro: the inviter's link hint (opaque here: data-layer.md §19.2)
+const T_LINK_HINT: u64 = 0x0478; // intro: the inviter's link hint (opaque here: invite.md §6.1)
 
 const T_U64_VERSION: u64 = 0x0481; // anchor: context version
 const T_WIRE: u64 = 0x0482; // primary signed-Data blob (delegation / bundle / safebag); anchor: legacy unsigned context Content
@@ -117,7 +117,7 @@ pub const FORMAT_VERSION: u8 = 1;
 pub const CAPABILITY_NONCE_LEN: usize = 16;
 
 /// Length of an introduction's secret: 128 bits from the system RNG
-/// (data-layer.md §19).
+/// (invite.md §4.1).
 pub const INTRO_SECRET_LEN: usize = 16;
 
 /// How many octets of the anchor fingerprint an introduction's words form
@@ -312,7 +312,7 @@ pub struct Capability {
     pub grant: Option<Bytes>,
 }
 
-/// A one-use offer of a folder, as its code carries it (data-layer.md §19):
+/// A one-use offer of a space, as its code carries it (invite.md §6):
 /// what the holder needs to join. The secret is the whole of what makes the
 /// code worth stealing; [`Debug`] never shows it.
 ///
@@ -330,13 +330,13 @@ pub struct Introduction {
     /// SHA-256 of the inviter's root anchor public key: the anchor the
     /// answer's trust context must be signed by.
     pub fingerprint: [u8; ANCHOR_FINGERPRINT_LEN],
-    /// The offer record's name, as an NDN URI
-    /// (`<device>/keyword=log/<folder>/seq=<n>`).
+    /// The offer's name, as an NDN URI (`<device>/32=intro/32=offer/<id>`,
+    /// invite.md §2.1).
     pub offer: String,
     /// The offer's secret.
     pub secret: [u8; INTRO_SECRET_LEN],
     /// The inviter's link hint — its device key and where to try dialling
-    /// it directly — as data-layer.md §19.2 encodes it; this crate carries
+    /// it directly — as invite.md §6.1 encodes it; this crate carries
     /// the octets and judges none of them. Reachability only, never trusted
     /// for anything else.
     pub link_hint: Option<Bytes>,

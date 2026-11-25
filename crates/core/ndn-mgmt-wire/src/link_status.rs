@@ -117,7 +117,7 @@ pub mod link_tlv {
 
 /// `links/list` TLV-TYPE codes of the fault-layer notice
 /// ([`LinkListing::fault_injection`]): 0x050C–0x051E, clear of `cs/list`
-/// (0x0500–0x0509) and the data layer (0x0520…). All even (non-critical).
+/// (0x0500–0x0509) and the numbers `invite.md` keeps from the former data layer (0x0520…). All even (non-critical).
 pub mod fault_tlv {
     /// Nested, top level, optional: present exactly when the daemon was built
     /// with the link library's test-only fault layer.

@@ -224,7 +224,7 @@ impl Validator {
     /// same keyring — and also judges the names of `scoped`'s person's
     /// namespace by `scoped`'s context wherever this keyring holds none
     /// ([`Keyring::with_scoped_view`]): for one scope of its holder's
-    /// (data-layer.md §6.3). This validator itself, and every other user of
+    /// (heap.md §9.4). This validator itself, and every other user of
     /// its keyring (a forwarder's validation stage), keep refusing that
     /// namespace as one not held. Expected-context admissions are this
     /// validator's own and are not carried over.
@@ -325,9 +325,9 @@ impl Validator {
     ///
     /// A `digest` (DigestSha256) packet is not refused here: it names no
     /// signer and vouches for nothing, so it passes on its digest alone,
-    /// labelled integrity-only, as under every other name. A device's
-    /// wrapped `32=held` answers (how a stranger to the namespace fetches an
-    /// offer before it trusts the inviter) and the namespace's RDR metadata
+    /// labelled integrity-only, as under every other name. An introduction's
+    /// answer to an ask (how a stranger to the namespace learns whether it was
+    /// admitted before it trusts the inviter) and the namespace's RDR metadata
     /// pointer are such packets; their consumers check what they carry. The
     /// context versions themselves are signed: they are taken only under an
     /// expectation ([`Self::expect_context`]), which is decided before this.

@@ -255,7 +255,7 @@ pub enum FaceScope {
 /// is the Unix socket (it is world-connectable, so another user's program can
 /// open it); what arrives on those is no more believable than what arrives
 /// from the network, and a forged Data that such a face's cache admitted would
-/// be served to every later consumer of the name (data-layer.md §18.1,
+/// be served to every later consumer of the name (history/data-layer-remainder.md §18.1,
 /// trust-context.md §6.6). A face the forwarder opens for a requester
 /// (a shared-memory face provisioned by a command) has no more trust than the
 /// requester's own face.

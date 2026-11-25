@@ -1897,7 +1897,7 @@ where
 
 /// Adopt the self-certifying namespace `namespace` by its name alone, as
 /// [`adopt_by_name`] does, for one scope of its holder's alone
-/// (`docs/specs/data-layer.md` §6.3): into no keyring a node judges by, but
+/// (`docs/specs/heap.md` §9.4): into no keyring a node judges by, but
 /// as a [`ScopedContext`] that its holder judges that scope's data by
 /// ([`Keyring::with_scoped_view`]), so no other path ever sees it.
 ///

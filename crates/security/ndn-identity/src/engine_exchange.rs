@@ -14,14 +14,14 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 /// How many times in all [`EngineExchange::fetching`] asks for one signed
 /// packet, counting asks answered by a copy the engine refused as
 /// [`Refusal::BadSignature`] (forged or altered on the way: the faulty
-/// network of the data-layer spec §18.1 alters 5% of packets).
+/// network of the former data-layer spec, history/data-layer-remainder.md §18.1, alters 5% of packets).
 const FETCH_TRIES: u32 = 8;
 
 /// How many asks of one signed packet nothing at all answers end
 /// [`EngineExchange::fetching`]'s fetch with no answer (trust-context spec
 /// §8.1). Inside each ask the Interest is expressed again every
 /// [`REEXPRESS_GAP`] while its lifetime lasts, so on the faulty network of
-/// the data-layer spec §18.1 an ask goes unanswered under one time in
+/// the former data-layer spec (history/data-layer-remainder.md §18.1) an ask goes unanswered under one time in
 /// twenty and three asks under one in ten thousand; a path down costs
 /// three Interest lifetimes (some 15 s).
 const NO_ANSWER_ASKS: u32 = 3;
@@ -29,7 +29,7 @@ const NO_ANSWER_ASKS: u32 = 3;
 /// The wait before an unanswered plain fetch is expressed again inside its
 /// ask: longer than a forwarder's retransmission suppression holds back a
 /// fresh-nonce Interest from the same face (NFD caps it at 250 ms), and
-/// than a round trip over the faulty network of the data-layer spec §18.1
+/// than a round trip over the faulty network of the former data-layer spec (history/data-layer-remainder.md §18.1)
 /// (400 ms of delay each way). An earlier Interest stays pending, so a
 /// late answer to it counts as well.
 const REEXPRESS_GAP: Duration = Duration::from_secs(1);

@@ -120,7 +120,7 @@ pub struct Keyring {
 
 /// A person's self-certifying namespace (`/user/<0xA1: …>`) adopted by name
 /// for one scope alone — e.g. for judging the data of the folders whose
-/// members records list it as a writer (data-layer.md §6.3) — and never
+/// members records list it as a writer (heap.md §9.4) — and never
 /// into a node's keyring: its checked genesis and the newest version
 /// reached from it by the continuity rule. Made only from a [`Genesis`],
 /// which only its signature check makes, exactly as
@@ -182,7 +182,7 @@ impl ScopedContext {
 
     /// The newest version's signed Data, whole, when known: kept by a
     /// holder that judges by this context again after a restart
-    /// (data-layer.md §6.3).
+    /// (heap.md §9.4).
     pub fn data(&self) -> Option<&Bytes> {
         self.data.as_ref()
     }
@@ -347,7 +347,7 @@ impl Keyring {
 
     /// A view of this keyring that also judges the names of `scoped`'s
     /// person's namespace by `scoped`'s context, wherever no held context
-    /// covers them: for its holder's one scope (data-layer.md §6.3). It
+    /// covers them: for its holder's one scope (heap.md §9.4). It
     /// shares this keyring's held contexts **live**, as
     /// [`with_ambient_view`](Self::with_ambient_view) does, and its ambient.
     ///

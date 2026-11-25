@@ -1,7 +1,7 @@
 //! Octets as English words (trust-envelope.md §5.8): the BIP39 English list,
 //! whose checksum catches a mistyped or swapped word. A recovery kit shows
 //! its seed so, and an introduction code its secret and anchor fingerprint
-//! (data-layer.md §19); both use this one list.
+//! (invite.md §6.3); both use this one list.
 //!
 //! Two codecs share it. [`encode`] / [`decode`]: exactly 32 octets as 24
 //! words, BIP39's own 8-bit checksum (recovery kits, the words form of an

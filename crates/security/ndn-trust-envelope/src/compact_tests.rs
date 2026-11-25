@@ -20,7 +20,7 @@ fn escaped(fp: &[u8; 32]) -> String {
     fp.iter().map(|b| format!("%{b:02X}")).collect()
 }
 
-/// A link hint's octets as data-layer.md §19.2 writes them: the key and each
+/// A link hint's octets as invite.md §6.1 writes them: the key and each
 /// candidate (kind, address, port).
 fn hint(candidates: &[(u8, &[u8], u16)]) -> Bytes {
     let mut w = TlvWriter::new();

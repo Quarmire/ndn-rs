@@ -1,5 +1,5 @@
 //! A person's self-certifying namespace adopted for one scope alone
-//! (data-layer.md §6.3, trust-context.md §4.5.7): a [`ScopedContext`], made
+//! (heap.md §9.4, trust-context.md §4.5.7): a [`ScopedContext`], made
 //! only from a checked genesis, judges that namespace's names through a view
 //! of a keyring or validator, and nothing that judges by the keyring itself
 //! ever sees it; a context of the namespace the keyring holds is used as is,

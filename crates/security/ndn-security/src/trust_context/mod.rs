@@ -65,7 +65,7 @@ pub const SYNC_GROUP_KEYWORD: &[u8] = b"sync";
 
 /// The sync group of `namespace`: `<namespace>/32=sync`, the State Vector
 /// Sync group in which the namespace's devices say they wrote
-/// (`docs/specs/data-layer.md` §12). `namespace` is the context's whole
+/// (`docs/specs/heap.md` §2.5). `namespace` is the context's whole
 /// namespace name, however many components it has. A forwarder holding the
 /// namespace's context runs the group with the multicast strategy and
 /// routes it over each link that carries the namespace; a member registers
