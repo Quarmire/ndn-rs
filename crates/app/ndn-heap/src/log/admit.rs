@@ -10,13 +10,15 @@
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::Data;
+use ndn_security::cert_name::key_name_of;
 
 use super::chain::{RANGES_MAX, Ranges, Status};
 use super::view::{View, head_for};
 use super::*;
 use crate::error::Timestamp;
 use crate::register::ValueChange;
-use crate::wire::{Prev, parse_log_name, signed_digest_of};
+use crate::trust::TipCut;
+use crate::wire::{Prev, device_of, parse_log_name, signed_digest_of};
 
 /// What admission is given about the entry that arrived: its ref, its bytes,
 /// the verified signer, the time, and whether only an unsigned counter asked
@@ -53,6 +55,7 @@ struct Loaded {
     key: Name,
     person: Name,
     owner_capable: bool,
+    wire: Bytes,
 }
 
 /// How a held entry is judged again ([`Log::reassess`]).
@@ -160,6 +163,7 @@ impl Log {
             now,
             probe,
         };
+        self.note_tip(&v.key, v.tip.as_ref(), fx);
         let (device, seq) = (&a.id.device, a.id.seq);
         let held = self.view().marker(device, seq);
         if let Some(held) = held {
@@ -247,8 +251,15 @@ impl Log {
             self.view().status(&a.id.device, a.id.seq),
             Some(Status::Refused(Refusal::OutsideCut(_)) | Status::Waiting)
         ) && shape(a.data, a.id.seq).is_some_and(|(entry, _, _)| {
-            self.assess(&a.id, &a.v.person, a.v.owner_capable, &a.v.key, &entry)
-                .is_ok()
+            self.assess(
+                &a.id,
+                a.wire,
+                &a.v.person,
+                a.v.owner_capable,
+                &a.v.key,
+                &entry,
+            )
+            .is_ok()
         })
     }
 
@@ -300,7 +311,7 @@ impl Log {
         if let Some((entry, _, _)) = shape(a.data, id.seq)
             && matches!(entry.body, Body::Members(_) | Body::Epoch(_))
             && self
-                .assess(id, &v.person, v.owner_capable, &v.key, &entry)
+                .assess(id, a.wire, &v.person, v.owner_capable, &v.key, &entry)
                 .is_ok()
         {
             self.set_applied(id, &v.person, &entry, true, fx);
@@ -372,7 +383,7 @@ impl Log {
                 // still the evidence of a key signing two chains: told to
                 // the host, with no refusal and no suspicion (the key is
                 // the removed writer's, and the owner decides by the cut).
-                Some(conflict) if !self.judged_by_cut(&v.person, &id.device) => {
+                Some(conflict) if !self.judged_by_cut(&v.person, &id.device, &v.key) => {
                     self.equivocated(a, conflict, fx);
                     Err(Status::Refused(Refusal::Chain))
                 }
@@ -383,7 +394,7 @@ impl Log {
                             seq,
                         });
                     }
-                    self.assess(id, &v.person, v.owner_capable, &v.key, entry)
+                    self.assess(id, a.wire, &v.person, v.owner_capable, &v.key, entry)
                         .map(|()| entry)
                 }
             },
@@ -480,6 +491,7 @@ impl Log {
     fn assess(
         &self,
         id: &EntryRef,
+        wire: &Bytes,
         person: &Name,
         owner_capable: bool,
         key: &Name,
@@ -511,6 +523,11 @@ impl Log {
         // inside the cut.
         if !self.fold.is_writer(person) {
             self.cutting(id, person)?;
+        }
+        // 4b. A key revoked by a cut that names a tip of this log: below the tip only the chain
+        // of the tip is kept, as the very bytes it names.
+        if let Some(tipped) = self.tipped.get(&key_name_of(key)) {
+            tipped.keeps(&self.store, &self.space, id, wire)?;
         }
         // 5. Sealing.
         let create = self.fold.create();
@@ -551,16 +568,17 @@ impl Log {
             .is_none_or(|dev| dev.person == *self.fold.owner() && dev.owner_capable)
     }
 
-    /// Whether the entries of `device` signed by `person` are judged by a
-    /// removal cut alone: the person is no writer now and a cut names a tip
-    /// of this device.
-    fn judged_by_cut(&self, person: &Name, device: &Name) -> bool {
-        !self.fold.is_writer(person)
-            && self
-                .fold
-                .removal_tips(person)
-                .iter()
-                .any(|t| t.device == *device)
+    /// Whether the entries of `device` signed by `key` (of `person`) are judged by a cut alone:
+    /// the person is no writer now and a removal cut names a tip of this device, or the key is
+    /// revoked by a cut that names a tip of this log.
+    fn judged_by_cut(&self, person: &Name, device: &Name, key: &Name) -> bool {
+        self.tipped.contains_key(&key_name_of(key))
+            || (!self.fold.is_writer(person)
+                && self
+                    .fold
+                    .removal_tips(person)
+                    .iter()
+                    .any(|t| t.device == *device))
     }
 
     /// What a removed writer's cut says of the entry: `Ok` when the cut keeps
@@ -620,19 +638,81 @@ impl Log {
         self.advance_cut(device, fx);
     }
 
-    /// An entry of a removed device arrived: the cut's walk goes on from
-    /// where it stopped.
+    /// An entry of a removed device, or of a device whose key a cut names a tip of, arrived: the
+    /// cut's walk goes on from where it stopped.
     fn advance_cut(&mut self, device: &Name, fx: &mut Effects) {
-        let Some(kept) = self.kept.get_mut(device) else {
+        let mut moved = false;
+        if let Some(kept) = self.kept.get_mut(device) {
+            let before = kept.clone();
+            kept.advance(&self.store, device, &self.space);
+            if *kept != before {
+                fx.wants.extend(frontier_wants(device, kept));
+                moved = true;
+            }
+        }
+        for tipped in self.tipped.values_mut().filter(|t| t.device == *device) {
+            let before = tipped.kept.clone();
+            tipped.kept.advance(&self.store, device, &self.space);
+            if tipped.kept != before {
+                fx.wants.extend(frontier_wants(device, &tipped.kept));
+                moved = true;
+            }
+        }
+        if moved {
+            self.queue.push(Scope::Waiting(device.clone()));
+        }
+    }
+
+    /// The judge says the revocation cut of the key `key` names `tip` in this log (`None`: it
+    /// names none, or the key is not revoked): the chain below the tip is walked through the
+    /// markers, what it needs is wanted, and the entries held of the key's device are judged
+    /// again by it. Nothing happens when the log has been told as much already.
+    fn note_tip(&mut self, key: &Name, tip: Option<&TipCut>, fx: &mut Effects) {
+        let key = key_name_of(key);
+        let Some(device) = device_of(&key) else {
             return;
         };
-        let before = kept.clone();
-        kept.advance(&self.store, device, &self.space);
-        if *kept == before {
-            return;
+        let same_tip = self
+            .tipped
+            .get(&key)
+            .zip(tip)
+            .is_some_and(|(held, cut)| held.kept.tips == [cut.tip]);
+        match tip {
+            None => {
+                if self.tipped.remove(&key).is_none() {
+                    return;
+                }
+            }
+            Some(cut) if same_tip => {
+                let held = self.tipped.get_mut(&key).expect("the tip is held");
+                if held.readmitted == cut.readmitted {
+                    return;
+                }
+                held.readmitted.clone_from(&cut.readmitted);
+            }
+            Some(cut) => {
+                let tipped = Tipped::compute(&self.store, &device, &self.space, cut);
+                fx.wants.extend(frontier_wants(&device, &tipped.kept));
+                self.tipped.insert(key, tipped);
+            }
         }
-        fx.wants.extend(frontier_wants(device, kept));
-        self.queue.push(Scope::Waiting(device.clone()));
+        if let Some(dev) = self.devices.get(&device) {
+            self.queue
+                .push(Scope::Persons(BTreeSet::from([dev.person.clone()])));
+        }
+    }
+
+    /// The judge says what the revocation cut of each key `(key, tip)` names in this log
+    /// ([`Self::note_tip`]): the held entries off a tip's chain are withdrawn, and what waited
+    /// for a chain is judged as the chain says. Called when a trust context was adopted or the
+    /// node started.
+    pub(crate) fn cut_tips(&mut self, tips: Vec<(Name, Option<TipCut>)>) -> Effects {
+        let mut fx = Effects::default();
+        for (key, tip) in &tips {
+            self.note_tip(key, tip.as_ref(), &mut fx);
+        }
+        self.settle(&mut fx);
+        fx
     }
 
     pub(super) fn write_ledger(&self, device: &Name) {
@@ -782,7 +862,7 @@ impl Log {
     /// An applied entry is refused after the fact: out of the fold or the
     /// register (what it superseded returns), and told to the host.
     fn unapply(&mut self, l: &Loaded, why: &Status, fx: &mut Effects) {
-        let why = self.withdrawn_why(why, &l.id.device);
+        let why = self.withdrawn_why(why, &l.id.device, &l.key);
         fx.changes.push(Change::Withdrawn {
             id: l.id.clone(),
             why,
@@ -790,12 +870,16 @@ impl Log {
         self.set_applied(&l.id, &l.person, &l.entry, false, fx);
     }
 
-    fn withdrawn_why(&self, status: &Status, device: &Name) -> Refusal {
+    fn withdrawn_why(&self, status: &Status, device: &Name, key: &Name) -> Refusal {
         match status {
             Status::Refused(why) => why.clone(),
             Status::Waiting => Refusal::OutsideCut(Cut {
                 device: device.clone(),
-                keeps_to: self.kept.get(device).map_or(0, |k| k.keeps_to()),
+                keeps_to: self.kept.get(device).map_or(0, |k| k.keeps_to()).max(
+                    self.tipped
+                        .get(&key_name_of(key))
+                        .map_or(0, |t| t.kept.keeps_to()),
+                ),
             }),
             Status::Closed | Status::Unreadable => Refusal::Untrusted {
                 why: "its epoch key is no longer held".into(),
@@ -918,7 +1002,8 @@ impl Log {
     fn load_entry(&self, device: &Name, seq: u64) -> Option<Loaded> {
         let view = self.view();
         let marker = view.marker(device, seq)?;
-        let data = Data::decode(view.wire_at(device, seq)?).ok()?;
+        let wire = view.wire_at(device, seq)?;
+        let data = Data::decode(wire.clone()).ok()?;
         let key = data.sig_info()?.key_locator_name()?;
         let (entry, _, _) = shape(&data, seq)?;
         Some(Loaded {
@@ -933,6 +1018,7 @@ impl Log {
             key: (*key).clone(),
             person: self.devices.get(device)?.person.clone(),
             owner_capable: self.devices.get(device)?.owner_capable,
+            wire,
         })
     }
 
@@ -957,13 +1043,13 @@ impl Log {
                 // writer; the cut settles what it keeps (spec 3.7), so the
                 // verdict is judged again.
                 let forked_then_cut = matches!(l.status, Some(Status::Refused(Refusal::Chain)))
-                    && self.judged_by_cut(&l.person, device);
+                    && self.judged_by_cut(&l.person, device, &l.key);
                 if (l.status.as_ref().is_some_and(|s| !s.can_change()) && !forked_then_cut)
                     || (held_for_trust && matches!(how, Rejudge::Held))
                 {
                     return;
                 }
-                self.assess(&l.id, &l.person, l.owner_capable, &l.key, &l.entry)
+                self.assess(&l.id, &l.wire, &l.person, l.owner_capable, &l.key, &l.entry)
                     .err()
             }
         };
@@ -1056,6 +1142,7 @@ impl Log {
             now,
             probe: false,
         };
+        self.note_tip(&v.key, v.tip.as_ref(), fx);
         let (device, seq) = (&a.id.device, a.id.seq);
         let held = self.view().marker(device, seq);
         let status = self.view().status(device, seq);
@@ -1068,7 +1155,7 @@ impl Log {
             return Outcome::Refused(why);
         }
         let accepted = shape(data, seq).is_some_and(|(entry, _, _)| {
-            self.assess(&a.id, &v.person, v.owner_capable, &v.key, &entry)
+            self.assess(&a.id, a.wire, &v.person, v.owner_capable, &v.key, &entry)
                 .is_ok()
         });
         if !accepted {

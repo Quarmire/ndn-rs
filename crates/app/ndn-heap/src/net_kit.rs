@@ -689,6 +689,7 @@ impl Host for Toyhost {
             person: Name::from_components(device.components()[..1].iter().cloned()),
             key_digest: [0; 32],
             owner_capable: true,
+            tip: None,
         })
     }
 

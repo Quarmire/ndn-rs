@@ -1092,6 +1092,71 @@ async fn a_revoked_key_is_outside_its_cut() {
     }
 }
 
+/// A key revoked with a cut that names a tip: below the tip a packet is valid by name, and the
+/// verdict carries the tip (and what the cut re-admits by name) for the log to bind the bytes
+/// by chain; at the tip only the bytes the cut names are valid; above it the cut keeps nothing
+/// (it names no range). A key the context does not revoke has no tip. The wants are the tip.
+#[tokio::test]
+async fn a_tip_cut_judges_below_the_tip_by_name_and_tells_the_log_the_tip() {
+    let digest_of =
+        |seq: u64, by: &Ed25519Signer| ndn_security::signed_region_digest(&bob_entry(seq, by));
+    let readmitted = log_name(&n(DEVICE), &bob_space(), 9).append_implicit_digest([4; 32]);
+    let (judge, phone) = {
+        let (_, phone) = bob((PAST, u64::MAX), |c| c).await;
+        let mut cut = RevocationCut::new(n(PHONE_KEY));
+        cut.add_tip(&bob_log_prefix(), 3, digest_of(3, &phone));
+        cut.readmit(readmitted).unwrap();
+        bob((PAST, u64::MAX), |c| {
+            c.with_revocation(n(PHONE_KEY)).with_revocation_cut(cut)
+        })
+        .await
+    };
+    let tip = TipCut {
+        tip: Link {
+            seq: 3,
+            digest: digest_of(3, &phone),
+        },
+        readmitted: vec![(9, [4; 32])],
+    };
+    let below = valid(judge.validate(&bob_entry(2, &phone), &bob_space()).await);
+    assert_eq!(below.tip.as_ref(), Some(&tip));
+    let at = valid(judge.validate(&bob_entry(3, &phone), &bob_space()).await);
+    assert_eq!(at.tip.as_ref(), Some(&tip));
+
+    let refused = |judged: Judged| match judged {
+        Judged::Refused(Refusal::OutsideCut(Cut { device, keeps_to })) => {
+            assert_eq!(device, n(DEVICE));
+            keeps_to
+        }
+        other => panic!("{other:?}"),
+    };
+    let other_bytes = Data::decode(
+        DataBuilder::new(log_name(&n(DEVICE), &bob_space(), 3), b"other").sign_sync(
+            SignatureType::SignatureEd25519,
+            Some(phone.key_name()),
+            |region| phone.sign_sync(region).unwrap(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(refused(judge.validate(&other_bytes, &bob_space()).await), 3);
+    assert_eq!(
+        refused(judge.validate(&bob_entry(4, &phone), &bob_space()).await),
+        3,
+        "above the tip the cut keeps the chain up to seq 3, nothing more"
+    );
+    assert_eq!(
+        judge.cut_tips(&bob_space()),
+        vec![(n(DEVICE), 3, digest_of(3, &phone))]
+    );
+    assert_eq!(judge.cut_tips(&other_space()), vec![]);
+
+    // The key is not revoked: no tip is told.
+    let (judge, phone) = bob((PAST, u64::MAX), |c| c).await;
+    let ok = valid(judge.validate(&bob_entry(2, &phone), &bob_space()).await);
+    assert_eq!(ok.tip, None);
+    assert_eq!(judge.cut_tips(&bob_space()), vec![]);
+}
+
 /// A context lists a cut for any key it likes, but the keys it governs are the ones under its
 /// namespace: a cut for another namespace's device raises no wants (an adopted friend's context
 /// cannot make a node walk someone else's log), and one for a key under its own namespace does.

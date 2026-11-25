@@ -17,6 +17,17 @@
 //! bound leaves out, and every entry that verified but cannot be read, is
 //! listed by its full name, for the owner to re-admit one by one.
 //!
+//! With [`CutBound::tips`] the cut names one tip per space instead
+//! (`RevocationCut::add_tip`: the log's prefix, the seq and the signed-region digest of the
+//! entry, which is the marker's `signed_digest`) and no runs and no manifest. The tip of a
+//! space is the highest kept entry whose whole chain below it (`PREV`/`PREV_SEQ` through the
+//! markers, as [`crate::log`] walks a removal cut's ancestry) this node holds and keeps; a kept
+//! entry off the chain of the tip is listed like the ones the bound leaves out. The digest is
+//! of the signed region, so a relay's high-S copy of an ECDSA entry, another packet by its
+//! whole encoding, is the entry the tip names and is kept with it; a manifest of implicit
+//! digests does not cover it. The validator accepts the key's packets below a tip by name; the
+//! log binds the bytes by the chain of the tip (spec §9.5).
+//!
 //! The log names `<D>/32=log/<S>/seq=<n>` are under `<D>/32=log`, which is all
 //! `ndn-cert` asks of a cut's names (`check_cut_names`): `ndn-fwd revoke` and
 //! the cut file need no change.
@@ -43,7 +54,7 @@ use parking_lot::Mutex;
 
 use crate::error::{HeapError, Timestamp};
 use crate::log::{Log, Standing};
-use crate::store::Kind;
+use crate::store::{Kind, Marker};
 use crate::trust::Judge;
 use crate::wire::{device_of, implicit_digest, log_name, log_prefix};
 
@@ -61,17 +72,28 @@ pub struct CutBound {
     /// so the space names the log `<D>/32=log/<S>`, and a space is what the
     /// owner knows.
     pub upto: BTreeMap<Name, u64>,
+    /// Name one tip per space (`<D>/32=log/<S>`, seq, signed-region digest) instead of the
+    /// seqs and a manifest of every entry kept: the tip is the highest kept entry whose whole
+    /// chain (`PREV`/`PREV_SEQ`) below it this node holds and keeps. A relay's high-S copy of
+    /// an ECDSA entry has the signed-region digest of the entry and is kept with it; the kept
+    /// entries off the chain of the tip are listed like any the bound leaves out. Default
+    /// false: the manifest form.
+    pub tips: bool,
 }
 
 /// A revocation cut a node vouches for (`propose`).
 #[derive(Clone, Debug)]
 pub struct CutProposal {
     /// The cut, with the digest of the public key that verified its entries
-    /// and the full name of its manifest's root.
+    /// and the full name of its manifest's root. In the tips form
+    /// ([`CutBound::tips`]) it names the tips ([`RevocationCut::tips`]: one per space, the
+    /// space's log prefix, seq and signed-region digest) and no runs and no manifest; the tips
+    /// are read from the cut itself, so the proposal carries no second copy of them.
     pub cut: RevocationCut,
     /// The manifest's packets, root first: self-certifying Data listing the
     /// implicit digest of every entry the cut's ranges accept, to be
-    /// published beside the trust context. Empty when the cut keeps nothing.
+    /// published beside the trust context. Empty when the cut keeps nothing,
+    /// and in the tips form.
     pub manifest: Vec<Bytes>,
     /// The entries of the key held here that the bound leaves out, and the
     /// ones that verified but cannot be read, each by its full name ending in
@@ -145,6 +167,58 @@ pub(crate) fn cut_authority(judge: &Judge, key: &Name) -> Result<CutAuthority, H
     })
 }
 
+/// An entry held of the key's device, as a cut sees it.
+struct Seen {
+    seq: u64,
+    /// What was kept when it was verified.
+    marker: Option<Marker>,
+    /// Whether the key may have signed it (a packet that names no signer, or is not held, may
+    /// be the key's).
+    mine: bool,
+    /// Whether it is the key's work the cut keeps: applied or held closed, readable, first seen
+    /// before and at or below the bound.
+    kept: bool,
+    /// The implicit digest of the packet held at its name, when the marker verified it.
+    implicit: Option<[u8; 32]>,
+    /// Whether a cut may keep it or must list it ([`Standing::Live`] or
+    /// [`Standing::Unreadable`]).
+    eligible: bool,
+}
+
+/// The tip of a log: its highest kept entry whose chain below is whole and kept, and the seqs
+/// of that chain (the tip included). `None` when no entry kept is one.
+fn tip_of(seen: &[Seen]) -> Option<(u64, BTreeSet<u64>)> {
+    // Seen ascending by seq. An entry is on a sound chain when it links to the first entry
+    // (zero digest, seq 0) or to a sound entry held as the bytes it names, and when it is not the
+    // key's work that the cut leaves out. What it links to: `PREV_SEQ`, or none for the first.
+    let mut sound: BTreeMap<u64, ([u8; 32], Option<u64>)> = BTreeMap::new();
+    for s in seen {
+        let Some(m) = s.marker else {
+            continue;
+        };
+        let first = m.prev == [0; 32] && m.prev_seq == 0;
+        let linked = first
+            || sound
+                .get(&m.prev_seq)
+                .is_some_and(|(digest, _)| *digest == m.prev);
+        if linked && (s.kept || !s.mine) {
+            sound.insert(s.seq, (m.signed_digest, (!first).then_some(m.prev_seq)));
+        }
+    }
+    let tip = seen
+        .iter()
+        .rev()
+        .find(|s| s.kept && sound.contains_key(&s.seq))?
+        .seq;
+    let mut chain = BTreeSet::new();
+    let mut at = Some(tip);
+    while let Some(seq) = at {
+        chain.insert(seq);
+        at = sound.get(&seq).and_then(|(_, prev)| *prev);
+    }
+    Some((tip, chain))
+}
+
 /// The cut this node can vouch for if `key` (a key name `<id>/KEY/<k>`, or one
 /// of its certificate names) is revoked now, over every space in `logs`,
 /// bounded by `bound` (see the module docs).
@@ -176,26 +250,33 @@ pub(crate) fn propose(
     }
     let device = device_of(&key).expect("key_of checked the key name");
     let mut entries: Vec<(Name, u64, [u8; 32])> = Vec::new();
+    let mut tips: Vec<(Name, u64, [u8; 32])> = Vec::new();
     let mut left_out = Vec::new();
     let mut public: BTreeSet<[u8; 32]> = BTreeSet::new();
     for log in logs {
         let space = &log.space;
         let prefix = log_prefix(&device, space);
+        let mut seen = Vec::new();
         log.each_held(&device, |held| {
-            if !matches!(held.standing, Standing::Live | Standing::Unreadable) {
-                return;
-            }
+            let eligible = matches!(held.standing, Standing::Live | Standing::Unreadable);
             let name = log_name(&device, space, held.seq);
             let Some(wire) = held.wire else {
-                tracing::warn!(%name, "held without the packet its marker verified: left out of the cut");
+                if eligible {
+                    tracing::warn!(%name, "held without the packet its marker verified: left out of the cut");
+                }
+                seen.push(Seen {
+                    seq: held.seq,
+                    marker: held.marker,
+                    mine: true,
+                    kept: false,
+                    implicit: None,
+                    eligible,
+                });
                 return;
             };
             // A packet that names no signer may be the key's: it is listed.
             let signer = signer_of(&wire);
-            if signer.as_ref().is_some_and(|s| *s != key) {
-                return;
-            }
-            let digest = implicit_digest(&wire);
+            let mine = signer.as_ref().is_none_or(|s| *s == key);
             let in_time = bound
                 .held_before
                 .is_none_or(|t| held.marker.is_some_and(|m| m.at < t.0));
@@ -204,19 +285,49 @@ pub(crate) fn propose(
                     .upto
                     .get(space)
                     .is_some_and(|upto| held.seq <= *upto);
-            match held.marker {
-                Some(m)
-                    if held.standing == Standing::Live
-                        && signer.is_some()
-                        && in_time
-                        && in_seq =>
-                {
-                    public.insert(m.key_digest);
-                    entries.push((prefix.clone(), held.seq, digest));
-                }
-                _ => left_out.push(name.append_implicit_digest(digest)),
-            }
+            seen.push(Seen {
+                seq: held.seq,
+                marker: held.marker,
+                mine,
+                kept: eligible
+                    && mine
+                    && held.standing == Standing::Live
+                    && held.marker.is_some()
+                    && signer.is_some()
+                    && in_time
+                    && in_seq,
+                implicit: Some(implicit_digest(&wire)),
+                eligible,
+            });
         });
+        // What the cut keeps of this space: every entry kept (the runs and the manifest), or the
+        // chain of the tip.
+        let chain = if bound.tips { tip_of(&seen) } else { None };
+        for s in &seen {
+            let (Some(implicit), true, true) = (s.implicit, s.eligible, s.mine) else {
+                continue;
+            };
+            let on_chain = match &chain {
+                Some((_, chain)) => chain.contains(&s.seq),
+                None => !bound.tips,
+            };
+            match s.marker {
+                Some(m) if s.kept && on_chain => {
+                    public.insert(m.key_digest);
+                    if !bound.tips {
+                        entries.push((prefix.clone(), s.seq, implicit));
+                    }
+                }
+                _ => {
+                    left_out.push(log_name(&device, space, s.seq).append_implicit_digest(implicit))
+                }
+            }
+        }
+        if let Some((tip, _)) = chain
+            && let Some(m) = seen.iter().find(|s| s.seq == tip).and_then(|s| s.marker)
+        {
+            tips.push((prefix, tip, m.signed_digest));
+        }
     }
     if public.len() > 1 {
         return Err(bad(format!(
@@ -242,6 +353,9 @@ pub(crate) fn propose(
     let mut cut = RevocationCut::new(key.clone());
     for (prefix, seq, _) in &entries {
         cut.add_seq(prefix, *seq);
+    }
+    for (prefix, seq, digest) in &tips {
+        cut.add_tip(prefix, *seq, *digest);
     }
     cut.set_key_digest(key_digest);
     let manifest = if entries.is_empty() {

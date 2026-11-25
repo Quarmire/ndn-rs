@@ -1,5 +1,6 @@
 //! What the log keeps in memory of each device's chain, and its records:
-//! held seqs as ranges, declared voids, and the ancestry a removal cut keeps.
+//! held seqs as ranges, declared voids, and the ancestry a removal cut or a revocation cut that
+//! names a tip keeps.
 //!
 //! Memory is O(devices + ranges + removed devices): no entry and no marker
 //! is held. A marker is read from the store when a decision needs it.
@@ -12,7 +13,8 @@ use ndn_sync::DataStore;
 
 use crate::error::{Cut, Refusal};
 use crate::store::{Kind, Link, Marker};
-use crate::wire::{EntryRef, log_name};
+use crate::trust::TipCut;
+use crate::wire::{EntryRef, implicit_digest, log_name};
 
 /// The most separate runs of held seqs, and the most gap statements, this
 /// device keeps for one device: the `ledger/` record is rewritten with every
@@ -454,5 +456,60 @@ impl Kept {
         } else {
             outside()
         })
+    }
+}
+
+/// What a revocation cut that names a tip of a revoked key's log keeps of it (spec §9.5): the
+/// chain below the tip, walked from the tip as a removal cut's is ([`Kept`]), and the entries
+/// the cut re-admits by exact name.
+///
+/// The validator accepts the key's packets below the tip by name and cannot see which bytes are
+/// kept; this is where they are bound: an entry of the key below the tip is kept only as the
+/// bytes the chain from the tip names (by signed-region digest, so a relay's copy under another
+/// signature value is the same entry). What lies above the tip is the validator's: it refuses
+/// it, or a range of the same cut accepts it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Tipped {
+    /// The device whose log the tip is of.
+    pub device: Name,
+    /// The chain from the tip.
+    pub kept: Kept,
+    /// The entries of the log the cut re-admits by name, `(seq, implicit digest)`.
+    pub readmitted: Vec<(u64, [u8; 32])>,
+}
+
+impl Tipped {
+    /// The chain `cut` keeps of `device`'s log, walked as far as the markers go.
+    pub(super) fn compute(
+        store: &dyn DataStore,
+        device: &Name,
+        space: &Name,
+        cut: &TipCut,
+    ) -> Tipped {
+        Tipped {
+            device: device.clone(),
+            kept: Kept::compute(store, device, space, vec![cut.tip]),
+            readmitted: cut.readmitted.clone(),
+        }
+    }
+
+    /// What the cut says of the entry `id`, held (or arriving) as `wire`: `Ok` when it is above
+    /// the tip (not the chain's to judge), re-admitted by name, or on the chain of the tip as
+    /// the very bytes the chain names; else as [`Kept::keeps`] says: waiting while the chain
+    /// below is not whole, refused when off it.
+    pub(super) fn keeps(
+        &self,
+        store: &dyn DataStore,
+        space: &Name,
+        id: &EntryRef,
+        wire: &Bytes,
+    ) -> Result<(), Status> {
+        if id.seq > self.kept.keeps_to()
+            || (!self.readmitted.is_empty()
+                && self.readmitted.contains(&(id.seq, implicit_digest(wire))))
+        {
+            return Ok(());
+        }
+        self.kept.keeps(store, space, id)
     }
 }

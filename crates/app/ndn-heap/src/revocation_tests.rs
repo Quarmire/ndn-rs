@@ -13,18 +13,18 @@ use ndn_packet::Data;
 use ndn_packet::encode::DataBuilder;
 use ndn_security::confidentiality::RecipientKey;
 use ndn_security::{
-    CertCache, Certificate, Ed25519Signer, Keyring, RevocationCut, SignedTrustContext, Signer,
-    Validator, public_key_digest,
+    CertCache, Certificate, EcdsaP256Signer, Ed25519Signer, Keyring, RevocationCut,
+    SignedTrustContext, Signer, Validator, public_key_digest,
 };
 use ndn_sync::{DataStore, MemoryStore};
 
 use super::*;
 use crate::error::{Cut, NextStep, Refusal, Timestamp};
-use crate::log::{Log, Outcome, Params};
+use crate::log::{Log, Outcome, Params, Standing};
 use crate::reserve::Flusher;
 use crate::seal::{self, Keys};
 use crate::test_kit::{CrashStore, n};
-use crate::trust::{Judge, Verified};
+use crate::trust::{Judge, Judged, Verified};
 use crate::wire::{
     Body, Entry, MembersBody, Op, Payload, Prev, PutBody, Role, implicit_digest, log_name,
     signed_digest,
@@ -46,7 +46,7 @@ struct Dev {
     name: Name,
     key: Name,
     person: Name,
-    signer: Arc<Ed25519Signer>,
+    signer: Arc<dyn Signer>,
 }
 
 fn dev(name: &str, person: &str, key_id: &str, seed: u8) -> Dev {
@@ -75,7 +75,7 @@ fn carol() -> Dev {
 }
 
 fn key_digest(d: &Dev) -> [u8; 32] {
-    public_key_digest(&d.signer.public_key_bytes())
+    public_key_digest(&d.signer.public_key().expect("a public key"))
 }
 
 /// A signed packet.
@@ -196,6 +196,7 @@ fn admit_as(log: &mut Log, p: &Packet, digest: Option<[u8; 32]>, now: u64) -> Ou
         person: p.dev.person.clone(),
         key_digest: digest.unwrap_or_else(|| key_digest(&p.dev)),
         owner_capable: true,
+        tip: None,
     };
     log.admit(&p.wire, &data, &v, now, false).0
 }
@@ -557,6 +558,7 @@ async fn the_cut_names_satisfy_check_cut_names() {
     let bound = CutBound {
         held_before: Some(Timestamp(2_000)),
         upto: [(notes(), 9), (photos(), 9)].into_iter().collect(),
+        ..CutBound::default()
     };
     let proposal = propose(&[&a, &b], &authority(), &bob().key, &bound).unwrap();
     assert_eq!(proposal.cut.ranges().len(), 2);
@@ -590,9 +592,10 @@ async fn the_cut_names_satisfy_check_cut_names() {
 /// A certificate of Bob's phone's first key, issued by the key itself.
 async fn bob_cert() -> Certificate {
     let subject = bob().signer;
+    let public = subject.public_key().unwrap();
     let wire = ndn_security::manager::encode_cert_data(
         &subject.key_name().clone().append("self").append_version(1),
-        &subject.public_key_bytes(),
+        &public,
         &*subject,
         1_000_000_000_000_000_000,
         u64::MAX,
@@ -802,4 +805,306 @@ async fn a_burst_of_equivocating_keys_of_one_person_marks_no_more_than_the_allow
         );
     }
     assert_eq!(suspicion.keys().len(), SUSPECTS_PER_PERSON);
+}
+
+// -- A cut that names tips (spec §9.5) ---------------------------------------------------
+
+fn tips_at(t: u64) -> CutBound {
+    CutBound {
+        held_before: Some(Timestamp(t)),
+        tips: true,
+        ..CutBound::default()
+    }
+}
+
+/// The tips a cut over Bob's logs names: `(space, seq, the entry)` each.
+fn expected_tips(key: &Dev, tips: &[(&Name, u64, &Packet)]) -> RevocationCut {
+    let mut cut = RevocationCut::new(key.key.clone());
+    for (space, seq, p) in tips {
+        cut.add_tip(&prefix(space), *seq, signed_digest(&p.wire));
+    }
+    cut
+}
+
+/// Asked for tips, a cut names one tip per space (the highest entry it keeps whose chain below
+/// is whole and kept) and no seqs and no manifest: the bytes below a tip are bound by its
+/// chain, not by a list of every entry. The manifest form stays the default.
+#[tokio::test]
+async fn a_revocation_cut_as_tips_names_one_tip_per_space_and_no_manifest() {
+    let store = Arc::new(CrashStore::new());
+    let mut a = found(&store, &notes(), &["/bob"]);
+    let mut b = found(&store, &photos(), &["/bob"]);
+    let mut c = found(&store, &diary(), &[]);
+    let mut in_notes = Chain::new(bob(), notes());
+    applied(&mut a, &in_notes.put("/a", "1"), 1_000);
+    applied(&mut a, &in_notes.put("/b", "2"), 1_000);
+    // Seq 3 was never signed: the entry at 4 states the gap, which a chain walk follows.
+    let top = in_notes.put_at(4, "/c", "4");
+    applied(&mut a, &top, 1_000);
+    let mut in_photos = Chain::new(bob(), photos());
+    applied(&mut b, &in_photos.put("/p", "1"), 1_000);
+    let newest = in_photos.put("/q", "2");
+    applied(&mut b, &newest, 1_000);
+    // The diary does not list Bob: refused as it arrives, neither kept nor listed.
+    let refused = Chain::new(bob(), diary()).put("/x", "5");
+    assert_eq!(
+        admit_as(&mut c, &refused, None, 1_000),
+        Outcome::Refused(Refusal::NotMember)
+    );
+
+    let logs = [&a, &b, &c];
+    let proposal = propose(&logs, &authority(), &bob().key, &tips_at(2_000)).unwrap();
+    let want = expected_tips(&bob(), &[(&notes(), 4, &top), (&photos(), 2, &newest)]);
+    assert_eq!(proposal.cut.tips(), want.tips());
+    assert!(proposal.cut.ranges().is_empty(), "no seqs are listed");
+    assert!(
+        proposal.cut.manifest().is_none() && proposal.manifest.is_empty(),
+        "no manifest is made"
+    );
+    assert!(proposal.left_out.is_empty(), "{:?}", proposal.left_out);
+    assert_eq!(proposal.cut.key_digest(), Some(&key_digest(&bob())));
+
+    // By a certificate name of the key: the same cut.
+    let cert_name = bob().key.append("self").append_version(1);
+    let by_cert = propose(&logs, &authority(), &cert_name, &tips_at(2_000)).unwrap();
+    assert_eq!(by_cert.cut.tips(), want.tips());
+
+    // A bound that keeps nothing names no tip and lists what it leaves out; the key digest is
+    // the one public key the authority holds of the key.
+    let certified = CutAuthority {
+        namespace: n("/bob"),
+        certified: [[1u8; 32]].into_iter().collect(),
+    };
+    let none = propose(&logs, &certified, &bob().key, &tips_at(500)).unwrap();
+    assert!(none.cut.tips().is_empty() && none.cut.manifest().is_none());
+    assert_eq!(none.cut.key_digest(), Some(&[1u8; 32]));
+    assert_eq!(none.left_out.len(), 5);
+
+    // The seq bound caps the tip of each space it names, and a space it leaves out keeps nothing.
+    let upto = CutBound {
+        upto: [(notes(), 2)].into_iter().collect(),
+        tips: true,
+        ..CutBound::default()
+    };
+    let capped = propose(&logs, &authority(), &bob().key, &upto).unwrap();
+    assert_eq!(capped.cut.tips().len(), 1);
+    assert_eq!(capped.cut.tips()[0].seq, 2);
+    assert_eq!(capped.left_out.len(), 3, "{:?}", capped.left_out);
+
+    // Without the switch the cut is the manifest form.
+    let manifest = propose(&logs, &authority(), &bob().key, &lost_at(2_000)).unwrap();
+    assert!(manifest.cut.tips().is_empty() && manifest.cut.manifest().is_some());
+}
+
+/// A kept entry that is not on the chain of the tip (a fork beside the chain, or one whose chain
+/// below is not held) is not covered by the tip: it is listed by its full name, for the owner to
+/// re-admit one by one, and a space whose chain is not whole has no tip.
+#[tokio::test]
+async fn entries_off_the_chain_of_the_tip_are_left_out_and_listed() {
+    let store = Arc::new(CrashStore::new());
+    let mut log = found(&store, &notes(), &["/bob"]);
+    let mut chain = Chain::new(bob(), notes());
+    let e1 = chain.put("/a", "1");
+    let e2 = chain.put("/b", "2");
+    let fork = chain.put("/fork", "off the chain");
+    // Seq 4 names seq 2 as its predecessor, so seq 3 is on no chain from 4 or above.
+    chain.last = Some((2, signed_digest(&e2.wire)));
+    let e4 = chain.put_at(4, "/c", "4");
+    let e5 = chain.put("/d", "5");
+    for p in [&e1, &e2, &fork, &e4, &e5] {
+        applied(&mut log, p, 1_000);
+    }
+
+    let proposal = propose(&[&log], &authority(), &bob().key, &tips_at(2_000)).unwrap();
+    assert_eq!(
+        proposal.cut.tips(),
+        expected_tips(&bob(), &[(&notes(), 5, &e5)]).tips()
+    );
+    assert_eq!(proposal.left_out, vec![fork.full()], "listed, to re-admit");
+
+    // Bounded to seq 3, the fork is the highest entry kept and its chain is whole: the tip is
+    // there, and what lies above the bound is listed as always.
+    let upto = CutBound {
+        upto: [(notes(), 3)].into_iter().collect(),
+        tips: true,
+        ..CutBound::default()
+    };
+    let capped = propose(&[&log], &authority(), &bob().key, &upto).unwrap();
+    assert_eq!(
+        capped.cut.tips(),
+        expected_tips(&bob(), &[(&notes(), 3, &fork)]).tips()
+    );
+    let mut above = vec![e4.full(), e5.full()];
+    above.sort();
+    assert_eq!(capped.left_out, above);
+
+    // A chain with a hole below the entries held has no tip: nothing is kept, all is listed.
+    let mut b = found(&store, &photos(), &["/bob"]);
+    let mut in_photos = Chain::new(bob(), photos());
+    let (_missing, p2, p3) = (
+        in_photos.put("/p", "1"),
+        in_photos.put("/q", "2"),
+        in_photos.put("/r", "3"),
+    );
+    applied(&mut b, &p2, 1_000);
+    applied(&mut b, &p3, 1_000);
+    let certified = CutAuthority {
+        namespace: n("/bob"),
+        certified: [key_digest(&bob())].into_iter().collect(),
+    };
+    let whole = propose(&[&b], &certified, &bob().key, &tips_at(2_000)).unwrap();
+    assert!(whole.cut.tips().is_empty());
+    let mut listed = vec![p2.full(), p3.full()];
+    listed.sort();
+    assert_eq!(whole.left_out, listed);
+}
+
+/// A certificate of `subject`'s key issued by `issuer`'s.
+async fn issued(subject: &dyn Signer, issuer: &dyn Signer, id: &str) -> Certificate {
+    let wire = ndn_security::manager::encode_cert_data(
+        &subject.key_name().clone().append(id).append_version(1),
+        &subject.public_key().unwrap(),
+        issuer,
+        1_000_000_000_000_000_000,
+        u64::MAX,
+    )
+    .await
+    .unwrap();
+    Certificate::decode(&Data::decode(wire).unwrap()).unwrap()
+}
+
+/// A judge over the namespace `/bob`, anchored at a root key that certified `dev`'s key; `edit`
+/// shapes the context (a revocation and its cut), `manifest` is what the validator holds of it.
+async fn judge_for(
+    dev: &Dev,
+    edit: impl FnOnce(SignedTrustContext) -> SignedTrustContext,
+    manifest: &[Bytes],
+) -> Arc<Judge> {
+    let root = Ed25519Signer::from_seed(&[70; 32], n("/bob/KEY/root"));
+    let anchor = issued(&root, &root, "self").await;
+    let leaf = issued(&*dev.signer, &root, "root").await;
+    let ctx = edit(SignedTrustContext::hierarchical(n("/bob")).with_version(1));
+    ctx.anchors().insert(Arc::clone(&anchor.name), anchor);
+    let keyring = Arc::new(Keyring::new());
+    keyring.adopt(Arc::new(ctx)).unwrap();
+    let cache = Arc::new(CertCache::new());
+    cache.insert(leaf);
+    let validator = Arc::new(Validator::with_keyring(keyring, cache, None, 5));
+    for packet in manifest {
+        let data = Data::decode(packet.clone()).unwrap();
+        validator.cut_manifests().insert(&data).unwrap();
+    }
+    Judge::new(
+        validator,
+        Arc::new(MemoryStore::new()) as Arc<dyn DataStore>,
+        None,
+    )
+    .0
+}
+
+async fn judged(judge: &Judge, wire: &Bytes, space: &Name) -> Judged {
+    judge
+        .validate(&Data::decode(wire.clone()).unwrap(), space)
+        .await
+}
+
+fn valid(judged: Judged) -> Verified {
+    match judged {
+        Judged::Valid(v) => v,
+        other => panic!("not valid: {other:?}"),
+    }
+}
+
+/// L10 closed: a relay's high-S copy of an ECDSA entry has the signed region of the entry and
+/// not its implicit digest. A cut that lists implicit digests (the manifest form) does not
+/// cover the copy, so the validator refuses it; a cut that names a tip by the signed-region
+/// digest covers it, below the tip and at it, and the log takes the copy for the entry the
+/// chain names.
+#[tokio::test]
+async fn a_high_s_copy_of_an_entry_below_the_tip_is_accepted() {
+    let ecdsa = Dev {
+        name: n("/bob/phone"),
+        key: n("/bob/phone/KEY/e1"),
+        person: n("/bob"),
+        signer: Arc::new(EcdsaP256Signer::from_seed(&[11; 32], n("/bob/phone/KEY/e1")).unwrap()),
+    };
+    let store = Arc::new(CrashStore::new());
+    let mut log = found(&store, &notes(), &["/bob"]);
+    let mut chain = Chain::new(ecdsa.clone(), notes());
+    let (e1, e2, e3) = (
+        chain.put("/a", "1"),
+        chain.put("/b", "2"),
+        chain.put("/c", "3"),
+    );
+    for p in [&e1, &e2, &e3] {
+        applied(&mut log, p, 1_000);
+    }
+    let by_manifest = propose(&[&log], &authority(), &ecdsa.key, &lost_at(2_000)).unwrap();
+    let by_tip = propose(&[&log], &authority(), &ecdsa.key, &tips_at(2_000)).unwrap();
+    assert!(by_manifest.cut.manifest().is_some() && by_tip.cut.tips().len() == 1);
+
+    let (copy2, copy3) = (
+        crate::test_kit::other_s_copy(&e2.wire, &*ecdsa.signer),
+        crate::test_kit::other_s_copy(&e3.wire, &*ecdsa.signer),
+    );
+    assert_ne!(implicit_digest(&copy2), implicit_digest(&e2.wire));
+    assert_eq!(signed_digest(&copy2), signed_digest(&e2.wire));
+
+    // The manifest lists the implicit digest of the entry: the copy is another packet, refused.
+    let (key, cut) = (ecdsa.key.clone(), by_manifest.cut.clone());
+    let manifest_judge = judge_for(
+        &ecdsa,
+        |c| c.with_revocation(key).with_revocation_cut(cut),
+        &by_manifest.manifest,
+    )
+    .await;
+    valid(judged(&manifest_judge, &e2.wire, &notes()).await);
+    assert!(
+        matches!(
+            judged(&manifest_judge, &copy2, &notes()).await,
+            Judged::Refused(Refusal::OutsideCut(_))
+        ),
+        "the manifest form refuses a relay's copy of an entry it keeps"
+    );
+
+    // The tip names the signed region: the copy is the entry, below the tip and at it, and the
+    // verdict tells the log the tip.
+    let (key, cut) = (ecdsa.key.clone(), by_tip.cut.clone());
+    let tip_judge = judge_for(
+        &ecdsa,
+        |c| c.with_revocation(key).with_revocation_cut(cut),
+        &[],
+    )
+    .await;
+    let below = valid(judged(&tip_judge, &copy2, &notes()).await);
+    let at = valid(judged(&tip_judge, &copy3, &notes()).await);
+    let tip = crate::trust::TipCut {
+        tip: crate::store::Link {
+            seq: 3,
+            digest: signed_digest(&e3.wire),
+        },
+        readmitted: vec![],
+    };
+    assert_eq!(
+        (below.tip.as_ref(), at.tip.as_ref()),
+        (Some(&tip), Some(&tip))
+    );
+
+    // A device that took the copies keeps them as the entries the chain names: the entries
+    // above name the signed digest, which a copy shares with the original.
+    let other = Arc::new(CrashStore::new());
+    let mut late = found(&other, &notes(), &["/bob"]);
+    for wire in [&copy3, &copy2, &e1.wire] {
+        let data = Data::decode(wire.clone()).unwrap();
+        let v = valid(judged(&tip_judge, wire, &notes()).await);
+        let (outcome, _) = late.admit(wire, &data, &v, 1_000, false);
+        assert_eq!(outcome, Outcome::Applied, "{}", data.name);
+    }
+    let mut live = 0;
+    late.each_held(&ecdsa.name, |held| {
+        if held.standing == Standing::Live {
+            live += 1;
+        }
+    });
+    assert_eq!(live, 3, "the chain is whole and kept");
 }

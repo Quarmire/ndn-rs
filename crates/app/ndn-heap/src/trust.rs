@@ -42,7 +42,7 @@ use tokio::sync::mpsc;
 
 use crate::error::{Cut, Refusal, Timestamp};
 use crate::rt::{self, Instant};
-use crate::store::Kind;
+use crate::store::{Kind, Link};
 use crate::wire::{ASKER_CHAIN_MAX, ASKER_CHAIN_OCTETS_MAX, device_of, log_prefix, parse_log_name};
 
 /// The first pause before a person the host could not adopt is asked again;
@@ -132,6 +132,20 @@ impl fmt::Display for Waiting {
     }
 }
 
+/// What the revocation cut that revoked a key says of the key's log of one space, when it names
+/// a tip there (spec §9.5): the log's one tip and the entries the cut re-admits by exact name.
+/// The validator accepts a packet of a tip cut's key below the tip by name, and the tip entry
+/// by its signed-region digest; which bytes below the tip count is the log's to say, by chain
+/// ancestry of the tip ([`crate::log::Log::cut_tips`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TipCut {
+    /// The tip entry of the log: its seq and its signed-region digest.
+    pub tip: Link,
+    /// The entries of this log the cut re-admits by exact name, `(seq, implicit digest)`: kept
+    /// whatever the chain says, for the owner re-admits them one by one.
+    pub readmitted: Vec<(u64, [u8; 32])>,
+}
+
 /// A packet that verified: who signed it, and by which key. The packet itself
 /// is the caller's (it passed it in); nothing here borrows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +165,9 @@ pub(crate) struct Verified {
     /// context that vouched for the key; the log judges every owner power by
     /// it (spec §1.2, §9.9).
     pub owner_capable: bool,
+    /// The tip of the revocation cut of the signing key for this log, when the key is revoked
+    /// by a cut that names one: the log judges the key's entries below it by its chain.
+    pub tip: Option<TipCut>,
 }
 
 /// The verdict on one packet.
@@ -943,23 +960,33 @@ impl Judge {
         let mut out = Vec::new();
         for ctx in self.validator.keyring().contexts() {
             for cut in governed_cuts(&ctx) {
-                for full in cut.exact() {
-                    let Some((last, rest)) = full.components().split_last() else {
-                        continue;
-                    };
-                    let Ok(digest) = <[u8; 32]>::try_from(last.value.as_ref()) else {
-                        continue;
-                    };
-                    if last.typ != ndn_packet::tlv_type::IMPLICIT_SHA256 {
-                        continue;
-                    }
-                    let entry = Name::from_components(rest.iter().cloned());
-                    let Some(log) = parse_log_name(&entry) else {
-                        continue;
-                    };
-                    if log.space == *space && device_of(cut.key()).as_ref() == Some(&log.device) {
-                        out.push((log.device, log.seq, digest));
-                    }
+                let Some(device) = device_of(cut.key()) else {
+                    continue;
+                };
+                out.extend(
+                    readmitted_in(cut, &device, space)
+                        .into_iter()
+                        .map(|(seq, digest)| (device.clone(), seq, digest)),
+                );
+            }
+        }
+        out
+    }
+
+    /// The tips the trust contexts this node holds name in revocation cuts, of `space`:
+    /// `(device, seq, signed-region digest)`. A device that holds nothing of a revoked key asks
+    /// for its tip by that digest, whatever counter the group shows; the log walks the chain
+    /// below it from there ([`crate::log::Log::cut_wants`]). Only the cuts of keys a context
+    /// governs count ([`Self::cut_runs`]).
+    pub(crate) fn cut_tips(&self, space: &Name) -> Vec<(Name, u64, [u8; 32])> {
+        let mut out = Vec::new();
+        for ctx in self.validator.keyring().contexts() {
+            for cut in governed_cuts(&ctx) {
+                let Some(device) = device_of(cut.key()) else {
+                    continue;
+                };
+                if let Some(tip) = cut.tip_for(&log_prefix(&device, space)) {
+                    out.push((device, tip.seq, tip.digest));
                 }
             }
         }
@@ -1205,16 +1232,56 @@ impl Judge {
 // ---- the verdicts of the durable rule ----------------------------------------------------------
 
 /// What `ctx`'s revocation of `key` keeps of `device`'s log of `space`: the
-/// highest seq its cut accepts there. A revocation with no cut for that log
-/// keeps nothing (tip 0).
+/// highest seq its cut accepts there, a run's last or the cut's tip (the entries on the chain
+/// up to the tip). A revocation with no cut for that log keeps nothing (tip 0).
 fn cut_of(ctx: &SignedTrustContext, key: &Name, device: Name, space: &Name) -> Cut {
     let prefix = log_prefix(&device, space);
-    let keeps_to = ctx
-        .revocation_cut(&key_name_of(key))
+    let cut = ctx.revocation_cut(&key_name_of(key));
+    let ranged = cut
         .and_then(|cut| cut.ranges().iter().find(|r| r.prefix == prefix))
         .and_then(|range| range.runs.iter().map(|&(_, last)| last).max())
         .unwrap_or(0);
-    Cut { device, keeps_to }
+    let tipped = cut
+        .and_then(|cut| cut.tip_for(&prefix))
+        .map_or(0, |tip| tip.seq);
+    Cut {
+        device,
+        keeps_to: ranged.max(tipped),
+    }
+}
+
+/// The entries `cut` re-admits by exact name in `device`'s log of `space`: `(seq, implicit
+/// digest)`.
+fn readmitted_in(cut: &RevocationCut, device: &Name, space: &Name) -> Vec<(u64, [u8; 32])> {
+    cut.exact()
+        .iter()
+        .filter_map(|full| {
+            let (last, rest) = full.components().split_last()?;
+            let digest = <[u8; 32]>::try_from(last.value.as_ref()).ok()?;
+            if last.typ != ndn_packet::tlv_type::IMPLICIT_SHA256 {
+                return None;
+            }
+            let log = parse_log_name(&Name::from_components(rest.iter().cloned()))?;
+            (log.space == *space && log.device == *device).then_some((log.seq, digest))
+        })
+        .collect()
+}
+
+/// The tip `ctx`'s revocation of `key` names in `device`'s log of `space`, with what the cut
+/// re-admits there by name: `None` when `key` is not revoked or its cut names no tip there.
+fn tip_cut(ctx: &SignedTrustContext, key: &Name, device: &Name, space: &Name) -> Option<TipCut> {
+    if !ctx.is_revoked(key) {
+        return None;
+    }
+    let cut = ctx.revocation_cut(&key_name_of(key))?;
+    let tip = cut.tip_for(&log_prefix(device, space))?;
+    Some(TipCut {
+        tip: Link {
+            seq: tip.seq,
+            digest: tip.digest,
+        },
+        readmitted: readmitted_in(cut, device, space),
+    })
 }
 
 /// The revocation cuts of `ctx` that it governs: the cuts of keys under its own namespace. A
@@ -1258,14 +1325,20 @@ async fn decide(view: &Validator, data: &Data, space: &Name, fetch: bool) -> Jud
     };
     let key = data.sig_info().and_then(|s| s.key_locator_name());
     match verdict {
-        ValidationResult::Valid(safe) => accept(view, data, *safe, key.as_deref()),
+        ValidationResult::Valid(safe) => accept(view, data, *safe, key.as_deref(), space),
         ValidationResult::Pending => Judged::Pending(Waiting::Chain),
         ValidationResult::Invalid(e) => refuse(view, data, space, key.as_deref(), &e),
     }
 }
 
 /// A packet the validator found valid: signed by a key, not by a digest.
-fn accept(view: &Validator, data: &Data, safe: SafeData, key: Option<&Name>) -> Judged {
+fn accept(
+    view: &Validator,
+    data: &Data,
+    safe: SafeData,
+    key: Option<&Name>,
+    space: &Name,
+) -> Judged {
     if matches!(safe.trust_path(), TrustPath::DigestSha256) {
         return Judged::Refused(Refusal::Untrusted {
             why: "it is signed by a digest alone, which names no signer (anyone can compute it)"
@@ -1282,12 +1355,14 @@ fn accept(view: &Validator, data: &Data, safe: SafeData, key: Option<&Name>) -> 
     };
     let ctx = view.keyring().context_for(&data.name);
     let person = ctx.namespace().clone();
+    let tip = tip_cut(&ctx, key, &device, space);
     Judged::Valid(Verified {
         key: key.clone(),
         device,
         person,
         key_digest,
         owner_capable: owner_capable(&ctx, key),
+        tip,
     })
 }
 

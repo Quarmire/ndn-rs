@@ -18,7 +18,8 @@
 //!
 //! **What the log holds.** O(devices + ranges + removed devices + heads): per
 //! device its person, the held seqs and declared voids as ranges, the highest
-//! seq heard, the chain tip; per removed device the ancestry its cut keeps.
+//! seq heard, the chain tip; per removed device (and per revoked key a cut names a tip of) the
+//! ancestry its cut keeps.
 //! No entry and no marker is resident: a marker is read when a decision needs
 //! it, so a cold open of 100,000 entries reads one `ledger/` record per
 //! device. An entry's state is its `status/` record (absent = applied).
@@ -50,12 +51,17 @@
 //!    entry that verifies but does not decode is recorded as refused for what
 //!    it carries, so walks through it complete. Every digest is a
 //!    signed-region digest: a relay's re-signed copy changes nothing.
-//! 4. **Cuts as tips** ([`chain::Kept`]): for a removed person, per device,
+//! 4. **Cuts as tips** ([`chain::Kept`], [`chain::Tipped`]): for a removed person, per device,
 //!    the seqs reachable from the cut's tip through `verified/` markers
 //!    alone. An entry is kept iff its seq is reached AND its signed digest is
 //!    the one the chain names; other bytes at a kept seq are refused. Links
 //!    not held are [`Want`]s with the exact digest; what is not yet connected
-//!    waits ([`Outcome::Waiting`]) and never counts.
+//!    waits ([`Outcome::Waiting`]) and never counts. The same walk binds the
+//!    key of a revocation cut that names a tip of this log ([`Verified::tip`], told by the
+//!    judge with every entry and by [`Log::cut_tips`] when a context is adopted): the validator
+//!    accepts the key's packets below the tip by name, and an entry of the key below the tip is
+//!    kept only as a chain ancestor of the tip (a relay's high-S copy is the same signed
+//!    object), or when the cut re-admits it by exact name; above the tip the validator decides.
 //! 5. **Re-check** ([`Log::admit`] of a Members entry, [`Log::key_arrived`],
 //!    [`Log::withdraw`]): the held entries of the persons whose standing
 //!    changed are judged again from the store; an applied one now refused
@@ -100,7 +106,7 @@ mod view;
 #[cfg(test)]
 mod tests;
 
-use chain::{Dev, Kept, Status};
+use chain::{Dev, Kept, Status, Tipped};
 pub(crate) use own::pack_ops;
 pub(crate) use view::Standing;
 use view::View;
@@ -430,6 +436,10 @@ pub(crate) struct Log {
     devices: BTreeMap<Name, Dev>,
     /// What each removed device's cut keeps.
     kept: BTreeMap<Name, Kept>,
+    /// What the revocation cut of each revoked key that names a tip of a log of this space keeps
+    /// of it, by key: what the judge last told the log ([`Log::cut_tips`], [`Verified::tip`]).
+    /// Nothing is stored: a restart judges the held entries again, which tells it.
+    tipped: BTreeMap<Name, Tipped>,
     suspicion: Arc<Suspicion>,
     /// Entries held closed.
     closed: u64,
@@ -482,6 +492,7 @@ impl Log {
             own_tip: None,
             devices: BTreeMap::new(),
             kept: BTreeMap::new(),
+            tipped: BTreeMap::new(),
             closed: 0,
             closed_in: parking_lot::Mutex::new(None),
             queue: Vec::new(),
@@ -890,11 +901,15 @@ impl Log {
     /// one by one (`exact`, from [`Judge::cut_exact`](crate::trust::Judge::cut_exact)) are wanted
     /// by the bytes it names unless the packet held at the name has those bytes (a held entry
     /// refused for the cut is judged again when the cut arrives, not asked for; the same bytes
-    /// kept only as evidence beside others are asked for).
+    /// kept only as evidence beside others are asked for). The tips a cut names (`tips`, from
+    /// [`Judge::cut_tips`](crate::trust::Judge::cut_tips): `(device, seq, signed digest)`) are
+    /// wanted by that digest unless an entry with it is held: the tip is the one entry nothing
+    /// else names, and the chain below it is wanted from there ([`Self::missing`]).
     pub(crate) fn cut_wants(
         &self,
         runs: &[(Name, u64, u64)],
         exact: &[(Name, u64, [u8; 32])],
+        tips: &[(Name, u64, [u8; 32])],
     ) -> Vec<Want> {
         let mut out = Vec::new();
         for (device, first, last) in runs {
@@ -931,13 +946,26 @@ impl Log {
                 });
             }
         }
+        for (device, seq, digest) in tips {
+            let held = view
+                .marker(device, *seq)
+                .is_some_and(|m| m.signed_digest == *digest);
+            if !held {
+                out.push(Want {
+                    device: device.clone(),
+                    first: *seq,
+                    last: *seq,
+                    digest: Some(Pin::Signed(*digest)),
+                });
+            }
+        }
         out
     }
 
     /// Everything wanted: the holes below the highest seq held of each device
-    /// it walks ([`Self::high`]), and the exact entries a removal cut names
-    /// that are not held. A device is walked once an admitted entry of it is
-    /// held (it vouches), or when it is this device or a removed one: a
+    /// it walks ([`Self::high`]), and the exact entries a removal cut or a
+    /// revocation cut's tip chain names that are not held. A device is walked once an admitted
+    /// entry of it is held (it vouches), or when it is this device or a removed one: a
     /// stranger's refused entry opens no walk below itself. A counter heard
     /// wants nothing here; the fetch probes the entry it names
     /// ([`Self::high`]). The node windows what it asks at a time.
@@ -961,6 +989,9 @@ impl Log {
         }
         for (device, kept) in &self.kept {
             out.extend(frontier_wants(device, kept));
+        }
+        for tipped in self.tipped.values() {
+            out.extend(frontier_wants(&tipped.device, &tipped.kept));
         }
         out
     }

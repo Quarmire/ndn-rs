@@ -23,7 +23,7 @@ use crate::node::tests::private;
 use crate::seal::{self, GrantRefusal};
 use crate::space::MembersChange;
 use crate::sync::Taken;
-use crate::wire::{Body, Entry as WireEntry, Payload, PutBody};
+use crate::wire::{Body, Entry as WireEntry, Payload, Prev, PutBody};
 
 /// A face that counts the Interests a node expresses through it.
 struct Tap {
@@ -668,6 +668,209 @@ async fn a_late_device_reads_what_a_revocation_cut_keeps_below_a_counter_nobody_
     })
     .await;
     assert_eq!(late.get(&n("/c")).await.unwrap(), None);
+}
+
+/// Every device of the mesh adopts version `version` of the namespace's context, which revokes
+/// `key` with `cut`.
+fn adopt_revoking(m: &Mesh, key: &Name, version: u64, cut: &ndn_security::RevocationCut) {
+    for dev in &m.devs {
+        let held = dev
+            .validator
+            .keyring()
+            .contexts()
+            .into_iter()
+            .find(|c| *c.namespace() == n("/alice"))
+            .expect("the namespace's context");
+        let next = ndn_security::SignedTrustContext::hierarchical(n("/alice"))
+            .with_version(version)
+            .with_revocation(key.clone())
+            .with_revocation_cut(cut.clone());
+        for anchor in held.anchors().iter() {
+            next.add_anchor(anchor.value().clone());
+        }
+        dev.validator
+            .keyring()
+            .adopt_update(Arc::new(next))
+            .expect("adopted");
+    }
+}
+
+/// A cut that names a tip, with no manifest, keeps what a device that was never in the group
+/// asks for: the tip by its signed-region digest (the counter the group shows names an entry
+/// above it that nobody serves), then the chain below it, entry by entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_device_reads_what_a_tip_cut_keeps_below_a_counter_nobody_answers() {
+    let m = mesh(&["/alice/laptop", "/alice/phone", "/alice/tablet"]).await;
+    let (laptop, phone) = (m.boot(0, fast()).await, m.boot(1, fast()).await);
+    let mine = laptop.create(&space(), public()).await.unwrap();
+    let theirs = phone.open(&space()).await.unwrap();
+    eventually("the phone holds the space", || async { theirs.ready() }).await;
+    for (path, value) in [("/a", "one"), ("/b", "two")] {
+        theirs
+            .put(&n(path), bytes(value), durable(false))
+            .await
+            .unwrap();
+    }
+    eventually("the laptop holds the phone's two entries", || async {
+        has(&mine, "/a", "one").await && has(&mine, "/b", "two").await
+    })
+    .await;
+
+    // The laptop vouches for what it holds, as one tip; the phone writes once more, above it.
+    let key = m.devs[1].name.clone().append("KEY").append("1");
+    let bound = CutBound {
+        held_before: Some(Timestamp(u64::MAX / 2)),
+        tips: true,
+        ..CutBound::default()
+    };
+    let proposal = laptop.revocation_cut(&key, &bound).unwrap();
+    assert!(proposal.manifest.is_empty() && proposal.cut.manifest().is_none());
+    assert_eq!(proposal.cut.tips().len(), 1);
+    theirs
+        .put(&n("/c"), bytes("three"), durable(false))
+        .await
+        .unwrap();
+
+    adopt_revoking(&m, &key, 2, &proposal.cut);
+    eventually(
+        "the phone's third entry is refused by the laptop",
+        || async { matches!(mine.get(&n("/c")).await, Ok(None)) },
+    )
+    .await;
+    assert_eq!(
+        mine.get(&n("/a")).await.unwrap().unwrap().bytes,
+        bytes("one")
+    );
+
+    // A device of the owner that was never in the group reads what the tip keeps.
+    let tablet = m.boot(2, fast()).await;
+    let late = tablet.open(&space()).await.unwrap();
+    eventually("the tablet reads the entries the tip keeps", || async {
+        has(&late, "/a", "one").await && has(&late, "/b", "two").await
+    })
+    .await;
+    assert_eq!(late.get(&n("/c")).await.unwrap(), None);
+}
+
+/// A cut that names a tip, adopted after the node took the key's entries, withdraws the ones off
+/// the chain of the tip (the rejudge on the context's adoption) and keeps the ancestors; the
+/// owner re-admits the one it left out by its name and digest and the node takes it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tip_cut_adopted_later_withdraws_the_entries_off_the_chain_of_its_tip() {
+    let m = mesh(&["/alice/laptop", "/alice/phone"]).await;
+    let laptop = m.boot(0, fast()).await;
+    let mine = laptop.create(&space(), public()).await.unwrap();
+    let phone = m.devs[1].name.clone();
+    let key = phone.clone().append("KEY").append("1");
+    let signer = m.devs[1].keys.get_signer_sync(&key).unwrap();
+
+    // The phone's chain, signed by hand: 1 <- 2 <- 4 <- 5, and an entry 3 beside it that names 2
+    // as 4 does (4 states the gap over 3).
+    let signed = |seq: u64, prev: Option<Prev>, path: &str| -> Bytes {
+        let content = WireEntry {
+            prev,
+            after: Vec::new(),
+            body: Body::Put(PutBody {
+                path: n(path),
+                payload: Payload::Inline(bytes(path)),
+            }),
+        }
+        .encode()
+        .unwrap();
+        seal::sign(
+            DataBuilder::new(log_name(&phone, &space(), seq), &content),
+            &*signer,
+        )
+        .unwrap()
+    };
+    let digest = |wire: &Bytes| crate::wire::signed_digest(wire);
+    let e1 = signed(1, None, "/a");
+    let e2 = signed(
+        2,
+        Some(Prev {
+            digest: digest(&e1),
+            seq: None,
+        }),
+        "/b",
+    );
+    let fork = signed(
+        3,
+        Some(Prev {
+            digest: digest(&e2),
+            seq: None,
+        }),
+        "/fork",
+    );
+    let e4 = signed(
+        4,
+        Some(Prev {
+            digest: digest(&e2),
+            seq: Some(2),
+        }),
+        "/c",
+    );
+    let e5 = signed(
+        5,
+        Some(Prev {
+            digest: digest(&e4),
+            seq: None,
+        }),
+        "/d",
+    );
+    for wire in [&e1, &e2, &fork, &e4, &e5] {
+        let taken = laptop.inner.take(&space(), wire.clone(), false).await;
+        assert!(
+            matches!(
+                &taken,
+                Taken::Decided {
+                    outcome: Outcome::Applied,
+                    ..
+                }
+            ),
+            "{taken:?}"
+        );
+    }
+    for path in ["/a", "/b", "/fork", "/c", "/d"] {
+        assert!(has(&mine, path, path).await, "{path}");
+    }
+
+    // The laptop's cut: the tip is seq 5; the fork is off its chain, so it is left out and listed.
+    let bound = CutBound {
+        held_before: Some(Timestamp(u64::MAX / 2)),
+        tips: true,
+        ..CutBound::default()
+    };
+    let proposal = laptop.revocation_cut(&key, &bound).unwrap();
+    assert_eq!(proposal.cut.tips().len(), 1);
+    assert_eq!(proposal.cut.tips()[0].seq, 5);
+    assert_eq!(
+        proposal.left_out,
+        vec![
+            log_name(&phone, &space(), 3)
+                .append_implicit_digest(crate::wire::implicit_digest(&fork))
+        ]
+    );
+
+    adopt_revoking(&m, &key, 2, &proposal.cut);
+    eventually("the laptop withdraws the entry off the chain", || async {
+        matches!(mine.get(&n("/fork")).await, Ok(None))
+    })
+    .await;
+    for path in ["/a", "/b", "/c", "/d"] {
+        assert!(
+            has(&mine, path, path).await,
+            "{path} is on the chain of the tip"
+        );
+    }
+
+    // The owner re-admits it by name and digest: the node takes it back, though it is off the chain.
+    let mut cut = proposal.cut.clone();
+    assert!(cut.readmit(proposal.left_out[0].clone()).unwrap());
+    adopt_revoking(&m, &key, 3, &cut);
+    eventually("the laptop takes the re-admitted entry back", || async {
+        has(&mine, "/fork", "/fork").await
+    })
+    .await;
 }
 
 /// The owner re-admits one entry a revocation cut left out, by its name and digest: every node

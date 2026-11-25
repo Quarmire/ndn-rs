@@ -33,6 +33,90 @@ pub(crate) fn n(uri: &str) -> Name {
     uri.parse().expect("a valid name")
 }
 
+/// The order of the P-256 group.
+const P256_ORDER: [u8; 32] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
+];
+
+/// The `(r, s)` of a DER ECDSA signature, each as 32 octets big-endian.
+fn der_scalars(der: &[u8]) -> ([u8; 32], [u8; 32]) {
+    assert_eq!(der[0], 0x30, "a DER sequence");
+    assert_eq!(der[1] as usize + 2, der.len(), "a short-form length");
+    let mut at = 2;
+    let mut out = [[0u8; 32]; 2];
+    for scalar in &mut out {
+        assert_eq!(der[at], 0x02, "a DER integer");
+        let len = der[at + 1] as usize;
+        let int = &der[at + 2..at + 2 + len];
+        let int = int.strip_prefix(&[0u8][..]).unwrap_or(int);
+        scalar[32 - int.len()..].copy_from_slice(int);
+        at += 2 + len;
+    }
+    assert_eq!(at, der.len());
+    (out[0], out[1])
+}
+
+/// `n - s`: the other `S` that verifies with the same `r`.
+fn other_s(s: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut borrow = 0i16;
+    for i in (0..32).rev() {
+        let d = i16::from(P256_ORDER[i]) - i16::from(s[i]) - borrow;
+        borrow = i16::from(d < 0);
+        out[i] = d.rem_euclid(256) as u8;
+    }
+    out
+}
+
+fn der_ecdsa(r: &[u8; 32], s: &[u8; 32]) -> Bytes {
+    let int = |x: &[u8; 32]| {
+        let start = x.iter().position(|b| *b != 0).unwrap_or(31);
+        let mut v = Vec::new();
+        if x[start] & 0x80 != 0 {
+            v.push(0);
+        }
+        v.extend_from_slice(&x[start..]);
+        let mut out = vec![0x02, v.len() as u8];
+        out.extend(v);
+        out
+    };
+    let mut body = int(r);
+    body.extend(int(s));
+    let mut der = vec![0x30, body.len() as u8];
+    der.extend(body);
+    Bytes::from(der)
+}
+
+/// A relay's copy of an ECDSA P-256 packet `wire` that `signer` signed with a plain
+/// `DataBuilder` over its name and content: the same signed region under the other signature
+/// value (`n - s`), which every verifier accepts. Another packet by its whole encoding (its
+/// implicit digest), the same signed object.
+pub(crate) fn other_s_copy(wire: &Bytes, signer: &dyn ndn_security::Signer) -> Bytes {
+    let data = ndn_packet::Data::decode(wire.clone()).expect("a packet");
+    let (r, s) = der_scalars(data.sig_value());
+    let flipped = der_ecdsa(&r, &other_s(&s));
+    assert_ne!(
+        flipped.as_ref(),
+        data.sig_value(),
+        "n - s is another signature value"
+    );
+    let content = data.content().expect("content").clone();
+    let copy = ndn_packet::encode::DataBuilder::new((*data.name).clone(), &content).sign_sync(
+        signer.sig_type(),
+        Some(signer.key_name()),
+        |_| flipped.clone(),
+    );
+    let decoded = ndn_packet::Data::decode(copy.clone()).expect("the copy decodes");
+    assert_eq!(
+        decoded.signed_region(),
+        data.signed_region(),
+        "one signed region"
+    );
+    assert_ne!(copy, *wire, "another packet");
+    copy
+}
+
 /// Whether a store's `sync` is held, and who waits for it to be released.
 #[derive(Default)]
 struct Gate {

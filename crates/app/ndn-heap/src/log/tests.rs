@@ -21,6 +21,7 @@ use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
 use crate::store::{self, Kind, Marker, ReserveRecord, write_reserve};
 use crate::test_kit::{CrashStore, n};
+use crate::trust::TipCut;
 use crate::wire::{
     self, Body, Entry, EntryRef, EpochBody, EpochId, MembersBody, Op, Payload, Prev, PutBody, Role,
     SealedBody, log_name, signed_digest,
@@ -100,6 +101,7 @@ fn verified(d: &Dev) -> Verified {
         person: d.person.clone(),
         key_digest: public_key_digest(&d.signer.public_key_bytes()),
         owner_capable: d.owner_capable,
+        tip: None,
     }
 }
 
@@ -2533,13 +2535,13 @@ async fn an_entry_a_cut_readmits_is_wanted_by_its_implicit_digest_until_held() {
         digest: Some(Pin::Implicit(digest)),
     };
     assert_eq!(
-        r.log.cut_wants(&[], &[(bob().name, 1, named)]),
+        r.log.cut_wants(&[], &[(bob().name, 1, named)], &[]),
         vec![want(named)]
     );
     r.applied(&p1);
-    assert_eq!(r.log.cut_wants(&[], &[(bob().name, 1, named)]), vec![]);
+    assert_eq!(r.log.cut_wants(&[], &[(bob().name, 1, named)], &[]), vec![]);
     assert_eq!(
-        r.log.cut_wants(&[], &[(bob().name, 1, [7; 32])]),
+        r.log.cut_wants(&[], &[(bob().name, 1, [7; 32])], &[]),
         vec![want([7; 32])],
         "other bytes at the name are not the ones the cut names"
     );
@@ -2566,7 +2568,7 @@ async fn the_second_packet_kept_as_evidence_takes_the_name_when_the_first_is_ref
         digest: Some(Pin::Implicit(named)),
     };
     assert_eq!(
-        r.log.cut_wants(&[], &[(bob().name, 1, named)]),
+        r.log.cut_wants(&[], &[(bob().name, 1, named)], &[]),
         vec![want],
         "the honest bytes kept as evidence are not the entry held at the name"
     );
@@ -2595,7 +2597,7 @@ async fn the_second_packet_kept_as_evidence_takes_the_name_when_the_first_is_ref
         Some(thief.wire.clone()),
         "the refused bytes are the evidence now"
     );
-    assert_eq!(r.log.cut_wants(&[], &[(bob().name, 1, named)]), vec![]);
+    assert_eq!(r.log.cut_wants(&[], &[(bob().name, 1, named)], &[]), vec![]);
 }
 
 // -- The owner's devices: only an `admin` or `member` device holds the owner's powers (§9.9) --
@@ -2826,5 +2828,293 @@ async fn the_epochs_of_closed_entries_are_kept_until_an_entry_moves_to_or_from_c
     assert!(
         r.log.closed_epochs().is_empty(),
         "the entry opened: no epoch is waited for"
+    );
+}
+
+// -- A revocation cut that names a tip (spec §9.5) --------------------------------------------
+
+/// What the judge tells the log of Bob's key when its revocation's cut names `tip` for this log.
+fn tipped(tip: &Packet, readmitted: Vec<(u64, [u8; 32])>) -> Verified {
+    Verified {
+        tip: Some(TipCut {
+            tip: store::Link {
+                seq: tip.seq,
+                digest: tip.digest,
+            },
+            readmitted,
+        }),
+        ..verified(&tip.dev)
+    }
+}
+
+/// The status record of a held entry: `None` for an applied one.
+fn status_of(r: &Rig, p: &Packet) -> Option<Status> {
+    let at = Kind::STATUS.seq(&space(), &p.dev.name, p.seq);
+    r.store
+        .get(&at)
+        .map(|record| Status::decode(&record, &p.dev.name).expect("a status record"))
+}
+
+fn outside_the_tip() -> Option<Status> {
+    Some(Status::Refused(Refusal::OutsideCut(Cut {
+        device: bob().name,
+        keeps_to: 0,
+    })))
+}
+
+impl Rig {
+    fn admit_as(&mut self, p: &Packet, v: &Verified) -> Admitted {
+        let data = Data::decode(p.wire.clone()).unwrap();
+        let (outcome, effects) = self.log.admit(&p.wire, &data, v, NOW, false);
+        Admitted { outcome, effects }
+    }
+}
+
+/// Bob's chain `1 <- 2 <- 4 <- 5` with an entry `3` of his key beside it: `3` names `2` as `4`
+/// does, so it is on no chain from the tip `5`; `4` states the gap over `3`.
+struct Forked {
+    p1: Packet,
+    p2: Packet,
+    fork: Packet,
+    p4: Packet,
+    tip: Packet,
+}
+
+fn forked() -> Forked {
+    let mut b = Chain::new(&bob());
+    let p1 = b.put("/a", "one");
+    let p2 = b.put("/b", "two");
+    let fork = b.put("/fork", "off the chain");
+    let p4 = b.entry_after_gap(
+        Body::Put(PutBody {
+            path: n("/c"),
+            payload: Payload::Inline(Bytes::from_static(b"three")),
+        }),
+        2,
+        p2.digest,
+    );
+    let tip = b.put("/d", "four");
+    assert_eq!((p4.seq, tip.seq), (4, 5));
+    Forked {
+        p1,
+        p2,
+        fork,
+        p4,
+        tip,
+    }
+}
+
+fn pinned(p: &Packet) -> Want {
+    Want {
+        device: bob().name,
+        first: p.seq,
+        last: p.seq,
+        digest: Some(Pin::Signed(p.digest)),
+    }
+}
+
+/// Under a cut that names a tip, the validator accepts Bob's key below the tip by name, and the
+/// log keeps an entry only if it is a chain ancestor of the tip, the very bytes the chain names:
+/// one off the chain waits while the chain below the tip is not whole (never applied meanwhile)
+/// and is refused once the chain has passed it.
+#[tokio::test]
+async fn an_entry_of_a_tip_cut_key_is_kept_only_if_it_is_a_chain_ancestor_of_the_tip() {
+    let f = forked();
+    let v = tipped(&f.tip, vec![]);
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+
+    // The chain below the tip is not whole: what lies below waits, applied by nobody.
+    assert_eq!(r.admit_as(&f.fork, &v).outcome, Outcome::Waiting);
+    assert_eq!(r.admit_as(&f.p1, &v).outcome, Outcome::Waiting);
+    assert_eq!(r.value("/fork"), None);
+    assert_eq!(
+        r.value("/a"),
+        None,
+        "an ancestor waits too until its chain is whole"
+    );
+
+    // The tip is the entry the cut names: kept, and what it chains to is wanted by the exact
+    // bytes the chain names.
+    let a = r.admit_as(&f.tip, &v);
+    assert_eq!(a.outcome, Outcome::Applied);
+    assert!(
+        a.effects.wants.contains(&pinned(&f.p4)),
+        "{:?}",
+        a.effects.wants
+    );
+    assert_eq!(status_of(&r, &f.fork), Some(Status::Waiting));
+
+    // Seq 4 is an ancestor and its link names seq 2: seq 3 cannot be an ancestor now, for the
+    // chain has passed it.
+    let a = r.admit_as(&f.p4, &v);
+    assert_eq!(a.outcome, Outcome::Applied);
+    assert!(
+        a.effects.wants.contains(&pinned(&f.p2)),
+        "{:?}",
+        a.effects.wants
+    );
+    assert_eq!(status_of(&r, &f.fork), outside_the_tip());
+    assert_eq!(r.value("/fork"), None);
+
+    // The rest of the chain arrives; the ancestor that waited is applied.
+    assert_eq!(r.admit_as(&f.p2, &v).outcome, Outcome::Applied);
+    assert_eq!(status_of(&r, &f.p1), None);
+    for (path, value) in [
+        ("/a", "one"),
+        ("/b", "two"),
+        ("/c", "three"),
+        ("/d", "four"),
+    ] {
+        assert_eq!(r.value(path).as_deref(), Some(value), "{path}");
+    }
+
+    // With the chain whole, an entry off it is refused as it arrives, naming the tip.
+    let mut late = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    late.applied(&creation(&mut owner));
+    for p in [&f.tip, &f.p4, &f.p2, &f.p1] {
+        assert_eq!(late.admit_as(p, &v).outcome, Outcome::Applied);
+    }
+    let a = late.admit_as(&f.fork, &v);
+    assert!(
+        matches!(
+            a.outcome,
+            Outcome::Refused(Refusal::OutsideCut(Cut { keeps_to: 5, .. }))
+        ),
+        "{:?}",
+        a.outcome
+    );
+    assert!(has_alert(
+        &a,
+        |al| matches!(al, Alert::OutsideCut { id } if id.seq == 3)
+    ));
+    assert_eq!(late.value("/fork"), None);
+}
+
+/// The entry at the tip's number is only the bytes the cut names: other bytes signed at that seq
+/// are refused, and the bytes it names take the name when they arrive, the others staying as
+/// evidence. The log says nothing of what lies above the tip: the validator judged it.
+#[tokio::test]
+async fn other_bytes_at_the_tip_are_refused_and_the_named_bytes_take_the_name() {
+    let f = forked();
+    let v = tipped(&f.tip, vec![]);
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let other = gap_entry(&bob(), 5, f.p4.digest, 4, "other bytes at the tip");
+    let a = r.admit_as(&other, &v);
+    assert!(
+        matches!(
+            a.outcome,
+            Outcome::Refused(Refusal::OutsideCut(Cut { keeps_to: 5, .. }))
+        ),
+        "{:?}",
+        a.outcome
+    );
+
+    let a = r.admit_as(&f.tip, &v);
+    assert_eq!(a.outcome, Outcome::Applied, "{:?}", a.effects.alerts);
+    assert_eq!(r.value("/d").as_deref(), Some("four"));
+    assert!(r.store.get(&Kind::EQUIVOCAL.of(&f.tip.name())).is_some());
+
+    // Above the tip: not the chain's to judge (the validator refused it, or a range of the same
+    // cut accepts it). A log that holds the chain applies it.
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    for p in [&f.tip, &f.p4, &f.p2, &f.p1] {
+        assert_eq!(r.admit_as(p, &v).outcome, Outcome::Applied);
+    }
+    let mut b = Chain::new(&bob());
+    b.seq = 5;
+    b.last = Some(f.tip.digest);
+    let above = b.put("/e", "five");
+    assert_eq!(above.seq, 6);
+    assert_eq!(r.admit_as(&above, &v).outcome, Outcome::Applied);
+}
+
+/// An entry the owner re-admits by its exact name stays kept though it is off the chain of the
+/// tip: the cut lists the entries a tip leaves out for the owner to bring back one by one.
+#[tokio::test]
+async fn an_entry_a_tip_cut_readmits_by_name_is_kept_off_the_chain() {
+    let f = forked();
+    let readmitted = vec![(f.fork.seq, wire::implicit_digest(&f.fork.wire))];
+    let v = tipped(&f.tip, readmitted);
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    for p in [&f.tip, &f.p4, &f.p2, &f.p1] {
+        assert_eq!(r.admit_as(p, &v).outcome, Outcome::Applied);
+    }
+    assert_eq!(r.admit_as(&f.fork, &v).outcome, Outcome::Applied);
+    assert_eq!(r.value("/fork").as_deref(), Some("off the chain"));
+}
+
+/// A cut that names a tip, adopted after the entries were taken, withdraws the held entries off
+/// the tip's chain and keeps the ancestors; once the cut names no tip, what was refused for it
+/// is judged again when it is offered.
+#[tokio::test]
+async fn a_tip_adopted_after_the_entries_withdraws_those_off_the_chain() {
+    let f = forked();
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    for p in [&f.p1, &f.p2, &f.fork, &f.p4, &f.tip] {
+        r.applied(p);
+    }
+    assert_eq!(r.value("/fork").as_deref(), Some("off the chain"));
+
+    let tip = TipCut {
+        tip: store::Link {
+            seq: f.tip.seq,
+            digest: f.tip.digest,
+        },
+        readmitted: vec![],
+    };
+    let fx = r.log.cut_tips(vec![(bob().key, Some(tip))]);
+    assert!(
+        fx.changes.iter().any(|c| matches!(
+            c,
+            Change::Withdrawn { id, why: Refusal::OutsideCut(Cut { keeps_to: 5, .. }) } if id.seq == 3
+        )),
+        "{:?}",
+        fx.changes
+    );
+    assert_eq!(r.value("/fork"), None);
+    assert_eq!(status_of(&r, &f.fork), outside_the_tip());
+    for (path, value) in [
+        ("/a", "one"),
+        ("/b", "two"),
+        ("/c", "three"),
+        ("/d", "four"),
+    ] {
+        assert_eq!(r.value(path).as_deref(), Some(value), "{path}");
+    }
+
+    r.log.cut_tips(vec![(bob().key, None)]);
+    let a = r.admit(&f.fork);
+    assert_eq!(a.outcome, Outcome::Duplicate);
+    assert_eq!(r.value("/fork").as_deref(), Some("off the chain"));
+}
+
+/// A cut's tip is wanted by the signed-region digest it names until an entry with that digest is
+/// held, whatever counter the group shows: a device that holds nothing of the key asks for it,
+/// and then for what the tip chains to.
+#[tokio::test]
+async fn the_tip_a_cut_names_is_wanted_by_its_signed_digest_until_held() {
+    let f = forked();
+    let mut r = rig(&carol());
+    let mut owner = Chain::new(&phone());
+    r.applied(&creation(&mut owner));
+    let tips = [(bob().name, f.tip.seq, f.tip.digest)];
+    assert_eq!(r.log.cut_wants(&[], &[], &tips), vec![pinned(&f.tip)]);
+    let v = tipped(&f.tip, vec![]);
+    assert_eq!(r.admit_as(&f.tip, &v).outcome, Outcome::Applied);
+    assert_eq!(r.log.cut_wants(&[], &[], &tips), vec![], "held");
+    assert!(
+        r.log.missing().contains(&pinned(&f.p4)),
+        "what the tip chains to is wanted by the walk, as a removal cut's chain is"
     );
 }

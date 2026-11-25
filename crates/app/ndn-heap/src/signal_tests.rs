@@ -117,6 +117,7 @@ impl Dev {
             person: self.person.clone(),
             key_digest: public_key_digest(&self.signer.public_key().unwrap()),
             owner_capable: true,
+            tip: None,
         }
     }
 }

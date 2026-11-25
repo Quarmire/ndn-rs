@@ -48,7 +48,7 @@ use crate::serve;
 use crate::space::{Follower, GRANTEES_PER_PERSON, Heap, Share, SpaceInner, check_audience};
 use crate::store::{Kind, OWNER_RULE};
 use crate::sync::{HostRef, Net, Taken};
-use crate::trust::{Adopter, Adoption, Judge, Judged, Verified};
+use crate::trust::{Adopter, Adoption, Judge, Judged, TipCut, Verified};
 use crate::wire::{
     EpochId, GrantAsk, device_of, is_device_name, is_namespace, log_name, parse_log_name,
     parse_seal_key_name, parse_space_name,
@@ -210,6 +210,10 @@ struct Rejudged {
     /// Each device it accepts entries of, and whether it stands as an owner
     /// device ([`crate::trust::owner_capable`]).
     standing: BTreeMap<Name, bool>,
+    /// Each key it accepts entries of, and the tip its revocation's cut names for the space
+    /// (`None`: it names none, or the key is not revoked): the log judges what it holds of the
+    /// key by it.
+    tips: BTreeMap<Name, Option<TipCut>>,
 }
 
 impl Node {
@@ -860,6 +864,7 @@ impl NodeInner {
                 }
                 Judged::Valid(v) => {
                     out.standing.insert(log_name.device, v.owner_capable);
+                    out.tips.insert(v.key, v.tip);
                 }
                 _ => {}
             }
@@ -869,6 +874,10 @@ impl NodeInner {
 
     /// Apply what [`Self::rejudged`] says to a log not yet joined (at start).
     fn apply_rejudged(&self, log: &mut Log, judged: Rejudged) {
+        let fx = log.cut_tips(judged.tips.into_iter().collect());
+        if fx.membership {
+            self.judge.note(&log.space, &SpaceInner::listing(log));
+        }
         for (device, seq, why) in judged.refused {
             let fx = log.withdraw(&device, seq, why);
             if fx.membership {
@@ -945,6 +954,16 @@ impl NodeInner {
                 persons.iter().flat_map(|p| log.held_names(p)).collect()
             };
             let judged = self.rejudged(&space, names).await;
+            // The tips the cuts name, before what is refused: the held entries off a tip's chain
+            // are withdrawn as the chain says.
+            if !judged.tips.is_empty() {
+                let routed = {
+                    let mut log = held.log.lock();
+                    let fx = log.cut_tips(judged.tips.into_iter().collect());
+                    held.route(self, &log, fx, true)
+                };
+                held.finish(self, routed);
+            }
             for (device, seq, why) in judged.refused {
                 let routed = {
                     let mut log = held.log.lock();
@@ -1124,7 +1143,11 @@ impl NodeInner {
         self.space_of(space).map_or_else(Vec::new, |s| {
             let log = s.log.lock();
             let mut wants = log.missing();
-            wants.extend(log.cut_wants(&self.judge.cut_runs(space), &self.judge.cut_exact(space)));
+            wants.extend(log.cut_wants(
+                &self.judge.cut_runs(space),
+                &self.judge.cut_exact(space),
+                &self.judge.cut_tips(space),
+            ));
             wants
         })
     }
