@@ -1,6 +1,6 @@
 # Channel: ephemeral live data over a space
 
-- **Status:** stage 2 built: the setup (names, the ask, the session, judging at both ends, renewal, re-keying, ending, the announce, limits and refusals, the setup TLVs and their vectors). Stage 3 part 1 built: the frame (§11: header, key schedule and seal, messages, kinds, limits, short frames on L2, vectors, threat notes). The receiver is built (§12: the order of checks before any cryptography, the replay window, the generation check, key epochs, the name table and its 50 ms hold, `HELLO`, standing values, the queues per mode and the gap rule, `Items`, limits, threat notes); the writer's batching and the modes' sender side are added with the rest of stage 3; fan-out in stage 4; checkpoints in stage 5. Where a later stage's text is not here yet, it is not specified yet, and nothing in this file says how it will be.
+- **Status:** stage 2 built: the setup (names, the ask, the session, judging at both ends, renewal, re-keying, ending, the announce, limits and refusals, the setup TLVs and their vectors). Stage 3 built: the frame (§11: header, key schedule and seal, messages, kinds, limits, short frames on L2, vectors, threat notes); the receiver (§12: the order of checks before any cryptography, the replay window, the generation check, key epochs, the name table and its 50 ms hold, `HELLO`, standing values, the queues per mode and the gap rule, `Items`, limits, threat notes); and the sender (§13: `Heap::emit` and its refusals, the combining writer with its headroom rule and re-pack, the name-id table and the `CONTROL` bodies, the three modes, `stand`, what a new session is given, the carrier a face must provide, limits, threat notes). Not yet: the sender does not send `END`; routing frames by the forwarder's side table is stage 4 (one fixed carrier stands in); checkpoints are stage 5. Where a later stage's text is not here yet, it is not specified yet, and nothing in this file says how it will be.
 - **Implementation:** `ndn-heap`, module `chan` (`ndn-rs/crates/app/ndn-heap/src/chan/`): `wire.rs` (the records), `answer.rs` (the sender judges), `ask.rs` (the receiver asks and judges), `channels.rs` (the sender's table), `sessions.rs` (the receiver's store), `hub.rs` (the node's state, the announce, the maintenance task), `standing.rs` (membership, shared with signals).
 - **Scope:** an ephemeral **channel**: one device of a writer of a space sends live data (presence, a cursor, a drag) to the devices of the space's readers and writers, without making an entry. This file specifies how a channel is **set up** between two devices by signed NDN: who is answered, how a key reaches only the devices that may hold it, how a session ends, is renewed and is re-keyed; and the **frame** (§11) that carries the data once it is set up: the header, the key schedule and the seal, the messages, the limits and the short-frame rule for raw L2 faces. It builds on [heap.md](heap.md) (names §2, the members record §5, epochs and audiences §6, the lapsed rule §9.3) and uses ndn-link's carrier ([ndn-link.md](ndn-link.md)) for what comes after setup.
 
@@ -536,3 +536,122 @@ The counters (each a `u64`, in `Stats.rx`): `frames`, `short`, `marker`, `versio
 - **A removed sender** is refused at the first frame after this device holds the removing record (§12.3). Frames it sealed before the record arrived were delivered; frames sealed with the old key by a holder after the re-key fail the AEAD.
 - **A slow consumer** cannot make memory grow without bound: 4,096 names, or 1 MiB (plus the frame in hand), per `Items`. With `Block` it stalls the stream of a `Reliable` or `Window` channel (the sender is told by flow control); with `Drop`, or in `Latest`, it is told it lagged.
 - **Clocks.** No decision about who is a member or what is genuine rests on a clock. The 50 ms hold and the one-second limits are counted on the receiver's monotonic clock and decide only what is kept for a moment and how often a sender is asked.
+
+## 13. The sender
+
+Implementation: `ndn-heap` `chan/emit.rs` (`Heap::emit`, the writer gate), `tx.rs` (the combining writer), `queues.rs` (the pending sets), `table.rs` (the name-id table), `history.rs` (the window and the standing values), `control.rs` (the `CONTROL` bodies), `carrier.rs` (the carrier a host gives the node), `verbs.rs` (the public types of `emit` and `live`).
+
+### 13.1 `Heap::emit`
+
+`emit(path, bytes, EmitOptions)` sends `bytes` to the receivers of the channel of `opts.mode` over this space. `EmitOptions { mode, stand, congestion }`: `mode` is `Latest` (default), `Reliable` or `Window(Window)`; `stand` is a lifetime (§13.6); `congestion` is `Drop` or `Block`. `EmitOptions::latest()` is the default, and `EmitOptions::reliable()` and `EmitOptions::window(w)` say `Block` (the `Drop` of the type's `Default` is the default of `Latest` alone).
+
+Before anything is sent the call passes **the writer gate**: this device's key stands as a **writer** of the space by the entries held now, which is the gate of §4.2, and, in a sealed space, an epoch is in force. The gate is passed again only when the trust generation or the space's fold version moved (two atomic loads), so the steady state of `emit` takes no log lock. The first `emit` of a mode also opens the channel of (space, mode) in the sender's table (§3.5), so asks can be answered and the announce (§9) names the mode. A device with no receiver sends nothing and the call returns at once (§13.2).
+
+| Refusal | When | `NextStep` |
+|---|---|---|
+| `NotWriter` | this device is no writer of the space | `AskOwner` |
+| `NotReady` | the space's record is not held here, or a sealed space has no epoch in force | `RetryLater` |
+| `TooLarge { what, size, max }` | a message over 1 MiB; a name over 255 octets; `names in one channel` (4,096); `standing names in one channel` (256); `standing octets in one channel` (64 KiB); `stand lifetime in seconds` (3,600); a message that fits no datagram on a path with no stream; more channels than the sender may keep (64) | `FixRequest` |
+| `Congested { retry_after }` | `Drop` found the queue full of what cannot be dropped (a frame being written, a control frame); try again in 100 ms | `RetryLater` |
+| `NoStream { what }` | `Reliable`, `Window` or a standing value on a path whose carrier has no stream | `FixRequest` |
+| `FixRequest` | `Latest` with `Block`: "Latest never blocks; a newer emission replaces an older one. Use Reliable" | `FixRequest` |
+| `SequenceExhausted` | the channel used its last sequence (§13.2) | `RetryLater` |
+| `Local` | this device's own failure | `FixLocal` |
+
+No receiver is **not** an error. A refusal changes nothing: no sequence is taken, no name is bound.
+
+### 13.2 The combining writer
+
+No timer decides when a frame leaves. A channel has two **lanes**, the datagram lane and the stream lane, each with a pending set and a `writing` flag.
+
+1. **Sequences are taken at emission, under the channel's lock.** So the order of a queue is the order of the sequences, and a message that is dropped leaves a gap a receiver sees. A frame holds a **run of consecutive sequences** (`seq0 + index`): a `Latest` message that a newer one replaced leaves a gap, and the run ends at it. A `CONTROL` frame takes one sequence like any frame. Sequences are below 2^62 (a `HELLO` and a replayed message carry one as a varint; the frame's own limit is 2^63): at the limit `emit` says `SequenceExhausted`, the channel is closed in the sender's table (a receiver's next ask makes a new channel, a new id and a new key), and the next emission begins it.
+2. **The pending sets.** `Latest`: one slot per name id, in the order of the sequences; a newer message replaces an unsent older one of its name and moves to the back (the replaced sequence is never sent); at 1 MiB of waiting payload the oldest slot that is not in a frame being written is dropped and counted. `Reliable` and `Window`: a FIFO of messages and control frames, 1 MiB of payload; a full queue makes `Block` wait for room and `Drop` drop the oldest message that is not in a frame being written (counted; its sequence is a gap).
+3. **The datagram lane.** If its `writing` flag is clear the caller of `emit` sets it and **is the writer**: it packs messages of consecutive sequences into a frame up to the carrier's room (`min(datagram_max(), 9,000)` read for every frame) or 255 messages, seals it **once** (the frame stays sealed: a re-pack takes new sequences), hands it to the carrier, and goes on for up to `COMBINE_MAX = 4` frames; it then looks at the set again under the lock that clears the flag. What is left goes to the carrier's writer task through `on_ready` (§13.8), which writes until nothing waits. A message that arrives while the flag is set waits for the writer, which looks again before it clears the flag. So **an idle link sees one message leave at once, inline, as a frame of one**, and **a batch forms only while the writer is busy or the carrier refused**.
+4. **The headroom rule is the carrier's.** `try_send_datagram` refuses with `Full` when the link has enough queued ahead (ndn-link.md: `QUEUE_FLOOR` to `QUEUE_CAP`). A `Latest` message then stays pending, coalescing, and `emit` never waits; the writer asks the carrier for a call back, and while one is asked for, later emissions only queue (they do not seal a frame the carrier would refuse).
+5. **A message stays in its queue until its frame was handed over.** A frame the carrier refused loses nothing; a message replaced while its frame was sealed is sent and not counted replaced.
+6. **An oversize `Latest` message** (it fits no datagram frame) goes on the stream, in a frame of its own run; until the stream took it a newer message of its name replaces it, and an oversize message replaces an unsent small one. On a path with no stream it is refused `TooLarge`.
+7. **A frame the path's size fell under** (`try_send_datagram` says `TooLarge { max }`) is re-packed once at `max` with **new sequences** (counted `resized`); if that frame falls again, its messages go to the stream (counted `resized`). A message that was replaced meanwhile is not re-sent.
+8. **The stream lane** is written by a task of the node (a stream frame may wait on flow control, which an emitter cannot be cancelled in): one frame at a time, in the order of the sequences, a run of data messages up to 1 MiB + 1 KiB and 255 messages, or one control frame. `Block` waits for **queue room**, not for the stream.
+9. **The ring.** Every frame sent, on either lane, is recorded in the ring of sent-frame hashes (`ring.rs`); nothing reads it before checkpoints (stage 5).
+
+Cost (measured by `the_64_byte_latest_path_allocates_nothing_per_message_beyond_the_frame`): an idle 64-octet `Latest` message allocates **exactly 2** (its frame's buffer and the shared header `Bytes` freezing adds); 14 messages queued while the carrier is full allocate **0**, and the one frame that carries them **2** in all.
+
+### 13.3 The name-id table
+
+A channel carries every path its sender emits in the space under the mode. Ids are allocated from 1, in order, at most 4,096 live. A new name takes an id and a `BIND` (§13.4) joins the stream's FIFO at once (it takes the sequence before the message's). **A datagram can overtake the stream**, so the first three messages under an id and every message within 200 ms of its bind are `NAMED` (the name inline); later ones are bare. On a path with no stream there is no `BIND` and every message names itself.
+
+At 90 % of the table (3,687 live ids) a **new** name first frees the ids not used for 60 s (an `UNBIND` each), at most once a second; at 4,096 live a new name is refused `TooLarge { what: "names in one channel", size: 4097, max: 4096 }`. A freed id is reused only after every older free id: it was idle for 60 s before it was freed, so no datagram naming it can still be in flight. The session's table (`S_TABLE`) holds the first binds in the order of the ids, at most 64 and 4 KiB; the others follow as `BIND` frames right after `HELLO` (§13.7).
+
+### 13.4 `CONTROL` bodies
+
+A `CONTROL` frame takes one sequence, travels on the stream, and carries `op (1)` and the record, then nothing but padding (§11.3). Varints are §11.4's.
+
+| op | Name | Body |
+|---|---|---|
+| 1 | `BIND` | name id (varint, 1 to 4,096), name length (varint, at most 255), the name's octets |
+| 2 | `UNBIND` | name id (varint) |
+| 3 | `HELLO` | the sequence the sender's **next** message takes (varint, below 2^62) |
+| 4 | `END` | none: the sender ends the channel (the codec and the receiver read it; this stage's sender does not send one: a channel ends by its lifetime and by its receivers' asks being Nacked) |
+| 5 | `STANDING_BEGIN` | none: standing values follow |
+| 6 | `STANDING_END` | none: the standing values are over |
+
+A record that is empty, of an unassigned op, cut short, with a name id outside 1 to 4,096, a name over 255 octets or anything but padding after it is refused. Golden octets: `HELLO` with next sequence `1122334455667788` is `03d122334455667788`; `BIND` id 2 for `/a` is `010203080161`; `UNBIND` 2 is `0202`; `END` is `04`.
+
+### 13.5 Modes as built
+
+- **`Latest`**: datagrams for messages that fit, the stream for those that do not; the newest per name; never blocks; a `Full` carrier only makes messages wait.
+- **`Reliable`**: every message on the stream, in the order of the sequences; `Block` (the default of `EmitOptions::reliable()`) waits for queue room, `Drop` drops the oldest queued message and counts it.
+- **`Window`**: as `Reliable`, and the sender keeps what it sent (at send time, replays excluded): the last **256 messages, 1 MiB, 10 s**, whichever is least; the most a caller may ask for is 4,096 messages, 16 MiB and 5 minutes (a larger window is clamped, not refused). The channel's window is the one its latest emission gave; the session says it (`S_WINDOW`). A joiner is replayed the window on the stream, before live frames (§13.7). **The cost of the replay:** a replay is written on the carrier's one route, so every receiver of that carrier gets it too (a receiver drops a replayed message whose original sequence it already has, §12.6), and each replayed message takes a new sequence on the stream.
+- **No stream (an L2 path)**: `Reliable`, `Window` and a standing value are refused `NoStream`; every `Latest` message names itself.
+
+### 13.6 `stand`
+
+With `opts.stand` the sender holds the **last emission of the path** for the stated lifetime (at most one hour), and the message carries the `STAND` flag with the lifetime in seconds. At most 256 names and 64 KiB of payload stand per channel; over either, `TooLarge` (and the path's earlier standing value stays). An emission of the path **without** `stand` removes what stood under it: the last emission is the one that stands. A standing value is replayed to a new session (§13.7). A sender with no receiver still holds it, and a `Window` message sent with no receiver still enters the window: both are for a receiver that joins later. Such an emission takes a sequence and sends no frame.
+
+### 13.7 What a new receiver is given
+
+When the sender admits an ask (§3.3 step 11) the session carries the sender's **table** (§13.3), its **window** (`Window` channels), `S_FRAME_MAX` (9,000: the most a datagram frame carries; the sender sends `min(path size now, 9,000)`) and the next sequence. If the carrier has a stream and the asker's **device was not a receiver before** (a renewal is not new), these frames follow on the stream, in this order, taking sequences in this order:
+
+1. `HELLO` (the sequence the next message takes);
+2. a `BIND` for each live bind the session's table did not take;
+3. the names the replays below need that were not bound are bound (a `BIND` each);
+4. `STANDING_BEGIN`; each standing value as a message with the `STANDING` flag, the **original sequence**, its name **inline** (`NAMED`) and `stand seconds` = **what is left** of the lifetime (whole seconds, rounded up; a value with none left is not sent); `STANDING_END`;
+5. in `Window` mode, the window from `ASK_SINCE` (the whole window when the ask names none) as messages with the `REPLAYED` flag, the original sequence and the name inline.
+
+A receiver that is not new and asks with `ASK_SINCE` in `Window` mode is given only step 5. The frames are queued when the session is built, before the session Data is signed: they may reach the carrier before the receiver has installed the session. A receiver that cannot hold them (no session yet) drops them and recovers as §12 says (a `Window` receiver re-asks from the first missing sequence); with fan-out (stage 4) the frames follow the session over the route the ask installed.
+
+### 13.8 The carrier a face must provide
+
+`ndn-heap` cannot depend on the faces, so the host gives the node a `Carrier` (`NodeHandle::attach_carrier`; until the forwarder's side table routes frames (stage 4) a node has one fixed route, and every frame of every channel goes to it). A carrier MUST:
+
+- `datagram_max()`: the largest datagram frame the path takes **now** (it follows path MTU discovery; the sender reads it for every frame); 0 if there is no datagram class.
+- `has_stream()`: whether it has an ordered, reliable stream.
+- `try_send_datagram(frame)`: never block. Take the frame, or refuse it: `Full` when the headroom rule says so; `TooLarge { max }` when the path no longer takes a frame this size; `Closed` when the link is gone.
+- `send_stream(frame)`: take a whole frame onto the stream, in the order of the calls, and complete when the stream took it (it waits for flow control). The sender calls it again only after the last call completed and never drops a future in progress, so a frame is written whole or not at all.
+- `on_ready(drain)`: call `drain` **once, from the carrier's own writer task, when `try_send_datagram` would take a frame again** (at once if it already would). `drain` sends what waits, never blocks, and may call `try_send_datagram` and `on_ready`. A carrier that never calls it leaves refused messages waiting until the next emission finds the link ready. A call on one that is not the attached carrier any more is not waited for.
+
+A carrier that meets this is all the sender needs: no timer, no task of its own, no knowledge of channels.
+
+### 13.9 Limits of the sender
+
+| What | Limit | Over it |
+|---|---|---|
+| Frames one emitter writes before it hands over | 4 (`COMBINE_MAX`) | the carrier's writer task, without bound |
+| Messages per frame | 255 | the next frame |
+| Datagram frame | `min(path size, 9,000)`, read per frame | re-packed once, then the stream (`resized`) |
+| Waiting payload per channel | 1 MiB | `Block` waits; `Drop` drops the oldest; `Latest` drops the oldest slot; `Congested` when nothing can be dropped |
+| Names per channel | 4,096; the table frees idle ids at 3,687 | `TooLarge` |
+| Standing names / octets / lifetime | 256 / 64 KiB / 1 h | `TooLarge` |
+| History window | 256 messages, 1 MiB, 10 s by default; at most 4,096, 16 MiB, 5 min | clamped |
+| Sequence | below 2^62 | `SequenceExhausted`: the channel ends |
+| `Congested` retry | 100 ms | |
+
+### 13.10 Threat notes for the sender
+
+- **A local application cannot exhaust the sender's memory.** Every queue is bounded: 1 MiB of waiting payload per channel, 4,096 names, 256 standing names and 64 KiB standing, a window of at most 16 MiB (and 4,096 messages) per `Window` channel, a ring of 4,096 hashes. A burst of new names costs one sweep a second at most.
+- **A slow receiver cannot block a `Latest` sender.** `emit` never waits in `Latest`; a full carrier only makes messages wait, replaced by newer ones, in at most 4,096 slots; the oldest slot is dropped at 1 MiB. What a slow receiver costs the others is nothing the sender decides (the headroom rule is the carrier's, and a relay that cannot keep up drops visibly, §12.6).
+- **`Reliable` blocks only its own sender.** `Block` waits for queue room of **that channel**; another channel, another mode and every `Latest` sender are unaffected. With `Drop` it never waits, and what it dropped is a gap every receiver sees.
+- **No name-table exhaustion by a stranger.** Only a writer's device emits (§13.1); the table is the sender's own; a receiver cannot make the sender bind a name. 4,096 ids and one sweep a second bound the cost of a sender that makes up names.
+- **A replay amplifies by the number of receivers on the route**, never more than one window or 64 KiB of standing values per **new** receiver, and only for a receiver that was not admitted before (or a `Window` receiver that names a start): a renewal costs no replay.
+- **A re-key** replaces the cipher the next frame is sealed with (the writer reads the channel's key epoch for every frame); a frame is never sealed twice and a sequence is never sealed twice under a key, so a (key, nonce) pair never recurs (§11.2).
+- **Clocks.** The 200 ms of a bind, the 60 s of an idle id, the age of a window and the lifetime of a standing value are counted on the sender's monotonic clock; no decision about who is a member or what is genuine rests on them.
