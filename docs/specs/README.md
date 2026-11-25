@@ -48,7 +48,11 @@ here before using it.
 
 | Block | Owner |
 |---|---|
-| 0x0403–0x040F | free (left below the trust-context block) |
+| 0x0403 | free |
+| 0x0404 | [trust-context.md](trust-context.md) §3.3.12: `CutTip` (a sub-TLV of RevocationCut) |
+| 0x0405 | free |
+| 0x0406 | [trust-context.md](trust-context.md) §3.3.12: `CutTipDigest` (in CutTip) |
+| 0x0407–0x040F | free (left below the trust-context block) |
 | 0x0410–0x043E | [trust-context.md](trust-context.md) |
 | 0x0440–0x046C | [ndn-link.md](ndn-link.md) (hello/verdict, the control messages after the verdict — Reachability 0x0440, Presence 0x0446, ObservedAddress 0x0458 and, since round 7, `Departure` 0x044C, §5.9 — and the punch messages) |
 | 0x0470–0x049F | [trust-envelope.md](trust-envelope.md) (the `intro` kind's offer, relay hint and secret: 0x0475–0x0477; its link hint, the octets of data-layer.md §19.2's hint: 0x0478; since round 10 the compact form, names as wire relative to the namespace instead of text: `IntroNamespaceWire` 0x0490, `IntroOfferWire` 0x0492, `IntroRelayWire` 0x0494, all even; the text tags 0x0489, 0x0475, 0x0476 are still read, never written) |

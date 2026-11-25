@@ -115,6 +115,8 @@ evolvability rule: a type is *critical* iff `type <= 31` or `type` is odd.
 | `0x042E` | CutExact | no | in RevocationCut | 0..n | a complete Name TLV whose last component is an ImplicitSha256DigestComponent |
 | `0x0430` | CutKeyDigest | no | in RevocationCut | 0..1 (REQUIRED in a new cut) | 32 octets: SHA-256 of the revoked key's public key (§3.3.12) |
 | `0x0432` | CutManifest | no | in RevocationCut | 0..1 (REQUIRED in a new cut with a CutRange) | a complete Name TLV ending in an ImplicitSha256DigestComponent: the cut manifest's root packet (§3.3.12) |
+| `0x0404` | CutTip | no | in RevocationCut | 0..n (one per prefix) | a complete Name TLV (a log prefix), a SequenceNumNameComponent (the tip's seq) and a CutTipDigest (§3.3.12) |
+| `0x0406` | CutTipDigest | no | in CutTip | 1 | 32 octets: SHA-256 of the signed region of the tip's entry (§3.3.12) |
 | `0x0434` | DataRequiresCut | no | in TrustContext | 0..n | UTF-8 role name (§3.3.13) |
 | `0x0436` | CutManifestNode | (outer) | a cut manifest's Data Content | 1 | ManifestRange entries (a leaf) or ManifestChild entries (an interior node) (§3.3.12) |
 | `0x0438` | ManifestRange | no | in CutManifestNode | 0..n | a complete Name TLV (a CutRange prefix) + 1..n ManifestEntry |
@@ -128,13 +130,15 @@ whose even numbers are taken too, and then at `0x0430–0x043F`: `0x0430`,
 `0x0432` and `0x0434` above, and `0x0436–0x043E` for the content of a cut
 manifest, which is a Data of its own, not part of the TrustContext
 (§3.3.12). The odd numbers of both later blocks are unassigned.
-`0x0403–0x040F` is left free below the block. The block is provisional and
+`0x0404` (CutTip) and `0x0406` (CutTipDigest) sit just below the block, as
+sub-TLVs of a RevocationCut that were added after it was full; the rest of
+`0x0403–0x040F` is free. The block is provisional and
 has not been submitted to the NDN TLV registry.
 
 The value encodings differ in one place that implementers must notice. The
 namespace Name is written *directly* as a `0x07` child of TrustContext. The
 values of CaEndpoint, Revocation, KeyRole, AdvertisedRelay, RevocationCut,
-CutRange, CutExact and CutManifest *contain* a full `0x07` Name TLV, header
+CutRange, CutExact, CutManifest and CutTip *contain* a full `0x07` Name TLV, header
 included.
 
 ### 3.2 Structure and producer order
@@ -162,7 +166,7 @@ SchemaAuthoritative = 0x041C 0
 CaEndpoint     = 0x0414 TLV-LENGTH Name
 EnrollmentHint = 0x0416 TLV-LENGTH Flags *OCTET
 Revocation     = 0x0418 TLV-LENGTH Name
-RevocationCut  = 0x0428 TLV-LENGTH Name [CutKeyDigest] [CutManifest] *CutRange *CutExact
+RevocationCut  = 0x0428 TLV-LENGTH Name [CutKeyDigest] [CutManifest] *CutRange *CutExact *CutTip
                                                               ; Name = the revoked key
 CutKeyDigest   = 0x0430 32 32OCTET                            ; SHA-256 of the key's public key
 CutManifest    = 0x0432 TLV-LENGTH Name                       ; ends in an ImplicitSha256DigestComponent
@@ -170,6 +174,9 @@ CutRange       = 0x042A TLV-LENGTH Name 1*CutRun              ; Name = a prefix
 CutRun         = 0x042C TLV-LENGTH SequenceNumNameComponent SequenceNumNameComponent
                                                               ; first, last; first <= last
 CutExact       = 0x042E TLV-LENGTH Name                       ; ends in an ImplicitSha256DigestComponent
+CutTip         = 0x0404 TLV-LENGTH Name SequenceNumNameComponent CutTipDigest
+                                                              ; Name = a log prefix; the seq = the tip entry's
+CutTipDigest   = 0x0406 32 32OCTET                            ; SHA-256 of the tip entry's signed region
 DataRequiresCut = 0x0434 TLV-LENGTH 1*OCTET                   ; UTF-8 role name
 SequenceNumNameComponent = 0x3A TLV-LENGTH NonNegativeInteger
 SourceBundleHash = 0x041A 32 32OCTET
@@ -513,12 +520,14 @@ encrypts it); see [ndn-link.md](ndn-link.md).
 #### 3.3.12 RevocationCut (`0x0428`)
 
 ```
-value        = Name [CutKeyDigest] [CutManifest] *CutRange *CutExact
+value        = Name [CutKeyDigest] [CutManifest] *CutRange *CutExact *CutTip
 CutKeyDigest = 0x0430 32 32OCTET
 CutManifest  = 0x0432 TLV-LENGTH Name
 CutRange     = 0x042A TLV-LENGTH Name 1*CutRun
 CutRun       = 0x042C TLV-LENGTH SequenceNumNameComponent SequenceNumNameComponent
 CutExact     = 0x042E TLV-LENGTH Name
+CutTip       = 0x0404 TLV-LENGTH Name SequenceNumNameComponent CutTipDigest
+CutTipDigest = 0x0406 32 32OCTET
 ```
 
 A revocation cut is the root's signed statement of where a revoked key's
@@ -547,10 +556,21 @@ most one entry per key.
 - **CutExact** (`0x042E`): a complete `0x07` TLV whose last component is an
   ImplicitSha256DigestComponent (TLV-TYPE `0x01`, 32 octets): one packet,
   by its full name.
+- **CutTip** (`0x0404`): the tip of one log. A prefix `P` (a complete `0x07`
+  TLV, a log `<D>/32=log/<S>`), one SequenceNumNameComponent (`0x3A`, the
+  tip's sequence number `t`, in its shortest form) and a **CutTipDigest**
+  (`0x0406`, exactly 32 octets): the SHA-256 of the signed region of the
+  tip's entry (see Acceptance). At most one per prefix, written after every
+  CutExact. A cut may name a log by one tip instead of a manifest of every
+  entry.
 
 **Acceptance.** Let `X` be a Data packet with name `N` and implicit digest
 `d` (SHA-256 of `X`'s whole TLV encoding, as NDN defines the implicit
-digest). The cut **accepts** `X` iff either:
+digest), and let `r` be the **signed-region digest** of `X`: the SHA-256 of
+the octets of `X` from the start of its Name through the end of its
+SignatureInfo, the SignatureValue excluded (ndn-rs:
+`ndn_security::signed_region_digest`, the same definition as the data
+layer's signed digest). The cut **accepts** `X` iff any of:
 
 - some CutRange has a prefix `P` (which may be empty) such that `N` is `P`
   followed by exactly one component, that component is a
@@ -558,12 +578,19 @@ digest). The cut **accepts** `X` iff either:
   (§1), its value `s` lies in one of that CutRange's runs, and, when the cut
   has a CutManifest, the manifest lists exactly `(s, d)` under `P`; or
 - some CutExact equals `N` followed by the ImplicitSha256DigestComponent of
-  `d`.
+  `d`; or
+- some CutTip has a prefix `P` (which may be empty) such that `N` is `P`
+  followed by exactly one component, that component is a
+  SequenceNumNameComponent in its shortest form (§1) with value `s`, and
+  either `s < t` (below the tip: accepted by name, whatever the bytes) or
+  `s = t` and `r` equals the tip's CutTipDigest.
 
 Nothing else is accepted: not a longer or shorter name under `P`, not a
 sequence number outside the runs, not a sequence number written in a
 longer form (`seq=` with value `00 02` is another name than `seq=2`), not
-other bytes at an exact name, and, under a manifest, not other bytes at a
+other bytes at an exact name or at a tip's own name, not a sequence number
+above a tip's (the tip says nothing about it: a range or an exact entry may
+still accept it), and, under a manifest, not other bytes at a
 name a range lists. A range with a manifest binds names and bytes, as an
 exact entry does; a range of a cut without a manifest (one made before
 manifests) binds names only (§10). While a reader does not hold every
@@ -574,6 +601,29 @@ are refused. The cut never reads a date, a sequence number's meaning or a
 validity period; which names a range lists is the producer's business
 (the data layer bounds them by the root's own observation,
 [data-layer.md](data-layer.md) §8.1).
+
+**Tips.** A tip names a log by its last entry instead of listing every
+entry. Every `P` + `s` below `t` is accepted by name; the tip's own name only
+as the signed object the digest names. The digest covers the signed region,
+not the whole packet, on purpose: an ECDSA signature `(r, s)` and
+`(r, n − s)` both verify, so a relay that holds an entry can serve a
+*high-S copy* with the same signed region and another implicit digest, and
+no key is needed to make it. A cut that lists implicit digests (a manifest,
+a CutExact) refuses that copy, which is the entry the key signed (the
+residual L10 of [heap.md](heap.md)); a tip accepts it, the copy and the
+original being one signed object. Other bytes at the tip's name have another
+signed region and stay refused. A cut with tips and no manifest and no
+range accepts, besides its CutExact entries, only names under its tips.
+
+A tip binds names below it, not bytes. The validator (§6.3) accepts a
+packet below a tip by name when it verifies under the key (and the cut's
+CutKeyDigest, if any, matches): it holds one packet, never the log. The ends
+bind the bytes: the data layer ([data-layer.md](data-layer.md)) accepts an
+entry below a tip only when it lies in the chain ancestry of the tip (each
+entry names its predecessors by signed digest), which a node holding one
+packet cannot check. A forwarder's Content Store re-check (§6.3) shares the
+validator's rule and so cannot bind them either: it keeps a below-tip
+packet that verifies, and the ends decide.
 
 <a id="cut-manifest"></a>**Cut manifest.** A cut's ranges can list
 thousands of packets, and a digest each does not fit the one Data a context
@@ -631,16 +681,18 @@ every cut it holds (§7.3).
 2. MUST carry every cut of version `N` into every later version verbatim,
    except that a later version MAY add CutExact entries to it
    (**re-admission**, §5.3). It MUST NOT change, add or remove a CutRange,
-   a run, the CutKeyDigest or the CutManifest, remove a CutExact entry, or
+   a run, a CutTip, the CutKeyDigest or the CutManifest, remove a CutExact entry, or
    drop a cut whose key a Revocation entry covers. Re-admission is by exact
-   name and digest only, never by range: a range added later would admit
+   name and digest only, never by range or tip: a range or tip added later would admit
    whatever the key's thief signed at those names. A cut whose key no
    Revocation entry covers (an orphan, which has no effect) is not carried.
 3. MUST write each cut canonically: CutRange entries in canonical order of
    their prefixes (§3.2), one per prefix; inside each, runs ascending,
    disjoint and not adjacent (runs `a..b` and `b+1..c` are written as one
    run `a..c`); CutExact entries in canonical order of their names, without
-   duplicates; NonNegativeIntegers in their shortest form.
+   duplicates; then CutTip entries in canonical order of their prefixes,
+   one per prefix, after every CutExact; NonNegativeIntegers in their
+   shortest form.
 4. MUST give every new cut a CutKeyDigest, computed from the certificate
    whose public key verified the packets the cut lists, and MUST refuse to
    make the cut when those packets verify under two different public keys
@@ -650,6 +702,15 @@ every cut it holds (§7.3).
    version is published (§7.3). A cut without a CutKeyDigest, or with ranges
    and no CutManifest, is one made before these fields: it is carried as it
    is (rule 2), never made anew.
+5. MAY name a log by a CutTip instead of ranges: the tip is the last entry
+   of the log the root itself verified before the moment the owner gives as
+   the loss of the key (as for ranges, [data-layer.md](data-layer.md)
+   §8.1), with its sequence number and its signed-region digest. A cut
+   that names logs by tips alone needs no CutManifest; a cut that also has
+   a CutRange still needs its CutManifest (rule 4). A later version
+   carries every tip verbatim (rule 2): a tip is never lowered, raised,
+   dropped or given another digest, and a packet at or above a tip's number
+   is re-admitted by CutExact like any other.
 
 Which packets a range lists is not judged here; the data layer's producer
 lists only packets the root itself verified before the moment the owner
@@ -676,14 +737,17 @@ when a RevocationCut is malformed:
 - a CutKeyDigest is not exactly 32 octets, or a cut has two;
 - a CutManifest is not one Name TLV ending in an ImplicitSha256DigestComponent
   of 32 octets, or a cut has two;
+- a CutTip is not a Name TLV, a SequenceNumNameComponent in its shortest
+  form and a CutTipDigest of exactly 32 octets, nothing else; or a cut has
+  two CutTip entries for one prefix;
 - a RevocationCut or CutRange holds an unknown critical child (`<= 31` or
   odd, a second Name included); an unknown non-critical (even) child is
   skipped;
 - two RevocationCut entries name the same key.
 
 The key Name is checked as a Name only; its form (`…/KEY/<k>`) is the
-producer's rule (§3.3.6). A decoder accepts cuts, ranges, runs and exact
-entries in any order and reads them as their union: overlapping or
+producer's rule (§3.3.6). A decoder accepts cuts, ranges, runs, exact
+entries and tips in any order and reads them as their union: overlapping or
 adjacent runs, two CutRange entries with one prefix, and a repeated
 CutExact mean what their canonical form means (rule 3), which ndn-rs
 writes when it re-encodes. A cut whose key no Revocation entry covers is
@@ -707,12 +771,24 @@ even on purpose: an odd (critical) type would make that node reject the
 whole version, so it would miss the revocation itself and go on accepting
 everything the key signs.
 
+A decoder that knows cuts but predates CutTip skips it (even) and reads the
+cut without its tips. For a cut that names logs only by tips, that is a cut
+that accepts nothing it names: the node refuses the log's packets, below
+the tip and at it, until it is updated. It refuses more than an updated
+node and never less, so it fails closed. A cut that also has ranges is read
+by such a node by its ranges alone.
+
 **Size.** A context is one Data packet (§7.2). A cut over a log is a few
 runs per prefix, one per stretch of consecutive sequence numbers; each
 CutExact costs its name and 34 octets, the CutKeyDigest 34 and the
 CutManifest its name. The digest of each packet a range lists is in the
 manifest, outside the context, so the context stays one packet however
 long the key's log was.
+
+A tip costs its prefix Name plus 43 octets with a one-octet sequence number
+(4 of header, 3 of sequence number, 36 of CutTipDigest), one per log
+however long the log is: a cut over many logs fits the context where a
+manifest of every entry would not.
 
 #### 3.3.13 DataRequiresCut (`0x0434`)
 
@@ -1401,7 +1477,8 @@ An adopted version is **revoking** when it may refuse Data the replaced one
 accepted. That is the case when it revokes a name the replaced version did
 not; when, for a key the replaced version holds a cut of, the new cut does
 not contain the old one — the cut is removed, a run of the old cut is not
-covered by the new one, a CutExact entry is dropped, or the CutKeyDigest
+covered by the new one, a CutExact entry is dropped, a CutTip is dropped,
+lowered or changed at its own number, or the CutKeyDigest
 or CutManifest is added, removed or changed (a new manifest may list other
 bytes); and when it lists a role in DataRequiresCut (§3.3.13) that the
 replaced version did not. The producer rules forbid shrinking a cut
@@ -1702,6 +1779,15 @@ with these differences:
    as for a missing certificate: the forwarder's validation stage parks the
    Data and fetches them as it fetches certificates, and gives the Data up
    if they do not come in time.
+4. **The tip.** When the cut has a CutTip for the prefix of the Data's name
+   (the name is that prefix and one sequence number, §3.3.12), a number
+   below the tip's is accepted by name, the tip's own number only with the
+   signed-region digest the tip carries, a higher one not by the tip. The
+   key's CutKeyDigest binds all three as before. The walk holds one
+   packet, so it does not bind the bytes below a tip: the data layer does,
+   by chain ancestry of the tip, and a forwarder's Content Store re-check
+   (`chain_clear`), which shares this rule, cannot. A cut that has tips and
+   no manifest never leaves a verdict pending for a manifest.
 
 A revoked key with no cut, and one whose cut does not accept the packet,
 are refused alike (ndn-rs: `TrustError::Revoked`). A key revoked with no
@@ -2347,6 +2433,15 @@ through from it. Only verified versions may feed the Behind rule (§8.2).
 - Re-admission is exact (§3.3.12): one name with one digest. It admits no
   neighbouring sequence number, no packet under another prefix and no other
   bytes at that name, so it cannot be turned into a range.
+- A cut with a tip binds names below it, not their bytes (§3.3.12): a thief
+  of the key who signs at a name below the tip, which the key's log never
+  held, gets it accepted by the walk and by a forwarder's cache. The ends
+  refuse it: the data layer accepts an entry below a tip only in the tip's
+  chain ancestry. Applications that read Data below a tip without the data
+  layer have the cost of a name-only range (the residual of a cut made
+  before manifests) for those names. The tip entry itself is bound by its
+  signed region, so another signature value over it (a relay's high-S ECDSA
+  copy) is the same object and no other bytes are accepted at its name.
 - Data ignores validity periods (§6.3), except that a role listed in
   DataRequiresCut (§3.3.13) is refused once its certificate lapsed until
   its cut is held. A device's authority over Data therefore ends at its
@@ -2394,8 +2489,10 @@ through from it. Only verified versions may feed the Behind rule (§8.2).
   checking again every cut it carries.
 - A node that predates cuts refuses every packet of a revoked key, the
   in-cut ones too (§3.3.12): it fails safe. A node that knows cuts but
-  predates CutKeyDigest, CutManifest and DataRequiresCut keeps the
-  residuals those fields close, for its own judgements, until updated.
+  predates CutKeyDigest, CutManifest, CutTip and DataRequiresCut keeps the
+  residuals those fields close, for its own judgements, until updated; for
+  a cut that names logs only by tips, such a node accepts none of them and
+  refuses more, never less.
 - A forwarder believes a face's Data unchecked only when the operating
   system or the process itself vouches for the program on it *and* the node
   trusts that program as its own (an in-process face, shared memory, a Unix
@@ -2750,6 +2847,44 @@ Its full name, the value of T9's CutManifest:
 context listing `guest` and `relay` writes them in that order, after its
 RevocationCut entries (§3.2). T2 lists no role and is unchanged.
 
+### T11 RevocationCut with tips (319 octets)
+
+A cut that names logs by tips instead of a manifest: key
+`/home/bob/member/phone/KEY/k1`, a CutKeyDigest of the octets `0x40`
+through `0x5f` (a stand-in, as in T9), the CutExact of T8
+(`…/32=log/notes/seq=9`, digest `000102…1f`), and two CutTip entries,
+written after the CutExact in canonical order of their prefixes (the shorter
+prefix first):
+
+- `/home/bob/member/phone/32=log`, seq 1, CutTipDigest `202122…3f` (the
+  octets `0x20` through `0x3f`, a stand-in for the signed-region digest);
+- `/home/bob/member/phone/32=log/notes`, seq 7, CutTipDigest `606162…7f`.
+
+It has no CutRange and no CutManifest:
+
+```
+fd0428fd013907230804686f6d650803626f6208066d656d626572080570686f
+6e6508034b455908026b31fd043020404142434445464748494a4b4c4d4e4f50
+5152535455565758595a5b5c5d5e5ffd042e4d074b0804686f6d650803626f62
+08066d656d626572080570686f6e6520036c6f6708056e6f7465733a01090120
+000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+fd040448071f0804686f6d650803626f6208066d656d626572080570686f6e65
+20036c6f673a0101fd040620202122232425262728292a2b2c2d2e2f30313233
+3435363738393a3b3c3d3e3ffd04044f07260804686f6d650803626f6208066d
+656d626572080570686f6e6520036c6f6708056e6f7465733a0107fd04062060
+6162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f
+```
+
+Under this cut, `…/notes/seq=0` through `seq=6` are accepted by name (with
+any bytes, if the key digest matches); `…/notes/seq=7` only as the signed
+object whose signed-region digest is `606162…7f`, whichever signature value
+it carries; `…/notes/seq=8` is not accepted by the tip, and `…/notes/seq=9`
+only by the CutExact, with the implicit digest `000102…1f`. In the log
+`…/32=log` itself, seq 0 is accepted by name and seq 1 only with `202122…3f`.
+A cut without CutTip entries encodes as before (T8–T10 are unchanged).
+A node that does not know `0x0404` skips both tips and reads a cut that
+accepts the CutExact only.
+
 ### Generated namespace structure (not a byte vector)
 
 `ndn_cert::init_namespace(/home/bob)` gives a context Data of 1944 octets
@@ -2812,6 +2947,17 @@ and `t10_manifest()` (`RevocationCut::{set_key_digest, set_manifest}`,
 `t8_bytes_decode_as_an_old_form_cut` checks that T8 still decodes without
 the two fields; `data_requires_cut_round_trips_in_canonical_order` checks
 the DataRequiresCut encoding and its order.
+
+T11 is `spec_vector_t11_cut_with_tips` in the same file (helper
+`t11_cut()`, `RevocationCut::{add_tip, readmit, set_key_digest}`), which
+also checks what the cut accepts by name. In `ndn-security`,
+`a_cut_with_tips_and_no_manifest_decodes_in_an_old_node_as_refusing` checks
+the skipped sub-TLV and that a cut without tips keeps its bytes,
+`covers_never_accepts_less_with_tips` the adopter's comparison, and, in
+the validator's tests, `a_cut_with_tips_accepts_below_the_tip_by_name` and
+`a_high_s_copy_of_the_tip_entry_is_accepted_by_a_tip_cut` the acceptance rule
+with real signatures, a manifest cut refusing the high-S copy that a tip
+cut accepts.
 
 ## 12. Decisions
 
