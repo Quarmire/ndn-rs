@@ -10,23 +10,27 @@
 //! the PIB), that none is the root's or the CA's, which of them the held
 //! version does not revoke yet ([`ndn_cert::plan_revocation`]), and that a
 //! cut file given is bounded at or before the time the owner says the key
-//! was lost, carries its whole manifest, and holds the cut of one of those
-//! keys, listing only its device's log, naming its public key
-//! ([`ndn_cert::GivenCut`], [`ndn_cert::check_cut`]: `cut-refused`
+//! was lost, carries its manifest or its tips (a cut with ranges carries its
+//! whole manifest; a cut that names a tip per log needs none), and holds the
+//! cut of one of those keys, listing only its device's log, naming its
+//! public key ([`ndn_cert::GivenCut`], [`ndn_cert::check_cut`]:
+//! `cut-refused`
 //! otherwise). [`revoke`] then checks the running device uses the same PIB,
-//! stores the cut's manifest packets beside the contexts (the running
-//! device serves them with the version), unlocks that namespace's root to
-//! sign version `N+1` ([`ndn_cert::bump_context_revoking`]), drops the
+//! stores the cut's manifest packets (a cut of tips has none) beside the
+//! contexts (the running device serves them with the version), unlocks that
+//! namespace's root to sign version `N+1`
+//! ([`ndn_cert::bump_context_revoking`]), drops the
 //! signer, and hands the version to the running device
 //! ([`super::device::hand_over`]). The other namespaces whose roots the PIB
 //! holds are not touched.
 //!
 //! Without a cut, every packet a revoked key signed is refused once a node
-//! holds the version. With one, the packets the cut accepts (the log
-//! entries the root's data layer first verified before the loss, each by
-//! its exact bytes as the manifest lists them) stay accepted, and the key's
-//! certificates stay served so they can be verified; everything else it
-//! signed is refused. The entries the cut's bound left out
+//! holds the version. With one, the packets the cut accepts stay accepted
+//! (the log entries the root's data layer first verified before the loss,
+//! each by its exact bytes as the manifest lists them, or, below a tip, by
+//! name, the data layer binding them to the tip by chain ancestry), and the
+//! key's certificates stay served so they can be verified; everything else
+//! it signed is refused. The entries the cut's bound left out
 //! ([`ndn_cert::CutFile::left_out`]) are refused with the rest; a genuine
 //! one is re-admitted later by its full name ([`super::readmit`]).
 //!
@@ -49,9 +53,10 @@ use crate::admin::HandedOver;
 /// Every check of revoking what `name` designates that needs no key, on the
 /// PIB at `pib_dir`. `namespace`, when named, must be the namespace the
 /// revocation is made in (`revoke-other-namespace` otherwise). `cut`, when
-/// given, must be bounded at or before its loss time, carry its whole
-/// manifest and be the revocation cut of one of the keys the version adds,
-/// listing only that key's device log and naming its public key
+/// given, must be bounded at or before its loss time, carry its manifest or
+/// its tips (a cut with ranges, its whole manifest) and be the revocation
+/// cut of one of the keys the version adds, listing only that key's device
+/// log and naming its public key
 /// (`cut-refused` otherwise); it is signed beside the revocation. `adding`
 /// empty: the held version revokes them all already, nothing to sign.
 pub fn plan(
@@ -144,7 +149,8 @@ pub struct Revoked {
 /// Store the manifest packets of `cut` beside the contexts of `namespace`
 /// in the PIB at `pib_dir`, so the running device (now, or at its next
 /// start) serves them with the version (`cut-refused` when one cannot be
-/// stored: nothing is signed).
+/// stored: nothing is signed). A cut file without manifest packets (a cut
+/// that names tips, not a manifest) stores none.
 pub(crate) fn store_manifest(
     pib_dir: &Path,
     namespace: &Name,

@@ -11,6 +11,12 @@
 //! packets of every cut they hold, beside the versions
 //! ([`crate::publish::PublishedContexts::publish_cut_manifests`]).
 //!
+//! A cut that names tips and no ranges (one `(log prefix, seq, digest)` per
+//! space) names no manifest: there is nothing of it to keep, serve or
+//! fetch, and only the cuts that name one are walked here. What lies below
+//! a tip is bound by the data layer's chain test, not by a packet of the
+//! namespace.
+//!
 //! When a version is kept ([`crate::keep`]), the packets the store holds
 //! already (the root device stores those of the cut file it signed before
 //! handing the version over) are served at once; the missing ones are
@@ -214,4 +220,41 @@ pub async fn fetch_missing(
         }
     }
     kept
+}
+
+#[cfg(test)]
+mod tests {
+    //! Invariant: only a cut that names a manifest has packets to keep,
+    //! serve or fetch; a cut of tips names none.
+
+    use ndn_security::RevocationCut;
+
+    use super::*;
+
+    fn n(s: &str) -> Name {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn only_a_cut_that_names_a_manifest_has_roots() {
+        let tips_key = n("/a/member/phone/KEY/k");
+        let manifest_key = n("/a/member/tablet/KEY/t");
+        let notes = n("/a/member/tablet/32=log/notes");
+        let mut tips = RevocationCut::new(tips_key.clone());
+        tips.add_tip(&n("/a/member/phone/32=log/notes"), 4, [9; 32]);
+        let built = ndn_security::cut_manifest::build(
+            &n("/a"),
+            &manifest_key,
+            &[(notes.clone(), 1, [1; 32])],
+        )
+        .unwrap();
+        let mut ranged = RevocationCut::new(manifest_key);
+        ranged.add_run(&notes, 1, 1);
+        ranged.set_manifest(built.root.clone()).unwrap();
+
+        let ctx = SignedTrustContext::hierarchical(n("/a")).with_revocation_cut(tips);
+        assert!(roots(&ctx).is_empty(), "a tip cut has no manifest to keep");
+        let ctx = ctx.with_revocation_cut(ranged);
+        assert_eq!(roots(&ctx), vec![built.root]);
+    }
 }

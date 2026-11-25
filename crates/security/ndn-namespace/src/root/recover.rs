@@ -29,9 +29,10 @@
 //! ([`ndn_cert::RecoveryVersion::dropped_cuts`]). With the old root
 //! compromised, `N+1` may add a cut for each key it newly revokes
 //! ([`RecoverRequest::cuts`]): each from a cut file bounded at or before
-//! the time the person says the key was lost and carrying its whole
-//! manifest, checked before anything is asked; its manifest packets are
-//! stored beside the contexts before `N+1` is handed over, so the running
+//! the time the person says the key was lost and carrying its manifest or
+//! its tips (a cut with ranges, its whole manifest; a cut of tips, none),
+//! checked before anything is asked; a manifest's packets are stored
+//! beside the contexts before `N+1` is handed over, so the running
 //! device serves them with it. Then, only once the person has seen the cuts
 //! carried and confirmed ([`RecoverRequest::recertify`]), the new CA
 //! certifies again each key revoked with a cut whose certificate with the
@@ -74,7 +75,8 @@ pub struct RecoverRequest {
     /// `N+1` newly revokes (the old root's, the old root device's, the kits
     /// not kept), at most one per key, each with when the person says the
     /// key was lost: it must be bounded at or before then and carry its
-    /// whole manifest ([`ndn_cert::CutFile::check_bound`],
+    /// manifest or its tips (a cut with ranges, its whole manifest;
+    /// [`ndn_cert::CutFile::check_bound`],
     /// [`ndn_cert::CutFile::check_manifest`]; `cut-refused` otherwise).
     pub cuts: Vec<GivenCut>,
     /// Nothing answers: the person vouches that no version newer than the
@@ -191,8 +193,9 @@ fn no_root_here(
 
 /// Recover the namespace of `request` onto this device (see the
 /// [module docs](self)). Refusals: `cut-refused` (a cut file unbounded,
-/// bounded after its loss time, without its whole manifest, or not the cut
-/// of a key `N+1` newly revokes; its manifest packets cannot be stored),
+/// bounded after its loss time, with ranges and without its whole manifest,
+/// or not the cut of a key `N+1` newly revokes; its manifest packets cannot
+/// be stored),
 /// the anti-fork ones of [`crate::admin::NewestRefusal`], the kit's, the
 /// running device's, `version-not-taken` (`N+1` refused: everything
 /// written was removed) and `hand-over-unknown` (whether `N+1` was taken is
@@ -217,7 +220,7 @@ pub async fn recover(
     } = request;
     // A cut file is checked before anything is asked: bounded at or before
     // the loss time, so it cannot accept what a thief wrote after it, and
-    // carrying the whole manifest the cut names.
+    // carrying its manifest or its tips.
     for given in &cuts {
         given
             .file

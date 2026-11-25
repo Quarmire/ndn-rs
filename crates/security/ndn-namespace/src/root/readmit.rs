@@ -3,12 +3,14 @@
 //! the key's revocation cut.
 //!
 //! A cut accepts the log entries the key's device published before it was
-//! revoked, as the cut lists them; a packet the device made after (or a
+//! revoked, as the cut lists them (by a manifest, or by tips: below a tip's
+//! sequence number by name); a packet the device made after (or a
 //! reader only learns of later) is refused, and reported with its full name
 //! (its name and implicit SHA-256 digest). The owner who decides that packet
 //! is genuine re-admits it by that full name: an exact entry accepts that
 //! name with those bytes only — never a range, so a neighbouring sequence
-//! number or another packet at that name stays refused.
+//! number or another packet at that name stays refused. A cut that names
+//! tips takes exact entries too (above a tip's number).
 //!
 //! [`plan`] checks, before anything is asked, that this is the root device
 //! of the namespace the key is in (a namespace named must be that one),

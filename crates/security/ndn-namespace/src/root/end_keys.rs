@@ -9,7 +9,7 @@
 //! ended. Nothing is queued: a key leaves the list once a version revokes
 //! it. [`plan`] matches the cut files given (one per key, written by the
 //! root's data layer: its `cut <key> <file> --held-before <when>`) to them —
-//! each bounded at or before its key's end, with its whole manifest — and
+//! each bounded at or before its key's end, with its manifest or its tips — and
 //! [`end`] signs ONE version revoking every key that has its cut, with its
 //! cut beside it, and hands it over. A key without a cut file is never
 //! revoked here: a cut is added only with its key's revocation, so revoking
@@ -216,7 +216,8 @@ pub struct EndPlan {
 /// whose root the PIB at `pib_dir` holds) at `now` with the cut files
 /// `cuts`: each must be the cut of a key to end (`cut-refused`, `why`
 /// `not-ending` otherwise), bounded at or before the moment that key's
-/// authority ended, with its whole manifest, naming its public key, listing
+/// authority ended, with its manifest or its tips (a cut with ranges its
+/// whole manifest), naming its public key, listing
 /// only its device log (`cut-refused`).
 pub fn plan(
     pib_dir: &Path,
@@ -280,7 +281,7 @@ pub struct Ended {
 /// Sign and hand over `planned` on the PIB at `pib_dir`: one version
 /// revoking every key of [`EndPlan::ending`] with its cut. Refusals:
 /// `nothing-to-sign` (no key has a cut file), the running device's, the
-/// manifest's (`cut-refused`), the secret's and `root-not-unlocked`,
+/// manifest's, if its cut has one (`cut-refused`), the secret's and `root-not-unlocked`,
 /// `version-not-taken`, `hand-over-unknown` (params `keys`).
 pub async fn end(
     planned: EndPlan,

@@ -517,6 +517,107 @@ async fn a_revocation_with_a_cut_and_a_readmission_into_it() {
     assert_eq!(versions(&pib), (3, 1));
 }
 
+/// A cut file whose cut names a tip of the key's device log and no
+/// manifest is signed beside the revocation: no manifest packet is stored
+/// or asked for, and the version holds the cut with its tip.
+#[tokio::test]
+async fn a_revocation_with_a_tip_cut_signs_without_a_manifest() {
+    use ndn_cert::{CutFile, GivenCut};
+    use ndn_security::RevocationCut;
+
+    let (_dir, pib) = two_roots().await;
+    let secrets = Secrets::new(b"unused");
+    let key = n("/a/member/phone/KEY/k");
+    let notes = ndn_cert::device_log_of(&key).append("notes");
+    let mut cut = RevocationCut::new(key.clone());
+    cut.add_tip(&notes, 4, [9; 32]);
+    cut.set_key_digest([3; 32]);
+    let mut file = CutFile::new(cut.clone());
+    file.held_before = Some(1_000);
+    let given = GivenCut { file, lost: 1_000 };
+
+    let planned = revoke::plan(&pib, &key, None, Some(given.clone())).unwrap();
+    let revoked = revoke::revoke(planned, &key, &pib, &Device::NotRunning, &secrets)
+        .await
+        .unwrap();
+    assert_eq!(revoked.cut.as_ref(), Some(&given.file));
+    let (held, _) = read_stored_context(&pib, &n("/a")).unwrap().unwrap();
+    let held_cut = held.revocation_cut(&key).unwrap();
+    assert_eq!(held_cut, &cut);
+    assert_eq!(held_cut.manifest(), None);
+    assert_eq!(held_cut.tip_for(&notes).map(|t| t.seq), Some(4));
+    assert!(
+        ndn_cert::read_cut_manifest_packets(&pib, &n("/a"))
+            .unwrap()
+            .is_empty(),
+        "a tip cut names no manifest: none is stored"
+    );
+}
+
+/// A re-admission adds one exact full name above a tip to the tip cut:
+/// that packet only (a name below the tip is accepted by name already:
+/// `nothing-to-sign`), and the cut keeps its tip.
+#[tokio::test]
+async fn readmit_adds_an_exact_entry_to_a_tip_cut() {
+    use ndn_cert::{CutFile, GivenCut};
+    use ndn_packet::NameComponent;
+    use ndn_security::RevocationCut;
+
+    let (_dir, pib) = two_roots().await;
+    let secrets = Secrets::new(b"unused");
+    let key = n("/a/member/phone/KEY/k");
+    let notes = ndn_cert::device_log_of(&key).append("notes");
+    let mut cut = RevocationCut::new(key.clone());
+    cut.add_tip(&notes, 4, [9; 32]);
+    cut.set_key_digest([3; 32]);
+    let mut file = CutFile::new(cut);
+    file.held_before = Some(1_000);
+    let planned = revoke::plan(&pib, &key, None, Some(GivenCut { file, lost: 1_000 })).unwrap();
+    revoke::revoke(planned, &key, &pib, &Device::NotRunning, &secrets)
+        .await
+        .unwrap();
+
+    let full = |seq: u64| {
+        notes
+            .clone()
+            .append_component(NameComponent::sequence_num(seq))
+            .append_component(NameComponent::new(
+                ndn_packet::tlv_type::IMPLICIT_SHA256,
+                bytes::Bytes::from(vec![seq as u8; 32]),
+            ))
+    };
+    let planned = readmit::plan(&pib, &key, &[full(7)], None).unwrap();
+    assert_eq!(planned.adding, vec![full(7)]);
+    let readmitted = readmit::readmit(planned, &pib, &Device::NotRunning, &secrets)
+        .await
+        .unwrap();
+    assert_eq!((readmitted.held_version, readmitted.version), (2, 3));
+    let (held, _) = read_stored_context(&pib, &n("/a")).unwrap().unwrap();
+    let cut = held.revocation_cut(&key).unwrap();
+    assert_eq!(cut.exact(), &[full(7)]);
+    assert_eq!(cut.tip_for(&notes).map(|t| t.seq), Some(4));
+    assert!(
+        cut.accepts(
+            &notes
+                .clone()
+                .append_component(NameComponent::sequence_num(7)),
+            &[7; 32]
+        )
+    );
+
+    // Below the tip the cut accepts by name already: nothing to sign.
+    let nothing = readmit::readmit(
+        readmit::plan(&pib, &key, &[full(2)], None).unwrap(),
+        &pib,
+        &Device::NotRunning,
+        &secrets,
+    )
+    .await
+    .unwrap_err();
+    assert_code(&nothing, code::NOTHING_TO_SIGN);
+    assert_eq!(versions(&pib), (3, 1));
+}
+
 #[tokio::test]
 async fn a_recovery_kit_changes_only_its_namespace() {
     let (_dir, pib) = two_roots().await;
