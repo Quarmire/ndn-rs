@@ -14,7 +14,7 @@
 //! # Case 1 — a write that returned survives `kill -9`
 //!
 //! The child opens TWO stores of one engine in different directories (a
-//! device store and a separate local store, as ndn-data and ndf do) and
+//! device store and a separate local store, as ndn-heap and ndf do) and
 //! inserts numbered keys into each, alternately, reporting each insert after
 //! it returned. The parent kills it right after a chosen report, reopens both
 //! stores, and requires every reported key with its exact value — in its own

@@ -142,8 +142,8 @@ pub const ENVELOPE_MAX: usize = 256 * 1024;
 /// stands for (shared components and its own), before any text is built.
 pub const NAME_WIRE_MAX: usize = 8800;
 
-/// The most relays an introduction names: the data layer's relay bound
-/// (`ndn_data::HINT_RELAYS_MAX`, which is this value), far above what a code
+/// The most relays an introduction names: the bound `ndn-invite`'s hint
+/// records hold to as well (the same value), far above what a code
 /// carries (`IntroPolicy::code_relays`, 2 by default). Each relay stands for a
 /// name as long as the namespace, so the count is what bounds what the
 /// relays of one link make a device build.

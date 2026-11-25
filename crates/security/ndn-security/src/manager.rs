@@ -1201,7 +1201,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pib_path = dir.path().join("pib");
         let identity = n("/alice/laptop");
-        let name = n("/localhost/ndn-data/seal/alice/laptop");
+        let name = n("/localhost/ndn-heap/seal/alice/laptop");
         let (first, _) = SecurityManager::auto_init(&identity, &pib_path).unwrap();
         assert_eq!(first.secret(&name), None);
         first.put_secret(name.clone(), &[7; 32]).unwrap();
