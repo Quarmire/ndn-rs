@@ -671,6 +671,23 @@ chain arrive, and recomputed when the tips change. It is **not stored**: a
 node computes it again at open, from the tips the fold says and the `verified/`
 markers alone, which gives the same set and the same frontier (§4.3).
 
+**Chain ancestry of a revoked key's tip (§9.5).** The same ancestry binds a key that a
+trust context revokes with a cut that names a **tip** of this device's log of this
+space: the validator accepts the key's packets below the tip by name (it holds one packet
+and cannot see which bytes the owner meant) and the tip's own seq only with the tip's
+signed-region digest, so the data layer is the end that binds the bytes. An entry signed by
+that key at seq `q` at or below the tip is kept iff it is a chain ancestor of the tip (the
+rule above, one tip, the digests being signed-region digests: a relay's high-S copy is the
+same entry), **or** the cut re-admits that exact packet by name (`CutExact`: the entries a tip
+leaves out are listed for the owner to re-admit one by one, §9.5). Otherwise: waiting while
+the chain below the tip is not whole, `OutsideCut` (naming `D` and the tip's seq) once the
+walk has passed `q` or reached genesis without it. An entry above the tip is not the chain's
+to judge: the validator refused it, or a range of the same cut accepted it. The tip is wanted
+by its digest from any node that holds the cut, whatever counter the group shows, and the
+chain from it by the frontier as for a removal. The verdict of the judge tells the log the tip
+with every entry it validates (`Verified::tip`) and with each re-judgement of a context
+(§9.7); like a removal's, the walk is not stored and is computed again from the markers.
+
 **Re-check and withdrawal.** Every change of what decides admission (a
 `Members` or `Epoch` entry, an adopted trust context or person, a revocation, a
 key that arrives, an entry that completes a cut's chain) judges again the held
@@ -1694,7 +1711,10 @@ a restart, a lost packet or a refusal changes nothing about what is owed.
   declaring entry was held are at most the window, never the length of the void.
 - **The entries a cut names.** A revocation cut a held trust context lists (§9.5) wants the
   seqs it keeps that are neither held nor void, whatever counter the group shows, and the
-  entries it re-admits one by one, by their implicit digest: the bytes must be those. Only
+  entries it re-admits one by one, by their implicit digest: the bytes must be those. A tip it
+  names (§9.5) is wanted by its signed-region digest until an entry with that digest is held,
+  and the chain below it by the frontier of its walk (§3.8), each link by the exact digest the
+  chain names. Only
   the cuts of keys the context itself governs count, those under its own namespace: a
   context another person signed that lists a cut for someone else's device says nothing
   here, and wants nothing (an adopted friend's context cannot make a node walk another
@@ -2213,9 +2233,10 @@ digest of the public key that verified it and the time it first saw it (§4.3).
 `revocation_cut(key, bound)` reads those markers and nothing else:
 
 1. `bound` is a `CutBound { held_before: Option<Timestamp>, upto: BTreeMap<space,
-   seq> }`; **at least one** is given (else `BadRequest`, saying so and, when the
-   key is suspected, since when). They are this node's own observations, never
-   anything the revoked key signed.
+   seq>, tips: bool }`; **at least one** of the first two is given (else `BadRequest`,
+   saying so and, when the key is suspected, since when). They are this node's own
+   observations, never anything the revoked key signed. `tips` (default false) asks for the
+   tip form, below.
 2. For every space the node holds, for every entry held of the key's device that
    is **applied or held closed** and whose packet names the key as its signer,
    keep it if it was first verified here **strictly before** `held_before` (the
@@ -2237,6 +2258,40 @@ digest of the public key that verified it and the time it first saw it (§4.3).
    validator, so it judges its held entries by the cut once adopted without
    fetching what it made.
 
+**A cut that names tips.** With `CutBound::tips` the cut names **one tip per space** instead
+of runs and a manifest: `RevocationCut::add_tip(<D>/32=log/<S>, seq, digest)` with `digest`
+the SHA-256 of the tip entry's **signed region** (the marker's `signed_digest`;
+`ndn_security::signed_region_digest`), and no manifest is made (`CutProposal::manifest`
+is empty; the tips are `cut.tips()`, the proposal carries no second copy). The tip of a
+space is the **highest kept entry whose whole chain below it this node holds and keeps**:
+following `PREV` / `PREV_SEQ` through the markers from it, every link is held as the bytes
+the chain names, and every entry on the chain that the key may have signed is itself kept
+(a hole, other bytes held at a link, or an unreadable entry on the chain makes it no tip).
+Kept entries that are **not ancestors** of the tip (a fork beside the chain, an entry the
+chain jumps over by a stated gap) are `left_out` with the entries the bound leaves out, each by its
+full name and implicit digest, for the owner to re-admit one by one; a space with no
+such tip names none and lists everything it holds. The key digest and its refusals are those
+of the manifest form. The log prefix names are the same, so the cut file carries the cut
+verbatim (`RevocationCut` TLV) and needs no second carrier of the tips.
+
+*Why a tip.* The digest of a tip is of the signed region (§1.5), so a relay's **high-S copy of
+an ECDSA writer's entry**, another packet by its whole encoding but one signed object, is the
+entry the tip names, below the tip or at it, and the data layer takes it as the entry the chain
+names. A manifest lists implicit digests and refuses the copy: that was the residual **L10**,
+and naming a tip closes it. The manifest form remains for contexts already published and for
+owners who ask for it, and is judged as before. A cut may name both (a tip, and ranges and a
+manifest for the entries above it); the data layer binds what lies at or below the tip by chain
+and leaves what lies above to the validator.
+
+*The two ends.* The validator accepts below a tip **by name**; a forwarder's content store
+re-checks with the same function and cannot bind bytes below a tip, so the ends decide: the
+data layer keeps an entry of a tip-cut key only as a **chain ancestor of the tip** (§3.8,
+"Chain ancestry of a revoked key's tip"), else `OutsideCut`; it **waits**, never applied,
+while the chain below the tip is not whole, as a removed writer's tip cut does, and
+re-judges what it holds when the context is adopted (§9.7), withdrawing the held entries off
+the chain. A node that does not know tips skips the sub-TLV and sees a cut that accepts
+nothing: it keeps refusing (fail closed).
+
 What a revoked key's entries are, once its revocation is held: those the cut
 accepts, by seq **and** digest, stay; the rest are refused `OutsideCut`
 (`Standing::Revoked` while the person still writes), withdrawn if applied, and
@@ -2252,7 +2307,8 @@ operation, applied by every reader as chain ancestry (§3.8, §5.6): the trust
 context is untouched, and the cut's digests are signed-region digests of entries,
 not implicit digests of packets. A revocation (§9.5) is the key's namespace's
 decision about a key everywhere; a removal is the space's decision about a
-person there.
+person there. A revocation may itself name tips (§9.5, "A cut that names tips"): the
+same ancestry, one tip per log, in the trust context instead of the members operation.
 
 ### 9.7 Re-judgement
 
@@ -2263,7 +2319,10 @@ context's, in every space, by the durable rule, with the whole walk: an entry
 refused now — a revoked issuer in its chain, a cut that no longer accepts it —
 is **withdrawn** (§3.8) with the refusal as its reason. A `Lapsed` verdict is left
 as it is. A person's newer version that refuses more does the same for her
-devices' entries in the spaces that list her.
+devices' entries in the spaces that list her. A revoked key whose cut names a tip is judged
+again against it: the judge tells each log the tip it now names for every key it accepts
+entries of (`Log::cut_tips`), before what is refused, so the held entries of the key off the
+tip's chain are withdrawn (`OutsideCut`) and those on it stay.
 
 **What is refused may have a second packet.** A device that signed two packets at one name
 (§3.7: a thief heard first, the owner's bytes second) has the first held at the entry name and
@@ -2322,15 +2381,16 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
 
 ### 9.9 Threat notes
 
-- **A revocation cut lists entries by implicit digest (residual, L10).** The
-  manifest format belongs to the trust context (`ndn-security`
-  `cut_manifest`): it binds `<prefix>/seq=<n>` to the *implicit* (full-wire)
-  digest, so a relay's high-S copy of an ECDSA writer's entry falls outside the
-  cut although it is the same signed object. Listing signed-region digests
-  alongside needs a manifest format change and a validator rule, which is the
-  tip carrier of the trust stage, not an interim here; until then the owner
-  re-admits such an entry by its full name (§9.5, `ndn-fwd readmit`). Removal
-  cuts (§9.6) are tips of signed-region digests and are not affected.
+- **A forwarder's cache below a tip.** A forwarder's content-store re-check accepts a
+  revoked key's packet below a tip by name, as the validator does (§9.5): it cannot tell the
+  bytes the owner meant from another packet of the key's chain at that name. It serves what
+  it caches; **readers decide** (a reader refuses an entry off the chain of the tip,
+  `OutsideCut`), so a cache can delay a reader but not make it keep other bytes. The
+  manifest form binds bytes in the cache too, at the price of listing every entry.
+- **A tip is the owner's word about where the chain stopped, not a proof.** A node that
+  holds the tip's entry but not the entries below it waits for them (§3.8), and a chain whose
+  links nobody serves waits for good: the owner re-admits what it holds by name, or names a
+  lower tip. Entries above the tip are never accepted by it.
 - **Writes between theft and revocation.** What the owner's node first verified
   before the loss time it states stays accepted (a residual); later entries are
   left out of the cut, listed, and refused everywhere; once the key is suspected,
