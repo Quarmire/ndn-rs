@@ -2751,9 +2751,12 @@ and the node does not carry it after a restart). A space open as a member is
 sticky store error, if any, as `Local` (§4.6, §4.7). **`close`** is §4.5 rule 4:
 it refuses puts that begin after it, drains each publisher, flushes, records
 the head of each space that has signed since its start (or started clean) as a
-clean close, flushes, and stops; the next start has no hole. **`shutdown`**,
-and `Drop`, stop at once: every watch ends, whatever the
-flusher had not made durable is not, and the next start is unclean (§4.9).
+clean close, flushes, and stops; the next start has no hole. It returns when
+every task of the node has ended (§4.5 rule 5), so the store is released when it
+returns, unless the caller still holds a `Heap`, a `Follower` or a `NodeHandle`.
+**`shutdown`**, and `Drop`, stop at once: every watch ends, whatever the
+flusher had not made durable is not, and the next start is unclean (§4.9); the
+tasks are told to end, and `shutdown` does not wait for them.
 
 `name()`, `namespace()` and `writer()` are the device, its person and the name of
 the key it signs with. `signatures()` counts the signatures the node
