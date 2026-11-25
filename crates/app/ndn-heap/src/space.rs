@@ -23,7 +23,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
@@ -249,6 +249,9 @@ pub(crate) struct SpaceInner {
     /// Alerts that stay true (evidence of rollback, of equivocation): a
     /// watcher that begins later is told them after the heads.
     standing: Mutex<Vec<Alert>>,
+    /// The [`Alert::RolledBack`] raised since the space was opened, standing or not
+    /// ([`Heap::rollbacks`]).
+    rollbacks: AtomicU64,
     /// The entries whose refusal was told, last [`REFUSED_MAX`], with the
     /// alert: a watcher that begins later is told them after the heads.
     refused: Mutex<VecDeque<(Name, Alert)>>,
@@ -322,6 +325,7 @@ impl SpaceInner {
             closing: AtomicBool::new(false),
             owed: Mutex::new(HashMap::new()),
             standing: Mutex::new(Vec::new()),
+            rollbacks: AtomicU64::new(0),
             refused: Mutex::new(VecDeque::new()),
             lapsed: Mutex::new(BTreeSet::new()),
         }
@@ -380,6 +384,9 @@ impl SpaceInner {
         }
         for alert in fx.alerts {
             tracing::warn!(space = %self.name, ?alert, "alert");
+            if matches!(alert, Alert::RolledBack { .. }) {
+                self.rollbacks.fetch_add(1, Ordering::AcqRel);
+            }
             if matches!(alert, Alert::RolledBack { .. } | Alert::Equivocation { .. }) {
                 let mut standing = self.standing.lock();
                 if !standing.contains(&alert) && standing.len() < STANDING_MAX {
@@ -1204,6 +1211,15 @@ impl Heap {
             .lock()
             .iter()
             .any(|alert| matches!(alert, Alert::RolledBack { .. }))
+    }
+
+    /// How many times this node has raised [`Alert::RolledBack`] for the space since it was
+    /// opened. It only grows and counts every alert, also those the standing list behind
+    /// [`Self::rolled_back`] no longer holds (it keeps [`STANDING_MAX`] distinct ones). A
+    /// host that acted on a rollback compares it with the count it acted on: a later rollback
+    /// is a new reason to distrust the notes it wrote since, which a standing flag cannot say.
+    pub fn rollbacks(&self) -> u64 {
+        self.inner.rollbacks.load(Ordering::Acquire)
     }
 
     /// The epoch writers seal in, as this node's fold holds it: its id (the owner device that

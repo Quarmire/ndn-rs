@@ -8,8 +8,7 @@
 //! note durable before the reply it backs; what this module keeps in memory is only
 //! what is made again from those notes at a start.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::AtomicBool;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -159,9 +158,11 @@ pub(crate) struct Inner {
     pub(crate) serial: tokio::sync::Mutex<()>,
     /// The grants and mirror notes.
     pub(crate) grants: Arc<Grants>,
-    /// Whether the offers held were closed because a space they name raised
-    /// `Alert::RolledBack` (once: an offer made later is not about that rollback).
-    pub(crate) rollback_closed: AtomicBool,
+    /// For each space the offers name, the count of [`ndn_heap::Heap::rollbacks`] the offers
+    /// were last closed for: every `Alert::RolledBack` above it closes the offers held then
+    /// (an offer made after a rollback is not about it, but one made before a later rollback
+    /// is).
+    pub(crate) rollbacks_acted: Mutex<HashMap<Name, u64>>,
 }
 
 /// One ask held ([`State::queued`]), let go as it is dropped.
@@ -245,7 +246,7 @@ impl Invites {
             }),
             serial: tokio::sync::Mutex::new(()),
             grants,
-            rollback_closed: AtomicBool::new(false),
+            rollbacks_acted: Mutex::new(HashMap::new()),
         });
         inner.restore();
         inner.close_after_unclean_start();

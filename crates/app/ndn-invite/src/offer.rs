@@ -7,7 +7,6 @@
 //! use mark, the closing mark — is in the store under `/localhost/ndn-invite/`, each
 //! note durable before the reply it backs; the offer is never a log entry.
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
@@ -431,19 +430,28 @@ impl Inner {
         );
     }
 
-    /// Once, the first time a space the offers name has raised `Alert::RolledBack`
-    /// ([`Heap::rolled_back`]: entries signed under this device's name lie above what it
-    /// kept, so the store is an old image or a copy of one): close every offer held then.
-    /// An offer made later is not about that rollback.
+    /// Every time a space the offers name has raised `Alert::RolledBack` since the offers were
+    /// last closed for it ([`Heap::rollbacks`]: an entry signed under this device's name lies
+    /// above what it kept, so the store is an old image or a copy of one, or a copy of this
+    /// device's key signs): close every offer held then. An offer made after a rollback is
+    /// not about it, but one made before the next rollback is: the count is kept per space,
+    /// and any alert above it closes again, not only the first of the process.
     fn close_after_rollback(&self) {
-        if self.rollback_closed.load(Ordering::Acquire) {
-            return;
-        }
-        if self.close_every_offer_if(
+        let mut acted = self.rollbacks_acted.lock();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let closed = self.close_every_offer_if(
             "a space they name found this device's store older than what its peers hold, so the notes of the offers cannot be trusted",
-            Heap::rolled_back,
-        ) {
-            self.rollback_closed.store(true, Ordering::Release);
+            |heap| {
+                let count = heap.rollbacks();
+                let fresh = count > acted.get(heap.name()).copied().unwrap_or(0);
+                if fresh {
+                    seen.borrow_mut().push((heap.name().clone(), count));
+                }
+                fresh
+            },
+        );
+        if closed {
+            acted.extend(seen.into_inner());
         }
     }
 

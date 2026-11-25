@@ -10,9 +10,10 @@
 //! A child of `offer_tests`: it uses its `Inviter`.
 
 use bytes::Bytes;
-use ndn_heap::{Readers, Share};
+use ndn_heap::{Alert, Change, Frontier, Readers, Share};
 use ndn_packet::encode::DataBuilder;
 use ndn_security::confidentiality::{ContentKey, wrap_ck_to};
+use ndn_trust_envelope::TrustEnvelope;
 
 use super::*;
 use crate::invites::InviteConfig;
@@ -956,13 +957,23 @@ async fn laptop_on(
     laptop
 }
 
-/// A backup of the device taken while its offer was open, put back after the offer was used
-/// and its person admitted — the image says the stop was clean, so nothing but the space shows
-/// it: the phone holds entries signed under the laptop's name above what the image reserved,
-/// and the laptop raises `RolledBack`. The `used/` note is gone with the rollback, so another
-/// key holding the code would be admitted a second time: every offer is closed instead.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rolled_back_store_closes_every_open_offer() {
+/// A laptop over a store restored from a backup older than what it did, with its offer open
+/// and its phone online: the backup was taken while the offer was open, put back after the
+/// offer was used and its person admitted. The image says the stop was clean, so nothing but
+/// the space shows it: the phone holds entries signed under the laptop's name above what the
+/// image reserved, and the laptop raises `RolledBack`. The `used/` note is gone with the
+/// rollback, so another key holding the code would be admitted a second time.
+struct RolledBack {
+    _net: Net,
+    _runs: Vec<CancellationToken>,
+    /// The restored laptop and the offer it holds, open in its store.
+    offered: Offered,
+    id: OfferId,
+    phone: Device,
+    keys: Arc<ndn_security::SecurityManager>,
+}
+
+async fn rolled_back_laptop() -> RolledBack {
     let net = Net::new().await;
     let alice = Person::new("/alice");
     let disk = DiskStore::new();
@@ -1071,7 +1082,15 @@ async fn a_rolled_back_store_closes_every_open_offer() {
 
     // The backup is restored under the running phone: used/ is gone, the offer is open again.
     let third_run = CancellationToken::new();
-    let laptop = laptop_on(&net, &third_run, &alice, backup, Some(keys), &[&phone]).await;
+    let laptop = laptop_on(
+        &net,
+        &third_run,
+        &alice,
+        backup,
+        Some(Arc::clone(&keys)),
+        &[&phone],
+    )
+    .await;
     assert!(
         !laptop.store.contains(&store::used_key(&id)),
         "precondition: the restored store holds no use mark"
@@ -1087,16 +1106,152 @@ async fn a_rolled_back_store_closes_every_open_offer() {
         heap.rolled_back(),
         "precondition: the space never raised RolledBack"
     );
-    // Carol holds the same code. The restored notes would admit her; the offer is closed.
+    RolledBack {
+        _net: net,
+        _runs: vec![phone_net, third_run],
+        offered: Offered {
+            laptop,
+            alice,
+            code,
+            secret,
+        },
+        id,
+        phone,
+        keys,
+    }
+}
+
+/// A rolled back store closes every offer: Carol holds the same code, the restored notes
+/// would admit her a second time, and the offer is closed instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rolled_back_store_closes_every_open_offer() {
+    let r = rolled_back_laptop().await;
+    let Offered {
+        laptop,
+        code,
+        secret,
+        ..
+    } = &r.offered;
     let carol = phone_of("/carol").await;
-    let got = answer(&laptop, ask(&carol, &laptop, &code.offer, &secret, &[])).await;
+    let got = answer(laptop, ask(&carol, laptop, &code.offer, secret, &[])).await;
     assert!(
         matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
         "a key was answered {got:?} by an offer of a store the device found rolled back: the code was used twice"
     );
-    assert!(!listed(&laptop, "/carol"), "carol was admitted");
+    assert!(!listed(laptop, "/carol"), "carol was admitted");
     assert!(
-        laptop.store.contains(&store::closed_key(&id)),
+        laptop.store.contains(&store::closed_key(&r.id)),
         "the offer was refused without a closing mark"
+    );
+}
+
+/// Every rollback closes the offers held then, not the first one of the process: after the
+/// first rollback closed the offers, the laptop makes a new one, and a copy of its key
+/// signs an entry above what the laptop reserved. That is a rollback again (the notes of
+/// the new offer cannot be trusted either), and the new offer is closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_later_rollback_closes_the_offers_made_since_the_first() {
+    let r = rolled_back_laptop().await;
+    let Offered {
+        laptop,
+        alice,
+        code,
+        secret,
+    } = &r.offered;
+    // The first rollback closes the offer held, once an ask judges it.
+    let carol = phone_of("/carol").await;
+    let got = answer(laptop, ask(&carol, laptop, &code.offer, secret, &[])).await;
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
+        "the first rollback closed nothing: {got:?}"
+    );
+    // An offer made after it.
+    let later = laptop
+        .invites
+        .offer(
+            &notebook(),
+            Offer {
+                role: Role::Writer,
+                until: Timestamp(laptop.node.now().0 + 3_600_000),
+                tries: 3,
+            },
+        )
+        .await
+        .unwrap();
+    let Ok(TrustEnvelope::Intro(intro)) = TrustEnvelope::from_uri(&later.link) else {
+        panic!("an offer's link is an introduction link");
+    };
+    let later_id = parse_offer_name(&later.offer).unwrap().1;
+    assert!(
+        !laptop.store.contains(&store::closed_key(&later_id)),
+        "precondition: the new offer starts open"
+    );
+
+    // A copy of the laptop's key, over a store of its own, signs an entry in the space.
+    let copy_run = CancellationToken::new();
+    let copy = laptop_on(
+        &r._net,
+        &copy_run,
+        alice,
+        Arc::clone(&DiskStore::new()) as Arc<dyn DataStore>,
+        Some(Arc::clone(&r.keys)),
+        &[&r.phone, laptop],
+    )
+    .await;
+    let theirs = copy.node.open(&notebook()).await.unwrap();
+    for _ in 0..300 {
+        if theirs.members_known() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(theirs.members_known(), "the copy never held the space");
+    let mut signed = None;
+    for _ in 0..300 {
+        match theirs
+            .put(
+                &n("/copy"),
+                Bytes::from_static(b"signed by a copy"),
+                Default::default(),
+            )
+            .await
+        {
+            Ok(id) => {
+                signed = Some(id.seq);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let signed = signed.expect("the copy never wrote into the space");
+    // The laptop tells RolledBack for that entry.
+    let mine = heap(laptop, &notebook());
+    let mut changes = mine.watch(&Frontier::new()).await.unwrap();
+    let told = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(change) = changes.next().await {
+            if let Ok(Change::Alert(Alert::RolledBack { seen, .. })) = change
+                && seen >= signed
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(
+        told,
+        Ok(true),
+        "precondition: the laptop never told RolledBack for seq {signed}"
+    );
+    let dave = phone_of("/dave").await;
+    let got = answer(laptop, ask(&dave, laptop, &later.offer, &intro.secret, &[])).await;
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
+        "a key was answered {got:?} by an offer made after the first rollback, once the space raised RolledBack again"
+    );
+    assert!(!listed(laptop, "/dave"), "dave was admitted");
+    assert!(
+        laptop.store.contains(&store::closed_key(&later_id)),
+        "the later rollback closed no offer"
     );
 }

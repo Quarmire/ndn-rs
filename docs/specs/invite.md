@@ -427,12 +427,12 @@ An offer is **closed**, judged on every ask and every hint request from durable 
   also writes `closed/<id>`;
 - the device may hold notes older than what it did: **every offer held is closed**, `closed/<id>` written for each, (a) when the
   node opened a space an offer names after a stop it did not make (`Heap::started_unclean`: a crash, a power cut, an image copied while
-  the device ran), at the start of the introductions, and (b) the first time a space an offer names raises `Alert::RolledBack`
-  (`Heap::rolled_back`, heap.md §4.8: the device's store is older than what its peers hold), before the next ask or hint request of any
+  the device ran), at the start of the introductions, and (b) each time a space an offer names raises `Alert::RolledBack`
+  (`Heap::rollbacks`, heap.md §4.8: the device's store is older than what its peers hold), before the next ask or hint request of any
   offer is judged. The marks are in the store before that judgement and flushed after; one lost to a stop is written again by the unclean
   start that follows. A backup restored under a running device could otherwise roll `used/<id>`, `using/<id>` or `tries/…` back and
-  let a code be used again (§18.1). An offer made after the alert is not about it, and a stop of this device that was clean closes
-  nothing. The cost: a crash closes the offers, a joiner whose use was under way meets `Closed`, and the owner makes a new offer;
+  let a code be used again (§18.1). An offer made after an alert is not about it, but the next alert of any space an offer names closes it
+  too, and a stop of this device that was clean closes nothing. The cost: a crash closes the offers, a joiner whose use was under way meets `Closed`, and the owner makes a new offer;
 - the space's members no longer list the person the offer was used by — or, while a use is under way, the key being admitted
   (`Heap::removed_by` names a removal of that device's person, heap.md §10.3): a removed member never comes back by its code
   (§9.5). This is a derivation, **not** a mark: nothing is written, the offer is closed for as long as the removal stands in
@@ -1739,7 +1739,7 @@ component; `<key>` the public-key digest, 32 octets, as one generic component.
 | `using/<id>` | the key a use under way is for: its Name TLV, then the digest (32 octets) | start of the use (§9.3 step 1); dropped on failure and in the batch of step 5 | inviter |
 | `accepted/<id>` | the acceptance answered to the key that used the offer (one `INTRO_ANSWER`) | with `used/<id>` (§9.3 step 5) | inviter |
 | `used/<id>` | the use mark: one `INTRO_USED` naming the offer, the key and its public key's digest (§16.1) | with the acceptance; at most once | inviter |
-| `closed/<id>` | the closing mark: one octet, `1` | `close_offer`, the overall cap, a start after an unclean stop, the first `RolledBack` (a removal closes by derivation, nothing is written, §5.4) | inviter |
+| `closed/<id>` | the closing mark: one octet, `1` | `close_offer`, the overall cap, a start after an unclean stop, each `RolledBack` (a removal closes by derivation, nothing is written, §5.4) | inviter |
 | `grant/<id>` | the grant note, MAC'd (§10 rule 3, 11) | with the acceptance | inviter |
 | `mirror/<space>/<key>` | the mirror note, MAC'd (§11 rule 17) | when the admission is held | joiner |
 
@@ -1933,9 +1933,9 @@ first, and the ones that changed say so.
   older note that read, so a backup restored under the device could roll `used/<id>`, `using/<id>` or `tries/…` back and let a
   code be used a second time. What the device does about it: it **closes every offer it holds** (`closed/<id>`, as `close_offer`
   does) (a) at a start after a stop the node did not make, which is what a copy of a running device shows
-  (`Heap::started_unclean` of a space an offer names), and (b) the first time a space an offer names raises `Alert::RolledBack`
-  (`Heap::rolled_back`: an entry signed under this device's name lies above what it reserved, so its store is older than what its
-  peers hold: heap.md §4.8), before the next ask or hint of any offer is judged. The cost is that every crash, and every start after
+  (`Heap::started_unclean` of a space an offer names), and (b) each time a space an offer names raises `Alert::RolledBack`
+  (`Heap::rollbacks`, kept per space, which counts every alert: an entry signed under this device's name lies above what it reserved, so
+  its store is older than what its peers hold: heap.md §4.8), before the next ask or hint of any offer is judged. The cost is that every crash, and every start after
   one, closes the offers: a joiner whose use was under way meets `Closed` and asks for a new code, and the owner makes one (an
   admission already made stays: a used offer's user is still answered, §9.2 step 5). **What a restore can still do:** (1) restore
   an image that was stopped cleanly and that no peer can contradict — nothing signed since the backup is held by a peer, or no peer
@@ -1987,6 +1987,10 @@ first, and the ones that changed say so.
   yet taken closes nothing yet.
   `close_offer` closes an offer to everyone new at any time, and keeps answering its user so: a host that closes an offer as soon as
   the new member appears loses no joiner whose answer was lost. Keep expiries short.
+- **A rollback after the first.** Every `Alert::RolledBack` closes the offers held when the next ask or hint is judged, not only the
+  first of the process: the count is kept per space (`Heap::rollbacks`, which counts every alert, also those the 32 standing alerts no
+  longer hold). An offer made after an alert is open until the next one (a copy of this device's key that signs above its
+  reservation raises it again), which closes it as well.
 - **Replay.** An ask replayed by anyone gets the answer kept for it: bound to the asker's key and digest, it admits only the asker's
   person, which the fold already lists; it shows the replayer the space's name, the role and the inviter's public credentials (the
   answer is not sealed). A replay after the inviter's device dropped the kept answer is judged again: a used offer answers its
@@ -2194,7 +2198,8 @@ The new tests this crate adds for what changed: `an_offer_is_served_as_an_extens
 `an_unproven_ask_gets_silence_for_an_unknown_used_or_closed_offer` (§9.2 steps 3–5, §17.1),
 `a_guest_or_relay_device_makes_no_offer` and `a_space_whose_creation_is_not_held_makes_no_offer` (§5.3),
 `a_grant_whose_space_is_not_open_is_revoked_and_installed_again_when_it_opens` (§10 rule 6),
-`an_unclean_start_closes_every_open_offer`, `a_rolled_back_store_closes_every_open_offer` and
+`an_unclean_start_closes_every_open_offer`, `a_rolled_back_store_closes_every_open_offer`,
+`a_later_rollback_closes_the_offers_made_since_the_first` (§5.4, §18.2) and
 `a_stop_between_using_and_the_members_change_closes_the_offer_at_the_next_start` (§5.4, §9.3, §18.1).
 
 ## 20. Differences from data-layer §19
