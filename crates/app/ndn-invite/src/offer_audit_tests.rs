@@ -17,7 +17,7 @@ use super::*;
 use crate::invites::InviteConfig;
 use crate::proofs::{commitment, proof_key};
 use crate::sealed::wrap_note;
-use crate::test_kit::{DiskStore, ask_sealed_to, fast};
+use crate::test_kit::{DiskStore, ask_sealed_to, ask_unproven, ask_unproven_sealed_to, fast};
 use crate::wire::{IntroRecord, OfferBody, UsedBody};
 
 /// A note as it was written before notes carried a MAC: the secret wrapped to the
@@ -149,9 +149,9 @@ async fn a_forged_offer_note_is_not_served_or_judged() {
         ask_sealed_to(&mallory, &device, &seal_key, &offer2, &secret2, &[]),
     )
     .await;
-    assert!(
-        matches!(got, Some(Outcome::Refused(IntroRefusal::Unknown))),
-        "an ask for an offer the device never made was answered {got:?}"
+    assert_eq!(
+        got, None,
+        "an ask for an offer the device never made was answered {got:?}, not met with silence"
     );
     assert!(!listed(&alice.laptop, "/mallory"), "the attacker is listed");
     // The real offer still stands.
@@ -647,4 +647,118 @@ async fn an_offer_is_not_spent_when_the_members_change_fails() {
     let got = answer(&laptop, ask(&bob, &laptop, &code.offer, &secret, &[])).await;
     assert!(accepted(&got), "the retry was answered {got:?}");
     assert!(listed(&laptop, "/bob"));
+}
+
+// ---- L3: a refusal travels only to an asker that proved a key (spec §9.2, §17.1) --------------------
+
+/// An ask that opens and names a key with credentials, but whose asker proof does not
+/// prove that key for this ask, is met with silence whatever the offer is: one this device
+/// never made, one already used, one closed. Only an asker that proved a key is told
+/// that an offer is used or closed, so a prober holding no proving key learns nothing of
+/// what the device holds. A proven ask for the same offers is still refused with its
+/// reason, so the joiner is told what to do.
+#[tokio::test]
+async fn an_unproven_ask_gets_silence_for_an_unknown_used_or_closed_offer() {
+    let alice = Inviter::new(Role::Writer, None, &[]).await;
+    let (bob, carol, mallory) = (
+        phone_of("/bob").await,
+        phone_of("/carol").await,
+        phone_of("/mallory").await,
+    );
+    let device = n("/alice/laptop");
+    let seal_key = alice.laptop.node.recipient().public();
+
+    // An offer this device never made.
+    let unknown = offer_name(&device, &[0x77; 16]);
+    let got = answer(
+        &alice.laptop,
+        ask_unproven_sealed_to(&mallory, &device, &seal_key, &unknown, &[1; SECRET_LEN]),
+    )
+    .await;
+    assert_eq!(
+        got, None,
+        "an unproven ask naming no held offer was answered {got:?}, not met with silence"
+    );
+    let got = answer(
+        &alice.laptop,
+        ask_sealed_to(
+            &mallory,
+            &device,
+            &seal_key,
+            &unknown,
+            &[1; SECRET_LEN],
+            &[],
+        ),
+    )
+    .await;
+    assert_eq!(
+        got, None,
+        "an ask naming no held offer was answered {got:?}, not met with silence"
+    );
+
+    // An offer used by Bob.
+    let first = alice.answers(&bob).await;
+    assert!(accepted(&first), "bob was answered {first:?}");
+    let got = answer(
+        &alice.laptop,
+        ask_unproven(&carol, &alice.laptop, &alice.offer, &alice.secret),
+    )
+    .await;
+    assert_eq!(
+        got, None,
+        "an unproven ask of a used offer was answered {got:?}, not met with silence"
+    );
+    let got = alice.answers(&carol).await;
+    assert!(
+        matches!(
+            got,
+            Some(Outcome::Refused(IntroRefusal::Used | IntroRefusal::Closed))
+        ),
+        "an ask that proved its key was answered {got:?}, not refused with its reason"
+    );
+
+    // An offer closed before anyone used it.
+    let second = alice_offer_again(&alice).await;
+    alice.laptop.invites.close_offer(&second.0).await.unwrap();
+    let got = answer(
+        &alice.laptop,
+        ask_unproven(&mallory, &alice.laptop, &second.0, &second.1),
+    )
+    .await;
+    assert_eq!(
+        got, None,
+        "an unproven ask of a closed offer was answered {got:?}, not met with silence"
+    );
+    let got = answer(
+        &alice.laptop,
+        ask(&mallory, &alice.laptop, &second.0, &second.1, &[]),
+    )
+    .await;
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
+        "an ask that proved its key was answered {got:?} by a closed offer"
+    );
+}
+
+/// A second offer of Alice's notebook on her laptop: its name and secret.
+async fn alice_offer_again(alice: &Inviter) -> (Name, [u8; SECRET_LEN]) {
+    let code = alice
+        .laptop
+        .invites
+        .offer(
+            &notebook(),
+            Offer {
+                role: Role::Writer,
+                until: Timestamp(alice.laptop.node.now().0 + 3_600_000),
+                tries: 3,
+            },
+        )
+        .await
+        .unwrap();
+    let Ok(ndn_trust_envelope::TrustEnvelope::Intro(intro)) =
+        ndn_trust_envelope::TrustEnvelope::from_uri(&code.link)
+    else {
+        panic!("an offer's link is an introduction link");
+    };
+    (code.offer, intro.secret)
 }

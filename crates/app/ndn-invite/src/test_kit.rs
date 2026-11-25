@@ -772,6 +772,45 @@ pub(crate) fn ask_sealed_to(
     secret: &[u8; SECRET_LEN],
     extra: &[Certificate],
 ) -> (Name, Bytes) {
+    built_ask(joiner, inviter, seal_key, offer, secret, extra, false)
+}
+
+/// [`ask`] whose asker proof is bound to another ask than this one (a proof packet that
+/// verifies, signed by the joiner's own key, and proves nothing of this ask): an ask
+/// that opens, names a key with credentials, and whose asker proved no key.
+pub(crate) fn ask_unproven(
+    joiner: &Rig,
+    inviter: &Rig,
+    offer: &Name,
+    secret: &[u8; SECRET_LEN],
+) -> (Name, Bytes) {
+    let seal_key = inviter.invites.inner().state.lock().offers
+        [&parse_offer_name(offer).expect("an offer's name").1]
+        .body
+        .seal_key;
+    built_ask(joiner, &inviter.name, &seal_key, offer, secret, &[], true)
+}
+
+/// [`ask_unproven`] for an offer the inviter does not hold: sealed to `seal_key`.
+pub(crate) fn ask_unproven_sealed_to(
+    joiner: &Rig,
+    inviter: &Name,
+    seal_key: &[u8; 32],
+    offer: &Name,
+    secret: &[u8; SECRET_LEN],
+) -> (Name, Bytes) {
+    built_ask(joiner, inviter, seal_key, offer, secret, &[], true)
+}
+
+fn built_ask(
+    joiner: &Rig,
+    inviter: &Name,
+    seal_key: &[u8; 32],
+    offer: &Name,
+    secret: &[u8; SECRET_LEN],
+    extra: &[Certificate],
+    unproven: bool,
+) -> (Name, Bytes) {
     let j = joiner.invites.inner();
     let me = joiner.node.writer().clone();
     let digest = j.own_key_digest();
@@ -786,7 +825,12 @@ pub(crate) fn ask_sealed_to(
         credentials: cred,
         asker: Bytes::new(),
     };
-    body.asker = j.ask_proof(&body.binding(inviter)).unwrap();
+    let binding = if unproven {
+        [0xEE; 32]
+    } else {
+        body.binding(inviter)
+    };
+    body.asker = j.ask_proof(&binding).unwrap();
     let aad = intro_prefix(inviter).encode_to_tlv();
     let sealed = AskKey::to(seal_key, &aad)
         .unwrap()

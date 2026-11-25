@@ -11,7 +11,6 @@ use ndn_foundation_types::Name;
 use ndn_heap::{HeapError, MembersChange};
 use ndn_packet::Data;
 use ndn_packet::encode::DataBuilder;
-use ndn_security::cert_name::key_name_of;
 use ndn_sync::StoreOp;
 use ndn_trust_envelope::Introduction;
 
@@ -362,14 +361,15 @@ impl Inner {
 
     // ---- answering an ask --------------------------------------------------------------
 
-    /// Answer an ask of this device (spec §19.4): open it, judge it in the order
-    /// specified, and answer — admitting the asker, or refusing and saying why. One ask
-    /// at a time; the same ask asked again gets the same answer while it is kept. `None`
-    /// (a Nack) for what does not open or whose asker does not verify — a stranger's
-    /// garbage costs a parse and one signature check — and for an ask past the ones
-    /// held already ([`IntroPolicy::asks_queued`](crate::IntroPolicy)): opening and
-    /// verifying run at most [`InviteConfig::asks_verifying`](crate::InviteConfig) at
-    /// once.
+    /// Answer an ask of this device (spec §19.4): open it, prove its asker, judge it in the
+    /// order specified, and answer — admitting the asker, or refusing and saying why. One
+    /// ask at a time; the same ask asked again gets the same answer while it is kept.
+    /// `None` (a Nack) for what does not open, for an asker that proved no key — a
+    /// refusal travels only to an asker that proved a key, so a prober learns nothing of
+    /// what the device holds — for an offer this device holds none of, and for an ask
+    /// past the ones held already
+    /// ([`IntroPolicy::asks_queued`](crate::IntroPolicy)): opening and verifying run at
+    /// most [`InviteConfig::asks_verifying`](crate::InviteConfig) at once.
     pub(crate) async fn answer_intro(&self, name: &Name, params: Option<Bytes>) -> Option<Bytes> {
         if let Some(r) = self.state.lock().answers.get(name) {
             return Some(r.clone());
@@ -390,7 +390,7 @@ impl Inner {
             st.queued += 1;
             Queued(self)
         };
-        let (body, proof, asker, opened, claimed) = {
+        let (body, proof, asker, opened, by) = {
             let _verifying = self.verifying.acquire().await.ok()?;
             let ask = IntroAsk::decode(params).ok()?;
             let aad = intro_prefix(&device).encode_to_tlv();
@@ -404,20 +404,23 @@ impl Inner {
             let body = AskBody::decode(Bytes::from(plain)).ok()?;
             let (proof, asker) = claimed_asker(&body.asker)?;
             let opened = open_credentials(&body.credentials).await?;
-            // Who it claims to be, unverified: what a refusal before the chain is
-            // checked is addressed to.
-            let locator = proof.sig_info()?.key_locator_name()?;
-            let claimed = key_name_of(&locator);
-            let digest = opened.claimed(&claimed)?;
-            (body, proof, asker, opened, (claimed, digest))
+            // The asker proves a key before anything is said to it: the proof packet is
+            // this ask's (its name binds the ask), signed by a key of the asking device
+            // that chains to the anchor the credentials carry.
+            let (key, digest) = opened.signer(&proof).await?;
+            if *proof.name != ask_name(&asker, &body.binding(&device))
+                || device_of(&key).as_ref() != Some(&asker)
+            {
+                tracing::debug!(offer = %body.offer, %asker, "an ask whose asker's proof does not verify; not answered");
+                return None;
+            }
+            (body, proof, asker, opened, (key, digest))
         };
         let _turn = self.serial.lock().await;
         if let Some(r) = self.state.lock().answers.get(name) {
             return Some(r.clone());
         }
-        let answer = self
-            .judge_ask(&body, &proof, &asker, &opened, claimed)
-            .await?;
+        let answer = self.judge_ask(&body, &proof, &asker, &opened, by).await?;
         let reply = DataBuilder::new(name.clone(), &answer.encode()).sign_digest_sha256();
         self.state
             .lock()
@@ -426,22 +429,22 @@ impl Inner {
         Some(reply)
     }
 
-    /// Judge an opened ask, in order (spec §19.4): the offer is this device's and
-    /// known; not closed; the asker's key chains to the anchor its credentials carry;
-    /// not used by another key (its user is answered the acceptance it was given, and
-    /// nothing more is done); not expired by this device's clock; the asker's own wrong
-    /// tries not spent; the proof is right (a wrong one counted durably, against the
-    /// asker and toward the overall cap); the asker's namespace is no other's. Then the
-    /// use is noted, the asker's anchor adopted, the asker added to the space with one
-    /// members change, and the acceptance, the use mark and the grant kept, all durable
-    /// before the answer; a failure before lets the use go.
+    /// Judge an opened ask whose asker proved the key `by` (spec §19.4), in order: the
+    /// offer is this device's and known (else no answer); not closed; not used by another
+    /// key (its user is answered the acceptance it was given, and nothing more is done);
+    /// not expired by this device's clock; the asker's own wrong tries not spent; the proof
+    /// is right (a wrong one counted durably, against the asker and toward the overall
+    /// cap); the asker's namespace is no other's. Then the use is noted, the asker's anchor
+    /// adopted, the asker added to the space with one members change, and the acceptance,
+    /// the use mark and the grant kept, all durable before the answer; a failure before
+    /// lets the use go.
     async fn judge_ask(
         &self,
         body: &AskBody,
         proof: &Data,
         asker: &Name,
         opened: &Opened,
-        claimed: (Name, [u8; 32]),
+        by: (Name, [u8; 32]),
     ) -> Option<AnswerBody> {
         let offer = &body.offer;
         let refuse = |(asker, digest): (Name, [u8; 32]), why| AnswerBody {
@@ -458,30 +461,22 @@ impl Inner {
             let ob = self.offer_held(&id)?.body;
             Some((id, self.proof_key_of(&id)?, ob))
         });
-        let Some((id, pk, ob)) = held else {
-            return Some(refuse(claimed, IntroRefusal::Unknown));
-        };
+        // An offer this device does not hold is no answer, not a refusal: a prober that
+        // guesses an id is met with the silence of every other miss (spec §2.3).
+        let (id, pk, ob) = held?;
         // A use mark that is there and does not read is a use by a key nobody knows: the
         // offer is used, whoever asks (spec §18).
         let used = match self.used(&id) {
             Use::By(key, digest) => Some((key, digest)),
-            Use::Unreadable => return Some(refuse(claimed, IntroRefusal::Used)),
+            Use::Unreadable => return Some(refuse(by, IntroRefusal::Used)),
             Use::Not => None,
         };
         let closed = self.offer_closed(&id, &ob);
         // A closed offer admits no one new: only the key a use mark names is still
-        // answered (below), until the offer expires (spec §19.4 step 4).
-        if closed && used.as_ref() != Some(&claimed) {
-            return Some(refuse(claimed, IntroRefusal::Closed));
+        // answered (below), until the offer expires (spec §9.2 step 5).
+        if closed && used.as_ref() != Some(&by) {
+            return Some(refuse(by, IntroRefusal::Closed));
         }
-        let (key, digest) = opened.signer(proof).await?;
-        if *proof.name != ask_name(asker, &body.binding(self.node.name()))
-            || device_of(&key).as_ref() != Some(asker)
-        {
-            tracing::debug!(%offer, %asker, "an ask whose asker's proof does not verify; not answered");
-            return None;
-        }
-        let by = (key, digest);
         // One use: a use mark, else a use a stop interrupted. Its user is answered
         // again — never admitted again: a later members entry may have removed it
         // (spec §19.7).

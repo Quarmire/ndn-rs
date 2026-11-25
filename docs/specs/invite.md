@@ -205,7 +205,8 @@ is gone: the offer is fetched directly (§8.2).
 **Silence.** `Extension::answer` returns `None` for an Interest it will not
 answer, and the node Nacks it as it does every unanswerable name (heap.md §2.4,
 §7.6): the same for a name that does not parse, a name that parses and names no
-offer or token this device holds, and an ask that does not open (§9.2 step 1). A refusal that names a reason travels
+offer or token this device holds, an ask that does not open (§9.2 step 1), an ask whose asker proved no key (step 3) and an
+ask that names no offer this device holds (step 4). A refusal that names a reason travels
 only inside an answer to an ask that opened and whose asker proved a key (§9.2),
 never as the response to a name. A prober who does not hold a code therefore
 learns nothing of what the device holds: an offer name is 128 random bits, a hint
@@ -383,11 +384,11 @@ Each is durable (`Node::flush`) before the reply that depends on it (§9.6). `<i
 generic component (§15). `key/<id>`, `hint/<id>`, `using/<id>`, `used/<id>`, `tries/<id>` and `tries/<id>/<digest>` end in
 a 32-octet HMAC-SHA256 over their own key's Name TLV and their value, under a key derived from the device's recipient
 secret (§18.1): a note that does not check is **unread** and fails closed (a use mark or use under way: a use by a key
-nobody knows; tries: the cap; a proof key: `Unknown`), and a note moved to another key does not check. A device writes
+nobody knows; tries: the cap; a proof key: the offer is not held and an ask of it gets no answer), and a note moved to another key does not check. A device writes
 `used/<id>` at most once and never changes it (the first mark naming a key stands); `closed/<id>` is written by `close_offer`
 and by the overall cap, and writing it again changes nothing. Only the offering device marks its offer: the marks are local,
-not served, and authenticated by the MAC, not signed, because nobody else reads them. Other devices of the inviter answer
-`Unknown` for an offer they do not hold (§18).
+not served, and authenticated by the MAC, not signed, because nobody else reads them. Other devices of the inviter do not hold an offer they
+did not make: an ask of it gets no answer (§9.2 step 4, §18).
 
 ### 5.3 Offering
 
@@ -410,7 +411,7 @@ not served, and authenticated by the MAC, not signed, because nobody else reads 
 
 `close_offer(offer)` on the device that made the offer writes `closed/<id>` and returns once it is durable: the offer admits
 no one new, every ask by a key other than the one it was used by is refused `Closed`, even with the right secret, and it still
-answers the key it admitted, with the acceptance kept for its use and nothing else, until the offer expires (§9.2 step 4). It
+answers the key it admitted, with the acceptance kept for its use and nothing else, until the offer expires (§9.2 step 5). It
 also drops the signed hint packet kept for the offer's token, so the next request for the token is answered with the gone mark
 (§7.1 item 7). A host that closes an offer as soon as it sees the new member needs no pending close of its own for a joiner
 whose answer was lost.
@@ -1084,25 +1085,28 @@ at once (8 by default), before any unwrapping.
    certificates (at most 8); the claimed key — the proof packet's KeyLocator — is an
    anchor of the context (a key that is its own anchor) or has a valid certificate among
    them. Else no answer.
-3. **The offer is its own and known**: named under this device
+3. **The asker proved a key**: the proof packet, named `<J>/32=ask/<binding>` for this ask (the
+   binding covers this device, the offer and the body: a proof of another ask is none), verifies by a validator
+   that holds the presented context alone and the presented certificates (the hierarchical schema and certificate
+   validity checked), signed by a key of `J`. Else no answer: a forgery, or a broken
+   enrollment the joiner's own check (§8.2 step 2) reports. **This comes before every refusal**: a refusal
+   travels only to an asker that proved a key (§17.1), so that a party that holds no proving key learns
+   nothing of what the device holds, and what is said from here on is addressed to the proved key. The ask path
+   pays this signature in any case.
+4. **The offer is its own and known**: named under this device
    (`<D>/32=intro/32=offer/<id>`), an offer it holds (`offer/<id>`), its proof key in its
-   store (`key/<id>`). Else `Unknown`.
-4. **Not closed to this key.** An offer is *closed* when `closed/<id>` is held, when
+   store (`key/<id>`). Else **no answer** (a Nack), the same as for any other miss (§2.3): an ask that names no
+   offer this device holds is met with silence even when its asker proved a key, so that a guessed id learns nothing.
+5. **Not closed to this key.** An offer is *closed* when `closed/<id>` is held, when
    at least `IntroPolicy::wrong_tries_max` wrong tries are counted toward the overall
    cap, or when the fold shows a removal of the person it was used by (§5.4). A closed offer
    admits no one new: it answers `Closed`, except to the key `used/<id>` names (not a use
    a stop interrupted, which was never completed; `using/<id>` alone is no use), which it
    answers as step 6 says — the acceptance kept for its use, and nothing else — while the
    offer has not expired by this device's clock, and `Expired` after. This comparison is
-   made on the key the proof packet claims, before step 5 checks its chain; step 6 compares
-   the verified key. So closing never makes an offer answer more than it did: an open
+   made on the key step 3 proved. So closing never makes an offer answer more than it did: an open
    offer's user is answered whenever it asks (step 6), a closed offer's until the offer
    expires.
-5. **The asker's key chains to the anchor it sent**: the proof packet, named
-   `<J>/32=ask/<binding>` for this ask, verifies by a validator that holds the presented
-   context alone and the presented certificates (the hierarchical schema and certificate
-   validity checked), signed by a key of `J`. Else no answer: a forgery, or a broken
-   enrollment the joiner's own check (§8.2 step 2) reports.
 6. **Not used by another key**: `used/<id>` — or a use under way that a stop interrupted
    (`using/<id>`) — naming another key or digest is `Used`; nothing is counted. Used by this
    key, it answers the acceptance it kept for the use (`accepted/<id>`; made again, without `ADMITTED`, from the proof key
@@ -1223,7 +1227,7 @@ durable write on the path of a wrong try; it MUST NOT delay a right one.
 
 An ask without the secret fails step 9 and is counted; it cannot be turned into another key's
 membership: the proof binds the offer, the key, its digest and the nonce. An ask without valid
-credentials (step 2) or whose proof packet does not verify (step 5) costs one signature check and gets no
+credentials (step 2) or whose proof packet does not verify (step 3) costs one signature check and gets no
 answer. A forged ask grants nothing, whatever it counts (case i6).
 
 ## 10. Grants
@@ -1270,7 +1274,7 @@ of a members **entry** (§11). The host's side of every call is §12.
    not spent, §9.3), or when `IntroPolicy::grant_for` is `Some(Duration::ZERO)` (nothing is kept, nothing
    is told).
 2. **What it names, and its date.** The key is the public-key digest of the asker's key as the exchange
-   proved it (§9.2 steps 5–9); `namespaces` is the one namespace the join adopted (never one the asker
+   proved it (§9.2 steps 3–9); `namespaces` is the one namespace the join adopted (never one the asker
    merely claims over another); `folder` is the offer's space; `role` is the offer's at the admission and,
    from then on, whatever the fold makes of the namespace (rule 6). **By default a grant has no date**
    (`grant_for` `None`, `until` `None`): it follows the members, lasting while the fold lists the person
@@ -1822,10 +1826,10 @@ in a class (`NextStep`, heap.md §10.5); `retry()` says the same call can succee
 
 | `IntroRefusal` | When | Next | Retry |
 |---|---|---|---|
-| `Unknown` | the offering device holds no such offer | `AskOwner` (a new code) | no |
+| `Unknown` | what the joiner fetched under the offer's name is no offer's record (never on the wire: an ask for an offer the offering device holds none of gets no answer, §9.2 step 4) | `AskOwner` (a new code) | no |
 | `Used` | another key joined with this offer | `AskOwner` | no |
 | `Expired` | past its expiry by the offering device's clock | `AskOwner` | no |
-| `Closed` | closed to everyone but the key that used it: this key's wrong tries spent, all askers' at the device's cap, `close_offer`, or the member it brought removed by a members entry (the key the offer was used by is still answered, until the offer expires, §9.2 step 4) | `AskOwner` | no |
+| `Closed` | closed to everyone but the key that used it: this key's wrong tries spent, all askers' at the device's cap, `close_offer`, or the member it brought removed by a members entry (the key the offer was used by is still answered, until the offer expires, §9.2 step 5) | `AskOwner` | no |
 | `WrongProof { left }` | the proof of the secret is wrong; counted against this key, `left` more allowed it | `FixRequest` (check the code) | no |
 | `Conflict` | the asker's namespace overlaps the inviter's or one the inviter trusts, is one it trusts under another anchor, or one the policy refuses (§9.2 step 10); or, for a self-certifying asker namespace adopted from its genesis, the presented credentials carry an anchor the held context does not; or the asker's proof does not verify under the context the inviter's device holds (a key it revokes, shown with an older version) (§9.3) | `FixLocal` (renew the device's certificate when it is the last) | no |
 | `InviterConflict { inviter, why }` | the joiner refuses the inviter's namespace (§8.2 step 4; never on the wire): `why` says what it overlaps; or, for a self-certifying inviter namespace adopted from its genesis, the answer's credentials carry an anchor the held context does not; or the inviter's proof or offer does not verify under the context the joiner holds (§8.2 step 5) | `AskOwner` (do not use the code) | no |
@@ -1840,7 +1844,9 @@ Other errors wrap the heap's (`InviteError::Heap`, with the step of what they wr
 from an offer of a space this device does not own, `Refused` from a revoked or suspected own key.
 
 An offer is **never** refused to a prober that holds no code: it is silence (§2.3). A refusal travels only in the
-answer to an ask that opened and whose asker proved a key.
+answer to an ask that opened and whose asker **proved a key** (§9.2 step 3, before any refusal is decided): an ask whose
+asker proved none, and an ask that names no offer the device holds, are met with silence, so a prober that cannot prove a key
+learns of a held offer neither that it is open, nor used, nor closed.
 
 ### 17.2 A short code adds
 
@@ -1900,7 +1906,7 @@ first, and the ones that changed say so.
   recipient secret the key store keeps, over the note's own key name and value. A party that can write the data store and
   not the key store cannot make a proof key (which would admit whoever knew the secret it names), a use mark, a use under way or
   a count that reads, nor move a note to another key. A note that is there and does not read fails **closed**: a proof key that
-  does not read makes the offer `Unknown`; a use mark or a use under way that does not read is a use by a key nobody knows
+  does not read makes the offer not held (an ask of it gets no answer); a use mark or a use under way that does not read is a use by a key nobody knows
   (`Used` to every asker, its user included); a count that does not read is the cap (`Closed`, for that asker or for all). The
   offer is a signed Data and the device checks its own signature when it reads its offers at a start: a note the device's key
   did not sign is not an offer of the device's, so one written into the store is neither served nor judged. `closed/<id>` takes any
@@ -1970,7 +1976,7 @@ first, and the ones that changed say so.
   the inviter judges the joiner's (§8.2 step 4) before it adopts anything, so a stranger's code cannot replace the anchor of a
   namespace the joiner trusts, nor claim one under or over it (`InviterConflict`).
 - **Reuse across the inviter's devices.** An offer is answered only by the device that made it, which alone holds its proof key and
-  its use mark; another device of the inviter answers `Unknown` (see §18.1 for what changed).
+  its use mark; another device of the inviter gives no answer to an ask of it (see §18.1 for what changed).
 - **Clock.** Expiry, and the overall cap's backoff, are judged by the offering device's clock alone: a slow one keeps an offer open
   longer and counts toward the cap more slowly, a fast one closes it early and counts sooner; no other decision reads a clock, and
   certificate validity in the credentials is checked as a live exchange.
@@ -2109,7 +2115,7 @@ id. The rules above that a case guards, and the tests this crate names for them:
 | i10 | Removing a member who joined by a code lasts: asking again with the code never makes it a member again | §9.5 |
 | i11 | A stranger cannot close someone else's offer; a used offer counts no tries | §9.6 |
 | i12 | A member removed from another device of the owner never comes back by its code | §9.2 step 6, §9.5 |
-| i13 | A closed offer admits no one new yet answers the writer it admitted until it expires | §5.4, §9.2 step 4 |
+| i13 | A closed offer admits no one new yet answers the writer it admitted until it expires | §5.4, §9.2 step 5 |
 | i14 | A join returns once the joiner may write and says what it waits for | §8.5, §17.3 |
 | i15 | An offer's admission makes one grant to link, for the admitted key only | §10 rules 1–4 |
 | i16 | A held entry that leaves the person out ends the grant, and a restart keeps the rest | §10 rules 6, 7 |
@@ -2149,7 +2155,7 @@ Everything not listed here is carried over as written (with `folder` read as `sp
 | §19.8 rule 14 the departure mark names the record chosen by reading revisions held from the highest down | §11 rule 14 the entry `Heap::removed_by(person)` names | one function of the entries held replaces the revision walk |
 | §19.8 rule 15 `take_departure` fetches the record by name | §11 rule 15 `Node::fetch_entry`, judged and applied as any entry | the host surface lends the fetch |
 | §19.8 rule 16 `writer_carries` adds summary roots, `writer_sync` adds `<W>/32=sync` | §13.3 `writer_carries` adds the seal keys, the grant asks and held copies; no summary roots, no `writer_sync` | the heap has no summaries, and a space's sync group is its owner's |
-| §19.7 "every device of the inviter sees the offer used" (the use mark is in its log) | §18.1 only the device that made the offer sees it used; another device answers `Unknown` | an offer is answered only by the device that made it |
+| §19.7 "every device of the inviter sees the offer used" (the use mark is in its log) | §18.1 only the device that made the offer sees it used; another device gives no answer to an ask of it | an offer is answered only by the device that made it |
 | §19.9 `Device::local_notes` | not carried: the link memory of ndn-link keeps its own notes under `/localhost/ndn-link/memory/` | not an introduction |
 | `Introducer::adopt_scoped`, `release_scoped` | `Adopter` of heap.md §9.4 | they adopt a person for one space, and belong to the node |
 | `DataError::Introduction { why }` | `InviteError::Refused(IntroRefusal)`; `InviteError::{Heap, Local, NotReady, BadRequest}` | `InviteError::next()` and `refusal()` keep the old mapping for `ndf`'s `Code::BadCode` |

@@ -177,7 +177,9 @@ impl Default for IntroPolicy {
 /// Why an introduction was refused (spec §19.5).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum IntroRefusal {
-    /// The offering device holds no such offer.
+    /// What was fetched under the offer's name is no offer's record, or the offering
+    /// device holds no such offer. An offering device never says the latter on the wire:
+    /// an ask for an offer it holds none of is met with silence (spec §9.2 step 4).
     Unknown,
     /// Another key joined with this offer.
     Used,
