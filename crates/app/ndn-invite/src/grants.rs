@@ -175,7 +175,7 @@ impl Grants {
         }
         *self.joined_seen.lock() = self.joined_list();
         let weak = Arc::downgrade(self);
-        ndn_app::rt::spawn(async move {
+        self.node.spawn(async move {
             while let Some(grants) = weak.upgrade() {
                 grants.follow_spaces();
                 grants.judge().await;
@@ -445,7 +445,7 @@ impl Grants {
             return;
         }
         let (weak, space) = (Arc::downgrade(self), space.clone());
-        ndn_app::rt::spawn(async move {
+        self.node.spawn(async move {
             let ended = Self::watch(&weak, &heap).await;
             if let Some(grants) = weak.upgrade() {
                 grants.following.lock().remove(&space);

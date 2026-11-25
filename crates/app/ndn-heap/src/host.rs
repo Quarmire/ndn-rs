@@ -388,6 +388,24 @@ impl NodeHandle {
         Ok(self.inner.flusher.flush().await?)
     }
 
+    /// Run `task` as one of the node's own tasks, for a host or an extension that works
+    /// alongside it (a watch it keeps on a space, a loop that judges what it holds): the task
+    /// is dropped, with whatever it holds (a [`Heap`], this handle), when the node stops, and
+    /// [`Node::close`](crate::Node::close) returns once it has been. A task spawned on
+    /// another runtime handle is not waited for by `close`, and a [`Heap`] it holds keeps the
+    /// node, and so its store, until it ends. A node that has stopped starts it and drops it at
+    /// once.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn spawn<F: Future<Output = ()> + Send + 'static>(&self, task: F) {
+        self.inner.tasks.spawn(task);
+    }
+
+    /// As the native one: `task` is one of the node's own tasks.
+    #[cfg(target_arch = "wasm32")]
+    pub fn spawn<F: Future<Output = ()> + 'static>(&self, task: F) {
+        self.inner.tasks.spawn(task);
+    }
+
     /// Register `extension` to answer the Interests under `<D>/32=<keyword>`
     /// for each of its keywords, and to have the node sign packets named
     /// under them ([`Self::sign_packet`]).

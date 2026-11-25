@@ -438,6 +438,7 @@ async fn each_structural_entry_holds_everything_after_it_until_its_own_flush() {
         seen: Mutex::new(Vec::new()),
     });
     let publisher = Publisher::spawn(
+        &Tasks::new(),
         Arc::clone(&flusher),
         Arc::clone(&sink) as Arc<dyn FlushSink>,
     );
@@ -495,6 +496,7 @@ async fn a_structural_entry_is_released_only_after_a_flush_that_covers_it() {
     let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
     let sink = Arc::new(Recorder::default());
     let publisher = Publisher::spawn(
+        &Tasks::new(),
         Arc::clone(&flusher),
         Arc::clone(&sink) as Arc<dyn FlushSink>,
     );
@@ -536,6 +538,7 @@ async fn a_structural_entry_is_never_released_when_its_flush_fails() {
     let flusher = Flusher::spawn(Arc::clone(&store) as Arc<dyn DataStore>);
     let sink = Arc::new(Recorder::default());
     let publisher = Publisher::spawn(
+        &Tasks::new(),
         Arc::clone(&flusher),
         Arc::clone(&sink) as Arc<dyn FlushSink>,
     );

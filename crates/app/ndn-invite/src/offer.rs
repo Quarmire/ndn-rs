@@ -411,7 +411,7 @@ impl Inner {
             }
             tracing::warn!(device = %self.node.name(), %space, closed = open.len(), "every open offer of this device is closed: {why}; make a new offer for each code still wanted");
             let store = Arc::clone(&self.store);
-            ndn_app::rt::spawn(async move {
+            self.node.spawn(async move {
                 if let Err(e) = store::flush(&store).await {
                     tracing::warn!("the closing of the offers is not durable: {e}");
                 }

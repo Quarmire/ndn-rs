@@ -41,7 +41,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::error::{Cut, Refusal, Timestamp};
-use crate::rt::{self, Instant};
+use crate::rt::{self, Instant, Tasks};
 use crate::store::{Kind, Link};
 use crate::wire::{ASKER_CHAIN_MAX, ASKER_CHAIN_OCTETS_MAX, device_of, log_prefix, parse_log_name};
 
@@ -602,6 +602,8 @@ pub(crate) struct Judge {
     /// How many person adoptions so far refused more than the version before
     /// them: what a keyring's own revocation epoch counts for its contexts.
     scoped_revocations: AtomicU64,
+    /// The adoptions the host is asked for, and the pauses before asking again.
+    tasks: Arc<Tasks>,
 }
 
 impl Judge {
@@ -637,6 +639,7 @@ impl Judge {
             scopes: Mutex::new(scopes),
             events,
             scoped_revocations: AtomicU64::new(0),
+            tasks: Tasks::new(),
         });
         // The listener runs on the adopting thread: it only releases what the
         // node holds now itself, and queues the announcement.
@@ -647,6 +650,18 @@ impl Judge {
             }
         });
         (judge, inbox)
+    }
+
+    /// End the adoptions under way and the pauses before them, now. The judge judges still;
+    /// it asks the host for nothing more.
+    pub(crate) fn stop(&self) {
+        self.tasks.stop();
+    }
+
+    /// Wait until every task of the judge was dropped: nothing it asked the host of keeps the
+    /// judge, or the store, any more. Call it after [`Self::stop`].
+    pub(crate) async fn ended(&self) {
+        self.tasks.ended().await;
     }
 
     /// A counter that moves whenever a verdict given before may have changed
@@ -1097,7 +1112,7 @@ impl Judge {
         if let Some(at) = wake {
             // An ask a pause deferred: made once the pause ends.
             let weak = Arc::downgrade(self);
-            rt::spawn(async move {
+            self.tasks.spawn(async move {
                 rt::sleep(at.saturating_duration_since(Instant::now())).await;
                 if let Some(judge) = weak.upgrade() {
                     judge.scopes.lock().waking = false;
@@ -1115,7 +1130,7 @@ impl Judge {
         for (person, from) in asks {
             let judge = Arc::clone(self);
             let host = Arc::clone(&host);
-            rt::spawn(async move {
+            self.tasks.spawn(async move {
                 let got = host.adopt_scoped(&person, from.as_ref()).await;
                 if let Some(refuses) = judge.adopted(&person, from, got) {
                     judge.announce(&person, refuses);

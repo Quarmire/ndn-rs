@@ -45,7 +45,6 @@ use ndn_security::cert_name::{is_cert_name, is_key_name, key_name_of};
 use parking_lot::Mutex;
 
 use crate::limit::Counts;
-use crate::rt;
 use crate::seal::seal_key_matches;
 use crate::sync::{HostRef, Net, Shared};
 use crate::trust::Judged;
@@ -142,7 +141,7 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
         Some(Served::Seal) => host.seal_key_packet(&name),
         Some(Served::Grant) => {
             if let Some((_, ask)) = parse_grant_name(&name).filter(|(g, _)| *g == me) {
-                rt::spawn(async move {
+                shared.tasks.clone().spawn(async move {
                     let wire = grant(&shared, &name, ask).await;
                     reply(&name, responder, wire).await;
                 });
@@ -158,7 +157,7 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
         // (its own task, as a grant's: it may sign and wait); anything else is Nacked.
         None => match shared.extensions.answering(&me, &name) {
             Some(extension) if !is_local(&name) => {
-                rt::spawn(async move {
+                shared.tasks.spawn(async move {
                     let wire = extension.answer(&interest).await;
                     reply(&name, responder, wire).await;
                 });

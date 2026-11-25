@@ -35,7 +35,7 @@ use crate::log::{Blob, Outcome};
 use crate::node::Config;
 use crate::register::EntryId;
 use crate::reserve::FlushSink;
-use crate::rt;
+use crate::rt::Tasks;
 use crate::serve::Granting;
 use crate::trust::Waiting;
 use crate::wire::{EpochId, parse_space_name, sync_group_of};
@@ -86,6 +86,9 @@ pub(crate) struct Shared {
     /// What the host registered to answer keywords of its own
     /// ([`crate::host::Extension`]).
     pub(crate) extensions: Extensions,
+    /// The tasks of the half: the groups', the pumps', the announcement's and the server's
+    /// (one per Interest answered). Stopped with the half.
+    pub(crate) tasks: Arc<Tasks>,
 }
 
 // -- The node's one network half ------------------------------------------------------------------------
@@ -103,6 +106,24 @@ pub(crate) struct Net {
     owners: Mutex<BTreeSet<Name>>,
     stop: CancellationToken,
     face_up: FaceUp,
+    /// The driver's end ([`MultiSvs::ended`]).
+    svs_ended: CancellationToken,
+}
+
+/// What waits for the network half to have ended once it is stopped: every task of it
+/// dropped, the SVS driver ended. It holds neither the half nor the node.
+pub(crate) struct NetEnd {
+    tasks: Arc<Tasks>,
+    svs: CancellationToken,
+}
+
+impl NetEnd {
+    /// Wait until the half's tasks and its driver have ended: nothing of it keeps the node, or
+    /// the store the node holds, any more. Call it after [`Net::shutdown`].
+    pub(crate) async fn ended(self) {
+        self.tasks.ended().await;
+        self.svs.cancelled().await;
+    }
 }
 
 impl Net {
@@ -119,11 +140,13 @@ impl Net {
         let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(256);
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(256);
         let svs = Arc::new(spawn_multi_svs(host.device().clone(), out_tx, in_rx));
+        let svs_ended = svs.ended();
+        let tasks = Tasks::new();
         let stop = CancellationToken::new();
         {
-            let (sync, stop) = (Arc::clone(&sync), stop.clone());
-            rt::spawn(async move {
-                while let Some(Some(packet)) = stop.run_until_cancelled(out_rx.recv()).await {
+            let sync = Arc::clone(&sync);
+            tasks.spawn(async move {
+                while let Some(packet) = out_rx.recv().await {
                     if sync.send(packet).await.is_err() {
                         break;
                     }
@@ -131,9 +154,9 @@ impl Net {
             });
         }
         {
-            let (sync, stop) = (Arc::clone(&sync), stop.clone());
-            rt::spawn(async move {
-                while let Some(Some(packet)) = stop.run_until_cancelled(sync.recv()).await {
+            let sync = Arc::clone(&sync);
+            tasks.spawn(async move {
+                while let Some(packet) = sync.recv().await {
                     if Interest::decode(packet.clone()).is_ok() && in_tx.send(packet).await.is_err()
                     {
                         break;
@@ -144,6 +167,7 @@ impl Net {
         let groups: Arc<Mutex<BTreeMap<Name, Arc<Group>>>> = Arc::default();
         let face_up = FaceUp::spawn(
             Arc::clone(&sync),
+            Arc::clone(&tasks),
             {
                 let groups = Arc::clone(&groups);
                 move || groups.lock().values().map(|g| g.group.clone()).collect()
@@ -171,6 +195,7 @@ impl Net {
             cfg,
             grants: Granting::default(),
             extensions: Extensions::default(),
+            tasks,
         });
         Arc::new(Net {
             shared,
@@ -180,6 +205,7 @@ impl Net {
             owners: Mutex::new(BTreeSet::new()),
             stop,
             face_up,
+            svs_ended,
         })
     }
 
@@ -245,6 +271,7 @@ impl Net {
             Arc::clone(&observed),
             Arc::clone(&heard_any),
             stop.clone(),
+            Arc::clone(&self.shared.tasks),
         );
         let group = Arc::new(Group {
             space: space.clone(),
@@ -267,8 +294,8 @@ impl Net {
             herald,
         });
         self.groups.lock().insert(space.clone(), Arc::clone(&group));
-        rt::spawn(notices(Arc::clone(&group), handle));
-        rt::spawn(fetch::run(Arc::clone(&group)));
+        self.shared.tasks.spawn(notices(Arc::clone(&group), handle));
+        self.shared.tasks.spawn(fetch::run(Arc::clone(&group)));
         group.herald.hail();
         Ok(group)
     }
@@ -295,11 +322,22 @@ impl Net {
         }
     }
 
-    /// Stop the driver, every group and the announcement at once. Idempotent.
+    /// Stop the driver, every group, every task and the announcement at once. Idempotent.
+    /// The tasks end at their next poll, not before this returns: [`Self::end`] is what
+    /// waits for them.
     pub(crate) fn shutdown(&self) {
         self.stop.cancel();
+        self.shared.tasks.stop();
         self.face_up.stop();
         self.svs.shutdown();
+    }
+
+    /// What waits for this half to have ended, once [`Self::shutdown`] was called.
+    pub(crate) fn end(&self) -> NetEnd {
+        NetEnd {
+            tasks: Arc::clone(&self.shared.tasks),
+            svs: self.svs_ended.clone(),
+        }
     }
 }
 

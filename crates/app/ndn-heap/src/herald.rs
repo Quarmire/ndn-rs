@@ -41,7 +41,7 @@ use ndn_sync::{MultiSvs, ObservedState};
 use tokio_util::sync::CancellationToken;
 
 use crate::fetch::retry_pause;
-use crate::rt;
+use crate::rt::{self, Tasks};
 use crate::sync::TIMELINE;
 
 /// The announcements made whatever is seen of the peers: one takes the notice,
@@ -63,6 +63,8 @@ pub(crate) struct Herald {
     /// A notice of the group was heard (`Group::heard_any`, the same flag).
     heard: Arc<AtomicBool>,
     stop: CancellationToken,
+    /// The node's network tasks: the announcements run among them.
+    tasks: Arc<Tasks>,
     /// The highest seq of this device announced in the group.
     announced: AtomicU64,
     /// The highest seq of this device a peer asked for.
@@ -79,6 +81,7 @@ impl Herald {
         observed: Arc<ObservedState>,
         heard: Arc<AtomicBool>,
         stop: CancellationToken,
+        tasks: Arc<Tasks>,
     ) -> Arc<Herald> {
         Arc::new(Herald {
             svs,
@@ -87,6 +90,7 @@ impl Herald {
             observed,
             heard,
             stop,
+            tasks,
             announced: AtomicU64::new(0),
             taken: AtomicU64::new(0),
             running: AtomicBool::new(false),
@@ -99,7 +103,7 @@ impl Herald {
     /// vector; one announcement and one answer both have to cross the link.
     pub(crate) fn hail(self: &Arc<Self>) {
         let herald = Arc::clone(self);
-        rt::spawn(async move {
+        self.tasks.spawn(async move {
             for again in 0..HERALD_MAX {
                 rt::sleep(retry_pause(again)).await;
                 if herald.stop.is_cancelled() || herald.heard.load(Ordering::Relaxed) {
@@ -121,7 +125,7 @@ impl Herald {
     pub(crate) fn announced(self: &Arc<Self>, seq: u64) {
         self.announced.fetch_max(seq, Ordering::SeqCst);
         if !self.running.swap(true, Ordering::SeqCst) {
-            rt::spawn(Arc::clone(self).run());
+            self.tasks.spawn(Arc::clone(self).run());
         }
     }
 

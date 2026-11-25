@@ -50,6 +50,8 @@ use crate::svs_sync::{GroupCore, PENDING_RETRY, SvsConfig};
 pub struct MultiSvs {
     control_tx: mpsc::Sender<MultiControl>,
     cancel: CancellationToken,
+    /// Cancelled once the driver's task has ended and dropped what it held.
+    ended: CancellationToken,
 }
 
 enum MultiControl {
@@ -71,12 +73,19 @@ pub fn spawn_multi_svs(
     recv: mpsc::Receiver<Bytes>,
 ) -> MultiSvs {
     let cancel = CancellationToken::new();
+    let ended = CancellationToken::new();
     let (control_tx, control_rx) = mpsc::channel(64);
-    let task_cancel = cancel.clone();
+    let (task_cancel, task_ended) = (cancel.clone(), ended.clone());
     rt::spawn(async move {
         multi_task(local_name, send, recv, control_rx, task_cancel).await;
+        // The task's state (every group's configuration, the face) is dropped by now.
+        task_ended.cancel();
     });
-    MultiSvs { control_tx, cancel }
+    MultiSvs {
+        control_tx,
+        cancel,
+        ended,
+    }
 }
 
 impl MultiSvs {
@@ -126,6 +135,14 @@ impl MultiSvs {
     /// Stop the driver and every group it carries.
     pub fn shutdown(&self) {
         self.cancel.cancel();
+    }
+
+    /// The signal of the driver's end: it is cancelled once the driver's task, stopped by
+    /// [`Self::shutdown`] (or dropping this), has ended and dropped everything it held (the
+    /// groups' configurations, whatever their closures keep alive). It does not borrow the
+    /// handle, so it can be waited for after the handle is dropped.
+    pub fn ended(&self) -> CancellationToken {
+        self.ended.clone()
     }
 }
 

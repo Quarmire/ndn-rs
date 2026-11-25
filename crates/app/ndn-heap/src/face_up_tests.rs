@@ -69,6 +69,7 @@ impl Rig {
         let told: Arc<Mutex<Vec<(Name, Instant)>>> = Arc::default();
         let face_up = FaceUp::spawn(
             Arc::clone(&tell) as Arc<dyn Connection>,
+            Tasks::new(),
             {
                 let groups = Arc::clone(&groups);
                 move || groups.lock().clone()
@@ -331,13 +332,18 @@ async fn a_stopped_face_up_announces_nothing_more() {
 #[tokio::test(start_paused = true)]
 async fn a_connection_that_tells_no_routes_announces_nothing() {
     let told: Arc<Mutex<usize>> = Arc::default();
-    let face_up = FaceUp::spawn(Arc::new(Mute) as Arc<dyn Connection>, || vec![n(NOTES)], {
-        let told = Arc::clone(&told);
-        move |_| {
+    let face_up = FaceUp::spawn(
+        Arc::new(Mute) as Arc<dyn Connection>,
+        Tasks::new(),
+        || vec![n(NOTES)],
+        {
             let told = Arc::clone(&told);
-            async move { *told.lock() += 1 }.boxed()
-        }
-    });
+            move |_| {
+                let told = Arc::clone(&told);
+                async move { *told.lock() += 1 }.boxed()
+            }
+        },
+    );
     pass(Duration::from_secs(5)).await;
     assert_eq!(*told.lock(), 0);
     drop(face_up);

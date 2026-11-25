@@ -42,12 +42,12 @@ use crate::host::NodeHandle;
 use crate::log::{Alert, Blob, Change, Log, Outcome, Params, Want};
 use crate::reserve::{Flusher, Publisher};
 use crate::revocation::{self, CutBound, CutProposal, Suspicion};
-use crate::rt;
+use crate::rt::{self, Tasks};
 use crate::seal::{self, GrantRefusal, Keys};
 use crate::serve;
 use crate::space::{Follower, GRANTEES_PER_PERSON, Heap, Share, SpaceInner, check_audience};
 use crate::store::{Kind, OWNER_RULE};
-use crate::sync::{HostRef, Net, Taken};
+use crate::sync::{HostRef, Net, NetEnd, Taken};
 use crate::trust::{Adopter, Adoption, Judge, Judged, TipCut, Verified};
 use crate::wire::{
     EpochId, GrantAsk, device_of, is_device_name, is_namespace, log_name, parse_log_name,
@@ -57,6 +57,10 @@ use crate::wire::{
 #[cfg(test)]
 #[path = "node_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "close_tests.rs"]
+mod close_tests;
 
 #[cfg(test)]
 #[path = "mesh_tests.rs"]
@@ -195,6 +199,13 @@ pub(crate) struct NodeInner {
     pub(crate) signatures: AtomicU64,
     stopped: AtomicBool,
     serving: Mutex<Option<ServeGuard>>,
+    /// The tasks of the node itself: adoption, lapse and store-failure watching, one per
+    /// Interest answered, a space's recovery of its own entries, and each space's publisher.
+    /// The network half's are its own ([`NodeInner::net_end`]), the judge's and the flusher's
+    /// theirs.
+    pub(crate) tasks: Arc<Tasks>,
+    /// What waits for the network half to have ended: taken by [`NodeInner::ended`].
+    net_end: Mutex<Option<NetEnd>>,
 }
 
 /// What the store says of a space opened before: a member (1) or a carrier
@@ -296,6 +307,8 @@ impl Node {
             signatures: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             serving: Mutex::new(None),
+            tasks: Tasks::new(),
+            net_end: Mutex::new(None),
         });
         let node = Node {
             inner: Arc::clone(&inner),
@@ -307,25 +320,34 @@ impl Node {
             conn,
             transport.sync,
         );
+        *inner.net_end.lock() = Some(net.end());
         *inner.net.write() = Some(net);
         // From here a failure drops `node`, which stops what was started.
         let held = inner.restore().await?;
-        rt::spawn(NodeInner::adoption_task(Arc::downgrade(&inner), adoptions));
-        rt::spawn(NodeInner::lapse_task(Arc::downgrade(&inner)));
-        rt::spawn(NodeInner::failure_task(
+        inner
+            .tasks
+            .spawn(NodeInner::adoption_task(Arc::downgrade(&inner), adoptions));
+        inner
+            .tasks
+            .spawn(NodeInner::lapse_task(Arc::downgrade(&inner)));
+        inner.tasks.spawn(NodeInner::failure_task(
             Arc::downgrade(&inner),
             Arc::clone(&inner.flusher),
         ));
-        let serving = Arc::downgrade(&inner);
+        // An Interest is answered as one of the node's tasks, counted when it arrives: the
+        // node is reached from inside the task, which a stopped node never starts, so no
+        // answer holds the node once `close` has seen the tasks end.
+        let (serving, tasks) = (Arc::downgrade(&inner), Arc::clone(&inner.tasks));
         let guard = transport
             .node
             .serve(device.clone(), move |interest, responder| {
-                let net = serving.upgrade().and_then(|inner| inner.net());
-                async move {
+                let serving = serving.clone();
+                tasks.track(async move {
+                    let net = serving.upgrade().and_then(|inner| inner.net());
                     if let Some(net) = net {
                         serve::answer(net, interest, responder).await;
                     }
-                }
+                })
             })
             .await
             .map_err(|e| HeapError::local(format!("cannot serve {device}: {e}")))?;
@@ -411,6 +433,14 @@ impl Node {
     /// Stop cleanly: refuse new puts, drain the publishers, flush, record
     /// each space's head as a clean close, flush, stop. The next start has no
     /// hole and says nothing.
+    ///
+    /// It returns when every task of the node has ended (the recovery of a
+    /// space's own entries, the fetches, the announcements, the answers, the
+    /// adoptions, the flusher), each dropped, and with them the node's hold on
+    /// its store: a store that is a directory (fjall) opens again at once, in
+    /// this process, with no wait. What a caller still holds of the node (a
+    /// [`Heap`], a [`Follower`], a [`NodeHandle`] it kept) keeps the node and so
+    /// the store: drop them first.
     pub async fn close(self) {
         let inner = Arc::clone(&self.inner);
         let spaces: Vec<Arc<SpaceInner>> = inner.spaces.read().values().cloned().collect();
@@ -439,9 +469,12 @@ impl Node {
             }
         }
         inner.shutdown();
+        inner.ended().await;
     }
 
-    /// Stop at once. Whatever the flusher had not made durable is not; the
+    /// Stop at once, without waiting: every task is told to end and does at
+    /// its next poll, and [`Self::close`] is what returns once they have.
+    /// Whatever the flusher had not made durable is not; the
     /// reservation stays above the head, so the next start is unclean (a
     /// hole and a gap statement).
     pub fn shutdown(&self) {
@@ -614,6 +647,8 @@ impl NodeInner {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.tasks.stop();
+        self.judge.stop();
         self.flusher.stop();
         if let Some(net) = self.net.write().take() {
             net.shutdown();
@@ -627,6 +662,19 @@ impl NodeInner {
             drop(space.log.lock());
             space.close_watchers();
         }
+    }
+
+    /// Wait until every task of the node has ended, once [`Self::shutdown`] has been called: the
+    /// network half's (and the sync driver), the node's own, the judge's and the flusher's.
+    /// Each is dropped by then, so none holds the node or its store.
+    async fn ended(&self) {
+        let net = self.net_end.lock().take();
+        if let Some(net) = net {
+            net.ended().await;
+        }
+        self.tasks.ended().await;
+        self.judge.ended().await;
+        self.flusher.ended().await;
     }
 
     // -- Opening ----------------------------------------------------------------
@@ -739,7 +787,7 @@ impl NodeInner {
         let space = log.space.clone();
         let counter = if follower { 0 } else { log.head() };
         let group = net.join(&space, counter).await?;
-        let publisher = Publisher::spawn(Arc::clone(&self.flusher), group.sink());
+        let publisher = Publisher::spawn(&self.tasks, Arc::clone(&self.flusher), group.sink());
         let inner = Arc::new(SpaceInner::new(
             log,
             publisher,
@@ -766,7 +814,7 @@ impl NodeInner {
             } else if unclean {
                 let group = Arc::clone(&group);
                 let settle = self.config.settle;
-                rt::spawn(async move {
+                self.tasks.spawn(async move {
                     group.recover(settle).await;
                 });
             }

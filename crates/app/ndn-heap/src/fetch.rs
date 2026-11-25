@@ -1522,7 +1522,7 @@ impl Group {
             );
         }
         for launch in launches {
-            rt::spawn(Arc::clone(self).ask_entry(launch));
+            self.shared.tasks.spawn(Arc::clone(self).ask_entry(launch));
         }
 
         if self.relist.swap(false, Ordering::Relaxed) {
@@ -1530,7 +1530,7 @@ impl Group {
         }
         for epoch in host.owed_keys(space) {
             if self.asking.lock().insert(epoch.clone()) {
-                rt::spawn(Arc::clone(self).pull_key(epoch));
+                self.shared.tasks.spawn(Arc::clone(self).pull_key(epoch));
             }
         }
         next
@@ -1615,7 +1615,7 @@ impl Group {
     pub(crate) fn assemble(self: &Arc<Self>, blobs: Vec<Blob>) {
         for blob in blobs {
             if self.assembling.lock().insert(blob.id.clone()) {
-                rt::spawn(Arc::clone(self).assemble_one(blob));
+                self.shared.tasks.spawn(Arc::clone(self).assemble_one(blob));
             }
         }
     }
@@ -1820,8 +1820,20 @@ impl Group {
     /// entries the log wants (up to four reservation blocks above the head)
     /// are fetched or asked for in vain ([`FETCH_TRIES`] times each). What
     /// the log does with them (adoption, rollback evidence) is its own: this
-    /// only fetches and hands over.
+    /// only fetches and hands over. It ends at once, `complete` and `heard`
+    /// unset, when the group is stopped (left, or the node stopped).
     pub(crate) async fn recover(&self, settle: Duration) -> Recovered {
+        let stopped = Recovered {
+            heard: false,
+            complete: false,
+        };
+        self.stop
+            .run_until_cancelled(self.recover_until_done(settle))
+            .await
+            .unwrap_or(stopped)
+    }
+
+    async fn recover_until_done(&self, settle: Duration) -> Recovered {
         // The first vector: any notice, or a peer's counter for this device's
         // own name (which is no notice, `Group::note_own`), within `settle`.
         let began = Instant::now();

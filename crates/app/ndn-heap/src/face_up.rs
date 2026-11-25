@@ -48,7 +48,7 @@ use ndn_foundation_types::Name;
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::rt::{self, Instant};
+use crate::rt::{self, Instant, Tasks};
 
 /// At most one announcement per group in this long: a link that flaps adds
 /// its routes again and again.
@@ -138,6 +138,8 @@ struct Shared {
     gate: Mutex<Gate>,
     /// Cancelled when the node stops the task.
     stop: CancellationToken,
+    /// The tasks the announcements run among.
+    tasks: Arc<Tasks>,
 }
 
 impl Shared {
@@ -159,11 +161,13 @@ pub(crate) struct FaceUp {
 
 impl FaceUp {
     /// Follow the routes of `conn` and announce each group of `groups` that a
-    /// route coming up covers, with `announce`. Nothing is followed, and
+    /// route coming up covers, with `announce`; the task and each announcement
+    /// waiting for its turn are among `tasks`. Nothing is followed, and
     /// nothing announced, when `conn` cannot tell its routes
     /// ([`Connection::routes`]).
     pub(crate) fn spawn(
         conn: Arc<dyn Connection>,
+        tasks: Arc<Tasks>,
         groups: impl Fn() -> Vec<Name> + Send + Sync + 'static,
         announce: impl Fn(Name) -> BoxFuture<'static, ()> + Send + Sync + 'static,
     ) -> FaceUp {
@@ -174,8 +178,9 @@ impl FaceUp {
                 announce: Box::new(announce),
                 gate: Mutex::default(),
                 stop: stop.clone(),
+                tasks: Arc::clone(&tasks),
             };
-            rt::spawn(run(routes, Arc::new(shared)));
+            tasks.spawn(run(routes, Arc::new(shared)));
         }
         FaceUp { stop }
     }
@@ -219,7 +224,9 @@ async fn run(mut routes: RouteEvents, shared: Arc<Shared>) {
                     (shared.announce)(group).await;
                 }
                 Verdict::After(wait) => {
-                    rt::spawn(announce_when_due(group, wait, Arc::clone(&shared)));
+                    shared
+                        .tasks
+                        .spawn(announce_when_due(group, wait, Arc::clone(&shared)));
                 }
                 Verdict::Waiting => {}
             }

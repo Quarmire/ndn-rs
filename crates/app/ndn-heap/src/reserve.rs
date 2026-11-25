@@ -30,7 +30,7 @@ use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc};
 
 use crate::error::HeapError;
-use crate::rt;
+use crate::rt::Tasks;
 use crate::store::{Corrupt, Kind, ReserveRecord, read_head, read_reserve};
 
 #[cfg(test)]
@@ -91,6 +91,8 @@ pub(crate) struct Flusher {
     wake: Arc<Notify>,
     /// To waiters: a flush returned, failed, or the flusher stopped.
     done: Notify,
+    /// The flush task, and the end of it: [`Self::ended`].
+    tasks: Arc<Tasks>,
 }
 
 impl Flusher {
@@ -98,13 +100,15 @@ impl Flusher {
     /// stopped or dropped.
     pub(crate) fn spawn(store: Arc<dyn DataStore>) -> Arc<Flusher> {
         let wake = Arc::new(Notify::new());
+        let tasks = Tasks::new();
         let flusher = Arc::new(Flusher {
             store,
             st: Mutex::new(FlushState::default()),
             wake: Arc::clone(&wake),
             done: Notify::new(),
+            tasks: Arc::clone(&tasks),
         });
-        rt::spawn(Self::run(Arc::downgrade(&flusher), wake));
+        tasks.spawn(Self::run(Arc::downgrade(&flusher), wake));
         flusher
     }
 
@@ -166,7 +170,11 @@ impl Flusher {
             std::thread::Builder::new()
                 .name("ndn-heap-flush".into())
                 .spawn(move || {
-                    let _ = done.send(store.sync());
+                    let synced = store.sync();
+                    // The thread lets go of the store before it says it is done: whoever
+                    // waited for the flush may release the store the moment it returns.
+                    drop(store);
+                    let _ = done.send(synced);
                 })?;
             return flushed.await.unwrap_or_else(|e| {
                 Err(std::io::Error::other(format!(
@@ -255,11 +263,18 @@ impl Flusher {
     }
 
     /// Stop at once: waiters are woken with [`FlushError::Stopped`] and no
-    /// flush is begun again. A flush under way finishes on its thread.
+    /// flush is begun again. A flush under way finishes on its thread, and
+    /// [`Self::ended`] waits for it.
     pub(crate) fn stop(&self) {
         self.st.lock().stopped = true;
         self.wake.notify_one();
         self.done.notify_waiters();
+    }
+
+    /// Wait until the flusher's task has ended, a flush it had under way included, and has let
+    /// go of the flusher and so of the store. Call it after [`Self::stop`].
+    pub(crate) async fn ended(&self) {
+        self.tasks.ended().await;
     }
 }
 
@@ -494,13 +509,17 @@ pub(crate) struct Publisher {
 impl Publisher {
     /// Start the publisher. Its task ends when the publisher is dropped, or
     /// when the flusher can no longer cover a held entry.
-    pub(crate) fn spawn(flusher: Arc<Flusher>, sink: Arc<dyn FlushSink>) -> Publisher {
+    pub(crate) fn spawn(
+        tasks: &Arc<Tasks>,
+        flusher: Arc<Flusher>,
+        sink: Arc<dyn FlushSink>,
+    ) -> Publisher {
         let (queue, entries) = mpsc::unbounded_channel();
         let shared = Arc::new(PublisherShared {
             st: Mutex::new(PublisherState::default()),
             progress: Notify::new(),
         });
-        rt::spawn(Self::drive(
+        tasks.spawn(Self::drive(
             entries,
             Arc::clone(&flusher),
             Arc::downgrade(&shared),

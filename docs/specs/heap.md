@@ -935,6 +935,19 @@ entry's key check (§6.2); otherwise it is dropped.
    its next start is unclean again. `Node::shutdown` (what `Drop` calls) stops
    at once and leaves `R` above the head: the next start is unclean, with a
    hole and a gap statement.
+5. **After `close` returns the store is released.** Every task the node
+   started has ended and been dropped (the recovery of a space's own entries,
+   the fetches of entries, pieces and keys, the announcements, the answers to
+   Interests, the adoptions it asked its host for, the flusher's task and a flush
+   under way, the sync driver, and the tasks a sibling crate spawned with
+   `NodeHandle::spawn`), and with them every hold on the store: a store that is a
+   directory (fjall) opens again in the same process at once, with no retry
+   and no wait for `Config.settle`. No task is waited for by a timer: `close`
+   stops each task (they end at their next poll) and waits for each to have been
+   dropped. What the caller still holds of the node keeps its store: a `Heap`, a
+   `Follower` or a `NodeHandle` (the invitations hold one) is one hold each, and
+   the store is released when the last is dropped: at `close` if none is held
+   then. `shutdown` stops every task the same way but does not wait for them.
 
 ### 4.6 The flusher and the publisher
 
@@ -3054,7 +3067,10 @@ that rides the device's key, trust, store and serving, without this layer
 growing a case for it. `Node` dereferences to a `NodeHandle`, the same
 surface held by a task or an extension: a `Node` stops when it is dropped, a
 handle does not, and a stopped node makes every method that needs the network
-answer `HeapError::Local` and the rest read what it held.
+answer `HeapError::Local` and the rest read what it held. A handle keeps the
+node, and so its store, alive for as long as it lives; the tasks a sibling crate
+runs alongside the node are spawned with `NodeHandle::spawn`, so that they are
+the node's own: dropped when it stops and waited for by `close` (§4.5 rule 5).
 
 ```rust
 pub trait Extension: Send + Sync {
@@ -3066,6 +3082,7 @@ impl Node { pub fn handle(&self) -> NodeHandle; }          // and Deref<Target =
 impl NodeHandle {                                          // Clone; every method is Node's too
     pub fn sign_packet(&self, packet: DataBuilder) -> Result<Bytes, HeapError>;
     pub fn extend(&self, extension: Arc<dyn Extension>) -> Result<(), HeapError>;
+    pub fn spawn<F: Future<Output = ()> + Send + 'static>(&self, task: F); // a task of the node (§4.5 rule 5)
     pub fn consumer(&self) -> Consumer;
     pub fn validator(&self) -> &Arc<Validator>;
     pub fn keys(&self) -> &Arc<SecurityManager>;
