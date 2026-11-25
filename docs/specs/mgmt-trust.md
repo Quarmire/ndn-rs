@@ -819,12 +819,26 @@ Unix socket of any other user, is validated even to a loopback address (trust-co
 
 | code | where | params | meaning |
 |---|---|---|---|
-| `data-valid` | `DataInspection.detail` | `signer`, `namespace`? | the signature verifies and the chain reaches a trust anchor (verdict `valid`) |
+| `data-valid` | `DataInspection.detail` | `signer`, `namespace`?; `cut_key`?, `cut_tips`? | the signature verifies and the chain reaches a trust anchor (verdict `valid`) |
 | `data-digest-only` | 〃 | — | the Data carries a matching SHA-256 digest: intact, but no signer vouches for it (verdict `valid`) |
-| `data-invalid` | 〃 | `error` | the Data fails validation: bad signature, revoked key, a signer the trust context does not authorize, an untrusted root, an expired certificate (verdict `invalid`) |
+| `data-invalid` | 〃 | `error`; `cut_key`?, `cut_tips`? | the Data fails validation: bad signature, revoked key, a signer the trust context does not authorize, an untrusted root, an expired certificate (verdict `invalid`) |
 | `data-refused` | 〃 | `refusal` (`chain`, `revoked`, `bad-signature`, `schema`, `untrusted-root`, `context`, `unverifiable`), `final` (`true`/`false`) | the device's forwarder refused the Data that answered, so it was not kept to inspect (verdict `invalid`, or `pending` when not final) |
-| `data-chain-incomplete` | 〃 | `certificate`? (the first one missing), `timeout_ms` | a certificate on the chain could not be had in time (verdict `pending`) |
+| `data-chain-incomplete` | 〃 | `certificate`? (the first one missing), `manifest`? (the first manifest packet missing), `timeout_ms`; `cut_key`?, `cut_tips`? | a certificate on the chain, or a packet of the manifest of the signer's cut, could not be had in time (verdict `pending`) |
 | `data-unchecked` | 〃 | — | the device validates nothing: validation is disabled (verdict `unchecked`) |
+
+`cut_key` and `cut_tips` are set on those three codes (not on `data-refused`,
+`data-digest-only` or `data-unchecked`) when the Data names its signer's key
+(KeyLocator) and the trust context covering its name holds a revocation cut
+for that key that names tips (trust-context.md §3.3.12): `cut_key` is the
+key, `cut_tips` its tips as `<log prefix> seq=<n> digest=<hex>` joined by
+`, ` (the digest is the SHA-256 of the tip entry's signed region, in the
+cut's canonical order). They are told whatever the verdict, of what the cut
+accepts and what it refuses alike: the verdict is one packet's, and below a
+tip it rests on the tip's name rule (a packet below a tip is accepted by name
+when the key verifies it). Binding the bytes below a tip to the tip is the
+data layer's chain test, which one packet does not show, so a `valid`
+verdict of a Data below a tip does not say the data layer keeps it. A cut
+without tips (ranges and a manifest) sets neither.
 
 | code | status | retry | next | params | meaning |
 |---|---|---|---|---|---|
@@ -845,9 +859,9 @@ error chains shows it, one that words codes ignores it).
 | operation | library | does |
 |---|---|---|
 | init | `root::init::init` | a new namespace: its root in the chosen root store, its CA and admin identity, version 1 |
-| revoke | `root::revoke::plan`, `revoke` | version `N+1` revoking the keys a device identity, key or certificate name designates, with the revocation cut of a key when one is given (trust-context.md §3.3.12): a cut file bounded no later than the loss time the owner gives, with its key digest and manifest, whose left-out entries are reported |
+| revoke | `root::revoke::plan`, `revoke` | version `N+1` revoking the keys a device identity, key or certificate name designates, with the revocation cut of a key when one is given (trust-context.md §3.3.12): a cut file bounded no later than the loss time the owner gives, with its key digest and its manifest or its tips (a cut with ranges needs its manifest; a cut of tips alone needs none), whose left-out entries are reported |
 | end keys | `root::end_keys::pending`, `pending_all`, `plan`, `end` | the keys to end — lapsed keys of a role listed in DataRequiresCut and keys replaced by a newer key of their device — and one version `N+1` revoking every one of them that has a cut bounded at its end (trust-context.md §5.3); never a key without a cut |
-| readmit | `root::readmit::plan`, `readmit` | version `N+1` adding exact versions (full names ending in their implicit digest) to the revocation cut of a revoked key |
+| readmit | `root::readmit::plan`, `readmit` | version `N+1` adding exact versions (full names ending in their implicit digest) to the revocation cut of a revoked key; a cut of tips takes them too, for the entries a tip leaves out (above its number) |
 | recovery kits | `root::kit::create`, `list`, `check`, `revoke` | a recovery key listed as a recovery anchor by `N+1` (24 words, a sealed file, a key on a second YubiKey); the kits held; a kit opened against the held version; `N+1` without it |
 | recover | `root::recover::recover` | a replacement device becomes the root device with a kit: `N+1` signed by the kit, `N+2` by the new root, both carrying every revocation cut but those it drops (orphans, names outside the key's log), and a cut for a key it newly revokes when one is given; with the old root compromised and on the operator's confirmation, the new CA certifies again every key revoked with a cut, from a certificate of it the PIB holds whose public key has the cut's key digest, so its in-cut Data keeps a chain |
 | recertify | `root::recover::recertify` | the new CA certifies the keys revoked with a cut that it has not certified yet, from certificates given or held in the PIB whose public key has the cut's key digest (the recovery's re-certification, run again once the missing certificates are found or the operator confirms) |
@@ -929,7 +943,7 @@ params too; a param shown `?` is set only when it applies.
 | `revoke-none-issued` | 404 | no | fix-request | `pib`, `name` | the namespace CA issued no certificate under that device name |
 | `revoke-refused` | 403 | no | fix-request | `name`, `error` | the key may not be revoked (not of the namespace, or it covers an anchor) |
 | `nothing-to-sign` | 409 | no | none | `version` | the held version has everything asked already |
-| `cut-refused` | 400 | no | fix-request | `key`, `error`, `why`; for `why`: `revoking` (`, `-separated), `version`, or `name` and `log`; `held_before` and `lost` (`after-loss`, ms since the epoch); `reason` (`manifest-incomplete`); `namespace` and `version` (`orphan-cut`) | the revocation cut is refused, `why`: `unbounded` (the cut file carries no time bound: say when the device was lost and make the cut again), `after-loss` (bounded later than the loss time answered, or, for `end-keys`, later than the key's end, given as `lost`), `no-key-digest` or `no-manifest` (made by a tool that predates them, or with runs and no manifest), `manifest-incomplete` (the file's manifest packets do not form the whole tree its CutManifest names: a node missing, a packet that does not decode or does not match its digest), `duplicate` (two cuts for one key), `orphan-cut` (its key is not revoked), `not-ending` (`end-keys`: the cut's key is no unrevoked lapsed or replaced key); or its key is not one this version newly revokes (`revoking`: the keys it does revoke), or the held `version` revokes that key already, or it lists a `name` outside the key's device log `log`; in a recovery also a cut while the old root is destroyed (nothing is revoked). A cut is added only in the version that revokes its key; single versions are re-admitted with readmit |
+| `cut-refused` | 400 | no | fix-request | `key`, `error`, `why`; for `why`: `revoking` (`, `-separated), `version`, or `name` and `log`; `held_before` and `lost` (`after-loss`, ms since the epoch); `reason` (`manifest-incomplete`); `namespace` and `version` (`orphan-cut`) | the revocation cut is refused, `why`: `unbounded` (the cut file carries no time bound: say when the device was lost and make the cut again), `after-loss` (bounded later than the loss time answered, or, for `end-keys`, later than the key's end, given as `lost`), `no-key-digest` (made by a tool that predates it) or `no-manifest` (the cut has ranges and no manifest; a cut that names tips alone needs none), `manifest-incomplete` (the cut names a manifest and the file's manifest packets do not form the whole tree its CutManifest names: a node missing, a packet that does not decode or does not match its digest), `duplicate` (two cuts for one key), `orphan-cut` (its key is not revoked), `not-ending` (`end-keys`: the cut's key is no unrevoked lapsed or replaced key); or its key is not one this version newly revokes (`revoking`: the keys it does revoke), or the held `version` revokes that key already, or it lists a `name` (a range prefix, an exact name or a tip's log prefix) outside the key's device log `log`; in a recovery also a cut while the old root is destroyed (nothing is revoked). A cut is added only in the version that revokes its key; single versions are re-admitted with readmit |
 | `readmit-no-cut` | 409 | no | fix-request | `key`, `namespace`, `version` | the held version holds no revocation cut for the key: a key not yet revoked is revoked with a cut first; a key revoked without one has none to add to (a cut is added only with its key's revocation), so its Data stays refused |
 | `readmit-refused` | 400 | no | fix-request | `key`, `name`, `log`, `error` | a name to re-admit is not a full name ending in its implicit digest (32 octets), or is not under the key's device log `log` (`<device>/32=log`) |
 | `not-a-kit` | 400 | no | fix-request | `path`, `reason` | the file is not a recovery kit |
