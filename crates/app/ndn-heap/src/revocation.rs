@@ -350,6 +350,11 @@ impl Suspicion {
         self.marks.lock().get(&key_name_of(key)).copied()
     }
 
+    /// The keys marked suspected here, sorted.
+    pub(crate) fn keys(&self) -> Vec<Name> {
+        self.marks.lock().keys().cloned().collect()
+    }
+
     /// Mark `key` suspected since `since`, by this node's clock: from now on
     /// no new entry of it is taken in any space, and the entries held before
     /// stay. Refused when `key` names no key.

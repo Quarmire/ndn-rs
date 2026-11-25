@@ -474,9 +474,15 @@ impl Node {
         })
     }
 
-    /// Mark `key` suspected since `since`: no new entry of it is taken.
+    /// Mark `key` suspected since `since`: no new entry of it is taken, no epoch key is
+    /// granted to it, and an owner device of a sealed space it reads owes the space a new
+    /// epoch (spec §9.8).
     pub fn suspect(&self, key: &Name, since: Timestamp) -> Result<(), HeapError> {
-        self.inner.suspicion.mark(key, since)
+        self.inner.suspicion.mark(key, since)?;
+        for space in self.inner.sorted() {
+            space.settle(&self.inner);
+        }
+        Ok(())
     }
 
     /// Lift the mark of `key`. Whether there was one.
@@ -1294,9 +1300,10 @@ impl NodeInner {
         let person = self.person_of(asker);
         let log = held.log.lock();
         let revoked = asker_key.is_some_and(|k| self.judge.key_revoked(k, space));
+        let suspected = asker_key.is_some_and(|k| self.suspicion.since(k).is_some());
         let capable = self.judge.owner_capable(asker_key.unwrap_or(asker), space);
         seal::may_grant(
-            &log.fold, &log.keys, space, epoch, &person, capable, revoked,
+            &log.fold, &log.keys, space, epoch, &person, capable, revoked, suspected,
         )?;
         // Under the lock: the entry is held back there, in the same stretch
         // that stores it, so no grant can slip in between.

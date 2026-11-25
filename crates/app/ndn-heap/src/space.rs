@@ -364,6 +364,12 @@ impl SpaceInner {
             let gate = if p.structural { ticket } else { None };
             self.publisher.submit(p.seq, gate);
         }
+        // A device caught signing two packets at one name is suspected (by the call that
+        // returned this alert): if it is a reader's device it holds the key in force.
+        let equivocated = fx
+            .alerts
+            .iter()
+            .any(|alert| matches!(alert, Alert::Equivocation { .. }));
         for change in fx.changes {
             self.tell(change);
         }
@@ -384,7 +390,10 @@ impl SpaceInner {
             repair = !self.follower
                 && log.sealed()
                 && log.owner_only().is_ok()
-                && (!log.fold.complete() || self.revocation_owed(node, log) || self.rule_owed(log));
+                && (!log.fold.complete() || self.loss_owed(node, log) || self.rule_owed(log));
+        }
+        if equivocated && !repair {
+            repair = self.loss_owed(node, log);
         }
         Routed {
             ticket,
@@ -469,24 +478,36 @@ impl SpaceInner {
         Ok(signed)
     }
 
-    /// The revocations held here of keys under the namespace of a person the
-    /// space reads for: the lost devices that may hold an epoch key.
-    fn reader_revocations(&self, node: &NodeInner, log: &Log) -> BTreeSet<Name> {
+    /// The keys of devices of a person the space reads for that may hold an epoch key and are
+    /// lost, as this node knows it: the revocations held here of keys under the person's
+    /// namespace, and the keys this node marks suspected under it (spec §9.8).
+    fn reader_losses(&self, node: &NodeInner, log: &Log) -> BTreeSet<Name> {
         let Readers::Persons(readers) = log.fold.readers() else {
             return BTreeSet::new();
         };
+        let suspected = node.suspicion.keys();
         readers
             .iter()
-            .flat_map(|person| node.judge.revoked_under(person, &self.name))
+            .flat_map(|person| {
+                node.judge
+                    .revoked_under(person, &self.name)
+                    .into_iter()
+                    .chain(
+                        suspected
+                            .iter()
+                            .filter(|key| key.has_prefix(person))
+                            .cloned(),
+                    )
+            })
             .collect()
     }
 
     /// Whether this owner device owes the sealed space an epoch because a key
-    /// of a reader's device is revoked (spec §6.6): a revocation changes no
-    /// member, but the lost device holds the key in force and would open every
-    /// later write. Owed while the revocations held are not those the last
+    /// of a reader's device is lost (spec §6.6, §9.8): revoked, or suspected here. It changes
+    /// no member, but the lost device holds the key in force and would open every
+    /// later write. Owed while the lost keys known here are not those the last
     /// epoch this device signed accounted for (`revoked/<S>`).
-    fn revocation_owed(&self, node: &NodeInner, log: &Log) -> bool {
+    fn loss_owed(&self, node: &NodeInner, log: &Log) -> bool {
         if self.follower
             || !log.sealed()
             || log.fold.create() != Some(false)
@@ -494,10 +515,10 @@ impl SpaceInner {
         {
             return false;
         }
-        let revoked = self.reader_revocations(node, log);
-        !revoked.is_empty()
+        let lost = self.reader_losses(node, log);
+        !lost.is_empty()
             && node.store.get(&Kind::REVOKED.of(&self.name)).as_deref()
-                != Some(&revocations_digest(&revoked)[..])
+                != Some(&revocations_digest(&lost)[..])
     }
 
     /// Whether this owner device owes the sealed space a fresh epoch because
@@ -520,7 +541,7 @@ impl SpaceInner {
         let owed = {
             let log = self.log.lock();
             node.release_joined(&log);
-            self.revocation_owed(node, &log) || self.rule_owed(&log)
+            self.loss_owed(node, &log) || self.rule_owed(&log)
         };
         if owed {
             self.spawn_repair(node);
@@ -548,7 +569,7 @@ impl SpaceInner {
         let now = node.now();
         self.attempt(node, &mut |log| {
             let fold = &log.fold;
-            let owed = self.revocation_owed(node, log);
+            let owed = self.loss_owed(node, log);
             let rule = self.rule_owed(log);
             if fold.create() != Some(false)
                 || (fold.complete() && !owed && !rule)
@@ -559,7 +580,7 @@ impl SpaceInner {
             let Readers::Persons(audience) = fold.readers() else {
                 return Ok(None);
             };
-            let accounted = revocations_digest(&self.reader_revocations(node, log));
+            let accounted = revocations_digest(&self.reader_losses(node, log));
             let step = log.sign_epoch(audience, now)?;
             if matches!(step, Step::Done(..)) {
                 node.store.insert(

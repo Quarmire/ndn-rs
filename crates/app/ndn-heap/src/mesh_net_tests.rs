@@ -247,6 +247,41 @@ async fn a_reader_device_with_a_revoked_key_is_refused_every_grant() {
     );
 }
 
+/// Stage-7 L5: a key this node suspects (reported stolen, or caught equivocating) is granted
+/// no key though its person is a reader, until the mark is lifted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_device_whose_key_is_suspected_here_is_refused_every_grant() {
+    let m = mesh(&["/alice/laptop", "/bob/phone"]).await;
+    let alice = m.boot(0, fast()).await;
+    let heap = alice.create(&space(), private(&["/bob"])).await.unwrap();
+    let epoch = heap.inner.log.lock().fold.in_force().expect("an epoch");
+    let (phone, key) = (
+        m.devs[1].name.clone(),
+        m.devs[1].name.clone().append("KEY").append("1"),
+    );
+    assert_eq!(
+        alice.inner.may_grant(&space(), &epoch, &phone, Some(&key)),
+        Ok(())
+    );
+    alice.suspect(&key, Timestamp(1)).unwrap();
+    let refused = alice.inner.may_grant(&space(), &epoch, &phone, Some(&key));
+    assert_eq!(
+        refused,
+        Err(GrantRefusal::AskerKeySuspected),
+        "a suspected asker was granted the epoch key"
+    );
+    assert!(
+        refused.unwrap_err().to_string().contains("lifted"),
+        "the refusal says what to do"
+    );
+    assert!(alice.unsuspect(&key));
+    assert_eq!(
+        alice.inner.may_grant(&space(), &epoch, &phone, Some(&key)),
+        Ok(()),
+        "granted again once the mark is lifted"
+    );
+}
+
 /// Two owner devices each remove a different reader at the same time; each
 /// repairs the epoch it sees incomplete, and the space ends with one complete
 /// epoch on both.

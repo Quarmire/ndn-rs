@@ -1337,7 +1337,7 @@ otherwise it is dropped. It unwraps with its recipient key and the grant's name
 as AAD. Every ask carries the device's own seal key packet as it signed it.
 
 **Granter side.** A device `G` answers `<G>/32=grant/<GrantAsk>` **only when all
-seven hold**, checked in this order:
+eight hold**, checked in this order:
 
 1. a held owner-signed `Epoch` entry names `E` (`EpochNotNamed`);
 2. the asker is no guest, node or role-less device of the owner: where the
@@ -1358,7 +1358,12 @@ seven hold**, checked in this order:
    enrolls it again, and asks again). A lapse moves no counter of the judge and
    writes no record, so it is judged **at every ask**, never taken from what was
    kept: the packet in the ask is judged afresh each time, a grant already
-   made for the name included.
+   made for the name included;
+8. that key is **not suspected here** (`AskerKeySuspected`, §9.8): a key this
+   node marks suspected (reported stolen, or caught signing two packets at one
+   name) is granted nothing until the mark is lifted or the key is revoked and
+   the device enrolled again. Suspicion is this node's own mark, so it is judged
+   at every ask like a lapse.
 
 Anything else gets **no answer**, and `G` sends no Interest for any ask: the
 exchange is one Interest and one Data. Conditions 1–5 are decided first, from the
@@ -1370,7 +1375,7 @@ nothing about it is kept). A signer whose chain `G` does not hold is not
 fetched for: the ask gets no answer, and the asker asks another device of the
 space (up to 8, above) and this one again once `G` holds the chain, which it
 learns from the entries and signals of `D`'s person that it judges (§7.6, §9.1)
-or from the host that seeds its certificates. All seven
+or from the host that seeds its certificates. All eight
 conditions are checked **again** after the judging, with the key that signed it,
 since the records may have moved. It answers with the key wrapped to `pk` (§6.2) under the
 **grant's own name** as AAD, signed by its device key. `pk` is the key of the
@@ -2224,6 +2229,18 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   (§9.5) and the mark would only refuse what the cut keeps.
 - **A removed person is not suspected out of the cut:** her entries are judged by
   the removal cut alone (§3.7).
+- **A suspected key is granted no epoch key, and rotates the epoch.** A suspected
+  key is refused every grant (`AskerKeySuspected`, §6.5 condition 8). A suspected
+  key of a device of a person a sealed space reads for may already hold the key in
+  force, and its person still reads, so no member changed: **an owner device that
+  holds the mark owes the space a new epoch**, as it does for a revoked key
+  (§6.6). The suspected keys and the revocations of the readers' devices are
+  accounted for together in `revoked/<S>` (a digest of both sets): an epoch is
+  owed while the set held now is not the one the last epoch this device signed
+  accounted for, and a restart owes nothing more. The mark is checked when it is
+  made (`suspect`) and when a call's effects report an equivocation (§3.7).
+  Suspicion is **this node's** mark: only an owner device that holds it owes the
+  epoch; the other owner devices owe it once the key is revoked (§9.7).
 
 ### 9.9 Threat notes
 
@@ -2249,6 +2266,13 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   for a role not in DataRequiresCut; every role is, by default.
 - **A person's context in an older version after a restart** is refused (§9.4):
   a key a newer version revoked never writes again.
+- **Suspicion and grants (stage-7 L5).** A node that suspected a key still gave it
+  every new epoch key until the revocation was adopted. Now a suspected key is
+  refused the grant and the owner device that marked it signs a new epoch. What
+  remains: a key already granted stays known to the device until the next epoch;
+  and a mark made on one owner device does not reach the others, so a thief of a
+  reader's key is still granted by owner and reader devices that have not marked it
+  until the revocation reaches them.
 - **The owner rule's second half is checked.** An owner device is a key whose
   device lies under the owner's namespace by name **and** whose person is the
   owner (§2.1). A `Members` or `Epoch` entry is refused (`NotMember`) unless its

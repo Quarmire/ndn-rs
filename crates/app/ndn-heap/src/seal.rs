@@ -413,6 +413,14 @@ pub(crate) enum GrantRefusal {
          enrolls the device with a new key"
     )]
     AskerKeyRevoked,
+    /// The key of the asking device is marked suspected by this node.
+    #[error(
+        "the asking device's key is marked suspected here (reported stolen, or caught signing \
+         two packets at one name): a suspected device is granted no key until the mark is \
+         lifted or the owner of the person's namespace revokes the key and enrolls the device \
+         with a new one"
+    )]
+    AskerKeySuspected,
 }
 
 /// Whether the key of `epoch` of `space` may be granted to a device of
@@ -435,6 +443,7 @@ pub(crate) fn may_grant(
     asker: &Name,
     asker_capable: bool,
     revoked: bool,
+    suspected: bool,
 ) -> Result<(), GrantRefusal> {
     if fold.epoch_body(epoch).is_none() {
         Err(GrantRefusal::EpochNotNamed)
@@ -448,6 +457,8 @@ pub(crate) fn may_grant(
         Err(GrantRefusal::KeyNotHeld)
     } else if revoked {
         Err(GrantRefusal::AskerKeyRevoked)
+    } else if suspected {
+        Err(GrantRefusal::AskerKeySuspected)
     } else {
         Ok(())
     }
@@ -585,19 +596,35 @@ mod tests {
         );
         let (kept, late, removed) = (n("/p/1"), n("/p/3"), n("/p/2"));
         let unknown = epoch("/o/d0", 9);
-        let ask = |keys: &Keys, e: &EpochId, asker: &Name, revoked| {
-            may_grant(&fold, keys, &space, e, asker, true, revoked)
+        let ask = |keys: &Keys, e: &EpochId, asker: &Name, revoked, suspected| {
+            may_grant(&fold, keys, &space, e, asker, true, revoked, suspected)
         };
-        assert_eq!(ask(&held, &e, &kept, false), Ok(()));
+        assert_eq!(ask(&held, &e, &kept, false, false), Ok(()));
         let refusals = [
             (
-                ask(&held, &unknown, &kept, false),
+                ask(&held, &unknown, &kept, false, false),
                 GrantRefusal::EpochNotNamed,
             ),
-            (ask(&held, &e, &late, false), GrantRefusal::NotInAudience),
-            (ask(&held, &e, &removed, false), GrantRefusal::NotReaderNow),
-            (ask(&keys(), &e, &kept, false), GrantRefusal::KeyNotHeld),
-            (ask(&held, &e, &kept, true), GrantRefusal::AskerKeyRevoked),
+            (
+                ask(&held, &e, &late, false, false),
+                GrantRefusal::NotInAudience,
+            ),
+            (
+                ask(&held, &e, &removed, false, false),
+                GrantRefusal::NotReaderNow,
+            ),
+            (
+                ask(&keys(), &e, &kept, false, false),
+                GrantRefusal::KeyNotHeld,
+            ),
+            (
+                ask(&held, &e, &kept, true, false),
+                GrantRefusal::AskerKeyRevoked,
+            ),
+            (
+                ask(&held, &e, &kept, false, true),
+                GrantRefusal::AskerKeySuspected,
+            ),
         ];
         let mut said = BTreeSet::new();
         for (got, refusal) in refusals {
@@ -609,8 +636,13 @@ mod tests {
         }
         // Every condition is checked in the plan's order.
         assert_eq!(
-            ask(&keys(), &unknown, &late, true),
+            ask(&keys(), &unknown, &late, true, true),
             Err(GrantRefusal::EpochNotNamed)
+        );
+        assert_eq!(
+            ask(&held, &e, &kept, true, true),
+            Err(GrantRefusal::AskerKeyRevoked),
+            "a revoked key is told so before a suspicion"
         );
     }
 
@@ -621,8 +653,9 @@ mod tests {
     fn an_owners_guest_or_node_device_is_granted_no_epoch_key() {
         let (fold, held, space, e, _) = sealed_space();
         let (owner, reader) = (n("/o"), n("/p/1"));
-        let ask =
-            |asker: &Name, capable| may_grant(&fold, &held, &space, &e, asker, capable, false);
+        let ask = |asker: &Name, capable| {
+            may_grant(&fold, &held, &space, &e, asker, capable, false, false)
+        };
         assert_eq!(ask(&owner, true), Ok(()), "a member device of the owner");
         let refused = ask(&owner, false);
         assert_eq!(refused, Err(GrantRefusal::NotOwnerDevice));
@@ -852,7 +885,7 @@ mod tests {
         let (mut fold, granter, space, e, key) = sealed_space();
         let (kept, removed) = (n("/p/1"), n("/p/2"));
         let ask = |fold: &Fold, keys: &Keys, e: &EpochId, asker: &Name| {
-            may_grant(fold, keys, &space, e, asker, true, false)
+            may_grant(fold, keys, &space, e, asker, true, false, false)
         };
         assert_eq!(ask(&fold, &granter, &e, &kept), Ok(()));
         assert_eq!(ask(&fold, &granter, &e, &removed), Ok(()));

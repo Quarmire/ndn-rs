@@ -419,6 +419,66 @@ async fn revoking_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_on
     assert_eq!(heap.inner.log.lock().fold.epochs().len(), 2);
 }
 
+/// Stage-7 L5: a reader's device whose key this node suspects holds the epoch key in force and
+/// its person still reads: the owner device that marked it signs a new epoch that replaces the
+/// old one, once, as for a revocation; a restart owes nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suspecting_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_once() {
+    let devs = world(&["/alice/laptop", "/bob/phone"]).await;
+    let (node, _) = boot(&devs[0], cfg()).await;
+    let heap = node.create(&space(), private(&["/bob"])).await.unwrap();
+    let in_force = |heap: &Heap| heap.inner.log.lock().fold.in_force();
+    let first = in_force(&heap).expect("an epoch");
+    node.suspect(
+        &devs[1].name.clone().append("KEY").append("1"),
+        crate::error::Timestamp(1),
+    )
+    .unwrap();
+    let mut second = None;
+    for _ in 0..100 {
+        if let Some(e) = in_force(&heap)
+            && e != first
+        {
+            second = Some(e);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let second = second
+        .expect("an owner device signs a new epoch for the suspicion of a reader device's key");
+    {
+        let log = heap.inner.log.lock();
+        assert!(log.fold.complete());
+        assert_eq!(
+            log.fold.epoch_tips(),
+            vec![second.clone()],
+            "it replaces the old"
+        );
+        assert_eq!(log.fold.epochs().len(), 2);
+    }
+    let id = heap
+        .put(
+            &n("/after"),
+            bytes("not for the thief"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let Body::Sealed(sealed) = entry_body(&devs[0], id.seq).body else {
+        panic!("the put is sealed");
+    };
+    assert_eq!(
+        sealed.epoch, second,
+        "sealed in the epoch the thief never held"
+    );
+    // A restart owes nothing: the suspicion is accounted for.
+    node.close().await;
+    let (node, _) = boot(&devs[0], cfg()).await;
+    let heap = node.open(&space()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(heap.inner.log.lock().fold.epochs().len(), 2);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_owner_device_signs_the_epoch_a_members_entry_of_another_leaves_incomplete() {
     let devs = world(&["/alice/laptop", "/alice/phone"]).await;
