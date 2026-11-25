@@ -15,6 +15,12 @@
 //! check, whichever face answered. Data the pipeline refused never reaches
 //! the consumer: the answer then reports the refusal (`data-refused`).
 //!
+//! When the held context revokes the key that signed the Data with a cut
+//! that names tips, the answer's detail also lists them (`cut_key`,
+//! `cut_tips`). The verdict is one packet's: below a tip it rests on the
+//! tip's name rule; binding those bytes to the tip is the data layer's
+//! chain test, not shown here.
+//!
 //! Read only, but it makes this node express Interests and fetch
 //! certificates on the caller's behalf, so it is not a public read: it goes
 //! through the command gate (a local operator on the management socket, or
@@ -121,6 +127,7 @@ async fn inspect_data(
         budget,
     )
     .await;
+    let detail = with_cut_tips(detail, validator, data);
     DataInspection {
         name: data.name.to_string(),
         signature_type: sig_info.map_or_else(String::new, |si| signature_type(si.sig_type)),
@@ -147,11 +154,52 @@ async fn inspect_data(
     }
 }
 
+/// `detail` naming the tips of the revocation cut the context covering
+/// `data` holds for the key that signed it, when the cut has any
+/// (`cut_key`: the key; `cut_tips`: `, `-separated `<log prefix>
+/// seq=<n> digest=<hex>` entries, the digest being SHA-256 of the tip
+/// entry's signed region). Said of what the cut accepts and what it
+/// refuses alike: a tip names the last entry of a log the key's device had
+/// published; the Data below it are accepted by name here, and the data
+/// layer binds their bytes by chain ancestry of the tip, which one packet
+/// does not show.
+fn with_cut_tips(detail: Detail, validator: Option<&Validator>, data: &Data) -> Detail {
+    let Some(key) = data
+        .sig_info()
+        .and_then(|si| si.key_locator_name())
+        .and_then(|locator| ndn_cert::key_name_of(&locator))
+    else {
+        return detail;
+    };
+    let Some(validator) = validator else {
+        return detail;
+    };
+    let context = validator.keyring().context_for(&data.name);
+    let Some(cut) = context.revocation_cut(&key) else {
+        return detail;
+    };
+    if cut.tips().is_empty() {
+        return detail;
+    }
+    let tips: Vec<String> = cut
+        .tips()
+        .iter()
+        .map(|tip| {
+            let digest: String = tip.digest.iter().map(|b| format!("{b:02x}")).collect();
+            format!("{} seq={} digest={digest}", tip.prefix, tip.seq)
+        })
+        .collect();
+    detail
+        .with("cut_key", key)
+        .with("cut_tips", tips.join(", "))
+}
+
 /// The verdict on `data`, why, and the certificate names walked. The verdict
 /// is the durable one the forwarder's validation stage reaches for Data
 /// ([`Validator::validate_durable`]): no clock decides it (except for a key
 /// whose role needs a cut), and a key revoked with a cut still vouches for
-/// the Data its cut accepts (bound to its public key and manifest).
+/// the Data its cut accepts (bound to its public key and to its manifest or
+/// its tips).
 async fn judge(
     data: &Data,
     validator: Option<&Validator>,
@@ -543,6 +591,82 @@ mod tests {
         assert_eq!(got.valid_from.as_deref(), Some(iso(from).as_str()));
         assert_eq!(got.valid_until.as_deref(), Some(iso(until).as_str()));
         assert!(got.valid_from.unwrap().ends_with('Z'));
+    }
+
+    /// A key revoked with a cut that names a tip: the inspection of its
+    /// Data lists the tip (prefix, sequence number, signed-region digest in
+    /// hex) — of the Data the cut accepts (below the tip) and of what it
+    /// refuses (above it) alike.
+    #[tokio::test]
+    async fn inspect_lists_the_tips_of_a_cut() {
+        use ndn_packet::NameComponent;
+        use ndn_security::{CertCache, Keyring, RevocationCut, SignedTrustContext};
+
+        async fn issue(name: &str, subject: &Ed25519Signer, issuer: &Ed25519Signer) -> Certificate {
+            let public = subject.public_key().unwrap();
+            let wire = ndn_security::encode_cert_data(&n(name), &public, issuer, 0, u64::MAX)
+                .await
+                .unwrap();
+            Certificate::decode(&Data::decode(wire).unwrap()).unwrap()
+        }
+        let root = Ed25519Signer::from_seed(&[51; 32], n("/root/KEY/r"));
+        let ca = Ed25519Signer::from_seed(&[52; 32], n("/root/CA/KEY/c"));
+        let key = Ed25519Signer::from_seed(&[53; 32], n("/root/p/KEY/k"));
+        let certs = Arc::new(CertCache::new());
+        certs.insert(issue("/root/CA/KEY/c/root/v1", &ca, &root).await);
+        certs.insert(issue("/root/p/KEY/k/ca/v1", &key, &ca).await);
+
+        let log = n("/root/p/log");
+        let entry = |seq: u64| {
+            let name = log
+                .clone()
+                .append_component(NameComponent::sequence_num(seq));
+            Data::decode(
+                DataBuilder::new(name, b"entry")
+                    .sign_with_sync(&key)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let tip_digest = ndn_security::signed_region_digest(&entry(3));
+        let mut cut = RevocationCut::new(n("/root/p/KEY/k"));
+        cut.add_tip(&log, 3, tip_digest);
+        let ctx = SignedTrustContext::hierarchical(n("/root"))
+            .with_ca_endpoint(n("/root/CA"))
+            .with_version(2)
+            .with_revocation(n("/root/p/KEY/k"))
+            .with_revocation_cut(cut);
+        let anchor = issue("/root/KEY/r/self/v1", &root, &root).await;
+        assert!(ctx.add_anchor(anchor));
+        let keyring = Arc::new(Keyring::new());
+        keyring.adopt(Arc::new(ctx)).unwrap();
+        let validator = Validator::with_keyring(keyring, certs, None, 5);
+
+        let hex: String = tip_digest.iter().map(|b| format!("{b:02x}")).collect();
+        let expected = format!("{log} seq=3 digest={hex}");
+        let budget = Duration::from_secs(1);
+        for (seq, verdict) in [(2, DataVerdict::Valid), (5, DataVerdict::Invalid)] {
+            let got = inspect_data(&entry(seq), Some(&validator), later(budget), budget).await;
+            assert_eq!(got.verdict, verdict, "seq {seq}: {:?}", got.detail);
+            assert_eq!(
+                got.detail.param("cut_tips"),
+                Some(expected.as_str()),
+                "seq {seq}: {:?}",
+                got.detail
+            );
+            assert_eq!(got.detail.param("cut_key"), Some("/root/p/KEY/k"));
+        }
+
+        // Data of a key with no cut: no cut parameters.
+        let (plain, wire, _) = signed_setup().await;
+        let got = inspect_data(
+            &Data::decode(wire).unwrap(),
+            Some(&plain),
+            later(budget),
+            budget,
+        )
+        .await;
+        assert_eq!(got.detail.param("cut_tips"), None);
     }
 
     /// The verb makes the node fetch on the caller's behalf: never an
