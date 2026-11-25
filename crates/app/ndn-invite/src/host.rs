@@ -415,10 +415,10 @@ pub type Adopting<'a> = futures::future::LocalBoxFuture<'a, Result<(), String>>;
 ///   state held weakly), so the host may keep its hints in a field written after the links start
 ///   (`Intro.hints = LinkHints::new(links.clone())`) and no chain leads from the links back to
 ///   the host, the invitations or the node. A host that keeps its own handle on the invitations
-///   or on a [`ndn_heap::NodeHandle`] holds the node, and so its store, for as long as it lives:
+///   or on a [`ndn_heap::host::NodeHandle`] holds the node, and so its store, for as long as it lives:
 ///   keep a `Weak`, or drop the host after the node is closed.
-/// - The invitations hold the node through a [`ndn_heap::NodeHandle`] (the store stays locked
-///   while any handle lives) and keep their tasks on the node ([`ndn_heap::NodeHandle::spawn`]):
+/// - The invitations hold the node through a [`ndn_heap::host::NodeHandle`] (the store stays locked
+///   while any handle lives) and keep their tasks on the node ([`ndn_heap::host::NodeHandle::spawn`]):
 ///   [`ndn_heap::Node::close`] ends those, and returns once they have ended. After it returns,
 ///   dropping the last of the invitations and the host releases the store; nothing else of
 ///   them runs.

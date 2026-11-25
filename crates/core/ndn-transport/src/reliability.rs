@@ -598,7 +598,7 @@ impl LpReliability {
     /// check still excludes these from RTT sampling via `is_retx`.
     ///
     /// `limit` is the largest frame the transport takes now: a repair held in a
-    /// larger frame is cut again to it ([`Self::reframe`]), never sent over.
+    /// larger frame is cut again to it (by the private `reframe`), never sent over.
     pub fn take_fast_retransmits(&mut self, limit: usize) -> Vec<Bytes> {
         if self.fast_retx_candidates.is_empty() {
             return Vec::new();
@@ -672,7 +672,7 @@ impl LpReliability {
     ///
     /// `limit` is the largest frame the transport takes now. A frame framed
     /// for a larger one (the path's datagram size fell since) is not resent
-    /// as it is: its packet is cut again to `limit` ([`Self::reframe`]).
+    /// as it is: its packet is cut again to `limit` (by the private `reframe`).
     pub fn check_retransmit(&mut self, limit: usize) -> Vec<Bytes> {
         let now = self.clock.now();
         let rto = std::time::Duration::from_micros(self.rto_us);
