@@ -939,6 +939,44 @@ async fn a_stale_epoch_sender_is_refused_with_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_for_another_sender_space_or_mode_than_asked_is_not_used() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
+    let (share, change) = public_with(&["/bob"], &["/carol"]);
+    shared(&rig, share, change).await;
+    let (alice, bob, carol) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
+    let (_, interest) = signed_ask(bob, alice, &ask_of(bob, ChannelMode::Latest));
+    let name = (*interest.name).clone();
+    let by_alice = |record| crafted(alice, bob, &name, record);
+    let other_sender = record_of(carol.name(), None);
+    let other_space = SessionRecord {
+        space: n("/alice/32=data/other"),
+        ..record_of(alice.name(), None)
+    };
+    let other_mode = SessionRecord {
+        mode: ChannelMode::Reliable,
+        ..record_of(alice.name(), None)
+    };
+    for (what, record) in [
+        ("sender", other_sender),
+        ("space", other_space),
+        ("mode", other_mode),
+    ] {
+        match judge(bob, alice, &name, by_alice(record)).await {
+            Err(ChanError::BadAnswer { why, .. }) => {
+                assert!(why.contains("sender, space and mode"), "{what}: {why}");
+            }
+            other => panic!("a session for another {what} is bad: {other:?}"),
+        }
+    }
+    assert!(bob.inner.chan.sessions.all().is_empty());
+    // Control: the session for what was asked, judged by the epoch in force, is installed.
+    let record = record_of(alice.name(), in_force_of(bob));
+    judge(bob, alice, &name, by_alice(record))
+        .await
+        .expect("a session for the ask");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_announce_of_a_stranger_costs_a_lookup_and_no_ask() {
     let rig = rig(&["/alice/laptop", "/bob/phone", "/dave/pc"]).await;
     let (share, change) = public_with(&["/bob"], &[]);
