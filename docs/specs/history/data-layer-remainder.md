@@ -1,3 +1,5 @@
+> Superseded by heap.md and invite.md at ndn-rs 2b344e09. Kept for history; nothing here is normative.
+
 # Data layer: named, signed, versioned data
 
 - **Status:** Slices 1–3, 5 and 6 normative, with the durability barrier (§4.2:

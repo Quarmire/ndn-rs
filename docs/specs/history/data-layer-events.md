@@ -1,4 +1,4 @@
-> Superseded by NAME.md at ndn-rs <commit>. Kept for history; nothing here is normative.
+> Superseded by heap.md and invite.md at ndn-rs 2b344e09. Kept for history; nothing here is normative.
 
 # Device events text cut from `data-layer.md`
 
