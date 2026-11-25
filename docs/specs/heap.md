@@ -831,7 +831,7 @@ big-endian, so keys order numerically. Other names are appended as components.
 | `reserve/<S>` | `R` 8 (big-endian) ‖ clean 1 (0 or 1): 9 octets | at open, at each extension, at clean close |
 | `revoked/<S>` | 32 octets: the digest of the revocations of the readers' devices (§5.3 rule 8) and the keys of them this node suspects (§9.8) that the last `Epoch` entry this device signed accounted for | after each Epoch entry this device signs |
 | `rule/<S>` | 1 octet: the version of the owner rule (§2.1, §9.9) the space's entries were last judged by here; 1 is the role rule | at the first open of a space with no entries, and after the one judgement at start (and the fresh epoch an owner device of a sealed space signs) of a space stored under an earlier rule |
-| `granted/<S>/<key>` | the seal key packet of a device this owner device granted an epoch key of the sealed space to, by the key that signed it (at most 1,024 a space; §6.5) | before the grant is answered; removed when the epoch signed for the device's lapse is |
+| `granted/<S>/<person>/<key>` (each as a TLV component) | the grant ask (§6.5: the seal key packet and the certificate chain it carried, at most 2,048 + 6,144 octets) of a device of `<person>` this owner device granted an epoch key of the sealed space to, by the key that signed the packet; at most 32 a person | before the grant is answered, and again only if the ask differs; removed when the epoch signed for the device's lapse is, when `<person>` no longer reads the space (at the change and at each sweep), and when the key is revoked (at each sweep) |
 | `space/<S>` | 1 octet: 1 a space this node is a member of, 2 a space it only follows (§10) | when the space is created, opened or followed |
 | `joined/<S>` | 1 octet, 1, then the 32-octet signed-region digest of each `Members` entry held that removes the device's person: an offer's answer admitted this device to the space and the fold does not list its person yet (§10.9); while it stands, a refusal for want of a listing is a wait | at `note_joined`, when the fold does not list the person; removed when it does, and when a removal of her arrives that it does not name |
 | `structural/<S as TLV component>/<device as TLV component>/<seq 8>` | empty | with a `Members` or `Epoch` entry (start replays only these) |
@@ -1418,20 +1418,33 @@ flushed (it is not servable before), so that a power loss cannot take the entry
 and leave the key granted. Every ask a device does not answer is Nacked, never
 left to time out.
 
-**A reader's lapse owes an epoch (stage-7 M2).** An owner device that grants a key
-records the device first: `granted/<S>/<key>` holds the seal key packet the key
-was granted by (§4.3), at most 1,024 devices a space; a grant that would pass
-that is not answered, so no key is ever given untracked (the record of a device
-that lapsed ends when the epoch its lapse owes is signed). Every
-`lapse_sweep` (60 s by default, and at once at start) the owner device judges
-each recorded packet again from the certificates it holds alone (§9.3): a key
-that is **lapsed by this node's clock** owes the space a new epoch, as a
-revocation does (§6.6), because the device still holds the key in force and
-nothing else rotates it. The epoch is signed once for the devices lapsed at the
-time, the lapsed devices leave the record, and a device that renews asks again
-and is granted the new epoch. The epoch signed on the lapse is owed on the clock
-and the certificates **this owner device** holds: a lapse that another node's
-clock sees, or a device it never granted a key to, owes nothing here.
+**A reader's lapse owes an epoch (stage-7 M2, N1, N2).** An owner device that grants
+a key records the device first: `granted/<S>/<person>/<key>` holds the **grant ask**
+the key was granted by, the seal key packet and the certificate chain it carried
+(§4.3). At most 32 devices of one person (`GRANTEES_PER_PERSON`) are recorded a
+space, so no reader can fill the record for the others; a grant that would pass
+that is not answered and says why, so no key is ever given untracked. The
+record is looked up by one `get`, and written again only if the ask differs.
+Every `lapse_sweep` (60 s by default, and at once at start) the owner device
+first ends the records of persons who no longer read the space (also when the
+removal is applied, and when the epoch it owes is signed) and of revoked keys (an
+epoch accounts for a revoked key through `revoked/<S>`, §6.6), then judges each
+remaining packet again with the chain stored beside it (§9.3; nothing is
+fetched): a key that is **lapsed by this node's clock** owes the space a new epoch,
+as a revocation does (§6.6), because the device still holds the key in force and
+nothing else rotates it. The chain is kept because nothing keeps other people's
+certificates across a restart: judged by the certificates held alone, a node that
+restarted would see `Pending` for every grantee and a lapse would never be seen.
+**It fails closed:** a grantee still `Pending` after **5 sweeps in a row**
+(`PENDING_SWEEPS_MAX`; five minutes at the default, counted in sweeps and never
+read off a clock, in memory so a restart counts again) also owes the epoch. One or
+two undecided sweeps happen while the node loads its trust contexts; five mean the
+node cannot vouch for that key any more, and a key nobody can vouch for is
+re-keyed rather than trusted. The epoch is signed once for the devices owed at the
+time, they leave the record, and a device that renews asks again and is granted
+the new epoch. The epoch signed on the lapse is owed on the clock and the
+certificates **this owner device** holds: a lapse that another node's clock sees,
+or a device it never granted a key to, owes nothing here.
 
 Why the exchange is one: an ask that made the granter fetch the asker's seal key
 packet put two exchanges inside one Interest lifetime (the ask, the granter's

@@ -45,12 +45,12 @@ use crate::revocation::{self, CutBound, CutProposal, Suspicion};
 use crate::rt;
 use crate::seal::{self, GrantRefusal, Keys};
 use crate::serve;
-use crate::space::{Follower, Heap, Share, SpaceInner, check_audience};
+use crate::space::{Follower, GRANTEES_PER_PERSON, Heap, Share, SpaceInner, check_audience};
 use crate::store::{Kind, OWNER_RULE};
 use crate::sync::{HostRef, Net, Taken};
 use crate::trust::{Adopter, Adoption, Judge, Judged, Verified};
 use crate::wire::{
-    EpochId, device_of, is_device_name, is_namespace, log_name, parse_log_name,
+    EpochId, GrantAsk, device_of, is_device_name, is_namespace, log_name, parse_log_name,
     parse_seal_key_name, parse_space_name,
 };
 
@@ -201,8 +201,6 @@ pub(crate) struct NodeInner {
 /// (2).
 const MEMBER: u8 = 1;
 const CARRIER: u8 = 2;
-/// The most devices an owner device keeps of those it granted epoch keys of one space to.
-const GRANTEES_MAX: usize = 1024;
 
 /// What the judge says now of entries it was asked about again.
 #[derive(Default)]
@@ -1350,16 +1348,21 @@ impl NodeInner {
     }
 
     /// Record that this owner device is about to grant an epoch key of `space` to the device
-    /// whose key `key` signed `seal_packet`, so that a lapse of that key owes the space a new
-    /// epoch ([`SpaceInner::sweep_lapsed`], spec §6.5). Only an owner device of a sealed space
-    /// it writes keeps one; for any other it records nothing and says yes. The record is
-    /// kept **before** the key is given: at most [`GRANTEES_MAX`] devices a space, and a grant
-    /// that would pass that is refused with what to do (the key is never given untracked).
+    /// whose key `key` signed the seal key packet of `ask`, so that a lapse of that key owes the
+    /// space a new epoch ([`SpaceInner::sweep_lapsed`], spec §6.5). The record is the ask
+    /// itself: the packet and the certificate chain it carried, which the sweep judges it
+    /// by after a restart, when nothing else holds another person's certificates. Only an
+    /// owner device of a sealed space it writes keeps one; for any other it records nothing and
+    /// says yes. It is kept **before** the key is given, under the person the key is of, at
+    /// most [`GRANTEES_PER_PERSON`] devices of one person a space, so no reader can fill the
+    /// room of the others; a grant that would pass that is refused with what to do (the key is
+    /// never given untracked). A key already recorded is found by one `get`, and written
+    /// again only if the ask differs.
     pub(crate) fn note_grantee(
         &self,
         space: &Name,
         key: &Name,
-        seal_packet: &Bytes,
+        ask: &GrantAsk,
     ) -> Result<(), String> {
         let Some(held) = self.space_of(space) else {
             return Ok(());
@@ -1367,17 +1370,35 @@ impl NodeInner {
         if held.follower || !held.log.lock().tracks_grantees() {
             return Ok(());
         }
-        let at = Kind::GRANTED.device(space, key);
-        let known = self.store.scan_under(&Kind::GRANTED.listing(space), 0);
-        if known.len() >= GRANTEES_MAX && !known.iter().any(|(held, _)| *held == at) {
+        let Some(device) = device_of(key) else {
             return Err(format!(
-                "this device tracks the {GRANTEES_MAX} devices it granted keys of the space to, \
-                 so that a lapse of one owes a new epoch, and that is as many as it keeps: the \
-                 record of a device that lapsed ends when the epoch its lapse owes is signed; \
-                 ask another device of the space, or this one again then"
+                "{key} is no device's key (<device>/KEY/<id>), so no grant is kept of it: the \
+                 asker's device must sign its seal key packet with a key of its own"
             ));
+        };
+        let person = self.person_of(&device);
+        let at = Kind::GRANTED.pair(space, &person, key);
+        let record = ask.encode();
+        match self.store.get(&at) {
+            Some(kept) if kept == record => return Ok(()),
+            Some(_) => {}
+            None => {
+                let kept = self
+                    .store
+                    .scan_under(&Kind::GRANTED.person(space, &person), GRANTEES_PER_PERSON);
+                if kept.len() >= GRANTEES_PER_PERSON {
+                    return Err(format!(
+                        "this device keeps {GRANTEES_PER_PERSON} devices of {person} it granted keys \
+                         of the space to, so that a lapse of one owes a new epoch, and that is as \
+                         many as it keeps of one person: the record of a device ends when the \
+                         epoch its lapse owes is signed, when {person} no longer reads the space, \
+                         or when its key is revoked; ask another device of the space, or ask \
+                         again after one of those"
+                    ));
+                }
+            }
         }
-        self.store.insert(at, seal_packet.clone());
+        self.store.insert(at, record);
         Ok(())
     }
 

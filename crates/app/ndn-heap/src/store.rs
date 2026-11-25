@@ -103,10 +103,12 @@ impl Kind {
     /// removed when the fold lists the person, and when a removal of her
     /// arrives that it does not name.
     pub(crate) const JOINED: Kind = Kind("joined");
-    /// `granted/<S>/<key>`: the seal key packet of a device this owner device granted an epoch
-    /// key of the sealed space `S` to, by the key that signed it. What a lapse is judged by
-    /// ([`crate::space::SpaceInner::sweep_lapsed`]); removed once the epoch signed for the
-    /// lapse is.
+    /// `granted/<S>/<person>/<key>`: the grant ask (`GrantAsk`: the asker's seal key packet and
+    /// the certificate chain it carried) of a device of `<person>` this owner device granted an
+    /// epoch key of the sealed space `S` to, by the key that signed the packet. What a lapse
+    /// is judged by, restart or not ([`crate::space::SpaceInner::sweep_lapsed`]); removed
+    /// once the epoch signed for the lapse is, when the person no longer reads, and when the
+    /// key is revoked. Per person, so that her records are counted and dropped by one prefix.
     pub(crate) const GRANTED: Kind = Kind("granted");
 
     /// `/localhost/ndn-heap/<kind>`: the prefix of every key of the kind.
@@ -187,6 +189,28 @@ impl Kind {
         Some((
             device,
             u64::from_be_bytes(seq.value.as_ref().try_into().ok()?),
+        ))
+    }
+
+    /// `<kind>/<S>/<person>`: the prefix of every [`Self::pair`] key of one person.
+    pub(crate) fn person(self, space: &Name, person: &Name) -> Name {
+        self.listing(space).append_component(tlv_component(person))
+    }
+
+    /// `<kind>/<S>/<person>/<key>`, each as one component.
+    pub(crate) fn pair(self, space: &Name, person: &Name, key: &Name) -> Name {
+        self.person(space, person)
+            .append_component(tlv_component(key))
+    }
+
+    /// The person and key a [`Self::pair`] key of `space` names.
+    pub(crate) fn parse_pair(self, space: &Name, key: &Name) -> Option<(Name, Name)> {
+        let [person, device] = self.tail(space, key) else {
+            return None;
+        };
+        Some((
+            Name::decode_from_tlv(person.value.clone()).ok()?,
+            Name::decode_from_tlv(device.value.clone()).ok()?,
         ))
     }
 }

@@ -548,11 +548,8 @@ async fn a_reader_devices_lapse_makes_an_owner_device_sign_a_new_epoch_once() {
     let in_force = |heap: &Heap| heap.inner.log.lock().fold.in_force();
     let first = in_force(&heap).expect("an epoch");
     // The phone is granted the key: what the granter records once its seal key packet verifies.
-    let phone = &devs[1];
-    let key = phone.name.clone().append("KEY").append("1");
-    let signer = phone.keys.get_signer_sync(&key).unwrap();
-    let packet = crate::seal::seal_key_packet(&phone.name, &[9; 32], &*signer).unwrap();
-    node.inner.note_grantee(&space(), &key, &packet).unwrap();
+    let (key, ask) = grant_ask_of(&node, &devs[1], &first, [9; 32]);
+    node.inner.note_grantee(&space(), &key, &ask).unwrap();
     tokio::time::sleep(Duration::from_millis(1_000)).await;
     assert_eq!(
         in_force(&heap),
@@ -596,6 +593,213 @@ async fn a_reader_devices_lapse_makes_an_owner_device_sign_a_new_epoch_once() {
     let heap = node.open(&space()).await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(heap.inner.log.lock().fold.epochs().len(), 2);
+}
+
+/// The ask a device's host sends for `epoch` of the test space: its seal key packet for
+/// `public`, signed by the device's key, carrying the chain of that key as `node` holds it.
+fn grant_ask_of(
+    node: &crate::Node,
+    dev: &crate::node::tests::Dev,
+    epoch: &EpochId,
+    public: [u8; 32],
+) -> (Name, crate::wire::GrantAsk) {
+    let key = dev.name.clone().append("KEY").append("1");
+    let signer = dev.keys.get_signer_sync(&key).unwrap();
+    let packet = crate::seal::seal_key_packet(&dev.name, &public, &*signer).unwrap();
+    let ask = crate::wire::GrantAsk::new(space(), epoch.clone(), packet)
+        .unwrap()
+        .with_chain(node.inner.judge.chain_of(&key))
+        .unwrap();
+    (key, ask)
+}
+
+/// Stage-7 N1: an owner device that restarted holds none of a reader device's certificates
+/// (nothing keeps other people's certificates across a restart), and judged each grantee
+/// by the certificates held alone, so the lapse of the phone's certificate was never seen and the
+/// key in force was never rotated. The record now keeps the chain the ask carried, and the
+/// sweep judges the packet with it. The certificate of Bob's phone lasts four seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_devices_lapse_owes_an_epoch_after_the_owner_device_restarted() {
+    let devs = crate::node::tests::world_with(
+        &["/alice/member/laptop", "/bob/member/phone"],
+        |name| Name::from_components(name.components()[..1].iter().cloned()),
+        |name| {
+            if name.has_prefix(&n("/bob")) {
+                4_000
+            } else {
+                365 * 24 * 3600 * 1000
+            }
+        },
+    )
+    .await;
+    let mut config = cfg();
+    config.lapse_sweep = Duration::from_millis(100);
+    let (node, _) = boot(&devs[0].layered(), config.clone()).await;
+    let heap = node.create(&space(), private(&["/bob"])).await.unwrap();
+    let first = heap.inner.log.lock().fold.in_force().expect("an epoch");
+    let (key, ask) = grant_ask_of(&node, &devs[1], &first, [9; 32]);
+    node.inner.note_grantee(&space(), &key, &ask).unwrap();
+    node.close().await;
+    // The owner device starts again with a validator that holds nothing of Bob's phone.
+    let restarted = devs[0].layered();
+    restarted.validator.cert_cache().remove(&key);
+    let (node, _) = boot(&restarted, config).await;
+    let heap = node.open(&space()).await.unwrap();
+    let mut second = None;
+    for _ in 0..150 {
+        if let Some(e) = heap.inner.log.lock().fold.in_force()
+            && e != first
+        {
+            second = Some(e);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        second.is_some(),
+        "a reader device whose certificate lapsed was never re-keyed after the owner device restarted"
+    );
+}
+
+/// Stage-7 N1, fail closed: a grantee the sweep cannot judge at all (no certificate held, none
+/// kept with the record) owes the epoch once it stays undecided for `PENDING_SWEEPS_MAX`
+/// sweeps in a row, and not before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grantee_that_stays_undecided_for_the_stated_sweeps_owes_the_epoch() {
+    let devs = world(&["/alice/member/laptop", "/bob/member/phone"]).await;
+    let owner = devs[0].layered();
+    let (node, _) = boot(&owner, cfg()).await;
+    let heap = node.create(&space(), private(&["/bob"])).await.unwrap();
+    let first = heap.inner.log.lock().fold.in_force().expect("an epoch");
+    let (key, ask) = grant_ask_of(&node, &devs[1], &first, [9; 32]);
+    // A record that carries no chain, on a node that holds no certificate of the phone.
+    let ask = crate::wire::GrantAsk::new(space(), first.clone(), ask.seal_packet.clone()).unwrap();
+    owner.validator.cert_cache().remove(&key);
+    node.inner.note_grantee(&space(), &key, &ask).unwrap();
+    let owed = |heap: &Heap| {
+        let log = heap.inner.log.lock();
+        heap.inner.loss_owed(&node.inner, &log)
+    };
+    for sweep in 1..PENDING_SWEEPS_MAX {
+        heap.inner.sweep_lapsed(&node.inner).await;
+        assert!(
+            !owed(&heap),
+            "no epoch is owed after {sweep} undecided sweeps"
+        );
+    }
+    heap.inner.sweep_lapsed(&node.inner).await;
+    assert!(
+        owed(&heap),
+        "a grantee undecided for {PENDING_SWEEPS_MAX} sweeps in a row owes no epoch"
+    );
+}
+
+/// Stage-7 N2: one person's devices fill no more than `GRANTEES_PER_PERSON` records, so a reader
+/// cannot make an owner device refuse every other person's new device; the refusal says why and
+/// what to do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_readers_devices_cannot_fill_the_grantee_table() {
+    let devs = world(&[
+        "/alice/member/laptop",
+        "/bob/member/phone",
+        "/carol/member/phone",
+    ])
+    .await;
+    let (node, _) = boot(&devs[0].layered(), cfg()).await;
+    let heap = node
+        .create(&space(), private(&["/bob", "/carol"]))
+        .await
+        .unwrap();
+    let first = heap.inner.log.lock().fold.in_force().expect("an epoch");
+    let ask = |device: &str| {
+        let key = n(device).append("KEY").append("1");
+        let (_, ask) = grant_ask_of(&node, &devs[1], &first, [9; 32]);
+        (key, ask)
+    };
+    for i in 0..GRANTEES_PER_PERSON + 8 {
+        let (key, ask) = ask(&format!("/bob/member/d{i}"));
+        let noted = node.inner.note_grantee(&space(), &key, &ask);
+        if i < GRANTEES_PER_PERSON {
+            noted.unwrap();
+        } else {
+            let said = noted.expect_err(&format!(
+                "the {}th device of one person was recorded",
+                i + 1
+            ));
+            assert!(
+                said.contains(&GRANTEES_PER_PERSON.to_string()) && said.contains("ask"),
+                "the refusal says how many and what to do: {said}"
+            );
+        }
+    }
+    let (key, carol) = ask("/carol/member/new");
+    node.inner
+        .note_grantee(&space(), &key, &carol)
+        .expect("another person's new device is recorded");
+}
+
+/// Stage-7 N2: removing a reader ends the records of her devices at once, and the sweep ends
+/// those of a person who reads no more and of a key a trust context revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_records_of_a_removed_reader_and_of_a_revoked_key_end() {
+    let devs = world(&[
+        "/alice/member/laptop",
+        "/bob/member/phone",
+        "/carol/member/phone",
+        "/dave/member/phone",
+    ])
+    .await;
+    let owner = devs[0].layered();
+    let (node, _) = boot(&owner, cfg()).await;
+    let heap = node
+        .create(&space(), private(&["/bob", "/carol"]))
+        .await
+        .unwrap();
+    let first = heap.inner.log.lock().fold.in_force().expect("an epoch");
+    let records = || {
+        node.inner
+            .store
+            .scan_under(&crate::store::Kind::GRANTED.listing(&space()), 0)
+            .len()
+    };
+    let note = |dev: &crate::node::tests::Dev, device: &str| {
+        let key = n(device).append("KEY").append("1");
+        let (_, ask) = grant_ask_of(&node, dev, &first, [9; 32]);
+        node.inner.note_grantee(&space(), &key, &ask).unwrap();
+        key
+    };
+    for i in 0..5 {
+        note(&devs[1], &format!("/bob/member/d{i}"));
+    }
+    let carol = note(&devs[2], "/carol/member/d0");
+    assert_eq!(records(), 6);
+    heap.change(changed(&[], &[], &["/bob"])).await.unwrap();
+    assert_eq!(
+        records(),
+        1,
+        "the records of the devices of a reader removed from the space stay"
+    );
+    // A person the space does not list (a record kept for her) is ended by the sweep.
+    note(&devs[3], "/dave/member/d0");
+    assert_eq!(records(), 2);
+    heap.inner.sweep_lapsed(&node.inner).await;
+    assert_eq!(
+        records(),
+        1,
+        "the sweep ends the record of a person who does not read the space"
+    );
+    // A key a trust context revokes: its record ends at the sweep (the epoch it owes is
+    // accounted for by `revoked/<S>`, not by the record).
+    let revoking = ndn_security::SignedTrustContext::hierarchical(n("/carol"))
+        .with_version(2)
+        .with_revocation(carol);
+    owner
+        .validator
+        .keyring()
+        .adopt_update(Arc::new(revoking))
+        .expect("adopted");
+    heap.inner.sweep_lapsed(&node.inner).await;
+    assert_eq!(records(), 0, "the record of a revoked key stays");
 }
 
 /// Stage-7 M2: a private space of a namespace with the role layout, an owner's `member`

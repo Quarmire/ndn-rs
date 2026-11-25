@@ -96,8 +96,8 @@ impl crate::sync::net_kit::Host for NodeInner {
     fn signer_chain(&self) -> Vec<Bytes> {
         NodeInner::signer_chain(self)
     }
-    fn note_grantee(&self, space: &Name, key: &Name, seal_packet: &Bytes) -> Result<(), String> {
-        NodeInner::note_grantee(self, space, key, seal_packet)
+    fn note_grantee(&self, space: &Name, key: &Name, ask: &GrantAsk) -> Result<(), String> {
+        NodeInner::note_grantee(self, space, key, ask)
     }
     fn key_arrived(&self, space: &Name, epoch: &EpochId, name: &Name, content: Bytes) -> bool {
         NodeInner::key_arrived(self, space, epoch, name, content)

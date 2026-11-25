@@ -31,7 +31,7 @@ use crate::seal::GrantRefusal;
 use crate::sync::Taken;
 use crate::test_kit::n;
 use crate::trust::{Judged, Verified};
-use crate::wire::{EpochId, encode_seal_key, log_name, parse_log_name, seal_key_name};
+use crate::wire::{EpochId, GrantAsk, encode_seal_key, log_name, parse_log_name, seal_key_name};
 
 /// The space the cases run in.
 pub(crate) const SPACE: &str = "/alice/32=data/notes";
@@ -375,7 +375,7 @@ pub(crate) trait Host: Send + Sync + 'static {
     /// The certificates of this device's signing key and its issuers, leaf first, as far as the
     /// node holds them: what a grant ask carries.
     fn signer_chain(&self) -> Vec<Bytes>;
-    fn note_grantee(&self, space: &Name, key: &Name, seal_packet: &Bytes) -> Result<(), String>;
+    fn note_grantee(&self, space: &Name, key: &Name, ask: &GrantAsk) -> Result<(), String>;
     fn key_arrived(&self, space: &Name, epoch: &EpochId, name: &Name, content: Bytes) -> bool;
     fn generation(&self) -> u64;
     fn may_grant(
@@ -707,7 +707,7 @@ impl Host for Toyhost {
         self.st.lock().own_chain.clone()
     }
 
-    fn note_grantee(&self, _space: &Name, key: &Name, _seal_packet: &Bytes) -> Result<(), String> {
+    fn note_grantee(&self, _space: &Name, key: &Name, _ask: &GrantAsk) -> Result<(), String> {
         let mut st = self.st.lock();
         if let Some(why) = st.grantees_full.clone() {
             return Err(why);

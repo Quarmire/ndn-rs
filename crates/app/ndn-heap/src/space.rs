@@ -20,7 +20,7 @@
 //! [`Change::Lagged`], and the changes after the drop are dropped until it
 //! has been told.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -48,8 +48,8 @@ use crate::store::Kind;
 use crate::sync::{Group, TIMELINE};
 use crate::trust::{Judged, Listing};
 use crate::wire::{
-    AUDIENCE_MAX, ChunksBody, EpochId, INLINE_MAX, MembersBody, Op, PAYLOAD_MAX, Payload, Role,
-    device_of, log_name, parse_log_name, signed_digest_of,
+    AUDIENCE_MAX, ChunksBody, EpochId, GrantAsk, INLINE_MAX, MembersBody, Op, PAYLOAD_MAX, Payload,
+    Role, device_of, log_name, parse_log_name, signed_digest_of,
 };
 
 #[cfg(test)]
@@ -259,6 +259,9 @@ pub(crate) struct SpaceInner {
     /// certificates lapsed by this node's clock, as the last [`Self::sweep_lapsed`] found
     /// them: what owes the space a new epoch until one is signed (spec §6.5).
     lapsed: Mutex<BTreeSet<Name>>,
+    /// For each granted key the last sweep could not judge, how many sweeps in a row it has
+    /// stayed undecided ([`PENDING_SWEEPS_MAX`]): in memory only, so a restart counts again.
+    pending: Mutex<BTreeMap<Name, u32>>,
 }
 
 /// The most standing alerts a space keeps for watchers that begin later.
@@ -266,6 +269,21 @@ const STANDING_MAX: usize = 32;
 
 /// The most refused entries a space remembers having told.
 const REFUSED_MAX: usize = 256;
+
+/// The most devices of one person an owner device keeps of those it granted epoch keys of one
+/// space to (spec §6.5). A reader chooses how many devices she asks with, so the record is
+/// bounded per person: no reader can fill it for the others. A person has few devices, and one
+/// whose certificate lapsed leaves the record when the epoch it owes is signed.
+pub(crate) const GRANTEES_PER_PERSON: usize = 32;
+
+/// How many sweeps in a row ([`SpaceInner::sweep_lapsed`]) a grantee may stay undecided
+/// (`Pending`: the certificates it is judged by can be had neither from the record nor from
+/// this node) before it owes the epoch (spec §6.5, §9.9). It counts sweeps and not time: no
+/// verdict is read off a clock. A node whose trust contexts or certificates are still being
+/// loaded stays undecided for a sweep or two; one still undecided after five (five minutes at
+/// the default `lapse_sweep`) cannot vouch for that key any more, and a key nobody can vouch
+/// for is re-keyed, never trusted by default.
+pub(crate) const PENDING_SWEEPS_MAX: u32 = 5;
 
 /// A signing step run under the lock: `None` when there is nothing to sign.
 type Sign<'a> = &'a mut (dyn FnMut(&mut Log) -> Result<Option<Step>, HeapError> + Send);
@@ -328,6 +346,7 @@ impl SpaceInner {
             rollbacks: AtomicU64::new(0),
             refused: Mutex::new(VecDeque::new()),
             lapsed: Mutex::new(BTreeSet::new()),
+            pending: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -399,6 +418,8 @@ impl SpaceInner {
         if fx.membership {
             node.judge.note(&self.name, &Self::listing(log));
             node.release_joined(log);
+            // A reader removed from the space ends the records of her devices at once.
+            self.forget_non_readers(node, log);
             repair = !self.follower
                 && log.sealed()
                 && log.owner_only().is_ok()
@@ -547,41 +568,103 @@ impl SpaceInner {
             .collect()
     }
 
+    /// The persons the space lists as readers (none for a public space).
+    fn reading_persons(log: &Log) -> BTreeSet<Name> {
+        match log.fold.readers() {
+            Readers::Persons(readers) => readers.into_iter().collect(),
+            Readers::Anyone => BTreeSet::new(),
+        }
+    }
+
+    /// End the records of the devices of every person the space does not list as a reader
+    /// now (spec §6.5): she is granted nothing more and an epoch has already left her out
+    /// (or will be signed), so her records no longer owe anything and must not take the
+    /// room of another person's.
+    fn forget_non_readers(&self, node: &NodeInner, log: &Log) {
+        if self.follower {
+            return;
+        }
+        let readers = Self::reading_persons(log);
+        for (at, _) in node.store.scan_under(&Kind::GRANTED.listing(&self.name), 0) {
+            let reads = Kind::GRANTED
+                .parse_pair(&self.name, &at)
+                .is_some_and(|(person, _)| readers.contains(&person));
+            if !reads {
+                node.store.remove(&at);
+            }
+        }
+    }
+
     /// Look at the devices this owner device granted epoch keys of the space to
-    /// ([`NodeInner::note_grantee`]): those whose key is lapsed by this node's clock now are
-    /// what a reader's lapse owes the space a new epoch for (spec §6.5). Each is judged by
-    /// the seal key packet it was granted by, from the certificates held alone (nothing is
-    /// fetched); only the judge's `Lapsed` counts, so a renewed certificate held here ends
-    /// the lapse. A lapse moves no counter, so this is run on a timer (`Config.lapse_sweep`).
+    /// ([`NodeInner::note_grantee`]); a lapse moves no counter, so this runs on a timer
+    /// (`Config.lapse_sweep`). It first ends the records of persons who no longer read the
+    /// space and of revoked keys (an epoch accounts for a revoked key by `revoked/<S>`, not by
+    /// the record). Each other record is judged by the seal key packet it was granted by,
+    /// with the certificate chain the ask carried, so a restart that lost every certificate of
+    /// another person's device does not hide a lapse (nothing is fetched). A key whose
+    /// certificate is `Lapsed` by this node's clock owes the epoch; a renewed certificate held
+    /// here ends the lapse. One that stays undecided for [`PENDING_SWEEPS_MAX`] sweeps in a
+    /// row owes it too (it fails closed).
     pub(crate) async fn sweep_lapsed(&self, node: &Arc<NodeInner>) {
         if self.follower {
             return;
         }
-        let granted = node.store.scan_under(&Kind::GRANTED.listing(&self.name), 0);
-        let mut lapsed = BTreeSet::new();
-        for (at, wire) in granted {
-            let Some(key) = Kind::GRANTED.parse_device(&self.name, &at) else {
+        let readers = Self::reading_persons(&self.log.lock());
+        let before = self.pending.lock().clone();
+        let (mut lapsed, mut undecided) = (BTreeMap::new(), BTreeMap::new());
+        for (at, wire) in node.store.scan_under(&Kind::GRANTED.listing(&self.name), 0) {
+            let Some((person, key)) = Kind::GRANTED.parse_pair(&self.name, &at) else {
+                node.store.remove(&at);
                 continue;
             };
-            let (Some(device), Ok(data)) = (device_of(&key), Data::decode(wire)) else {
+            if !readers.contains(&person) || node.judge.key_revoked(&key, &self.name) {
+                node.store.remove(&at);
                 continue;
+            }
+            let judged = match (GrantAsk::decode(wire), device_of(&key)) {
+                (Ok(ask), Some(device)) => match Data::decode(ask.seal_packet.clone()) {
+                    Ok(data) => Some(
+                        node.judge
+                            .validate_asker_packet(&data, &device, &self.name, &ask.chain)
+                            .await,
+                    ),
+                    Err(_) => None,
+                },
+                _ => None,
             };
-            let judged = node
-                .judge
-                .validate_asker_packet(&data, &device, &self.name, &[])
-                .await;
-            if matches!(judged, Judged::Refused(Refusal::Lapsed { .. })) {
-                lapsed.insert(key);
+            match judged {
+                Some(Judged::Refused(Refusal::Lapsed { .. })) => {
+                    lapsed.insert(key, at);
+                }
+                Some(Judged::Valid(_) | Judged::Refused(_)) => {}
+                // Undecided, or a record that cannot be read: counted.
+                Some(Judged::Pending(_)) | None => {
+                    let waited = before.get(&key).map_or(1, |n| n.saturating_add(1));
+                    if waited >= PENDING_SWEEPS_MAX {
+                        lapsed.insert(key.clone(), at);
+                    }
+                    undecided.insert(key, waited);
+                }
             }
         }
-        *self.lapsed.lock() = lapsed;
+        // An epoch signed while this sweep judged ended some records: they owe nothing.
+        lapsed.retain(|_, at| node.store.get(at).is_some());
+        *self.lapsed.lock() = lapsed.into_keys().collect();
+        *self.pending.lock() = undecided;
     }
 
     /// The epoch signed for the lapsed devices ends their record: they are granted no
     /// key until they renew and ask again.
     fn forget_lapsed(&self, node: &NodeInner) {
-        for key in std::mem::take(&mut *self.lapsed.lock()) {
-            node.store.remove(&Kind::GRANTED.device(&self.name, &key));
+        let lapsed = std::mem::take(&mut *self.lapsed.lock());
+        self.pending.lock().retain(|key, _| !lapsed.contains(key));
+        for (at, _) in node.store.scan_under(&Kind::GRANTED.listing(&self.name), 0) {
+            let owed = Kind::GRANTED
+                .parse_pair(&self.name, &at)
+                .is_some_and(|(_, key)| lapsed.contains(&key));
+            if owed {
+                node.store.remove(&at);
+            }
         }
     }
 
