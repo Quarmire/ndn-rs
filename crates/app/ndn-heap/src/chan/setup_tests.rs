@@ -355,6 +355,72 @@ async fn a_strangers_ask_is_nacked_and_costs_no_signature_verification() {
     assert_eq!(stats.answered.get(), 0);
 }
 
+/// An ask that names a member's key in its KeyLocator but is signed by another key (the
+/// ParametersSha256Digest recomputed over what was signed, so the name holds) is Nacked after
+/// exactly one signature verification; no channel, receiver or session comes of it, and the
+/// sender answers with neither a session nor a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ask_signed_by_another_key_than_the_one_it_names_is_nacked_and_makes_no_session() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
+    let (share, change) = public_with(&["/bob"], &["/carol"]);
+    shared(&rig, share, change).await;
+    let (alice, bob, carol) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
+    let (stats, judge) = (&alice.inner.chan.stats, &alice.inner.judge);
+
+    // Carol, a listed reader, claims Bob's key and signs with her own.
+    let carol_signer = Arc::clone(&carol.inner.signer);
+    let params = ask_of(bob, ChannelMode::Latest).encode().unwrap();
+    let forged = InterestBuilder::new(chan_prefix(alice.name()))
+        .must_be_fresh()
+        .lifetime(Duration::from_secs(4))
+        .app_parameters(params.to_vec())
+        .sign_sync(carol_signer.sig_type(), Some(bob.writer()), |region| {
+            carol_signer.sign_sync(region).unwrap()
+        });
+    let interest = Interest::decode(forged.clone()).unwrap();
+    assert!(
+        crate::wire::parse_chan_name(&interest.name).is_some_and(|(_, digest)| interest
+            .parameters_portion()
+            .is_some_and(|portion| {
+                use sha2::Digest;
+                sha2::Sha256::digest(&portion).as_slice() == digest
+            })),
+        "the forged ask's name holds the digest of what it carries: only the signature is wrong"
+    );
+    assert!(nacked(fetch(carol, forged).await, NackReason::NoRoute));
+    assert_eq!(
+        (stats.unverified.get(), judge.interest_walks()),
+        (1, 1),
+        "exactly one verification, and it refused"
+    );
+    assert_eq!(stats.answered.get(), 0);
+    assert_eq!(
+        alice.inner.chan.channels.count(),
+        0,
+        "the forger made no channel"
+    );
+    assert_eq!(
+        alice
+            .inner
+            .chan
+            .channels
+            .receiver_count(&space(), ChannelMode::Latest),
+        0
+    );
+    assert!(carol.inner.chan.sessions.all().is_empty(), "no session");
+    assert_eq!(
+        (stats.refused.get(), stats.answered.get()),
+        (0, 0),
+        "alice signed neither a session nor a refusal for a forgery"
+    );
+
+    // Control: Bob's own, genuinely signed ask is answered.
+    let (wire, _) = signed_ask(bob, alice, &ask_of(bob, ChannelMode::Latest));
+    fetch(bob, wire).await.expect("the genuine ask is answered");
+    assert_eq!(judge.interest_walks(), 2);
+    assert_eq!(alice.inner.chan.channels.count(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reader_cannot_be_a_sender_and_a_data_from_one_is_refused() {
     let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;

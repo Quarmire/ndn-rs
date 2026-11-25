@@ -39,8 +39,7 @@ use super::channels::{Admitted, Asker, Cap};
 use super::key::ChannelKey;
 use super::standing::{Who, gate, standing};
 use super::wire::{
-    ASK_MAX, CarrierOffer, ChanAsk, RefusalCode, RefusalRecord, SessionRecord, Window,
-    carrier,
+    ASK_MAX, CarrierOffer, ChanAsk, RefusalCode, RefusalRecord, SessionRecord, Window, carrier,
 };
 use crate::error::HeapError;
 use crate::node::NodeInner;
