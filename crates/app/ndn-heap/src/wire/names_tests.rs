@@ -1,10 +1,12 @@
 //! Names, digests and the keyword router (spec §2).
 
 use crate::wire::encode_seal_key;
+use crate::wire::prim::{write_epoch_id, write_name};
 use bytes::Bytes;
 use ndn_foundation_types::{Name, NameComponent};
 use ndn_packet::encode::DataBuilder;
 use ndn_security::{Ed25519Signer, Signer};
+use ndn_tlv::TlvWriter;
 
 use super::*;
 
@@ -115,6 +117,31 @@ fn a_grant_ask_may_carry_a_bounded_certificate_chain() {
     let mut over = carrying.clone();
     over.chain = vec![cert_of("/a/KEY/1/x/v=1", 10); ASKER_CHAIN_MAX + 1];
     assert_eq!(parse_grant_name(&grant_name(&device, &over)), None);
+}
+
+/// Stage-7 I6: a grant ask's parser stops at the `ASKER_CHAIN_MAX + 1`th certificate: it keeps
+/// no more and reads nothing after it, so a flood of certificates in one Interest costs no more
+/// than the limit. (The proof: an unknown critical TLV after the fifth certificate is never
+/// reached.)
+#[test]
+fn a_grant_ask_parse_stops_at_the_certificate_over_the_limit() {
+    let plain = ask(&n("/alice/32=data/notes"));
+    let mut w = TlvWriter::new();
+    w.write_nested(tlv::GRANT_ASK, |w| {
+        write_name(w, &plain.space);
+        write_epoch_id(w, &plain.epoch);
+        w.write_tlv(tlv::SEAL_KEY_PACKET, &plain.seal_packet);
+        for _ in 0..=ASKER_CHAIN_MAX {
+            w.write_tlv(tlv::ASKER_CERT, b"a certificate");
+        }
+        // Never reached: it would make the whole ask an unknown critical TLV.
+        w.write_tlv(0x0FF1, b"after");
+    });
+    let error = GrantAsk::decode(w.finish()).expect_err("five certificates are too many");
+    assert!(
+        matches!(error, WireError::TooLarge { .. }),
+        "the parse went on past the certificate over the limit: {error:?}"
+    );
 }
 
 #[test]

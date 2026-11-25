@@ -13,7 +13,11 @@
 //! * `<D>/32=seal/<key>`: this device's seal key packet.
 //! * `<G>/32=grant/<ask>`: the key of an epoch, **only** when the node says
 //!   the asker may have it (`NodeInner::may_grant`); anything else is not
-//!   answered, and nothing is decoded or judged for it. The ask carries the
+//!   answered. The first decision is made from the ask as parsed and nothing more: the
+//!   parse is bounded (a seal key packet of at most 2,048 octets and at most 4 certificates
+//!   of 6,144 octets in all, [`parse_grant_name`] stops at the first over the limit), and
+//!   no signature is checked, no certificate judged and nothing fetched until the node
+//!   has said yes by the names. The ask carries the
 //!   asker's seal key packet and the certificates of its signer chain, so this is one
 //!   exchange and the granter fetches nothing: the packet is judged as the asker device's
 //!   at every ask, from the certificates held and carried (the carried ones only as
@@ -207,8 +211,9 @@ fn held_packet(host: &HostRef, me: &Name, name: &Name) -> Option<Bytes> {
     Some(DataBuilder::new(name.clone(), &wire).sign_digest_sha256())
 }
 
-/// Answer a grant ask (spec §6.5) in the one exchange: the node decides first, from the names
-/// alone, before anything is decoded or judged; then the seal key packet the ask carries is
+/// Answer a grant ask (spec §6.5) in the one exchange: the node decides first, from the ask as
+/// parsed (its names and nothing judged: the parse is bounded, no signature is checked, no
+/// certificate vouched for, nothing fetched); then the seal key packet the ask carries is
 /// judged as the asker's device's, **at every ask** (nothing about the asker's key is kept: a
 /// lapse of its certificate moves no counter, only the clock refuses it), the node decides
 /// again with the key that signed it, and the key is wrapped to the seal key. One name, one

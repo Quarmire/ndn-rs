@@ -368,16 +368,28 @@ impl GrantAsk {
 
     /// Decode a `GRANT_ASK` TLV; the space must be a space name, the epoch's
     /// creator a device, the packet a seal key packet's Data ([`Self::new`]) and the
-    /// certificates Data within the limits ([`Self::with_chain`]).
+    /// certificates Data within the limits ([`Self::with_chain`]). The parse stops at the first
+    /// certificate over [`ASKER_CHAIN_MAX`] or [`ASKER_CHAIN_OCTETS_MAX`] octets in all,
+    /// before it keeps it or reads anything after it.
     pub(crate) fn decode(content: Bytes) -> Result<GrantAsk, WireError> {
         let value = super::prim::only(content, tlv::GRANT_ASK, "a grant ask is one GRANT_ASK TLV")?;
         let (mut space, mut epoch, mut packet) = (None, None, None);
-        let mut chain = Vec::new();
+        let (mut chain, mut chain_octets) = (Vec::new(), 0);
         fields!(value, |v| {
             tlv_type::NAME => once(&mut space, read_name(v)?, "a grant ask's space")?,
             tlv::EPOCH_ID => once(&mut epoch, read_epoch_id(v)?, "a grant ask's epoch")?,
             tlv::SEAL_KEY_PACKET => once(&mut packet, v, "a grant ask's seal key packet")?,
-            tlv::ASKER_CERT => chain.push(v),
+            tlv::ASKER_CERT => {
+                chain_octets += v.len();
+                if chain.len() == ASKER_CHAIN_MAX || chain_octets > ASKER_CHAIN_OCTETS_MAX {
+                    return Err(WireError::TooLarge {
+                        what: "the certificates a grant ask carries",
+                        size: chain_octets,
+                        max: ASKER_CHAIN_OCTETS_MAX,
+                    });
+                }
+                chain.push(v)
+            },
         });
         let (Some(space), Some(epoch), Some(packet)) = (space, epoch, packet) else {
             return Err(WireError::Malformed(
