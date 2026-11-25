@@ -1334,7 +1334,7 @@ impl Heap {
 
     /// How many times this node has raised [`Alert::RolledBack`] for the space since it was
     /// opened. It only grows and counts every alert, also those the standing list behind
-    /// [`Self::rolled_back`] no longer holds (it keeps [`STANDING_MAX`] distinct ones). A
+    /// [`Self::rolled_back`] no longer holds (it keeps `STANDING_MAX` distinct ones). A
     /// host that acted on a rollback compares it with the count it acted on: a later rollback
     /// is a new reason to distrust the notes it wrote since, which a standing flag cannot say.
     pub fn rollbacks(&self) -> u64 {
