@@ -24,6 +24,7 @@ use sha2::Sha256;
 use zeroize::ZeroizeOnDrop;
 
 use super::*;
+use crate::Timestamp;
 use crate::error::NextStep;
 use crate::log::{Outcome, Params, Step};
 use crate::register::EntryId;
@@ -197,6 +198,7 @@ impl World {
         let flusher = Flusher::spawn(Arc::clone(&raw));
         let owner_capable =
             crate::trust::owner_capable(&self.validator.keyring().context_for(&dev.key), &dev.key);
+        let suspicion = Suspicion::open(Arc::clone(&raw));
         let log = Log::open(
             Params {
                 space: space(),
@@ -205,7 +207,7 @@ impl World {
                 owner_capable,
                 signer: Arc::clone(&dev.signer),
                 keys: Keys::new(RecipientKey::generate()),
-                suspicion: Suspicion::open(Arc::clone(&raw)),
+                suspicion: Arc::clone(&suspicion),
                 block: 8,
             },
             Arc::clone(&raw),
@@ -217,6 +219,7 @@ impl World {
             judge: Judge::new(Arc::clone(&self.validator), raw, None).0,
             store,
             flusher,
+            suspicion,
             dev,
         }
     }
@@ -229,6 +232,7 @@ struct Seat {
     store: Arc<CrashStore>,
     flusher: Arc<Flusher>,
     dev: Dev,
+    suspicion: Arc<Suspicion>,
 }
 
 fn add(id: u8, who: &str, role: Role) -> Op {
@@ -499,6 +503,57 @@ async fn a_revoked_key_is_no_member_once_its_revocation_is_held() {
     assert!(!alice.member(&bob));
     assert!(alice.member(&key_of("/bob/tablet")), "only that key");
     assert_ne!(alice.judge.generation(), before);
+}
+
+/// A key this node marks suspected (reported stolen, or caught signing two
+/// packets at one name) is no member for signals either, before any revocation
+/// is held: its run headers are refused saying so, and its own device uses no
+/// signals. Lifting the mark restores it; a revocation held refuses it as a
+/// revoked key.
+#[tokio::test]
+async fn a_suspected_key_is_no_member_for_signals_until_unsuspected() {
+    let world = World::new().await;
+    let (alice, _) = bob_may_write(&world).await;
+    let bob = world.seat("/bob/phone").await;
+    alice.relay_seq(1, &bob);
+    let phone = bob.dev.key.clone();
+    let tablet = key_of("/bob/tablet");
+    assert!(alice.member(&phone));
+    bob.scope().expect("a member before the mark");
+
+    alice.suspicion.mark(&phone, Timestamp(NOW)).unwrap();
+    bob.suspicion.mark(&phone, Timestamp(NOW)).unwrap();
+    assert!(!alice.member(&phone), "a suspected key is no member");
+    assert!(alice.member(&tablet), "only that key");
+    let header = header_by(&bob.dev, &space());
+    match alice.sender(&header) {
+        Err(r @ SignalRefusal::Suspected { .. }) => {
+            let text = r.to_string();
+            assert!(
+                text.contains("suspected") && text.contains("unsuspects"),
+                "{text}"
+            );
+        }
+        other => panic!("a suspected key's header: {other:?}"),
+    }
+    match bob.header(&RUN) {
+        Err(e @ HeapError::NotAllowed { .. }) => {
+            assert!(e.to_string().contains("suspected"), "{e}")
+        }
+        other => panic!("a suspected device signs no run header: {other:?}"),
+    }
+    assert!(matches!(bob.scope(), Err(HeapError::NotAllowed { .. })));
+
+    assert!(alice.suspicion.lift(&phone));
+    assert!(alice.member(&phone), "unsuspected: a member again");
+
+    alice.suspicion.mark(&phone, Timestamp(NOW)).unwrap();
+    world.revoke("/bob", 2, &phone);
+    assert_eq!(
+        alice.sender(&header),
+        Err(SignalRefusal::BadSignature { key: phone }),
+        "a revoked key is refused as revoked, whether or not it is suspected"
+    );
 }
 
 /// A device that is no member (removed, revoked, never listed) uses no

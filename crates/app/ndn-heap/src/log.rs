@@ -611,6 +611,11 @@ impl Log {
         View::of(self)
     }
 
+    /// Whether this node marks `key` suspected (spec §9.8).
+    pub(crate) fn suspected(&self, key: &Name) -> bool {
+        self.suspicion.since(key).is_some()
+    }
+
     /// Whether the last run left the space without a clean close.
     pub(crate) fn unclean(&self) -> bool {
         !self.reservation.clean

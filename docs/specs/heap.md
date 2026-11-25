@@ -2277,6 +2277,12 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   (§9.5) and the mark would only refuse what the cut keeps.
 - **A removed person is not suspected out of the cut:** her entries are judged by
   the removal cut alone (§3.7).
+- **A suspected key has no signal standing (stage-7 I8).** A key marked suspected
+  here is no signal member (`signal_member` false, `signal_sender` refuses
+  `Suspected`, its own device's signal calls `NotAllowed`), as one revoked is:
+  its run headers and its sends stop at the mark, not at the revocation. The mark
+  is this node's, so other nodes admit the key until they hold it or the
+  revocation.
 - **A suspected key is granted no epoch key, and rotates the epoch.** A suspected
   key is refused every grant (`AskerKeySuspected`, §6.5 condition 8). A suspected
   key of a device of a person a sealed space reads for may already hold the key in
@@ -3042,7 +3048,8 @@ A **member** of a space, for signals, is a key of a device whose **person** is a
 writer of the space (the owner always is), which is an `admin` or `member` device
 of that person where her namespace declares the role layout (a `guest` or `node`
 device of any member is **no** signal member, §9.9), and which the trust context
-governing that key does not revoke. The person is the namespace of the context that
+governing that key does not revoke and this node does not mark suspected (§9.8: a
+suspected key's entries are refused, so are its run headers). The person is the namespace of the context that
 governs the key, taken from the view the node judges the key's packets about the
 space by (§9.4): the node's own for a person it holds, else the view adopted for
 her while a listing of the space names her as a writer or a reader. The answer is
@@ -3074,7 +3081,7 @@ or, sealed, no epoch is in force, or the key of the epoch in force is not held
 yet and this device is in the audience: ask again after the grant; the gate
 starts no ask), `BadName` (the name is no space name: no node can open one of
 that name, fix the name), `NotAllowed` (neither writer nor reader, or, for
-`signal_header`, not a writer; or its own key is revoked) or `Sealed` (a person
+`signal_header`, not a writer; or its own key is revoked or marked suspected) or `Sealed` (a person
 outside the sealed space's audience, which may not hold its key; the owner
 counts as inside). A header can be signed without the epoch's key. The checks
 that judge another device's key (`signal_member`, `signal_sender`) count writers
@@ -3088,8 +3095,9 @@ signed by a key of `D`. It is never stored, served or fetched here.
 
 `signal_sender` refuses with: `Malformed` (a scope other than the space, a name
 that is not a run header of it, no key locator, a key of another device than the
-name's), `NotReady` (the creation is not held), `NotMember`, or `BadSignature`
-(for a key the context governing it revokes). Its answer is
+name's), `NotReady` (the creation is not held), `NotMember`, `BadSignature`
+(for a key the context governing it revokes) or `Suspected` (for a key this node
+marks suspected, §9.8). Its answer is
 `SignalSender { key, device, namespace }`, the **namespace being the person**: a
 transport bounds a sender's admissions and runs by it, since a person can make as
 many keys and devices as it likes and never more persons.
@@ -3098,9 +3106,9 @@ The transport admits a header in three steps: `signal_sender` first (a stranger'
 header costs nothing more); then it verifies the header by the validator
 `signal_view` gives, the one that judges the signer's person (the node's own,
 or the view adopted for her), by the **live** rule: its certificates valid now,
-a revoked key refused; and then `signal_sender` again, so a removal or
-revocation held while the chain was fetched ends it (`NotMember`,
-`BadSignature`). `signal_view` decides nothing about membership and answers
+a revoked or suspected key refused; and then `signal_sender` again, so a removal,
+revocation or mark held while the chain was fetched ends it (`NotMember`,
+`BadSignature`, `Suspected`). `signal_view` decides nothing about membership and answers
 `NotReady` for a space not open here as a member. The chain is walked from the
 certificates held first; one not held is fetched, and the transport bounds those
 fetches: only while fewer than **2** headers of the signer's person wait for

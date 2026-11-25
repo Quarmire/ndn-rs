@@ -188,6 +188,19 @@ pub enum SignalRefusal {
         /// The key its KeyLocator names.
         key: Name,
     },
+    /// Its key is marked suspected on this node: reported stolen, or caught
+    /// signing two packets at one name (spec §9.8). Revoked keys are
+    /// `BadSignature`.
+    #[error(
+        "a run header signed by {key} is refused: this node marks that key suspected (reported \
+         stolen, or caught signing two packets at one name): drop its run; its runs stay \
+         refused until the host unsuspects the key (once a revocation of it is held it is \
+         refused as revoked); the person's other devices are not affected"
+    )]
+    Suspected {
+        /// The key its KeyLocator names.
+        key: Name,
+    },
     /// Its key is no member of the space by the entries held here.
     #[error(
         "{key} is no member of {scope} by the entries held here: drop its run; its runs are \
@@ -230,13 +243,14 @@ pub enum SignalRefusal {
 // -- Membership --------------------------------------------------------------------------
 
 /// The person `key` belongs to, if the fold lists that person as a writer or,
-/// when `reads`, as a reader (everybody reads a public space), and the trust
-/// context governing the key does not revoke it; else the refusal: `NotMember`
-/// (no standing person owns the key) or `BadSignature` (the context revokes
-/// it). The context is the one `judge` judges the key's packets about the space
-/// by (spec §11): the node's own for a person it holds, else the view adopted
-/// for the person while a listing of the space names her as a writer or a
-/// reader.
+/// when `reads`, as a reader (everybody reads a public space), the trust
+/// context governing the key does not revoke it and this node does not mark it
+/// suspected (§9.8: no new entry of a suspected key is taken, and no run header
+/// either); else the refusal: `NotMember` (no standing person owns the key),
+/// `BadSignature` (the context revokes it) or `Suspected`. The context is the
+/// one `judge` judges the key's packets about the space by (spec §11): the
+/// node's own for a person it holds, else the view adopted for the person while
+/// a listing of the space names her as a writer or a reader.
 fn standing(log: &Log, judge: &Judge, key: &Name, reads: bool) -> Result<Name, SignalRefusal> {
     let not_member = || SignalRefusal::NotMember {
         scope: log.space.clone(),
@@ -258,10 +272,13 @@ fn standing(log: &Log, judge: &Judge, key: &Name, reads: bool) -> Result<Name, S
     if !owner_capable(&context, key) {
         return Err(not_member());
     }
-    match context.is_revoked(key) {
-        true => Err(SignalRefusal::BadSignature { key: key.clone() }),
-        false => Ok(person.clone()),
+    if context.is_revoked(key) {
+        return Err(SignalRefusal::BadSignature { key: key.clone() });
     }
+    if log.suspected(key) {
+        return Err(SignalRefusal::Suspected { key: key.clone() });
+    }
+    Ok(person.clone())
 }
 
 /// [`NodeHandle::signal_member`] over one space.
@@ -278,18 +295,29 @@ fn own_gate(log: &Log, judge: &Judge, reads: bool) -> Result<(), HeapError> {
             why: NO_RECORD.into(),
         });
     }
-    let why = match standing(log, judge, &log.key, reads) {
+    let (why, next) = match standing(log, judge, &log.key, reads) {
         Ok(_) => return Ok(()),
-        Err(SignalRefusal::BadSignature { .. }) => {
-            "the trust context governing this device's key revokes it"
-        }
-        Err(_) if reads => "this device is neither a writer nor a reader of it by the entries held",
-        Err(_) => "this device is no writer of it by the entries held",
+        Err(SignalRefusal::BadSignature { .. }) => (
+            "the trust context governing this device's key revokes it",
+            "ask the owner to add this device's person to the space",
+        ),
+        Err(SignalRefusal::Suspected { .. }) => (
+            "this device's key is marked suspected here",
+            "unsuspect it if it is safe, or enrol this device with a new key",
+        ),
+        Err(_) if reads => (
+            "this device is neither a writer nor a reader of it by the entries held",
+            "ask the owner to add this device's person to the space",
+        ),
+        Err(_) => (
+            "this device is no writer of it by the entries held",
+            "ask the owner to add this device's person to the space",
+        ),
     };
     tracing::debug!(space = %log.space, key = %log.key, "signals refused: {why}");
     Err(HeapError::NotAllowed {
         space: log.space.clone(),
-        why: format!("{why}; ask the owner to add this device's person to the space"),
+        why: format!("{why}; {next}"),
     })
 }
 
