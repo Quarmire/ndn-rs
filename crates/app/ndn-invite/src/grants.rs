@@ -64,7 +64,8 @@ const JUDGE_EVERY_MIN: Duration = Duration::from_millis(10);
 /// What the members in force for a grant's space make of the person.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Standing {
-    /// The space is not open here or its creation is not seen: nothing to judge by.
+    /// The space is not open here or its creation is not seen: nothing to judge by, so a
+    /// grant of it is not left standing (the host is told to revoke it) until it is read.
     Unknown,
     /// The members list the person neither as a writer nor as a reader (or, in a public
     /// space, an entry removed them).
@@ -118,6 +119,11 @@ pub(crate) struct Grants {
     /// The `(key, space)` of each grant the host holds from this device in this run: a
     /// live grant not in it (its space was not known at start) is told when it stands.
     told: Mutex<BTreeSet<([u8; 32], Name)>>,
+    /// The `(key, space)` of each grant the host was told to revoke because its space is not
+    /// open here (or its creation is not held): while the space cannot be read, the members
+    /// cannot say the person is still in, so the grant is not left standing. Told once; the
+    /// entry goes when the space can be read again.
+    withheld: Mutex<BTreeSet<([u8; 32], Name)>>,
 }
 
 /// A take of a space's departure entry under way, let go as it is dropped.
@@ -153,6 +159,7 @@ impl Grants {
             departing: Mutex::new(BTreeSet::new()),
             departures_begun: Mutex::new(VecDeque::new()),
             told: Mutex::new(BTreeSet::new()),
+            withheld: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -493,14 +500,30 @@ impl Grants {
     ///   then of the end of this space's grant alone; then the note is marked ended
     ///   (with the mark, under the same MAC) durably;
     /// - the person is in another role than the grant bears: the note takes the role,
-    ///   the host is told again and the note is made durable.
+    ///   the host is told again and the note is made durable;
+    /// - the space is not open here, or its creation is not held: the members cannot say the
+    ///   person is still in, so the host is told `revoke_grant` once and the note is left as
+    ///   it is (not ended: the space may be closed here and nothing more); the first judgement
+    ///   that reads the space again installs the grant if the person is listed, and ends it
+    ///   as above if not.
     ///
     /// The person's grants of other spaces are not touched. Called with the notes held.
     async fn judge_inviter_notes(&self) {
         let now = self.node.now();
         let (mut ending, mut retold, mut installing) = (Vec::new(), Vec::new(), Vec::new());
         for note in self.used_grants().into_iter().filter(|note| !note.ended) {
-            match self.standing(&note.namespace, &note.space) {
+            let standing = self.standing(&note.namespace, &note.space);
+            let tracked = (note.key, note.space.clone());
+            if standing == Standing::Unknown {
+                if self.withheld.lock().insert(tracked.clone()) {
+                    self.host.revoke_grant(&note.key, &note.space);
+                    self.told.lock().remove(&tracked);
+                    tracing::info!(offer = %note.offer, space = %note.space, namespace = %note.namespace, "the space is not open here, or its creation is not held, so its members cannot say the person is still in: its grant to link is revoked until it is; open the space to install it again");
+                }
+                continue;
+            }
+            self.withheld.lock().remove(&tracked);
+            match standing {
                 Standing::Out => {
                     let departure = self.departure_mark(&note, now);
                     ending.push(GrantNote { departure, ..note });

@@ -1323,9 +1323,13 @@ of a members **entry** (§11). The host's side of every call is §12.
    grant, the device updates the note durably and calls `Host::grant` again with the grant as it now stands (the host replaces its
    grant; ndn-link closes a link made under the old scope); a writer demoted to a reader is a reader at once, not at the grant's end.
    It is derived from the notes and the fold, so it is the same after a restart, less what ended. While the space is not open here,
-   or its creation is not held, **nothing is judged and no grant of it is in force**, and nothing ends either: a note waits for the
-   fold to be seen. The first judgement that finds the space known and the fold listing the person **installs the grant through
-   `Host::grant`** if the host was not told of it in this run (its space was not restored when the invitations started), once.
+   or its creation is not held, **no grant of it is in force and the host is told `Host::revoke_grant` for it, once** (fail closed:
+   the members of a space that cannot be read cannot say the person is still in — an owner device elsewhere may have removed them
+   while the space was closed here — so a link the grant opened is not left standing on a fold that was not seen). The note does
+   **not** end: the space may only be closed here, so the note waits for the fold to be seen. The first judgement that finds the space
+   known and the fold listing the person **installs the grant through `Host::grant`** again (it is not among what the host was told in
+   this run, whether its space was not restored when the invitations started or was closed since), once; one that finds the fold leaving
+   the person out ends it as rule 7 says, with its departure mark.
    The watch of a space is subscribed from everything held (`Frontier::everything`, heap.md §10.4): it replays no head and reads no
    value, since only the members' changes matter, and the first judgement after subscribing covers what changed before it. One
    `Grant` is listed for each live note (rule 13).

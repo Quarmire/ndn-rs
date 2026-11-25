@@ -1322,3 +1322,59 @@ async fn a_grant_whose_space_is_known_only_after_start_is_installed_when_it_is()
     settle(alice.laptop()).await;
     assert_eq!(again.granted().len(), 1, "the grant was installed twice");
 }
+
+/// Spec §10 rule 6, fail closed: a grant is not left standing on the host while its space is
+/// not open on the granting device. The members of a space that is not open cannot be read, so
+/// they cannot say Bob was removed (on another owner device, or since): the host is told
+/// `revoke_grant` for the grant once, the note is not ended (the space may only be closed
+/// here), and when the space opens again and lists Bob the grant is installed through the
+/// host once more. A space that opens and no longer lists him ends the grant as any removal does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_whose_space_is_not_open_is_revoked_and_installed_again_when_it_opens() {
+    let mut alice = Inviter::new(Role::Writer, None).await;
+    let bob_phone = phone_of("/bob").await;
+    assert!(accepted(&alice.answers(&bob_phone).await));
+    let told = alice.calls.granted();
+    assert_eq!(told.len(), 1);
+    // The space is not open on the laptop any more: its record goes, so it is not restored.
+    let again = alice.restart_polling(Duration::from_millis(200)).await;
+    eventually(
+        "the host is told to revoke the grant of a space that is not open here",
+        || again.revoked_in() == vec![(key_of(&bob_phone), notebook())],
+    )
+    .await;
+    assert_eq!(again.granted(), Vec::new());
+    assert_eq!(alice.laptop().invites.grants(), Vec::new());
+    // Once: however often the notes are judged while the space stays closed.
+    settle(alice.laptop()).await;
+    assert_eq!(
+        again.revoked().len(),
+        1,
+        "the revocation of a grant of a space not open was told more than once"
+    );
+    // Not ended: the note stands, so that the space opening again brings the grant back.
+    assert_eq!(
+        grant_notes(&*alice.store).len(),
+        1,
+        "the grant's note was dropped"
+    );
+    alice
+        .laptop()
+        .node
+        .open(&notebook())
+        .await
+        .expect("the space opens from what the store holds");
+    eventually(
+        "the grant is installed again once its space is open and lists bob",
+        || again.granted() == told,
+    )
+    .await;
+    assert_eq!(alice.laptop().invites.grants(), told);
+    settle(alice.laptop()).await;
+    assert_eq!(again.granted().len(), 1, "the grant was installed twice");
+    assert_eq!(
+        again.revoked().len(),
+        1,
+        "a grant that stands again was revoked again"
+    );
+}
