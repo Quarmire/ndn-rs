@@ -10,15 +10,20 @@
 //! is genuine re-admits it by that full name: an exact entry accepts that
 //! name with those bytes only — never a range, so a neighbouring sequence
 //! number or another packet at that name stays refused. A cut that names
-//! tips takes exact entries too (above a tip's number).
+//! tips takes exact entries too, below a tip's number as well as above it:
+//! the tip accepts a name below it by name, but a device's data layer keeps
+//! below a tip only the chain ancestors of the tip, and an exact entry
+//! exempts a packet it lists from that test.
 //!
 //! [`plan`] checks, before anything is asked, that this is the root device
 //! of the namespace the key is in (a namespace named must be that one),
 //! that the held version holds a cut for exactly that key (`readmit-no-cut`
 //! otherwise: a key not revoked is revoked with a cut first; one revoked
 //! without a cut has none to add to), and that each name is a full name in
-//! the key's device log `<device>/32=log/...` (`readmit-refused`). Names the
-//! cut accepts already are left out; none left is `nothing-to-sign`.
+//! the key's device log `<device>/32=log/...` (`readmit-refused`). Names a
+//! range decides, and names an exact entry of the cut lists already, are
+//! left out (a name below a tip is not: it is added as an exact entry); none
+//! left is `nothing-to-sign`.
 //! [`readmit`] then checks the running device uses the same PIB, unlocks the
 //! root to sign version `N+1` ([`ndn_cert::bump_context_readmitting`]),
 //! drops the signer, and hands the version to the running device
@@ -40,8 +45,8 @@ pub struct ReadmitPlan {
     pub root: RootDevice,
     /// The key revoked with a cut.
     pub key: Name,
-    /// The full names asked that its cut does not accept yet, each once;
-    /// empty when it accepts them all.
+    /// The full names asked that the cut does not decide or list already
+    /// (a range, an exact entry), each once; empty when there are none.
     pub adding: Vec<Name>,
 }
 
@@ -110,8 +115,10 @@ pub struct Readmitted {
 }
 
 /// Sign and hand over the re-admission `planned` (on the PIB at
-/// `pib_dir`). Refusals: `nothing-to-sign` (the cut accepts every name
-/// already), the running device's (`device-*`, before the root is
+/// `pib_dir`). Refusals: `nothing-to-sign` (no name given is left to add:
+/// each is decided by a range of the cut or listed by one of its exact
+/// entries already; a name below a tip is added, not left out), the running
+/// device's (`device-*`, before the root is
 /// unlocked), the secret's and `root-not-unlocked`, `version-not-taken`
 /// (nothing changed) and `hand-over-unknown` (params `key`, `names`: asking
 /// again once the device is idle settles it).
@@ -126,7 +133,8 @@ pub async fn readmit(
     let nothing = || {
         RootError::new(
             code::NOTHING_TO_SIGN,
-            "the key's cut accepts every name given already; nothing was signed",
+            "every name given is decided by the key's cut or listed in it already (by a range, \
+             or as an exact entry); nothing was signed",
         )
         .with("version", held_version)
     };

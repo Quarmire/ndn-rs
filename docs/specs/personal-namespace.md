@@ -427,10 +427,12 @@ On the root device: `ndn-fwd revoke /<ns>/<role>/<dev> [--cut <file>]
    name and digest; the owner runs `ndn-fwd readmit <key> <full-name>…`,
    which signs `N+1` adding those exact names to the cut. Never a range
    or a tip: a neighbouring seq or other bytes at that name stay out. A
-   tips cut takes exact entries too, for what its tips do not accept:
-   entries above a tip's seq (a name the cut accepts already, below a tip
-   or the tip with its digest, is left out of the addition, and none left
-   is `nothing-to-sign`).
+   tips cut takes exact entries too, for entries above a tip's seq, at it
+   with other bytes, and below it: the tip accepts a name below it by
+   name, but the data layer keeps below a tip only the chain ancestors of
+   the tip, and an exact entry exempts the packet it lists from that test.
+   Only a name a range decides, or an exact entry lists already, is left
+   out of the addition; none left is `nothing-to-sign`.
 Gap: revoking from an admin device other than the root device (the root key
 signs the bump, so the command runs where the root key is).
 

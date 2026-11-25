@@ -529,8 +529,10 @@ pub async fn bump_context_revoking(
 }
 
 /// The cut of `key` in `ctx` and the names of `names` a version after `ctx`
-/// would add to it as exact entries: those it does not accept already,
-/// each once; empty when it accepts all of them. Refused when `key` is not
+/// would add to it as exact entries: those no range decides and no exact
+/// entry lists already, each once — a name below a tip too (the tip accepts
+/// it by name; an exact entry also exempts it from the chain-ancestry test
+/// of the data layer); empty when there are none. Refused when `key` is not
 /// a key name under the namespace, has no cut (not revoked, or revoked
 /// without one), or a name is not a full name (ending in its implicit
 /// digest) in the key's device log ([`device_log_of`]).
@@ -582,8 +584,12 @@ fn readmission(
         }
         // A name inside a range is decided by the range (with a manifest:
         // only the bytes it lists), never by a re-admission of other bytes.
+        // A name at or below a tip is accepted by name by the tip, but the
+        // ends keep below a tip only the chain ancestors of the tip, and an
+        // exact entry exempts a packet from that test: so it is added unless
+        // an exact entry lists it already.
         let in_range = cut.range_seq(&packet).is_some();
-        if !in_range && !cut.accepts(&packet, &digest) && !added.contains(name) {
+        if !in_range && !cut.accepts_exactly(&packet, &digest) && !added.contains(name) {
             added.push(name.clone());
         }
     }
@@ -591,8 +597,10 @@ fn readmission(
 }
 
 /// The full names of `names` a version after `ctx` would add to the cut of
-/// the revoked key `key` as exact entries (re-admission) — those the cut
-/// does not accept already, each once; empty when it accepts all of them.
+/// the revoked key `key` as exact entries (re-admission) — those no range
+/// decides and no exact entry lists already, each once (a name below a tip
+/// too: the tip accepts it by name, but only an exact entry exempts it from
+/// the data layer's chain-ancestry test); empty when there are none.
 /// Refused when `key` is not a key name under the namespace, has no cut
 /// (not revoked: revoke it with a cut first; revoked without one: nothing
 /// of it can be re-admitted), or a name is not a full name (ending in its
@@ -610,9 +618,9 @@ pub fn readmissions_to_add(
 /// added to the cut of the revoked key `key` as exact entries
 /// (re-admission: each accepts one packet, by name and digest; never a
 /// range), signed by `signer`, an anchor key of `held`. Checked as
-/// [`readmissions_to_add`] does; `Ok(None)` when the cut accepts all of
-/// them already (nothing is signed). Every other field — the cut's ranges
-/// and earlier exact entries, the other cuts — is carried over verbatim.
+/// [`readmissions_to_add`] does; `Ok(None)` when there is nothing to add
+/// (nothing is signed). Every other field — the cut's ranges and tips,
+/// earlier exact entries, the other cuts — is carried over verbatim.
 /// Pure: nothing is adopted, stored or published.
 pub async fn bump_context_readmitting(
     signer: &dyn Signer,

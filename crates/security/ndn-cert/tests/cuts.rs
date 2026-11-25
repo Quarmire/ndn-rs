@@ -929,11 +929,13 @@ async fn a_tip_cut_is_carried_verbatim_and_never_lowered() {
     assert_eq!(adopt(None), epoch + 4, "the cut dropped");
 }
 
-/// A re-admission into a tip cut adds exact entries the tip does not
-/// accept: above it, or at its number with other bytes; below it the tip
-/// accepts by name, so nothing is signed. The tip is carried unchanged.
+/// A re-admission into a tip cut adds an exact entry for every name a range
+/// does not decide, below the tip too: the tip accepts it by name, but the
+/// data layer keeps only chain ancestors of the tip and honours an exact
+/// entry as an exemption from that test. Each name is added once (listed
+/// already: nothing to sign), and the tip is carried unchanged.
 #[tokio::test]
-async fn a_readmission_adds_exact_names_to_a_tip_cut() {
+async fn a_readmission_of_an_entry_below_a_tip_is_added_as_an_exact_entry() {
     let root_dev = RootDevice::new().await;
     let root = root_dev.root().await;
     let tips = tip_cut_of(&phone(), 4, PHONE_SEED);
@@ -942,23 +944,45 @@ async fn a_readmission_adds_exact_names_to_a_tip_cut() {
     let above = full(&entry(&phone(), "notes", 7), 1);
     let at_tip = full(&entry(&phone(), "notes", 4), 2);
     let below = full(&entry(&phone(), "notes", 3), 3);
-    let bump = bump_context_readmitting(
-        root.as_ref(),
-        &v2,
-        &phone(),
-        &[above.clone(), at_tip.clone(), below],
-    )
-    .await
-    .unwrap()
-    .expect("a new version");
+    let asked = [above.clone(), at_tip.clone(), below.clone()];
+    let bump = bump_context_readmitting(root.as_ref(), &v2, &phone(), &asked)
+        .await
+        .unwrap()
+        .expect("a name below the tip is signed too");
     let readmitted = bump.context.revocation_cut(&phone()).unwrap();
     assert_eq!(readmitted.tips(), tips.tips());
     let mut exact = readmitted.exact().to_vec();
     exact.sort();
-    let mut expected = vec![above, at_tip];
+    let mut expected = asked.to_vec();
     expected.sort();
-    assert_eq!(exact, expected, "what is below the tip is not added");
+    assert_eq!(exact, expected);
     assert!(readmitted.covers(&tips));
+    assert!(bump.added.is_empty());
+
+    // Listed already: nothing more to sign, for each of them.
+    for name in &asked {
+        assert!(
+            bump_context_readmitting(
+                root.as_ref(),
+                &bump.data,
+                &phone(),
+                std::slice::from_ref(name)
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        ndn_cert::readmissions_to_add(&open(&v2), &phone(), &asked).unwrap(),
+        asked.to_vec()
+    );
+    assert!(
+        ndn_cert::readmissions_to_add(&open(&bump.data), &phone(), &asked)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A cut file carries a tip cut as the RevocationCut TLV, verbatim: no

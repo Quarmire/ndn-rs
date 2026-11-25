@@ -555,8 +555,8 @@ async fn a_revocation_with_a_tip_cut_signs_without_a_manifest() {
 }
 
 /// A re-admission adds one exact full name above a tip to the tip cut:
-/// that packet only (a name below the tip is accepted by name already:
-/// `nothing-to-sign`), and the cut keeps its tip.
+/// that packet only, and the cut keeps its tip; asking for it again signs
+/// nothing (`nothing-to-sign`).
 #[tokio::test]
 async fn readmit_adds_an_exact_entry_to_a_tip_cut() {
     use ndn_cert::{CutFile, GivenCut};
@@ -605,7 +605,64 @@ async fn readmit_adds_an_exact_entry_to_a_tip_cut() {
         )
     );
 
-    // Below the tip the cut accepts by name already: nothing to sign.
+    // Listed already: nothing to sign.
+    let nothing = readmit::readmit(
+        readmit::plan(&pib, &key, &[full(7)], None).unwrap(),
+        &pib,
+        &Device::NotRunning,
+        &secrets,
+    )
+    .await
+    .unwrap_err();
+    assert_code(&nothing, code::NOTHING_TO_SIGN);
+    assert_eq!(versions(&pib), (3, 1));
+}
+
+/// A re-admission of a full name BELOW a tip signs too: the tip accepts it
+/// by name, but the data layer keeps only chain ancestors of the tip, and
+/// an exact entry exempts it from that test. Asking for it again is
+/// `nothing-to-sign`.
+#[tokio::test]
+async fn readmit_adds_an_exact_entry_below_a_tip() {
+    use ndn_cert::{CutFile, GivenCut};
+    use ndn_packet::NameComponent;
+    use ndn_security::RevocationCut;
+
+    let (_dir, pib) = two_roots().await;
+    let secrets = Secrets::new(b"unused");
+    let key = n("/a/member/phone/KEY/k");
+    let notes = ndn_cert::device_log_of(&key).append("notes");
+    let mut cut = RevocationCut::new(key.clone());
+    cut.add_tip(&notes, 4, [9; 32]);
+    cut.set_key_digest([3; 32]);
+    let mut file = CutFile::new(cut);
+    file.held_before = Some(1_000);
+    let planned = revoke::plan(&pib, &key, None, Some(GivenCut { file, lost: 1_000 })).unwrap();
+    revoke::revoke(planned, &key, &pib, &Device::NotRunning, &secrets)
+        .await
+        .unwrap();
+
+    let full = |seq: u64| {
+        notes
+            .clone()
+            .append_component(NameComponent::sequence_num(seq))
+            .append_component(NameComponent::new(
+                ndn_packet::tlv_type::IMPLICIT_SHA256,
+                bytes::Bytes::from(vec![seq as u8; 32]),
+            ))
+    };
+    let planned = readmit::plan(&pib, &key, &[full(2)], None).unwrap();
+    assert_eq!(planned.adding, vec![full(2)]);
+    let readmitted = readmit::readmit(planned, &pib, &Device::NotRunning, &secrets)
+        .await
+        .unwrap();
+    assert_eq!((readmitted.held_version, readmitted.version), (2, 3));
+    assert_eq!(readmitted.readmitted, vec![full(2)]);
+    let (held, _) = read_stored_context(&pib, &n("/a")).unwrap().unwrap();
+    let cut = held.revocation_cut(&key).unwrap();
+    assert_eq!(cut.exact(), &[full(2)]);
+    assert_eq!(cut.tip_for(&notes).map(|t| t.seq), Some(4));
+
     let nothing = readmit::readmit(
         readmit::plan(&pib, &key, &[full(2)], None).unwrap(),
         &pib,
