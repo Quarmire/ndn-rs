@@ -127,7 +127,9 @@ pub trait Transport: Send + Sync + 'static {
 
     /// Send one side frame (see [`crate::side`]) on the carrier `class` asks
     /// for. The frame is sent as is: no LP header, no fragmentation, no
-    /// reliability. The default sends it through
+    /// reliability. The default refuses a frame that does not start with the
+    /// marker [`Malformed`](SideRefused::Malformed) (so an NDN packet never
+    /// takes the side path), then sends it through
     /// [`send_bytes`](Transport::send_bytes) when it fits
     /// [`send_mtu`](Transport::send_mtu) and refuses it
     /// [`TooLarge`](SideRefused::TooLarge) otherwise; `class` is ignored.
@@ -140,6 +142,9 @@ pub trait Transport: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), SideRefused>> + Send {
         let _ = class;
         async move {
+            if frame.first() != Some(&crate::side::SIDE_MARKER) {
+                return Err(SideRefused::Malformed);
+            }
             let max = self.send_mtu().unwrap_or(usize::MAX);
             if frame.len() <= max {
                 self.send_bytes(frame).await.map_err(Into::into)
@@ -574,6 +579,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t.sent.lock().unwrap().len(), 1);
+    }
+
+    /// Only a marked frame goes on the side path: one that does not start with the
+    /// marker (an NDN packet, an empty frame) is refused `Malformed` before the MTU is
+    /// looked at, and nothing is sent.
+    #[tokio::test]
+    async fn send_side_refuses_a_frame_that_does_not_start_with_the_marker() {
+        let t = Recorder::new(Some(100));
+        let ndn = Bytes::from_static(&[0x05, 0x03, 0x07, 0x01, 0x41]);
+        let too_long_and_unmarked = Bytes::from(vec![0x05; 101]);
+        for class in [SideClass::Datagram, SideClass::Stream] {
+            for frame in [ndn.clone(), Bytes::new(), too_long_and_unmarked.clone()] {
+                assert_eq!(
+                    Transport::send_side(&t, frame.clone(), class).await,
+                    Err(SideRefused::Malformed),
+                    "{frame:02x?}"
+                );
+                let erased: &dyn ErasedTransport = &t;
+                assert_eq!(
+                    erased.send_side(frame, class).await,
+                    Err(SideRefused::Malformed)
+                );
+            }
+        }
+        assert!(t.sent.lock().unwrap().is_empty());
     }
 
     /// A `send_bytes` failure is reported as the matching refusal.

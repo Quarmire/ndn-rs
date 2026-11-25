@@ -43,6 +43,13 @@ pub enum SideRefused {
     /// The peer did not advertise channel capability.
     #[error("the peer did not advertise channel capability")]
     PeerLacksChannels,
+    /// The frame does not start with [`SIDE_MARKER`] (or is empty): it is not a
+    /// side frame, and a carrier that would take it could hand an NDN packet to
+    /// a path that never judges one. Nothing was sent.
+    #[error(
+        "not a side frame: it must start with the marker octet 0x00 (send an NDN packet as an Interest or Data on the face, not on the side path)"
+    )]
+    Malformed,
     /// This face or link carries no side frames (a policy decided before any
     /// verdict on the frame).
     #[error("this face carries no side frames")]

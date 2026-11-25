@@ -99,8 +99,10 @@ of the heap crate is the first). `Face::send_side(frame, class)` hands one to
 the transport **without the link service**: no LP header, no fragmentation, no
 reliability, no scope judge. `SideClass` says `Datagram` or `Stream`.
 
-`Transport` defaults are right for most faces: `send_side` sends a frame that
-fits `send_mtu()` through `send_bytes` as is and refuses a longer one
+`Transport` defaults are right for most faces: `send_side` refuses a frame that
+does not start with the marker (`SideRefused::Malformed`; an NDN packet never
+takes the side path), sends one that fits `send_mtu()` through `send_bytes` as
+is and refuses a longer one
 (`SideRefused::TooLarge`; nothing is fragmented), ignoring the class;
 `forward_side` (a synchronous send that never waits) is `Unsupported`;
 `side_frame_max()` is `send_mtu()` or 65,536. Override them only when the
