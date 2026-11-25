@@ -6,9 +6,12 @@
 //! — the proof key, the wrong tries, the key being admitted, the acceptance given, the
 //! use mark, the closing mark — is in the store under `/localhost/ndn-invite/`, each
 //! note durable before the reply it backs; the offer is never a log entry.
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
 use bytes::Bytes;
 use ndn_foundation_types::Name;
-use ndn_heap::{HeapError, MembersChange};
+use ndn_heap::{Heap, HeapError, MembersChange};
 use ndn_packet::Data;
 use ndn_packet::encode::DataBuilder;
 use ndn_sync::StoreOp;
@@ -347,8 +350,10 @@ impl Inner {
     /// askers at the policy's cap, because a use note does not read, or because the
     /// person it was used by is no longer listed by its space (a removed member never
     /// comes back by its code, spec §19.7). Derived from durable data on every call, never
-    /// cached.
+    /// cached; a space that raised `Alert::RolledBack` closes every offer first
+    /// ([`Self::close_after_rollback`]).
     pub(crate) fn offer_closed(&self, id: &OfferId, body: &OfferBody) -> bool {
+        self.close_after_rollback();
         if self.closing_mark(id) || self.overall_tries(id).0 >= self.policy.wrong_tries_max {
             return true;
         }
@@ -365,6 +370,81 @@ impl Inner {
             return false;
         };
         heap.removed_by(&self.node.person_of(&device)).is_some()
+    }
+
+    // ---- a store that may be older than what the device did ---------------------------------
+
+    /// Close every offer held, when `distrusts` holds of the open heap of one of the spaces
+    /// the offers name, and say why. The notes of an offer (`used/`, `using/`, `tries/`) are
+    /// authenticated and cannot be forged, but a copy of the store older than what the device
+    /// did holds an older note that still reads: a restored backup would let a code be used
+    /// again, or give wrong tries back. The closing marks are in the store when this returns
+    /// (every judgement reads them) and flushed in the background: a stop before the flush
+    /// ends is an unclean start, which closes them again. Whether any was closed.
+    fn close_every_offer_if(&self, why: &str, distrusts: impl Fn(&Heap) -> bool) -> bool {
+        let held: Vec<(OfferId, Name)> = self
+            .state
+            .lock()
+            .offers
+            .iter()
+            .map(|(id, held)| (*id, held.body.space.clone()))
+            .collect();
+        let Some(space) = held
+            .iter()
+            .map(|(_, space)| space)
+            .find(|space| self.node.space(space).is_some_and(|heap| distrusts(&heap)))
+        else {
+            return false;
+        };
+        let open: Vec<OfferId> = held
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| !self.closing_mark(id))
+            .collect();
+        if !open.is_empty() {
+            self.store.apply(
+                open.iter()
+                    .map(|id| StoreOp::Insert(store::closed_key(id), Bytes::from_static(&[1])))
+                    .collect(),
+            );
+            for id in &open {
+                self.drop_hint_served(id);
+            }
+            tracing::warn!(device = %self.node.name(), %space, closed = open.len(), "every open offer of this device is closed: {why}; make a new offer for each code still wanted");
+            let store = Arc::clone(&self.store);
+            ndn_app::rt::spawn(async move {
+                if let Err(e) = store::flush(&store).await {
+                    tracing::warn!("the closing of the offers is not durable: {e}");
+                }
+            });
+        }
+        true
+    }
+
+    /// At a start: close every offer read back when the node opened a space they name after
+    /// a stop it did not make ([`Heap::started_unclean`]): the store may be a copy older
+    /// than what this device did and the peers hold.
+    pub(crate) fn close_after_unclean_start(&self) {
+        self.close_every_offer_if(
+            "the space they name was opened after a stop the node did not make, so the notes of the offers may be older than what this device did",
+            Heap::started_unclean,
+        );
+    }
+
+    /// Once, the first time a space the offers name has raised `Alert::RolledBack`
+    /// ([`Heap::rolled_back`]: entries signed under this device's name lie above what it
+    /// kept, so the store is an old image or a copy of one): close every offer held then.
+    /// An offer made later is not about that rollback.
+    fn close_after_rollback(&self) {
+        if self.rollback_closed.load(Ordering::Acquire) {
+            return;
+        }
+        if self.close_every_offer_if(
+            "a space they name found this device's store older than what its peers hold, so the notes of the offers cannot be trusted",
+            Heap::rolled_back,
+        ) {
+            self.rollback_closed.store(true, Ordering::Release);
+        }
     }
 
     /// Close the offer `id`, durably, and drop the packet kept for its hint token so

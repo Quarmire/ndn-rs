@@ -385,8 +385,8 @@ generic component (§15). `key/<id>`, `hint/<id>`, `using/<id>`, `used/<id>`, `t
 a 32-octet HMAC-SHA256 over their own key's Name TLV and their value, under a key derived from the device's recipient
 secret (§18.1): a note that does not check is **unread** and fails closed (a use mark or use under way: a use by a key
 nobody knows; tries: the cap; a proof key: the offer is not held and an ask of it gets no answer), and a note moved to another key does not check. A device writes
-`used/<id>` at most once and never changes it (the first mark naming a key stands); `closed/<id>` is written by `close_offer`
-and by the overall cap, and writing it again changes nothing. Only the offering device marks its offer: the marks are local,
+`used/<id>` at most once and never changes it (the first mark naming a key stands); `closed/<id>` is written by `close_offer`, by the
+overall cap and by a start after an unclean stop or a rollback (§5.4), and writing it again changes nothing. Only the offering device marks its offer: the marks are local,
 not served, and authenticated by the MAC, not signed, because nobody else reads them. Other devices of the inviter do not hold an offer they
 did not make: an ask of it gets no answer (§9.2 step 4, §18).
 
@@ -425,6 +425,14 @@ An offer is **closed**, judged on every ask and every hint request from durable 
 - `closed/<id>` is held;
 - all askers' wrong tries are at the device's cap (§9.6): the overall counter reached `wrong_tries_max`; the ask that reaches it
   also writes `closed/<id>`;
+- the device may hold notes older than what it did: **every offer held is closed**, `closed/<id>` written for each, (a) when the
+  node opened a space an offer names after a stop it did not make (`Heap::started_unclean`: a crash, a power cut, an image copied while
+  the device ran), at the start of the introductions, and (b) the first time a space an offer names raises `Alert::RolledBack`
+  (`Heap::rolled_back`, heap.md §4.8: the device's store is older than what its peers hold), before the next ask or hint request of any
+  offer is judged. The marks are in the store before that judgement and flushed after; one lost to a stop is written again by the unclean
+  start that follows. A backup restored under a running device could otherwise roll `used/<id>`, `using/<id>` or `tries/…` back and
+  let a code be used again (§18.1). An offer made after the alert is not about it, and a stop of this device that was clean closes
+  nothing. The cost: a crash closes the offers, a joiner whose use was under way meets `Closed`, and the owner makes a new offer;
 - the space's members no longer list the person the offer was used by — or, while a use is under way, the key being admitted
   (`Heap::removed_by` names a removal of that device's person, heap.md §10.3): a removed member never comes back by its code
   (§9.5). This is a derivation, **not** a mark: nothing is written, the offer is closed for as long as the removal stands in
@@ -1163,8 +1171,9 @@ If the adoption or the entry fails, the device drops `using/<id>` durably — th
 no answer (a Nack); if the host adopts the asker but the namespace it adopted from its genesis does not hold the presented
 anchors, or the asker's proof does not verify under the namespace as this device now holds it, the device drops
 `using/<id>` the same way and answers `Conflict`. The joiner's retry is judged again. If the durable batch of step 5 fails,
-`using/<id>` stays and the device gives no answer: a stop after step 1 and before the batch leaves the offer to that key,
-and its retry runs the use again (step 6 of the checks lets no other key in, and no other key is counted).
+`using/<id>` stays and the device gives no answer: a retry in the same run runs the use again (step 6 of the checks lets no
+other key in, and no other key is counted). A stop after step 1 and before the batch is a stop the node did not make, so the
+next start closes every offer (§5.4): the retry meets `Closed`, nobody is admitted by the offer, and the owner makes a new one.
 
 ### 9.4 The inviter's effect on the space
 
@@ -1730,7 +1739,7 @@ component; `<key>` the public-key digest, 32 octets, as one generic component.
 | `using/<id>` | the key a use under way is for: its Name TLV, then the digest (32 octets) | start of the use (§9.3 step 1); dropped on failure and in the batch of step 5 | inviter |
 | `accepted/<id>` | the acceptance answered to the key that used the offer (one `INTRO_ANSWER`) | with `used/<id>` (§9.3 step 5) | inviter |
 | `used/<id>` | the use mark: one `INTRO_USED` naming the offer, the key and its public key's digest (§16.1) | with the acceptance; at most once | inviter |
-| `closed/<id>` | the closing mark: one octet, `1` | `close_offer`, the overall cap (a removal closes by derivation, nothing is written, §5.4) | inviter |
+| `closed/<id>` | the closing mark: one octet, `1` | `close_offer`, the overall cap, a start after an unclean stop, the first `RolledBack` (a removal closes by derivation, nothing is written, §5.4) | inviter |
 | `grant/<id>` | the grant note, MAC'd (§10 rule 3, 11) | with the acceptance | inviter |
 | `mirror/<space>/<key>` | the mirror note, MAC'd (§11 rule 17) | when the admission is held | joiner |
 
@@ -1907,7 +1916,7 @@ first, and the ones that changed say so.
 - **An offer is not in the log.** The log of a space holds the membership the offer made and nothing of the offer, its use or
   its closing, so what a member or a relay holds of the space says nothing of who was invited, when, with what expiry or
   how many tries. The use mark is a note of the offering device (`used/<id>`), local and authenticated by a MAC (below): **only that device
-  sees the offer used**, and another device of the inviter answers `Unknown` for it (the old design's note "every device of
+  sees the offer used**, and another device of the inviter gives no answer to an ask of it (the old design's note "every device of
   the inviter sees the offer used" no longer holds, and need not: an offer is answered only by the device that made it).
 - **The notes an offer is judged by are authenticated, and fail closed.** The recipient key a note is wrapped to is
   public, so the wrap proves nothing of who wrote it: `key/<id>`, `hint/<id>`, `using/<id>`, `used/<id>`, `tries/<id>` and
@@ -1920,10 +1929,22 @@ first, and the ones that changed say so.
   offer is a signed Data and the device checks its own signature when it reads its offers at a start: a note the device's key
   did not sign is not an offer of the device's, so one written into the store is neither served nor judged. `closed/<id>` takes any
   value (a forgery only closes) and `accepted/<id>` is not read when it does not decode (the acceptance is made again, never
-  admitting). **Residual, not defended:** a MAC cannot protect a note against its **deletion** or against its replacement by an
-  older note that read. A party that can delete or roll back `used/<id>`, `using/<id>` or `tries/…` reopens the single use or
-  gives wrong tries back; the store of a device is the device's, and its protection (permissions, encryption at rest, backups
-  that are not restored under a running device) is the host's.
+  admitting). **Residual, narrowed:** a MAC cannot protect a note against its **deletion** or against its replacement by an
+  older note that read, so a backup restored under the device could roll `used/<id>`, `using/<id>` or `tries/…` back and let a
+  code be used a second time. What the device does about it: it **closes every offer it holds** (`closed/<id>`, as `close_offer`
+  does) (a) at a start after a stop the node did not make, which is what a copy of a running device shows
+  (`Heap::started_unclean` of a space an offer names), and (b) the first time a space an offer names raises `Alert::RolledBack`
+  (`Heap::rolled_back`: an entry signed under this device's name lies above what it reserved, so its store is older than what its
+  peers hold: heap.md §4.8), before the next ask or hint of any offer is judged. The cost is that every crash, and every start after
+  one, closes the offers: a joiner whose use was under way meets `Closed` and asks for a new code, and the owner makes one (an
+  admission already made stays: a used offer's user is still answered, §9.2 step 5). **What a restore can still do:** (1) restore
+  an image that was stopped cleanly and that no peer can contradict — nothing signed since the backup is held by a peer, or no peer
+  has yet been reached — so the space shows no rollback: the offers of that image are open, as they were when it was taken, and a code
+  can be used once more; (2) ask in the window between the start and the first vector of a peer, which is what raises the alert.
+  Neither gives more than one use of a code the owner made, to a holder of its secret, within its expiry; the members entry that
+  admits the second key is signed by this device and is seen by every member. Rolling back `tries/…` alone is harmless: the secret
+  is always 16 octets (128 bits), so wrong tries given back buy no useful number of guesses. The store of a device is the device's, and
+  its protection (permissions, encryption at rest, backups that are not restored under a running device) is the host's.
 - **The inviter's effect is one entry.** Nothing but one `Heap::change` reaches the space (§9.4). The entry is signed by the
   heap's rules, judged by every reader as any members entry (heap.md §3.8 step 6), and the joiner waits for exactly it
   (§8.5): an entry that raced it, or a fold that listed the person by another carrier, is not taken for it.
@@ -1931,6 +1952,26 @@ first, and the ones that changed say so.
   of a keyword the extension registered (`intro`, `hint`, `ask`): the key signs offers, hint records, answers and the proof packets
   `<X>/32=ask/<binding>` and cannot be made to sign an entry's name, a certificate's, another device's or any octets the caller names
   (heap.md §10.2; the node offers no raw signing).
+- **A refusal travels only to an asker that proved a key.** The asker's proof packet is checked (§9.2 step 3) before the offer is
+  looked up, closed, used or expired: an ask whose asker proved no key, and an ask that names an offer this device does not hold, are
+  met with silence. A party that holds no proving key learns of a held offer neither that it is open, nor used, nor closed; a random
+  id, and the id of an offer the device never made, learn nothing even from an asker that proved a key. The signature check that this
+  needs is one the ask pays in any case, bounded as a crowd of asks is (§9.1).
+- **Only an owner device shows a code.** `offer` refuses a device that is no owner device of the space (a `guest` or `node` device
+  of the owner's namespace, in a namespace that declares the role layout) and a space whose creation it has not seen, before the offer
+  is made, stored or served (§5.3), so a code is never shown that admits nobody and leaves its joiner with silence; a device that was
+  one when it made an offer and no longer is gives no answer at the admission (§9.4). Nothing is widened by this: the admission was
+  always `Heap::change`'s, and refused to such a device.
+- **A grant of a space this device cannot read is revoked.** The grant's fold is the space's members; while the space is not open
+  here, or its creation is not held, the host is told `revoke_grant` once and the note stays, so a link the grant opened is not left
+  standing on a fold that was not seen (rule 6 of §10); opening the space installs it again if the person is still listed. Residual:
+  the joiner's own mirror notes keep the earlier rule (nothing is done while the space is not open here): they admit only the
+  inviter's own link, which this device did not ask to be cut.
+- **Grant-link routes persist until the link ends.** A grant installs the link's routes when the link is admitted, and the routes
+  stay until the link ends; ending or revoking the grant does not remove them. What crosses the link is not decided by the routes: the
+  link's name filter and its `answers_in` filter are judged at every packet against the grants in force then (ndn-link.md §8.7 rules
+  5 and 10), so a person whose grant ended sends an Interest along a route that is still there and gets a Nack, and receives nothing:
+  the cost of the persistence is a Nack at the link, never data.
 
 ### 18.2 Carried over
 
@@ -1972,6 +2013,15 @@ first, and the ones that changed say so.
   substituted offer and opened the ask learns the joiner's public credentials, cannot answer as the inviter, and can at most relay
   the ask to the real inviter — whose answer admits exactly the joiner. A refusal is not authenticated: a forged one denies, never
   admits, and an on-path party can deny anyway.
+- **Link and words codes: the offer's seal key is not authenticated when the ask is sealed.** A short code's record vouches for the
+  offer before the ask is sealed (S7); a link or a words code has no record, so nothing vouches for the offer packet until the
+  answer's credentials are judged (§8.2 step 3). With the commitment public, an active party on the transit path that serves a
+  substituted offer — its own seal key, the genuine commitment — is sealed the ask and reads it: the joiner's public credentials
+  (its namespace's trust context and certificates), its device name and its proof of the secret. **It gains no admission:** it
+  cannot sign the answer as the inviter's device under the anchor the code's fingerprint names, so the joiner refuses its answer
+  (`Forged`, `InviterConflict`) and adopts nothing; relaying the ask to the real inviter admits exactly the joiner, whose key, digest
+  and nonce the proof binds; and a passive observer sees only sealed bytes. What is lost to such a party is the privacy of the joiner's
+  public credentials and device name. A host that wants the offer authenticated before the ask is sealed uses a short code.
 - **Joiner impersonation.** The asker's key must chain to the anchor it presents, and a namespace already trusted under another
   anchor, one under or over any namespace the inviter trusts or its own, the root, or one the policy refuses is refused
   (`Conflict`): a joiner cannot speak for a namespace the inviter knows, take over a name under one (a device name of a person the
@@ -2140,7 +2190,12 @@ id. The rules above that a case guards, and the tests this crate names for them:
 | i26 | A short code is refused saying why: a typo, a wrong count, a closed, expired or unanswered offer, an altered record | §17.2 |
 
 The new tests this crate adds for what changed: `an_offer_is_served_as_an_extension_under_32_intro_offer` (§2.3, §5.5) and
-`the_offer_name_cannot_be_guessed` (§2.3, §18.1: 16 random octets; refusal is silence).
+`the_offer_name_cannot_be_guessed` (§2.3, §18.1: 16 random octets; refusal is silence); and for the stage-7 review:
+`an_unproven_ask_gets_silence_for_an_unknown_used_or_closed_offer` (§9.2 steps 3–5, §17.1),
+`a_guest_or_relay_device_makes_no_offer` and `a_space_whose_creation_is_not_held_makes_no_offer` (§5.3),
+`a_grant_whose_space_is_not_open_is_revoked_and_installed_again_when_it_opens` (§10 rule 6),
+`an_unclean_start_closes_every_open_offer`, `a_rolled_back_store_closes_every_open_offer` and
+`a_stop_between_using_and_the_members_change_closes_the_offer_at_the_next_start` (§5.4, §9.3, §18.1).
 
 ## 20. Differences from data-layer §19
 

@@ -9,6 +9,7 @@
 //! what is made again from those notes at a start.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -158,6 +159,9 @@ pub(crate) struct Inner {
     pub(crate) serial: tokio::sync::Mutex<()>,
     /// The grants and mirror notes.
     pub(crate) grants: Arc<Grants>,
+    /// Whether the offers held were closed because a space they name raised
+    /// `Alert::RolledBack` (once: an offer made later is not about that rollback).
+    pub(crate) rollback_closed: AtomicBool,
 }
 
 /// One ask held ([`State::queued`]), let go as it is dropped.
@@ -190,8 +194,11 @@ impl Invites {
     /// Start the introductions of `node`'s device: register the extension that serves
     /// offers, hint records and ask proofs, read back what an earlier run kept under
     /// `/localhost/ndn-invite/` (offers, hint tokens, grants, mirror notes) and begin
-    /// to follow the spaces those grants are about. `host` is what the introductions
-    /// need of the device's host: its anchor, adopting another person's, dialling.
+    /// to follow the spaces those grants are about. A start after a stop the node did
+    /// not make closes every offer read back ([`Invites::close_offer`]'s mark, spec
+    /// §5.4): what the notes of an offer say may be older than what the device did.
+    /// `host` is what the introductions need of the device's host: its anchor, adopting
+    /// another person's, dialling.
     ///
     /// # Errors
     ///
@@ -238,8 +245,10 @@ impl Invites {
             }),
             serial: tokio::sync::Mutex::new(()),
             grants,
+            rollback_closed: AtomicBool::new(false),
         });
         inner.restore();
+        inner.close_after_unclean_start();
         inner
             .node
             .extend(Arc::new(Served(Arc::downgrade(&inner))))?;

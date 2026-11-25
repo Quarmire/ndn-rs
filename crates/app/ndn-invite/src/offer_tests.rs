@@ -746,10 +746,14 @@ async fn wrong_tries_survive_a_restart() {
         matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
         "a key whose tries are spent was answered {got:?} with the right secret"
     );
-    // Another asker's tries are its own: it is not closed out by Bob's.
+    // Nobody else is admitted either: the power cut left an unclean start, which closes
+    // the offer (its notes may be older than what the device did).
     let carol_phone = phone_of("/carol").await;
     let got = alice.answers(&carol_phone).await;
-    assert!(accepted(&got), "carol was answered {got:?}");
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
+        "carol was answered {got:?} by an offer after an unclean start"
+    );
 }
 
 /// Spec §19.4, i5: a code presented by two keys at once admits one, never two; asking

@@ -385,10 +385,12 @@ async fn a_joiner_whose_namespace_overlaps_a_held_one_is_answered_conflict() {
 // ---- T2: the crash window and the removal elsewhere -----------------------------------------------------
 
 /// A stop after the use was noted and before the members change (the host's adoption was
-/// under way) leaves the offer to the key being admitted: its retry finishes the use with
-/// exactly one members entry, and another key finds the offer used.
+/// under way), the next start finding the node's stop unclean: the use noted is durable, and
+/// nothing of it is finished. The unclean start closes the offer (the notes may be older than
+/// what the device did), so no key is admitted by it, the key that was being admitted
+/// included: it is told the offer is closed, and the owner makes a new one.
 #[tokio::test]
-async fn a_stop_between_using_and_the_members_change_leaves_the_offer_to_its_key() {
+async fn a_stop_between_using_and_the_members_change_closes_the_offer_at_the_next_start() {
     let started = Arc::new(Notify::new());
     let gate = Arc::new(Semaphore::new(0));
     let disk = DiskStore::new();
@@ -433,35 +435,15 @@ async fn a_stop_between_using_and_the_members_change_leaves_the_offer_to_its_key
         .store(image)
         .start()
         .await;
-    // Another key finds the offer its first key's.
-    let got = answer(&laptop, ask(&carol, &laptop, &code.offer, &secret, &[])).await;
-    assert!(
-        matches!(got, Some(Outcome::Refused(IntroRefusal::Used))),
-        "another key was answered {got:?} by an offer whose use was under way"
-    );
-    assert!(!listed(&laptop, "/carol"));
-    // The key being admitted finishes it, once.
-    let got = answer(&laptop, ask(&bob, &laptop, &code.offer, &secret, &[])).await;
-    let Some(Outcome::Accepted { admitted, .. }) = got else {
-        panic!("the key that was being admitted was answered {got:?}");
-    };
-    assert!(
-        admitted.is_some(),
-        "the finished use names no members entry"
-    );
-    assert!(listed(&laptop, "/bob"));
-    let h = heap(&laptop, &notebook());
-    assert_eq!(
-        h.members()
-            .writers
-            .iter()
-            .filter(|w| **w == n("/bob"))
-            .count(),
-        1,
-        "the person is listed twice"
-    );
-    let again = answer(&laptop, ask(&bob, &laptop, &code.offer, &secret, &[])).await;
-    assert!(accepted(&again));
+    // No key is admitted by the offer now: it is closed, the one being admitted included.
+    for (who, name) in [(&carol, "another key"), (&bob, "the key being admitted")] {
+        let got = answer(&laptop, ask(who, &laptop, &code.offer, &secret, &[])).await;
+        assert!(
+            matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
+            "{name} was answered {got:?} by an offer whose use was under way at an unclean stop"
+        );
+    }
+    assert!(!listed(&laptop, "/carol") && !listed(&laptop, "/bob"));
 }
 
 /// The members change that removes the person an offer admitted may be signed by another
@@ -589,9 +571,9 @@ async fn asks_opened_at_once_never_exceed_asks_verifying() {
 // ---- T4: a members change that fails does not spend the offer --------------------------------------------
 
 /// The members change fails after the asker's anchor was adopted (here the node stops while
-/// the host adopts): nothing is written as used, the use under way is let go, the asker is
-/// told nothing, and the offer is as it was — once the device runs again, the asker's retry
-/// is answered and admits it once.
+/// the host adopts): nothing is written as used, the use under way is let go, and the asker is
+/// told nothing. The node stopped, so the next start is unclean and closes the offer: the
+/// retry is refused as closed (not as used: nothing was spent) and admits nobody.
 #[tokio::test]
 async fn an_offer_is_not_spent_when_the_members_change_fails() {
     let started = Arc::new(Notify::new());
@@ -628,7 +610,8 @@ async fn an_offer_is_not_spent_when_the_members_change_fails() {
         "a failed admission left the offer to its asker"
     );
     assert_eq!(calls.granted(), Vec::new());
-    // The device runs again over what it kept: the retry is judged again.
+    // The device runs again over what it kept, after a stop it did not make: the offer is
+    // closed and was never spent.
     let Offered {
         laptop,
         alice: alice_person,
@@ -645,9 +628,13 @@ async fn an_offer_is_not_spent_when_the_members_change_fails() {
         .store(disk as Arc<dyn DataStore>)
         .start()
         .await;
+    assert!(!laptop.store.contains(&store::used_key(&id)));
     let got = answer(&laptop, ask(&bob, &laptop, &code.offer, &secret, &[])).await;
-    assert!(accepted(&got), "the retry was answered {got:?}");
-    assert!(listed(&laptop, "/bob"));
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
+        "the retry was answered {got:?} after an unclean stop"
+    );
+    assert!(!listed(&laptop, "/bob"));
 }
 
 // ---- L3: a refusal travels only to an asker that proved a key (spec §9.2, §17.1) --------------------
@@ -882,5 +869,234 @@ async fn a_space_whose_creation_is_not_held_makes_no_offer() {
     assert!(
         laptop.invites.inner().state.lock().offers.is_empty(),
         "an offer was held"
+    );
+}
+
+// ---- residual: a restored store cannot reopen a code ----------------------------------------------
+
+/// A start after a stop the node did not make (a crash, a power cut, an image copied while
+/// the device ran) closes every offer held, with the closing mark durable: the notes of
+/// the offers (`used/`, `using/`, `tries/`) may be older than what this device did, so a
+/// code could be used a second time, and the owner makes a new one. A clean stop and start
+/// leaves them open. Nobody is admitted by a closed offer, whoever asks and whatever they hold.
+#[tokio::test]
+async fn an_unclean_start_closes_every_open_offer() {
+    let disk = DiskStore::new();
+    let alice = Inviter::over(
+        Role::Writer,
+        IntroPolicy::new(),
+        &[],
+        Arc::clone(&disk) as Arc<dyn DataStore>,
+    )
+    .await;
+    let (second, second_secret) = alice_offer_again(&alice).await;
+    let ids = [alice.id(), parse_offer_name(&second).unwrap().1];
+    // A clean stop and start leaves both open.
+    let alice = alice.restart(Arc::clone(&disk) as Arc<dyn DataStore>).await;
+    for id in &ids {
+        assert!(
+            !alice.laptop.store.contains(&store::closed_key(id)),
+            "a clean stop and start closed an offer"
+        );
+    }
+    // The power goes while the device runs: the image is what a copy of a running device holds.
+    let image = disk.crash();
+    let alice = alice.restart(image).await;
+    for id in &ids {
+        assert!(
+            alice.laptop.store.contains(&store::closed_key(id)),
+            "an offer stayed open across an unclean start: a restored copy of the store could let its code be used twice"
+        );
+    }
+    let bob = phone_of("/bob").await;
+    let got = alice.answers(&bob).await;
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
+        "a code was answered {got:?} after an unclean start"
+    );
+    let got = answer(
+        &alice.laptop,
+        ask(&bob, &alice.laptop, &second, &second_secret, &[]),
+    )
+    .await;
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
+        "a second code was answered {got:?} after an unclean start"
+    );
+    assert!(!listed(&alice.laptop, "/bob"), "bob was admitted");
+}
+
+/// Alice's laptop on the net over `store` (with its `keys` after the first run), her devices
+/// of the test holding each other's certificates.
+async fn laptop_on(
+    net: &Net,
+    cancel: &CancellationToken,
+    alice: &Person,
+    store: Arc<dyn DataStore>,
+    keys: Option<Arc<SecurityManager>>,
+    peers: &[&Device],
+) -> Device {
+    let mut setup = Setup::new(alice, "/alice/laptop")
+        .config(fast())
+        .on(net, cancel)
+        .store(store);
+    if let Some(keys) = keys {
+        setup = setup.keys(keys);
+    }
+    let laptop = setup.start().await;
+    for peer in peers {
+        for (from, to) in [(&laptop, *peer), (*peer, &laptop)] {
+            let k = key(&from.name);
+            let public = from.keys.get_signer_sync(&k).unwrap().public_key().unwrap();
+            to.validator
+                .cert_cache()
+                .insert(alice.certify(&k, &public).await);
+        }
+    }
+    laptop
+}
+
+/// A backup of the device taken while its offer was open, put back after the offer was used
+/// and its person admitted — the image says the stop was clean, so nothing but the space shows
+/// it: the phone holds entries signed under the laptop's name above what the image reserved,
+/// and the laptop raises `RolledBack`. The `used/` note is gone with the rollback, so another
+/// key holding the code would be admitted a second time: every offer is closed instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rolled_back_store_closes_every_open_offer() {
+    let net = Net::new().await;
+    let alice = Person::new("/alice");
+    let disk = DiskStore::new();
+    let store = || Arc::clone(&disk) as Arc<dyn DataStore>;
+    let first_run = CancellationToken::new();
+    let phone_net = CancellationToken::new();
+    let laptop = laptop_on(&net, &first_run, &alice, store(), None, &[]).await;
+    let keys = Arc::clone(&laptop.keys);
+    let phone = Setup::new(&alice, "/alice/phone")
+        .config(fast())
+        .on(&net, &phone_net)
+        .start()
+        .await;
+    let a = alice_offers(laptop, alice, Role::Writer).await;
+    meet(&a, &phone).await;
+    let theirs = phone.node.open(&notebook()).await.unwrap();
+    for _ in 0..300 {
+        if theirs.members_known() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(theirs.members_known(), "the phone never held the space");
+    // The phone signs an entry the laptop holds: the laptop knows a peer, so a start from
+    // this image waits for what the peers hold of the laptop.
+    let mut written = false;
+    for _ in 0..300 {
+        if theirs
+            .put(
+                &n("/note"),
+                Bytes::from_static(b"hello"),
+                Default::default(),
+            )
+            .await
+            .is_ok()
+        {
+            written = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(written, "the phone never wrote into the space");
+    let mine = heap(&a.laptop, &notebook());
+    for _ in 0..300 {
+        if matches!(mine.get(&n("/note")).await, Ok(Some(_))) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        matches!(mine.get(&n("/note")).await, Ok(Some(_))),
+        "the laptop never held the phone's entry"
+    );
+    drop(mine);
+    let Offered {
+        laptop,
+        alice,
+        code,
+        secret,
+    } = a;
+    let id = parse_offer_name(&code.offer).unwrap().1;
+    // The backup: the device stopped cleanly with its offer open.
+    let rig = Arc::try_unwrap(laptop)
+        .ok()
+        .expect("only the test holds the laptop");
+    rig.node.close().await;
+    drop(rig.invites);
+    first_run.cancel();
+    let backup = disk.crash();
+
+    // The device runs on (clean start: its offer stays open) and Bob uses the code; the phone
+    // holds the entry that admitted him.
+    let second_run = CancellationToken::new();
+    let laptop = laptop_on(
+        &net,
+        &second_run,
+        &alice,
+        store(),
+        Some(Arc::clone(&keys)),
+        &[&phone],
+    )
+    .await;
+    assert!(
+        !laptop.store.contains(&store::closed_key(&id)),
+        "a clean start closed the offer"
+    );
+    let bob = phone_of("/bob").await;
+    let got = answer(&laptop, ask(&bob, &laptop, &code.offer, &secret, &[])).await;
+    assert!(accepted(&got), "bob was answered {got:?}");
+    for _ in 0..300 {
+        if theirs.members().writers.contains(&n("/bob")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        theirs.members().writers.contains(&n("/bob")),
+        "the phone never saw bob listed"
+    );
+    let rig = Arc::try_unwrap(laptop)
+        .ok()
+        .expect("only the test holds the laptop");
+    rig.node.close().await;
+    drop(rig.invites);
+    second_run.cancel();
+
+    // The backup is restored under the running phone: used/ is gone, the offer is open again.
+    let third_run = CancellationToken::new();
+    let laptop = laptop_on(&net, &third_run, &alice, backup, Some(keys), &[&phone]).await;
+    assert!(
+        !laptop.store.contains(&store::used_key(&id)),
+        "precondition: the restored store holds no use mark"
+    );
+    let heap = laptop.node.space(&notebook()).expect("the restored space");
+    for _ in 0..400 {
+        if heap.rolled_back() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        heap.rolled_back(),
+        "precondition: the space never raised RolledBack"
+    );
+    // Carol holds the same code. The restored notes would admit her; the offer is closed.
+    let carol = phone_of("/carol").await;
+    let got = answer(&laptop, ask(&carol, &laptop, &code.offer, &secret, &[])).await;
+    assert!(
+        matches!(got, Some(Outcome::Refused(IntroRefusal::Closed))),
+        "a key was answered {got:?} by an offer of a store the device found rolled back: the code was used twice"
+    );
+    assert!(!listed(&laptop, "/carol"), "carol was admitted");
+    assert!(
+        laptop.store.contains(&store::closed_key(&id)),
+        "the offer was refused without a closing mark"
     );
 }
