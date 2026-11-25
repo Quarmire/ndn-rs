@@ -252,8 +252,10 @@ fn standing(log: &Log, judge: &Judge, key: &Name, reads: bool) -> Result<Name, S
     if person.is_empty() || !(fold.is_writer(person) || (reads && fold.is_reader(person))) {
         return Err(not_member());
     }
-    // The owner's person stands only through its owner devices (`admin` or `member`).
-    if person == fold.owner() && !owner_capable(&context, key) {
+    // A person stands only through its `admin` and `member` devices, where its namespace
+    // declares the role layout: a `guest` or a `node` relay device of a member is no member
+    // for signals, as none is for the owner (spec §9.9).
+    if !owner_capable(&context, key) {
         return Err(not_member());
     }
     match context.is_revoked(key) {

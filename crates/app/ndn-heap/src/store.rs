@@ -103,6 +103,11 @@ impl Kind {
     /// removed when the fold lists the person, and when a removal of her
     /// arrives that it does not name.
     pub(crate) const JOINED: Kind = Kind("joined");
+    /// `granted/<S>/<key>`: the seal key packet of a device this owner device granted an epoch
+    /// key of the sealed space `S` to, by the key that signed it. What a lapse is judged by
+    /// ([`crate::space::SpaceInner::sweep_lapsed`]); removed once the epoch signed for the
+    /// lapse is.
+    pub(crate) const GRANTED: Kind = Kind("granted");
 
     /// `/localhost/ndn-heap/<kind>`: the prefix of every key of the kind.
     fn root(self) -> Name {

@@ -87,6 +87,9 @@ impl crate::sync::net_kit::Host for NodeInner {
     async fn validate_asker_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged {
         NodeInner::validate_asker_packet(self, space, data, device).await
     }
+    fn note_grantee(&self, space: &Name, key: &Name, seal_packet: &Bytes) -> Result<(), String> {
+        NodeInner::note_grantee(self, space, key, seal_packet)
+    }
     fn key_arrived(&self, space: &Name, epoch: &EpochId, name: &Name, content: Bytes) -> bool {
         NodeInner::key_arrived(self, space, epoch, name, content)
     }
@@ -185,6 +188,10 @@ impl Trust {
             let mut ctx = SignedTrustContext::hierarchical(ns.clone());
             if layered {
                 ctx = ctx.schema_authoritative();
+                // As the context `ndn-fwd init` makes: every role needs a cut once lapsed.
+                for role in ["admin", "member", "guest", "node"] {
+                    ctx = ctx.with_data_requires_cut(role);
+                }
             }
             assert!(ctx.add_anchor(anchor.clone()));
             validator.adopt_context(Arc::new(ctx)).unwrap();
@@ -207,6 +214,15 @@ pub(crate) async fn world(devices: &[&str]) -> Vec<Dev> {
 
 /// [`world`] with the namespace of each device given by `ns_of`.
 pub(crate) async fn world_of(devices: &[&str], ns_of: impl Fn(&Name) -> Name) -> Vec<Dev> {
+    world_with(devices, ns_of, |_| 365 * 24 * 3600 * 1000).await
+}
+
+/// [`world_of`] with the validity of each device's certificate, in ms, given by `validity`.
+pub(crate) async fn world_with(
+    devices: &[&str],
+    ns_of: impl Fn(&Name) -> Name,
+    validity: impl Fn(&Name) -> u64,
+) -> Vec<Dev> {
     let mut roots: Vec<(Name, SecurityManager, Name, Certificate)> = Vec::new();
     for d in devices {
         let ns = ns_of(&n(d));
@@ -231,7 +247,7 @@ pub(crate) async fn world_of(devices: &[&str], ns_of: impl Fn(&Name) -> Name) ->
             .unwrap();
         let public = keys.get_signer_sync(&key).unwrap().public_key().unwrap();
         let cert = root
-            .certify(&key, public, root_key, 365 * 24 * 3600 * 1000)
+            .certify(&key, public, root_key, validity(&name))
             .await
             .unwrap();
         made.push((name, keys, cert));

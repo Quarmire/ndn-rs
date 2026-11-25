@@ -317,6 +317,10 @@ pub(crate) struct Toy {
     pub lapsed: bool,
     /// How many times `may_grant` was asked before the asker's key was known.
     pub grant_asks: usize,
+    /// The keys `note_grantee` was told of, in order.
+    pub grantees: Vec<Name>,
+    /// Why `note_grantee` refuses, when the toy's record is full.
+    pub grantees_full: Option<String>,
     /// The generation of the judge the toy reports.
     pub generation: u64,
     /// The keys the toy says are revoked.
@@ -358,6 +362,7 @@ pub(crate) trait Host: Send + Sync + 'static {
     fn seal_public(&self) -> [u8; 32];
     async fn validate_device_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged;
     async fn validate_asker_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged;
+    fn note_grantee(&self, space: &Name, key: &Name, seal_packet: &Bytes) -> Result<(), String>;
     fn key_arrived(&self, space: &Name, epoch: &EpochId, name: &Name, content: Bytes) -> bool;
     fn generation(&self) -> u64;
     fn may_grant(
@@ -676,6 +681,15 @@ impl Host for Toyhost {
 
     async fn validate_asker_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged {
         self.validate_device_packet(space, data, device).await
+    }
+
+    fn note_grantee(&self, _space: &Name, key: &Name, _seal_packet: &Bytes) -> Result<(), String> {
+        let mut st = self.st.lock();
+        if let Some(why) = st.grantees_full.clone() {
+            return Err(why);
+        }
+        st.grantees.push(key.clone());
+        Ok(())
     }
 
     fn key_arrived(&self, _space: &Name, epoch: &EpochId, name: &Name, _content: Bytes) -> bool {

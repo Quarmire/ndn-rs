@@ -46,10 +46,10 @@ use crate::rt;
 use crate::seal;
 use crate::store::Kind;
 use crate::sync::{Group, TIMELINE};
-use crate::trust::Listing;
+use crate::trust::{Judged, Listing};
 use crate::wire::{
     AUDIENCE_MAX, ChunksBody, EpochId, INLINE_MAX, MembersBody, Op, PAYLOAD_MAX, Payload, Role,
-    log_name, parse_log_name, signed_digest_of,
+    device_of, log_name, parse_log_name, signed_digest_of,
 };
 
 #[cfg(test)]
@@ -252,6 +252,10 @@ pub(crate) struct SpaceInner {
     /// The entries whose refusal was told, last [`REFUSED_MAX`], with the
     /// alert: a watcher that begins later is told them after the heads.
     refused: Mutex<VecDeque<(Name, Alert)>>,
+    /// The keys of devices of readers this owner device granted epoch keys to whose
+    /// certificates lapsed by this node's clock, as the last [`Self::sweep_lapsed`] found
+    /// them: what owes the space a new epoch until one is signed (spec §6.5).
+    lapsed: Mutex<BTreeSet<Name>>,
 }
 
 /// The most standing alerts a space keeps for watchers that begin later.
@@ -319,6 +323,7 @@ impl SpaceInner {
             owed: Mutex::new(HashMap::new()),
             standing: Mutex::new(Vec::new()),
             refused: Mutex::new(VecDeque::new()),
+            lapsed: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -516,9 +521,61 @@ impl SpaceInner {
             return false;
         }
         let lost = self.reader_losses(node, log);
-        !lost.is_empty()
-            && node.store.get(&Kind::REVOKED.of(&self.name)).as_deref()
-                != Some(&revocations_digest(&lost)[..])
+        !self.lapsed_readers(log).is_empty()
+            || (!lost.is_empty()
+                && node.store.get(&Kind::REVOKED.of(&self.name)).as_deref()
+                    != Some(&revocations_digest(&lost)[..]))
+    }
+
+    /// The granted devices of a person the space reads for whose certificate lapsed.
+    fn lapsed_readers(&self, log: &Log) -> BTreeSet<Name> {
+        let Readers::Persons(readers) = log.fold.readers() else {
+            return BTreeSet::new();
+        };
+        self.lapsed
+            .lock()
+            .iter()
+            .filter(|key| readers.iter().any(|person| key.has_prefix(person)))
+            .cloned()
+            .collect()
+    }
+
+    /// Look at the devices this owner device granted epoch keys of the space to
+    /// ([`NodeInner::note_grantee`]): those whose key is lapsed by this node's clock now are
+    /// what a reader's lapse owes the space a new epoch for (spec §6.5). Each is judged by
+    /// the seal key packet it was granted by, from the certificates held alone (nothing is
+    /// fetched); only the judge's `Lapsed` counts, so a renewed certificate held here ends
+    /// the lapse. A lapse moves no counter, so this is run on a timer (`Config.lapse_sweep`).
+    pub(crate) async fn sweep_lapsed(&self, node: &Arc<NodeInner>) {
+        if self.follower {
+            return;
+        }
+        let granted = node.store.scan_under(&Kind::GRANTED.listing(&self.name), 0);
+        let mut lapsed = BTreeSet::new();
+        for (at, wire) in granted {
+            let Some(key) = Kind::GRANTED.parse_device(&self.name, &at) else {
+                continue;
+            };
+            let (Some(device), Ok(data)) = (device_of(&key), Data::decode(wire)) else {
+                continue;
+            };
+            let judged = node
+                .judge
+                .validate_asker_packet(&data, &device, &self.name)
+                .await;
+            if matches!(judged, Judged::Refused(Refusal::Lapsed { .. })) {
+                lapsed.insert(key);
+            }
+        }
+        *self.lapsed.lock() = lapsed;
+    }
+
+    /// The epoch signed for the lapsed devices ends their record: they are granted no
+    /// key until they renew and ask again.
+    fn forget_lapsed(&self, node: &NodeInner) {
+        for key in std::mem::take(&mut *self.lapsed.lock()) {
+            node.store.remove(&Kind::GRANTED.device(&self.name, &key));
+        }
     }
 
     /// Whether this owner device owes the sealed space a fresh epoch because
@@ -587,6 +644,7 @@ impl SpaceInner {
                     Kind::REVOKED.of(&self.name),
                     Bytes::copy_from_slice(&accounted),
                 );
+                self.forget_lapsed(node);
                 if rule {
                     // The fresh epoch is the one in force: no key a guest or
                     // node device of the owner held opens what is written now.

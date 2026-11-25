@@ -135,6 +135,12 @@ impl Log {
         }
     }
 
+    /// Whether this device keeps the record of the devices it grants epoch keys to (spec §6.5:
+    /// a reader's lapse owes a new epoch): it is an owner device of a sealed space.
+    pub(crate) fn tracks_grantees(&self) -> bool {
+        self.sealed() && self.fold.create() == Some(false) && self.owner_only().is_ok()
+    }
+
     /// The judge says `device` stands as an owner device (`capable`) or does
     /// not: [`crate::trust::owner_capable`], read again (the context that
     /// governs its key was replaced, or the rule changed). What it signed is

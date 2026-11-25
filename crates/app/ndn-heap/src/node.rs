@@ -88,6 +88,10 @@ pub struct Config {
     /// How long a removal looks for entries of the removed person's devices
     /// that were heard of and are not held yet, so that its cut binds them.
     pub first_look: Duration,
+    /// How often an owner device looks at the devices it granted epoch keys to, for one
+    /// whose certificate lapsed by this node's clock (spec §6.5), and at once when it starts.
+    /// A lapse moves no counter, so only looking finds it.
+    pub lapse_sweep: Duration,
     /// The most asks of one device the node has in flight at once, whatever space or value
     /// they are for: a device's window starts at 16, follows what it answers and is at most
     /// this and half of [`Self::in_flight`].
@@ -133,6 +137,7 @@ impl Config {
             }),
             lifetime: Duration::from_secs(4),
             first_look: Duration::from_secs(4),
+            lapse_sweep: Duration::from_secs(60),
             window: 128,
             in_flight: 256,
             settle: Duration::from_secs(1),
@@ -196,6 +201,8 @@ pub(crate) struct NodeInner {
 /// (2).
 const MEMBER: u8 = 1;
 const CARRIER: u8 = 2;
+/// The most devices an owner device keeps of those it granted epoch keys of one space to.
+const GRANTEES_MAX: usize = 1024;
 
 /// What the judge says now of entries it was asked about again.
 #[derive(Default)]
@@ -302,6 +309,7 @@ impl Node {
         // From here a failure drops `node`, which stops what was started.
         let held = inner.restore().await?;
         rt::spawn(NodeInner::adoption_task(Arc::downgrade(&inner), adoptions));
+        rt::spawn(NodeInner::lapse_task(Arc::downgrade(&inner)));
         rt::spawn(NodeInner::failure_task(
             Arc::downgrade(&inner),
             Arc::clone(&inner.flusher),
@@ -1026,6 +1034,24 @@ impl NodeInner {
         }
     }
 
+    /// Every `Config.lapse_sweep`, and at once: each space this node holds looks for grantees
+    /// whose certificates lapsed ([`SpaceInner::sweep_lapsed`]) and owes the epoch they owe.
+    async fn lapse_task(node: Weak<NodeInner>) {
+        let mut pause = Duration::ZERO;
+        loop {
+            rt::sleep(pause).await;
+            let Some(inner) = node.upgrade() else { return };
+            if inner.stopped.load(Ordering::Relaxed) {
+                return;
+            }
+            pause = inner.config.lapse_sweep;
+            for space in inner.sorted() {
+                space.sweep_lapsed(&inner).await;
+                space.settle(&inner);
+            }
+        }
+    }
+
     async fn failure_task(node: Weak<NodeInner>, flusher: Arc<Flusher>) {
         let Some(why) = flusher.failed().await else {
             return;
@@ -1310,6 +1336,38 @@ impl NodeInner {
         if epoch.creator == self.device && !held.publisher.servable(epoch.seq) {
             return Err(GrantRefusal::EpochNotNamed);
         }
+        Ok(())
+    }
+
+    /// Record that this owner device is about to grant an epoch key of `space` to the device
+    /// whose key `key` signed `seal_packet`, so that a lapse of that key owes the space a new
+    /// epoch ([`SpaceInner::sweep_lapsed`], spec §6.5). Only an owner device of a sealed space
+    /// it writes keeps one; for any other it records nothing and says yes. The record is
+    /// kept **before** the key is given: at most [`GRANTEES_MAX`] devices a space, and a grant
+    /// that would pass that is refused with what to do (the key is never given untracked).
+    pub(crate) fn note_grantee(
+        &self,
+        space: &Name,
+        key: &Name,
+        seal_packet: &Bytes,
+    ) -> Result<(), String> {
+        let Some(held) = self.space_of(space) else {
+            return Ok(());
+        };
+        if held.follower || !held.log.lock().tracks_grantees() {
+            return Ok(());
+        }
+        let at = Kind::GRANTED.device(space, key);
+        let known = self.store.scan_under(&Kind::GRANTED.listing(space), 0);
+        if known.len() >= GRANTEES_MAX && !known.iter().any(|(held, _)| *held == at) {
+            return Err(format!(
+                "this device tracks the {GRANTEES_MAX} devices it granted keys of the space to, \
+                 so that a lapse of one owes a new epoch, and that is as many as it keeps: the \
+                 record of a device that lapsed ends when the epoch its lapse owes is signed; \
+                 ask another device of the space, or this one again then"
+            ));
+        }
+        self.store.insert(at, seal_packet.clone());
         Ok(())
     }
 

@@ -227,7 +227,11 @@ is that namespace's device: with `/home` and `/home/bob` held,
 of a space of `/home`. **The role layout** is declared by a marker the root
 signs into the context: its schema is *authoritative* (the generated namespace
 schema of every `ndn-cert` namespace). Where it is declared, a `guest`, a `node`,
-any other role and a device with no role are not owner devices; where it is not
+any other role and a device with no role are not owner devices **and hold no epoch
+key and no standing for signals in any person's name, a reader's included**
+(§6.5 condition 2, §11.1; the entries of a person's guest device are judged by
+the members entries alone, so guest *writes* stay as the record admits them);
+where it is not
 (a flat namespace), every device of `O` is. The `DataRequiresCut` list is not
 the marker: an owner can narrow it to nothing without declaring a flat layout.
 
@@ -819,8 +823,9 @@ big-endian, so keys order numerically. Other names are appended as components.
 | `assembled/<entry name>` | 1 octet: every piece of the entry's value in pieces is held and proved (§8.5); a value not marked is not read | after the last piece arrives; in the entry's batch for a value this device wrote |
 | `head/<S>` | own `seq` 8 ‖ its signed-region digest 32 (40 octets) | with every own entry |
 | `reserve/<S>` | `R` 8 (big-endian) ‖ clean 1 (0 or 1): 9 octets | at open, at each extension, at clean close |
-| `revoked/<S>` | 32 octets: the digest of the revocations of the readers' devices (§5.3 rule 8) that the last `Epoch` entry this device signed accounted for | after each Epoch entry this device signs |
+| `revoked/<S>` | 32 octets: the digest of the revocations of the readers' devices (§5.3 rule 8) and the keys of them this node suspects (§9.8) that the last `Epoch` entry this device signed accounted for | after each Epoch entry this device signs |
 | `rule/<S>` | 1 octet: the version of the owner rule (§2.1, §9.9) the space's entries were last judged by here; 1 is the role rule | at the first open of a space with no entries, and after the one judgement at start (and the fresh epoch an owner device of a sealed space signs) of a space stored under an earlier rule |
+| `granted/<S>/<key>` | the seal key packet of a device this owner device granted an epoch key of the sealed space to, by the key that signed it (at most 1,024 a space; §6.5) | before the grant is answered; removed when the epoch signed for the device's lapse is |
 | `space/<S>` | 1 octet: 1 a space this node is a member of, 2 a space it only follows (§10) | when the space is created, opened or followed |
 | `joined/<S>` | 1 octet, 1, then the 32-octet signed-region digest of each `Members` entry held that removes the device's person: an offer's answer admitted this device to the space and the fold does not list its person yet (§10.9); while it stands, a refusal for want of a listing is a wait | at `note_joined`, when the fold does not list the person; removed when it does, and when a removal of her arrives that it does not name |
 | `structural/<S as TLV component>/<device as TLV component>/<seq 8>` | empty | with a `Members` or `Epoch` entry (start replays only these) |
@@ -1340,10 +1345,13 @@ as AAD. Every ask carries the device's own seal key packet as it signed it.
 eight hold**, checked in this order:
 
 1. a held owner-signed `Epoch` entry names `E` (`EpochNotNamed`);
-2. the asker is no guest, node or role-less device of the owner: where the
-   asker's person is the owner, the asking device's role is `admin` or `member`
-   (`NotOwnerDevice`; §2.1, §9.9) — the owner's person is in every audience, but
-   only its `admin` and `member` devices hold the owner's powers;
+2. the asker is an `admin` or `member` device of its person: where the asker's
+   person declares the role layout, a **guest, node or role-less device of any
+   person** — the owner's or a reader's — is refused
+   (`NotAdminOrMemberDevice`; §2.1, §9.9). Nothing rotates the epoch when a guest
+   or a relay device lapses, and the owner never admitted it and cannot see it, so
+   only the `admin` and `member` devices of a person hold a key; the asker is told to read from
+   one of those. In a flat namespace every device passes;
 3. `audience(E)` contains the asker's **person** — the person of the device
    `D` of the seal key name in the ask (`NotInAudience`);
 4. `readers()` contains that person **now** (`NotReaderNow`): a removed
@@ -1392,6 +1400,21 @@ this device itself made is not granted until its `Epoch` entry has been
 flushed (it is not servable before), so that a power loss cannot take the entry
 and leave the key granted. Every ask a device does not answer is Nacked, never
 left to time out.
+
+**A reader's lapse owes an epoch (stage-7 M2).** An owner device that grants a key
+records the device first: `granted/<S>/<key>` holds the seal key packet the key
+was granted by (§4.3), at most 1,024 devices a space; a grant that would pass
+that is not answered, so no key is ever given untracked (the record of a device
+that lapsed ends when the epoch its lapse owes is signed). Every
+`lapse_sweep` (60 s by default, and at once at start) the owner device judges
+each recorded packet again from the certificates it holds alone (§9.3): a key
+that is **lapsed by this node's clock** owes the space a new epoch, as a
+revocation does (§6.6), because the device still holds the key in force and
+nothing else rotates it. The epoch is signed once for the devices lapsed at the
+time, the lapsed devices leave the record, and a device that renews asks again
+and is granted the new epoch. The epoch signed on the lapse is owed on the clock
+and the certificates **this owner device** holds: a lapse that another node's
+clock sees, or a device it never granted a key to, owes nothing here.
 
 Why the exchange is one: an ask that made the granter fetch the asker's seal key
 packet put two exchanges inside one Interest lifetime (the ask, the granter's
@@ -2306,6 +2329,30 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   back into owner devices. A namespace without the marker (a flat namespace of
   devices, as small hosts and tests make) has no roles to tell devices apart by,
   and all its devices are owner devices, as before.
+- **A member's guest or node device holds no epoch key and no signal standing
+  (stage-7 M2).** The exclusion of H1 protected only the owner's own devices: a
+  member's `guest` (a friend's phone for a weekend) or `node` relay that opened a
+  private space was granted the key in force, kept reading every later entry after
+  its certificate lapsed (nothing rotated), and the owner never admitted it and
+  cannot see it. Where a person's namespace declares the role layout, epoch keys
+  are now granted to her `admin` and `member` devices only, and so are signals
+  (§6.5 condition 2, §11.1). Her guest and node devices still **write** where the
+  record admits her (the entries are the person's, §3.8) and are told, by the
+  refusal, to read from an `admin` or `member` device. What remains: a key
+  already granted stays known to the device until the next epoch; a lapse is
+  judged by each node's clock, so an owner device owes the rotation only on the
+  clock and the certificates it holds and only for the devices it granted keys to
+  (a key another device granted is rotated when that device's owner device sees
+  the lapse, or on any other change of members); a flat namespace has no roles
+  to tell devices apart by, and is as before.
+- **A node serves any certificate it vouched for (accepted residual, review
+  I3).** `<D>/32=held/<certificate name>` answers a certificate its validator
+  vouched for (§7.6, `Judge::held_certificate`), which lets a prober who names
+  a key exactly learn that this node vouches for it, hence some co-membership.
+  The prober needs the exact key name, certificates are public, and only
+  vouched copies are served (a holder's copy enters only as unverified and
+  through the normal walk, so a returned certificate is never accepted outside
+  validation). Nothing is added; the note is the record.
 - **Migration.** A space stored under the earlier rule has no `rule/<S>` record
   (§4.3). At start, the first time, every held entry of the owner's devices is
   judged again under the new rule: what a guest or node device signed leaves the
@@ -2967,8 +3014,10 @@ transport, not to this layer.
 ### 11.1 Members
 
 A **member** of a space, for signals, is a key of a device whose **person** is a
-writer of the space (the owner always is) and which the trust context governing
-that key does not revoke. The person is the namespace of the context that
+writer of the space (the owner always is), which is an `admin` or `member` device
+of that person where her namespace declares the role layout (a `guest` or `node`
+device of any member is **no** signal member, §9.9), and which the trust context
+governing that key does not revoke. The person is the namespace of the context that
 governs the key, taken from the view the node judges the key's packets about the
 space by (§9.4): the node's own for a person it holds, else the view adopted for
 her while a listing of the space names her as a writer or a reader. The answer is

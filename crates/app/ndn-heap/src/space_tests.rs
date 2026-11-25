@@ -479,6 +479,155 @@ async fn suspecting_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_
     assert_eq!(heap.inner.log.lock().fold.epochs().len(), 2);
 }
 
+/// Stage-7 M2: a reader's device this owner device granted the epoch key to whose certificate
+/// lapses (by this node's clock) still holds that key, and nothing rotates it: the owner
+/// device signs a new epoch that replaces the old one, once, and ends the record of the
+/// device; a restart owes nothing more. The certificate of Bob's phone lasts four seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_devices_lapse_makes_an_owner_device_sign_a_new_epoch_once() {
+    let devs = crate::node::tests::world_with(
+        &["/alice/member/laptop", "/bob/member/phone"],
+        |name| Name::from_components(name.components()[..1].iter().cloned()),
+        |name| {
+            if name.has_prefix(&n("/bob")) {
+                4_000
+            } else {
+                365 * 24 * 3600 * 1000
+            }
+        },
+    )
+    .await;
+    let mut config = cfg();
+    config.lapse_sweep = Duration::from_millis(100);
+    let (node, _) = boot(&devs[0].layered(), config.clone()).await;
+    let heap = node.create(&space(), private(&["/bob"])).await.unwrap();
+    let in_force = |heap: &Heap| heap.inner.log.lock().fold.in_force();
+    let first = in_force(&heap).expect("an epoch");
+    // The phone is granted the key: what the granter records once its seal key packet verifies.
+    let phone = &devs[1];
+    let key = phone.name.clone().append("KEY").append("1");
+    let signer = phone.keys.get_signer_sync(&key).unwrap();
+    let packet = crate::seal::seal_key_packet(&phone.name, &[9; 32], &*signer).unwrap();
+    node.inner.note_grantee(&space(), &key, &packet).unwrap();
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    assert_eq!(
+        in_force(&heap),
+        Some(first.clone()),
+        "no epoch is owed while the device's certificate is valid"
+    );
+    let mut second = None;
+    for _ in 0..150 {
+        if let Some(e) = in_force(&heap)
+            && e != first
+        {
+            second = Some(e);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let second =
+        second.expect("an owner device signs a new epoch for the lapse of a reader's device");
+    {
+        let log = heap.inner.log.lock();
+        assert!(log.fold.complete());
+        assert_eq!(
+            log.fold.epoch_tips(),
+            vec![second.clone()],
+            "it replaces the old"
+        );
+        assert_eq!(log.fold.epochs().len(), 2);
+    }
+    assert!(
+        node.inner
+            .store
+            .scan_under(&crate::store::Kind::GRANTED.listing(&space()), 0)
+            .is_empty(),
+        "the epoch ends the record of the device that lapsed"
+    );
+    // Not again: the lapse is accounted for.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(heap.inner.log.lock().fold.epochs().len(), 2);
+    node.close().await;
+    let (node, _) = boot(&devs[0].layered(), config).await;
+    let heap = node.open(&space()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(heap.inner.log.lock().fold.epochs().len(), 2);
+}
+
+/// Stage-7 M2: a private space of a namespace with the role layout, an owner's `member`
+/// device, and Bob's devices of each role (Bob reads the space). What `asker` is told when
+/// it asks the owner's device for the epoch key in force, by the names alone and with the
+/// key that signed its seal key packet known.
+async fn grant_to_bobs(
+    asker: &str,
+) -> (
+    Result<(), crate::seal::GrantRefusal>,
+    Result<(), crate::seal::GrantRefusal>,
+) {
+    let devs = world(&[
+        "/alice/member/laptop",
+        "/bob/guest/g",
+        "/bob/node/n",
+        "/bob/admin/a",
+        "/bob/member/m",
+    ])
+    .await;
+    let (node, _) = boot(&devs[0].layered(), cfg()).await;
+    let heap = node.create(&space(), private(&["/bob"])).await.unwrap();
+    let epoch = heap.inner.log.lock().fold.in_force().expect("an epoch");
+    let bob = devs
+        .iter()
+        .find(|d| d.name == n(asker))
+        .expect("a device of the world");
+    let key = bob.name.clone().append("KEY").append("1");
+    (
+        node.inner.may_grant(&space(), &epoch, &bob.name, None),
+        node.inner
+            .may_grant(&space(), &epoch, &bob.name, Some(&key)),
+    )
+}
+
+/// A member's `guest` device is granted no epoch key: nothing rotates the epoch when it
+/// lapses, and it would read every later entry. The refusal says why and what to do, before
+/// the packet in the ask is judged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_members_guest_device_is_granted_no_epoch_key() {
+    let (by_name, by_key) = grant_to_bobs("/bob/guest/g").await;
+    assert_eq!(
+        by_name,
+        Err(crate::seal::GrantRefusal::NotAdminOrMemberDevice),
+        "a member's guest device was granted an epoch key"
+    );
+    assert_eq!(by_key, by_name);
+    let said = by_name.unwrap_err().to_string();
+    assert!(
+        said.contains("`admin` or `member`") && said.contains("ask the person"),
+        "it says which devices are granted and what to do: {said}"
+    );
+}
+
+/// A member's `node` relay device is granted no epoch key either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_members_node_device_is_granted_no_epoch_key() {
+    let (by_name, by_key) = grant_to_bobs("/bob/node/n").await;
+    assert_eq!(
+        by_name,
+        Err(crate::seal::GrantRefusal::NotAdminOrMemberDevice),
+        "a member's node device was granted an epoch key"
+    );
+    assert_eq!(by_key, by_name);
+}
+
+/// A member's `admin` and `member` devices are granted the epoch key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_members_admin_or_member_device_is_granted_the_epoch_key() {
+    for asker in ["/bob/admin/a", "/bob/member/m"] {
+        let (by_name, by_key) = grant_to_bobs(asker).await;
+        assert_eq!(by_name, Ok(()), "{asker} by name");
+        assert_eq!(by_key, Ok(()), "{asker} by key");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_owner_device_signs_the_epoch_a_members_entry_of_another_leaves_incomplete() {
     let devs = world(&["/alice/laptop", "/alice/phone"]).await;

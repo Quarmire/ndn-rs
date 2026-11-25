@@ -391,15 +391,16 @@ pub(crate) enum GrantRefusal {
          are forward only; the owner can add it back as a reader"
     )]
     NotReaderNow,
-    /// The asker is a device of the owner's namespace that holds none of the
-    /// owner's powers (a `guest`, a `node` relay, another role, no role).
+    /// The asker is a device whose role is neither `admin` nor `member`, in a namespace that
+    /// declares the role layout (a `guest`, a `node` relay, another role, no role).
     #[error(
-        "the asking device belongs to the space owner's namespace but is no owner device: its \
-         role is not `admin` or `member` (a `guest`, a `node` relay, any other role, or none), \
-         and the epoch keys go to the owner's `admin` and `member` devices only; ask the owner \
-         to read from one of those"
+        "the asking device's role is not `admin` or `member` (it is a `guest`, a `node` relay, \
+         another role, or has none), and epoch keys go only to `admin` and `member` devices, of \
+         the owner's namespace or of any reader's: nothing rotates the epoch when a guest or a \
+         relay device lapses, and it would read every later entry; ask the person to read from \
+         one of its `admin` or `member` devices"
     )]
-    NotOwnerDevice,
+    NotAdminOrMemberDevice,
     /// This device does not hold the epoch's key.
     #[error(
         "this device does not hold the epoch's key: it neither made it nor was granted it; ask \
@@ -424,16 +425,18 @@ pub(crate) enum GrantRefusal {
 }
 
 /// Whether the key of `epoch` of `space` may be granted to a device of
-/// `asker`'s person: **all six** of (1) a held owner-signed Epoch entry of
+/// `asker`'s person: **all eight** of (1) a held owner-signed Epoch entry of
 /// `fold` names the epoch (the log applies no other), (2) the asking device
-/// is no guest, node or role-less device of the owner (`asker_capable`: the
-/// owner's person is in every audience, but only its `admin` and `member`
-/// devices hold its powers, spec §9.9; the flag matters for the owner's
-/// person alone), (3) the epoch's audience contains the person, (4) the
-/// person reads the space now, (5) this device holds the key, (6) the key of
-/// the asking device is not `revoked` (by a trust context held here; `false`
-/// before the seal key packet is judged). Forward only: a removed reader
-/// fails (4) for every later ask, a revoked device key fails (6). Pure; first
+/// is an `admin` or `member` device of its person (`asker_capable`: a guest,
+/// node or role-less device of any person is refused where the person's
+/// namespace declares the role layout, because nothing rotates the epoch when
+/// it lapses, spec §6.5, §9.9), (3) the epoch's audience contains the person,
+/// (4) the person reads the space now, (5) this device holds the key, (6) the
+/// key of the asking device is not `revoked` (by a trust context held here;
+/// `false` before the seal key packet is judged), (8) it is not `suspected`
+/// here (likewise). The seventh condition of the spec, that the key is not
+/// lapsed, is the judge's, at the packet. Forward only: a removed reader fails
+/// (4) for every later ask, a revoked device key fails (6). Pure; first
 /// failure named.
 pub(crate) fn may_grant(
     fold: &Fold,
@@ -447,8 +450,8 @@ pub(crate) fn may_grant(
 ) -> Result<(), GrantRefusal> {
     if fold.epoch_body(epoch).is_none() {
         Err(GrantRefusal::EpochNotNamed)
-    } else if asker == fold.owner() && !asker_capable {
-        Err(GrantRefusal::NotOwnerDevice)
+    } else if !asker_capable {
+        Err(GrantRefusal::NotAdminOrMemberDevice)
     } else if !fold.audience(epoch).contains(asker) {
         Err(GrantRefusal::NotInAudience)
     } else if !fold.is_reader(asker) {
@@ -646,9 +649,9 @@ mod tests {
         );
     }
 
-    /// The owner's person is in every audience, but only its `admin` and `member` devices are
-    /// granted the key: a guest or node device of the owner is refused, and says why. Another
-    /// person's devices are judged by the person alone.
+    /// Only the `admin` and `member` devices of a person are granted the key: a guest or node
+    /// device is refused, whether its person is the owner or a reader, and says why. The
+    /// person's audience and reading are judged as before.
     #[test]
     fn an_owners_guest_or_node_device_is_granted_no_epoch_key() {
         let (fold, held, space, e, _) = sealed_space();
@@ -658,7 +661,7 @@ mod tests {
         };
         assert_eq!(ask(&owner, true), Ok(()), "a member device of the owner");
         let refused = ask(&owner, false);
-        assert_eq!(refused, Err(GrantRefusal::NotOwnerDevice));
+        assert_eq!(refused, Err(GrantRefusal::NotAdminOrMemberDevice));
         assert!(
             refused
                 .unwrap_err()
@@ -666,10 +669,11 @@ mod tests {
                 .contains("`admin` or `member`"),
             "it says which devices are granted"
         );
+        assert_eq!(ask(&reader, true), Ok(()), "a member device of a reader");
         assert_eq!(
             ask(&reader, false),
-            Ok(()),
-            "the standing of a reader's device is its person's"
+            Err(GrantRefusal::NotAdminOrMemberDevice),
+            "a guest or node device of a reader is refused as the owner's is"
         );
     }
 

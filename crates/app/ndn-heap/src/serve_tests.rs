@@ -341,6 +341,25 @@ async fn a_device_whose_certificate_lapsed_is_granted_no_new_epoch() {
     );
 }
 
+/// Stage-7 M2: an owner device records the device it grants a key to before it gives the key
+/// (a lapse of that device's certificate owes the space a new epoch); a record that cannot be
+/// kept refuses the grant, so no key is given untracked.
+#[tokio::test(start_paused = true)]
+async fn the_grantee_is_recorded_before_the_key_is_given_and_a_full_record_refuses_the_grant() {
+    let s = serving(ME).await;
+    let (_, name) = grant_ask(TABLET, [9; 32]);
+    assert!(s.ask(&name).await.is_some());
+    assert_eq!(
+        s.host.st.lock().grantees,
+        vec![n(TABLET).append("KEY").append("1")],
+        "the key that signed the seal key packet is the record"
+    );
+    s.host.st.lock().grantees_full = Some("the record is full".into());
+    let (_, next) = grant_ask_of(PHONE, [8; 32], 2);
+    assert!(s.ask(&next).await.is_none(), "no key is given untracked");
+    assert_eq!(s.host.st.lock().granted_to, vec![[9; 32]]);
+}
+
 /// A reader who was removed is refused every later grant, even the one
 /// already answered once: the decision is the host's at each ask. A captured ask replayed after
 /// the removal gets nothing, and one replayed while the reader reads gets the key wrapped to

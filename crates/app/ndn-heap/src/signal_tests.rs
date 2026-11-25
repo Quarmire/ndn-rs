@@ -412,7 +412,7 @@ async fn a_guest_or_node_device_of_the_owner_is_no_member_for_signals() {
         ("/alice/admin/phone", true),
         ("/alice/guest/kid", false),
         ("/alice/node/vps", false),
-        ("/bob/phone", true),
+        ("/bob/member/phone", true),
     ] {
         for seat in [&owner, &observer] {
             assert_eq!(seat.member(&key_of(device)), member, "{device}");
@@ -421,6 +421,45 @@ async fn a_guest_or_node_device_of_the_owner_is_no_member_for_signals() {
     assert!(
         matches!(guest.scope(), Err(HeapError::NotAllowed { .. })),
         "a guest device of the owner gets no scope"
+    );
+    assert!(matches!(
+        guest.header(&RUN),
+        Err(HeapError::NotAllowed { .. })
+    ));
+}
+
+/// Stage-7 M2: the same holds for a member's devices. Where Bob's namespace declares the role
+/// layout, his `guest` and `node` devices are no member for signals though his person is a
+/// writer (an `admin` or `member` device of his is one); they get no scope and send nothing.
+#[tokio::test]
+async fn a_guest_or_node_device_of_a_member_is_no_member_for_signals() {
+    let world = World::layered().await;
+    let owner = world.seat("/alice/member/laptop").await;
+    let observer = world.seat("/rita/pad").await;
+    let guest = world.seat("/bob/guest/kid").await;
+    let one = owner
+        .members(members(Some(true), vec![add(1, "/bob", Role::Writer)]))
+        .await;
+    owner.relay(&one, &observer);
+    owner.relay(&one, &guest);
+    for (device, member) in [
+        ("/bob/member/phone", true),
+        ("/bob/admin/tablet", true),
+        ("/bob/guest/kid", false),
+        ("/bob/node/vps", false),
+        ("/bob/phone", false),
+    ] {
+        for seat in [&owner, &observer] {
+            assert_eq!(
+                seat.member(&key_of(device)),
+                member,
+                "{device}: a member's guest or node device stood for signals"
+            );
+        }
+    }
+    assert!(
+        matches!(guest.scope(), Err(HeapError::NotAllowed { .. })),
+        "a guest device of a member gets no scope"
     );
     assert!(matches!(
         guest.header(&RUN),

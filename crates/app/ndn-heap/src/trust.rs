@@ -710,13 +710,7 @@ impl Judge {
         self.device_packet(data, device, space, false).await
     }
 
-    async fn device_packet(
-        &self,
-        data: &Data,
-        device: &Name,
-        space: &Name,
-        fetch: bool,
-    ) -> Judged {
+    async fn device_packet(&self, data: &Data, device: &Name, space: &Name, fetch: bool) -> Judged {
         let view = self.view_for(&data.name, space, true);
         match decide(&view, data, space, fetch).await {
             Judged::Valid(v) if v.device != *device => {

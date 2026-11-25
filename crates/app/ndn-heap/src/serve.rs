@@ -235,6 +235,11 @@ async fn grant(shared: &Arc<Shared>, name: &Name, ask: GrantAsk) -> Option<Bytes
         tracing::debug!(%asker, %key, epoch = ?ask.epoch, "grant refused: {why}");
         return None;
     }
+    // Recorded before the key is given, so that a lapse of this key owes the space an epoch.
+    if let Err(why) = host.note_grantee(&ask.space, &key, &ask.seal_packet) {
+        tracing::debug!(%asker, %key, "grant not answered: {why}");
+        return None;
+    }
     if let Some(kept) = shared.grants.grants.lock().get(generation, name) {
         return Some(kept);
     }
