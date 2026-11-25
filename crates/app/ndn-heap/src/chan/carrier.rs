@@ -20,13 +20,17 @@
 //!   never calls it again before the previous call completed, and it **does not drop the future**
 //!   of a call in progress (a frame is written whole or not at all, so the future needs no cancel
 //!   safety). [`Carrier::has_stream`] says whether the class exists.
-//! * [`Carrier::on_ready`] is how a datagram that was refused with `Full` is sent later with no timer
-//!   and no task of the node's: the sender gives the carrier a closure, and the carrier **calls it
-//!   once, from its own writer task, when `try_send_datagram` would take a frame again** (at once
-//!   if it already would). The closure sends what waits, never blocks, and may call
-//!   `try_send_datagram` and `on_ready` itself. A carrier that never calls it leaves the messages
-//!   that were refused waiting until the next emission finds the link ready; a carrier that is
-//!   dropped may drop the closures unrun. The closure may be called from any thread.
+//! * [`Carrier::on_ready`] is how a datagram that was refused with `Full`, or that waited so that a
+//!   loop of emissions leaves in batches, is sent later with no timer and no task of the node's: the
+//!   sender gives the carrier a closure, and the carrier **calls it once, from its own writer task,
+//!   when `try_send_datagram` would take a frame again** (the next time that task runs if it
+//!   already would). The closure sends what waits, never blocks, and may call
+//!   `try_send_datagram` and `on_ready` itself. The sender asks for it **after every frame an
+//!   emitter wrote inline**, not only after `Full`: the emissions that follow queue until the
+//!   call, so that a loop of them leaves in batches. A carrier that never calls it therefore
+//!   stalls the channel; one that is dropped may drop the closures unrun. The closure may be
+//!   called from any thread, and a carrier calls it from its writer task, not from inside
+//!   `on_ready` (an emitter that called it there would leave no batch to form).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
