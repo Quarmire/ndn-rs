@@ -370,12 +370,15 @@ pub fn revocations_to_add(
 /// Check the revocation cut `cut` against a version after `ctx` that adds
 /// `adding` to its revocations ([`revocations_to_add`]): its key must be
 /// one of `adding` (a cut comes with the revocation of exactly its key,
-/// never after it), every name it lists (range prefixes, exact names)
-/// must be in that key's device log ([`device_log_of`]), it must name the
-/// public key that signed what it accepts (CutKeyDigest), and a cut with
-/// ranges must carry its manifest (CutManifest: the digest of every entry
-/// the ranges accept). Needs no key: a caller checks a cut with it before
-/// unlocking the root ([`bump_context_revoking`] applies the same checks).
+/// never after it), every name it lists (range prefixes, exact names, the
+/// log prefix of each tip) must be in that key's device log
+/// ([`device_log_of`]), it must name the public key that signed what it
+/// accepts (CutKeyDigest), and a cut with ranges must carry its manifest
+/// (CutManifest: the digest of every entry the ranges accept). A cut of
+/// tips alone needs no manifest: a tip names the signed-region digest of
+/// one entry per log, and the ends bind what lies below it by chain
+/// ancestry. Needs no key: a caller checks a cut with it before unlocking
+/// the root ([`bump_context_revoking`] applies the same checks).
 pub fn check_cut(
     ctx: &SignedTrustContext,
     adding: &[Name],
@@ -409,12 +412,17 @@ pub fn check_cut(
     Ok(())
 }
 
-/// Refuse `cut` unless every name it lists (range prefixes, exact names)
-/// is in its key's device log ([`device_log_of`]).
+/// Refuse `cut` unless every name it lists (range prefixes, exact names,
+/// tip prefixes) is in its key's device log ([`device_log_of`]).
 pub(crate) fn check_cut_names(cut: &RevocationCut) -> Result<(), BumpError> {
     let key = cut.key();
     let log = device_log_of(key);
-    let listed = cut.ranges().iter().map(|r| &r.prefix).chain(cut.exact());
+    let listed = cut
+        .ranges()
+        .iter()
+        .map(|r| &r.prefix)
+        .chain(cut.exact())
+        .chain(cut.tips().iter().map(|t| &t.prefix));
     for name in listed {
         if !name.has_prefix(&log) {
             return Err(BumpError::CutOutsideLog {

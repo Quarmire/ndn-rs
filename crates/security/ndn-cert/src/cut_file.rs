@@ -27,6 +27,17 @@
 //! ManifestPacket = 0xC5FA TLV-LENGTH Data                 ; root packet first
 //! ```
 //!
+//! A cut of tips (RevocationCut sub-TLV CutTip, 0x0404: one
+//! `(log prefix, seq, signed-region digest)` per space instead of a manifest
+//! of every entry) needs no field of the file: the RevocationCut TLV is
+//! carried verbatim, so its tips travel inside it, and a second carrier of
+//! the same tips would only be a duplicate that could disagree with the cut
+//! that is signed. A cut with tips and no ranges has no manifest, so a file
+//! of it holds no ManifestPacket and [`CutFile::check_manifest`] asks for
+//! none; a cut with ranges and tips (a manifest and tips together) still
+//! needs its manifest's packets. The next unused even type of this family is
+//! 0xC5FC.
+//!
 //! A file holding only the RevocationCut TLV (as written before cuts were
 //! bounded) decodes as a cut without a bound, which a root refuses to sign.
 
@@ -332,6 +343,55 @@ mod tests {
         assert!(matches!(
             CutFile::decode(&file.encode()),
             Err(CutFileError::LeftOutNotFullName(_))
+        ));
+    }
+
+    /// A cut of tips travels inside the RevocationCut TLV: a file reads
+    /// back with its tips, needs no manifest packet, and keeps its bound.
+    #[test]
+    fn a_tip_cut_reads_back_and_needs_no_manifest() {
+        let key = n("/home/bob/member/phone/KEY/k");
+        let notes = n("/home/bob/member/phone/32=log/notes");
+        let mut cut = RevocationCut::new(key);
+        cut.add_tip(&notes, 7, [7; 32]);
+        cut.set_key_digest([9; 32]);
+        let mut file = CutFile::new(cut.clone());
+        file.held_before = Some(1_790_000_000_000);
+        file.upto.insert(notes.clone(), 7);
+        let back = CutFile::decode(&file.encode()).unwrap();
+        assert_eq!(back, file);
+        assert_eq!(back.cut.tip_for(&notes).unwrap().seq, 7);
+        back.check_manifest().unwrap();
+        back.check_bound(1_790_000_000_000).unwrap();
+        assert!(matches!(
+            CutFile::new(cut.clone()).check_bound(1),
+            Err(BumpError::CutUnbounded { .. })
+        ));
+        let bare = CutFile::decode(&cut.encode()).unwrap();
+        assert_eq!(bare.cut, cut);
+        assert!(bare.manifest.is_empty());
+    }
+
+    /// A cut with ranges and tips names a manifest: its packets must all be
+    /// in the file.
+    #[test]
+    fn a_cut_of_ranges_and_tips_still_needs_its_manifest_packets() {
+        let key = n("/home/bob/member/phone/KEY/k");
+        let notes = n("/home/bob/member/phone/32=log/notes");
+        let built = ndn_security::cut_manifest::build(
+            &n("/home/bob"),
+            &key,
+            &[(notes.clone(), 1, [1; 32])],
+        )
+        .unwrap();
+        let mut cut = RevocationCut::new(key);
+        cut.add_run(&notes, 1, 1);
+        cut.add_tip(&n("/home/bob/member/phone/32=log/todo"), 3, [3; 32]);
+        cut.set_manifest(built.root).unwrap();
+        let file = CutFile::new(cut);
+        assert!(matches!(
+            file.check_manifest(),
+            Err(BumpError::CutManifestIncomplete { .. })
         ));
     }
 }

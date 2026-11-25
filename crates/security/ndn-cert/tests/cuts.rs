@@ -4,7 +4,9 @@
 //!
 //! - a cut is signed only with the revocation of exactly its key, lists
 //!   only that key's device log, names its public key, and carries its
-//!   manifest when it has ranges;
+//!   manifest when it has ranges (a cut of tips alone needs none, but each
+//!   tip names a log of the key's device; carried and re-admitted into like
+//!   any cut, a lowered tip being a cut that accepts less);
 //! - every producer of a version `N+1` from `N` carries every cut verbatim
 //!   (another revocation, a schema update, a recovery kit added or revoked,
 //!   a recovery's `N+1` and `N+2`, a re-admission of another key) — except
@@ -688,4 +690,309 @@ async fn recertification_certifies_only_the_public_key_the_cut_names() {
     );
     assert_eq!(pure.unheld, vec![phone()]);
     assert_eq!(pure.no_key_digest, vec![laptop]);
+}
+
+// ── Cuts as tips (trust-context.md §3.3.12) ─────────────────────────────────
+
+/// The tip cut of `key` (public key of seed `seed`): one tip, the log
+/// `<device>/32=log/notes` at seq `seq` with signed-region digest
+/// `[seq; 32]`. No ranges, no manifest.
+fn tip_cut_of(key: &Name, seq: u64, seed: u8) -> RevocationCut {
+    let mut cut = RevocationCut::new(key.clone());
+    cut.add_tip(&device_log_of(key).append("notes"), seq, [seq as u8; 32]);
+    cut.set_key_digest(public_key_digest(&public_key(seed)));
+    cut
+}
+
+/// A cut naming tips and no ranges needs no manifest: it is checked,
+/// signed and carried like any cut, though it still names its public key
+/// (the tip binds bytes of the log, not the key that signed them). With
+/// ranges it is the contingency form and needs its manifest as before.
+#[tokio::test]
+async fn a_cut_of_tips_needs_no_manifest() {
+    let root_dev = RootDevice::new().await;
+    let root = root_dev.root().await;
+    let v1 = root_dev.held();
+    let ctx = open(&v1);
+    let adding = [phone()];
+
+    let tips = tip_cut_of(&phone(), 4, PHONE_SEED);
+    assert!(tips.manifest().is_none() && tips.ranges().is_empty());
+    ndn_cert::check_cut(&ctx, &adding, &tips).unwrap();
+    ndn_cert::check_cuts(&ctx, &adding, std::slice::from_ref(&tips)).unwrap();
+    let v2 = revoke_with(&root_dev, &v1, &phone(), &tips).await;
+    assert_eq!(open(&v2).revocation_cut(&phone()), Some(&tips));
+
+    // Still no cut without the key digest.
+    let mut unbound = RevocationCut::new(phone());
+    unbound.add_tip(&device_log_of(&phone()).append("notes"), 4, [4; 32]);
+    assert!(matches!(
+        ndn_cert::check_cut(&ctx, &adding, &unbound),
+        Err(BumpError::CutWithoutKeyDigest { .. })
+    ));
+
+    // The contingency form: ranges and tips together need the manifest.
+    let mut both = cut_of(&phone(), 4, PHONE_SEED);
+    both.add_tip(&device_log_of(&phone()).append("todo"), 2, [2; 32]);
+    ndn_cert::check_cut(&ctx, &adding, &both).unwrap();
+    let v2b = revoke_with(&root_dev, &v1, &phone(), &both).await;
+    assert_eq!(open(&v2b).revocation_cut(&phone()), Some(&both));
+    let mut no_manifest = tip_cut_of(&phone(), 4, PHONE_SEED);
+    no_manifest.add_run(&device_log_of(&phone()).append("notes"), 1, 3);
+    assert!(matches!(
+        bump_context_revoking(root.as_ref(), &v1, &[phone()], &[no_manifest]).await,
+        Err(BumpError::CutWithoutManifest { .. })
+    ));
+}
+
+/// A tip names a log of the revoked key's own device: one under another
+/// device's log, outside the log, or above it is refused before anything is
+/// signed, with the name, the log, and what to do — in a revocation, and
+/// when a recovery carries a held cut with such a tip.
+#[tokio::test]
+async fn a_tip_outside_the_keys_device_log_is_refused() {
+    let root_dev = RootDevice::new().await;
+    let root = root_dev.root().await;
+    let v1 = root_dev.held();
+    let ctx = open(&v1);
+    let adding = [phone()];
+
+    for outside in [
+        device_log_of(&tablet()).append("notes"),
+        n("/home/bob/member/phone/summary"),
+        n("/home/bob/member/phone"),
+    ] {
+        let mut cut = RevocationCut::new(phone());
+        cut.add_tip(&outside, 3, [3; 32]);
+        cut.set_key_digest(public_key_digest(&public_key(PHONE_SEED)));
+        let refused = ndn_cert::check_cut(&ctx, &adding, &cut).unwrap_err();
+        let BumpError::CutOutsideLog { name, log, .. } = &refused else {
+            panic!("{outside}: {refused:?}")
+        };
+        assert_eq!(name, &outside.to_string());
+        assert_eq!(log, &device_log_of(&phone()).to_string());
+        let said = refused.to_string();
+        assert!(
+            said.contains("not in the key's device log") && said.contains("make the cut again"),
+            "{said}"
+        );
+        assert!(matches!(
+            bump_context_revoking(root.as_ref(), &v1, &[phone()], &[cut]).await,
+            Err(BumpError::CutOutsideLog { .. })
+        ));
+    }
+
+    // A held cut whose tip lies outside its key's log (planted by whoever
+    // held a compromised root) is dropped by a recovery and reported.
+    let tips = tip_cut_of(&phone(), 4, PHONE_SEED);
+    let v2 = revoke_with(&root_dev, &v1, &phone(), &tips).await;
+    let mut planted = RevocationCut::new(tablet());
+    planted.add_tip(&device_log_of(&phone()).append("notes"), 9, [9; 32]);
+    planted.set_key_digest(public_key_digest(&public_key(TABLET_SEED)));
+    let ns = n("/home/bob");
+    let seed = RecoverySeed::generate().unwrap();
+    let kit = recovery_anchor(Arc::new(seed.signer(&ns))).await.unwrap();
+    let v3 = add_recovery_anchor(root.as_ref(), &v2, &kit)
+        .await
+        .unwrap()
+        .data;
+    let ctx3 = open(&v3);
+    let signed = SignedTrustContext::decode_content(v3.content().unwrap(), ctx3.version() + 1)
+        .unwrap()
+        .with_revocation(tablet())
+        .with_revocation_cut(planted)
+        .sign_into_data_async(root.as_ref())
+        .await
+        .unwrap();
+    let new_root_mgr = SecurityManager::new();
+    let new_root_key = n("/home/bob/KEY/root2");
+    new_root_mgr.generate_ed25519(new_root_key.clone()).unwrap();
+    let new_root = new_root_mgr.get_signer_sync(&new_root_key).unwrap();
+    let new_anchor = new_root_mgr
+        .issue_self_signed_async(&new_root_key, new_root.public_key().unwrap(), u64::MAX)
+        .await
+        .unwrap();
+    let plan = recovery_plan(&new_anchor, OldRoot::Destroyed, &[]);
+    let version = recovery_version(&seed.signer(&ns), &signed, &plan)
+        .await
+        .unwrap();
+    assert_eq!(
+        version
+            .dropped_cuts
+            .iter()
+            .map(|d| d.key.clone())
+            .collect::<Vec<_>>(),
+        vec![tablet()]
+    );
+    assert!(version.dropped_cuts[0].reason.contains("device log"));
+    assert_eq!(
+        version.bump.context.revocation_cut(&phone()),
+        Some(&tips),
+        "the honest tip cut is carried"
+    );
+}
+
+/// A tip cut is carried verbatim by every producer (another revocation, a
+/// schema update, a recovery kit added and revoked, a re-admission, a
+/// recovery); a revocation of its key again with another tip is refused (a
+/// cut comes with the revocation only); and an adopter treats a later
+/// version that lowers a tip, changes the digest at its number, drops it or
+/// drops the cut as revoking (it accepts less), while one that raises the
+/// tip, re-admits an entry or carries it verbatim is not.
+#[tokio::test]
+async fn a_tip_cut_is_carried_verbatim_and_never_lowered() {
+    let root_dev = RootDevice::new().await;
+    let root = root_dev.root().await;
+    let tips = tip_cut_of(&phone(), 4, PHONE_SEED);
+    let v2 = revoke_with(&root_dev, &root_dev.held(), &phone(), &tips).await;
+    let carries = |data: &Data| assert_eq!(open(data).revocation_cut(&phone()), Some(&tips));
+
+    let tablet_cut = tip_cut_of(&tablet(), 2, TABLET_SEED);
+    let v3 = revoke_with(&root_dev, &v2, &tablet(), &tablet_cut).await;
+    carries(&v3);
+    let schema = namespace_schema(&n("/home/bob")).unwrap().blobs();
+    let link = LinkPolicy {
+        roles: vec!["admin".into(), "node".into()],
+        relay_roles: vec!["node".into()],
+        enrollment_links: true,
+        direct_paths: true,
+        direct_pairs: LinkPolicy::default_direct_pairs(),
+    };
+    let hint = ApprovalPolicy::default().to_hint();
+    let v4 = bump_context_schema(root.as_ref(), &v3, &schema, &hint, Some(&link), None, true)
+        .await
+        .unwrap()
+        .expect("another link policy")
+        .bump
+        .data;
+    carries(&v4);
+    let seed = RecoverySeed::generate().unwrap();
+    let kit = recovery_anchor(Arc::new(seed.signer(&n("/home/bob"))))
+        .await
+        .unwrap();
+    let v5 = add_recovery_anchor(root.as_ref(), &v4, &kit)
+        .await
+        .unwrap()
+        .data;
+    carries(&v5);
+    let v6 = remove_recovery_anchor(root.as_ref(), &v5, &kit.key_name())
+        .await
+        .unwrap()
+        .data;
+    carries(&v6);
+
+    // Another revocation of the key, with a lower tip, is refused.
+    let lower = tip_cut_of(&phone(), 2, PHONE_SEED);
+    assert!(matches!(
+        bump_context_revoking(root.as_ref(), &v6, &[phone()], &[lower]).await,
+        Err(BumpError::CutAfterRevocation { .. })
+    ));
+
+    // An adopter: what accepts less is revoking.
+    let keyring = ndn_security::Keyring::new();
+    let version = |v: u64, cut: Option<RevocationCut>| {
+        let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+            .with_version(v)
+            .with_revocation(phone());
+        Arc::new(match cut {
+            Some(cut) => ctx.with_revocation_cut(cut),
+            None => ctx,
+        })
+    };
+    keyring.adopt(version(1, Some(tips.clone()))).unwrap();
+    let epoch = keyring.revocation_epoch();
+    let mut next = 2;
+    let mut adopt = |cut: Option<RevocationCut>| {
+        keyring.adopt_update(version(next, cut)).unwrap();
+        next += 1;
+        keyring.revocation_epoch()
+    };
+    assert_eq!(adopt(Some(tips.clone())), epoch, "carried verbatim");
+    let mut higher = tip_cut_of(&phone(), 6, PHONE_SEED);
+    assert_eq!(adopt(Some(higher.clone())), epoch, "a higher tip");
+    higher
+        .readmit(full(&entry(&phone(), "notes", 9), 7))
+        .unwrap();
+    assert_eq!(adopt(Some(higher.clone())), epoch, "a re-admission");
+    let lowered = tip_cut_of(&phone(), 5, PHONE_SEED);
+    assert_eq!(adopt(Some(lowered)), epoch + 1, "a lower tip");
+    let mut changed = tip_cut_of(&phone(), 5, PHONE_SEED);
+    changed.add_tip(&device_log_of(&phone()).append("notes"), 5, [0xEE; 32]);
+    assert_eq!(
+        adopt(Some(changed)),
+        epoch + 2,
+        "another digest at the number"
+    );
+    let mut dropped = RevocationCut::new(phone());
+    dropped.set_key_digest(public_key_digest(&public_key(PHONE_SEED)));
+    assert_eq!(adopt(Some(dropped)), epoch + 3, "the tip dropped");
+    assert_eq!(adopt(None), epoch + 4, "the cut dropped");
+}
+
+/// A re-admission into a tip cut adds exact entries the tip does not
+/// accept: above it, or at its number with other bytes; below it the tip
+/// accepts by name, so nothing is signed. The tip is carried unchanged.
+#[tokio::test]
+async fn a_readmission_adds_exact_names_to_a_tip_cut() {
+    let root_dev = RootDevice::new().await;
+    let root = root_dev.root().await;
+    let tips = tip_cut_of(&phone(), 4, PHONE_SEED);
+    let v2 = revoke_with(&root_dev, &root_dev.held(), &phone(), &tips).await;
+
+    let above = full(&entry(&phone(), "notes", 7), 1);
+    let at_tip = full(&entry(&phone(), "notes", 4), 2);
+    let below = full(&entry(&phone(), "notes", 3), 3);
+    let bump = bump_context_readmitting(
+        root.as_ref(),
+        &v2,
+        &phone(),
+        &[above.clone(), at_tip.clone(), below],
+    )
+    .await
+    .unwrap()
+    .expect("a new version");
+    let readmitted = bump.context.revocation_cut(&phone()).unwrap();
+    assert_eq!(readmitted.tips(), tips.tips());
+    let mut exact = readmitted.exact().to_vec();
+    exact.sort();
+    let mut expected = vec![above, at_tip];
+    expected.sort();
+    assert_eq!(exact, expected, "what is below the tip is not added");
+    assert!(readmitted.covers(&tips));
+}
+
+/// A cut file carries a tip cut as the RevocationCut TLV, verbatim: no
+/// sub-TLV of its own, nothing to carry for a manifest. A tips-only cut
+/// has a complete manifest (there is none); the bound is checked as for any
+/// cut; and a revocation plan accepts it.
+#[test]
+fn a_cut_file_carries_a_tip_cut_verbatim() {
+    use ndn_cert::CutFile;
+    let tips = tip_cut_of(&phone(), 4, PHONE_SEED);
+    let mut file = CutFile::new(tips.clone());
+    file.held_before = Some(1_790_000_000_000);
+    let back = CutFile::decode(&file.encode()).unwrap();
+    assert_eq!(back, file);
+    assert_eq!(back.cut.tips(), tips.tips());
+    back.check_manifest().unwrap();
+    back.check_bound(1_790_000_000_000).unwrap();
+    assert!(matches!(
+        back.check_bound(1_789_999_999_999),
+        Err(BumpError::CutAfterLoss { .. })
+    ));
+    assert!(matches!(
+        CutFile::new(tips.clone()).check_bound(1),
+        Err(BumpError::CutUnbounded { .. })
+    ));
+    let bare = CutFile::decode(&tips.encode()).unwrap();
+    assert_eq!(bare.cut, tips);
+    bare.check_manifest().unwrap();
+
+    // The contingency form still needs its manifest packets.
+    let mut both = cut_of(&phone(), 2, PHONE_SEED);
+    both.add_tip(&device_log_of(&phone()).append("todo"), 2, [2; 32]);
+    assert!(matches!(
+        CutFile::new(both).check_manifest(),
+        Err(BumpError::CutManifestIncomplete { .. })
+    ));
 }
