@@ -479,6 +479,50 @@ async fn suspecting_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_
     assert_eq!(heap.inner.log.lock().fold.epochs().len(), 2);
 }
 
+/// Stage-7 L1 (carried chain), end to end over real nodes: the asker's node gives the chain of
+/// its signing key from its validator, and a granter whose validator holds none of it (and
+/// has no fetcher) judges the asker's seal key packet with it, where without it the packet
+/// waits for a certificate nobody sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_granter_that_holds_none_of_the_askers_chain_judges_the_ask_that_carries_it() {
+    use crate::trust::{Judged, Waiting};
+    use crate::wire::seal_key_name;
+    let devs = world(&["/alice/laptop", "/bob/phone"]).await;
+    let phone_key = devs[1].name.clone().append("KEY").append("1");
+    let (bob, _) = boot(&devs[1], cfg()).await;
+    let chain = bob.inner.signer_chain();
+    assert!(
+        !chain.is_empty(),
+        "a device whose validator holds its certificate carries it"
+    );
+    let own = seal_key_name(&devs[1].name, &bob.inner.seal_public());
+    let packet = bob
+        .inner
+        .seal_key_packet(&own)
+        .expect("its seal key packet");
+    let data = ndn_packet::Data::decode(packet).unwrap();
+    // The granter has never seen the phone's certificate.
+    devs[0].validator.cert_cache().remove(&phone_key);
+    let (alice, _) = boot(&devs[0], cfg()).await;
+    alice.create(&space(), private(&["/bob"])).await.unwrap();
+    let without = alice
+        .inner
+        .validate_asker_packet(&space(), &data, &devs[1].name, &[])
+        .await;
+    assert!(
+        matches!(without, Judged::Pending(Waiting::Chain)),
+        "without the chain the packet waits: {without:?}"
+    );
+    let with = alice
+        .inner
+        .validate_asker_packet(&space(), &data, &devs[1].name, &chain)
+        .await;
+    assert!(
+        matches!(with, Judged::Valid(_)),
+        "a granter that holds none of the chain did not judge the ask that carries it: {with:?}"
+    );
+}
+
 /// Stage-7 M2: a reader's device this owner device granted the epoch key to whose certificate
 /// lapses (by this node's clock) still holds that key, and nothing rotates it: the owner
 /// device signs a new epoch that replaces the old one, once, and ends the record of the

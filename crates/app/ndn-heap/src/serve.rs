@@ -14,8 +14,10 @@
 //! * `<G>/32=grant/<ask>`: the key of an epoch, **only** when the node says
 //!   the asker may have it (`NodeInner::may_grant`); anything else is not
 //!   answered, and nothing is decoded or judged for it. The ask carries the
-//!   asker's seal key packet, so this is one exchange and the granter fetches
-//!   nothing: the packet is judged as the asker device's at every ask (a lapse of the
+//!   asker's seal key packet and the certificates of its signer chain, so this is one
+//!   exchange and the granter fetches nothing: the packet is judged as the asker device's
+//!   at every ask, from the certificates held and carried (the carried ones only as
+//!   unverified copies, dropped again if no walk vouches for them; a lapse of the
 //!   asker's certificate moves no counter, so nothing about its key is kept), the node
 //!   decides again with the key that signed it (a revoked key is granted nothing), and the
 //!   answer is signed by this device with the key wrapped to that seal key.
@@ -43,8 +45,8 @@ use crate::seal::seal_key_matches;
 use crate::sync::{HostRef, Net, Shared};
 use crate::trust::Judged;
 use crate::wire::{
-    GrantAsk, Served, parse_grant_name, parse_held_name, parse_log_name, parse_piece_name,
-    parse_seal_key_name, served_kind,
+    ASKER_CHAIN_MAX, GrantAsk, Served, parse_grant_name, parse_held_name, parse_log_name,
+    parse_piece_name, parse_seal_key_name, served_kind,
 };
 
 /// How many grants a granter keeps to answer an ask it answered before without
@@ -267,7 +269,7 @@ async fn seal_key_verified(
     }
     match shared
         .host
-        .validate_asker_packet(&ask.space, &data, asker)
+        .validate_asker_packet(&ask.space, &data, asker, &ask.chain)
         .await
     {
         Judged::Valid(v) => Ok(v.key),
@@ -275,7 +277,8 @@ async fn seal_key_verified(
             "the asker's seal key packet is refused ({why}); a key is granted only to a device the trust context vouches for now: the asker's next round asks again"
         )),
         Judged::Pending(waiting) => Err(format!(
-            "the asker's seal key packet cannot be judged from what this node holds ({waiting}); a grant ask makes this node fetch nothing (spec 6.5): the chain reaches it with the entries or signals of the asker's person that it judges, or from the host that seeds its certificates; the asker asks another device of the space, and asks this one again once the chain is held"
+            "the asker's seal key packet cannot be judged from the certificates this node holds and the {} certificate(s) the ask carries ({waiting}); a grant ask makes this node fetch nothing (spec 6.5), so the asker's device must carry the certificates of its signing key and of its issuers in the ask (at most {ASKER_CHAIN_MAX}): it holds none of its own when it carries none, so enrol it or load its certificate; a chain that does not reach this node's trust anchors is refused; the asker's next round asks again",
+            ask.chain.len()
         )),
     }
 }

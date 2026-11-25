@@ -56,6 +56,67 @@ fn ask(space: &Name) -> GrantAsk {
     .expect("a grant ask")
 }
 
+/// A certificate-shaped Data of `len` octets of Content, for the limits of a carried chain.
+fn cert_of(name: &str, len: usize) -> Bytes {
+    DataBuilder::new(n(name), &vec![1; len]).sign_digest_sha256()
+}
+
+/// A grant ask carries the asker's signer chain after the seal key packet: it round-trips in
+/// the one canonical encoding, an ask without a chain still decodes, and the limits hold
+/// (at most 4 certificates, each Data of at most 4,096 octets, 6,144 in all).
+#[test]
+fn a_grant_ask_may_carry_a_bounded_certificate_chain() {
+    let space = n("/alice/32=data/notes");
+    let plain = ask(&space);
+    assert!(plain.chain.is_empty());
+    assert_eq!(GrantAsk::decode(plain.encode()), Ok(plain.clone()));
+
+    let chain = vec![
+        cert_of("/alice/laptop/KEY/1/CA/v=1", 300),
+        cert_of("/alice/CA/KEY/c/root/v=1", 300),
+    ];
+    let carrying = plain.clone().with_chain(chain.clone()).expect("a chain");
+    assert_eq!(carrying.chain, chain);
+    let device = n("/bob/phone");
+    let name = grant_name(&device, &carrying);
+    assert_eq!(
+        parse_grant_name(&name),
+        Some((device.clone(), carrying.clone())),
+        "a chain is part of the one canonical name"
+    );
+    assert_ne!(
+        name,
+        grant_name(&device, &plain),
+        "an ask with a chain is another ask"
+    );
+
+    let too_many = vec![cert_of("/a/KEY/1/x/v=1", 10); ASKER_CHAIN_MAX + 1];
+    let too_big = vec![cert_of("/a/KEY/1/x/v=1", 4097)];
+    let too_much = vec![
+        cert_of("/a/KEY/1/x/v=1", 3000),
+        cert_of("/a/KEY/1/y/v=1", 3000),
+        cert_of("/a/KEY/1/z/v=1", 3000),
+    ];
+    for (what, chain) in [
+        ("five", too_many),
+        ("one over 4,096", too_big),
+        ("over 6,144 in all", too_much),
+    ] {
+        assert!(plain.clone().with_chain(chain).is_err(), "{what}");
+    }
+    assert!(
+        plain
+            .clone()
+            .with_chain(vec![Bytes::from_static(b"not a Data")])
+            .is_err(),
+        "a certificate is a Data"
+    );
+    // A decoder holds the same limits: the TLV of an over-long chain names no grant.
+    let mut over = carrying.clone();
+    over.chain = vec![cert_of("/a/KEY/1/x/v=1", 10); ASKER_CHAIN_MAX + 1];
+    assert_eq!(parse_grant_name(&grant_name(&device, &over)), None);
+}
+
 #[test]
 fn space_names_of_one_to_four_components_parse_and_five_do_not() {
     let owner = n("/home/alice");

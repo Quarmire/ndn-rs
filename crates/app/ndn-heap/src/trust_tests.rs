@@ -860,15 +860,28 @@ async fn bob_bare() -> (Arc<Judge>, Ed25519Signer, Certificate, Certificate) {
 async fn bob_bare_fetching(
     fetched: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) -> (Arc<Judge>, Ed25519Signer, Certificate, Certificate) {
+    bob_bare_chain(fetched, (PAST, u64::MAX), false).await
+}
+
+/// [`bob_bare_fetching`] with the phone's certificate valid `leaf`, and its context listing the
+/// `member` role in DataRequiresCut when `cut` (so that a lapsed certificate is refused).
+async fn bob_bare_chain(
+    fetched: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    leaf: (u64, u64),
+    cut: bool,
+) -> (Arc<Judge>, Ed25519Signer, Certificate, Certificate) {
     let root = signer("/home/bob/KEY/root", 70);
     let ca = signer(CA_KEY, 71);
     let phone = signer(PHONE_KEY, 72);
     let anchor = cert(&root, &root, "self", PAST, u64::MAX).await;
     let ca_cert = cert(&ca, &root, "root", PAST, u64::MAX).await;
-    let leaf = cert(&phone, &ca, "CA", PAST, u64::MAX).await;
-    let ctx = SignedTrustContext::hierarchical(n("/home/bob"))
+    let leaf = cert(&phone, &ca, "CA", leaf.0, leaf.1).await;
+    let mut ctx = SignedTrustContext::hierarchical(n("/home/bob"))
         .with_ca_endpoint(n("/home/bob/CA"))
         .with_version(1);
+    if cut {
+        ctx = ctx.with_data_requires_cut("member");
+    }
     ctx.anchors().insert(Arc::clone(&anchor.name), anchor);
     let keyring = Arc::new(Keyring::new());
     keyring.adopt(Arc::new(ctx)).unwrap();
@@ -1154,7 +1167,7 @@ async fn judging_the_packet_of_a_grant_ask_fetches_no_certificate() {
     let (judge, phone, leaf, ca) = bob_bare_fetching(Some(Arc::clone(&fetched))).await;
     let packet = signed(seal_key_name(&n(DEVICE), &[9; 32]), &phone);
     let judged = judge
-        .validate_asker_packet(&packet, &n(DEVICE), &bob_space())
+        .validate_asker_packet(&packet, &n(DEVICE), &bob_space(), &[])
         .await;
     assert!(
         matches!(judged, Judged::Pending(Waiting::Chain)),
@@ -1170,7 +1183,7 @@ async fn judging_the_packet_of_a_grant_ask_fetches_no_certificate() {
     judge.validator.cert_cache().insert(leaf);
     valid(
         judge
-            .validate_asker_packet(&packet, &n(DEVICE), &bob_space())
+            .validate_asker_packet(&packet, &n(DEVICE), &bob_space(), &[])
             .await,
     );
     assert_eq!(fetched.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -1185,6 +1198,84 @@ async fn judging_the_packet_of_a_grant_ask_fetches_no_certificate() {
         fetched.load(std::sync::atomic::Ordering::SeqCst) > 0,
         "the fetching judge fetches, so the counter counts"
     );
+}
+
+/// Stage-7 L1 (carried chain): the ask carries the asker's certificate chain, so a granter that
+/// holds none of it judges the packet without fetching anything (a counting fetcher is asked
+/// for nothing), and what the walk vouched for is held afterwards.
+#[tokio::test]
+async fn a_grant_ask_carrying_its_chain_is_judged_without_a_fetch() {
+    let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (judge, phone, leaf, ca) = bob_bare_fetching(Some(Arc::clone(&fetched))).await;
+    let packet = signed(seal_key_name(&n(DEVICE), &[9; 32]), &phone);
+    let chain = [wire_of(&leaf), wire_of(&ca)];
+    let judged = judge
+        .validate_asker_packet(&packet, &n(DEVICE), &bob_space(), &chain)
+        .await;
+    assert!(
+        matches!(judged, Judged::Valid(_)),
+        "a grant ask carrying its chain was not judged valid: {judged:?}"
+    );
+    let calls = fetched.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(calls, 0, "the granter fetched {calls} certificate(s)");
+    assert!(
+        judge.validator.cert_cache().holds_vouched(&n(PHONE_KEY)),
+        "the walk vouched for the carried leaf"
+    );
+}
+
+/// A carried chain that does not reach the anchors vouches for nothing: a leaf issued by a key
+/// that is not the CA's, a chain with a hop left out, and junk are not a valid packet, and none
+/// of what was carried stays held.
+#[tokio::test]
+async fn a_carried_chain_that_does_not_reach_an_anchor_makes_nothing_valid_and_is_not_kept() {
+    let mallory = signer(CA_KEY, 99);
+    for case in 0..4 {
+        // A judge of its own per case: a genuine CA certificate one case got vouched for stays
+        // held, as it should, and would complete the next case's chain.
+        let (judge, phone, leaf, ca) = bob_bare().await;
+        let packet = signed(seal_key_name(&n(DEVICE), &[9; 32]), &phone);
+        let forged = cert(&phone, &mallory, "CA", PAST, u64::MAX).await;
+        let (what, chain) = match case {
+            0 => (
+                "a leaf issued by another key",
+                vec![wire_of(&forged), wire_of(&ca)],
+            ),
+            1 => ("a chain without its CA", vec![wire_of(&leaf)]),
+            2 => ("junk", vec![Bytes::from_static(b"junk")]),
+            _ => ("nothing", vec![]),
+        };
+        let judged = judge
+            .validate_asker_packet(&packet, &n(DEVICE), &bob_space(), &chain)
+            .await;
+        assert!(
+            !matches!(judged, Judged::Valid(_)),
+            "{what} made the packet valid"
+        );
+        assert!(
+            judge.validator.cert_cache().all(&n(PHONE_KEY)).is_empty(),
+            "{what}: a certificate that was not vouched for stayed held"
+        );
+    }
+}
+
+/// A carried chain does not end a lapse: the leaf's certificate ended, so the packet is
+/// refused as lapsed whatever the ask carries (the M1 rule holds at every ask).
+#[tokio::test]
+async fn a_carried_but_lapsed_chain_is_still_refused() {
+    let (judge, phone, leaf, ca) = bob_bare_chain(None, (PAST, EXPIRED), true).await;
+    let packet = signed(seal_key_name(&n(DEVICE), &[9; 32]), &phone);
+    let chain = [wire_of(&leaf), wire_of(&ca)];
+    match judge
+        .validate_asker_packet(&packet, &n(DEVICE), &bob_space(), &chain)
+        .await
+    {
+        Judged::Refused(Refusal::Lapsed { not_after, now }) => {
+            assert_eq!(not_after.0, EXPIRED / 1_000_000);
+            assert!(now > not_after);
+        }
+        other => panic!("a lapsed carried chain was not refused as lapsed: {other:?}"),
+    }
 }
 
 /// An issuer above the signer revoked: nothing a cut can excuse, so the entry

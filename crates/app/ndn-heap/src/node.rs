@@ -1250,15 +1250,25 @@ impl NodeInner {
         self.judge.validate_device_packet(data, device, space).await
     }
 
-    /// [`Self::validate_device_packet`] for the packet of a grant ask: nothing is fetched
+    /// [`Self::validate_device_packet`] for the packet of a grant ask: nothing is fetched, and
+    /// `chain`, the certificates the ask carries, is held only for the judging
     /// ([`Judge::validate_asker_packet`]).
     pub(crate) async fn validate_asker_packet(
         &self,
         space: &Name,
         data: &Data,
         device: &Name,
+        chain: &[Bytes],
     ) -> Judged {
-        self.judge.validate_asker_packet(data, device, space).await
+        self.judge
+            .validate_asker_packet(data, device, space, chain)
+            .await
+    }
+
+    /// The certificates of this device's signing key and its issuers, leaf first, as far as
+    /// this node's validator holds them: what a grant ask carries ([`Judge::chain_of`]).
+    pub(crate) fn signer_chain(&self) -> Vec<Bytes> {
+        self.judge.chain_of(self.signer.key_name())
     }
 
     /// The certificate packet this node's validator vouches for under `name`, for a held

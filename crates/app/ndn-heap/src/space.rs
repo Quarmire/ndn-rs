@@ -561,7 +561,7 @@ impl SpaceInner {
             };
             let judged = node
                 .judge
-                .validate_asker_packet(&data, &device, &self.name)
+                .validate_asker_packet(&data, &device, &self.name, &[])
                 .await;
             if matches!(judged, Judged::Refused(Refusal::Lapsed { .. })) {
                 lapsed.insert(key);

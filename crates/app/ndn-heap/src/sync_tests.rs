@@ -1254,6 +1254,11 @@ async fn the_grant_pull_walks_creator_then_relays_with_backoff() {
         None::<tokio::time::Instant>,
     )));
     let counter = Arc::clone(&answered);
+    let own_chain = vec![
+        DataBuilder::new(n("/alice/desktop/KEY/1/CA/v=1"), b"leaf").sign_digest_sha256(),
+        DataBuilder::new(n("/alice/CA/KEY/c/root/v=1"), b"ca").sign_digest_sha256(),
+    ];
+    r.host.st.lock().own_chain = own_chain.clone();
     let own_seal_packet = r
         .host
         .st
@@ -1268,6 +1273,10 @@ async fn the_grant_pull_walks_creator_then_relays_with_backoff() {
         assert_eq!(
             ask.seal_packet, own_seal_packet,
             "the ask carries this device's own seal key packet, so a granter fetches nothing"
+        );
+        assert_eq!(
+            ask.chain, own_chain,
+            "the ask carries this device's signer chain, so a granter that holds none of it judges the packet"
         );
         if granter == n(PHONE) {
             return Reply::Silent;

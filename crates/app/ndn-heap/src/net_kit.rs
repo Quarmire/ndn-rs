@@ -321,6 +321,10 @@ pub(crate) struct Toy {
     pub grantees: Vec<Name>,
     /// Why `note_grantee` refuses, when the toy's record is full.
     pub grantees_full: Option<String>,
+    /// How many certificates each `validate_asker_packet` was handed, in order.
+    pub chains_seen: Vec<usize>,
+    /// The certificates the toy gives as this device's own signer chain.
+    pub own_chain: Vec<Bytes>,
     /// The generation of the judge the toy reports.
     pub generation: u64,
     /// The keys the toy says are revoked.
@@ -361,7 +365,16 @@ pub(crate) trait Host: Send + Sync + 'static {
     fn owed_keys(&self, space: &Name) -> Vec<EpochId>;
     fn seal_public(&self) -> [u8; 32];
     async fn validate_device_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged;
-    async fn validate_asker_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged;
+    async fn validate_asker_packet(
+        &self,
+        space: &Name,
+        data: &Data,
+        device: &Name,
+        chain: &[Bytes],
+    ) -> Judged;
+    /// The certificates of this device's signing key and its issuers, leaf first, as far as the
+    /// node holds them: what a grant ask carries.
+    fn signer_chain(&self) -> Vec<Bytes>;
     fn note_grantee(&self, space: &Name, key: &Name, seal_packet: &Bytes) -> Result<(), String>;
     fn key_arrived(&self, space: &Name, epoch: &EpochId, name: &Name, content: Bytes) -> bool;
     fn generation(&self) -> u64;
@@ -679,8 +692,19 @@ impl Host for Toyhost {
         })
     }
 
-    async fn validate_asker_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged {
+    async fn validate_asker_packet(
+        &self,
+        space: &Name,
+        data: &Data,
+        device: &Name,
+        chain: &[Bytes],
+    ) -> Judged {
+        self.st.lock().chains_seen.push(chain.len());
         self.validate_device_packet(space, data, device).await
+    }
+
+    fn signer_chain(&self) -> Vec<Bytes> {
+        self.st.lock().own_chain.clone()
     }
 
     fn note_grantee(&self, _space: &Name, key: &Name, _seal_packet: &Bytes) -> Result<(), String> {

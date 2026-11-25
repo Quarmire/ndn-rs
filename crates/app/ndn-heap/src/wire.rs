@@ -71,6 +71,8 @@ pub(crate) use prim::{each, fields, once, read_name};
 pub(crate) use sign::{SignError, sign_entry};
 
 pub use digest::{signed_digest, signed_digest_of};
+pub use names::ASKER_CHAIN_MAX;
+pub(crate) use names::ASKER_CHAIN_OCTETS_MAX;
 pub use names::{
     GrantAsk, LogName, SignalRunName, SpaceName, grant_name, held_name, is_namespace, log_name,
     parse_grant_name, parse_held_name, parse_log_name, parse_seal_key_name, parse_signal_run_name,

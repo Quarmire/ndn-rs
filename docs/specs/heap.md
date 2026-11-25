@@ -247,7 +247,7 @@ device.
 | chunk of the payload of entry `E` | `<E>/32=piece/seg=<i>` | the chunk's octets (§8) | DigestSha256 |
 | manifest node `k` of entry `E` | `<E>/32=piece/32=manifest/seg=<k>` | `DIGEST`* (§8) | DigestSha256 |
 | seal key of device `D` | `<D>/32=seal/<public key>`, the last component 32 octets | one `SEAL_KEY` TLV (§6.2) | a key of device `D` |
-| grant | `<G>/32=grant/<GrantAsk TLV>`, the last component one GenericNameComponent holding the `GRANT_ASK` TLV, which carries the asker's seal key packet | one `GRANT` TLV (§6.5) | a key of the granter `G` |
+| grant | `<G>/32=grant/<GrantAsk TLV>`, the last component one GenericNameComponent holding the `GRANT_ASK` TLV, which carries the asker's seal key packet and the certificates of its signer chain | one `GRANT` TLV (§6.5) | a key of the granter `G` |
 | held copy | `<H>/32=held/<Name TLV of the original>`, the last component one GenericNameComponent | the complete wire of the original packet | DigestSha256 |
 | signal run header (§11; never stored, served or fetched) | `<D>/32=signal/<S>/32=run/<run id>`, the run id one GenericNameComponent of 16 octets | the run's body | a key of device `D` |
 | sync group | `<O>/32=sync/<c1>[/<c2>…]` | State Vector Sync Interests and Data (§7) | as `ndn-sync` |
@@ -286,11 +286,16 @@ Every name parses one way, and a node MUST refuse a name that does not parse.
 - **Grant.** `G` is the components before the first `32=grant` (a device
   name); exactly one GenericNameComponent follows whose value is one `GRANT_ASK`
   TLV: the space as one `Name` TLV (which MUST parse as a space name), one
-  `EPOCH_ID`, and one `SEAL_KEY_PACKET`, the asker's **seal key packet** — the
+  `EPOCH_ID`, one `SEAL_KEY_PACKET`, the asker's **seal key packet** — the
   whole signed Data `<D>/32=seal/<public key>` (its name MUST parse as a seal key
-  name, and it is at most 2,048 octets, `SEAL_KEY_PACKET_MAX`). The ask carries
-  the packet itself, not its name, so the granter learns the asker's device and
+  name, and it is at most 2,048 octets, `SEAL_KEY_PACKET_MAX`) — and **at most 4
+  `ASKER_CERT`**, the certificates of the key that signed the packet and of its
+  issuers, leaf first, each a whole Data of at most 4,096 octets (the held-copy
+  limit) and at most 6,144 octets in all. The ask carries the packet and the
+  chain themselves, not their names, so the granter learns the asker's device and
   key, and judges the packet, from the ask alone and sends no Interest (§6.5).
+  An ask with no `ASKER_CERT` is valid and is judged from the certificates the
+  granter holds.
   The encoding MUST be canonical: re-encoding the decoded ask MUST give the same
   octets, so one ask has one name. A name of the older form (the seal key named,
   not carried) names no grant.
@@ -416,13 +421,14 @@ class.
 | `EPOCH_BODY` | 0x062F | `ENTRY` | `KEY_CHECK`, `AUDIENCE` | at most one |
 | `KEY_CHECK` | 0x0631 | `EPOCH_BODY` | 32 octets (§6.2) | exactly one |
 | `AUDIENCE` | 0x0633 | `EPOCH_BODY` | `Name`* (persons) | exactly one; 0 to 256 persons |
-| `GRANT_ASK` | 0x0635 | the last name component of a grant | `Name` (space), `EPOCH_ID`, `SEAL_KEY_PACKET` | see §2.3 |
+| `GRANT_ASK` | 0x0635 | the last name component of a grant | `Name` (space), `EPOCH_ID`, `SEAL_KEY_PACKET`, `ASKER_CERT`* | see §2.3 |
 | `SEAL_KEY` | 0x0637 | Content of a seal key packet | 32 octets: an X25519 public key | exactly one |
 | `GRANT` | 0x0639 | Content of a grant packet | `EPHEMERAL_KEY`, `CIPHERTEXT` | exactly one of each |
 | `SEAL_KEY_PACKET` | 0x063B | `GRANT_ASK` | the wire of the asker's seal key packet, a whole Data | exactly one; ≤ 2,048 octets (`SEAL_KEY_PACKET_MAX`) |
+| `ASKER_CERT` | 0x063D | `GRANT_ASK` | the wire of one certificate of the asker's signer chain, a whole Data | at most 4 (`ASKER_CHAIN_MAX`), each ≤ 4,096 octets, ≤ 6,144 in all |
 
 `SEAL_KEY` and `GRANT` are packet Contents, not parts of an entry; `GRANT_ASK`
-and `SEAL_KEY_PACKET` live in a name. 0x063D–0x063F and every even number of the
+and `SEAL_KEY_PACKET` live in a name, as does `ASKER_CERT`. 0x063F and every even number of the
 block are free (§15).
 
 ### 3.4 Decoding
@@ -1377,13 +1383,24 @@ Anything else gets **no answer**, and `G` sends no Interest for any ask: the
 exchange is one Interest and one Data. Conditions 1–5 are decided first, from the
 ask's names alone, before the packet in it is decoded. Then `G` decodes the seal
 key packet the ask carries — `<D>/32=seal/<pk>` — and verifies it **from the
-certificates `G` holds alone** (§6.2: signed by a key of `D`, chained to `D`'s
-person's trust context as any packet of a device is, the Content equal to `pk`;
-nothing about it is kept). A signer whose chain `G` does not hold is not
-fetched for: the ask gets no answer, and the asker asks another device of the
-space (up to 8, above) and this one again once `G` holds the chain, which it
-learns from the entries and signals of `D`'s person that it judges (§7.6, §9.1)
-or from the host that seeds its certificates. All eight
+certificates the ask carries and `G` holds** (§6.2: signed by a key of `D`,
+chained to `D`'s person's trust context as any packet of a device is, the Content
+equal to `pk`; nothing about it is kept). The asker **carries its signer chain**
+(`ASKER_CERT`, §2.3): the certificate of the key that signed the packet and those
+of its issuers up to what `G` can anchor, from its own validator. `G` hands each
+carried certificate to its validator **only as an unverified copy** (as a held
+copy is, §7.6) and only for the hop the judging waits for — a certificate of the
+key that hop names — and judges the packet from certificates held alone; the walk
+vouches for a copy by reaching a trust anchor of the context that governs the
+key through it, and what it cannot vouch for is dropped again, so a forged chain
+leaves nothing held and makes nothing valid. A certificate whose NotAfter has
+passed is no better for being carried: the lapse of condition 7 is judged on
+the chain as it stands, at every ask. A signer whose chain is carried by no ask
+and held by no one is not fetched for: the ask gets no answer and the log says
+so (the asker's device holds no certificate of its own key when it carries
+none: it is to be enrolled, or its certificate loaded); the asker asks another
+device of the space (up to 8, above) and this one again, carrying its chain
+afresh each round (a renewed certificate is carried as soon as it is held). All eight
 conditions are checked **again** after the judging, with the key that signed it,
 since the records may have moved. It answers with the key wrapped to `pk` (§6.2) under the
 **grant's own name** as AAD, signed by its device key. `pk` is the key of the
@@ -1490,9 +1507,15 @@ inside the sealed body.
   no signature check (conditions 1–4 are checked first, from the names alone),
   and one that passes them for a real reader's device costs at most one
   judging of a packet of at most 2,048 octets, under the per-asker bound of 32.
-  That judging is from held certificates only (stage-7 L1): asks naming made-up
+  That judging is from held and carried certificates only (stage-7 L1): asks naming made-up
   keys of a reader's person (`/bob/x<i>/KEY/k`) cannot make `G` send an
   Interest toward that person, one out per Interest in, whatever names they use.
+  **A forged chain** (certificates the asker made up or issued by another key, a chain
+  with a hop left out, junk) is verified as any held copy is: unverified, vouched for
+  only by a walk that reaches an anchor, dropped when it does not; it never makes a
+  packet valid and stays held only if vouched for. The extra work is bounded: at most
+  4 certificates and 6,144 octets in an ask, one judging per carried certificate and one
+  more, each a few signature checks, all inside the per-asker bound of 32.
 
 ## 7. Sync and fetch
 
@@ -1779,8 +1802,10 @@ The conditions and the cryptography are §6.5. As implemented:
   Interest carried. A grant is judged as a packet of the granter's device
   (§9.1), unwrapped with the recipient key under the grant's name, and taken
   only if the log accepts it (§6.2); one that fails is dropped and the asking
-  goes on. The ask is built once per epoch owed from this device's own seal key
-  packet, which the node signed at start (`SEAL_KEY_PACKET`).
+  goes on. The ask is built each round from this device's own seal key
+  packet, which the node signed at start (`SEAL_KEY_PACKET`), and its signer chain
+  (`ASKER_CERT`, §6.5) from its validator; a device that holds no certificate of its
+  own key warns that it asks without one.
 - **Granter.** §6.5, with its bounds (asks per asker, grants kept).
 
 ### 7.9 Routing is the forwarder's
@@ -3486,7 +3511,7 @@ Each property of §1.6 is held by one module and shown by named tests (the
 The data layer owns **0x0600–0x063F** (64 numbers), registered in
 [README.md](README.md#tlv-type-numbers). **Odd** numbers are critical: a decoder
 refuses a record holding one it does not know. **Even** numbers are skippable
-and reserved for additive fields (§3.4). Every number in use is odd; 0x063D–0x063F
+and reserved for additive fields (§3.4). Every number in use is odd; 0x063F
 and every even number of the block are free.
 
 | TLV-TYPE | Name | Value | § |
@@ -3517,10 +3542,11 @@ and every even number of the block are free.
 | 0x062F | `EPOCH_BODY` | `KEY_CHECK`, `AUDIENCE` | 3.5, 6.3 |
 | 0x0631 | `KEY_CHECK` | 32 octets | 6.2 |
 | 0x0633 | `AUDIENCE` | `Name`* (≤ 256 persons) | 3.5 |
-| 0x0635 | `GRANT_ASK` | `Name` (space), `EPOCH_ID`, `SEAL_KEY_PACKET`: the last component of a grant's name | 2.3, 6.5 |
+| 0x0635 | `GRANT_ASK` | `Name` (space), `EPOCH_ID`, `SEAL_KEY_PACKET`, `ASKER_CERT`*: the last component of a grant's name | 2.3, 6.5 |
 | 0x0637 | `SEAL_KEY` | 32 octets: an X25519 public key; the Content of a seal key packet | 6.2 |
 | 0x0639 | `GRANT` | `EPHEMERAL_KEY`, `CIPHERTEXT`: the Content of a grant packet | 6.2, 6.5 |
 | 0x063B | `SEAL_KEY_PACKET` | the wire of the asker's seal key packet (a whole Data), at most 2,048 octets | 2.3, 3.3, 6.5 |
+| 0x063D | `ASKER_CERT` | the wire of one certificate of the asker's signer chain (a whole Data), at most 4 in a `GRANT_ASK`, each at most 4,096 octets, 6,144 in all | 2.3, 3.3, 6.5 |
 
 Name keywords this specification owns (KeywordNameComponent, TLV-TYPE 0x20): `data`,
 `log`, `piece`, `manifest`, `seal`, `grant`, `held`, `sync`, `signal`, `run` (§2, §11). The numbers

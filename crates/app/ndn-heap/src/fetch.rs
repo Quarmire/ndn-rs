@@ -1738,22 +1738,36 @@ impl Group {
     async fn pull_rounds(&self, epoch: &EpochId) {
         let host = &self.shared.host;
         let own = seal_key_name(host.device(), &host.seal_public());
-        let ask = match host
-            .seal_key_packet(&own)
-            .ok_or(WireError::Malformed("this device holds no seal key packet"))
-            .and_then(|packet| GrantAsk::new(self.space.clone(), epoch.clone(), packet))
-        {
-            Ok(ask) => ask,
-            Err(e) => {
-                tracing::warn!(space = %self.space, "the key of {epoch:?} is not asked for: this device's seal key packet cannot be carried in a grant ask ({e}); sign it with a device key whose signature is smaller");
-                return;
-            }
-        };
         let mut misses = 0u32;
         loop {
             if self.stop.is_cancelled() || !host.owed_keys(&self.space).contains(epoch) {
                 return;
             }
+            // Built each round: a certificate renewed meanwhile is carried as soon as it is
+            // held. The ask carries this device's signer chain, so that a granter that
+            // fetches nothing can judge the seal key packet (spec §6.5).
+            let ask = match host
+                .seal_key_packet(&own)
+                .ok_or(WireError::Malformed("this device holds no seal key packet"))
+                .and_then(|packet| GrantAsk::new(self.space.clone(), epoch.clone(), packet))
+            {
+                Ok(ask) => ask,
+                Err(e) => {
+                    tracing::warn!(space = %self.space, "the key of {epoch:?} is not asked for: this device's seal key packet cannot be carried in a grant ask ({e}); sign it with a device key whose signature is smaller");
+                    return;
+                }
+            };
+            let chain = host.signer_chain();
+            if chain.is_empty() && misses == 0 {
+                tracing::warn!(space = %self.space, "this device's validator holds no certificate of its signing key, so its grant asks carry no chain: a granter that does not hold the chain refuses them; enrol the device (or load its certificate) before it asks");
+            }
+            let ask = match ask.clone().with_chain(chain) {
+                Ok(carrying) => carrying,
+                Err(e) => {
+                    tracing::warn!(space = %self.space, "this device's certificate chain cannot be carried in a grant ask ({e}): asking without it");
+                    ask
+                }
+            };
             let granters = self
                 .heard
                 .lock()

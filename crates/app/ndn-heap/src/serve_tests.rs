@@ -360,6 +360,33 @@ async fn the_grantee_is_recorded_before_the_key_is_given_and_a_full_record_refus
     assert_eq!(s.host.st.lock().granted_to, vec![[9; 32]]);
 }
 
+/// Stage-7 L1 (carried chain): the certificates an ask carries are what the granter's judge is
+/// handed with the packet, and an ask without any is still answered (judged from what is held).
+#[tokio::test(start_paused = true)]
+async fn the_granter_judges_the_packet_with_the_chain_the_ask_carries() {
+    let s = serving(ME).await;
+    let cert = DataBuilder::new(n("/alice/tablet/KEY/1/CA/v=1"), b"cert").sign_digest_sha256();
+    let ask = GrantAsk::new(
+        space(),
+        EpochId {
+            creator: me(),
+            seq: 2,
+        },
+        seal_packet(TABLET, [9; 32]),
+    )
+    .expect("a grant ask")
+    .with_chain(vec![cert])
+    .expect("a chain");
+    assert!(s.ask(&grant_name(&me(), &ask)).await.is_some());
+    let (_, plain) = grant_ask_of(TABLET, [9; 32], 3);
+    assert!(s.ask(&plain).await.is_some());
+    assert_eq!(
+        s.host.st.lock().chains_seen,
+        vec![1, 0],
+        "the judge was handed the carried certificate, and none for the plain ask"
+    );
+}
+
 /// A reader who was removed is refused every later grant, even the one
 /// already answered once: the decision is the host's at each ask. A captured ask replayed after
 /// the removal gets nothing, and one replayed while the reader reads gets the key wrapped to

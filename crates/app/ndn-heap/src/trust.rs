@@ -43,7 +43,7 @@ use tokio::sync::mpsc;
 use crate::error::{Cut, Refusal, Timestamp};
 use crate::rt::{self, Instant};
 use crate::store::Kind;
-use crate::wire::{device_of, log_prefix, parse_log_name};
+use crate::wire::{ASKER_CHAIN_MAX, ASKER_CHAIN_OCTETS_MAX, device_of, log_prefix, parse_log_name};
 
 /// The first pause before a person the host could not adopt is asked again;
 /// it doubles on each refusal, up to [`SCOPE_PAUSE_MAX`].
@@ -697,17 +697,84 @@ impl Judge {
         self.device_packet(data, device, space, true).await
     }
 
-    /// [`Self::validate_device_packet`] for the packet a grant ask carries, from the
-    /// certificates this node holds alone: it sends no Interest (spec §6.5: a granter sends
-    /// none for any ask, so a stranger's asks cannot make it fetch). A signer whose chain is
-    /// not held is [`Judged::Pending`] (`Waiting::Chain`) and is not fetched for.
+    /// [`Self::validate_device_packet`] for the packet a grant ask carries: judged from the
+    /// certificates this node holds and `chain`, the certificates the ask carries, and sends
+    /// no Interest (spec §6.5: a granter sends none for any ask, so a stranger's asks cannot
+    /// make it fetch). Each carried certificate is handed to the validator only as an
+    /// **unverified** copy, and only for the hop the judgement waits for (a certificate of the
+    /// key it names, as a held copy is, [`Self::take_certificate`]); the walk vouches for it by
+    /// reaching a trust anchor through it. What the walk could not vouch for is dropped again,
+    /// so a forged chain leaves nothing held. The work is bounded: at most one judging per
+    /// carried certificate (at most [`ASKER_CHAIN_MAX`]) and one more, each checking
+    /// signatures of one packet and of the chain it reaches. A signer whose chain is not
+    /// carried and not held is [`Judged::Pending`] (`Waiting::Chain`).
     pub(crate) async fn validate_asker_packet(
         &self,
         data: &Data,
         device: &Name,
         space: &Name,
+        chain: &[Bytes],
     ) -> Judged {
-        self.device_packet(data, device, space, false).await
+        let view = self.view_for(&data.name, space, true);
+        let mut taken = Vec::new();
+        for _ in 0..chain.len().min(ASKER_CHAIN_MAX) {
+            let (ValidationResult::Pending, Some(missing)) =
+                view.validate_durable_cached(data).await
+            else {
+                break;
+            };
+            if is_full_name(&missing) {
+                break;
+            }
+            let Some(cert) = chain
+                .iter()
+                .find_map(|carried| Self::certificate_for(&missing, carried))
+            else {
+                break;
+            };
+            if !view.cert_cache().insert_unverified(cert.clone()) {
+                break;
+            }
+            taken.push(cert);
+        }
+        let judged = self.device_packet(data, device, space, false).await;
+        if !matches!(judged, Judged::Valid(_)) {
+            for cert in &taken {
+                view.cert_cache().drop_unverified(cert);
+            }
+        }
+        judged
+    }
+
+    /// The certificates of `key` and of its issuers, leaf first, as far as this node's
+    /// validator holds them (at most [`ASKER_CHAIN_MAX`], within the octet limits of a grant
+    /// ask): what a device carries in its grant asks so that a granter that fetches nothing
+    /// can judge its seal key packet. Empty when the validator holds no certificate of `key`.
+    pub(crate) fn chain_of(&self, key: &Name) -> Vec<Bytes> {
+        let cache = self.validator.cert_cache();
+        let (mut out, mut total, mut want) = (Vec::new(), 0, key.clone());
+        while out.len() < ASKER_CHAIN_MAX {
+            let Some(cert) = cache.get(&Arc::new(want.clone())) else {
+                break;
+            };
+            let Some(wire) = cert.data_wire() else { break };
+            if wire.len() > HELD_CERT_MAX || total + wire.len() > ASKER_CHAIN_OCTETS_MAX {
+                break;
+            }
+            let Ok(packet) = Data::decode(wire.clone()) else {
+                break;
+            };
+            total += wire.len();
+            out.push(wire);
+            let Some(issuer) = packet.sig_info().and_then(|s| s.key_locator_name()) else {
+                break;
+            };
+            if key_name_of(&issuer) == key_name_of(&want) {
+                break;
+            }
+            want = (*issuer).clone();
+        }
+        out
     }
 
     async fn device_packet(&self, data: &Data, device: &Name, space: &Name, fetch: bool) -> Judged {
@@ -768,25 +835,30 @@ impl Judge {
         missing: &Name,
         cert: Bytes,
     ) -> bool {
-        if cert.len() > HELD_CERT_MAX {
-            return false;
-        }
-        let Ok(packet) = Data::decode(cert) else {
-            return false;
-        };
-        let name = &*packet.name;
-        if !name.has_prefix(missing)
-            || is_reserved_non_cert(name)
-            || key_name_of(name) != key_name_of(missing)
-        {
-            return false;
-        }
-        let Ok(cert) = Certificate::decode(&packet) else {
+        let Some(cert) = Self::certificate_for(missing, &cert) else {
             return false;
         };
         self.view_for(&data.name, space, false)
             .cert_cache()
             .insert_unverified(cert)
+    }
+
+    /// `cert` as a certificate of the key `missing` names, if it is one: a packet of the
+    /// certificate shape (not another key's, not an NDNCERT decision) within [`HELD_CERT_MAX`]
+    /// octets.
+    fn certificate_for(missing: &Name, cert: &Bytes) -> Option<Certificate> {
+        if cert.len() > HELD_CERT_MAX {
+            return None;
+        }
+        let packet = Data::decode(cert.clone()).ok()?;
+        let name = &*packet.name;
+        if !name.has_prefix(missing)
+            || is_reserved_non_cert(name)
+            || key_name_of(name) != key_name_of(missing)
+        {
+            return None;
+        }
+        Certificate::decode(&packet).ok()
     }
 
     /// The validator that judges `name` about `space`: for a person's

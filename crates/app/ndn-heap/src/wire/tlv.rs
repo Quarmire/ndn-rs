@@ -70,3 +70,7 @@ pub(crate) const GRANT: u64 = 0x0639;
 /// key>`, carried in the grant ask so the granter verifies it without fetching
 /// it.
 pub(crate) const SEAL_KEY_PACKET: u64 = 0x063B;
+/// One certificate of the asker's signer chain, a whole Data, carried in the grant ask after the
+/// seal key packet (at most `ASKER_CHAIN_MAX`, leaf first) so a granter that fetches nothing
+/// can judge the packet.
+pub(crate) const ASKER_CERT: u64 = 0x063D;

@@ -84,8 +84,17 @@ impl crate::sync::net_kit::Host for NodeInner {
     async fn validate_device_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged {
         NodeInner::validate_device_packet(self, space, data, device).await
     }
-    async fn validate_asker_packet(&self, space: &Name, data: &Data, device: &Name) -> Judged {
-        NodeInner::validate_asker_packet(self, space, data, device).await
+    async fn validate_asker_packet(
+        &self,
+        space: &Name,
+        data: &Data,
+        device: &Name,
+        chain: &[Bytes],
+    ) -> Judged {
+        NodeInner::validate_asker_packet(self, space, data, device, chain).await
+    }
+    fn signer_chain(&self) -> Vec<Bytes> {
+        NodeInner::signer_chain(self)
     }
     fn note_grantee(&self, space: &Name, key: &Name, seal_packet: &Bytes) -> Result<(), String> {
         NodeInner::note_grantee(self, space, key, seal_packet)

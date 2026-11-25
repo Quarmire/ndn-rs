@@ -369,9 +369,10 @@ impl CertCache {
     }
 
     /// Drop `cert` if it is held unverified as exactly this copy (the same
-    /// signed bytes and signature value): a walk could not vouch for it.
-    /// Returns whether it was dropped.
-    pub(crate) fn drop_unverified(&self, cert: &Certificate) -> bool {
+    /// signed bytes and signature value): a walk could not vouch for it, or a
+    /// caller that handed it over for one judging takes it back (a vouched
+    /// certificate is never dropped). Returns whether it was dropped.
+    pub fn drop_unverified(&self, cert: &Certificate) -> bool {
         let Some((_, dropped)) = self
             .unverified
             .remove_if(&cert.name, |_, held| same_copy(held, cert))

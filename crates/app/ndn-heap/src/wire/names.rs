@@ -264,10 +264,21 @@ pub fn parse_seal_key_name(name: &Name) -> Option<(Name, [u8; 32])> {
 /// size of the Interest name.
 pub(crate) const SEAL_KEY_PACKET_MAX: usize = 2048;
 
+/// The most certificates a grant ask carries of the asker's signer chain.
+pub const ASKER_CHAIN_MAX: usize = 4;
+
+/// The most octets of one certificate a grant ask carries (the held-copy limit).
+pub(crate) const ASKER_CERT_MAX: usize = 4096;
+
+/// The most octets of the chain a grant ask carries in all, so that the Interest's name with
+/// the seal key packet stays inside one packet.
+pub(crate) const ASKER_CHAIN_OCTETS_MAX: usize = 6144;
+
 /// What a grant answers: the key of one epoch of a space, for the holder of
 /// a seal key. The ask carries the asker's seal key packet itself (a signed
-/// Data of a few hundred octets), so the granter judges it where it stands and
-/// asks nothing back: the exchange is one Interest and one Data.
+/// Data of a few hundred octets) and the certificates of its signer chain, so
+/// the granter judges it where it stands and asks nothing back: the exchange
+/// is one Interest and one Data.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GrantAsk {
     /// The asker's seal key packet's name, `<D>/32=seal/<public key>`
@@ -279,12 +290,18 @@ pub struct GrantAsk {
     pub epoch: EpochId,
     /// The asker's seal key packet as signed by its device: the whole Data.
     pub seal_packet: Bytes,
+    /// The certificates of the key that signed [`Self::seal_packet`] and of its issuers, leaf
+    /// first, each a whole Data: at most [`ASKER_CHAIN_MAX`], each at most 4,096 octets and
+    /// 6,144 in all. The granter holds them only as unverified copies for the one judging.
+    /// May be empty: the granter then judges from the certificates it holds.
+    pub chain: Vec<Bytes>,
 }
 
 impl GrantAsk {
     /// An ask for `epoch` of `space` that carries `seal_packet`, the asker's seal key packet;
     /// refused if that is no Data named `<device>/32=seal/<public key>` or is over
-    /// 2,048 octets. Whether the device signed it is for the granter's judge.
+    /// 2,048 octets. Whether the device signed it is for the granter's judge. It carries no
+    /// certificates until [`Self::with_chain`].
     pub fn new(space: Name, epoch: EpochId, seal_packet: Bytes) -> Result<GrantAsk, WireError> {
         if seal_packet.len() > SEAL_KEY_PACKET_MAX {
             return Err(WireError::TooLarge {
@@ -307,36 +324,67 @@ impl GrantAsk {
             space,
             epoch,
             seal_packet,
+            chain: Vec::new(),
         })
     }
 
-    /// The `GRANT_ASK` TLV: `{ Name(space), EPOCH_ID, SEAL_KEY_PACKET }`.
+    /// This ask carrying `chain`, the certificates of the asker's signer chain, leaf first;
+    /// refused if there are more than [`ASKER_CHAIN_MAX`], one is no Data or is over 4,096
+    /// octets, or all are over 6,144. Whether the chain is the signer's is for the judge.
+    pub fn with_chain(mut self, chain: Vec<Bytes>) -> Result<GrantAsk, WireError> {
+        let total: usize = chain.iter().map(Bytes::len).sum();
+        if chain.len() > ASKER_CHAIN_MAX
+            || total > ASKER_CHAIN_OCTETS_MAX
+            || chain.iter().any(|c| c.len() > ASKER_CERT_MAX)
+        {
+            return Err(WireError::TooLarge {
+                what: "the certificates a grant ask carries",
+                size: total,
+                max: ASKER_CHAIN_OCTETS_MAX,
+            });
+        }
+        if chain.iter().any(|c| Data::decode(c.clone()).is_err()) {
+            return Err(WireError::Malformed(
+                "a grant ask carries the asker's certificates, each a Data",
+            ));
+        }
+        self.chain = chain;
+        Ok(self)
+    }
+
+    /// The `GRANT_ASK` TLV: `{ Name(space), EPOCH_ID, SEAL_KEY_PACKET, ASKER_CERT* }`.
     pub fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(tlv::GRANT_ASK, |w| {
             write_name(w, &self.space);
             write_epoch_id(w, &self.epoch);
             w.write_tlv(tlv::SEAL_KEY_PACKET, &self.seal_packet);
+            for cert in &self.chain {
+                w.write_tlv(tlv::ASKER_CERT, cert);
+            }
         });
         w.finish()
     }
 
     /// Decode a `GRANT_ASK` TLV; the space must be a space name, the epoch's
-    /// creator a device and the packet a seal key packet's Data ([`Self::new`]).
+    /// creator a device, the packet a seal key packet's Data ([`Self::new`]) and the
+    /// certificates Data within the limits ([`Self::with_chain`]).
     pub(crate) fn decode(content: Bytes) -> Result<GrantAsk, WireError> {
         let value = super::prim::only(content, tlv::GRANT_ASK, "a grant ask is one GRANT_ASK TLV")?;
         let (mut space, mut epoch, mut packet) = (None, None, None);
+        let mut chain = Vec::new();
         fields!(value, |v| {
             tlv_type::NAME => once(&mut space, read_name(v)?, "a grant ask's space")?,
             tlv::EPOCH_ID => once(&mut epoch, read_epoch_id(v)?, "a grant ask's epoch")?,
             tlv::SEAL_KEY_PACKET => once(&mut packet, v, "a grant ask's seal key packet")?,
+            tlv::ASKER_CERT => chain.push(v),
         });
         let (Some(space), Some(epoch), Some(packet)) = (space, epoch, packet) else {
             return Err(WireError::Malformed(
                 "a grant ask has a space name, an epoch and the asker's seal key packet",
             ));
         };
-        GrantAsk::new(space, epoch, packet)
+        GrantAsk::new(space, epoch, packet)?.with_chain(chain)
     }
 }
 
