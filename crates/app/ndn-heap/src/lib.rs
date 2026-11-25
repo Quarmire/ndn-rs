@@ -42,7 +42,13 @@ mod test_kit;
 mod trust;
 
 pub use crate::chan::error::ChanError;
+pub use crate::chan::items::Items;
+pub use crate::chan::rx::{Delivery, Dropped};
 pub use crate::chan::sessions::{ChannelInfo, EndReason};
+pub use crate::chan::verbs::{
+    Congestion, EmitError, EmitOptions, Emitted, GetNotice, GetOptions, Got, Kept, Kind, Live,
+    LiveEnd, Mode, Modes, STAND_MAX, STANDING_BYTES_MAX, STANDING_NAMES_MAX, Select, Trust, Window,
+};
 pub use crate::chan::wire::{ChannelMode, RefusalCode};
 pub use crate::error::{Cut, HeapError, NextStep, Refusal, Timestamp};
 pub use crate::fold::Readers;

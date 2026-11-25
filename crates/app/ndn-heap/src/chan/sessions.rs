@@ -61,6 +61,8 @@ pub enum EndReason {
     Lapsed,
     /// This device left the space, or the node stopped.
     Left,
+    /// The sender ended the channel (a `CONTROL` frame `END`): nothing more will come under it.
+    Closed,
 }
 
 impl fmt::Display for EndReason {
@@ -70,6 +72,7 @@ impl fmt::Display for EndReason {
             EndReason::Replaced => f.write_str("the sender began a new channel"),
             EndReason::Lapsed => f.write_str("its lifetime ran out and it was not renewed"),
             EndReason::Left => f.write_str("this device left the space"),
+            EndReason::Closed => f.write_str("the sender ended the channel"),
         }
     }
 }

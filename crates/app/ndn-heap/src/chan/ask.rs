@@ -99,6 +99,19 @@ impl NodeInner {
         sender: &Name,
         mode: ChannelMode,
     ) -> Result<Arc<RecvSession>, ChanError> {
+        self.chan_ask_since(space, sender, mode, None).await
+    }
+
+    /// [`Self::chan_ask`] of a `Window` channel that names the first sequence still needed
+    /// (`ASK_SINCE`): the sender replays what its window holds from there. `None` asks for no
+    /// replay.
+    pub(crate) async fn chan_ask_since(
+        &self,
+        space: &Name,
+        sender: &Name,
+        mode: ChannelMode,
+        since: Option<u64>,
+    ) -> Result<Arc<RecvSession>, ChanError> {
         if parse_space_name(space).is_none() {
             return Err(ChanError::BadName {
                 name: space.clone(),
@@ -148,7 +161,7 @@ impl NodeInner {
             carriers: vec![carrier::DATAGRAM, carrier::STREAM],
             lifetime: LIFETIME_DEFAULT,
             epoch,
-            since: None,
+            since,
             chain: self.signer_chain(),
         };
         let params = ask.encode().map_err(|e| ChanError::Local {

@@ -25,6 +25,8 @@ use tokio::sync::Notify;
 
 use super::answer::ChanAnswer;
 use super::channels::Channels;
+use super::rx::{Receivers, RxStats};
+use super::tx::Tx;
 use super::sessions::{EndReason, RecvSessions};
 use super::standing::{Who, gate, standing};
 use super::wire::Announce;
@@ -97,6 +99,8 @@ pub(crate) struct Stats {
     pub(crate) announce_ignored: Counter,
     /// Asks an announce made this device send.
     pub(crate) announce_asks: Counter,
+    /// What the receiver counted: why each frame was dropped, and what each cost.
+    pub(crate) rx: RxStats,
 }
 
 /// What the announces heard are limited by.
@@ -144,6 +148,10 @@ pub(crate) struct Chan {
     pub(crate) channels: Channels,
     /// The sessions this device holds as a receiver.
     pub(crate) sessions: RecvSessions,
+    /// The sender's frame layer: its channels' writers and the fixed route's carrier.
+    pub(crate) tx: Tx,
+    /// The receiver: the channels this device takes frames of, and the `Items` it pushes to.
+    pub(crate) rx: Receivers,
     /// The replay guard of the signed asks: it remembers the last 512 asks of each key, which is
     /// more than the 120 s the rate of 4 a second lets one key make.
     pub(crate) replay: ReplayGuard,
@@ -152,6 +160,10 @@ pub(crate) struct Chan {
     wake: Arc<Notify>,
     listening: Mutex<HashMap<Name, usize>>,
     heard: Mutex<Heard>,
+    /// Test seam: while set, the maintenance pass does nothing, so a test can show what the frame
+    /// layer decides before the node's own pass has noticed a change.
+    #[cfg(test)]
+    pub(crate) tick_paused: std::sync::atomic::AtomicBool,
 }
 
 impl Chan {
@@ -159,11 +171,15 @@ impl Chan {
         Chan {
             channels: Channels::default(),
             sessions: RecvSessions::default(),
+            tx: Tx::default(),
+            rx: Receivers::default(),
             replay: ReplayGuard::new(512, false),
             stats: Stats::default(),
             wake: Arc::new(Notify::new()),
             listening: Mutex::new(HashMap::new()),
             heard: Mutex::new(Heard::default()),
+            #[cfg(test)]
+            tick_paused: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -361,6 +377,10 @@ impl NodeInner {
 
     /// One pass of the maintenance task at `now`.
     pub(crate) async fn chan_tick(&self, now: Instant) {
+        #[cfg(test)]
+        if self.chan.tick_paused.load(Ordering::SeqCst) {
+            return;
+        }
         // The sender: the record or the trust generation moved, so the receivers are judged
         // again; what ran out ends; the channels are announced when due or when they changed.
         let mut announce = Vec::new();
@@ -398,6 +418,9 @@ impl NodeInner {
                 let _ = session.recheck(self);
             }
         }
+        // The channels whose session ended or was replaced tell their `Items`; held messages
+        // past 50 ms are dropped.
+        self.chan.rx.sweep(self, now);
         for session in self.chan.sessions.due(now) {
             session.renewal_failed(now);
             let node = self.arc();
@@ -431,5 +454,6 @@ impl NodeInner {
         for session in self.chan.sessions.all() {
             session.end(EndReason::Left);
         }
+        self.chan.rx.close_all();
     }
 }

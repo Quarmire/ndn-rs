@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 096f2de452e812a8187378b872a27bdcfa88e9c82f9b43f160b922a10b068482 # shrinks to arrivals = [(4, 82, false), (1, 1, true), (4, 1, false)]
