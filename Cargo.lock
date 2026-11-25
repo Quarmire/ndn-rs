@@ -1707,36 +1707,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ndn-data"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "futures-core",
- "getrandom 0.2.17",
- "hkdf 0.13.0",
- "hmac 0.13.0",
- "ndn-app",
- "ndn-cert",
- "ndn-foundation-types",
- "ndn-packet",
- "ndn-security",
- "ndn-sync",
- "ndn-tlv",
- "ndn-trust-envelope",
- "parking_lot",
- "sha2 0.11.0",
- "subtle",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "web-time",
- "zeroize",
-]
-
-[[package]]
 name = "ndn-discovery-core"
 version = "0.1.0"
 dependencies = [
