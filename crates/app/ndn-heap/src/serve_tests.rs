@@ -293,9 +293,9 @@ async fn a_grant_ask_is_answered_without_the_granter_fetching_anything() {
     );
 }
 
-/// A new device of an admitted person gets the key, and the seal key the granter verified is
-/// kept: another epoch's ask carrying the same packet is not judged again within one generation
-/// of the judge.
+/// A new device of an admitted person gets the key, and every ask of it is judged afresh: the
+/// seal key packet is judged again for the next epoch's ask (nothing about a device's key is
+/// kept from one ask to the next, because the clock may have lapsed it since).
 #[tokio::test(start_paused = true)]
 async fn a_new_device_of_an_admitted_person_gets_the_key_by_a_grant() {
     let s = serving(ME).await;
@@ -307,8 +307,37 @@ async fn a_new_device_of_an_admitted_person_gets_the_key_by_a_grant() {
     s.host.st.lock().device_packets_valid = false;
     let (_, next) = grant_ask_of(TABLET, [9; 32], 3);
     assert!(
-        s.ask(&next).await.is_some(),
-        "a seal key verified is kept: the next epoch's ask is not judged again"
+        s.ask(&next).await.is_none(),
+        "the seal key packet in the next epoch's ask is judged again, not taken from what was kept"
+    );
+}
+
+/// Stage-7 M1. A device whose certificate lapsed after its seal key was verified gets no
+/// further key: a lapse moves nothing the granter keeps (the judge's generation moves on a
+/// revocation only), so the verdict on the asker's key is taken afresh at every ask, for a new
+/// epoch and for a name it was answered before.
+#[tokio::test(start_paused = true)]
+async fn a_device_whose_certificate_lapsed_is_granted_no_new_epoch() {
+    let s = serving(ME).await;
+    let (_, first) = grant_ask_of(TABLET, [9; 32], 2);
+    assert!(
+        s.ask(&first).await.is_some(),
+        "granted while the certificate is valid"
+    );
+    s.host.st.lock().lapsed = true;
+    let (_, next) = grant_ask_of(TABLET, [9; 32], 3);
+    assert!(
+        s.ask(&next).await.is_none(),
+        "a lapsed device was granted a new epoch from the kept seal key"
+    );
+    assert!(
+        s.ask(&first).await.is_none(),
+        "a lapsed device was served the grant kept before its certificate ended"
+    );
+    assert_eq!(
+        s.host.st.lock().granted_to,
+        vec![[9; 32]],
+        "one key wrapped: before the lapse"
     );
 }
 

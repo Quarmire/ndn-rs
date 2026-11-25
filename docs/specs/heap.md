@@ -1337,7 +1337,7 @@ otherwise it is dropped. It unwraps with its recipient key and the grant's name
 as AAD. Every ask carries the device's own seal key packet as it signed it.
 
 **Granter side.** A device `G` answers `<G>/32=grant/<GrantAsk>` **only when all
-six hold**, checked in this order:
+seven hold**, checked in this order:
 
 1. a held owner-signed `Epoch` entry names `E` (`EpochNotNamed`);
 2. the asker is no guest, node or role-less device of the owner: where the
@@ -1351,27 +1351,33 @@ six hold**, checked in this order:
 5. `G` holds the epoch's key (`KeyNotHeld`);
 6. the key that signed the asker's seal key packet is **not revoked** by a trust
    context `G` holds (`AskerKeyRevoked`): known only once the packet is judged,
-   so it is checked after the judging.
+   so it is checked after the judging;
+7. that key is **not lapsed** by `G`'s clock: a key of a role whose Data needs a
+   cut, none of whose certificates is valid now, is granted nothing
+   (the packet is refused as `Lapsed`, §9.3; the asker's device renews its certificate, or its owner
+   enrolls it again, and asks again). A lapse moves no counter of the judge and
+   writes no record, so it is judged **at every ask**, never taken from what was
+   kept: the packet in the ask is judged afresh each time, a grant already
+   made for the name included.
 
 Anything else gets **no answer**, and `G` sends no Interest for any ask: the
 exchange is one Interest and one Data. Conditions 1–5 are decided first, from the
 ask's names alone, before the packet in it is decoded. Then `G` decodes the seal
 key packet the ask carries — `<D>/32=seal/<pk>` — and verifies it (§6.2: signed
 by a key of `D`, chained to `D`'s person's trust context as any packet of a
-device is, the Content equal to `pk`; kept once verified); all six conditions
-are checked **again** after the judging, with the key that signed it, since the
-records may have moved. It answers with the key wrapped to `pk` (§6.2) under the
+device is, the Content equal to `pk`; nothing about it is kept); all seven
+conditions are checked **again** after the judging, with the key that signed it,
+since the records may have moved. It answers with the key wrapped to `pk` (§6.2) under the
 **grant's own name** as AAD, signed by its device key. `pk` is the key of the
 packet `D`'s device signed, never a key the ask names on its own: a grant ask
 made by anyone but `D` cannot make `G` wrap the key to any key but `D`'s.
-One name has one packet while it is kept; a granter keeps its last
-4,096 grants and the last 4,096 seal keys it verified (with the key that signed
-each), **for one generation of its judge**: a counter that moves whenever a
-revoking context is adopted or a person's newer version refuses more
-(`Judge::generation`). What was kept under another generation is not served;
-the packet is judged again. It works on at most 32 asks of one asker device at a
-time; a packet that does not verify gets no answer, and the asker's next round
-asks again. An epoch that
+One name has one packet while it is kept; a granter keeps its last 4,096 grants
+(and only after the decisions above hold for the ask in hand), **for one
+generation of its judge**: a counter that moves whenever a revoking context is
+adopted or a person's newer version refuses more (`Judge::generation`). What
+was kept under another generation is not served; the packet is judged again. It
+works on at most 32 asks of one asker device at a time; a packet that does not
+verify gets no answer, and the asker's next round asks again. An epoch that
 this device itself made is not granted until its `Epoch` entry has been
 flushed (it is not servable before), so that a power loss cannot take the entry
 and leave the key granted. Every ask a device does not answer is Nacked, never
@@ -1438,10 +1444,15 @@ inside the sealed body.
   epoch stays out of force while anyone who ever held its key is no reader
   (`holders`, §5.3 rule 5), so a new epoch is signed and the removed reader
   does not read what follows.
-- **A kept answer outliving a revocation.** A granter's kept seal keys and
-  grants are valid only for the judge's generation they were made in (§6.5): a
+- **A kept answer outliving a revocation or a lapse.** A granter's kept grants
+  are valid only for the judge's generation they were made in (§6.5): a
   revocation clears them, so a revoked device is judged again, never served from
-  what was kept before.
+  what was kept before. A lapse (a certificate whose NotAfter passed by `G`'s
+  clock) moves no generation, so nothing about an asker's key is kept at all:
+  its seal key packet is judged at every ask, and a kept grant is served only
+  after that judging and the other conditions hold again. (Stage-7 M1: a device
+  whose certificate lapsed after its seal key was verified was granted every
+  later epoch from a kept seal key.)
 - **A forged ask.** An ask names no sender; a stranger's ask costs the granter
   no signature check (conditions 1–4 are checked first, from the names alone),
   and one that passes them for a real reader's device costs at most one

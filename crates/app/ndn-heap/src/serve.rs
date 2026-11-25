@@ -15,11 +15,10 @@
 //!   the asker may have it (`NodeInner::may_grant`); anything else is not
 //!   answered, and nothing is decoded or judged for it. The ask carries the
 //!   asker's seal key packet, so this is one exchange and the granter fetches
-//!   nothing: the packet is judged as the asker device's (once per key: kept
-//!   while verified and while the judge's generation is the one it was verified
-//!   in), the node decides again with the key that signed it (a revoked key is
-//!   granted nothing), and the answer is signed by this device with the key
-//!   wrapped to that seal key.
+//!   nothing: the packet is judged as the asker device's at every ask (a lapse of the
+//!   asker's certificate moves no counter, so nothing about its key is kept), the node
+//!   decides again with the key that signed it (a revoked key is granted nothing), and the
+//!   answer is signed by this device with the key wrapped to that seal key.
 //! * `<D>/32=<keyword>/…` for a keyword a host registered
 //!   ([`Node::extend`](crate::Node::extend)): the extension answers, `None` is Nacked.
 //!   Core keywords are never given to an extension.
@@ -103,12 +102,11 @@ impl<V: Clone> Kept<V> {
     }
 }
 
-/// What a granter keeps: the grants it answered, the seal keys it verified
-/// and how many asks of each asker it is working on.
+/// What a granter keeps: the grants it answered and how many asks of each asker it is working
+/// on.
 #[derive(Default)]
 pub(crate) struct Granting {
     grants: Mutex<Kept<Bytes>>,
-    seal_keys: Mutex<Kept<Name>>,
     asks: Counts,
 }
 
@@ -209,10 +207,11 @@ fn held_packet(host: &HostRef, me: &Name, name: &Name) -> Option<Bytes> {
 
 /// Answer a grant ask (spec §6.5) in the one exchange: the node decides first, from the names
 /// alone, before anything is decoded or judged; then the seal key packet the ask carries is
-/// judged as the asker's device's (nothing is fetched), the node decides again with the key
-/// that signed it, and the key is wrapped to the seal key. One name, one packet while it is
-/// kept: kept only for the judge's generation it was made in (a revocation ends what was kept
-/// before it).
+/// judged as the asker's device's, **at every ask** (nothing about the asker's key is kept: a
+/// lapse of its certificate moves no counter, only the clock refuses it), the node decides
+/// again with the key that signed it, and the key is wrapped to the seal key. One name, one
+/// packet while it is kept, and only after both decisions: kept only for the judge's
+/// generation it was made in (a revocation ends what was kept before it).
 async fn grant(shared: &Arc<Shared>, name: &Name, ask: GrantAsk) -> Option<Bytes> {
     let host = &shared.host;
     let (asker, public) = parse_seal_key_name(&ask.seal_key)?;
@@ -221,36 +220,23 @@ async fn grant(shared: &Arc<Shared>, name: &Name, ask: GrantAsk) -> Option<Bytes
         return None;
     }
     let generation = host.generation();
-    if let Some(kept) = shared.grants.grants.lock().get(generation, name) {
-        return Some(kept);
-    }
     let Some(_slot) = shared.grants.asks.take(&asker, GRANTS_PER_ASKER) else {
         tracing::debug!(%asker, "grant not answered: the asker has as many grant asks in progress here as it may ({GRANTS_PER_ASKER}); its next round asks again once they end");
         return None;
     };
-    let kept = shared
-        .grants
-        .seal_keys
-        .lock()
-        .get(generation, &ask.seal_key);
-    let key = match kept {
-        Some(key) => key,
-        None => {
-            let Some(key) = seal_key_verified(shared, &ask, &asker, &public).await else {
-                tracing::debug!(%asker, "grant not answered: the seal key packet in the ask is not the asker's own (it does not carry the key it is named for, or its device's key does not verify); the asker's next round asks again");
-                return None;
-            };
-            shared
-                .grants
-                .seal_keys
-                .lock()
-                .insert(generation, ask.seal_key.clone(), key.clone());
-            key
+    let key = match seal_key_verified(shared, &ask, &asker, &public).await {
+        Ok(key) => key,
+        Err(why) => {
+            tracing::debug!(%asker, "grant not answered: {why}");
+            return None;
         }
     };
     if let Err(why) = host.may_grant(&ask.space, &ask.epoch, &asker, Some(&key)) {
         tracing::debug!(%asker, %key, epoch = ?ask.epoch, "grant refused: {why}");
         return None;
+    }
+    if let Some(kept) = shared.grants.grants.lock().get(generation, name) {
+        return Some(kept);
     }
     let wire = host.grant_packet(&ask.space, &ask.epoch, &asker, &key, &public, name)?;
     shared
@@ -262,24 +248,30 @@ async fn grant(shared: &Arc<Shared>, name: &Name, ask: GrantAsk) -> Option<Bytes
 }
 
 /// The key that signed the seal key packet the ask carries, if it is `asker`'s seal key packet
-/// for `public`, judged as signed by the asker's device.
+/// for `public`, judged as signed by the asker's device; else why not, and what to do.
 async fn seal_key_verified(
     shared: &Shared,
     ask: &GrantAsk,
     asker: &Name,
     public: &[u8; 32],
-) -> Option<Name> {
-    let data = Data::decode(ask.seal_packet.clone()).ok()?;
+) -> Result<Name, String> {
+    let not_the_askers = "the seal key packet in the ask is not the asker's own (it does not carry the key it is named for, or its device's key does not verify); the asker's next round asks again";
+    let data = Data::decode(ask.seal_packet.clone()).map_err(|_| not_the_askers.to_string())?;
     if !seal_key_matches(&data, asker, public) {
-        return None;
+        return Err(not_the_askers.to_string());
     }
     match shared
         .host
         .validate_device_packet(&ask.space, &data, asker)
         .await
     {
-        Judged::Valid(v) => Some(v.key),
-        _ => None,
+        Judged::Valid(v) => Ok(v.key),
+        Judged::Refused(why) => Err(format!(
+            "the asker's seal key packet is refused ({why}); a key is granted only to a device the trust context vouches for now: the asker's next round asks again"
+        )),
+        Judged::Pending(waiting) => Err(format!(
+            "the asker's seal key packet cannot be judged yet: {waiting}; the asker's next round asks again"
+        )),
     }
 }
 

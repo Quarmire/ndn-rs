@@ -24,7 +24,7 @@ use ndn_sync::StoreOp;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::error::Refusal;
+use crate::error::{Refusal, Timestamp};
 use crate::log::{Blob, Outcome, Want};
 use crate::register::EntryId;
 use crate::seal::GrantRefusal;
@@ -312,6 +312,9 @@ pub(crate) struct Toy {
     /// The validity the toy gives a device packet: the device it is of, or
     /// refused.
     pub device_packets_valid: bool,
+    /// Whether the key of every device packet has lapsed by the toy judge's clock (its
+    /// certificate ended), which refuses the packet as `Lapsed` and nothing else.
+    pub lapsed: bool,
     /// How many times `may_grant` was asked before the asker's key was known.
     pub grant_asks: usize,
     /// The generation of the judge the toy reports.
@@ -652,6 +655,12 @@ impl Host for Toyhost {
     }
 
     async fn validate_device_packet(&self, _space: &Name, _data: &Data, device: &Name) -> Judged {
+        if self.st.lock().lapsed {
+            return Judged::Refused(Refusal::Lapsed {
+                not_after: Timestamp(1_000),
+                now: Timestamp(2_000),
+            });
+        }
         if !self.st.lock().device_packets_valid {
             return Judged::Refused(Refusal::BadSignature);
         }
