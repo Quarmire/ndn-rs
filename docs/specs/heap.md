@@ -3123,7 +3123,7 @@ impl Heap { pub fn removed_by(&self, person: &Name) -> Option<EntryId>; }
 none, and answers `HeapError::BadRequest` (next step `FixRequest`) when it
 claims no keyword; a word that is not a keyword (lowercase ASCII letters,
 digits and `-`, at least one); a core keyword (§2.4: `data`, `log`, `seal`,
-`grant`, `held`, `piece`, `manifest`, `sync`, `signal`, `run`); or a keyword
+`grant`, `held`, `piece`, `manifest`, `sync`, `chan`, `signal`, `run`); or a keyword
 claimed already, by another extension or twice by itself. An Interest whose
 name is under this device's own name and whose keyword right after it is
 registered is **given to that extension, and to no other code**: it answers
