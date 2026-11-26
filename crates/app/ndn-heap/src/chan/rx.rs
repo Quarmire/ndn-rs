@@ -397,10 +397,13 @@ struct Pipe {
     /// The first sequence a `Window` re-ask is still owed from.
     pending_since: Option<u64>,
     reask_at: Option<Instant>,
+    /// This is the verified pipe: what it carries was listed by a verified checkpoint before it
+    /// was given ([`Emitted::verified`]).
+    verified: bool,
 }
 
 impl Pipe {
-    fn new(table: &[Bind]) -> Pipe {
+    fn new(table: &[Bind], verified: bool) -> Pipe {
         Pipe {
             names: Self::names(table),
             seen: Seen::default(),
@@ -409,6 +412,7 @@ impl Pipe {
             out: Vec::new(),
             pending_since: None,
             reask_at: None,
+            verified,
         }
     }
 
@@ -552,7 +556,7 @@ impl ChannelRx {
             reasking: Arc::new(AtomicBool::new(false)),
             state: Mutex::new(RxState {
                 replay: ReplayWindow::new(),
-                prompt: Pipe::new(&terms.table),
+                prompt: Pipe::new(&terms.table, false),
                 verified: None,
                 hello: None,
                 ciphers: Vec::with_capacity(2),
@@ -1177,7 +1181,7 @@ impl ChannelRx {
         }
         let verified_wanted = st.verify.is_some() && !lanes.verified.is_empty();
         if verified_wanted && st.verified.is_none() {
-            st.verified = Some(Pipe::new(&self.session.terms().table));
+            st.verified = Some(Pipe::new(&self.session.terms().table, true));
         } else if lanes.verified.is_empty() {
             st.verified = None;
         }
@@ -2005,6 +2009,7 @@ impl ChannelRx {
                 kind: Kind::Emitted(Emitted {
                     seq,
                     stands: message.stand_secs.map(Duration::from_secs),
+                    verified: pipe.verified,
                 }),
             },
         });

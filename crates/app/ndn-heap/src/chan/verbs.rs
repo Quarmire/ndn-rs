@@ -402,6 +402,14 @@ pub struct Emitted {
     pub seq: u64,
     /// What is left of a stated lifetime, for a standing value; `None` for a live emission.
     pub stands: Option<Duration>,
+    /// Whether a signed checkpoint of the sender had listed this frame **before it was given**
+    /// (an `Items` with [`Trust::Verified`] is given nothing else): the frame is then the
+    /// sender's, not a key holder's. `false` for a [`Trust::Prompt`] `Items`: it is given the
+    /// frame as soon as it opens under the channel's key, which every reader of the space holds,
+    /// and the checkpoint that covers it comes later (a [`GetNotice::Retracted`] follows a frame
+    /// it contradicts, and none follows a frame of a channel that sends no checkpoints). A
+    /// `Prompt` item is therefore never marked verified afterwards.
+    pub verified: bool,
 }
 
 /// What an item is.
@@ -422,7 +430,10 @@ pub struct Got {
     pub path: Name,
     /// The payload.
     pub bytes: Bytes,
-    /// The writer's person.
+    /// The writer's person. For a kept value, the person of the trust context that validated the
+    /// signing key of the entry. For an emission, the person of the sender's device as judged
+    /// when the session was set up: the channel's, not proof that this frame is the sender's
+    /// (see [`Emitted::verified`]).
     pub by: Name,
     /// The writer's device.
     pub writer: Name,

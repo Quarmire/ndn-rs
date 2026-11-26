@@ -661,3 +661,47 @@ async fn a_real_setup_verifies_the_senders_own_checkpoints() {
     assert!(ck.evidence().is_empty() && ck.bars().is_empty() && ck.alerts().is_empty());
     assert!(ck.session_held());
 }
+
+/// `Emitted::verified` says whether a signed checkpoint listed the frame before it was given: a
+/// `Trust::Verified` reader is given only listed frames, so its items say `true`; a `Prompt`
+/// reader of the same channel is given the same frame as it opens, before any checkpoint can
+/// list it, and says `false` and goes on saying it once the checkpoint has come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_emission_says_whether_a_checkpoint_listed_it_before_it_was_given() {
+    use super::verbs::Kind;
+    fn flags(items: &mut Items) -> Vec<bool> {
+        let mut out = Vec::new();
+        while let Some(Some(Ok(got))) = items.next().now_or_never() {
+            let Kind::Emitted(emitted) = got.kind else {
+                panic!("an emission, not {:?}", got.kind)
+            };
+            out.push(emitted.verified);
+        }
+        out
+    }
+    let mut ck = ck(ChannelMode::Reliable, verified(), LinkConfig::default()).await;
+    ck.pause_tick();
+    let mut prompt = prompt_reader(&ck);
+    let s = ck.start();
+    let a = ck.data(s, 0, b"genuine a");
+    ck.deliver(&a, HONEST, ck.at(0)).await;
+    assert_eq!(
+        flags(&mut prompt),
+        [false],
+        "no checkpoint had listed the frame when the Prompt reader was given it"
+    );
+    let first = ck.checkpoint(s + 1, s, s + 1, &[&a]);
+    ck.checkpoint_in(&first, HONEST, 20).await;
+    assert_eq!(
+        flags(&mut ck.items),
+        [true],
+        "the Verified reader is given the frame only once a checkpoint lists it"
+    );
+    let b = ck.data(s + 2, 1, b"genuine b");
+    ck.deliver(&b, HONEST, ck.at(30)).await;
+    assert_eq!(
+        flags(&mut prompt),
+        [false],
+        "a Prompt item is never marked verified, the checkpoint came after it or not"
+    );
+}

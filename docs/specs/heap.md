@@ -2892,7 +2892,10 @@ ephemeral message of a channel and is never the current value of a path.
    drop the oldest and tell `Lagged` (`Drop`).
 4. *`by` and `writer`.* For `Kept`, the writing device and the person of the
    trust context that validated its key; for `Emitted`, the sender's device and
-   its person as judged when the session was set up.
+   its person as judged when the session was set up: the person the channel
+   belongs to, not proof that this frame came from that device. `Emitted::verified`
+   says whether a signed checkpoint listed the frame before it was given (always
+   `false` for `Trust::Prompt`; channel.md §17.6, §13.12 item 31).
 5. *Entries refused after the fact* are told `GetNotice::Withdrawn { id, why }` if
    this stream gave `id` as the value of its path; the entry it superseded
    returns as the next `Kept`. `Members` and `Alert` changes are not data and

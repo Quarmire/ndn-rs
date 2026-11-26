@@ -306,7 +306,9 @@ impl Sink {
 ///   freed.
 /// * **What a delivery is worth** (docs/specs/channel.md, Checkpoints). With
 ///   [`Trust::Prompt`] (the default) an item is delivered as soon as its AEAD opens: it is
-///   authenticated as "a holder of the channel key's". A signed checkpoint of the sender then
+///   authenticated as "a holder of the channel key's", never as the sender's: [`Got::by`] and
+///   [`Got::writer`] name the channel's sender, and [`Emitted::verified`](super::verbs::Emitted)
+///   is `false`. A signed checkpoint of the sender then
 ///   covers it, at most `W = P + d + epsilon` later (the checkpoint period `P`, 20 ms by default,
 ///   the stream's one-way delay `d` and 1 ms of verification: about **22 ms** on a 1 ms path;
 ///   [`crate::ChannelInfo::detection_window`] computes it, and
