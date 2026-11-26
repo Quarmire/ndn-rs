@@ -26,7 +26,7 @@
 //!   older than `unchecked_max = max(4 x period, 100 ms)` is [`Silence::Hold`]; older than 3 s,
 //!   [`Silence::End`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -391,6 +391,11 @@ pub(crate) enum Silence {
 pub(crate) struct Verify {
     period: Duration,
     slots: BTreeMap<u64, Slot>,
+    /// The slots that begin a **run**: a slot whose nearest lower slot is more than the replay
+    /// window below it (the lowest slot begins the first run and is not listed). The lowest of
+    /// the highest run, which [`Verify::forget_farthest`] forgets, is the highest of these, or the
+    /// lowest slot when there is none: found without walking the slots.
+    starts: BTreeSet<u64>,
     /// Octets of `Pending` frames held.
     bytes: usize,
     /// Second frames held.
@@ -409,6 +414,7 @@ impl Verify {
         Verify {
             period,
             slots: BTreeMap::new(),
+            starts: BTreeSet::new(),
             bytes: 0,
             extra: 0,
             share,
@@ -456,26 +462,60 @@ impl Verify {
 
     /// Forget the slot at `seq0`, counting its pending frames.
     fn forget_slot(&mut self, seq0: u64) -> Option<u64> {
-        let slot = self.slots.remove(&seq0)?;
+        let slot = self.remove_slot(seq0)?;
         self.extra = self
             .extra
             .saturating_sub(slot.entries.len().saturating_sub(1));
         Some(self.forget(slot.entries))
     }
 
-    /// Forget the slot a checkpoint is least likely to judge soon, when octets are wanted: the
-    /// lowest of the **highest run** of sequences (a run is broken by a gap of more than the
-    /// replay window). Frames of a sender are one run, and then this is the lowest, the oldest;
-    /// a frame a key holder sealed far above them is a run of its own and is the first to go,
-    /// not the sender's frames below it.
-    fn forget_farthest(&mut self) -> Option<u64> {
-        let mut low = *self.slots.keys().next_back()?;
-        for &seq0 in self.slots.keys().rev().skip(1) {
-            if low - seq0 > REPLAY_WINDOW {
-                break;
+    /// The slot at `seq0`, made if it is not there; the run starts around it are kept.
+    fn slot_mut(&mut self, seq0: u64) -> &mut Slot {
+        if !self.slots.contains_key(&seq0) {
+            let below = self.slots.range(..seq0).next_back().map(|(&s, _)| s);
+            let above = self.slots.range(seq0..).next().map(|(&s, _)| s);
+            if below.is_some_and(|below| seq0 - below > REPLAY_WINDOW) {
+                self.starts.insert(seq0);
             }
-            low = seq0;
+            if let Some(above) = above {
+                self.starts.remove(&above);
+                if above - seq0 > REPLAY_WINDOW {
+                    self.starts.insert(above);
+                }
+            }
         }
+        self.slots.entry(seq0).or_default()
+    }
+
+    /// Remove the slot at `seq0`; the run starts around it are kept.
+    fn remove_slot(&mut self, seq0: u64) -> Option<Slot> {
+        let slot = self.slots.remove(&seq0)?;
+        self.starts.remove(&seq0);
+        let below = self.slots.range(..seq0).next_back().map(|(&s, _)| s);
+        if let Some(above) = self.slots.range(seq0..).next().map(|(&s, _)| s) {
+            self.starts.remove(&above);
+            if below.is_some_and(|below| above - below > REPLAY_WINDOW) {
+                self.starts.insert(above);
+            }
+        }
+        Some(slot)
+    }
+
+    /// The lowest slot of the highest **run** of sequences (a run is broken by a gap of more than
+    /// the replay window).
+    fn run_low(&self) -> Option<u64> {
+        self.starts
+            .last()
+            .or_else(|| self.slots.keys().next())
+            .copied()
+    }
+
+    /// Forget the slot a checkpoint is least likely to judge soon, when octets are wanted: the
+    /// lowest of the **highest run** of sequences. Frames of a sender are one run, and then this
+    /// is the lowest, the oldest; a frame a key holder sealed far above them is a run of its own
+    /// and is the first to go, not the sender's frames below it.
+    fn forget_farthest(&mut self) -> Option<u64> {
+        let low = self.run_low()?;
         self.forget_slot(low)
     }
 
@@ -547,7 +587,7 @@ impl Verify {
             epoch: accepted.epoch,
             rebinds: accepted.rebinds,
         };
-        self.slots.entry(seq0).or_default().entries.push(entry);
+        self.slot_mut(seq0).entries.push(entry);
         (forgotten, Ok(()))
     }
 
@@ -663,7 +703,7 @@ impl Verify {
                 .partition(|e| matches!(e.state, State::Pending(_)));
             slot.entries = settled;
             if slot.entries.is_empty() {
-                self.slots.remove(&seq0);
+                self.remove_slot(seq0);
             }
             judged.uncoverable += self.forget(pending);
         }
@@ -714,7 +754,7 @@ impl Verify {
             }
             slot.entries = keep;
             if slot.entries.is_empty() {
-                self.slots.remove(&seq0);
+                self.remove_slot(seq0);
             }
         }
         // Every frame judged left the slots: settled ones keep a hash, mismatches went to the
@@ -747,6 +787,7 @@ impl Verify {
         self.bytes = 0;
         self.extra = 0;
         self.slots.clear();
+        self.starts.clear();
     }
 }
 
@@ -1247,5 +1288,115 @@ mod tests {
         // Ten milliseconds later, a hundredth of the rate: 40.
         let later = (0..100_000).filter(|_| ceiling.take(at(10))).count();
         assert_eq!(later, (NODE_CHECKPOINTS_PER_SEC / 100.0) as usize);
+    }
+
+    /// The slot `forget_farthest` forgets, found the way it was before `starts` kept it (a walk
+    /// down from the highest slot until a gap wider than the replay window), and the run starts
+    /// found from scratch.
+    fn scanned(v: &Verify) -> (Option<u64>, BTreeSet<u64>) {
+        let keys: Vec<u64> = v.slots.keys().copied().collect();
+        let mut low = keys.last().copied();
+        for pair in keys.windows(2).rev() {
+            if pair[1] - pair[0] > REPLAY_WINDOW {
+                break;
+            }
+            low = Some(pair[0]);
+        }
+        let starts = keys
+            .windows(2)
+            .filter(|pair| pair[1] - pair[0] > REPLAY_WINDOW)
+            .map(|pair| pair[1])
+            .collect();
+        (low, starts)
+    }
+
+    /// The frames of a sender 54 sequences apart (a full 64 B frame) span more than the replay
+    /// window in a few dozen slots: the forgotten slot is still the lowest of the sender's run,
+    /// and a frame sealed far above is still the first to go, without a walk over the slots.
+    #[test]
+    fn the_run_start_is_kept_for_frames_spaced_wider_than_the_window_in_total() {
+        let budget = Arc::new(Budget::default());
+        let mut v = verify(&budget);
+        for i in 0..200u64 {
+            assert!(v.offer(i * 54, accepted(&frame(i, 64), 1, 0)).1.is_ok());
+        }
+        assert_eq!(v.run_low(), Some(0));
+        let far = 200 * 54 + 3 * REPLAY_WINDOW;
+        assert!(v.offer(far, accepted(&frame(far, 64), 9, 0)).1.is_ok());
+        assert_eq!(v.run_low(), Some(far));
+        assert_eq!(v.forget_farthest(), Some(1));
+        assert_eq!(
+            v.run_low(),
+            Some(0),
+            "the sender's frames are the run again"
+        );
+        assert_eq!(v.forget_farthest(), Some(1));
+        assert_eq!(v.run_low(), Some(54));
+        assert_eq!((v.run_low(), v.starts.clone()), scanned(&v));
+    }
+
+    /// Whatever is offered, judged, forgotten or shed, the run starts and the slot forgotten are
+    /// what a walk over the slots finds.
+    #[test]
+    fn the_run_starts_always_match_a_walk_over_the_slots() {
+        let budget = Arc::new(Budget::default());
+        let mut v = verify(&budget);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut seq0 = 0u64;
+        for step in 0..6_000u32 {
+            match next() % 8 {
+                0..=3 => {
+                    // The sender's next frame, sometimes after a long silence.
+                    seq0 += 1
+                        + next() % 60
+                        + if next() % 50 == 0 {
+                            3 * REPLAY_WINDOW
+                        } else {
+                            0
+                        };
+                    let f = frame(seq0, 64 + (next() % 3_000) as usize);
+                    let _ = v.offer(seq0, accepted(&f, 1, 0));
+                }
+                4 => {
+                    // A frame at any sequence near or far.
+                    let at = next() % (seq0 + 2 * REPLAY_WINDOW + 1);
+                    let f = frame(at, 64);
+                    let _ = v.offer(at, accepted(&f, 9, 0));
+                }
+                5 => {
+                    v.forget_farthest();
+                }
+                6 => {
+                    let lo = next() % (seq0 + 1);
+                    let hi = lo + next() % (2 * REPLAY_WINDOW);
+                    let _ = v.judge(&record(lo, hi, &[]), &Bytes::from_static(b"cp"));
+                }
+                _ => {
+                    // The slot a checkpoint empties by settling it.
+                    let lo = v.slots.keys().next().copied().unwrap_or(0);
+                    let held: Vec<(u64, Bytes)> = v
+                        .slots
+                        .range(lo..lo + 400)
+                        .filter_map(|(s, slot)| match &slot.entries[0].state {
+                            State::Pending(octets) => Some((*s, octets.clone())),
+                            State::Settled { .. } => None,
+                        })
+                        .collect();
+                    let listed: Vec<(u64, &Bytes)> = held.iter().map(|(s, f)| (*s, f)).collect();
+                    let _ = v.judge(&record(lo, lo + 400, &listed), &Bytes::from_static(b"cp"));
+                }
+            }
+            let (low, starts) = scanned(&v);
+            assert_eq!(v.starts, starts, "run starts after step {step}");
+            assert_eq!(v.run_low(), low, "run low after step {step}");
+        }
+        v.release_all();
+        assert!(v.starts.is_empty());
     }
 }
