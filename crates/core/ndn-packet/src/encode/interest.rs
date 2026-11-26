@@ -114,6 +114,8 @@ pub struct InterestBuilder {
     /// carrying `NextHopFaceId` (TLV 0x0330); the next-hop forwarder reads
     /// it in its strategy stage and bypasses FIB lookup.
     pin_face: Option<u64>,
+    /// The SignatureTime of a signed Interest, when the caller's clock is not the wall's.
+    signature_time: Option<u64>,
 }
 
 impl InterestBuilder {
@@ -128,6 +130,7 @@ impl InterestBuilder {
             forwarding_hint: None,
             reflexive_name: None,
             pin_face: None,
+            signature_time: None,
         }
     }
 
@@ -178,6 +181,14 @@ impl InterestBuilder {
     /// face ids cause the Interest to be dropped.
     pub fn pin_face(mut self, face_id: u64) -> Self {
         self.pin_face = Some(face_id);
+        self
+    }
+
+    /// The SignatureTime (milliseconds since the Unix epoch) a signed Interest carries, in place
+    /// of the host's wall clock: for a signer whose verifier judges the time by a clock of its
+    /// own (a node whose clock is configured, or simulated).
+    pub fn signature_time(mut self, ms: u64) -> Self {
+        self.signature_time = Some(ms);
         self
     }
 
@@ -398,10 +409,12 @@ impl InterestBuilder {
                 // `web_time` re-exports `std::time` on native and reads
                 // `Date.now()` on wasm32 — `std::time::SystemTime::now`
                 // panics in the browser.
-                let now_ms = web_time::SystemTime::now()
-                    .duration_since(web_time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                let now_ms = self.signature_time.unwrap_or_else(|| {
+                    web_time::SystemTime::now()
+                        .duration_since(web_time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64
+                });
                 let (time_buf, time_len) = nni(now_ms);
                 w.write_tlv(tlv_type::SIGNATURE_TIME, &time_buf[..time_len]);
             });
@@ -674,6 +687,26 @@ mod tests {
         let si = interest.sig_info().expect("sig_info");
         assert!(si.sig_nonce.is_some());
         assert!(si.sig_time.is_some());
+    }
+
+    #[test]
+    fn interest_builder_signature_time_is_the_callers_when_given() {
+        let sign = |builder: InterestBuilder| {
+            let wire = builder.sign_sync(crate::SignatureType::DigestSha256, None, |region| {
+                Bytes::copy_from_slice(sha2::Sha256::digest(region).as_ref())
+            });
+            Interest::decode(wire).unwrap().sig_info().unwrap().sig_time
+        };
+        assert_eq!(
+            sign(InterestBuilder::new(crate::name!("/cmd")).signature_time(1_234)),
+            Some(1_234),
+            "the time the caller's clock reads, not the host's"
+        );
+        assert_ne!(
+            sign(InterestBuilder::new(crate::name!("/cmd"))),
+            Some(1_234),
+            "without one, the host's wall clock"
+        );
     }
 
     #[test]

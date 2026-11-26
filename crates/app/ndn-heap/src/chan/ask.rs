@@ -105,6 +105,7 @@ impl NodeInner {
             .must_be_fresh()
             .lifetime(ASK_LIFETIME)
             .app_parameters(params.to_vec())
+            .signature_time(self.now())
             .sign_sync(self.signer.sig_type(), Some(key), |region| {
                 self.signer.sign_sync(region).unwrap_or_else(|e| {
                     failed = Some(e);

@@ -76,3 +76,6 @@ mod checkpoint_flow_tests;
 
 #[cfg(test)]
 mod checkpoint_verified_tests;
+
+#[cfg(test)]
+mod ask_stamp_tests;
