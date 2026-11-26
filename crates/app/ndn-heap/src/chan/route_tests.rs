@@ -1105,6 +1105,7 @@ async fn a_burst_of_ask_new_from_a_listed_receiver_is_welcomed_once_and_the_rest
     let tx = &bob.inner.chan.tx.stats;
     let replayed = tx.replayed.get();
 
+    let started = std::time::Instant::now();
     let (mut welcomed, mut busy) = (0, Vec::new());
     for _ in 0..6 {
         let ask = ChanAsk {
@@ -1136,15 +1137,19 @@ async fn a_burst_of_ask_new_from_a_listed_receiver_is_welcomed_once_and_the_rest
             other => panic!("a session or a refusal, not {other:?}"),
         }
     }
-    assert_eq!(
-        (welcomed, busy.len()),
-        (1, 5),
-        "6 asks that say ASK_NEW in a burst: one is welcomed, the rest are refused Busy"
+    // The limiter welcomes at most one claim per second: under load the six asks may straddle a
+    // second boundary, so the bound is one plus the whole seconds the burst took.
+    let allowed = 1 + started.elapsed().as_secs() as usize;
+    assert!(
+        (1..=allowed).contains(&welcomed) && welcomed + busy.len() == 6,
+        "6 asks that say ASK_NEW in a burst: at most one a second is welcomed (here {welcomed} of \
+         at most {allowed}), the rest are refused Busy ({} were)",
+        busy.len()
     );
     assert_eq!(
         tx.replayed.get() - replayed,
-        5,
-        "the window (5 messages) is replayed once, not once for each ask"
+        5 * welcomed as u64,
+        "the window (5 messages) is replayed once for each welcome, not once for each ask"
     );
     for r in &busy {
         assert_eq!(r.code, RefusalCode::Busy);

@@ -29,7 +29,7 @@
 //! the record answers the hello (a TLV element of type 0 with a length of `u64::MAX`) by closing
 //! the stream.
 //!
-//! A face's side frames go through a bounded [`SideLane`], one queue in order, written by a
+//! A face's side frames go through a bounded `SideLane`, one queue in order, written by a
 //! [`SidePump`] the owner of the face runs as a task (this crate spawns nothing): `send_side` waits
 //! for room in it, `forward_side` never waits and refuses [`SideRefused::Full`]. The pump writes
 //! each record whole under the face's writer lock, so a record is never split by an NDN packet.
