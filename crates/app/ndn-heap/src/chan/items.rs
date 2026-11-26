@@ -1,5 +1,6 @@
-//! `Items`, what `Heap::live` returns (docs/specs/channel.md, `Items`): the stream of what the
-//! channels of a space deliver to this device, and the sink the receiver pushes into.
+//! `Items`, what `Heap::get` returns (docs/specs/channel.md, The verbs: put, emit, get): the one
+//! stream of a space's kept values and of what its channels deliver to this device, and the sink
+//! the receiver pushes emissions into.
 //!
 //! A [`Sink`] is one `Items`' queues. A `Latest` channel's messages go to a coalescing queue (the
 //! newest per sender and name, at most 4,096 pairs); a `Reliable` or `Window` channel's go to a
@@ -30,7 +31,7 @@ use super::verbs::{Congestion, GetNotice, GetOptions, Got, Live, LiveEnd, Modes,
 use super::wire::ChannelMode;
 use crate::error::HeapError;
 use crate::node::NodeInner;
-use crate::space::Heap;
+use crate::space::{Heap, KeptFeed, KeptStep};
 
 /// A message on its way to the sinks: the key of its pair, its sequence, the octets it is
 /// charged for (what it pins, [`super::message::Message::pinned`]) and the item.
@@ -265,15 +266,33 @@ impl Sink {
     }
 }
 
-/// What `Heap::live` returns: every message the channels of one space deliver to this device whose
-/// path matches, and notices, as a [`Stream`] of `Result<Got, GetNotice>`.
+/// What `Heap::get` returns: the kept values of one space whose path matches, then the changes of
+/// kept values, and every message the channels of the space deliver to this device whose path
+/// matches, and notices, as a [`Stream`] of `Result<Got, GetNotice>`. `Got::kind` says which an
+/// item is: [`Kind::Kept`](super::verbs::Kind::Kept) is the register's head of its path (durable,
+/// signed), [`Kind::Emitted`](super::verbs::Kind::Emitted) is not (and is never the current
+/// value of a path).
 ///
-/// * **Creating it does no I/O.** It receives the messages of every session of the space this
-///   device holds, in the modes it asked for. Which senders to ask for a session is the caller's
-///   (`NodeHandle::ask_channel_in`) in this stage.
-/// * **Order.** Within one channel: `Reliable` and `Window` in sequence order, with a
-///   [`GetNotice::Lagged`] where messages are missing; `Latest`: the newest message per sender and
-///   name, never an older after a newer. Across channels: arrival order.
+/// * **Creating it does no I/O.** It registers its kept watcher and its emission sink at
+///   creation, so nothing between creation and the first poll is lost. It receives the messages
+///   of every session of the space this device holds, in the modes it asked for. Which senders to
+///   ask for a session is the caller's (`NodeHandle::ask_channel_in`) in this stage.
+/// * **Order.** The kept listing first, always: every path with a value under the selector, in
+///   path order, whatever was emitted meanwhile (that is held until the listing was yielded).
+///   Then the changes of kept values and the emissions, taken in turn so that neither starves the
+///   other, with no order promised between the two. Within the kept source: the register's apply
+///   order, never an older value of a path after a newer. Within the emissions: the mode's
+///   (below). A notice is told after what is queued before it, as it always was.
+/// * **A slow reader never loses a kept value.** The kept queue is bounded as `watch`'s is
+///   (`Config::watch_queue`); when it overflowed the stream is not told a loss, it reads the
+///   current value of each path it was not given from the store and goes on. A path that
+///   changed several times meanwhile is given its latest value, never an older one after a newer;
+///   a path removed meanwhile is told as a removal. `watch` and the log have the history.
+/// * **A path put and emitted** gives two items, one `Kept` and one `Emitted`, never merged and
+///   never one for the other.
+/// * **Order of the emissions.** Within one channel: `Reliable` and `Window` in sequence order,
+///   with a [`GetNotice::Lagged`] where messages are missing; `Latest`: the newest message per
+///   sender and name, never an older after a newer. Across channels: arrival order.
 /// * **A gap is never silent** in `Reliable` and `Window`: a frame that does not continue the
 ///   last one is a `Lagged { missed }` in its place in the stream (`missed` counts sequences,
 ///   and a control record takes one like a message does). `Latest` expects gaps and notices none;
@@ -307,8 +326,21 @@ impl Sink {
 /// The stream ends when the node stops. Poll it with [`futures::StreamExt::next`], or take
 /// everything queued at once with [`Items::next_batch`].
 pub struct Items {
-    sink: Arc<Sink>,
+    space: Name,
     node: Arc<NodeInner>,
+    /// The emissions, when asked for.
+    live: Option<Emission>,
+    /// The kept values, when asked for.
+    kept: Option<KeptFeed>,
+    /// The kept listing that [`Items::caught_up`] read before it was asked for.
+    ready: VecDeque<Got>,
+    /// Whether the kept changes are polled before the emissions on the next poll.
+    kept_turn: bool,
+}
+
+/// The emission side of an `Items`.
+struct Emission {
+    sink: Arc<Sink>,
     /// While held, announces of senders over the space make this device ask them.
     _listen: Listen,
 }
@@ -319,49 +351,77 @@ impl Items {
         futures::StreamExt::next(self).await
     }
 
-    /// Move everything queued **that is an item** into `buf` in one call, under one lock and with
-    /// no wake per item, and return how many. It stops before a notice: when it returns `0` with
-    /// something queued, the next thing is a notice, which [`Items::next`] yields. Returns `0`
-    /// with nothing queued too; it never waits.
+    /// Move everything queued **that is an item** into `buf` in one call, under one lock per
+    /// source and with no wake per item, and return how many: the kept listing first, then the
+    /// kept changes, then the emissions. It stops, in each source, before a notice: when it
+    /// returns `0` with something queued, the next thing is a notice, which [`Items::next`]
+    /// yields. Returns `0` with nothing queued too; it never waits.
     pub fn next_batch(&mut self, buf: &mut Vec<Got>) -> usize {
-        let node = &self.node;
-        node.chan.rx.sweep_held_if_any(&node.chan.stats.rx);
-        let mut st = self.sink.state.lock();
-        let was_full = st.fifo.is_full();
         let before = buf.len();
-        while let Some(got) = st.take_item() {
-            buf.push(got);
+        buf.extend(self.ready.drain(..));
+        if let Some(feed) = &mut self.kept {
+            while let Some(got) = feed.listing_next() {
+                buf.push(got);
+            }
+            while let Some(got) = feed.next_item() {
+                buf.push(got);
+            }
         }
-        let freed = self.sink.freed(was_full, &st);
-        drop(st);
-        if freed {
-            self.sink.room.notify_waiters();
+        if let Some(live) = &self.live {
+            let node = &self.node;
+            node.chan.rx.sweep_held_if_any(&node.chan.stats.rx);
+            let mut st = live.sink.state.lock();
+            let was_full = st.fifo.is_full();
+            while let Some(got) = st.take_item() {
+                buf.push(got);
+            }
+            let freed = live.sink.freed(was_full, &st);
+            drop(st);
+            if freed {
+                live.sink.room.notify_waiters();
+            }
         }
         buf.len() - before
     }
 
     /// Whether a `HELLO` has come on a channel this `Items` takes: the sender says the path
-    /// works. `false` says only that none has come yet.
+    /// works. `false` says only that none has come yet (and always for an `Items` with
+    /// [`Live::Off`]).
     pub fn hello_seen(&self) -> bool {
-        self.sink.hello.load(Ordering::Acquire)
+        self.live
+            .as_ref()
+            .is_some_and(|live| live.sink.hello.load(Ordering::Acquire))
     }
-}
 
-impl Stream for Items {
-    type Item = Result<Got, GetNotice>;
+    /// Resolves once the kept listing was yielded: every path that had a value under the selector
+    /// when this `Items` was made has been given by [`Items::next`] or [`Items::next_batch`].
+    /// Called before the listing was read, it reads the rest of it into this `Items`' own buffer
+    /// first (the next call of `next` gives it, before anything else), so it does not wait for
+    /// the caller to read it. At once for an `Items` with `kept: false`.
+    pub async fn caught_up(&mut self) {
+        if let Some(feed) = &mut self.kept {
+            while let Some(got) = feed.listing_next() {
+                self.ready.push_back(got);
+            }
+        }
+    }
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.sink.waker.register(cx.waker());
-        let node = &self.node;
+    /// The emissions side: the next item or notice, as the sink holds it.
+    fn poll_live(
+        node: &NodeInner,
+        sink: &Sink,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Got, GetNotice>>> {
+        sink.waker.register(cx.waker());
         node.chan.rx.sweep_held_if_any(&node.chan.stats.rx);
-        let mut st = self.sink.state.lock();
+        let mut st = sink.state.lock();
         let was_full = st.fifo.is_full();
         let next = st.take_notice_first();
         let closed = st.closed;
-        let freed = self.sink.freed(was_full, &st);
+        let freed = sink.freed(was_full, &st);
         drop(st);
         if freed {
-            self.sink.room.notify_waiters();
+            sink.room.notify_waiters();
         }
         match next {
             Some(item) => Poll::Ready(Some(item)),
@@ -369,66 +429,151 @@ impl Stream for Items {
             None => Poll::Pending,
         }
     }
+
+    /// The kept side: the next change as an item or a notice.
+    fn poll_kept(
+        feed: &mut KeptFeed,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Got, GetNotice>>> {
+        feed.watch(cx.waker());
+        match feed.step() {
+            KeptStep::Got(got) => Poll::Ready(Some(Ok(got))),
+            KeptStep::Notice(notice) => Poll::Ready(Some(Err(notice))),
+            KeptStep::Pending => Poll::Pending,
+            KeptStep::Ended => Poll::Ready(None),
+        }
+    }
+}
+
+impl Stream for Items {
+    type Item = Result<Got, GetNotice>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        // The kept listing first, whatever the emissions hold.
+        if let Some(got) = this.ready.pop_front() {
+            return Poll::Ready(Some(Ok(got)));
+        }
+        if let Some(feed) = &mut this.kept
+            && let Some(got) = feed.listing_next()
+        {
+            return Poll::Ready(Some(Ok(got)));
+        }
+        // Then the two sources in turn: the one that gave last goes second.
+        let (mut kept_ended, mut live_ended) = (this.kept.is_none(), this.live.is_none());
+        for pass in 0..2 {
+            if (pass == 0) == this.kept_turn {
+                if let Some(feed) = &mut this.kept {
+                    match Self::poll_kept(feed, cx) {
+                        Poll::Ready(Some(next)) => {
+                            this.kept_turn = false;
+                            return Poll::Ready(Some(next));
+                        }
+                        Poll::Ready(None) => kept_ended = true,
+                        Poll::Pending => {}
+                    }
+                }
+            } else if let Some(live) = &this.live {
+                match Self::poll_live(&this.node, &live.sink, cx) {
+                    Poll::Ready(Some(next)) => {
+                        this.kept_turn = true;
+                        return Poll::Ready(Some(next));
+                    }
+                    Poll::Ready(None) => live_ended = true,
+                    Poll::Pending => {}
+                }
+            }
+        }
+        if kept_ended && live_ended {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 impl Drop for Items {
     fn drop(&mut self) {
-        self.sink.close();
-        self.node.chan.rx.remove_sink(&self.sink);
-        // A session no other `Items` takes lapses, and its route is given up.
-        self.node.chan_route_release(&self.sink);
+        // The kept feed closes its watcher as it is dropped.
+        if let Some(live) = &self.live {
+            live.sink.close();
+            self.node.chan.rx.remove_sink(&live.sink);
+            // A session no other `Items` takes lapses, and its route is given up.
+            self.node.chan_route_release(&live.sink);
+        }
     }
 }
 
 impl std::fmt::Debug for Items {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Items")
-            .field("space", &self.sink.space)
+            .field("space", &self.space)
             .finish_non_exhaustive()
     }
 }
 
 impl Heap {
-    /// The emissions of this space as they arrive: a stream of what the channels of the space's
-    /// writers deliver to this device whose path is `what` (a path, or everything under a
-    /// prefix). Creating it does no I/O; it receives the messages of the sessions this device
-    /// holds ([`crate::host::NodeHandle::ask_channel_in`] asks a sender for one) in the modes
-    /// `opts.modes` joins. See [`Items`].
+    /// What this space holds and what its channels deliver, as one stream: the kept values of
+    /// the paths under `what` (a path, or everything under a prefix) in path order, then the
+    /// changes of kept values as they arrive, and, with [`GetOptions::live`] of
+    /// [`Live::Emitted`] (the default), the emissions of the sessions this device holds
+    /// ([`crate::host::NodeHandle::ask_channel_in`] asks a sender for one) in the modes
+    /// `opts.modes` joins. Creating it does no network I/O and registers both feeds, so nothing
+    /// that comes after this call is lost. See [`Items`] for the order, what a slow reader
+    /// keeps and loses, and what `by` is.
     ///
     /// # Errors
     ///
-    /// [`HeapError::NotAllowed`] for a space this device only follows (a follower takes no part in
-    /// channels: open the space as a member); [`HeapError::BadRequest`] for `opts.live` of
-    /// [`Live::Off`] (it asks for no emissions: read the kept value).
+    /// [`HeapError::BadRequest`] for `kept: false` with [`Live::Off`] (it asks for nothing: ask
+    /// for kept values, emissions, or both); [`HeapError::NotAllowed`] for emissions of a space
+    /// this device only follows (a follower takes no part in channels: open the space as a
+    /// member; it may read kept values with [`Live::Off`]); [`HeapError::Sealed`] when the
+    /// space is sealed and this device's person is no reader of it (kept values only: with
+    /// `kept: false` a non-member gets no session, so no emission).
     pub fn get(&self, what: Select, opts: GetOptions) -> Result<Items, HeapError> {
-        if self.inner.follower {
+        let live = opts.live == Live::Emitted;
+        if !opts.kept && !live {
+            return Err(HeapError::BadRequest {
+                why: "`kept: false` with `Live::Off` asks for nothing: ask for kept values \
+                      (`kept: true`), for emissions (`live: Live::Emitted`), or both"
+                    .into(),
+            });
+        }
+        if live && self.inner.follower {
             return Err(HeapError::NotAllowed {
                 space: self.inner.name.clone(),
                 why: "this device only follows the space and takes no part in its channels: \
-                      open it as a member"
+                      open it as a member, or read the kept values with `Live::Off`"
                     .into(),
             });
         }
-        if opts.live == Live::Off {
-            return Err(HeapError::BadRequest {
-                why: "`Live::Off` asks for no emissions, so there is nothing to stream: read the \
-                      kept value, or ask for `Live::Emitted`"
-                    .into(),
-            });
-        }
-        let sink = Arc::new(Sink::new(
-            self.inner.name.clone(),
-            what,
-            opts.modes,
-            opts.congestion,
-            opts.trust,
-        ));
-        let listen = self.node.chan_listen(&self.inner.name);
-        self.node.chan.rx.add_sink(Arc::clone(&sink));
+        let kept = if opts.kept {
+            Some(self.inner.kept_feed(&self.node, what.clone())?)
+        } else {
+            None
+        };
+        let live = live.then(|| {
+            let sink = Arc::new(Sink::new(
+                self.inner.name.clone(),
+                what,
+                opts.modes,
+                opts.congestion,
+                opts.trust,
+            ));
+            let listen = self.node.chan_listen(&self.inner.name);
+            self.node.chan.rx.add_sink(Arc::clone(&sink));
+            Emission {
+                sink,
+                _listen: listen,
+            }
+        });
         Ok(Items {
-            sink,
+            space: self.inner.name.clone(),
             node: Arc::clone(&self.node),
-            _listen: listen,
+            live,
+            kept,
+            ready: VecDeque::new(),
+            kept_turn: false,
         })
     }
 }

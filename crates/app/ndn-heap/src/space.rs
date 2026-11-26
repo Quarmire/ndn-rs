@@ -18,7 +18,8 @@
 //! `Config.watch_queue`. A change that does not fit is dropped and counted;
 //! the watcher reads what was queued and is then told
 //! [`Change::Lagged`], and the changes after the drop are dropped until it
-//! has been told.
+//! has been told. The kept part of `Heap::get` ([`KeptFeed`]) is a watcher
+//! that is never told: when its queue overflowed it reads the heads again.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
@@ -35,12 +36,13 @@ use ndn_sync::StoreOp;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
+use crate::chan::verbs::{GetNotice, Got, Kept, Kind as GotKind, Select};
 use crate::error::{HeapError, Refusal};
 use crate::fold::Readers;
 use crate::log::{Alert, Blob, Change, Effects, Frontier, Log, Members, Step};
 use crate::node::NodeInner;
 use crate::pieces;
-use crate::register::{EntryId, Item};
+use crate::register::{EntryId, Head, Item};
 use crate::reserve::{FlushError, Publisher, Ticket};
 use crate::rt;
 use crate::seal;
@@ -168,6 +170,30 @@ impl Queue {
         }
         Poll::Pending
     }
+
+    /// The next thing for a feed that reads a lag as a state to read again (a [`KeptFeed`]), not
+    /// as a number: a queued slot, that changes were dropped (told only once what was queued has
+    /// been read), that the queue is closed, or nothing yet. The caller registers its waker.
+    fn take(&self) -> Taken {
+        let mut st = self.st.lock();
+        if let Some(slot) = st.live.pop_front() {
+            return Taken::Slot(slot);
+        }
+        if st.missed > 0 {
+            return Taken::Behind;
+        }
+        if st.closed {
+            return Taken::Closed;
+        }
+        Taken::Empty
+    }
+
+    /// Forget what was dropped, and queue again from now on. Called with the log's lock held by a
+    /// feed that reads the state under it: changes are told under that lock, so none lies between
+    /// the forgetting and the read.
+    fn caught_up(&self) {
+        self.st.lock().missed = 0;
+    }
 }
 
 /// What a watch yields: every head the space held when it began, then the
@@ -217,6 +243,290 @@ impl Stream for Changes {
 impl Drop for Changes {
     fn drop(&mut self) {
         self.queue.close();
+    }
+}
+
+// -- The kept part of `get` --------------------------------------------------------------
+
+/// What a [`KeptFeed`] delivered at one path and still stands: the entry and the writer's
+/// person, which a removal told after a lag is built from when the register holds no head of the
+/// path any more.
+struct Delivered {
+    id: EntryId,
+    person: Name,
+}
+
+/// What a [`Queue`] holds for a [`KeptFeed`].
+enum Taken {
+    Slot(Slot),
+    /// Changes were dropped: nothing is queued, and nothing will be until
+    /// [`Queue::caught_up`].
+    Behind,
+    Empty,
+    Closed,
+}
+
+/// What [`KeptFeed::step`] found.
+pub(crate) enum KeptStep {
+    Got(Got),
+    Notice(GetNotice),
+    Pending,
+    Ended,
+}
+
+/// The kept part of an `Items` (`Heap::get`): the heads under the selector as they were when it
+/// was made, in path order, then the register's changes, with the same queue as a `watch`
+/// ([`Config::watch_queue`](crate::node::Config)). Unlike a watch it is never told it lagged: a
+/// feed whose queue overflowed reads the heads again under the log's lock, in the same step that
+/// forgets what was dropped, and goes on from there. It remembers the entry it told at each path,
+/// so what it told is not told twice and what changed while it was behind is.
+pub(crate) struct KeptFeed {
+    /// The heads of the selector when the feed was made, in path order.
+    listed: VecDeque<Slot>,
+    /// What the last catch-up read and has not told: before anything the queue holds.
+    again: VecDeque<Slot>,
+    /// A notice that `next_item` found before an item and gave back.
+    held: Option<GetNotice>,
+    queue: Arc<Queue>,
+    space: Arc<SpaceInner>,
+    node: Arc<NodeInner>,
+    select: Select,
+    /// The value told at each path that has one now, by the entry.
+    delivered: BTreeMap<Name, Delivered>,
+    /// The device stopped being a reader of the space: nothing more is told.
+    ended: bool,
+}
+
+fn kept_got(item: Item, removed: bool) -> Got {
+    Got {
+        path: item.path,
+        bytes: item.bytes,
+        by: item.by,
+        writer: item.writer,
+        kind: GotKind::Kept(Kept {
+            id: item.id,
+            as_of: item.as_of,
+            removed,
+        }),
+    }
+}
+
+impl KeptFeed {
+    /// Have the queue wake `waker` when it holds something.
+    pub(crate) fn watch(&self, waker: &std::task::Waker) {
+        self.queue.waker.register(waker);
+    }
+
+    /// The next head of the listing, `None` once it is told. A value in pieces is read now, and
+    /// told only while it is the head of its path and whole (it is told as a change when its
+    /// last piece is held).
+    pub(crate) fn listing_next(&mut self) -> Option<Got> {
+        while let Some(slot) = self.listed.pop_front() {
+            let Some(Change::Put(item)) = self.resolve(slot) else {
+                continue;
+            };
+            if let Some(KeptStep::Got(got)) = self.admit(Change::Put(item)) {
+                return Some(got);
+            }
+        }
+        None
+    }
+
+    fn resolve(&self, slot: Slot) -> Option<Change> {
+        match slot {
+            Slot::Change(change) => Some(change),
+            Slot::Blob(blob) => self.space.blob_change(&self.node, &blob),
+        }
+    }
+
+    /// What a change is to this feed: an item or a notice if it says something about what the
+    /// feed told, nothing if it does not (another path, a head already told, the members, an
+    /// alert).
+    fn admit(&mut self, change: Change) -> Option<KeptStep> {
+        match change {
+            Change::Put(item) => {
+                if !self.select.matches(&item.path)
+                    || self
+                        .delivered
+                        .get(&item.path)
+                        .is_some_and(|told| told.id == item.id)
+                {
+                    return None;
+                }
+                self.delivered.insert(
+                    item.path.clone(),
+                    Delivered {
+                        id: item.id.clone(),
+                        person: item.by.clone(),
+                    },
+                );
+                Some(KeptStep::Got(kept_got(item, false)))
+            }
+            Change::Removed(item) => {
+                // Told only for a path this feed told a value of: it has nothing to take back
+                // otherwise.
+                (self.select.matches(&item.path) && self.delivered.remove(&item.path).is_some())
+                    .then(|| KeptStep::Got(kept_got(item, true)))
+            }
+            Change::Withdrawn { id, why } => self
+                .delivered
+                .values()
+                .any(|told| told.id == id)
+                .then_some(KeptStep::Notice(GetNotice::Withdrawn { id, why })),
+            Change::Members(_) | Change::Alert(_) | Change::Lagged { .. } => None,
+        }
+    }
+
+    /// The next thing the changes say, without waiting; the caller has registered its waker
+    /// ([`Self::watch`]).
+    pub(crate) fn step(&mut self) -> KeptStep {
+        if let Some(notice) = self.held.take() {
+            return KeptStep::Notice(notice);
+        }
+        loop {
+            if self.ended {
+                return KeptStep::Ended;
+            }
+            let slot = match self.again.pop_front() {
+                Some(slot) => slot,
+                None => match self.queue.take() {
+                    Taken::Slot(slot) => slot,
+                    Taken::Behind => {
+                        self.catch_up();
+                        continue;
+                    }
+                    Taken::Empty => return KeptStep::Pending,
+                    Taken::Closed => return KeptStep::Ended,
+                },
+            };
+            let Some(change) = self.resolve(slot) else {
+                continue;
+            };
+            if let Some(step) = self.admit(change) {
+                return step;
+            }
+        }
+    }
+
+    /// The next item the changes say if the next thing is an item, never a notice (which stays
+    /// for [`Self::step`]).
+    pub(crate) fn next_item(&mut self) -> Option<Got> {
+        match self.step() {
+            KeptStep::Got(got) => Some(got),
+            KeptStep::Notice(notice) => {
+                self.held = Some(notice);
+                None
+            }
+            KeptStep::Pending | KeptStep::Ended => None,
+        }
+    }
+
+    /// The queue overflowed: the changes it dropped are not told as a number, the heads are read
+    /// again. Under the log's lock the queue forgets what it dropped and the register is read,
+    /// so each change is either in what is read or queued after it. What is owed is every head
+    /// under the selector that is not the entry already told at its path, and a removal for each
+    /// path told that has no value now, in path order.
+    fn catch_up(&mut self) {
+        let space = Arc::clone(&self.space);
+        let log = space.log.lock();
+        self.queue.caught_up();
+        if space.check_reader(&log).is_err() {
+            self.ended = true;
+            return;
+        }
+        let mut owed: BTreeMap<Name, Slot> = BTreeMap::new();
+        let heads: Vec<&Head> = match &self.select {
+            Select::Path(path) => log.register.value(path).into_iter().collect(),
+            Select::Prefix(_) => log
+                .register
+                .values()
+                .filter(|head| self.select.matches(&head.path))
+                .collect(),
+        };
+        for head in heads {
+            let told = self.delivered.get(&head.path);
+            if told.is_some_and(|told| told.id == head.entry) {
+                continue;
+            }
+            match log.shown(head) {
+                Some(Ok(item)) => {
+                    owed.insert(head.path.clone(), Slot::Change(Change::Put(item)));
+                }
+                Some(Err(blob)) => {
+                    owed.insert(head.path.clone(), Slot::Blob(blob));
+                }
+                None => {}
+            }
+        }
+        for (path, told) in &self.delivered {
+            if log.register.value(path).is_some() {
+                continue;
+            }
+            let item = match log.register.winner(path) {
+                Some(removal) => removal.item(Bytes::new()),
+                None => Item {
+                    path: path.clone(),
+                    bytes: Bytes::new(),
+                    by: told.person.clone(),
+                    writer: told.id.device.clone(),
+                    id: told.id.clone(),
+                    as_of: None,
+                },
+            };
+            owed.insert(path.clone(), Slot::Change(Change::Removed(item)));
+        }
+        self.again.extend(owed.into_values());
+    }
+}
+
+impl Drop for KeptFeed {
+    fn drop(&mut self) {
+        self.queue.close();
+    }
+}
+
+impl SpaceInner {
+    /// The kept part of an `Items` over `select`: the heads under it now, in path order, and a
+    /// watcher registered in the same step under the log's lock, so no change lies between the
+    /// listing and the queue. [`HeapError::Sealed`] for a person a sealed space does not list as
+    /// a reader.
+    pub(crate) fn kept_feed(
+        self: &Arc<Self>,
+        node: &Arc<NodeInner>,
+        select: Select,
+    ) -> Result<KeptFeed, HeapError> {
+        let (listed, queue) = {
+            let log = self.log.lock();
+            self.check_reader(&log)?;
+            let mut listed = VecDeque::new();
+            let mut list = |head: &Head| match log.shown(head) {
+                Some(Ok(item)) => listed.push_back(Slot::Change(Change::Put(item))),
+                Some(Err(blob)) => listed.push_back(Slot::Blob(blob)),
+                None => {}
+            };
+            match &select {
+                Select::Path(path) => log.register.value(path).into_iter().for_each(&mut list),
+                Select::Prefix(_) => log
+                    .register
+                    .values()
+                    .filter(|head| select.matches(&head.path))
+                    .for_each(&mut list),
+            }
+            let queue = Queue::new(node.config.watch_queue);
+            self.watchers.lock().push(Arc::clone(&queue));
+            (listed, queue)
+        };
+        Ok(KeptFeed {
+            listed,
+            again: VecDeque::new(),
+            held: None,
+            queue,
+            space: Arc::clone(self),
+            node: Arc::clone(node),
+            select,
+            delivered: BTreeMap::new(),
+            ended: false,
+        })
     }
 }
 
@@ -380,6 +690,17 @@ impl SpaceInner {
         for q in self.watchers.lock().drain(..) {
             q.close();
         }
+    }
+
+    /// How many watchers are open (a `watch` and the kept feed of an `Items` each are one): what
+    /// the tests of `Heap::get` count to see a feed closed.
+    #[cfg(test)]
+    pub(crate) fn watching(&self) -> usize {
+        self.watchers
+            .lock()
+            .iter()
+            .filter(|q| !q.is_closed())
+            .count()
     }
 
     /// The persons the space lists, as the judge adopts them.

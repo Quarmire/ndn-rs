@@ -1,7 +1,7 @@
-//! The public types of the live verbs: what `Heap::emit` takes and refuses, and what a receiver's
-//! `Items` yields (docs/specs/channel.md, Modes and The verbs).
+//! The public types of the verbs: what `Heap::emit` takes and refuses, and what a receiver's
+//! `Items` yields (docs/specs/channel.md, Modes and The verbs: put, emit, get).
 //!
-//! One place declares them so the sender (`emit`) and the receiver (`live`) agree: the options, the
+//! One place declares them so the sender (`emit`) and the receiver (`get`) agree: the options, the
 //! modes, the error with its [`NextStep`], and the item a receiver gets.
 
 use std::time::Duration;
@@ -11,7 +11,7 @@ use ndn_foundation_types::Name;
 
 use super::sessions::EndReason;
 use super::wire::ChannelMode;
-use crate::error::NextStep;
+use crate::error::{NextStep, Refusal};
 use crate::register::EntryId;
 
 /// The longest stand lifetime: one hour.
@@ -23,7 +23,7 @@ pub const STANDING_NAMES_MAX: usize = 256;
 /// The most octets of standing payloads one channel holds.
 pub const STANDING_BYTES_MAX: usize = 64 * 1024;
 
-/// What a receiver of `live` wants: one path or everything under a prefix.
+/// What a receiver of `get` wants: one path or everything under a prefix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Select {
     /// This path exactly.
@@ -33,7 +33,7 @@ pub enum Select {
 }
 
 impl Select {
-    /// Whether an emission at `path` is wanted.
+    /// Whether a kept value or an emission at `path` is wanted.
     pub fn matches(&self, path: &Name) -> bool {
         match self {
             Select::Path(want) => path == want,
@@ -312,13 +312,13 @@ impl Default for Modes {
     }
 }
 
-/// Whether `live` also receives emissions.
+/// Whether `get` also receives emissions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Live {
     /// Receive emissions (the default).
     #[default]
     Emitted,
-    /// Kept values only.
+    /// Kept values only (a follower may read these; it takes no part in channels).
     Off,
 }
 
@@ -352,10 +352,11 @@ pub enum Trust {
     Verified,
 }
 
-/// What a receiver of `live` asks for.
+/// What a receiver of `get` asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GetOptions {
-    /// Deliver kept values first (default `true`). Kept values: stage 6; `live` ignores it.
+    /// Deliver the kept values first, then the changes of kept values as they arrive (default
+    /// `true`). With `false` the stream carries emissions only.
     pub kept: bool,
     /// Whether to receive emissions (default [`Live::Emitted`]).
     pub live: Live,
@@ -381,13 +382,17 @@ impl Default for GetOptions {
     }
 }
 
-/// A kept value (what today's `Item` carries). Produced by `get` at stage 6; `live` yields none.
+/// A kept value: what `watch` and `kept` call an `Item`, as `get` yields it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Kept {
     /// The entry.
     pub id: EntryId,
     /// How long ago it was written, when known.
     pub as_of: Option<Duration>,
+    /// The path has no value now: the item's bytes are empty and `id` is the entry that removed
+    /// it (the entry this stream delivered last for the path when the register holds no head of
+    /// it any more).
+    pub removed: bool,
 }
 
 /// An emission as received.
@@ -403,13 +408,14 @@ pub struct Emitted {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Kind {
-    /// A kept value (stage 6).
+    /// A kept value: durable and signed by `Got::writer`'s device, the register's head of its
+    /// path.
     Kept(Kept),
-    /// A live emission.
+    /// A live emission: not durable, never the current value of the path.
     Emitted(Emitted),
 }
 
-/// One item `live` yields.
+/// One item `get` yields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Got {
     /// The path, relative to the space.
@@ -444,11 +450,23 @@ pub enum LiveEnd {
 /// What an `Items` says besides items.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GetNotice {
-    /// The consumer fell behind, or the mode dropped messages: this many were missed. For kept data
-    /// watch again; for emissions the mode dropped them.
+    /// The consumer fell behind, or the mode dropped messages: this many were missed. Told for
+    /// emissions only (the mode dropped them: `Latest` past its bound, `Reliable` and `Window`
+    /// with [`Congestion::Drop`], or a gap in the sequence). A slow reader of kept values is
+    /// never told this: it is given the current values again from the store.
     Lagged {
         /// How many.
         missed: u64,
+    },
+    /// An entry this stream delivered was refused after the fact (a signed removal of its writer
+    /// reached this device, a cut left it out): the value that stands is the one that follows,
+    /// or none (a removal item) when the path has no head left. Told for an entry that was the
+    /// current value this stream had delivered at its path.
+    Withdrawn {
+        /// The entry.
+        id: EntryId,
+        /// Why.
+        why: Refusal,
     },
     /// The live part ended; kept data goes on.
     LiveEnded(LiveEnd),

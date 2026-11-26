@@ -429,7 +429,7 @@ impl NodeInner {
 
     /// `sink`, an `Items`, was dropped: each session it took that no other `Items` takes lapses
     /// (ended as [`EndReason::Left`] and dropped), its `Unsub` goes upstream at once, and no
-    /// `Keep` follows. Does nothing on a node that attached no forwarder. A later `live` over
+    /// `Keep` follows. Does nothing on a node that attached no forwarder. A later `get` over
     /// the same sender needs a new ask, which brings a new route.
     pub(crate) fn chan_route_release(&self, sink: &Sink) {
         if self.chan.route.conn().is_none() {

@@ -98,6 +98,11 @@ pub(super) async fn rig_of(devs: Vec<Dev>) -> Rig {
 
 /// A rig whose nodes are tuned by `channel` (the checkpoint period).
 pub(super) async fn rig_with(devs: Vec<Dev>, channel: super::config::ChannelConfig) -> Rig {
+    rig_tuned(devs, |config| config.channel = channel).await
+}
+
+/// A rig whose nodes' configuration `tune` changes.
+pub(super) async fn rig_tuned(devs: Vec<Dev>, tune: impl Fn(&mut Config)) -> Rig {
     let (engine, shutdown) = EngineBuilder::new(Default::default())
         .build()
         .await
@@ -112,7 +117,7 @@ pub(super) async fn rig_with(devs: Vec<Dev>, channel: super::config::ChannelConf
     for dev in &devs {
         let sync = engine.app_face(cancel.child_token());
         let mut config = fast();
-        config.channel = channel;
+        tune(&mut config);
         nodes.push(
             Node::start(
                 Transport {
@@ -1534,9 +1539,9 @@ async fn a_forged_original_sequence_does_not_mute_a_name_in_latest() {
 // -- End to end: the real sender over a carrier that loses, duplicates and reorders -------------
 
 /// Bob's node sends over a [`Link`]; Carol's receives what the test hands over from it.
-struct Wire {
-    rig: Rig,
-    link: std::sync::Arc<Link>,
+pub(super) struct Wire {
+    pub(super) rig: Rig,
+    pub(super) link: std::sync::Arc<Link>,
 }
 
 async fn wire(cfg: LinkConfig) -> Wire {
@@ -1548,11 +1553,11 @@ async fn wire(cfg: LinkConfig) -> Wire {
 }
 
 impl Wire {
-    fn bob(&self) -> Heap {
+    pub(super) fn bob(&self) -> Heap {
         self.rig.nodes[1].space(&space()).unwrap()
     }
 
-    fn carol(&self) -> &Node {
+    pub(super) fn carol(&self) -> &Node {
         &self.rig.nodes[2]
     }
 
@@ -1571,7 +1576,7 @@ impl Wire {
     }
 
     /// Carol asks bob for his channel of `mode`.
-    async fn join(&self, mode: ChannelMode) -> ChannelInfo {
+    pub(super) async fn join(&self, mode: ChannelMode) -> ChannelInfo {
         self.carol()
             .ask_channel_in(&space(), self.rig.nodes[1].name(), mode)
             .await
@@ -1600,7 +1605,7 @@ impl Wire {
 
     /// Hand Carol every frame the link holds (the stream first, then the datagrams), as `seen`
     /// lets each be looked at on its way. Returns how many.
-    async fn pump(&self, mut seen: impl FnMut(&Bytes)) -> usize {
+    pub(super) async fn pump(&self, mut seen: impl FnMut(&Bytes)) -> usize {
         let mut count = 0;
         while let Some(frame) = self.link.pop_stream() {
             seen(&frame);
