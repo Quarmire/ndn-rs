@@ -28,6 +28,7 @@ pub(crate) mod measurements;
 pub(crate) mod rate_limit;
 pub(crate) mod reflexive;
 pub(crate) mod rib;
+pub(crate) mod side;
 pub(crate) mod status;
 pub(crate) mod strategy;
 pub(crate) mod webtransport;
@@ -62,6 +63,7 @@ pub fn register_builtins(router: &mut MgmtRouter) {
     router.register(Arc::new(compute::ComputeModule));
     router.register(Arc::new(rate_limit::RateLimitModule));
     router.register(Arc::new(reflexive::ReflexiveModule));
+    router.register(Arc::new(side::SideModule));
     router.register(Arc::new(ble::BleModule));
     router.register(Arc::new(ca::CaModule));
     router.register(Arc::new(webtransport::WebTransportModule));

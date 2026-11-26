@@ -41,6 +41,10 @@ pub mod module {
     /// host daemon as an extra module), local operators only: `list`, and
     /// the link commands `connect`, `disconnect` and `mode`.
     pub const LINKS: &[u8] = b"links";
+    /// The fan-out table for side (channel) frames (`ndn-engine` `side`):
+    /// `list` (routes and counters, read-only) and `quarantine` (ndn-rs
+    /// extension, not an NFD module).
+    pub const SIDE: &[u8] = b"side";
 }
 
 pub mod verb {
@@ -113,6 +117,9 @@ pub mod verb {
     /// ndn-rs-local read dataset: per-face cross-layer link signals
     /// (RSSI/SNR/congestion). Not an NFD verb — observability only.
     pub const LINK_QUALITY: &[u8] = b"link-quality";
+    /// `side/quarantine` (ndn-rs extension, signed-command gated): bar a face's
+    /// side (channel) frames for a time, or lift the bar.
+    pub const QUARANTINE: &[u8] = b"quarantine";
     pub const IDENTITY_LIST: &[u8] = b"identity-list";
     pub const IDENTITY_GENERATE: &[u8] = b"identity-generate";
     pub const IDENTITY_DID: &[u8] = b"identity-did";
