@@ -246,7 +246,7 @@ pub trait Connection: Send + Sync {
     /// [`LpInfo::incoming_face_id`] says) carries side frames of `class`: what that face's
     /// medium can do, not whether it has room now. A sender asks it of the first hop toward a
     /// receiver before it relies on [`SideClass::Stream`], which an Ethernet segment lacks. An
-    /// embedded engine's connection answers from the face ([`Face::side_carries`]; `false`
+    /// embedded engine's connection answers from the face (`Face::side_carries`; `false`
     /// for a face the engine no longer holds). The default, for a connection that cannot see
     /// its forwarder's faces, is `true`: it says nothing against the path, and a frame that
     /// does not get through is counted at the hop that refused it.
@@ -259,7 +259,7 @@ pub trait Connection: Send + Sync {
     /// what a node's carrier over it can promise before it knows any receiver. The default
     /// follows [`side_frame_max`](Self::side_frame_max) (a connection that carries side frames
     /// at all takes both classes); an embedded engine's connection answers from its face
-    /// ([`Face::side_carries`]).
+    /// (`Face::side_carries`).
     fn side_carries_here(&self, class: SideClass) -> bool {
         let _ = class;
         self.side_frame_max() != 0

@@ -584,7 +584,7 @@ impl SideTable {
     }
 
     /// The table's clock now (ns): what to pass to [`bar`](Self::bar),
-    /// [`sweep`](Self::sweep) and [`quarantine`](Self::quarantine) in a caller
+    /// [`sweep`](Self::sweep) and [`quarantine_for`](Self::quarantine_for) in a caller
     /// that has no clock of its own.
     pub fn now(&self) -> u64 {
         (self.clock)()
