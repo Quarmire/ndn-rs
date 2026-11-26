@@ -287,7 +287,11 @@ impl Sink {
 ///   (`Config::watch_queue`); when it overflowed the stream is not told a loss, it reads the
 ///   current value of each path it was not given from the store and goes on. A path that
 ///   changed several times meanwhile is given its latest value, never an older one after a newer;
-///   a path removed meanwhile is told as a removal. `watch` and the log have the history.
+///   a path removed meanwhile is told as a removal. `watch` and the log have the history. The
+///   queue holds only what the feed can tell (values under the selector and withdrawals), so
+///   members changes, alerts and other paths never make it read again. The kept part ends with
+///   [`GetNotice::KeptEnded`] when its reader is removed from the sealed space, and when it must
+///   read again while an entry of the space is held closed.
 /// * **A path put and emitted** gives two items, one `Kept` and one `Emitted`, never merged and
 ///   never one for the other.
 /// * **Order of the emissions.** Within one channel: `Reliable` and `Window` in sequence order,

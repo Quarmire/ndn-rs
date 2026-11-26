@@ -16,6 +16,7 @@ use crate::node::tests::{
 };
 use crate::test_kit::n;
 use crate::wire::{Body, Entry, log_name};
+use crate::{GetNotice, GetOptions, Live, Select};
 
 fn changed(add_writers: &[&str], add_readers: &[&str], remove: &[&str]) -> MembersChange {
     let names = |v: &[&str]| v.iter().map(|s| n(s)).collect();
@@ -1603,4 +1604,124 @@ async fn a_person_removed_and_added_as_a_reader_is_demoted_not_dropped() {
         .unwrap();
     let members = heap.members();
     assert!(members.writers.contains(&n("/bob")), "{members:?}");
+}
+
+// -- The kept feed of `get` ---------------------------------------------------------------
+
+/// `kept` is refused while an entry of a sealed space is held closed, because the path of that
+/// entry is unknown (it may be a newer write or a removal of what the register shows). The
+/// kept listing of `get` claims the same completeness and is refused the same way, with the
+/// same reason, instead of listing the older head as the current value and saying it is whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_listing_is_refused_while_an_entry_of_the_sealed_space_is_held_closed() {
+    let devs = world(&["/alice/laptop", "/bob/laptop"]).await;
+    let (alice, _) = boot(&devs[0], cfg()).await;
+    let heap = alice.create(&space(), private(&["/bob"])).await.unwrap();
+    heap.put(&n("/secret"), bytes("for bob"), PutOptions::default())
+        .await
+        .unwrap();
+    let (bob, _) = boot(&devs[1], cfg()).await;
+    let theirs = bob.open(&space()).await.unwrap();
+    deliver(&devs[0], &bob).await;
+    let kept = theirs
+        .kept(&n("/secret"))
+        .await
+        .expect_err("the entry is held closed");
+    let listed = theirs
+        .get(Select::Prefix(Name::root()), GetOptions::default())
+        .expect_err("a listing that cannot show the closed entry's path is not whole");
+    assert!(matches!(listed, HeapError::NotReady { .. }), "{listed:?}");
+    assert_eq!(listed.next(), NextStep::RetryLater);
+    assert_eq!(
+        listed.to_string(),
+        kept.to_string(),
+        "the reason `kept` gives"
+    );
+}
+
+/// A kept feed whose queue overflowed reads the heads again; while an entry of the sealed space
+/// is held closed it cannot trust them (the closed entry's path is unknown), so it ends and says
+/// so, instead of listing an older head as current and going on as if it were caught up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_feed_that_reads_the_heads_again_ends_while_an_entry_is_held_closed() {
+    let devs = world(&["/alice/laptop", "/bob/laptop"]).await;
+    let (alice, _) = boot(&devs[0], cfg()).await;
+    let heap = alice.create(&space(), private(&["/bob"])).await.unwrap();
+    heap.put(&n("/secret"), bytes("for bob"), PutOptions::default())
+        .await
+        .unwrap();
+    let item = heap
+        .kept(&n("/secret"))
+        .await
+        .unwrap()
+        .expect("alice holds it");
+    let mut config = cfg();
+    config.watch_queue = 1;
+    let (bob, _) = boot(&devs[1], config).await;
+    let theirs = bob.open(&space()).await.unwrap();
+    // Made before anything is held: nothing is closed yet.
+    let mut feed = theirs
+        .inner
+        .kept_feed(&bob.inner, Select::Prefix(Name::root()))
+        .unwrap();
+    // Two changes it wants into a queue of one: the second is dropped.
+    feed.queue.push(Change::Put(item.clone()));
+    feed.queue.push(Change::Put(item));
+    deliver(&devs[0], &bob).await;
+    assert!(
+        matches!(feed.step(), KeptStep::Got(_)),
+        "what the queue held"
+    );
+    let KeptStep::Notice(GetNotice::KeptEnded { why }) = feed.step() else {
+        panic!("the feed read the heads of a register it cannot trust and went on")
+    };
+    assert!(why.contains("closed"), "it says why: {why}");
+    assert!(matches!(feed.step(), KeptStep::Ended), "and it is over");
+}
+
+/// What a kept feed does not want never takes a place in its queue: a flood of changes of other
+/// paths and of members does not overflow a feed over one path, so it never has to read the
+/// heads again (which costs the log's lock and a scan of every head).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changes_a_kept_feed_does_not_want_never_take_a_place_in_its_queue() {
+    let dev = solo().await;
+    let mut config = cfg();
+    config.watch_queue = 4;
+    let (node, _) = boot(&dev, config).await;
+    let heap = node.create(&space(), public()).await.unwrap();
+    let mut items = heap
+        .get(
+            Select::Path(n("/a")),
+            GetOptions {
+                live: Live::Off,
+                ..GetOptions::default()
+            },
+        )
+        .unwrap();
+    for i in 0..12 {
+        heap.put(
+            &n(&format!("/other/{i}")),
+            bytes("x"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+        heap.change(changed(&[&format!("/p{i}")], &[], &[]))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        heap.inner.overflowed(),
+        0,
+        "24 changes the feed over `/a` does not want filled its queue of 4"
+    );
+    heap.put(&n("/a"), bytes("wanted"), PutOptions::default())
+        .await
+        .unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), futures::StreamExt::next(&mut items))
+        .await
+        .expect("the wanted change arrives")
+        .expect("the stream goes on")
+        .expect("an item");
+    assert_eq!((got.path, got.bytes), (n("/a"), bytes("wanted")));
 }

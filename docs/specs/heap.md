@@ -2793,7 +2793,8 @@ pub struct Got { pub path: Name, pub bytes: Bytes, pub by: Name, pub writer: Nam
 pub enum Kind { Kept(Kept), Emitted(Emitted) }
 pub struct Kept { pub id: EntryId, pub as_of: Option<Duration>, pub removed: bool }
 pub enum GetNotice { Lagged { missed: u64 }, Withdrawn { id: EntryId, why: Refusal },
-                     LiveEnded(LiveEnd), Retracted { writer: Name, from: u64, to: u64 } }
+                     LiveEnded(LiveEnd), KeptEnded { why: String },
+                     Retracted { writer: Name, from: u64, to: u64 } }
 ```
 
 A `Heap` is a cheap handle, `Clone`, on one space of one node. `Item.by` is the
@@ -3015,7 +3016,10 @@ order, filtered to its selector: it is not a second source of truth for kept
 data. Unlike `watch` it is never told `Lagged` (the host is told nothing it has
 to repair: §10.3 `get`), it lists in path order only the heads with a value (no
 alerts, no standing alerts, no `Members`), and it is not resumable (`watch` with
-a `Frontier` is).
+a `Frontier` is). It refuses the listing (`NotReady`, as `kept` does) while an
+entry of a sealed space is held closed, and an open kept feed ends with
+`GetNotice::KeptEnded { why }` when its reader is removed or when it must read the
+heads again while an entry is held closed (channel.md §17.5, §17.7).
 
 ### 10.5 Errors
 

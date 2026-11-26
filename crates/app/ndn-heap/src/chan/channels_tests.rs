@@ -411,7 +411,10 @@ fn one_person_cannot_fill_a_channels_receiver_places() {
     let table = Channels::default();
     let t0 = Instant::now();
     for i in 0..RECEIVERS_PER_PERSON {
-        let (d, k) = (n(&format!("/mallory/d{i}")), n(&format!("/mallory/d{i}/KEY/1")));
+        let (d, k) = (
+            n(&format!("/mallory/d{i}")),
+            n(&format!("/mallory/d{i}/KEY/1")),
+        );
         admit(&table, &d, &k, 0, t0).unwrap();
     }
     let (extra, extra_key) = (n("/mallory/extra"), n("/mallory/extra/KEY/1"));

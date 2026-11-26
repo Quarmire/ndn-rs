@@ -481,6 +481,16 @@ pub enum GetNotice {
     },
     /// The live part ended; kept data goes on.
     LiveEnded(LiveEnd),
+    /// The kept part ended and gives nothing more, while the live part goes on: this device's
+    /// person is no reader of the sealed space any more (a removal reached this node), or the
+    /// feed had to read the heads again and could not trust the register (an entry of a sealed
+    /// space is held closed, its path unknown, so a head may not be the current value of its
+    /// path). `why` says which and what to do; a new `get` after that either goes on or is
+    /// refused with the same reason.
+    KeptEnded {
+        /// Why, and what to do.
+        why: String,
+    },
     /// A signed checkpoint contradicted these emissions: a frame this `Items` was given for the
     /// writer's channel is not one the writer's checkpoint lists. Discard what was delivered with
     /// a `seq` from `from` to `to` (inclusive); delivered items stay delivered, nothing is taken

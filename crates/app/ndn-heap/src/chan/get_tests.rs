@@ -623,6 +623,50 @@ async fn a_removed_member_gets_nothing_neither_kept_values_nor_a_session() {
     );
 }
 
+/// A kept feed that is open when its reader is removed gives no further value, whether or not its
+/// queue overflowed: what it had queued before the removal reached this node is not told, and the
+/// feed ends saying why (a removed member gets no kept value, §17.7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_kept_feed_ends_when_its_reader_is_removed_though_its_queue_never_overflowed() {
+    let w = three(LinkConfig::default(), 4096).await;
+    let mut items = carol_get(&w, kept_only());
+    assert_eq!(drain(&mut items), vec![], "an empty space has no listing");
+    keep(&w.bob(), "/before", "v").await;
+    holds(&w, "/before", "v").await;
+    let owner = w.rig.nodes[0].space(&space()).unwrap();
+    owner
+        .change(MembersChange {
+            remove: vec![n("/carol")],
+            ..MembersChange::default()
+        })
+        .await
+        .unwrap();
+    eventually("carol holds the removal", || {
+        !w.carol()
+            .inner
+            .space_of(&space())
+            .unwrap()
+            .log
+            .lock()
+            .fold
+            .is_reader(&n("/carol"))
+    })
+    .await;
+
+    let got = drain(&mut items);
+    assert!(
+        got.iter().all(Result::is_err),
+        "a removed reader was given a kept value: {got:?}"
+    );
+    let [Err(GetNotice::KeptEnded { why })] = &got[..] else {
+        panic!("the feed says it ended, once: {got:?}")
+    };
+    assert!(
+        why.contains("reader") && why.contains("owner"),
+        "it says why and what to do: {why}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn latest_emissions_coalesce_per_name_and_lag_past_the_bound_while_kept_items_are_unaffected()
 {
