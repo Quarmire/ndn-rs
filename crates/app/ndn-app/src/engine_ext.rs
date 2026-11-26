@@ -177,6 +177,16 @@ impl Connection for EngineConnection {
         self.inner.recv_side().await
     }
 
+    /// What the engine's face says it carries ([`ForwarderEngine::face_carries_side`]).
+    fn side_carries(&self, face: FaceId, class: SideClass) -> bool {
+        self.engine.face_carries_side(face, class)
+    }
+
+    /// What this connection's own app face says it carries.
+    fn side_carries_here(&self, class: SideClass) -> bool {
+        self.engine.face_carries_side(self.face_id, class)
+    }
+
     /// Bar `face` in the engine's side table ([`ndn_engine::side::SideTable::bar`]): the first
     /// bar is 60 s and each repeat on the same face doubles, to an hour. This connection's own
     /// face is refused: every channel frame of this app goes over it, so barring it would cut

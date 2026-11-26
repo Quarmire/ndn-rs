@@ -13,6 +13,7 @@ use ndn_security::SignWith;
 use crate::AppError;
 use crate::connection::Connection;
 use crate::signing::DataSigner;
+use ndn_transport::FaceId;
 
 /// Single-use: call exactly one of [`Self::respond`],
 /// [`Self::respond_bytes`], or [`Self::nack`]. Dropping silently
@@ -26,6 +27,8 @@ pub struct Responder {
     /// [`with_signers`](crate::Producer::with_signers); makes
     /// [`respond`](Self::respond) sign instead of emitting a bare digest.
     signer: Option<DataSigner>,
+    /// The face the Interest arrived over at the forwarder, when the connection said.
+    ingress: Option<FaceId>,
 }
 
 impl Responder {
@@ -38,7 +41,21 @@ impl Responder {
             conn,
             interest_wire,
             signer,
+            ingress: None,
         }
+    }
+
+    /// Record the face the Interest arrived over at the forwarder ([`LpInfo::incoming_face_id`]).
+    pub(crate) fn arriving(mut self, ingress: Option<FaceId>) -> Self {
+        self.ingress = ingress;
+        self
+    }
+
+    /// The face the Interest arrived over at the forwarder: the first hop toward whoever
+    /// asked, which a reply will go back over. `None` when the connection does not say (an
+    /// external one, or a producer that reads without the local fields).
+    pub fn incoming_face(&self) -> Option<FaceId> {
+        self.ingress
     }
 
     pub async fn respond_bytes(self, wire: Bytes) -> Result<(), AppError> {

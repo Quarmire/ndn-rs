@@ -63,7 +63,10 @@ use crate::error::AppError;
 use crate::responder::Responder;
 use crate::rt::Instant;
 
-type Serves = Arc<SyncMutex<Vec<(Name, mpsc::UnboundedSender<Bytes>)>>>;
+/// What a serve receives: the Interest and the face it arrived over at the forwarder, when the
+/// connection says ([`Connection::recv_with_meta`]).
+type Served = (Bytes, Option<FaceId>);
+type Serves = Arc<SyncMutex<Vec<(Name, mpsc::UnboundedSender<Served>)>>>;
 type Pending = Arc<SyncMutex<PendingTable>>;
 
 /// The reply that answers an Interest registered on a [`Replies`] stream.
@@ -291,7 +294,7 @@ pub struct DemuxConnection {
 
 /// Pick the longest registered serve prefix that is a prefix of `name`, dropping
 /// closed channels lazily. Returns a cloned sender to use outside the lock.
-fn route(serves: &Serves, pkt: &Bytes) -> Option<mpsc::UnboundedSender<Bytes>> {
+fn route(serves: &Serves, pkt: &Bytes) -> Option<mpsc::UnboundedSender<Served>> {
     if is_lp_packet(pkt) {
         return None;
     }
@@ -316,11 +319,11 @@ impl DemuxConnection {
             let serves = Arc::clone(&serves);
             let pending = Arc::clone(&pending);
             crate::rt::spawn(async move {
-                while let Some(pkt) = inner.recv().await {
+                while let Some((pkt, lp)) = inner.recv_with_meta().await {
                     // Serve Interest → its handler; else the streams awaiting
                     // the Interest it answers; else the fallback recv queue.
                     if let Some(tx) = route(&serves, &pkt) {
-                        let _ = tx.send(pkt);
+                        let _ = tx.send((pkt, lp.incoming_face_id));
                     } else if let Some(pkt) = route_reply(&pending, pkt)
                         && fb_tx.send(pkt).is_err()
                     {
@@ -343,7 +346,7 @@ impl DemuxConnection {
         })
     }
 
-    fn register(&self, prefix: Name) -> mpsc::UnboundedReceiver<Bytes> {
+    fn register(&self, prefix: Name) -> mpsc::UnboundedReceiver<Served> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.serves.lock().push((prefix, tx));
         rx
@@ -365,11 +368,12 @@ impl DemuxConnection {
     {
         let mut rx = self.register(prefix.clone());
         self.inner.register_prefix(&prefix).await?;
-        while let Some(raw) = rx.recv().await {
+        while let Some((raw, ingress)) = rx.recv().await {
             let Ok(interest) = Interest::decode(raw.clone()) else {
                 continue;
             };
-            let responder = Responder::new(self.clone() as Arc<dyn Connection>, raw, None);
+            let responder =
+                Responder::new(self.clone() as Arc<dyn Connection>, raw, None).arriving(ingress);
             handler(interest, responder).await;
         }
         Ok(())
@@ -388,11 +392,12 @@ impl DemuxConnection {
         let mut rx = self.register(prefix.clone());
         let me = Arc::clone(self);
         crate::rt::spawn(async move {
-            while let Some(raw) = rx.recv().await {
+            while let Some((raw, ingress)) = rx.recv().await {
                 let Ok(interest) = Interest::decode(raw.clone()) else {
                     continue;
                 };
-                let responder = Responder::new(me.clone() as Arc<dyn Connection>, raw, None);
+                let responder =
+                    Responder::new(me.clone() as Arc<dyn Connection>, raw, None).arriving(ingress);
                 // Spawn each handler instead of awaiting it: serving a segmented
                 // object signs + responds to one Interest per call, and a serial
                 // loop caps producer throughput at one (sign + send) at a time —
@@ -446,6 +451,14 @@ impl Connection for DemuxConnection {
 
     async fn recv_side(&self) -> Option<(Bytes, FaceId)> {
         self.inner.recv_side().await
+    }
+
+    fn side_carries(&self, face: FaceId, class: SideClass) -> bool {
+        self.inner.side_carries(face, class)
+    }
+
+    fn side_carries_here(&self, class: SideClass) -> bool {
+        self.inner.side_carries_here(class)
     }
 
     async fn side_quarantine(&self, face: FaceId) -> Result<std::time::Duration, AppError> {
