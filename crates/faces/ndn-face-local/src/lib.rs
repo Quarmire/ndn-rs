@@ -4,13 +4,45 @@
 //! Split from `ndn-face` so wasm32 consumers get the channel face without
 //! OS-socket transports.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc};
 
 use ndn_transport::face::ScopePolicy;
 use ndn_transport::{
-    FaceError, FaceId, FaceKind, FacePersistency, FaceTrust, MtuError, PersistencyError, Transport,
+    FaceError, FaceId, FaceKind, FacePersistency, FaceTrust, MtuError, PersistencyError, SideClass,
+    SideRefused, Transport,
 };
+
+/// How many side frames an app's side inbox holds before the face refuses more
+/// ([`SideRefused::Full`], counted by [`InProcHandle::side_dropped`]).
+pub const SIDE_INBOX_FRAMES: usize = 256;
+
+/// How many octets of side frames the side inbox holds in all: a stream frame may be a mebibyte,
+/// so the frame count alone would let one face pin a gigabyte. A frame that would pass it is
+/// refused like one that finds the frame bound reached.
+pub const SIDE_INBOX_BYTES: usize = 8 * 1024 * 1024;
+
+/// What the face and its handle share of the side inbox: the octets queued and the frames refused.
+#[derive(Default)]
+struct SideGauge {
+    queued: AtomicUsize,
+    dropped: AtomicU64,
+}
+
+impl SideGauge {
+    /// Count `len` octets as queued if the byte bound allows it; false (nothing counted) if not.
+    fn admit(&self, len: usize) -> bool {
+        let before = self.queued.fetch_add(len, Ordering::AcqRel);
+        if before.saturating_add(len) > SIDE_INBOX_BYTES {
+            self.queued.fetch_sub(len, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+}
 
 /// Bytes plus optional source-face provenance, delivered to an in-process app
 /// via [`InProcHandle::recv_tagged`].
@@ -53,6 +85,8 @@ pub struct InProcFace {
     kind: FaceKind,
     face_rx: Mutex<mpsc::Receiver<Bytes>>,
     app_tx: mpsc::Sender<TaggedBytes>,
+    side_tx: mpsc::Sender<(Bytes, FaceId)>,
+    side: Arc<SideGauge>,
 }
 
 /// Application-side handle to an [`InProcFace`].
@@ -64,6 +98,8 @@ pub struct InProcHandle {
     id: FaceId,
     face_tx: mpsc::Sender<Bytes>,
     app_rx: Mutex<mpsc::Receiver<TaggedBytes>>,
+    side_rx: Mutex<mpsc::Receiver<(Bytes, FaceId)>>,
+    side: Arc<SideGauge>,
 }
 
 impl InProcFace {
@@ -83,16 +119,22 @@ impl InProcFace {
     pub fn new_kind(id: FaceId, buffer: usize, kind: FaceKind) -> (Self, InProcHandle) {
         let (face_tx, face_rx) = mpsc::channel(buffer);
         let (app_tx, app_rx) = mpsc::channel(buffer);
+        let (side_tx, side_rx) = mpsc::channel(SIDE_INBOX_FRAMES);
+        let side = Arc::new(SideGauge::default());
         let face = InProcFace {
             id,
             kind,
             face_rx: Mutex::new(face_rx),
             app_tx,
+            side_tx,
+            side: Arc::clone(&side),
         };
         let handle = InProcHandle {
             id,
             face_tx,
             app_rx: Mutex::new(app_rx),
+            side_rx: Mutex::new(side_rx),
+            side,
         };
         (face, handle)
     }
@@ -132,11 +174,81 @@ impl Transport for InProcFace {
             .map_err(|_| FaceError::Closed)
     }
 
-    /// An in-process face carries side frames: the mpsc takes any `Bytes`, so
-    /// the limit is the largest frame the faces grant (one stream frame), the
-    /// same bound every other carrier of a channel applies.
+    /// An in-process face carries side frames: the mpsc takes any `Bytes`, so the limit is the
+    /// largest frame the faces grant ([`ndn_transport::side_header::STREAM_FRAME_GRANT`], 1 MiB:
+    /// one stream frame, the same bound every other carrier of a channel applies). A channel's
+    /// datagram frame (at most 9,000 octets) and the shared-memory slot (8,960) both fit.
     fn side_frame_max(&self) -> usize {
         ndn_transport::side_header::STREAM_FRAME_GRANT
+    }
+
+    /// Push a side frame into the app's side inbox, waiting for room in the frame queue. The
+    /// frame did not arrive over another face, so its ingress is this face's own id. Refused
+    /// `Full` (and counted) if it would pass [`SIDE_INBOX_BYTES`].
+    async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        let _ = class;
+        if frame.first() != Some(&ndn_transport::SIDE_MARKER) {
+            return Err(SideRefused::Malformed);
+        }
+        let max = self.side_frame_max();
+        if frame.len() > max {
+            return Err(SideRefused::TooLarge {
+                size: frame.len(),
+                max,
+            });
+        }
+        let len = frame.len();
+        if !self.side.admit(len) {
+            return Err(SideRefused::Full);
+        }
+        match self.side_tx.reserve().await {
+            Ok(permit) => {
+                permit.send((frame, self.id));
+                Ok(())
+            }
+            Err(_) => {
+                self.side.queued.fetch_sub(len, Ordering::AcqRel);
+                Err(SideRefused::Closed)
+            }
+        }
+    }
+
+    /// Without the face a frame came over there is nothing to tell the app: the engine calls
+    /// [`forward_side_from`](Transport::forward_side_from) for every sink.
+    fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        let _ = (frame, class);
+        Err(SideRefused::Unsupported)
+    }
+
+    /// The engine's path to an app: push `(frame, ingress)` into the side inbox and wake its
+    /// consumer. Never blocks and never waits: a frame that finds the inbox at its frame bound
+    /// ([`SIDE_INBOX_FRAMES`]) or its byte bound ([`SIDE_INBOX_BYTES`]) is refused
+    /// [`Full`](SideRefused::Full) and counted ([`InProcHandle::side_dropped`]); the sender's
+    /// receiver sees the gap, as a congested link's would.
+    fn forward_side_from(
+        &self,
+        frame: Bytes,
+        class: SideClass,
+        ingress: FaceId,
+    ) -> Result<(), SideRefused> {
+        let _ = class;
+        let len = frame.len();
+        if !self.side.admit(len) {
+            self.side.dropped.fetch_add(1, Ordering::Relaxed);
+            return Err(SideRefused::Full);
+        }
+        match self.side_tx.try_send((frame, ingress)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.side.queued.fetch_sub(len, Ordering::AcqRel);
+                self.side.dropped.fetch_add(1, Ordering::Relaxed);
+                Err(SideRefused::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.side.queued.fetch_sub(len, Ordering::AcqRel);
+                Err(SideRefused::Closed)
+            }
+        }
     }
 
     async fn send_bytes_with_source(&self, pkt: Bytes, source: FaceId) -> Result<(), FaceError> {
@@ -170,9 +282,49 @@ impl InProcHandle {
         self.id
     }
 
-    /// Send a packet to the forwarder (readable via `InProcFace::recv`).
+    /// Send a packet to the forwarder (readable via `InProcFace::recv`). A frame that starts
+    /// with the side marker ([`ndn_transport::SIDE_MARKER`]) is a side frame: the face reader
+    /// peels it before the NDN pipeline and the engine's side table routes it.
     pub async fn send(&self, pkt: Bytes) -> Result<(), FaceError> {
         self.face_tx.send(pkt).await.map_err(|_| FaceError::Closed)
+    }
+
+    /// [`send`](Self::send) that never waits: [`FaceError::Full`] when the face's queue has no
+    /// room, [`FaceError::Closed`] when the engine dropped the face.
+    pub fn try_send(&self, pkt: Bytes) -> Result<(), FaceError> {
+        self.face_tx.try_send(pkt).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => FaceError::Full,
+            mpsc::error::TrySendError::Closed(_) => FaceError::Closed,
+        })
+    }
+
+    /// Completes when the face's queue has room for one more packet (at once if it has), or
+    /// when the face is gone. Room is not reserved: [`try_send`](Self::try_send) may still find
+    /// the queue full if another sender took it.
+    pub async fn send_ready(&self) {
+        let _ = self.face_tx.reserve().await;
+    }
+
+    /// The next side frame the engine routed to this app, with the id of the face it arrived
+    /// over at the forwarder (the engine's [`FaceId`]); `None` once the face is gone and the
+    /// inbox is read. Side frames never appear on [`recv`](Self::recv).
+    pub async fn recv_side(&self) -> Option<(Bytes, FaceId)> {
+        let item = self.side_rx.lock().await.recv().await?;
+        self.side.queued.fetch_sub(item.0.len(), Ordering::AcqRel);
+        Some(item)
+    }
+
+    /// The next side frame if one is queued, without waiting.
+    pub fn try_recv_side(&self) -> Option<(Bytes, FaceId)> {
+        let item = self.side_rx.try_lock().ok()?.try_recv().ok()?;
+        self.side.queued.fetch_sub(item.0.len(), Ordering::AcqRel);
+        Some(item)
+    }
+
+    /// How many side frames the face refused because the inbox was full (frame or byte
+    /// bound) since it was made.
+    pub fn side_dropped(&self) -> u64 {
+        self.side.dropped.load(Ordering::Relaxed)
     }
 
     /// Receive a packet from the forwarder, discarding any attached
@@ -257,9 +409,9 @@ mod tests {
         }
     }
 
-    /// An in-process face opts in to side frames: `send_side` pushes the frame
-    /// through the same channel, inline, byte-identical, whatever the class,
-    /// up to the stream frame grant.
+    /// An in-process face opts in to side frames: `send_side` pushes the frame into the side
+    /// inbox (not the NDN queue), byte-identical, whatever the class, up to the stream frame
+    /// grant.
     #[tokio::test]
     async fn a_side_frame_reaches_the_handle_unchanged() {
         use ndn_transport::{SIDE_MARKER, SideClass};
@@ -274,18 +426,114 @@ mod tests {
             v[0] = SIDE_MARKER;
             let frame = Bytes::from(v);
             face.send_side(frame.clone(), class).await.unwrap();
-            let got = handle.recv_tagged().await.unwrap();
-            assert_eq!(got.wire, frame);
-            assert_eq!(got.source_face, None);
+            // The side inbox, not the NDN queue; no other face carried it, so the ingress is
+            // the face itself.
+            let (got, ingress) = handle.recv_side().await.unwrap();
+            assert_eq!(got, frame);
+            assert_eq!(ingress, FaceId(5));
         }
         // The handle's frames reach the face's reader as is.
         let up = Bytes::from_static(&[SIDE_MARKER, 0x20, 7]);
         handle.send(up.clone()).await.unwrap();
         assert_eq!(face.recv_bytes().await.unwrap(), up);
-        // No non-blocking path yet: `forward_side` is `Unsupported` here.
+        // Without an ingress there is nothing to tell the app: `forward_side` is `Unsupported`.
         assert_eq!(
-            face.forward_side(up, SideClass::Datagram),
+            face.forward_side(up.clone(), SideClass::Datagram),
             Err(ndn_transport::SideRefused::Unsupported)
         );
+        // A frame that is no side frame, or is over the limit, is refused.
+        assert_eq!(
+            face.send_side(Bytes::from_static(&[1, 2, 3]), SideClass::Datagram)
+                .await,
+            Err(ndn_transport::SideRefused::Malformed)
+        );
+    }
+
+    /// `forward_side_from` is the engine's non-blocking path to an app: the frame and the face
+    /// it came over reach the handle's side inbox, in order, apart from NDN packets (which stay
+    /// on `recv`).
+    #[tokio::test]
+    async fn the_side_inbox_carries_the_frame_and_its_ingress() {
+        use ndn_transport::{SIDE_MARKER, SideClass};
+
+        let (face, handle) = InProcFace::new(FaceId(5), 4);
+        let frame = |n: u8| Bytes::from(vec![SIDE_MARKER, 0x20, n]);
+        face.forward_side_from(frame(1), SideClass::Datagram, FaceId(11))
+            .unwrap();
+        face.forward_side_from(frame(2), SideClass::Stream, FaceId(12))
+            .unwrap();
+        face.send_bytes(test_pkt(9)).await.unwrap();
+        assert_eq!(handle.recv_side().await, Some((frame(1), FaceId(11))));
+        assert_eq!(handle.recv_side().await, Some((frame(2), FaceId(12))));
+        assert_eq!(
+            handle.recv().await,
+            Some(test_pkt(9)),
+            "NDN packets stay apart"
+        );
+        assert_eq!(handle.side_dropped(), 0);
+    }
+
+    /// The inbox never blocks the engine: past its frame bound or its byte bound a frame is
+    /// refused `Full` and counted, and room that the app made is used again.
+    #[tokio::test]
+    async fn the_side_inbox_is_bounded_and_counts_its_drops() {
+        use ndn_transport::{SIDE_MARKER, SideClass, SideRefused};
+
+        let (face, handle) = InProcFace::new(FaceId(5), 4);
+        let small = Bytes::from(vec![SIDE_MARKER, 1, 2]);
+        for _ in 0..SIDE_INBOX_FRAMES {
+            face.forward_side_from(small.clone(), SideClass::Datagram, FaceId(1))
+                .unwrap();
+        }
+        assert_eq!(
+            face.forward_side_from(small.clone(), SideClass::Datagram, FaceId(1)),
+            Err(SideRefused::Full)
+        );
+        assert_eq!(handle.side_dropped(), 1);
+        assert!(handle.recv_side().await.is_some());
+        face.forward_side_from(small.clone(), SideClass::Datagram, FaceId(1))
+            .unwrap();
+        while handle.try_recv_side().is_some() {}
+
+        // The byte bound: a few big frames fill it long before the frame bound.
+        let big = Bytes::from(vec![SIDE_MARKER; SIDE_INBOX_BYTES / 4 + 1]);
+        let mut taken = 0;
+        while face
+            .forward_side_from(big.clone(), SideClass::Stream, FaceId(2))
+            .is_ok()
+        {
+            taken += 1;
+            assert!(taken <= 4, "the byte bound must hold");
+        }
+        assert_eq!(taken, 3);
+        assert_eq!(handle.side_dropped(), 2);
+        // Closed handle: the face says so instead of counting a drop.
+        drop(handle);
+        assert_eq!(
+            face.forward_side_from(small, SideClass::Datagram, FaceId(1)),
+            Err(SideRefused::Closed)
+        );
+    }
+
+    /// An app's send is `try_send` when it must not wait: `Full` when the face's queue has no
+    /// room, and `send_ready` completes once the engine took one.
+    #[tokio::test]
+    async fn try_send_refuses_when_full_and_send_ready_waits_for_room() {
+        let (face, handle) = InProcFace::new(FaceId(5), 2);
+        handle.try_send(test_pkt(1)).unwrap();
+        handle.try_send(test_pkt(2)).unwrap();
+        assert!(matches!(handle.try_send(test_pkt(3)), Err(FaceError::Full)));
+        let handle = std::sync::Arc::new(handle);
+        let ready = tokio::spawn({
+            let handle = std::sync::Arc::clone(&handle);
+            async move {
+                handle.send_ready().await;
+                handle.try_send(test_pkt(3))
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!ready.is_finished(), "no room yet");
+        assert_eq!(face.recv_bytes().await.unwrap(), test_pkt(1));
+        assert!(ready.await.unwrap().is_ok());
     }
 }
