@@ -24,7 +24,7 @@ use super::key::ChannelKey;
 use super::limits::{MESSAGE_MAX, STREAM_FRAME_MAX};
 use super::message::{Message, Origin};
 use super::table::name_octets;
-use super::tx::{KeySource, Refused, SEQ_END, TxChannel, TxStats};
+use super::tx::{BURST_GAP, KeySource, Refused, SEQ_END, TxChannel, TxStats};
 use super::verbs::{Congestion, EmitError, EmitOptions, Window};
 use super::wire::ChannelMode;
 use crate::rt::{Instant, Tasks};
@@ -323,10 +323,11 @@ async fn one_message_leaves_alone_when_idle_and_messages_pack_when_busy() {
 }
 
 /// An emitter that does not stop between two emissions (a loop) must not make a frame of one for
-/// each: the first leaves at once, the carrier is asked to call back, and the rest wait for that
-/// call and leave together. (An idle link keeps its one-message latency; a loop gets the batch.)
+/// each: the first leaves at once, the second (it follows within `BURST_GAP`) leaves too and asks
+/// the carrier to call back, and the rest wait for that call and leave together. (An idle link
+/// keeps its one-message latency and asks for nothing; a loop gets the batch.)
 #[tokio::test]
-async fn emissions_made_back_to_back_leave_in_one_frame_behind_the_first() {
+async fn emissions_made_back_to_back_leave_in_one_frame_behind_the_first_two() {
     let mut rig = rig(
         ChannelMode::Latest,
         LinkConfig {
@@ -341,15 +342,15 @@ async fn emissions_made_back_to_back_leave_in_one_frame_behind_the_first() {
     }
     assert_eq!(
         rig.link.queued_datagrams(),
-        1,
-        "the first left inline; the other 13 wait for the carrier to call back"
+        2,
+        "the first two left inline; the other 12 wait for the carrier to call back"
     );
     assert_eq!(rig.link.waiting_drains(), 1, "one call back is asked for");
     let seen = datagrams(&mut rig);
     assert_eq!(
         data_counts(&seen),
-        [1, 13],
-        "the first alone, then the rest in one frame"
+        [1, 1, 12],
+        "the first two alone, then the rest in one frame"
     );
     assert_eq!(rig.link.waiting_drains(), 0);
     // And after the carrier called back, the next emission is a first again: inline.
@@ -1383,12 +1384,12 @@ async fn the_64_byte_latest_path_allocates_nothing_per_message_beyond_the_frame(
     }
     let now = rig.t0 + Duration::from_secs(100);
     // One message, idle: one frame, which is two allocations (its buffer, and the shared header
-    // `Bytes` that freezing it adds), and one for the call back it asks of the carrier (the box
-    // of its closure): nothing for the message, the queue, the ring or the seal.
+    // `Bytes` that freezing it adds), and nothing for the call back (an isolated message asks for
+    // none): nothing for the message, the queue, the ring or the seal.
     let (_, one) = count_allocations(|| poll_once(tx.emit(&path, &payload, &latest, now)).unwrap());
     assert_eq!(
-        one, 3,
-        "an idle 64 B message allocates exactly its frame (2) and its call back (1)"
+        one, 2,
+        "an idle 64 B message allocates exactly its frame (2) and no call back"
     );
     void.fire();
     // A busy writer: 14 distinct names wait while the carrier is full, then leave in one frame:
@@ -1560,4 +1561,67 @@ async fn a_message_that_fits_no_frame_the_stream_takes_is_refused_before_anythin
         "{refused:?}"
     );
     assert_eq!(rig.tx.next_seq(), 1, "no sequence was taken");
+}
+
+/// An isolated message leaves inline and asks the carrier for nothing (a call back is a wake of
+/// the carrier's writer task, which an idle message does not need); a message that follows
+/// another inline one within [`BURST_GAP`] is a loop of emissions, and asks, so that the ones
+/// after it queue and leave together.
+#[tokio::test]
+async fn an_isolated_message_asks_no_call_back_and_a_burst_does() {
+    let mut rig = rig(
+        ChannelMode::Latest,
+        LinkConfig {
+            datagram_capacity: 1_000_000,
+            ..LinkConfig::default()
+        },
+    );
+    let latest = EmitOptions::latest();
+    send(&rig, &name(0), b"hello", &latest, rig.t0).await;
+    assert_eq!(rig.link.queued_datagrams(), 1, "left inline");
+    assert_eq!(
+        rig.link.waiting_drains(),
+        0,
+        "an idle message asks for no call back"
+    );
+    let _ = datagrams(&mut rig);
+
+    // Quiet for a second: isolated again.
+    send(&rig, &name(1), b"hello", &latest, at(&rig, 1)).await;
+    assert_eq!(
+        rig.link.waiting_drains(),
+        0,
+        "after a quiet second: still none"
+    );
+    let _ = datagrams(&mut rig);
+
+    // The next one follows within the gap: it leaves inline too, and asks.
+    send(
+        &rig,
+        &name(2),
+        b"hello",
+        &latest,
+        at(&rig, 1) + BURST_GAP / 2,
+    )
+    .await;
+    assert_eq!(rig.link.queued_datagrams(), 1, "still left inline");
+    assert_eq!(rig.link.waiting_drains(), 1, "a burst asks for a call back");
+
+    // Queued behind the call back, and out with it.
+    send(
+        &rig,
+        &name(3),
+        b"hello",
+        &latest,
+        at(&rig, 1) + BURST_GAP / 2,
+    )
+    .await;
+    assert_eq!(
+        rig.link.queued_datagrams(),
+        1,
+        "the third waits for the call back"
+    );
+    let seen = datagrams(&mut rig);
+    assert_eq!(seen.len(), 2);
+    settle(&rig.tx).await;
 }

@@ -56,6 +56,13 @@ use crate::rt::{Instant, Tasks};
 /// Frames one emitter writes before it hands what is left to the carrier's writer task.
 pub(crate) const COMBINE_MAX: usize = 4;
 
+/// A message that follows another one the emitter wrote inline within this long is a loop of
+/// emissions: it asks the carrier for a call back, so that the ones after it queue and leave
+/// together. A message after a longer pause is isolated and asks for none (a call back is a wake of
+/// the carrier's writer task). Not a timer: no frame waits for it; it only decides whether a
+/// message that finds the writer idle is the first of a burst. A round trip over a link is longer.
+pub(crate) const BURST_GAP: Duration = Duration::from_micros(50);
+
 /// Payload octets a queue holds: 1 MiB.
 pub(crate) const QUEUE_BYTES: usize = 1 << 20;
 
@@ -190,6 +197,9 @@ struct State {
     big: LatestSet,
     fifo: Fifo,
     datagram_writing: bool,
+    /// When an emitter last wrote a frame inline and found nothing else waiting (what
+    /// [`BURST_GAP`] is measured from).
+    last_inline: Option<Instant>,
     stream_writing: bool,
     history: History,
     window: Window,
@@ -388,6 +398,7 @@ impl TxChannel {
                 big: LatestSet::default(),
                 fifo: Fifo::default(),
                 datagram_writing: false,
+                last_inline: None,
                 stream_writing: false,
                 history: History::default(),
                 window: Window::DEFAULT,
@@ -572,7 +583,7 @@ impl TxChannel {
             };
             match waiting {
                 None => {
-                    self.run(kick, carrier.as_ref());
+                    self.run(kick, carrier.as_ref(), now);
                     return Ok(());
                 }
                 Some(notified) => notified.await,
@@ -581,14 +592,14 @@ impl TxChannel {
     }
 
     /// Do what the kick says: spawn the stream's writer, or be the datagram lane's.
-    fn run(self: &Arc<Self>, kick: Kick, carrier: Option<&Arc<dyn Carrier>>) {
+    fn run(self: &Arc<Self>, kick: Kick, carrier: Option<&Arc<dyn Carrier>>, now: Instant) {
         if kick.stream {
             self.spawn_stream();
         }
         if kick.datagram
             && let Some(carrier) = carrier
         {
-            self.write_datagrams(carrier, true);
+            self.write_datagrams(carrier, true, now);
         }
     }
 
@@ -880,7 +891,7 @@ impl TxChannel {
     /// `inline`: the writer is an emitter, which stops after [`COMBINE_MAX`] frames and gives the
     /// rest to the carrier's writer task; the carrier's own task (`inline` false) writes until
     /// nothing waits or the carrier refuses.
-    fn write_datagrams(self: &Arc<Self>, carrier: &Arc<dyn Carrier>, inline: bool) {
+    fn write_datagrams(self: &Arc<Self>, carrier: &Arc<dyn Carrier>, inline: bool, now: Instant) {
         let mut frames = 0usize;
         let mut shrunk: Option<usize> = None;
         loop {
@@ -900,12 +911,24 @@ impl TxChannel {
                 Pack::Frame(p) => p,
                 Pack::Gone => return,
                 Pack::Idle => {
-                    // An emitter wrote and nothing else waits: the emissions that follow without
-                    // the emitter stopping (a loop) must not each be a frame of one. They queue
-                    // behind a call back the carrier makes from its own writer task, and leave
+                    // An emitter wrote and nothing else waits. An isolated message is done: it
+                    // asks for nothing (no wake of the carrier's writer task). One that follows
+                    // another inline one within `BURST_GAP` is a loop of emissions, which must
+                    // not each be a frame of one: it asks for a call back the carrier makes from
+                    // its own writer task, the emissions after it queue behind it and leave
                     // together. The first of a burst keeps the idle link's latency.
                     if inline && frames > 0 {
-                        self.request_drain(carrier);
+                        let burst = {
+                            let mut st = self.state.lock();
+                            let burst = st
+                                .last_inline
+                                .is_some_and(|at| now.saturating_duration_since(at) < BURST_GAP);
+                            st.last_inline = Some(now);
+                            burst
+                        };
+                        if burst {
+                            self.request_drain(carrier);
+                        }
                     }
                     return;
                 }
@@ -1143,7 +1166,7 @@ impl TxChannel {
             }
             st.datagram_writing = true;
         }
-        self.write_datagrams(carrier, false);
+        self.write_datagrams(carrier, false, Instant::now());
     }
 
     // ---- the stream lane ------------------------------------------------------------------

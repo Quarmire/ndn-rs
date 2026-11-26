@@ -30,9 +30,10 @@
 //!   sender gives the carrier a closure, and the carrier **calls it once, from its own writer task,
 //!   when `try_send_datagram` would take a frame again** (the next time that task runs if it
 //!   already would). The closure sends what waits, never blocks, and may call
-//!   `try_send_datagram` and `on_ready` itself. The sender asks for it **after every frame an
-//!   emitter wrote inline**, not only after `Full`: the emissions that follow queue until the
-//!   call, so that a loop of them leaves in batches. A carrier that never calls it therefore
+//!   `try_send_datagram` and `on_ready` itself. The sender asks for it after `Full`, and after an
+//!   inline write that follows another within `BURST_GAP` (50 µs): the emissions that follow
+//!   queue until the call, so that a loop of them leaves in batches; an isolated message asks for
+//!   nothing. A carrier that never calls it therefore
 //!   stalls the channel; one that is dropped may drop the closures unrun. The closure may be
 //!   called from any thread, and a carrier calls it from its writer task, not from inside
 //!   `on_ready` (an emitter that called it there would leave no batch to form).
