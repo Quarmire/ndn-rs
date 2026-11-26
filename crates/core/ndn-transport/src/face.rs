@@ -544,6 +544,17 @@ impl Face {
         self.transport.forward_side(frame, class)
     }
 
+    /// Hand one side frame that arrived over face `ingress` to the transport
+    /// without waiting (see [`Transport::forward_side_from`]).
+    pub fn forward_side_from(
+        &self,
+        frame: Bytes,
+        class: SideClass,
+        ingress: FaceId,
+    ) -> Result<(), SideRefused> {
+        self.transport.forward_side_from(frame, class, ingress)
+    }
+
     /// The longest side frame [`send_side`](Face::send_side) accepts.
     pub fn side_frame_max(&self) -> usize {
         self.transport.side_frame_max()
@@ -739,5 +750,86 @@ mod tests {
             face.forward_side(Bytes::from_static(&[SIDE_MARKER]), SideClass::Datagram),
             Err(SideRefused::Unsupported)
         );
+    }
+
+    /// `forward_side_from` tells a transport which face a frame came over. A
+    /// transport that only implements `forward_side` gets the frame (the
+    /// ingress is dropped by the default); one that overrides it sees the
+    /// ingress, through `Face` and through the erased transport alike.
+    #[test]
+    fn forward_side_from_carries_the_ingress_and_defaults_to_forward_side() {
+        use crate::{SIDE_MARKER, SideClass, SideRefused};
+        use std::sync::Mutex;
+
+        struct Plain(Mutex<Vec<(Bytes, SideClass)>>);
+        impl Transport for Plain {
+            fn id(&self) -> FaceId {
+                FaceId(1)
+            }
+            fn kind(&self) -> FaceKind {
+                FaceKind::Internal
+            }
+            fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+                self.0.lock().unwrap().push((frame, class));
+                Ok(())
+            }
+            async fn send_bytes(&self, _w: Bytes) -> Result<(), FaceError> {
+                Ok(())
+            }
+            async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+                Err(FaceError::Closed)
+            }
+        }
+        struct Aware(Mutex<Vec<FaceId>>);
+        impl Transport for Aware {
+            fn id(&self) -> FaceId {
+                FaceId(2)
+            }
+            fn kind(&self) -> FaceKind {
+                FaceKind::Internal
+            }
+            fn forward_side_from(
+                &self,
+                _frame: Bytes,
+                _class: SideClass,
+                ingress: FaceId,
+            ) -> Result<(), SideRefused> {
+                self.0.lock().unwrap().push(ingress);
+                Ok(())
+            }
+            async fn send_bytes(&self, _w: Bytes) -> Result<(), FaceError> {
+                Ok(())
+            }
+            async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+                Err(FaceError::Closed)
+            }
+        }
+
+        let frame = Bytes::from_static(&[SIDE_MARKER, 0x20, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let plain = Arc::new(Plain(Mutex::new(Vec::new())));
+        let face = Face::new(plain.clone(), Arc::new(crate::LpLinkService::new()));
+        face.forward_side_from(frame.clone(), SideClass::Stream, FaceId(9))
+            .unwrap();
+        let erased: &dyn ErasedTransport = &*plain;
+        erased
+            .forward_side_from(frame.clone(), SideClass::Datagram, FaceId(10))
+            .unwrap();
+        assert_eq!(
+            *plain.0.lock().unwrap(),
+            vec![
+                (frame.clone(), SideClass::Stream),
+                (frame.clone(), SideClass::Datagram)
+            ]
+        );
+
+        let aware = Arc::new(Aware(Mutex::new(Vec::new())));
+        let face = Face::new(aware.clone(), Arc::new(crate::LpLinkService::new()));
+        face.forward_side_from(frame.clone(), SideClass::Datagram, FaceId(9))
+            .unwrap();
+        let erased: &dyn ErasedTransport = &*aware;
+        erased
+            .forward_side_from(frame, SideClass::Datagram, FaceId(10))
+            .unwrap();
+        assert_eq!(*aware.0.lock().unwrap(), vec![FaceId(9), FaceId(10)]);
     }
 }

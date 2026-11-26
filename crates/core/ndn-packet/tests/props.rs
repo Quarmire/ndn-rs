@@ -229,6 +229,7 @@ proptest! {
             incoming_face_id,
             next_hop_face_id,
             cache_policy,
+            side_route: None,
         };
         let wire = encode_lp_with_headers(&fragment, &headers);
 

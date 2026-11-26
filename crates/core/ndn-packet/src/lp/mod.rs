@@ -37,6 +37,45 @@ pub struct LpHeaders {
     /// named face. Honored by ndn-rs via `NextHopOverride` in the strategy stage.
     pub next_hop_face_id: Option<u64>,
     pub cache_policy: Option<CachePolicyType>,
+    /// `SideRoute` (0x0370): the fan-out label of a channel session Data.
+    pub side_route: Option<SideRoute>,
+}
+
+/// The `SideRoute` LP header (TLV 0x0370): the label a session Data carries so
+/// every forwarder on its reverse path installs a route for the channel frames
+/// that follow (see `ndn-engine`'s `SideTable`). The value is exactly 10
+/// octets: `id` (8, big-endian) then `ttl_secs` (2, big-endian); any other
+/// length makes the whole LP packet a decode error (fail closed). The type is
+/// even, so a forwarder that predates it skips it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SideRoute {
+    /// The opaque channel id the frames carry in octets 2..10.
+    pub id: u64,
+    /// Seconds a sink lapses after its last refresh; the receiving forwarder
+    /// clamps it to its own maximum.
+    pub ttl_secs: u16,
+}
+
+impl SideRoute {
+    /// Length of the encoded value.
+    pub const VALUE_LEN: usize = 10;
+
+    /// The 10-octet value.
+    pub fn to_value(self) -> [u8; Self::VALUE_LEN] {
+        let mut v = [0u8; Self::VALUE_LEN];
+        v[..8].copy_from_slice(&self.id.to_be_bytes());
+        v[8..].copy_from_slice(&self.ttl_secs.to_be_bytes());
+        v
+    }
+
+    /// Parse the value; `None` unless it is exactly 10 octets.
+    pub fn from_value(value: &[u8]) -> Option<Self> {
+        let value: &[u8; Self::VALUE_LEN] = value.try_into().ok()?;
+        Some(Self {
+            id: u64::from_be_bytes(value[..8].try_into().ok()?),
+            ttl_secs: u16::from_be_bytes(value[8..].try_into().ok()?),
+        })
+    }
 }
 
 pub fn is_lp_packet(raw: &[u8]) -> bool {

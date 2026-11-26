@@ -251,6 +251,7 @@ impl InterestBuilder {
                     incoming_face_id: None,
                     next_hop_face_id: Some(face_id),
                     cache_policy: None,
+                    side_route: None,
                 },
             ),
             None => interest_wire,

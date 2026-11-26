@@ -173,6 +173,21 @@ pub trait Transport: Send + Sync + 'static {
         Err(SideRefused::Unsupported)
     }
 
+    /// [`forward_side`](Transport::forward_side) for a frame that arrived over
+    /// face `ingress`. The forwarder calls this for every fan-out sink; a
+    /// transport that delivers into an application (the in-process face) keeps
+    /// the ingress so the application can say which link a frame came over.
+    /// The default ignores the ingress and calls `forward_side`. Never blocks.
+    fn forward_side_from(
+        &self,
+        frame: Bytes,
+        class: SideClass,
+        ingress: FaceId,
+    ) -> Result<(), SideRefused> {
+        let _ = ingress;
+        self.forward_side(frame, class)
+    }
+
     /// The longest side frame [`send_side`](Transport::send_side) accepts; 0
     /// (the default) means this transport carries none. A transport that sends
     /// a frame as is (a datagram, a ring slot) opts in by returning its limit,
@@ -280,6 +295,12 @@ pub trait ErasedTransport: Send + Sync + 'static {
         class: SideClass,
     ) -> Pin<Box<dyn Future<Output = Result<(), SideRefused>> + Send + '_>>;
     fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused>;
+    fn forward_side_from(
+        &self,
+        frame: Bytes,
+        class: SideClass,
+        ingress: FaceId,
+    ) -> Result<(), SideRefused>;
     fn side_frame_max(&self) -> usize;
 
     fn send_bytes(
@@ -357,6 +378,14 @@ impl<T: Transport> ErasedTransport for T {
     }
     fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
         Transport::forward_side(self, frame, class)
+    }
+    fn forward_side_from(
+        &self,
+        frame: Bytes,
+        class: SideClass,
+        ingress: FaceId,
+    ) -> Result<(), SideRefused> {
+        Transport::forward_side_from(self, frame, class, ingress)
     }
     fn side_frame_max(&self) -> usize {
         Transport::side_frame_max(self)

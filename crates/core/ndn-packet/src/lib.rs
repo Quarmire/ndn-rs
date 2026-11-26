@@ -39,7 +39,7 @@ pub use data::{ContentHashTarget, Data};
 pub use encode::random_reflexive_name;
 pub use error::PacketError;
 pub use interest::{Interest, Selector};
-pub use lp::{CachePolicyType, LpHeaders, LpPacket, encode_lp_packet};
+pub use lp::{CachePolicyType, LpHeaders, LpPacket, SideRoute, encode_lp_packet};
 pub use meta_info::MetaInfo;
 pub use nack::{Nack, NackHeader, NackReason, Refusal};
 pub use name::{Name, NameComponent, NameError};
@@ -157,6 +157,12 @@ pub mod tlv_type {
     pub const LP_TX_SEQUENCE: u64 = 0x0348;
     pub const LP_NON_DISCOVERY: u64 = 0x034C;
     pub const LP_PREFIX_ANNOUNCEMENT: u64 = 0x0350;
+    /// `SideRoute` (0x0370): the label a session Data carries so each
+    /// forwarder on its reverse path installs a fan-out route for the
+    /// channel frames that follow. Even (non-critical): a forwarder that
+    /// predates it skips it and forwards the Data without it. Value: channel
+    /// id (8 octets, big-endian) then TTL in seconds (2 octets, big-endian).
+    pub const LP_SIDE_ROUTE: u64 = 0x0370;
     pub const LP_INCOMING_FACE_ID: u64 = 0x032C;
     pub const LP_NEXT_HOP_FACE_ID: u64 = 0x0330;
     pub const LP_CACHE_POLICY: u64 = 0x0334;

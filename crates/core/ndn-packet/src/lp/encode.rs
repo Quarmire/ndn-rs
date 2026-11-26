@@ -120,6 +120,9 @@ pub fn encode_lp_with_headers(fragment: &[u8], headers: &LpHeaders) -> Bytes {
             let (buf, len) = nni(mark);
             w.write_tlv(tlv_type::LP_CONGESTION_MARK, &buf[..len]);
         }
+        if let Some(route) = headers.side_route {
+            w.write_tlv(tlv_type::LP_SIDE_ROUTE, &route.to_value());
+        }
         w.write_tlv(tlv_type::LP_FRAGMENT, fragment);
     });
     w.finish()

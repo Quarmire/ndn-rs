@@ -42,6 +42,9 @@ pub struct LpPacket {
     pub al_prev_hop_loc: Option<Bytes>,
     /// A-LAL destination/data location (12-byte [`super::GeoFix`]) for Location Score.
     pub al_data_loc: Option<Bytes>,
+    /// `SideRoute` (0x0370): the fan-out label of a channel session Data
+    /// ([`super::SideRoute`]).
+    pub side_route: Option<super::SideRoute>,
 }
 
 impl LpPacket {
@@ -70,6 +73,7 @@ impl LpPacket {
         let mut al_presence = None;
         let mut al_prev_hop_loc = None;
         let mut al_data_loc = None;
+        let mut side_route = None;
 
         // Enforce NDNLPv2 §"Element Order": LP headers ascend by TLV-TYPE,
         // only `Ack` (0x0344) is repeatable, and `Fragment` (0x50) is last.
@@ -173,6 +177,14 @@ impl LpPacket {
                 super::al_lal::TLV_AL_DATA_LOC => {
                     al_data_loc = Some(v);
                 }
+                tlv_type::LP_SIDE_ROUTE => {
+                    side_route = Some(super::SideRoute::from_value(&v).ok_or_else(|| {
+                        crate::PacketError::MalformedPacket(format!(
+                            "SideRoute (0x0370) value is {} octets, must be exactly 10",
+                            v.len()
+                        ))
+                    })?);
+                }
                 tlv_type::INTEREST | tlv_type::DATA => {
                     // NDNLPv2 requires the network-layer packet to be wrapped
                     // in `LpFragment` (0x50). Bare Interest/Data is not spec.
@@ -216,6 +228,7 @@ impl LpPacket {
             al_presence,
             al_prev_hop_loc,
             al_data_loc,
+            side_route,
         })
     }
 }
@@ -751,6 +764,7 @@ mod tests {
             incoming_face_id: Some(42),
             next_hop_face_id: None,
             cache_policy: Some(CachePolicyType::NoCache),
+            side_route: None,
         };
         let wire = encode_lp_with_headers(&interest_wire, &headers);
         let lp = LpPacket::decode(wire).unwrap();
@@ -847,6 +861,7 @@ mod tests {
             incoming_face_id: None,
             next_hop_face_id: None,
             cache_policy: None,
+            side_route: None,
         };
         let wire = encode_lp_with_headers(&interest_wire, &headers);
         let lp = LpPacket::decode(wire).unwrap();
@@ -857,5 +872,145 @@ mod tests {
         assert!(lp.cache_policy.is_none());
         let interest = Interest::decode(lp.fragment.unwrap()).unwrap();
         assert_eq!(*interest.name, n);
+    }
+
+    fn side_route_value(id: u64, ttl: u16) -> Vec<u8> {
+        let mut v = id.to_be_bytes().to_vec();
+        v.extend_from_slice(&ttl.to_be_bytes());
+        v
+    }
+
+    /// The header round-trips with every other header present, so it sits in
+    /// ascending TLV-TYPE order after the congestion mark and before the
+    /// fragment.
+    #[test]
+    fn side_route_round_trips_with_the_other_headers() {
+        let data = fixture_interest_wire();
+        for (id, ttl) in [
+            (0u64, 0u16),
+            (0x0102_0304_0506_0708, 30),
+            (u64::MAX, u16::MAX),
+        ] {
+            let headers = LpHeaders {
+                pit_token: Some(Bytes::from_static(&[9])),
+                congestion_mark: Some(1),
+                incoming_face_id: Some(2),
+                next_hop_face_id: Some(3),
+                cache_policy: Some(CachePolicyType::NoCache),
+                side_route: Some(crate::lp::SideRoute { id, ttl_secs: ttl }),
+            };
+            let lp = LpPacket::decode(encode_lp_with_headers(&data, &headers)).unwrap();
+            assert_eq!(
+                lp.side_route,
+                Some(crate::lp::SideRoute { id, ttl_secs: ttl })
+            );
+            assert_eq!(lp.congestion_mark, Some(1));
+            assert_eq!(lp.fragment.as_deref(), Some(&data[..]));
+        }
+    }
+
+    /// The value is exactly id (8, big-endian) then ttl (2, big-endian).
+    #[test]
+    fn side_route_wire_is_id_then_ttl_big_endian() {
+        let data = fixture_interest_wire();
+        let headers = LpHeaders {
+            side_route: Some(crate::lp::SideRoute {
+                id: 0x1122_3344_5566_7788,
+                ttl_secs: 0x99AA,
+            }),
+            ..LpHeaders::default()
+        };
+        let wire = encode_lp_with_headers(&data, &headers);
+        let needle = [
+            &[0xFD, 0x03, 0x70, 10][..],
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA][..],
+        ]
+        .concat();
+        assert!(
+            wire.windows(needle.len()).any(|w| w == &needle[..]),
+            "wire: {wire:02x?}"
+        );
+    }
+
+    /// Any value length but 10 fails the whole LP packet closed.
+    #[test]
+    fn a_side_route_of_the_wrong_length_is_a_decode_error() {
+        let data = fixture_interest_wire();
+        for len in [0usize, 1, 8, 9, 11, 12] {
+            let value = vec![7u8; len];
+            let wire = build_lp_wire(&[(tlv_type::LP_SIDE_ROUTE, &value)], Some(&data));
+            let err =
+                LpPacket::decode(wire).expect_err("a wrong-length side route must not decode");
+            assert!(
+                matches!(&err, crate::PacketError::MalformedPacket(m) if m.contains("SideRoute")),
+                "len {len}: {err:?}"
+            );
+        }
+        let ok = side_route_value(5, 6);
+        let wire = build_lp_wire(&[(tlv_type::LP_SIDE_ROUTE, &ok)], Some(&data));
+        assert!(LpPacket::decode(wire).is_ok());
+    }
+
+    /// A header that is out of TLV-TYPE order, doubled, or after the fragment
+    /// is rejected as every other LP header is.
+    #[test]
+    fn a_side_route_obeys_the_lp_header_order() {
+        let data = fixture_interest_wire();
+        let v = side_route_value(1, 2);
+        // Before the congestion mark (0x0340 < 0x0370 must come first).
+        let wire = build_lp_wire(
+            &[
+                (tlv_type::LP_SIDE_ROUTE, &v),
+                (tlv_type::LP_CONGESTION_MARK, &[1]),
+            ],
+            Some(&data),
+        );
+        assert!(LpPacket::decode(wire).is_err());
+        let wire = build_lp_wire(
+            &[(tlv_type::LP_SIDE_ROUTE, &v), (tlv_type::LP_SIDE_ROUTE, &v)],
+            Some(&data),
+        );
+        assert!(LpPacket::decode(wire).is_err());
+    }
+
+    /// The type is even, so a decoder that predates it (which treats every
+    /// unknown even LP type as skippable) ignores it: stated through the same
+    /// predicate the decoder uses, and shown with an unassigned even type
+    /// next to a known header.
+    #[test]
+    fn an_old_decoder_skips_the_even_side_route_type() {
+        assert!(!crate::is_critical_tlv_type(tlv_type::LP_SIDE_ROUTE));
+        let data = fixture_interest_wire();
+        let v = side_route_value(1, 2);
+        let wire = build_lp_wire(&[(0x0372, &v)], Some(&data));
+        let lp = LpPacket::decode(wire).expect("an unassigned even LP type is skipped");
+        assert!(lp.side_route.is_none());
+        assert_eq!(lp.fragment.as_deref(), Some(&data[..]));
+    }
+
+    /// Packets that carry no side route decode as before, and the fragment
+    /// helpers that skip headers by type read through one that does.
+    #[test]
+    fn lp_readers_still_read_packets_with_the_header_absent_or_present() {
+        let data = fixture_interest_wire();
+        let plain = encode_lp_with_headers(&data, &LpHeaders::default());
+        assert!(
+            LpPacket::decode(plain.clone())
+                .unwrap()
+                .side_route
+                .is_none()
+        );
+        let with = encode_lp_with_headers(
+            &data,
+            &LpHeaders {
+                side_route: Some(crate::lp::SideRoute { id: 3, ttl_secs: 4 }),
+                ..LpHeaders::default()
+            },
+        );
+        assert_eq!(crate::lp::lp_ndn_packet_bytes(&with), Some(&data[..]));
+        assert_eq!(crate::lp::lp_ndn_packet_bytes(&plain), Some(&data[..]));
+        assert!(crate::lp::peek_lp_name(&with).is_some());
+        let (_, acks) = crate::lp::extract_acks(&with);
+        assert!(acks.is_empty());
     }
 }
