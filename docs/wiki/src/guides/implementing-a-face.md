@@ -119,11 +119,13 @@ On receipt `LpLinkService::recv` returns a marked frame unchanged, before any
 reliability bookkeeping, and the engine's face reader peels it right after
 `recv_bytes_with_addr()`, before LP detection and the bounded pipeline
 channel: it never reaches the PIT, a spawned task, `in_drops` or the
-malformed-packet count. Until a side route table exists the reader counts it
-per face (`FaceCounters::in_side_frames`, `in_side_bytes`) and drops it.
+malformed-packet count. The reader counts it per face (`FaceCounters::in_side_frames`,
+`in_side_bytes`), stamps the face's activity and hands it to the engine's side table,
+which routes it from the one face a route came from and copies it to the faces that
+asked for it with `forward_side_from` (which must never wait; docs/specs/channel.md §14).
 Ethernet pads a payload under 46 octets and a receiver sees the padding, so a
 side frame on an Ethernet face must be self-delimiting or at least 46 octets
-(the stage-3 channel codec is bound by this).
+(the channel codec is bound by this).
 
 ### `FaceKind` vs `FacePersistency`
 
