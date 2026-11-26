@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
+use ndn_security::Signer;
 use ndn_transport::{SideClass, SideKind};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -39,6 +40,7 @@ use tokio::sync::Notify;
 use super::aead::{Aead, FrameCipher};
 use super::carrier::{Carrier, CarrierRefused, CarrierSlot};
 use super::channels::{Live, SendKey};
+use super::checkpoint;
 use super::control::Control;
 use super::frame::{self, Header};
 use super::history::{Held, History, StandFull, Standing};
@@ -46,12 +48,12 @@ use super::hub::Counter;
 use super::limits::{self, FRAME_OVERHEAD, MESSAGE_DEFAULT, MIN_FRAME_LEN, NAME_MAX};
 use super::message::{MessageWriter, Origin, OutMessage, WriteError};
 use super::queues::{Fifo, Item, LatestSet, Pending};
-use super::ring::SentFrames;
+use super::ring::{SentFrames, frame_hash};
 use super::table::{self, Full, NameTooLong, Table, Use};
 use super::varint;
 use super::verbs::{Congestion, EmitError, EmitOptions, Mode, STAND_MAX, Window};
 use super::wire::{self, ChannelMode};
-use crate::rt::{Instant, Tasks};
+use crate::rt::{Instant, Tasks, sleep};
 
 /// Frames one emitter writes before it hands what is left to the carrier's writer task.
 pub(crate) const COMBINE_MAX: usize = 4;
@@ -85,12 +87,26 @@ pub(crate) const SEQ_END: u64 = varint::MAX;
 /// and the message).
 const SEQ_HEADROOM: u64 = 4;
 
+/// What a sender signs its checkpoints with, and how often (docs/specs/channel.md, Checkpoints).
+#[derive(Clone)]
+pub(crate) struct Checkpointing {
+    /// The device key the session Data is signed with. It signs Ed25519 synchronously.
+    pub(crate) signer: Arc<dyn Signer>,
+    /// The checkpoint period (1 ms to 2 s).
+    pub(crate) period: Duration,
+}
+
 /// Where a channel's key comes from, and whom to tell when the sequence ran out.
 pub(crate) trait KeySource: Send + Sync {
     /// The channel's id, key epoch and frame key now; `None` when the channel is gone.
     fn current(&self) -> Option<SendKey>;
     /// The channel used its last sequence: end it (a new one begins with the next emission).
     fn exhausted(&self);
+    /// How this sender signs checkpoints; `None`: it sends none (a signer that is not Ed25519, or a
+    /// sender with no key store). Read once, when the channel is made.
+    fn checkpointing(&self) -> Option<Checkpointing> {
+        None
+    }
 }
 
 /// What the frame layer counted.
@@ -129,6 +145,17 @@ pub(crate) struct TxStats {
     pub(crate) replay_refused: Counter,
     /// Frames by the messages they carry: 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65-128, 129-255.
     pub(crate) by_count: [Counter; 9],
+    /// Checkpoints signed and sent (each is one Ed25519 signature).
+    pub(crate) checkpoints: Counter,
+    /// Of those, ones that listed no frame (the 5 s keep-alive, or one that followed a frame an
+    /// earlier checkpoint already covered).
+    pub(crate) empty_checkpoints: Counter,
+    /// Checkpoints that could not be signed or sealed (never expected: the frames they would have
+    /// covered stay in the ring for the next).
+    pub(crate) checkpoint_failed: Counter,
+    /// Frames no checkpoint can cover: the ring forgot them (4,096 frames or 4 MiB between two
+    /// checkpoints) or they lie below the range the checkpoint could vouch for.
+    pub(crate) unchecked: Counter,
 }
 
 impl TxStats {
@@ -181,6 +208,25 @@ pub(crate) struct Terms {
     pub(crate) frame_max: u64,
     /// The next sequence the sender will use.
     pub(crate) seq: u64,
+    /// The checkpoint period in milliseconds, or 0 when this sender sends no checkpoints (its
+    /// carrier has no stream to carry them, or its key does not sign Ed25519): the session says
+    /// so, and a receiver does not wait for one.
+    pub(crate) ckpt_ms: u64,
+}
+
+/// What the checkpoint writer keeps between checkpoints.
+#[derive(Default)]
+struct Ckpt {
+    /// One past the last sequence the last checkpoint covered: the next begins here.
+    hi: u64,
+    /// Checkpoint items queued on the stream and not yet written. A new one is not queued while
+    /// one waits: it lists everything sent by the time it is written.
+    queued: u32,
+    /// The period timer is running: it was armed by the first frame sent since the last
+    /// checkpoint and fires one period after it.
+    armed: bool,
+    /// When a checkpoint was last queued, or the channel was made.
+    last: Option<Instant>,
 }
 
 /// What an emission asks the caller to do once the lock is released.
@@ -221,6 +267,7 @@ struct State {
     end_kick: bool,
     /// When the window was last replayed to a receiver that is not new (an `ASK_SINCE`).
     since_replayed: Option<Instant>,
+    ckpt: Ckpt,
 }
 
 impl State {
@@ -307,6 +354,7 @@ impl State {
         for _ in 0..lost {
             stats.lost_closed.bump();
         }
+        self.ckpt.queued = 0;
     }
 }
 
@@ -332,6 +380,9 @@ pub(crate) struct TxChannel {
     gated_generation: AtomicU64,
     gated_version: AtomicU64,
     gate_set: AtomicBool,
+    /// How checkpoints are signed and how often, read once when the channel was made; `None`:
+    /// this channel sends none.
+    checkpointing: Option<Checkpointing>,
 }
 
 /// What `pack_datagram` found.
@@ -352,6 +403,9 @@ struct Packed {
 enum Done {
     /// The control frame at the head of the FIFO.
     Control,
+    /// The checkpoint at the head of the FIFO, covering the sequences below `hi`; `empty`: it
+    /// lists no frame.
+    Checkpoint { hi: u64, empty: bool },
     /// The first items of the FIFO.
     Fifo,
     /// Messages of `big`, as `(id, sequence)`.
@@ -365,6 +419,18 @@ enum StreamPack {
         body: Bytes,
         cipher: Arc<FrameCipher>,
         epoch: u8,
+    },
+    /// A checkpoint over `[lo, hi)`: the frames it lists were taken out of the ring and are
+    /// hashed and signed by the writer, with no lock held.
+    Checkpoint {
+        seq: u64,
+        cipher: Arc<FrameCipher>,
+        epoch: u8,
+        key_epoch: u32,
+        lo: u64,
+        hi: u64,
+        frames: Vec<(u64, Bytes)>,
+        signer: Arc<dyn Signer>,
     },
     Data {
         packed: Packed,
@@ -387,6 +453,7 @@ impl TxChannel {
         fold_version: Arc<AtomicU64>,
     ) -> Arc<TxChannel> {
         let aead = Aead::preferred();
+        let checkpointing = keys.checkpointing();
         Arc::new(TxChannel {
             id: key.id,
             mode,
@@ -416,6 +483,10 @@ impl TxChannel {
                 ending: false,
                 end_kick: false,
                 since_replayed: None,
+                ckpt: Ckpt {
+                    last: Some(Instant::now()),
+                    ..Ckpt::default()
+                },
             }),
             room: Notify::new(),
             drain_requested: AtomicU64::new(0),
@@ -425,6 +496,7 @@ impl TxChannel {
             gated_generation: AtomicU64::new(0),
             gated_version: AtomicU64::new(0),
             gate_set: AtomicBool::new(false),
+            checkpointing,
         })
     }
 
@@ -552,10 +624,149 @@ impl TxChannel {
         st.key_epoch = key.key_epoch;
         st.ending = true;
         st.control(&Control::End);
+        // A checkpoint after the `END`: it lists the frames before it and the `END` itself, so a
+        // receiver that holds the `END` until a checkpoint lists it can end the session.
+        self.push_checkpoint(st);
         if !st.stream_writing {
             st.stream_writing = true;
             st.end_kick = true;
         }
+    }
+
+    // ---- checkpoints ------------------------------------------------------------------------
+
+    /// The period this channel checkpoints at, or `None` when it sends none.
+    #[cfg(test)]
+    pub(crate) fn checkpoint_period(&self) -> Option<Duration> {
+        self.checkpointing.as_ref().map(|c| c.period)
+    }
+
+    /// Reserve a sequence for a checkpoint and queue it on the stream's FIFO, in the order of the
+    /// sequences. What it lists is decided when it is written, not now. Returns whether it was
+    /// queued (the channel must have a signer and room in its sequences).
+    fn push_checkpoint(&self, st: &mut State) -> bool {
+        if self.checkpointing.is_none() || st.next_seq + SEQ_HEADROOM >= SEQ_END {
+            return false;
+        }
+        let seq = st.take_seq();
+        st.fifo.push(Item::Checkpoint { seq });
+        st.ckpt.queued += 1;
+        true
+    }
+
+    /// One past the highest sequence a checkpoint written now may vouch for: below the first
+    /// sequence still waiting in a queue (a message that waits, or is in a frame being written, may
+    /// still be sent as a frame whose `seq0` is that low, and that frame has to be judged by a
+    /// later checkpoint, not this one) and below the next sequence to be taken. Everything under it
+    /// is either in the ring of sent frames or was never going to be sent (replaced, dropped).
+    fn watermark(st: &State) -> u64 {
+        let mut hi = st.next_seq;
+        for first in [
+            st.latest.iter().next().map(|p| p.seq),
+            st.big.iter().next().map(|p| p.seq),
+            st.fifo.iter().next().map(Item::seq),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            hi = hi.min(first);
+        }
+        hi
+    }
+
+    /// The first frame sent since the last checkpoint armed the period timer: one period later a
+    /// checkpoint is queued. Called under the lock after a frame was recorded in the ring.
+    fn arm_checkpoint(self: &Arc<Self>, st: &mut State) {
+        let Some(cp) = &self.checkpointing else {
+            return;
+        };
+        if st.ckpt.armed || st.ckpt.queued > 0 || st.ended {
+            return;
+        }
+        st.ckpt.armed = true;
+        let (me, period) = (Arc::clone(self), cp.period);
+        self.tasks.spawn(async move {
+            sleep(period).await;
+            me.checkpoint_due(Instant::now());
+        });
+    }
+
+    /// The period of a checkpoint is over: queue it if frames were sent and none waits to be
+    /// written (one that waits lists everything sent by the time it is written).
+    pub(crate) fn checkpoint_due(self: &Arc<Self>, now: Instant) {
+        let spawn = {
+            let mut st = self.state.lock();
+            st.ckpt.armed = false;
+            if st.ended || st.ckpt.queued > 0 || !st.sent.has_frames() {
+                false
+            } else {
+                self.queue_checkpoint(&mut st, now)
+            }
+        };
+        if spawn {
+            self.spawn_stream();
+        }
+    }
+
+    /// How long an idle channel (nothing sent) goes without a checkpoint: the sender is alive
+    /// and a receiver that has nothing unchecked has nothing to wait for either (liveness).
+    pub(crate) const IDLE_CHECKPOINT: Duration = Duration::from_secs(5);
+
+    /// The maintenance pass: a channel that has a receiver and a stream, sent nothing for
+    /// [`Self::IDLE_CHECKPOINT`] and has no checkpoint waiting or timing sends an **empty**
+    /// checkpoint. Nothing else is sent when idle.
+    pub(crate) fn idle_checkpoint(self: &Arc<Self>, now: Instant) {
+        if self.checkpointing.is_none() || self.live.receivers.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if !self.slot.get().is_some_and(|c| c.has_stream()) {
+            return;
+        }
+        let spawn = {
+            let mut st = self.state.lock();
+            let idle = st
+                .ckpt
+                .last
+                .is_none_or(|at| now.saturating_duration_since(at) >= Self::IDLE_CHECKPOINT);
+            if st.ended || st.ckpt.queued > 0 || st.ckpt.armed || !idle {
+                false
+            } else {
+                self.queue_checkpoint(&mut st, now)
+            }
+        };
+        if spawn {
+            self.spawn_stream();
+        }
+    }
+
+    /// Queue a checkpoint at `now`; true when the stream's writer must be spawned.
+    fn queue_checkpoint(&self, st: &mut State, now: Instant) -> bool {
+        if !self.push_checkpoint(st) {
+            return false;
+        }
+        st.ckpt.last = Some(now);
+        if st.stream_writing {
+            false
+        } else {
+            st.stream_writing = true;
+            true
+        }
+    }
+
+    /// The checkpoint at the head of the FIFO is written now: the range it covers and the frames
+    /// it lists, taken out of the ring under the lock. A frame sent after this point has
+    /// `seq0 >= hi` or stays in the ring for the next checkpoint.
+    fn take_checkpoint(&self, st: &mut State) -> (u64, u64, Vec<(u64, Bytes)>) {
+        let hi = Self::watermark(st).max(st.ckpt.hi);
+        // Begins where the last ended, and past what the ring forgot: a frame the ring no longer
+        // holds is never a mismatch.
+        let lo = st.ckpt.hi.max(st.sent.forgot_end()).min(hi);
+        let mut frames = st.sent.take_below(hi);
+        let before = frames.len();
+        frames.retain(|(seq0, _)| *seq0 >= lo);
+        let skipped = (before - frames.len()) as u64 + st.sent.take_forgotten();
+        self.stats.unchecked.add(skipped);
+        (lo, hi, frames)
     }
 
     /// Emit `payload` at `path` (relative to the space).
@@ -1014,7 +1225,7 @@ impl TxChannel {
     /// what the next `pack_datagram` would have found and set with two more lock rounds. `None`:
     /// the writer looks again.
     fn finish_datagram(
-        &self,
+        self: &Arc<Self>,
         scratch: Vec<(u64, u64)>,
         seq0: u64,
         frame: Option<&Bytes>,
@@ -1027,6 +1238,7 @@ impl TxChannel {
         }
         if let Some(frame) = frame {
             st.sent.record(seq0, frame);
+            self.arm_checkpoint(&mut st);
             self.stats.note_frame(SideClass::Datagram, count);
         }
         st.scratch = scratch;
@@ -1252,6 +1464,53 @@ impl TxChannel {
                         }
                     }
                 }
+                StreamPack::Checkpoint {
+                    seq,
+                    cipher,
+                    epoch,
+                    key_epoch,
+                    lo,
+                    hi,
+                    frames,
+                    signer,
+                } => {
+                    let entries: Vec<(u64, [u8; 16])> = frames
+                        .iter()
+                        .map(|(seq0, frame)| (*seq0, frame_hash(frame)))
+                        .collect();
+                    let sealed = checkpoint::sign(&*signer, self.id, key_epoch, lo, hi, &entries)
+                        .ok()
+                        .and_then(|record| {
+                            Header::new(
+                                SideClass::Stream,
+                                SideKind::Checkpoint,
+                                self.id,
+                                epoch,
+                                seq,
+                                0,
+                            )
+                            .and_then(|h| frame::seal(&cipher, &h, &record))
+                            .ok()
+                        });
+                    match sealed {
+                        Some(frame) => (
+                            frame,
+                            Done::Checkpoint {
+                                hi,
+                                empty: entries.is_empty(),
+                            },
+                            seq,
+                            0,
+                        ),
+                        None => {
+                            // What it would have listed is listed by the next one.
+                            self.stats.checkpoint_failed.bump();
+                            self.state.lock().sent.restore(frames);
+                            self.finish_stream(Done::Checkpoint { hi, empty: true }, None);
+                            continue;
+                        }
+                    }
+                }
                 StreamPack::Data {
                     mut packed,
                     from_fifo,
@@ -1291,11 +1550,25 @@ impl TxChannel {
     /// A frame left (`sent` says which, and how many messages it carried) or could not be sealed
     /// (`sent` is `None`): take its items out of the queues, record the frame, hold its messages
     /// in the window, and wake the emitters that wait for room.
-    fn finish_stream(&self, done: Done, sent: Option<(u64, &Bytes, usize)>) {
+    fn finish_stream(self: &Arc<Self>, done: Done, sent: Option<(u64, &Bytes, usize)>) {
         let mut st = self.state.lock();
         let window_mode = self.mode == ChannelMode::Window && sent.is_some();
+        // A checkpoint frame is not recorded: it needs no hash (a forged one fails its signature
+        // the moment a receiver reads it).
+        let record = !matches!(done, Done::Checkpoint { .. });
         match done {
             Done::Control => st.fifo.finish(|_| {}),
+            Done::Checkpoint { hi, empty } => {
+                st.fifo.finish(|_| {});
+                st.ckpt.queued = st.ckpt.queued.saturating_sub(1);
+                if sent.is_some() {
+                    st.ckpt.hi = st.ckpt.hi.max(hi);
+                    self.stats.checkpoints.bump();
+                    if empty {
+                        self.stats.empty_checkpoints.bump();
+                    }
+                }
+            }
             Done::Fifo => {
                 let window = st.window;
                 let mut held = Vec::new();
@@ -1325,7 +1598,10 @@ impl TxChannel {
             }
         }
         if let Some((seq0, frame, count)) = sent {
-            st.sent.record(seq0, frame);
+            if record {
+                st.sent.record(seq0, frame);
+                self.arm_checkpoint(&mut st);
+            }
             self.stats.note_frame(SideClass::Stream, count);
         }
         drop(st);
@@ -1347,11 +1623,13 @@ impl TxChannel {
         let epoch = st.key_epoch as u8;
         enum Head {
             Control(u64, Bytes),
+            Checkpoint(u64),
             Data(u64),
             Nothing,
         }
         let head = match st.fifo.iter().next() {
             Some(Item::Control { seq, body }) => Head::Control(*seq, body.clone()),
+            Some(Item::Checkpoint { seq }) => Head::Checkpoint(*seq),
             Some(Item::Data(p)) => Head::Data(p.seq),
             None => Head::Nothing,
         };
@@ -1363,6 +1641,28 @@ impl TxChannel {
                     body,
                     cipher: Arc::clone(&st.cipher),
                     epoch,
+                }
+            }
+            Head::Checkpoint(seq) => {
+                st.fifo.mark_inflight(1);
+                let Some(signer) = self.checkpointing.as_ref().map(|c| Arc::clone(&c.signer))
+                else {
+                    // Queued only by a channel that signs: nothing to write.
+                    st.fifo.finish(|_| {});
+                    st.ckpt.queued = st.ckpt.queued.saturating_sub(1);
+                    drop(st);
+                    return self.pack_stream(carrier);
+                };
+                let (lo, hi, frames) = self.take_checkpoint(&mut st);
+                StreamPack::Checkpoint {
+                    seq,
+                    cipher: Arc::clone(&st.cipher),
+                    epoch,
+                    key_epoch: st.key_epoch,
+                    lo,
+                    hi,
+                    frames,
+                    signer,
                 }
             }
             Head::Data(seq0) => {
@@ -1496,6 +1796,14 @@ impl TxChannel {
     ) -> Terms {
         let carrier = self.slot.get();
         let stream = carrier.as_ref().is_some_and(|c| c.has_stream());
+        // What follows the session on the stream waits, on a carrier that routes by a table the
+        // answer fills, until this receiver's route is up.
+        if stream
+            && (fresh || since.is_some())
+            && let Some(carrier) = &carrier
+        {
+            carrier.receiver_added(self.id);
+        }
         let mut st = self.state.lock();
         self.refresh_key(&mut st);
         let (inside, rest) = st.table.split_for_session();
@@ -1514,6 +1822,10 @@ impl TxChannel {
             }),
             frame_max: FRAME_CAP as u64,
             seq: st.next_seq,
+            ckpt_ms: match (&self.checkpointing, stream) {
+                (Some(cp), true) => cp.period.as_millis() as u64,
+                _ => 0,
+            },
         };
         let replay_window = self.mode == ChannelMode::Window && (fresh || since.is_some());
         if !stream || st.ended || !(fresh || replay_window) {
@@ -1750,6 +2062,15 @@ impl Tx {
     /// The sender of `(space, mode)`, if there is one.
     pub(crate) fn get(&self, space: &Name, mode: ChannelMode) -> Option<Arc<TxChannel>> {
         self.channels.read().get(space)?[index(mode)].clone()
+    }
+
+    /// Every sender this node has: what the maintenance pass visits.
+    pub(crate) fn all(&self) -> Vec<Arc<TxChannel>> {
+        self.channels
+            .read()
+            .values()
+            .flat_map(|modes| modes.iter().flatten().cloned())
+            .collect()
     }
 
     /// The sender of `(space, mode)` for the channel `id`: the one held if it is of that channel

@@ -15,7 +15,7 @@ use ndn_foundation_types::Name;
 use super::answer::FRAME_MAX;
 use super::channels::{Admitted, Cap, SendKey};
 use super::standing::{Who, gate};
-use super::tx::{KeySource, Refused, Terms, TxChannel};
+use super::tx::{Checkpointing, KeySource, Refused, Terms, TxChannel};
 use super::verbs::{EmitError, EmitOptions};
 use super::wire::{ChanAsk, ChannelMode};
 use crate::error::HeapError;
@@ -46,6 +46,26 @@ impl KeySource for NodeKeys {
         if let Some(node) = self.node.upgrade() {
             node.chan.channels.close(&self.space, self.mode);
         }
+    }
+
+    fn checkpointing(&self) -> Option<Checkpointing> {
+        let node = self.node.upgrade()?;
+        #[cfg(test)]
+        if node
+            .chan
+            .checkpoints_off
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return None;
+        }
+        // A checkpoint is an Ed25519 signature by the device key the session Data is signed with:
+        // a key of another algorithm sends none, and its sessions say so (`S_CKPT_MS` 0).
+        (node.signer.sig_type() == ndn_packet::SignatureType::SignatureEd25519).then(|| {
+            Checkpointing {
+                signer: Arc::clone(&node.signer),
+                period: node.config.channel.period(),
+            }
+        })
     }
 }
 
@@ -85,6 +105,7 @@ impl NodeInner {
             window: (ask.mode == ChannelMode::Window).then_some(super::answer::WINDOW),
             frame_max: FRAME_MAX,
             seq: admitted.seq,
+            ckpt_ms: 0,
         };
         let Some(key) = self.chan.channels.current(&ask.space, ask.mode) else {
             return fallback();

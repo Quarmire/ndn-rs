@@ -256,15 +256,21 @@ pub(crate) enum Item {
         /// The encoded record.
         body: Bytes,
     },
+    /// A `CHECKPOINT` frame: it holds its place in the order of the sequences, and is written (the
+    /// frames it lists taken from the ring, hashed and signed) when it reaches the head, so it
+    /// lists every frame sent before it.
+    Checkpoint {
+        /// The frame's sequence.
+        seq: u64,
+    },
 }
 
 impl Item {
     /// The sequence the item took.
-    #[cfg(test)]
     pub(crate) fn seq(&self) -> u64 {
         match self {
             Item::Data(p) => p.seq,
-            Item::Control { seq, .. } => *seq,
+            Item::Control { seq, .. } | Item::Checkpoint { seq } => *seq,
         }
     }
 }
@@ -302,7 +308,7 @@ impl Fifo {
             .skip(self.inflight)
             .map(|item| match item {
                 Item::Data(p) => p.payload.len(),
-                Item::Control { .. } => 0,
+                Item::Control { .. } | Item::Checkpoint { .. } => 0,
             })
             .sum()
     }
