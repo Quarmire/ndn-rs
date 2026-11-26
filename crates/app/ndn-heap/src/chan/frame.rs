@@ -278,7 +278,9 @@ impl FrameBuf {
     }
 
     /// Pads to 46 octets if shorter, writes the header (`count` messages),
-    /// reserves the tag and seals the plaintext in place.
+    /// reserves the tag and seals the plaintext in place. The frame is an allocation of its own
+    /// size: when the buffer it was built in has more than a quarter (and 64 octets) to spare,
+    /// the frame is copied to an exact one.
     pub(crate) fn seal(mut self, cipher: &FrameCipher, count: u8) -> Result<Bytes, FrameError> {
         let header = Header::new(
             self.class,
@@ -300,6 +302,13 @@ impl FrameBuf {
         let (head, rest) = self.buf.split_at_mut(HEADER_LEN);
         let (body, tag) = rest.split_at_mut(body_end - HEADER_LEN);
         tag.copy_from_slice(&cipher.seal_detached(header.nonce(), head, body));
+        // The buffer was sized for everything that was pending, and the run that fit may be a
+        // fraction of it. The ring (and a carrier that queues the frame) keeps the whole
+        // allocation alive, so a frame that uses well under its buffer moves to an exact one.
+        let wasted = self.buf.capacity() - self.buf.len();
+        if wasted > self.buf.len() / 4 + 64 {
+            return Ok(Bytes::copy_from_slice(&self.buf));
+        }
         Ok(self.buf.freeze())
     }
 }

@@ -246,8 +246,12 @@ impl MessageWriter {
     /// carrier gave, or the stream frame limit), `capacity` the octets to
     /// allocate up front. A frame is **two allocations** whatever its size and
     /// message count (the buffer, and the shared header `Bytes` adds when the
-    /// buffer is frozen) provided `capacity` is at least its final size, as it
-    /// is when the writer is sized to the room. `max_message` bounds a payload.
+    /// buffer is frozen) provided `capacity` is at least its final size and
+    /// within a quarter (and 64 octets) above it, as it is when the writer is
+    /// sized to the room; a frame that used less of its buffer than that is
+    /// copied to an exact one (three allocations, [`FrameBuf::seal`]), so a
+    /// frame never keeps much more than its own octets alive. `max_message`
+    /// bounds a payload.
     pub(crate) fn new(
         class: SideClass,
         channel: u64,

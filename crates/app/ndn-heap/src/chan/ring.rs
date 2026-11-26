@@ -290,4 +290,51 @@ mod tests {
         });
         assert_eq!(n, 0);
     }
+
+    /// A frame is built in a buffer sized for everything that was pending, and a run that ends
+    /// early (at a sequence gap, or before a control frame) uses little of it. The ring bounds the
+    /// octets of its frames, so what it keeps alive must be the frames and not the buffers they
+    /// were built in (security review M5).
+    #[test]
+    fn the_ring_holds_no_more_than_its_octet_bound_in_allocation() {
+        use crate::chan::aead::{Aead, FrameCipher};
+        use crate::chan::alloc_probe::live_bytes;
+        use crate::chan::key::ChannelKey;
+        use crate::chan::limits::{MESSAGE_DEFAULT, STREAM_FRAME_DEFAULT};
+        use crate::chan::message::{MessageWriter, OutMessage};
+        use ndn_transport::SideClass;
+
+        let cipher = FrameCipher::new(
+            &ChannelKey::from_bytes([9; 32]).frame_key(77, 0),
+            Aead::Aes256Gcm,
+        );
+        let payload = [0x42u8; 100];
+        let (ring, live) = live_bytes(|| {
+            let mut ring = SentFrames::new();
+            for seq0 in 0..100u64 {
+                // A buffer of 1 MiB, for a queue that was long when the frame was begun; the run
+                // that fits ended after one message.
+                let mut writer = MessageWriter::new(
+                    SideClass::Stream,
+                    77,
+                    0,
+                    seq0,
+                    STREAM_FRAME_DEFAULT,
+                    1 << 20,
+                    MESSAGE_DEFAULT,
+                )
+                .unwrap();
+                writer.push(&OutMessage::new(1, &payload)).unwrap();
+                let frame = writer.seal(&cipher).unwrap();
+                ring.record(seq0, &frame);
+            }
+            ring
+        });
+        let bound = ring.bytes();
+        assert_eq!(ring.len(), 100);
+        assert!(
+            live <= 2 * bound as i64 + 16 * 1024,
+            "the ring counts {bound} octets of frames and keeps {live} octets of allocation alive"
+        );
+    }
 }
