@@ -136,7 +136,7 @@ pub(crate) struct RxStats {
     pub(crate) held_unknown_expired: Counter,
 }
 
-/// Why a frame was not delivered. Every reason is counted ([`crate::chan::hub::Stats`]).
+/// Why a frame was not delivered. Every reason is counted by the node (channel.md §12.8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Dropped {

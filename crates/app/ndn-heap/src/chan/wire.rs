@@ -169,7 +169,7 @@ impl ChannelMode {
     }
 }
 
-/// Why a sender refuses an ask it judged ([`R_CODE`]).
+/// Why a sender refuses an ask it judged (the `R_CODE` field of a `CHAN_REFUSAL`, channel.md §7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefusalCode {
     /// The asker's person is not in the audience of the epoch in force.
