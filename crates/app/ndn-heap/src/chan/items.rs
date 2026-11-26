@@ -273,9 +273,7 @@ impl Items {
     /// with nothing queued too; it never waits.
     pub fn next_batch(&mut self, buf: &mut Vec<Got>) -> usize {
         let node = &self.node;
-        node.chan
-            .rx
-            .sweep_held_if_any(&node.chan.stats.rx);
+        node.chan.rx.sweep_held_if_any(&node.chan.stats.rx);
         let mut st = self.sink.state.lock();
         let was_full = st.fifo.is_full();
         let before = buf.len();
@@ -303,9 +301,7 @@ impl Stream for Items {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.sink.waker.register(cx.waker());
         let node = &self.node;
-        node.chan
-            .rx
-            .sweep_held_if_any(&node.chan.stats.rx);
+        node.chan.rx.sweep_held_if_any(&node.chan.stats.rx);
         let mut st = self.sink.state.lock();
         let was_full = st.fifo.is_full();
         let next = st.take_notice_first();
