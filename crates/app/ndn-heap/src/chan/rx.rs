@@ -823,6 +823,9 @@ pub(crate) struct Receivers {
     /// How many channels have held frames being taken in: no frame is looked up against a
     /// session without this being read.
     replaying: AtomicUsize,
+    /// The channel the last frame went through and the generation of the sessions held when it
+    /// was found: the next frame of it needs no lookup while that generation stands.
+    fast: RwLock<Option<(u64, Arc<ChannelRx>)>>,
 }
 
 impl Receivers {
@@ -847,8 +850,25 @@ impl Receivers {
         let ch = Arc::new(ChannelRx::new(session, node));
         if let Some(old) = channels.insert(session.id(), Arc::clone(&ch)) {
             old.state.lock().ended = true;
+            *self.fast.write() = None;
         }
         ch
+    }
+
+    /// The channel of `channel` that [`Self::remember`] kept, if the sessions held are still the
+    /// ones it was found under (`generation`) and no channel has frames being taken in.
+    fn fast_channel(&self, channel: u64, generation: u64) -> Option<Arc<ChannelRx>> {
+        if self.replaying.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        let fast = self.fast.read();
+        let (found_at, ch) = fast.as_ref()?;
+        (*found_at == generation && ch.channel == channel).then(|| Arc::clone(ch))
+    }
+
+    /// Keep `ch`, found while the sessions held stood at `generation`.
+    fn remember(&self, generation: u64, ch: &Arc<ChannelRx>) {
+        *self.fast.write() = Some((generation, Arc::clone(ch)));
     }
 
     /// The channel of `id`, if it has received a frame.
@@ -861,6 +881,7 @@ impl Receivers {
     /// it has queued. A channel replaced by a newer one of the same sender and mode is not told:
     /// the sink goes on with the new one.
     pub(crate) fn end_channel(&self, id: u64, why: &EndReason) {
+        *self.fast.write() = None;
         let Some(ch) = self.channels.lock().remove(&id) else {
             return;
         };
@@ -909,10 +930,16 @@ impl Receivers {
         }
     }
 
-    /// Sweep the hold of every channel if anything is held: what an `Items` poll does.
-    pub(crate) fn sweep_held_if_any(&self, stats: &RxStats, now: Instant) {
+    /// Sweep the hold of every channel if anything is held: what an `Items` poll does. The clock is
+    /// read only when something is held.
+    pub(crate) fn sweep_held_if_any(&self, stats: &RxStats) {
+        let held = self.held.load(Ordering::Acquire);
+        if held == 0 && self.unknown_frames.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let now = Instant::now();
         self.sweep_unknown(stats, now);
-        if self.held.load(Ordering::Acquire) == 0 {
+        if held == 0 {
             return;
         }
         let all: Vec<Arc<ChannelRx>> = self.channels.lock().values().cloned().collect();
@@ -1066,12 +1093,19 @@ impl NodeInner {
             Err(error) => return self.refuse(error),
         };
         let rx = &self.chan.rx;
+        // The steady state: the channel this frame's id went through last, while the sessions held
+        // have not moved since, takes it with no lookup of the session or of the channel.
+        let generation = self.chan.sessions.generation();
+        if let Some(channel) = rx.fast_channel(header.channel, generation) {
+            return channel.receive(self, header, frame, ingress, now).await;
+        }
         loop {
             let known = self.chan.sessions.get(header.channel);
             // A session whose held frames are being taken in is not yet taking frames: a frame
             // that arrives meanwhile queues behind them, so the order of arrival is kept.
             if let Some(session) = known.filter(|_| !rx.replaying(header.channel)) {
                 let channel = rx.channel_for(&session, self);
+                rx.remember(generation, &channel);
                 return channel.receive(self, header, frame, ingress, now).await;
             }
             let unknown = self.chan.sessions.get(header.channel).is_none();

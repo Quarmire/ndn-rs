@@ -1986,3 +1986,76 @@ async fn a_frame_that_arrives_while_held_frames_are_taken_in_queues_behind_them(
         Delivery::Delivered { .. }
     ));
 }
+
+// -- The steady state: no lookup per frame --------------------------------------------------
+
+/// Once a channel has taken a frame, the next ones of it are taken with no lookup of the session
+/// (the receiver keeps the channel while the sessions held stand still).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_steady_stream_of_frames_takes_no_session_lookup() {
+    let fx = latest().await;
+    let sessions = &fx.carol().inner.chan.sessions;
+    assert!(matches!(
+        fx.deliver(fx.data(SideClass::Datagram, 1, &[named(1, A, b"x")]))
+            .await,
+        Delivery::Delivered { .. }
+    ));
+    let looked_up = sessions.lookups();
+    for seq in 2..42 {
+        assert!(matches!(
+            fx.deliver(fx.data(SideClass::Datagram, seq, &[msg(1, b"y")]))
+                .await,
+            Delivery::Delivered { .. }
+        ));
+    }
+    assert_eq!(
+        sessions.lookups(),
+        looked_up,
+        "40 frames of a known channel looked the session up {} times",
+        sessions.lookups() - looked_up
+    );
+}
+
+/// What the receiver kept does not outlive the session: once it is dropped from the store the
+/// next frame of its channel is held as one of an unknown channel, not taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_session_takes_no_frame_though_the_channel_was_kept() {
+    let fx = latest().await;
+    assert!(matches!(
+        fx.deliver(fx.data(SideClass::Datagram, 1, &[named(1, A, b"x")]))
+            .await,
+        Delivery::Delivered { .. }
+    ));
+    fx.carol().inner.chan.sessions.remove(fx.info.channel);
+    assert_eq!(
+        fx.deliver(fx.data(SideClass::Datagram, 2, &[msg(1, b"late")]))
+            .await,
+        Delivery::Held,
+        "a frame of a channel whose session is gone is held, not delivered"
+    );
+}
+
+/// A session installed over the held one (the same channel, renewed) is the one frames go to:
+/// the channel kept for the old one is not used again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_installed_over_the_held_one_is_taken_up_by_the_next_frame() {
+    let fx = latest().await;
+    let sessions = &fx.carol().inner.chan.sessions;
+    assert!(matches!(
+        fx.deliver(fx.data(SideClass::Datagram, 1, &[named(1, A, b"x")]))
+            .await,
+        Delivery::Delivered { .. }
+    ));
+    let held = sessions.get(fx.info.channel).unwrap();
+    let before = sessions.lookups();
+    sessions.insert(held);
+    assert!(matches!(
+        fx.deliver(fx.data(SideClass::Datagram, 2, &[msg(1, b"again")]))
+            .await,
+        Delivery::Delivered { .. }
+    ));
+    assert!(
+        sessions.lookups() > before,
+        "the frame after an install looked the sessions up again"
+    );
+}

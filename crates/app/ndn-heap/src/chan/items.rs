@@ -30,7 +30,6 @@ use super::verbs::{Congestion, GetNotice, GetOptions, Got, Live, LiveEnd, Modes,
 use super::wire::ChannelMode;
 use crate::error::HeapError;
 use crate::node::NodeInner;
-use crate::rt::Instant;
 use crate::space::Heap;
 
 /// A message on its way to the sinks: the key of its pair, its sequence, its payload length and
@@ -276,7 +275,7 @@ impl Items {
         let node = &self.node;
         node.chan
             .rx
-            .sweep_held_if_any(&node.chan.stats.rx, Instant::now());
+            .sweep_held_if_any(&node.chan.stats.rx);
         let mut st = self.sink.state.lock();
         let was_full = st.fifo.is_full();
         let before = buf.len();
@@ -306,7 +305,7 @@ impl Stream for Items {
         let node = &self.node;
         node.chan
             .rx
-            .sweep_held_if_any(&node.chan.stats.rx, Instant::now());
+            .sweep_held_if_any(&node.chan.stats.rx);
         let mut st = self.sink.state.lock();
         let was_full = st.fifo.is_full();
         let next = st.take_notice_first();

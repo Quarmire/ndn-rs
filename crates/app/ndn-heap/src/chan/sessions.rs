@@ -449,12 +449,32 @@ struct Store {
 #[derive(Default)]
 pub(crate) struct RecvSessions {
     store: Mutex<Store>,
+    /// Moves whenever the set of sessions held does (one is inserted, removed or lapses): what a
+    /// receiver cached of a lookup is good while this stands still.
+    generation: AtomicU64,
+    /// How many times the store was asked for a session by id (a test counts them).
+    #[cfg(test)]
+    lookups: AtomicU64,
 }
 
 impl RecvSessions {
     /// The session of channel `id`.
     pub(crate) fn get(&self, id: u64) -> Option<Arc<RecvSession>> {
+        #[cfg(test)]
+        self.lookups.fetch_add(1, Ordering::Relaxed);
         self.store.lock().by_id.get(&id).cloned()
+    }
+
+    /// The generation of the set of sessions held: read it before a lookup, and what the lookup
+    /// found stands while it reads the same.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// How many times [`Self::get`] ran (a test asks).
+    #[cfg(test)]
+    pub(crate) fn lookups(&self) -> u64 {
+        self.lookups.load(Ordering::Relaxed)
     }
 
     /// The session of `sender` in `mode` over `space`, if one is held.
@@ -501,11 +521,13 @@ impl RecvSessions {
             }
         }
         store.by_id.insert(session.id, session);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Drop the session of channel `id`.
     pub(crate) fn remove(&self, id: u64) {
         self.store.lock().by_id.remove(&id);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// End and drop each session past its lifetime and grace at `now`; returns their ids.
@@ -520,6 +542,9 @@ impl RecvSessions {
             }
             keep
         });
+        if !gone.is_empty() {
+            self.generation.fetch_add(1, Ordering::Release);
+        }
         gone
     }
 
