@@ -1390,50 +1390,71 @@ async fn forged_asks_naming_a_member_do_not_throttle_that_members_real_ask() {
     );
 }
 
-/// A stranger that sends more forged asks than the verification budget holds (each names a
-/// listed key, so it passes the lookup and reaches the signature) must not use up what every
-/// genuine asker needs: a member's own ask, arriving over another face, is answered after them.
-/// The budget of verifications is kept per ingress face, under a ceiling of the node sized for
-/// its CPU, so one face cannot drain it for the rest.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_flood_of_forged_asks_from_one_face_does_not_starve_a_genuine_ask() {
+/// A stranger that sends more forged asks than the verification budget of its face holds (each
+/// names a listed key, so it passes the lookup and reaches the signature) uses up the budget of
+/// **that face** and no other: a member's own ask, arriving over another face, is answered right
+/// after them. What the design gives a genuine ask that arrives over the **same** face as the
+/// flood (a router in front of many sources shares its face's budget, channel.md 13.12 item 28)
+/// is a `Congestion` Nack, which tells the asker to ask again, and an answer once the face's
+/// budget has refilled (64 a second).
+///
+/// Time stands still (a paused clock) while the forgeries are judged, so no budget refills
+/// between them: a budget kept for the node as one bucket would be empty for the genuine ask
+/// whichever face it came over, and one that refilled while the forgeries were verified (each
+/// takes milliseconds) would hide it.
+#[tokio::test(start_paused = true)]
+async fn a_flood_of_forged_asks_from_one_face_leaves_another_faces_asks_answered() {
     let rig = rig(&["/alice/laptop", "/bob/phone", "/dave/pc"]).await;
     let (share, change) = public_with(&["/bob"], &[]);
     shared(&rig, share, change).await;
     let (alice, bob, dave) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
     let params = ask_of(bob, ChannelMode::Latest).encode().unwrap();
-    let forged_count = 600;
-    // Signed first, and judged all at once: the flood arrives faster than any budget refills.
-    let flood: Vec<Interest> = (0..forged_count)
-        .map(|_| Interest::decode(signed_as(dave, bob.writer(), alice, &params)).unwrap())
-        .collect();
-    // A verification takes milliseconds, so the flood runs on every worker at once: asks judged
-    // one after another would let the budget refill between them.
-    let tasks: Vec<_> = flood
-        .into_iter()
-        .map(|interest| {
-            let node = Arc::clone(&alice.inner);
-            tokio::spawn(async move {
-                node.chan_answer(&interest, Some(ndn_transport::FaceId(7_000)))
-                    .await
-            })
-        })
-        .collect();
-    let mut answers = Vec::new();
-    for task in tasks {
-        answers.push(task.await.unwrap());
-    }
-    let shed = answers
-        .iter()
-        .filter(|a| matches!(a, ChanAnswer::Nack(NackReason::Congestion)))
-        .count();
-    assert!(
-        shed > 0,
-        "{forged_count} forged asks over one face were all verified: nothing bounds one face"
+    let (flooded, elsewhere) = (
+        Some(ndn_transport::FaceId(7_000)),
+        Some(ndn_transport::FaceId(7_001)),
     );
-    bob.ask_channel(&space(), alice.name())
-        .await
-        .expect("bob's genuine ask is answered after the flood of forgeries from another face");
+    // A face's verification budget is a burst of 256 asks, then 64 a second.
+    let (burst, forged_count) = (256, 300);
+    let mut shed = 0;
+    for _ in 0..forged_count {
+        let interest = Interest::decode(signed_as(dave, bob.writer(), alice, &params)).unwrap();
+        if matches!(
+            alice.inner.chan_answer(&interest, flooded).await,
+            ChanAnswer::Nack(NackReason::Congestion)
+        ) {
+            shed += 1;
+        }
+    }
+    assert_eq!(
+        shed,
+        forged_count - burst,
+        "the flooded face's verification budget is a burst of {burst}: the forged asks over it \
+         are refused Congestion"
+    );
+    let ask = ask_of(bob, ChannelMode::Latest);
+    let (_, genuine) = signed_ask(bob, alice, &ask);
+    let answer = alice.inner.chan_answer(&genuine, elsewhere).await;
+    assert!(
+        matches!(answer, ChanAnswer::Session { .. }),
+        "bob's genuine ask over another face was answered {answer:?} after {forged_count} \
+         forged asks over the first: one face's flood used up what the others need"
+    );
+    // Over the flooded face itself the genuine ask is told to ask again ...
+    let (_, again) = signed_ask(bob, alice, &ask);
+    let answer = alice.inner.chan_answer(&again, flooded).await;
+    assert!(
+        matches!(answer, ChanAnswer::Nack(NackReason::Congestion)),
+        "a genuine ask over the face of the flood was answered {answer:?}, not told \
+         Congestion"
+    );
+    // ... and is answered once the face's budget has refilled.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let (_, later) = signed_ask(bob, alice, &ask);
+    let answer = alice.inner.chan_answer(&later, flooded).await;
+    assert!(
+        matches!(answer, ChanAnswer::Session { .. }),
+        "a genuine ask over the face of the flood was answered {answer:?} a second after it"
+    );
 }
 
 /// A member that asks over her key's rate (4 a second, burst 8) with asks she really signed is

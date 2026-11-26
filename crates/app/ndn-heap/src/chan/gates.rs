@@ -71,13 +71,6 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn full(rate: Rate, now: Instant) -> Bucket {
-        Bucket {
-            tokens: rate.burst,
-            at: now,
-        }
-    }
-
     /// What it holds at `now`.
     fn held(&self, rate: Rate, now: Instant) -> f64 {
         (self.tokens + now.saturating_duration_since(self.at).as_secs_f64() * rate.rate)
@@ -222,7 +215,7 @@ mod tests {
         let t0 = Instant::now();
         let lookups = (0..5000).filter(|_| gates.lookup(face(1), t0)).count();
         assert_eq!(lookups, LOOKUPS_FACE.burst as usize);
-        assert!(LOOKUPS_FACE.burst > VERIFIES_FACE.burst);
+        const { assert!(LOOKUPS_FACE.burst > VERIFIES_FACE.burst) };
     }
 
     /// A stranger that opens a face per ask cannot make the table of buckets grow without bound.
