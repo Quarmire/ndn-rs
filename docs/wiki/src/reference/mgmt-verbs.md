@@ -29,6 +29,7 @@ One module per row; one file per module under
 | `log` | `modules/log.rs` | Runtime log-filter set/get. |
 | `neighbors` | `modules/neighbors.rs` | Neighbour table (joins discovery info with face state). |
 | `service` | `modules/service.rs` | Service lifecycle (drain, shutdown). |
+| `side` | `modules/side.rs` | Side (channel) frame fan-out table: routes, counters, quarantine. |
 
 The catalogue tracks `crates/forwarding/ndn-mgmt/src/modules/mod.rs` —
 add a module there, it appears here.
@@ -149,6 +150,14 @@ Unknown TLVs inside the dataset are skipped.
 | `config` | Set the per-face cap and route-lifetime ceiling. |
 | `flush` | Drop all reverse routes immediately. |
 | `info` | Settings, live route count, and counters. |
+
+`side` (ndn-rs extension; the fan-out table for side (channel) frames in
+`ndn-engine`'s `side` module; every verb needs a signed command):
+
+| Verb | Effect |
+|---|---|
+| `list` | Read-only status text: the counters (routes, sinks, frames and octets in and out, each drop by reason: `unrouted`, `wrong_source`, `malformed`, `class_unsupported`, `quota`, `quarantined`, `sink_full`, `sink_error`; `UP` keeps and unsubs; each refused install by reason), one line per route (id in hex, source face, each sink with the time left before it lapses, frames, octets, age) and the faces barred now. Changes nothing. |
+| `quarantine` | Bar a face's side frames: `FaceId` (required; never defaults to the requesting face) and an optional `ExpirationPeriod` in **milliseconds**. Without it the bar is the face's next by its history (60 s, doubling per repeat on the same face up to 1 h, back to 60 s after an hour clean); with a value, that long; `0` lifts the bar. A barred face has the side frames it sends dropped (`quarantined`), its `Keep`s ignored and no route installed from it; the NDN traffic over it is untouched. Answers the length applied in `ExpirationPeriod`. |
 
 `security` (selected; the trust verbs and their answers are specified in
 `docs/specs/mgmt-trust.md`):
