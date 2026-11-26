@@ -1,5 +1,4 @@
-//! Who may take part in live data over a space: the membership judgement signals made
-//! (`signal.rs`) and a channel makes, one function for both.
+//! Who may take part in live data over a space: the membership judgement a channel makes.
 //!
 //! A key **stands** when the person the trust context governing it names is listed by the
 //! operation fold of the space the way the question asks ([`Who`]), the key's role is
@@ -8,9 +7,6 @@
 //! read from what is held at the call, so it flips on the first call after the entry that removes
 //! a person, or the context that revokes a key, is held. [`gate`] asks the same of this device
 //! itself.
-//!
-//! Signals keep their own surface (`signal_member`, `signal_scope`, `signal_header`): they call
-//! these functions and map the answer to their own refusal.
 
 use ndn_foundation_types::Name;
 
@@ -29,16 +25,12 @@ pub(crate) const NO_RECORD: &str = "its creation, the owner's first members entr
 pub(crate) enum Who {
     /// A writer: the owner always is.
     Writer,
-    /// A writer or a reader, **everybody reading a public space** (what signals asked
-    /// with `reads = true`).
-    Reader,
     /// A writer or a reader the fold **lists**: a public space makes no reader of an unlisted
     /// person, because a channel's key is wrapped to a judged key (channel.md).
     Listed,
 }
 
-/// Why a key does not stand. [`signal`](crate::signal) maps these to its refusals, a channel to
-/// its own.
+/// Why a key does not stand; a channel maps these to its own refusals.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Unstanding {
     /// No person of the asked kind owns the key, or its role is no owner-capable one, or it is no
@@ -65,7 +57,6 @@ pub(crate) fn standing(log: &Log, judge: &Judge, key: &Name, who: Who) -> Result
     let fold = &log.fold;
     let listed = match who {
         Who::Writer => fold.is_writer(person),
-        Who::Reader => fold.is_writer(person) || fold.is_reader(person),
         Who::Listed => fold.lists(person),
     };
     if person.is_empty() || !listed {

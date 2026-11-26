@@ -6,10 +6,8 @@
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_heap::wire::{
-    GrantAsk, PieceKind, grant_name, held_name, log_name, piece_name, seal_key_name,
-    signal_run_name,
+    EpochId, GrantAsk, PieceKind, grant_name, held_name, log_name, piece_name, seal_key_name,
 };
-use ndn_heap::{RUN_ID_LEN, wire::EpochId};
 use ndn_packet::encode::DataBuilder;
 
 use crate::folder_scope::{departure_carries, folder_carries, writer_carries};
@@ -170,10 +168,6 @@ fn seals_cross_and_what_is_not_the_layers_does_not() {
             "the seal key {seal} of a device outside the space's namespace crossed the link"
         );
     }
-    let run = signal_run_name(&device, &space, &[1; RUN_ID_LEN]);
-    assert!(folder_carries(&space, &run));
-    let other = signal_run_name(&device, &n("/alice/32=data/diary"), &[1; RUN_ID_LEN]);
-    assert!(!folder_carries(&space, &other));
 }
 
 #[test]
@@ -267,10 +261,9 @@ fn nothing_of_a_writer_outside_the_space_is_added() {
     let bob = n("/bob/member/phone");
     let diary = n("/bob/32=data/diary");
     for name in [
-        // Her other space's entry, piece and run header.
+        // Her other space's entry and piece.
         log_name(&bob, &diary, 3),
         piece_name(&log_name(&bob, &diary, 3), PieceKind::Chunk(0)),
-        signal_run_name(&bob, &diary, &[1; RUN_ID_LEN]),
         // The sync group, and names of no layer.
         n("/bob/32=sync"),
         n("/bob/member/phone"),

@@ -1,5 +1,5 @@
-//! The sibling surface ([`crate::host`], spec §12): what `ndn-invite` and
-//! `ndn-surface` reach the node by. An extension answers the keyword it
+//! The sibling surface ([`crate::host`], spec §12): what `ndn-invite`
+//! reaches the node by. An extension answers the keyword it
 //! registered and no other; the signing a node lends out is bounded by the
 //! keywords registered; a join's note turns a refusal into a wait until the
 //! space lists the device; one entry is fetched by name and judged as any.
@@ -264,9 +264,8 @@ async fn extend_refuses_a_core_keyword_and_a_duplicate() {
         &["held"],
         &["piece"],
         &["manifest"],
-        &["signal"],
-        &["run"],
         &["sync"],
+        &["chan"],
     ];
     let dev = solo().await;
     let (node, _) = boot(&dev, cfg()).await;

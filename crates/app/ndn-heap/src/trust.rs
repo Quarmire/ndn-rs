@@ -1042,7 +1042,7 @@ impl Judge {
     /// namespace the node does not hold, the view adopted for her if the
     /// listings say so (`member`: only as a writer or reader, not as a person
     /// a cut keeps); else the node's own, which refuses it as not held. The
-    /// signal gate judges live data by it.
+    /// channel's standing judges live data by it.
     pub(crate) fn view_for(&self, name: &Name, space: &Name, member: bool) -> Arc<Validator> {
         self.validator
             .keyring()
@@ -1457,7 +1457,7 @@ fn governed_cuts(ctx: &SignedTrustContext) -> impl Iterator<Item = &RevocationCu
 /// Whether `key`, a key of a device governed by `ctx`, may act as an owner
 /// device where `ctx`'s namespace owns a space: the single predicate every
 /// owner power of the log is judged by (admission of Members and Epoch entries,
-/// the owner's implicit write, the epoch grant, signals, and the owner
+/// the owner's implicit write, the epoch grant, a channel's standing, and the owner
 /// device's own signing).
 ///
 /// A namespace that declares the role layout (its context's schema is

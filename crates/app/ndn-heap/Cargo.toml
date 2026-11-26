@@ -27,7 +27,7 @@ sha2         = { workspace = true }
 hkdf         = { workspace = true }
 # The checkpoint hash of a sent frame above 2,048 octets (channel.md).
 blake3       = { workspace = true }
-# Signal keys (spec §11) are zeroed when dropped.
+# Channel keys and seal keys are zeroed when dropped.
 zeroize      = "1"
 # The seeded fast hash of the channel's per-message maps (names, ids): SipHash was a fifth of the
 # sender's CPU per message (channel.md, Measured). No unsafe, no_std, builds for wasm32.

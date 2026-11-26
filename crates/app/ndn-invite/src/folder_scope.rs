@@ -5,7 +5,7 @@
 //! A grant admits a person to the *link*; the layer above answers by name to whoever
 //! asks, and some of what it holds is not sealed (a public space, the members entries
 //! themselves). So the link must carry only the names of **the space of the grant**:
-//! its entries, their pieces, its run headers, and the few names of the layer's own
+//! its entries, their pieces, and the few names of the layer's own
 //! that reach them (seal keys, grants, held copies). Everything else this device holds
 //! by name (another space's entries, even one whose name extends this space's, the
 //! introductions, the sync group, certificates) is not carried.
@@ -17,7 +17,7 @@
 use ndn_foundation_types::{Name, tlv_type};
 use ndn_heap::wire::{
     is_namespace, parse_grant_name, parse_held_name, parse_log_name, parse_piece_name,
-    parse_seal_key_name, parse_signal_run_name, parse_space_name,
+    parse_seal_key_name, parse_space_name,
 };
 
 /// How deep a held copy's name may nest another: a `<H>/32=held/<Name>` whose inner
@@ -36,7 +36,6 @@ const LAYOUT_ROLES: [&[u8]; 4] = [b"admin", b"member", b"node", b"guest"];
 /// - a log entry `<D>/32=log/<space>/seq=<n>` **of this space**, whatever device wrote
 ///   it, and a piece or manifest node of such an entry; never an entry of another space,
 ///   even one whose name extends this space's;
-/// - a signal run header of this space;
 /// - a seal key of a device of the space's own owner namespace
 ///   (`<O>/<role>/<device>/32=seal/<public key>`) and a grant ask of this space **to a
 ///   device of the owner's namespace** (the epoch's creator, or another owner device
@@ -56,7 +55,7 @@ pub fn folder_carries(space: &Name, name: &Name) -> bool {
 /// `namespaces` (the persons the members list as writers), so that a writer can ask the
 /// other's device for the epoch key, and the **grant asks** (`<G>/32=grant/<GrantAsk>`)
 /// of this space to a device `G` of each listed `W`, which holds the key of an epoch it
-/// reads in too. Nothing else: every entry, piece and run header of the space,
+/// reads in too. Nothing else: every entry and piece of the space,
 /// whatever device wrote it, is [`folder_carries`]'s already, and nothing of a writer's
 /// outside the space is added. `false` for a `space` that is no space name.
 ///
@@ -143,9 +142,6 @@ fn carries(space: &Name, name: &Name, held_depth: u8) -> bool {
     }
     if let Some(piece) = parse_piece_name(name) {
         return piece.log.space == *space;
-    }
-    if let Some(run) = parse_signal_run_name(name) {
-        return run.scope == *space;
     }
     let owner = parse_space_name(space).map(|parsed| parsed.owner);
     if let Some((device, _)) = parse_seal_key_name(name) {

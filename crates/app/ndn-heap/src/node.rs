@@ -167,8 +167,8 @@ impl Default for Config {
 
 /// A device's heap layer.
 ///
-/// It dereferences to its [`NodeHandle`], the surface `ndn-invite` and
-/// `ndn-surface` use (see [`crate::host`]); the handle is the same node, cheap to
+/// It dereferences to its [`NodeHandle`], the surface `ndn-invite` uses
+/// (see [`crate::host`]); the handle is the same node, cheap to
 /// clone, and does not stop it when dropped.
 pub struct Node {
     pub(crate) inner: Arc<NodeInner>,

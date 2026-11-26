@@ -1,6 +1,5 @@
-//! The sibling surface of the node: the interface for `ndn-invite` and
-//! `ndn-surface` only (spec §10.9). A program that only reads and writes spaces
-//! never needs it.
+//! The sibling surface of the node: the interface for `ndn-invite` only
+//! (spec §10.9). A program that only reads and writes spaces never needs it.
 //!
 //! A sibling crate adds a protocol of its own to a device (introductions, a
 //! link layer's questions) that rides the node's key, its trust, its store and
@@ -455,7 +454,7 @@ impl NodeHandle {
     /// [`HeapError::BadRequest`], registering nothing, for an extension that
     /// claims no keyword, a word that is no keyword (lowercase ASCII letters,
     /// digits and `-`), a keyword the layer's own names carry (`data`, `log`,
-    /// `seal`, `grant`, `held`, `piece`, `manifest`, `sync`, `signal`, `run`), or
+    /// `seal`, `grant`, `held`, `piece`, `manifest`, `sync`, `chan`), or
     /// one already claimed; [`HeapError::Local`] once the node stopped.
     pub fn extend(&self, extension: Arc<dyn Extension>) -> Result<(), HeapError> {
         self.inner.extend(extension)
