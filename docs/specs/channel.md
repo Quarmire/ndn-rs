@@ -654,10 +654,10 @@ A carrier that meets this is all the sender needs: no timer, no task of its own,
 | Names per channel | 4,096; the table frees idle ids at 3,687 | `TooLarge` |
 | Standing names / octets / lifetime | 256 / 64 KiB / 1 h | `TooLarge` |
 | History window | 256 messages, 1 MiB, 10 s by default; at most 4,096, 16 MiB, 5 min | clamped |
+| Window replay to a receiver that is not new (`ASK_SINCE`) | once a second per channel, and only while the queue's 1 MiB has room for it | no replay, `replay_refused` |
 | Sequence | below 2^62 | `SequenceExhausted`: the channel ends |
 | `Congested` retry | 100 ms | |
 
-| Window replay to a receiver that is not new (`ASK_SINCE`) | once a second per channel, and only while the queue's 1 MiB has room for it | no replay, `replay_refused` |
 ### 13.10 Threat notes for the sender
 
 - **A local application cannot exhaust the sender's memory.** Every queue is bounded: 1 MiB of waiting payload per channel, 4,096 names, 256 standing names and 64 KiB standing, a window of at most 16 MiB (and 4,096 messages) per `Window` channel, a ring of at most 4,096 frames and 4 MiB. A burst of new names costs one sweep a second at most.
@@ -679,6 +679,118 @@ A channel ends when its sender closes it, and the sender then **seals and sends 
 - **Once.** A second close of the same channel sends nothing more; after it the sender takes no emission (`emit` makes the next channel: a new id and a new key).
 - **What `END` is worth.** It is sealed under the channel's key, which every receiver holds, so any receiver, and any holder of the key, can seal one (§12.9): it ends a session at the receiver, which can ask again. It decides nothing about who is a member.
 
+### 13.12 Accepted residuals before checkpoints (stage 5)
+
+Until the checkpoints of stage 5 exist, one thing is **not** guaranteed: that a frame that opens under a channel's key was sealed by the channel's sender. Every receiver holds the key, so what a holder can do to the channel of **another member** is the following. A holder is any receiver the sender admitted (readers included) and a removed member until the re-key; the review that found this is recorded in the commit history of this section. Each item is expected, bounded as stated, and ends at stage 5 (which authenticates the sender by the signed checkpoint) or at stage 4 (which binds a frame to the face it arrived on).
+
+1. **Forge.** Seal any `DATA` or `CONTROL` frame under the key. Every receiver the frame reaches accepts it, attributed to the sender. A reader of a sealed space can thereby write live data to the other receivers, which `heap.md` does not allow it to write in the space.
+2. **Re-seal old content.** An exact repeat is dropped by the replay window. A holder can seal captured plaintext again under a new `seq0` within 2^24 above what the receiver has seen (§12.2), which delivers old content as newer; in `Latest` a forged sequence on a name within that bound mutes that name's genuine messages until the record is forgotten. Past the bound the frame is refused (`TooFar`), so no frame can make later genuine frames `TooOld`.
+3. **End the session.** A forged `END` closes the session at every receiver it reaches; the receiver can ask again (§13.11), and does not do so by itself.
+4. **Truncate and withhold.** A holder or relay on the route can drop frames: a gap in `Reliable` and `Window`, invisible in `Latest`. A holder racing the genuine frame can deliver its own at the same `seq0`.
+5. **Rename.** A forged `BIND`, `NAMED` message or `UNBIND` rebinds ids, up to 4,096 names a channel; forged `HELLO` and standing brackets are bounded as in §12.9.
+6. **No ingress binding.** `deliver_frame` takes the ingress as an opaque number the host chooses; it decides what the early-frame hold shares between (§12.8), and nothing else. Until stage 4 any face on the host can inject frames, and a host that gives every face one number has one share for all of them; a peer that opens many faces holds many shares and the node's 4 MiB is then the only bound.
+7. **The early-frame hold.** A `Window` joiner's early replay or standing frames beyond one face's share (16 frames or 2 MiB) are lost, and the stream cannot ask for them again.
+8. **Stale grace.** A removed member keeps the old key, and with it the read of what was sealed under it, for the 5 s of grace counted from the answer that gave the others the new key (§3.6).
+9. **Retained memory.** A key holder can keep 4,096 payloads of up to 9,000 octets alive in a `Latest` queue (about 36 MiB) by sending small messages in frames of that size: the queue is charged what each message pins (§12.6), and a frame over 9,000 octets is copied out first.
+10. **A restart empties the ask replay guard.** An ask captured in the 240 s before a sender's restart can be replayed once after it (§3.3 step 5). It yields a session wrapped to the asker's own key and a receiver entry for the ask's lifetime, nothing readable to the replayer.
+11. **Announce.** It is a hint: a device is asked only if the space's record holds an entry of it (§9), so a writer's device that has never written is asked by name, not by hint.
+12. **Fair share is per link, not per person** (`ndn-link.md` §9): a grantee with N links holds N shares, and the floors of more than `capacity / floor` active links add up to more than the capacity. The link layer has a device and no person at the quota.
+13. **The first congestion window is 4 × `path_mtu_max`.** A connection's first congestion window is `max(14,720, 4 × path_mtu_max)` octets, 36,000 at the default 9,000, which exceeds RFC 9002 §7.2 on a real 1,452-octet path (about 25 packets in the first round trip). It is there because quinn gates a `CONNECTION_CLOSE` that has ack-eliciting data pending by the congestion window and an MTU probe in flight uses the window, so a refusal sent right after the handshake needs room (without it the refused peer read a stateless reset, not the reason, about one run in two). It is bounded: before the path is validated the server sends at most three times what it received; quinn paces at window over round trip; after a loss or timeout the window collapses to the minimum; a connection that carries nothing holds none of it. The 4× margin for other data in flight is not measured, so it was not narrowed.
+14. **Stage 4 reminders.** `deliver_frame` waits for room in the caller's task before the frame is authenticated, so a relay must not call it from a face reader without its own bound; relays check the source face and the quota.
+
 ## 14. Measured
 
-Informative. `examples/chan_ping.rs` of `ndn-face-quic` runs `Heap::emit` (`Latest`) into `Heap::live` between two nodes (the signed setup of §3, one link on loopback, a carrier over `LinkFace::forward_side`, `send_side` and `side_limits`), pinned to four cores of a 64-core host, 3 s a size, median of 3 interleaved with the raw QUIC datagram and stream rows of `carrier_bench` at the same `path_mtu_max`. At `path_mtu_max` 9,000 (after the tuning of SHAPES-CHANNEL.md 18.6, host load 5–6): 8 B 2.11 M messages/s, 64 B 1.84 M, 1 KiB 0.57 M, 8 KiB 89 k; that is 0.17, 0.23, 0.45 and 0.49 of the raw datagram row (the 8 KiB row against the raw stream: 0.60; 1 KiB against the raw stream: 0.80); the 64 B half round trip is 1.37 (cold) and 1.24 (hot) times the raw datagram's. At 1,452 (8 KiB over 256 paths, on the stream) 55 k messages/s, 0.83 of the raw stream; the sender no longer builds a stream frame over what the carrier takes (`Carrier::stream_frame_max`, §13.8). Per message at 64 B, 14 to a frame: the sender 469–477 ns, the receiver 333 ns by `poll_next` and 280 ns by `next_batch`. What the figures do not cover: a real NIC, `Reliable` and `Window`, relays, a sealed space's checkpoints, and the setup's Interests crossing the link (the two nodes share one forwarder).
+Informative. This section records what was measured of the stage-3 implementation, how, what the figures leave out, and what was tried and removed. Nothing in it is normative. The design note (SHAPES-CHANNEL.md §18 and §19) holds the raw tables, the commits and the scripts.
+
+### 14.1 Method
+
+- **The rung.** `examples/chan_ping.rs` of `ndn-face-quic` runs `Heap::emit` (`Latest`) into `Heap::live` between two nodes (`/bob/phone` writes, `/carol/tablet` reads). The space and the channel are made by the signed setup of §3. The frames cross **one** QUIC link on loopback. The `Carrier` is an adapter over `LinkFace::forward_side` (the datagram lane), `send_side` (the stream lane) and `side_limits`. The two nodes share one forwarder, so the setup's Interests do not cross the link; the frames do.
+- **Cores.** Pinned to four cores (`taskset -c 10-13`) of a shared 64-core AMD EPYC 7532 host, with two runtimes of one worker each: the sender's writer task and the QUIC driver share a worker.
+- **Throughput.** 0.5 s of warm-up, then 3 s a size. Each figure is the median of 3 pairs run back to back and interleaved (a channel run, then the raw run, alternating the order). The raw rows are the QUIC datagram and stream rows of `carrier_bench` at the same `path_mtu_max`, with the socket buffer and the bounded GSO batch a link has. The count is what `Items` yields; the emitter rotates 256 paths.
+- **Latency.** The half round trip of a 64-octet message: 14 pairs, each the p50 of 10,000 timed round trips after 1,000 warm-up ones, the outer 1 % dropped, against the raw QUIC datagram. *Cold* is the host as it is; *hot* adds four busy loops on other cores.
+- **Per-message CPU.** Without a link: a carrier that records frames and releases one at a time; 64 octets, 14 messages to a frame, 2,000,000 messages, 3 runs; the sender is `Heap::emit` through the sealed frame on one thread, the receiver is `deliver_frame` and the take from `Items`, by `poll_next` or by `next_batch`.
+- **`path_mtu_max`.** 9,000 (datagrams of 8,962 octets) and 1,452 (datagrams of 1,414), so a jumbo-frame path and an Ethernet path are both measured.
+- **Load.** The tuned figures of §14.2 were taken at host load 5.1–6.2 (the host was shared), which put about ±5 µs of noise on single latency pairs.
+
+### 14.2 After the stage-3 tuning
+
+At `path_mtu_max` 9,000. The ratio is to the raw QUIC datagram row; the last column names the raw stream row where it was measured.
+
+| size | channel, messages/s | × raw datagram | × raw stream |
+|---|---|---|---|
+| 8 B | 2.110 M | 0.17 | |
+| 64 B | 1.837 M [1.829, 1.858] | 0.23 | |
+| 128 B | 1.532 M | 0.23 | |
+| 256 B | 1.263 M | 0.30 | |
+| 512 B | 0.873 M | 0.43 | |
+| 1 KiB | 570 k [554, 618] (raw datagram 1,271 k) | 0.449 | 0.80 (raw stream 713 k) |
+| 8 KiB | 89 k [87, 93] (raw stream 148 k; raw datagram 180 k) | 0.49 | 0.60 |
+
+At `path_mtu_max` 1,452: 8 B 1.853 M; 64 B 1.535 M; 1 KiB 302 k against a raw datagram 429 k (0.70); 8 KiB, which goes on the stream, 54.7 k messages/s (3.6 Gbit/s) over 256 rotating paths against a raw stream 66 k (0.83).
+
+The 64-octet half round trip, at 9,000, medians of 14 pairs (the range of the pair ratios in brackets):
+
+| | channel | raw datagram | channel ÷ raw |
+|---|---|---|---|
+| cold | 42.7 µs | 30.7 µs | 1.37 [0.78, 2.08] |
+| hot | 46.1 µs | 37.7 µs | 1.24 [1.01, 1.45] |
+
+Per message at 64 octets, 14 to a frame: the sender 469 ns (`next_batch`) and 477 ns (`poll_next`); the receiver 280 ns by `next_batch` and 333 ns by `poll_next`. The per-message budget the design set was 500 ns. At 64 octets nothing is allocated per message beyond the frame (asserted by `the_64_byte_latest_path_allocates_nothing_per_message_beyond_the_frame`, §13.2).
+
+These figures are those of the tuning pass that ends at the design note's §18.6. Changes made after it (the one limit `STREAM_FRAME_GRANT`, the receiver keeping its last channel, the sender's one-lock idle decision, and the fixes of the security review: a message in a stream frame over 9,000 octets that is under half of it is copied out of the frame, the hold, the ring's exact-size frames, the setup's bounds) were **not** followed by a new full table; the one latency comparison made after the first three (24 interleaved pairs, for the receiver change) showed no detectable difference. The verdict of §14.6 therefore stands on these figures, and the optimisation pass (§14.6) starts with a fresh table.
+
+### 14.3 Why the gaps remain
+
+**Latency.** The channel's code runs cold once a message is alone on the link: the sender spends about 5 µs beyond quinn's `send_datagram` (the call the raw row makes too) and the receiver about 2.5 µs, against 1.4 µs a message when the same path runs hot in the per-message row. The 1.1× allowance is about 3 µs. The call back to the carrier and the wake of the `Items` consumer together are under 1.5 µs of the excess, and an isolated message asks for no call back (`BURST_GAP`, §13.8). The measured cause is the **cold footprint of the idle path**: the name table, the standing map, `Pending`, the ring and the lock are each touched by a lone message. Further measurements:
+
+- The half round trip is **bimodal per process** on this host: the channel at 32–33 µs on good runs and 40–47 µs on bad ones, the raw datagram at 28.5–29.5 µs.
+- With the sender's and the receiver's threads pinned to one core and the main thread to another the run is stable: 35.0 µs against 30.2 µs, a ratio of 1.16.
+- A per-ping timer makes no difference: 39.9 µs against 40.3 µs.
+- An earlier attribution of 4.5 µs "outside `Heap::emit`" does not exist: measured, it is 0.03 µs before and 0.06 µs after the receiver change, so it was cold-start cost of the measurement.
+
+**Throughput.** From 128 octets up the writer thread carries two AEAD passes over every octet: the channel's seal of the frame (§11.2) and quinn's own encryption of the packet, on one worker that also runs quinn's driver. The raw row does only the second. Removing the channel's seal entirely in a scratch run (not shipped) gives the ceiling: the sender's frames a second rise from 82.5 k to 103 k at 1 KiB (+25 %) and from 91.5 k to 107–121 k at 8 KiB, which is about 0.61 times the raw datagram at 1 KiB and about 0.72–0.82 times the raw stream at 8 KiB. So the 0.9 targets at 1 KiB and 8 KiB cannot be met with two AEAD passes on one worker. At 64 octets the same scratch run reaches 1.95–1.98 M messages/s against 1.79–1.87 M with the seal in, so the 1.94 M compared against is reachable only barely even with a free seal.
+
+### 14.4 What the tuning changed in the specified behaviour
+
+1. **The stream frame limit (§13.8, §11.6).** At `path_mtu_max` 1,452, 8 KiB messages over 256 paths stalled: 0 messages in the window. The cause was a stream frame of 1,049,252 octets, built from 128 queued messages, over the 1,048,576 octets the face grants. The face refused it, the refusal was taken as a dead stream, and every later emission rebuilt and re-sealed a 1 MiB frame (AES-GCM was 60 % of the sender thread). `Carrier::stream_frame_max()` is the fix: the stream lane packs to the smaller of it and the channel's own limit, and a message whose frame fits no frame the stream takes is refused `TooLarge` at `emit`. After it the same row is 54.7 k messages/s. The limits are now one constant: `ndn_transport::side_header::STREAM_FRAME_GRANT` (1 MiB) is the face's stream-frame limit and the channel's stream-frame default, and the message default is derived from it (the grant less 1 KiB), because a message at the earlier default was refused at `emit` (`TooLarge`, size 1,048,624, max 1,048,576), which the test `a_message_of_the_default_limit_fits_a_frame_the_face_grants` caught.
+2. **The ring hashes lazily (§13.2 item 9).** The checkpoint hash was a sixth of the writer thread at 1 KiB and 8 KiB (16–17 % of its samples). Recording a frame now keeps a reference and the hash is computed when the ring is drained. Interleaved before and after, 6 pairs: 64 B ×1.03, 1 KiB ×1.16 (506 k to 571 k), 8 KiB ×1.18 (74 k to 86 k).
+3. **The receiver keeps its last channel.** A run of frames for one channel takes no session lookup. The saving is small and was not separable in latency: no detectable difference over 24 interleaved pairs.
+4. **The idle write is one lock round.** An emitter that writes inline decides in the same lock round that commits its frame whether the lane is idle; the earlier path packed again and took a third lock. The per-frame message counter is one add. An isolated message asks for no call back (§13.8); that change had no measurable end-to-end effect (p50 median −0.5 µs over 20 interleaved pairs).
+
+### 14.5 Tried and removed
+
+**Authenticate-only for unsealed spaces.** The idea was to send the frames of an unsealed (public) space under a MAC and no encryption. It was measured and **dropped**: every frame in every space stays AEAD sealed (AES-256-GCM; ChaCha20-Poly1305 only where `ring` does not build or the CPU has no AES), and nothing of the work reached the wire, the codec or the sources. The reason is cost on the measuring host (AMD EPYC 7532: AES-NI and PCLMULQDQ, no VAES; `ring` 0.17): **no MAC beats `ring`'s AES-GCM seal above about 150 octets**, because the seal is one stitched AES-NI and PCLMUL kernel and every MAC has to process the whole frame as additional data, which `ring` does not stitch. ns a frame, medians:
+
+| octets | AES-256-GCM seal | AES-GMAC (`ring`) | ChaCha20-Poly1305 tag only (`ring`) | keyed BLAKE3 to 16 |
+|---|---|---|---|---|
+| 64 | 157 | 113 | 188 | 133 |
+| 1,200 | 484 | 1,033 | 621 | 1,498 |
+| 8,962 | 2,647 | 7,364 | 3,615 | 3,340 |
+| 65,000 | 18,410 | 52,645 | 25,169 | 20,643 |
+
+At 8,962 octets, the size the gates run at, GMAC is 2.8 times the seal, a ChaCha tag-only 1.37 times and BLAKE3 1.26 times. Only at 64 octets does a MAC win (GMAC 113 against 157 ns). Only on a CPU without AES (and on wasm32), where the seal is ChaCha, would a ChaCha tag-only be cheaper than the seal: 8–18 % (0.82–0.92 of ChaCha's own seal, from 64 octets to 1 MiB). That is not the host the gates run on, and nothing was built for it.
+
+**Taking the seal off the writer thread.** Two designs were built, measured against the shipped one in interleaved pairs (medians, host load 4–8), and **removed** because each was slower. Messages/s, shipped then variant:
+
+| design | 64 B | 1 KiB | 8 KiB |
+|---|---|---|---|
+| the whole drain on a writer thread | 1,825 k to 739 k | 558 k to 461 k | 86 k to 57 k |
+| seal one frame ahead on a seal thread | 1,792 k to 1,680 k | 619 k to 430 k | 93 k to 61 k |
+
+The cause is that a drain is about one frame long on a single worker, so nothing overlaps: the seal is not hidden and every frame pays a hand-over between threads. The first design also made the QUIC driver wake across threads (48 % of the sender thread was in libc); the second spent about a quarter of its time waiting on the seal thread. The latency with and without an offload was not measured, because none shipped.
+
+**The copies.** A read of the path from `Heap::emit` to quinn found one copy of a message's payload by the channel (into the frame buffer, which batching needs) and none for the seal, which is in place, nor for the datagram carrier. The one copy that could go is in ndn-ext: a stream frame of 16 KiB or less is copied once behind its 4-octet length prefix. It was not changed.
+
+### 14.6 Where this leaves the gates
+
+Against the targets of the design note every performance gate **except 8 B is missed**: the 64-octet half round trip (1.37 cold and 1.24 hot against 1.1), the 64-octet rate (1.837 M, about 5 % under the 1.94 M compared against), 128 octets to 1 KiB (0.23 to 0.449 of the raw datagram against 0.9) and 8 KiB (0.60 of the raw stream at 9,000 and 0.83 at 1,452 against 0.9). 8 B passes (2.110 M at 9,000, 1.07 times the figure compared against). What remains of the gap is the cold footprint of the idle path (latency) and the two AEAD passes on one worker (throughput), both of §14.3. What is not yet done and would help: the receiver's open off the reader thread (which needs `deliver_frame` to stop returning a per-frame result), the 4-octet prefix copy of ndn-ext's `side.rs`, a sender cache in `Heap::sender` (0.07 µs), a smaller cold footprint of the idle path, and striping a link over several connections (the design note's §17.6, undecided).
+
+**The owner's decision** is to finish stages 4–7 first and then to do **one focused performance pass**; the open items above are left to that pass.
+
+### 14.7 What the figures do not cover
+
+- A real network interface: every run is loopback.
+- `Reliable` and `Window` (only `Latest` was measured), relays and fan-out, a sealed space's checkpoints, and the setup's Interests crossing the link (the two nodes share one forwarder).
+- Zenoh was not rerun on this host; comparisons to it use the figures of the design note's baseline (§1.2), taken at another load. Zenoh was not measured at 128 B to 512 B.
+- A full table after the changes made since the tuning pass (§14.2), and the latency with and without an offload.
+- A quiet host: the figures were taken at load 5–6 on a shared host, and single latency pairs vary by ±5 µs.
