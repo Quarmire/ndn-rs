@@ -81,4 +81,7 @@ mod checkpoint_verified_tests;
 mod ask_stamp_tests;
 
 #[cfg(test)]
+mod standing_tests;
+
+#[cfg(test)]
 mod get_tests;
