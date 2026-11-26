@@ -396,6 +396,9 @@ pub(crate) struct Verify {
     /// the highest run, which [`Verify::forget_farthest`] forgets, is the highest of these, or the
     /// lowest slot when there is none: found without walking the slots.
     starts: BTreeSet<u64>,
+    /// The slots that hold a frame no checkpoint has judged. A checkpoint visits these, not the
+    /// settled slots that stay (up to 4,096) so that a repeat of a settled frame is known.
+    pending: BTreeSet<u64>,
     /// Octets of `Pending` frames held.
     bytes: usize,
     /// Second frames held.
@@ -406,6 +409,9 @@ pub(crate) struct Verify {
     /// The highest `hi` of a verified checkpoint, if any verified.
     #[cfg(test)]
     verified_hi: Option<u64>,
+    /// Slots a checkpoint looked at, all checkpoints (a test asks).
+    #[cfg(test)]
+    visited: usize,
 }
 
 impl Verify {
@@ -415,12 +421,15 @@ impl Verify {
             period,
             slots: BTreeMap::new(),
             starts: BTreeSet::new(),
+            pending: BTreeSet::new(),
             bytes: 0,
             extra: 0,
             share,
             pending_since: None,
             #[cfg(test)]
             verified_hi: None,
+            #[cfg(test)]
+            visited: 0,
         }
     }
 
@@ -491,6 +500,7 @@ impl Verify {
     fn remove_slot(&mut self, seq0: u64) -> Option<Slot> {
         let slot = self.slots.remove(&seq0)?;
         self.starts.remove(&seq0);
+        self.pending.remove(&seq0);
         let below = self.slots.range(..seq0).next_back().map(|(&s, _)| s);
         if let Some(above) = self.slots.range(seq0..).next().map(|(&s, _)| s) {
             self.starts.remove(&above);
@@ -588,6 +598,7 @@ impl Verify {
             rebinds: accepted.rebinds,
         };
         self.slot_mut(seq0).entries.push(entry);
+        self.pending.insert(seq0);
         (forgotten, Ok(()))
     }
 
@@ -653,6 +664,7 @@ impl Verify {
                     });
                     self.bytes += octets;
                     self.extra += 1;
+                    self.pending.insert(seq0);
                 }
                 None => self.share.release(octets),
             }
@@ -693,92 +705,103 @@ impl Verify {
             self.verified_hi = Some(self.verified_hi.map_or(record.hi, |hi| hi.max(record.hi)));
         }
         // Below the range: no later checkpoint covers it.
-        let below: Vec<u64> = self.slots.range(..record.lo).map(|(s, _)| *s).collect();
+        let below: Vec<u64> = self.pending.range(..record.lo).copied().collect();
         for seq0 in below {
+            self.pending.remove(&seq0);
+            #[cfg(test)]
+            {
+                self.visited += 1;
+            }
             let Some(slot) = self.slots.get_mut(&seq0) else {
                 continue;
             };
+            self.extra = self
+                .extra
+                .saturating_sub(slot.entries.len().saturating_sub(1));
             let (pending, settled): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut slot.entries)
                 .into_iter()
                 .partition(|e| matches!(e.state, State::Pending(_)));
             slot.entries = settled;
             if slot.entries.is_empty() {
                 self.remove_slot(seq0);
+            } else {
+                self.extra += slot.entries.len() - 1;
             }
             judged.uncoverable += self.forget(pending);
         }
-        let inside: Vec<u64> = self
-            .slots
-            .range(record.lo..record.hi)
-            .map(|(s, _)| *s)
-            .collect();
+        let inside: Vec<u64> = self.pending.range(record.lo..record.hi).copied().collect();
         let mut released = 0usize;
         for seq0 in inside {
+            self.pending.remove(&seq0);
+            #[cfg(test)]
+            {
+                self.visited += 1;
+            }
             let Some(slot) = self.slots.get_mut(&seq0) else {
                 continue;
             };
-            let mut keep = Vec::with_capacity(slot.entries.len());
-            for (index, entry) in std::mem::take(&mut slot.entries).into_iter().enumerate() {
-                let State::Pending(octets) = entry.state else {
-                    keep.push(entry);
+            self.extra = self
+                .extra
+                .saturating_sub(slot.entries.len().saturating_sub(1));
+            // `index` counts the entries as they were accepted: the first is the one delivered.
+            let (mut at, mut index) = (0, 0);
+            while at < slot.entries.len() {
+                let State::Pending(octets) = &slot.entries[at].state else {
+                    at += 1;
+                    index += 1;
                     continue;
                 };
                 released += octets.len();
-                let hash = frame_hash(&octets);
+                let hash = frame_hash(octets);
                 if record.listed(seq0).any(|listed| *listed == hash) {
                     if index == 0 {
                         judged.settled.push(seq0);
                     }
-                    keep.push(Entry {
-                        state: State::Settled {
-                            hash,
-                            proof: frame.clone(),
-                        },
-                        ..entry
-                    });
+                    slot.entries[at].state = State::Settled {
+                        hash,
+                        proof: frame.clone(),
+                    };
+                    at += 1;
                 } else {
-                    judged.mismatches.push(Mismatch {
-                        seq0,
-                        first: index == 0,
-                        accepted: Accepted {
-                            frame: octets,
-                            ingress: entry.ingress,
-                            at: entry.at,
-                            sequences: entry.sequences,
-                            kind: entry.kind,
-                            epoch: entry.epoch,
-                            rebinds: entry.rebinds,
-                        },
-                    });
+                    let entry = slot.entries.remove(at);
+                    if let State::Pending(octets) = entry.state {
+                        judged.mismatches.push(Mismatch {
+                            seq0,
+                            first: index == 0,
+                            accepted: Accepted {
+                                frame: octets,
+                                ingress: entry.ingress,
+                                at: entry.at,
+                                sequences: entry.sequences,
+                                kind: entry.kind,
+                                epoch: entry.epoch,
+                                rebinds: entry.rebinds,
+                            },
+                        });
+                    }
                 }
+                index += 1;
             }
-            slot.entries = keep;
             if slot.entries.is_empty() {
                 self.remove_slot(seq0);
+            } else {
+                self.extra += slot.entries.len() - 1;
             }
         }
         // Every frame judged left the slots: settled ones keep a hash, mismatches went to the
         // caller.
         self.bytes -= released.min(self.bytes);
         self.share.release(released);
-        self.recount_extra();
         // The frames above the range are still unjudged: the clock runs from the oldest of them.
         self.pending_since = self
-            .slots
+            .pending
             .range(range_hi..)
-            .flat_map(|(_, slot)| slot.entries.iter())
+            .filter_map(|seq0| self.slots.get(seq0))
+            .flat_map(|slot| slot.entries.iter())
             .filter(|e| matches!(e.state, State::Pending(_)))
             .map(|e| e.at)
             .min();
         judged
-    }
-
-    fn recount_extra(&mut self) {
-        self.extra = self
-            .slots
-            .values()
-            .map(|s| s.entries.len().saturating_sub(1))
-            .sum();
     }
 
     /// Give back everything held (the channel ended).
@@ -788,6 +811,7 @@ impl Verify {
         self.extra = 0;
         self.slots.clear();
         self.starts.clear();
+        self.pending.clear();
     }
 }
 
@@ -1350,7 +1374,7 @@ mod tests {
         };
         let mut seq0 = 0u64;
         for step in 0..6_000u32 {
-            match next() % 8 {
+            match next() % 9 {
                 0..=3 => {
                     // The sender's next frame, sometimes after a long silence.
                     seq0 += 1
@@ -1377,6 +1401,14 @@ mod tests {
                     let hi = lo + next() % (2 * REPLAY_WINDOW);
                     let _ = v.judge(&record(lo, hi, &[]), &Bytes::from_static(b"cp"));
                 }
+                8 => {
+                    // A second authentic frame at a held slot.
+                    let keys: Vec<u64> = v.slots.keys().copied().collect();
+                    if !keys.is_empty() {
+                        let at = keys[(next() % keys.len() as u64) as usize];
+                        let _ = v.conflict(at, accepted(&frame(at ^ 0xFF, 64), 9, 0));
+                    }
+                }
                 _ => {
                     // The slot a checkpoint empties by settling it.
                     let lo = v.slots.keys().next().copied().unwrap_or(0);
@@ -1395,8 +1427,58 @@ mod tests {
             let (low, starts) = scanned(&v);
             assert_eq!(v.starts, starts, "run starts after step {step}");
             assert_eq!(v.run_low(), low, "run low after step {step}");
+            let pending: BTreeSet<u64> = v
+                .slots
+                .iter()
+                .filter(|(_, slot)| {
+                    slot.entries
+                        .iter()
+                        .any(|e| matches!(e.state, State::Pending(_)))
+                })
+                .map(|(s, _)| *s)
+                .collect();
+            assert_eq!(v.pending, pending, "pending slots after step {step}");
+            let extra: usize = v
+                .slots
+                .values()
+                .map(|s| s.entries.len().saturating_sub(1))
+                .sum();
+            assert_eq!(v.extra, extra, "second frames after step {step}");
         }
         v.release_all();
         assert!(v.starts.is_empty());
+    }
+
+    /// A checkpoint looks at the slots that hold frames it can judge, not at every settled slot
+    /// the channel keeps so that a repeat is known: with 4,000 settled slots, one checkpoint over
+    /// 20 new frames visits 20 (it visited all 4,020 before: 0.4 ms of a 20 ms period).
+    #[test]
+    fn a_checkpoint_visits_only_the_slots_it_can_judge() {
+        let budget = Arc::new(Budget::default());
+        let mut v = verify(&budget);
+        let proof = Bytes::from_static(b"cp");
+        let mut frames = Vec::new();
+        for seq0 in 0..4_020u64 {
+            let f = frame(seq0, 64);
+            assert!(v.offer(seq0, accepted(&f, 1, 0)).1.is_ok());
+            frames.push(f);
+        }
+        // Settle the first 4,000 in checkpoints of 20.
+        for from in (0..4_000u64).step_by(20) {
+            let listed: Vec<(u64, &Bytes)> = (from..from + 20)
+                .map(|s| (s, &frames[s as usize]))
+                .collect();
+            let judged = v.judge(&record(from, from + 20, &listed), &proof);
+            assert_eq!(judged.settled.len(), 20);
+        }
+        assert_eq!(v.slots(), 4_020, "the settled slots stay: a repeat is known");
+        assert_eq!(v.seen(7, &frames[7]), Dup::Same);
+        v.visited = 0;
+        let listed: Vec<(u64, &Bytes)> = (4_000..4_020).map(|s| (s, &frames[s as usize])).collect();
+        let judged = v.judge(&record(4_000, 4_020, &listed), &proof);
+        assert_eq!(judged.settled.len(), 20);
+        assert!(judged.mismatches.is_empty());
+        assert_eq!(v.visited, 20, "only the slots with a pending frame");
+        assert_eq!(v.seen(4_005, &frames[4_005]), Dup::Same);
     }
 }
