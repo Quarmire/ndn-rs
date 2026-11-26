@@ -1471,7 +1471,11 @@ mod tests {
             let judged = v.judge(&record(from, from + 20, &listed), &proof);
             assert_eq!(judged.settled.len(), 20);
         }
-        assert_eq!(v.slots(), 4_020, "the settled slots stay: a repeat is known");
+        assert_eq!(
+            v.slots(),
+            4_020,
+            "the settled slots stay: a repeat is known"
+        );
         assert_eq!(v.seen(7, &frames[7]), Dup::Same);
         v.visited = 0;
         let listed: Vec<(u64, &Bytes)> = (4_000..4_020).map(|s| (s, &frames[s as usize])).collect();
