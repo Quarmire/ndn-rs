@@ -1,3 +1,5 @@
+> Superseded by channel.md at ndn-rs 19b5d1e0. Kept for history; nothing here is normative.
+
 # Signals: ephemeral live data between the members of a folder
 
 - **Status:** Draft (round 4)
