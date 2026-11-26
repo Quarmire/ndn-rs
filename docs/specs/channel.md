@@ -1,8 +1,8 @@
 # Channel: ephemeral live data over a space
 
-- **Status:** stage 2 built: the setup (names, the ask, the session, judging at both ends, renewal, re-keying, ending, the announce, limits and refusals, the setup TLVs and their vectors). Stage 3 built: the frame (§11: header, key schedule and seal, messages, kinds, limits, short frames on L2, vectors, threat notes); the receiver (§12: the order of checks before any cryptography, the hold of frames that overtake their session, the replay window, the generation check, key epochs, the name table and its 50 ms hold, `HELLO`, standing values, the queues per mode and the gap rule, `Items`, limits, threat notes); and the sender (§13: `Heap::emit` and its refusals, the combining writer with its headroom rule and re-pack, the name-id table and the `CONTROL` bodies, the three modes, `stand`, what a new session is given, the carrier a face must provide, the `END` a closed channel sends, limits, threat notes). Not yet: routing frames by the forwarder's side table is stage 4 (one fixed carrier stands in); checkpoints are stage 5. Where a later stage's text is not here yet, it is not specified yet, and nothing in this file says how it will be.
-- **Implementation:** `ndn-heap`, module `chan` (`ndn-rs/crates/app/ndn-heap/src/chan/`): `wire.rs` (the records), `answer.rs` (the sender judges), `ask.rs` (the receiver asks and judges), `channels.rs` (the sender's table), `sessions.rs` (the receiver's store), `hub.rs` (the node's state, the announce, the maintenance task), `standing.rs` (membership, shared with signals).
-- **Scope:** an ephemeral **channel**: one device of a writer of a space sends live data (presence, a cursor, a drag) to the devices of the space's readers and writers, without making an entry. This file specifies how a channel is **set up** between two devices by signed NDN: who is answered, how a key reaches only the devices that may hold it, how a session ends, is renewed and is re-keyed; and the **frame** (§11) that carries the data once it is set up: the header, the key schedule and the seal, the messages, the limits and the short-frame rule for raw L2 faces. It builds on [heap.md](heap.md) (names §2, the members record §5, epochs and audiences §6, the lapsed rule §9.3) and uses ndn-link's carrier ([ndn-link.md](ndn-link.md)) for what comes after setup.
+- **Status:** stage 2 built: the setup (names, the ask, the session, judging at both ends, renewal, re-keying, ending, the announce, limits and refusals, the setup TLVs and their vectors). Stage 3 built: the frame (§11: header, key schedule and seal, messages, kinds, limits, short frames on L2, vectors, threat notes); the receiver (§12: the order of checks before any cryptography, the hold of frames that overtake their session, the replay window, the generation check, key epochs, the name table and its 50 ms hold, `HELLO`, standing values, the queues per mode and the gap rule, `Items`, limits, threat notes); and the sender (§13: `Heap::emit` and its refusals, the combining writer with its headroom rule and re-pack, the name-id table and the `CONTROL` bodies, the three modes, `stand`, what a new session is given, the carrier a face must provide, the `END` a closed channel sends, limits, threat notes). Stage 4 built: the forwarder's side table (§14: the `SideRoute` header 0x0370 that the session's own Data carries, the table and its limits and refusals, the peel and the fan-out, `UP` keep and unsub, teardown at every site a face goes down, the bar, the per-face rate, what each face carries, what a node does with it, the management commands, threat notes). Stage 5 built: checkpoints (§15: the signed record with its vectors, the sender's schedule, the receiver's judgement, evidence, the bar, the silence rule, `Trust::Verified`, the stated window, what is not judged, threat notes); §13.12 lists what stays accepted after both. Not yet: the verbs `get` and `kept` (stage 6) and the replacement of signals (stage 7). Where a later stage's text is not here yet, it is not specified yet, and nothing in this file says how it will be.
+- **Implementation:** `ndn-heap`, module `chan` (`ndn-rs/crates/app/ndn-heap/src/chan/`): `wire.rs` (the records), `answer.rs` (the sender judges), `ask.rs` (the receiver asks and judges), `channels.rs` (the sender's table), `sessions.rs` (the receiver's store), `hub.rs` (the node's state, the announce, the maintenance task), `standing.rs` (membership, shared with signals). Stage 4 adds `route.rs` (the node's `Keep`, `Unsub`, gate and carrier over a connection to its forwarder) and `bar.rs` (the `IngressBar`); stage 5 adds `checkpoint.rs` (the record), `verify.rs` (the receiver's memory of accepted frames and its judgement), `evidence.rs` and `config.rs`, and its sender and receiver parts are in `tx.rs`, `queues.rs`, `rx.rs` and `items.rs`. The forwarder's side is in `ndn-packet`, `ndn-transport`, `ndn-engine`, `ndn-mgmt`, `ndn-face-local`, `ndn-app` and `ndn-face` (§14).
+- **Scope:** an ephemeral **channel**: one device of a writer of a space sends live data (presence, a cursor, a drag) to the devices of the space's readers and writers, without making an entry. This file specifies how a channel is **set up** between two devices by signed NDN: who is answered, how a key reaches only the devices that may hold it, how a session ends, is renewed and is re-keyed; the **frame** (§11) that carries the data once it is set up: the header, the key schedule and the seal, the messages, the limits and the short-frame rule for raw L2 faces; the **side table** (§14) with which a forwarder copies a frame to the faces of the receivers; and the signed **checkpoints** (§15) by which a receiver tells the frames the sender sealed from a key holder's. It builds on [heap.md](heap.md) (names §2, the members record §5, epochs and audiences §6, the lapsed rule §9.3) and uses ndn-link's carrier ([ndn-link.md](ndn-link.md)) for what comes after setup.
 
 The key words "MUST", "MUST NOT", "SHOULD" and "MAY" are as in BCP 14, in capitals only.
 
@@ -20,6 +20,10 @@ The key words "MUST", "MUST NOT", "SHOULD" and "MAY" are as in BCP 14, in capita
 | key holder | A device that holds a channel's key: the sender and every receiver it answered. |
 | standing | A key **stands** for a space when the person it belongs to is listed by the space's record in the role asked, the key's role is one that may act as an owner device, and the trust context that governs it does not revoke it and this node does not mark it suspected (§4.1). |
 | announce | An unsigned Interest a sender pushes into the space's sync group to say it has a channel. A hint, never a proof (§9). |
+| route | One path of a channel's frames through one forwarder: an id, one source face and one or more sink faces (§14). |
+| side table | A forwarder's table of routes. It copies each channel frame to the sinks of its route and knows nothing else of it (§14). |
+| checkpoint | A frame the sender signs: the hashes of the frames it sent in a range of sequences. It is how a receiver tells the sender's frames from a key holder's (§15). |
+| bar | A forwarder's refusal of the channel frames a face sends it, for a time, after a frame that came over that face was shown to be a forgery (§14.7). |
 
 ## 2. Names
 
@@ -38,7 +42,7 @@ The ask names the space, the path prefix the receiver wants (empty: everything),
 
 ### 3.2 The session
 
-The session is the Content of a Data of exactly the ask's name, signed by the sender's device key, `FreshnessPeriod` 0, carried in an NDNLPv2 packet with `CachePolicy = NoCache`: nothing of a channel's setup is cached. The Content is one `CHAN_SESSION` (§7), at most 8,000 octets. It names the channel id (8 octets, random from the system's CSPRNG), the sender and the space and the mode, the **key epoch**, the key's id (the first 8 octets of HKDF-SHA256 of `K` with info `ndn-channel/id/1`), the **wrapped key**, the AEAD (1 AES-256-GCM when the CPU has AES and carry-less multiplication, else 2 ChaCha20-Poly1305: every receiver supports both), the carriers on offer, the name table bound so far (at most 64 binds and 4 KiB), the checkpoint period, in `Window` mode the window, the lifetime in seconds counted **from receipt on the receiver's monotonic clock**, in a sealed space the audience epoch the sender judged the receiver by, the largest datagram frame, the next sequence the sender will use, and up to four certificates of the sender's chain (`S_CERT`).
+The session is the Content of a Data of exactly the ask's name, signed by the sender's device key, `FreshnessPeriod` 0, carried in an NDNLPv2 packet with `CachePolicy = NoCache`: nothing of a channel's setup is cached. A session (not a refusal) also carries the **`SideRoute` header** `(channel id, 30 s)` (§14.3), which is what makes every forwarder on its reverse path install a route for the channel's frames; it is not covered by the signature. The Content is one `CHAN_SESSION` (§7), at most 8,000 octets. It names the channel id (8 octets, random from the system's CSPRNG), the sender and the space and the mode, the **key epoch**, the key's id (the first 8 octets of HKDF-SHA256 of `K` with info `ndn-channel/id/1`), the **wrapped key**, the AEAD (1 AES-256-GCM when the CPU has AES and carry-less multiplication, else 2 ChaCha20-Poly1305: every receiver supports both), the carriers on offer, the name table bound so far (at most 64 binds and 4 KiB), the checkpoint period (0 when the sender sends no checkpoints, §15.3), in `Window` mode the window, the lifetime in seconds counted **from receipt on the receiver's monotonic clock**, in a sealed space the audience epoch the sender judged the receiver by, the largest datagram frame, the next sequence the sender will use, and up to four certificates of the sender's chain (`S_CERT`).
 
 - **The key.** `K` is 32 random octets from the CSPRNG per sender, per space, per mode, per session. It is never derived from a space's epoch key (a derivation would hand every member of an epoch every sender's key unasked, and a public space has no epoch key). The epoch decides the **audience** (who is judged in); it does not decide the key. The AEAD of a frame never uses `K` directly: it uses `HKDF-SHA256(K, "ndn-channel/frame/1" ‖ channel id ‖ key epoch)`.
 - **The wrap.** `S_WRAP` is the 32-octet ephemeral X25519 public key followed by the sealed key (`nonce (12) ‖ tag (16) ‖ ciphertext (32)`), made as a grant's key is ([heap.md](heap.md) §6.5): X25519 between the ephemeral key and the ask's recipient key, a key-encryption key `HKDF-SHA256(shared, info "ndn-security/confidentiality/x25519-kek/1" ‖ ephemeral ‖ recipient)`, and the AEAD of `K` under it with the **Name TLV of the answering Data as the AAD**. So the key opens only with the recipient's secret and only under that name.
@@ -85,16 +89,16 @@ The sender's channel table holds, per (space, mode), the channel's id, its key a
 A channel's life is bounded by five things, each a signed record or a local fact, never a timer alone:
 
 1. **The members record, and the trust generation.** The sender re-judges every receiver, offline, in one call, when the space's record changes or a trust context that revokes keys is adopted (both wake the node's maintenance task; it also looks every 250 ms): a receiver that no longer stands (its person left the record, or its key is revoked or suspected) or whose person left the audience of the epoch in force is **dropped**, and the channel is **re-keyed at once**. A channel whose audience epoch moved is re-keyed too. These are two causes, so removing a reader of a **sealed** space re-keys twice: once for the removal, and again when the owner's next epoch (which the removal owes) arrives and moves the audience. Between them the old epoch is no longer in force (a person it names is no longer a reader) and no audience can be judged: a receiver that still stands is kept, none is dropped for the want of an epoch, and the next ask is answered `NotReady`. Nothing re-keys without one of these causes. A sender that is no longer a writer ends its channels of the space. A receiver does the same for every sender it holds, against the writers of the record: a session caches the pair `(trust generation, the space's fold version)` it was judged under and exposes `is_current()` (two atomic loads); when either has moved the sender is judged again from what the node holds before another frame is delivered, and a sender that no longer stands as a writer ends the session with `NotMember` and the reason. A receiver whose own person left the space drops its sessions of it.
-2. **A grant** of a link ends the link and so the route (stage 4).
+2. **A grant** of a link ends the link, and its faces go down: every route over them goes with them (§14.6). A link that loses the identity that authorized channel frames and stays has its routes dropped by the forwarder ([ndn-link.md](ndn-link.md) §9 item 8).
 3. **The lifetime.** A session is **usable** until its lifetime and a 5 s grace passed since receipt, counted on the monotonic clock. A session past that is not used and is dropped.
 4. **The sender stops answering,** and ends the channel with a `CONTROL END` frame on the stream when it closes it (§13.11): a removed receiver's asks are Nacked; a stopped sender answers none.
-5. **The route's lifetime** (stage 4).
+5. **The route's lifetime.** A sink at a forwarder lapses 30 s after its last `Keep` (§14.6); a receiver that left or was removed stops sending them.
 
 **Renewal.** A receiver asks again at 75 % of the lifetime, with the same channel id; the answer carries the same `S_ID`, a new lifetime and, because a receiver that holds the current key and asks after half its lifetime renews, a **new key** (`S_KEY_EPOCH` + 1) unless the channel was re-keyed in the last 5 minutes. An ask sooner than that, from a receiver that holds an older key, or inside those 5 minutes, is given the key as it is. **No receiver can make the others ask again at will**: the asker names its lifetime, but one under a minute is raised to a minute (the renewal threshold is never under 30 s), and what an asker can cause by renewing or by vanishing is one re-key in 5 minutes; only a removal or revocation, which are signed records, re-key at once. A renewal that failed is tried again after 10 s.
 
 **Re-keying is pulled.** The sender re-keys at once when a receiver is removed or the trust generation moved, when the sealed space's epoch changed, and before the sequence passes 2^63; at a renewal and when a receiver's lease ran out it re-keys **at most once in 5 minutes** (`REKEY_MIN`): a renewal inside that time is given the key as it is, and the lapses of a stretch are one re-key, made when the 5 minutes have passed. It seals under the new key from the next frame and answers asks with it. A receiver that sees a frame under a key epoch it does not hold asks again, **at most once a second per sender**; the sender answers every asker it still judges in and Nacks the removed. **Nothing is pushed to a receiver**: nothing a removed member could be sent, nothing to forge.
 
-**The key before.** A receiver accepts the key before the current one for `REKEY_GRACE` (5 s) after the answer that gave it the new key epoch, so frames in flight are not lost. (A frame under a key the receiver does not hold is not authenticated, so it starts no grace: it would be a time anyone who can reach the device could choose.) A removed member's forgeries under the old key are bounded to that grace and then to the checkpoint window of stage 5.
+**The key before.** A receiver accepts the key before the current one for `REKEY_GRACE` (5 s) after the answer that gave it the new key epoch, so frames in flight are not lost. (A frame under a key the receiver does not hold is not authenticated, so it starts no grace: it would be a time anyone who can reach the device could choose.) A removed member's forgeries under the old key are bounded to that grace and then to the checkpoint window (§15.9).
 
 **After a removal** the removed member holds the old key and can read what was sealed under it; it cannot open anything sealed after the re-key.
 
@@ -172,7 +176,7 @@ The setup's TLV-TYPEs are the block **0x0660–0x06BF**, registered to this file
 | 0x0685 | `S_CARRIER` | repeatable: a kind octet, then its parameters |
 | 0x0687 | `S_TABLE` | `S_BIND`*, at most 64 binds and 4 KiB (the rest follow on the stream) |
 | 0x0689 | `S_BIND` | `B_ID`, `B_NAME` |
-| 0x068B | `S_CKPT_MS` | checkpoint period in ms |
+| 0x068B | `S_CKPT_MS` | checkpoint period in ms, 1 to 2,000 (a receiver holds it there); 0: this sender sends no checkpoints on the channel (its carrier has no stream) and a receiver waits for none (§15) |
 | 0x068D | `S_WINDOW` | `Window` mode: `W_MESSAGES`, `W_BYTES`, `W_MS` |
 | 0x068F | `S_LIFETIME` | seconds, from receipt, on the receiver's monotonic clock; 60 to 86,400 (a session that names another is refused) |
 | 0x0691 | `S_AUDIENCE_EPOCH` | an EpochId (sealed spaces) |
@@ -248,7 +252,7 @@ The sync driver never sees an announce: the sync face's reader takes a name of t
 
 A channel frame is **not an NDN packet and not TLV**: it is a compact binary record, because it is on the hot path and a relay routes on its first ten octets. It travels as a *side frame* on a face that carries one ([ndn-link.md](ndn-link.md) §3.1; the face's `send_side`; a face carries side frames only if it opts in, by a `side_frame_max()` above its default of 0, so a face that frames, decodes or codes what it sends refuses every frame `NotCarried`, and a frame that does not start with the marker is refused `Malformed` by every face), is marked by a first octet of `0x00` (TLV-TYPE 0 is not assigned: no Interest, Data, Nack or NDNLPv2 packet starts with it), and is never fragmented, retransmitted or judged by the link service.
 
-Implementation: the routing header and the `UP` record are in `ndn-transport` (`side_header.rs`); the rest of the header, the seal, the messages and the limits are in `ndn-heap` `chan` (`frame.rs`, `aead.rs`, `message.rs`, `varint.rs`, `limits.rs`, and, for the checkpoint hash ring, `ring.rs`).
+Implementation: the routing header and the `UP` record are in `ndn-transport` (`side_header.rs`); the rest of the header, the seal, the messages and the limits are in `ndn-heap` `chan` (`frame.rs`, `aead.rs`, `message.rs`, `varint.rs`, `limits.rs`, and, for the checkpoint hash ring, `ring.rs`). The forwarder's table that routes the frames is §14.
 
 ### 11.1 The header
 
@@ -334,9 +338,9 @@ flags:  bit 0 NAMED    the full name rides here (the id is bound by this message
 ### 11.5 Kinds
 
 - **`DATA` (0):** messages. On the datagram class for `Latest` messages that fit, on the stream otherwise.
-- **`CHECKPOINT` (1):** a signed checkpoint of the frames sent. Always on the stream. Its record is specified with checkpoints (stage 5); the sender records every frame it sends (`ring.rs`: the frame's own `Bytes`, a reference and no copy, kept for at most 4,096 frames **and 4 MiB** per channel, the oldest forgotten and counted) and the hash a checkpoint signs, the first 16 octets of SHA-256 for a frame of at most 2,048 octets and of BLAKE3 above, is **computed when the ring is drained** for a checkpoint, not when the frame is sent.
+- **`CHECKPOINT` (1):** a signed checkpoint of the frames sent (§15). Always on the stream. Its record is §15.2. The sender records every frame it sends except a `CHECKPOINT` frame (`ring.rs`: the frame's own `Bytes`, a reference and no copy, kept for at most 4,096 frames **and 4 MiB** per channel, the oldest forgotten and counted) and the hash a checkpoint lists, the first 16 octets of SHA-256 for a frame of at most 2,048 octets and of BLAKE3 above, is **computed when the ring is drained** for a checkpoint, not when the frame is sent.
 - **`CONTROL` (2):** always on the stream. The plaintext is `op (1) | …`: 1 `BIND` (id, name), 2 `UNBIND` (id), 3 `HELLO` (the first frame after a session starts: the sender's current sequence), 4 `END`, 5 `STANDING_BEGIN`, 6 `STANDING_END`. It takes one sequence.
-- **`UP` (4):** the unsealed 11-octet record `0x00 | 0x24 | id (8) | op (1)`, `op` 1 `Keep` or 2 `Unsub`, then zero octets to 46 (§11.3). It is accepted only from a face that is a sink of the route and changes nothing but that face's own entry.
+- **`UP` (4):** the unsealed 11-octet record `0x00 | 0x24 | id (8) | op (1)`, `op` 1 `Keep` or 2 `Unsub`, then zero octets to 46 (§11.3). It is accepted only from a face that is a sink of the route and changes nothing but that face's own entry (§14.5).
 
 ### 11.6 Limits
 
@@ -396,7 +400,7 @@ Nonce `02000000 1122334455667788`. Frame, 57 octets:
 003001020304050607080211223344556677880119081eeb7cc1449f10937cd4a971a420bf82233f87e8846faf36
 ```
 
-**4. `CHECKPOINT` on a stream, AES-256-GCM,** a 30-octet plaintext `01 02 … 1e` (a stand-in: the record is specified with checkpoints), `count` 0:
+**4. `CHECKPOINT` on a stream, AES-256-GCM,** a 30-octet plaintext `01 02 … 1e` (a stand-in for the framing: the record of a checkpoint is §15.2, and §15.12 has a frame with a real record), `count` 0:
 
 ```
 00310102030405060708021122334455667788007b727c23d0cbf536d620c4a3215bb2f7e24027e5d13ac14f1f042a165ae413a2371eb6c94c4f120297429b26ee95
@@ -429,7 +433,7 @@ Nonce `02000000 1122334455667788`. Frame, 57 octets:
 
 What a device does with the frames of the sessions it holds as a receiver (§3.4), from the octets the host read to the `Items` of a `live` call (§12.7). Implementation: `ndn-heap`, `chan` (`rx.rs` the frame path, `replay.rs`, `rx_names.rs`, `latest.rs` and `fifo.rs` the queues, `items.rs`).
 
-The host hands the node one whole frame at a time (a datagram, or one frame of the stream) with an opaque id of the face it came over (`NodeHandle::deliver_frame(frame, ingress)`; the id is kept for the evidence of checkpoints, stage 5). Frames of one channel are taken one at a time and in the order they were handed over; frames of different channels do not wait for each other. No timer task runs for the receiver: what must expire is swept by the next frame of the channel, by a poll of an `Items`, and by the node's maintenance pass.
+The host hands the node one whole frame at a time (a datagram, or one frame of the stream) with an opaque id of the face it came over (`NodeHandle::deliver_frame(frame, ingress)`; with a forwarder (§14.10) it is the forwarder's own id of the face, which decides what the early-frame hold shares between (§12.8) and is the face the evidence of a checkpoint names and the node bars (§15.5)). Frames of one channel are taken one at a time and in the order they were handed over; frames of different channels do not wait for each other. No timer task runs for the receiver: what must expire is swept by the next frame of the channel, by a poll of an `Items`, and by the node's maintenance pass.
 
 ### 12.1 What is checked, in this order
 
@@ -463,7 +467,7 @@ Each channel has a window of the last **4,096 frame sequences** and a bitmap bes
 
 - **Check before the AEAD.** A `seq0` the bitmap has set is `replayed`; one at least 4,096 below the highest is `too_old` (the window cannot say whether it was seen). Both are dropped before any cryptography: a flood of copies of a genuine frame costs a comparison each.
 - **Mark after the AEAD.** `seq0` is marked only once a frame of that sequence **authenticated**. A forged copy of a genuine frame (the same header, an octet of the body changed) fails the AEAD, marks nothing and so cannot burn the genuine `seq0`. A genuine frame that arrives after a forged copy is delivered.
-- **A bound on the jump.** After the AEAD and before the mark, a frame whose `seq0` is more than **2^24** (16,777,216) above the higher of the window's highest `seq0` and the session's `S_SEQ` as the sender last answered is refused (`too_far`, `Dropped::TooFar`), marks nothing, and makes the receiver ask the sender again (at most once a second per sender, the limit of §12.3's key epoch asks); the answer moves `S_SEQ`, so a receiver that was cut off for more than 2^24 sequences takes the next frame instead of being stuck until its session ends. Before any frame is marked the reference is `S_SEQ`: the first frame of a session is above it by what the sender sent while the ask and the install went by. Restart and renewal need no exception: a restart is a new channel id and a new window; a re-key keeps the channel's sequences; a `Window` replay takes new sequences at the sender's counter, and so does `HELLO`. **Why:** a holder of the key can seal any `seq0` below 2^63, and a window that marked one would make every genuine frame after it `too_old`; with the bound one forged frame wedges the channel for at most 2^24 sequences. In `Latest` the per-name comparison (§12.6) inherits the bound: a message's sequence is its frame's `seq0` plus its index, and a `STANDING` or `REPLAYED` message's original sequence is below its own (§11.4), so no message carries a sequence above its frame's. **Residual (until stage 5):** a key holder can still forge a frame within the bound, and again each time the genuine sequence has caught up, so it can keep a channel wedged; checkpoints detect forged frames but do not repair the window.
+- **A bound on the jump.** After the AEAD and before the mark, a frame whose `seq0` is more than **2^24** (16,777,216) above the higher of the window's highest `seq0` and the session's `S_SEQ` as the sender last answered is refused (`too_far`, `Dropped::TooFar`), marks nothing, and makes the receiver ask the sender again (at most once a second per sender, the limit of §12.3's key epoch asks); the answer moves `S_SEQ`, so a receiver that was cut off for more than 2^24 sequences takes the next frame instead of being stuck until its session ends. Before any frame is marked the reference is `S_SEQ`: the first frame of a session is above it by what the sender sent while the ask and the install went by. Restart and renewal need no exception: a restart is a new channel id and a new window; a re-key keeps the channel's sequences; a `Window` replay takes new sequences at the sender's counter, and so does `HELLO`. **Why:** a holder of the key can seal any `seq0` below 2^63, and a window that marked one would make every genuine frame after it `too_old`; with the bound one forged frame wedges the channel for at most 2^24 sequences. In `Latest` the per-name comparison (§12.6) inherits the bound: a message's sequence is its frame's `seq0` plus its index, and a `STANDING` or `REPLAYED` message's original sequence is below its own (§11.4), so no message carries a sequence above its frame's. **Residual:** a key holder can still forge a frame within the bound, and again each time the genuine sequence has caught up, so it can keep a channel wedged; checkpoints (§15) expose such a frame once the sender's range reaches its sequence (§13.12 item 3), but do not repair the window.
 - **Within a frame** the messages are numbered `seq0` + index (§11.4); the window is not asked about them.
 - **Across sessions** a replayed frame fails the AEAD: a key is fresh for every session and every re-key (§11.2).
 - No clock is read.
@@ -484,8 +488,8 @@ Each channel has a table from name id to name, filled by the session's table (§
 
 ### 12.5 `HELLO`, `END` and standing values
 
-- **`HELLO`** records the sequence the sender says its next message takes, and tells every `Items` that takes the channel that **the path works** (`Items::hello_seen`); stage 6's `NoPath` rule reads it. In `Reliable` and `Window` it is also where the receiver's stream begins (§12.6).
-- **`END`** ends the session (`Closed`): the `Items` are told once what they hold has been read, and later frames find no session (a stream frame is held for 2 s like any frame of an unknown channel, §12.1, and then dropped; a datagram is dropped). A sender sends one when it closes a channel (§13.11).
+- **`HELLO`** records the sequence the sender says its next message takes, and tells every `Items` that takes the channel that **the path works** (`Items::hello_seen`); the `NoPath` rule reads it (§14.10). In `Reliable` and `Window` it is also where the receiver's stream begins (§12.6).
+- **`END`** ends the session (`Closed`): the `Items` are told once what they hold has been read, and later frames find no session (a stream frame is held for 2 s like any frame of an unknown channel, §12.1, and then dropped; a datagram is dropped). A sender sends one when it closes a channel (§13.11). On a channel that announces checkpoints (§15) the session ends only once a verified checkpoint lists the `END` (§15.6).
 - **Standing values.** The messages between `STANDING_BEGIN` and `STANDING_END` carry the `STANDING` flag and the original sequence (§11.4). Each is delivered as an emission whose `seq` is the **original** sequence and whose `stands` is its stand seconds (what is left of the stated lifetime). A `STANDING` message outside the bracket is dropped (`standing_stray`). In `Latest` the original sequence is also what a message is compared by (§12.6): a standing value older than a live message of its name is not delivered.
 
 ### 12.6 Modes at the receiver
@@ -507,12 +511,12 @@ Each channel has a table from name id to name, filled by the session's table (§
 
 ### 12.7 `Items`
 
-`Heap::live(Select, GetOptions)` returns an `Items`, a `Stream` of `Result<Got, GetNotice>` (`GetOptions::kept`, `trust` and the kept values are stage 5 and 6; `live` refuses `Live::Off` and `Trust::Verified`, and a follower).
+`Heap::live(Select, GetOptions)` returns an `Items`, a `Stream` of `Result<Got, GetNotice>` (`GetOptions::kept` and the kept values are stage 6; `trust` is `Trust::Prompt` or `Trust::Verified` (§15.8); `live` refuses `Live::Off` and a follower).
 
 - **Creating it does no I/O.** It takes every message of every session of the space this device holds, in the modes it joined (`Modes`), whose path matches `Select::Path` (exactly) or `Select::Prefix`. While it exists, this device is *listening* to the space (§9): announces of writers' channels make it ask. Asking a sender for a session is the caller's (`NodeHandle::ask_channel_in`) until the verbs of stage 6 do it.
 - **`Got`** carries the path (relative to the space), the payload (a slice of the opened frame when the frame is at most 9,000 octets or the payload is most of it, a copy of its own otherwise: §12.6), the writer's person and device, and `Kind::Emitted { seq, stands }`.
 - **Order.** Within a channel as §12.6. Across channels, the order messages were queued in.
-- **Notices.** `Lagged { missed }` as above. `LiveEnded(Ended { writer, reason })` when a session ends (`NotMember` when the sender no longer stands, `Closed` for an `END`, `Lapsed`, `Left`), told **after** the messages queued before it; a session replaced by a newer one of the same sender and mode is not told, since the `Items` simply goes on with the new one. `Retracted` is raised by checkpoints (stage 5).
+- **Notices.** `Lagged { missed }` as above. `LiveEnded(Ended { writer, reason })` when a session ends (`NotMember` when the sender no longer stands, `Closed` for an `END` (once a checkpoint lists it, §15.6), `Lapsed`, `Left`, `BadCheckpoint` and `Unverifiable` (§15.6, §15.7)), told **after** the messages queued before it; a session replaced by a newer one of the same sender and mode is not told, since the `Items` simply goes on with the new one. `LiveEnded(NoPath { why })` when no `HELLO` came within 2 s of the session's install (§14.10). `Retracted { writer, from, to }` is raised by checkpoints (§15.5).
 - **`next_batch(&mut Vec<Got>) -> usize`** moves everything queued that is an item into the buffer, under one lock, with no wake per item and no allocation when the buffer has room; it stops before a notice (the next `next()` yields it) and never waits.
 - **Back pressure** (§12.6) is applied by the receiver before it takes a stream frame, so it reaches the sender through the stream's flow control. An `Items` that is never read stalls the stream of a `Reliable` or `Window` channel with `Block`; dropping it frees the stream.
 - **Dropping an `Items`** cancels its sink: nothing more is queued for it. The stream ends when the node stops.
@@ -531,9 +535,15 @@ Each channel has a table from name id to name, filled by the session's table (§
 | `Reliable`/`Window` queue | 1 MiB charged per `Items` (what a message pins + 64 octets, §12.6) | back pressure, or the oldest dropped and `Lagged` |
 | Delivered original sequences kept for `REPLAYED` | 64 ranges per channel | the two oldest joined |
 | `Window` re-asks | once a second per channel, one in flight | the gap stands as `Lagged` until the next |
+| Accepted frames kept for checkpoints | 4,096 frames, 2 MiB a channel, 8 MiB a node (§15.4) | the lowest `seq0` is forgotten and counted `unchecked` |
+| Frames held for a lane (silence, `Verified`) | 4,096 frames and 2 MiB a channel, within the node's 8 MiB (§15.7) | the oldest is dropped, `held_dropped`, `Lagged` |
+| A second authentic frame at one sequence | 3 AEAD attempts a sequence, 64 kept a channel (§15.6) | compared only |
+| Silence | frames held after `max(4 × period, 100 ms)` with no verified checkpoint; the session ends at 3 s (§15.7) | `held`; `Unverifiable` |
 | Cost of a frame | one allocation for a frame of at most 9,000 octets, whatever its message count, none per message; a message of a larger frame costs one (its copy) unless it is most of the frame; `next_batch` none | |
 
 The counters (each a `u64`, in `Stats.rx`): `frames`, `short`, `marker`, `version`, `kind`, `truncated`, `count`, `sequence`, `oversize`, `unknown_channel`, `held_unknown_full`, `held_unknown_evicted`, `held_unknown_expired`, `wrong_class`, `not_member`, `unknown_epoch`, `epoch_limited`, `epoch_asks`, `replayed`, `too_old`, `too_far`, `aead_attempts`, `unauthentic`, `malformed`, `accepted`, `messages`, `unknown_name`, `name_held`, `hold_full`, `bad_bind`, `standing_stray`, `duplicates`, `gaps`, `reasks`, `controls`, `hellos`, `checkpoints`, `no_sink`, `ended`. `epoch_asks` and `epoch_limited` count the asks made, and the asks held back by the one-a-second limit, for a frame under an unknown key epoch and for a frame far ahead (`too_far`).
+
+The counters of checkpoints (stage 5) are `checkpoints` (every `CHECKPOINT` frame taken, above), `checkpoints_verified`, `unverifiable_checkpoints`, `bad_checkpoints`, `mismatches`, `conflicts`, `unchecked`, `held`, `held_dropped`, `resets` and `unverifiable` (§15.10).
 
 ### 12.9 Threat notes for the receiver
 
@@ -542,7 +552,7 @@ The counters (each a `u64`, in `Stats.rx`): `frames`, `short`, `marker`, `versio
 - **A forged copy of a genuine `seq0`** is the same: refused by the tag, marks nothing.
 - **A held-back bare id cannot grow memory.** At most 64 messages per channel are held, for 50 ms; the 65th is dropped at once; the number of channels is bounded by the sessions (§6).
 - **A flood of frames of unknown channel ids cannot grow memory, and cannot crowd out another face's early frames.** Each costs the header checks, one lookup and, if the hold has room, one copy of the frame (a stream frame; a datagram is dropped before any copy): at most **16 frames and 2 MiB from one face** and **64 frames and 4 MiB in all**, **2 s each**, whatever the number of ids. A frame that does not fit its face's share is dropped at once (`held_unknown_full`), so what a face sent first stays; a frame of a face that holds less than the face holding the most pushes that face's oldest frame out (`held_unknown_evicted`); one nobody claimed in 2 s is dropped when the next frame, an install, an `Items` poll or the node's maintenance pass sweeps (`held_unknown_expired`). The 64 frames are four faces' full shares, so a fifth face still gets room by eviction, and a frame of the stream grant (1 MiB) can be held. The share is per `ingress` id the host gives (§12). A held frame is **not decrypted and decides nothing**: no key is tried, no sequence marked, no session or channel made. It is a copy of the bytes, not a slice of the host's read buffer, so a held frame pins nothing of the host's.
-- **A key holder** can seal frames the receiver accepts (§11.8): it can send a `BIND` that renames an id, a `STANDING` bracket, an `END`, a gap, a `HELLO`. Each is bounded as above (the table has 4,096 ids, the hold 64 messages, the delivered ranges 64) and none changes who the sender is: attributing frames to the sender's device is the work of signed checkpoints (stage 5). A holder cannot make the replay window jump more than 2^24 sequences with one frame (§12.2), but within that bound it can still wedge the channel (a residual until stage 5).
+- **A key holder** can seal frames the receiver accepts (§11.8): it can send a `BIND` that renames an id, a `STANDING` bracket, an `END`, a gap, a `HELLO`. Each is bounded as above (the table has 4,096 ids, the hold 64 messages, the delivered ranges 64) and none changes who the sender is. Attributing frames to the sender's device is the work of signed checkpoints (§15): a frame a holder made is exposed by the next checkpoint that covers it, and an `END` ends nothing until one lists it. A holder cannot make the replay window jump more than 2^24 sequences with one frame (§12.2), but within that bound it can still mute a name in `Latest` until a checkpoint reaches the sequence (§13.12 item 3).
 - **A removed sender** is refused at the first frame after this device holds the removing record (§12.3). Frames it sealed before the record arrived were delivered; frames sealed with the old key by a holder after the re-key fail the AEAD.
 - **A slow consumer** cannot make memory grow without bound: 4,096 names and 1 MiB charged (plus the frame in hand), per `Items`. With `Block` it stalls the stream of a `Reliable` or `Window` channel (the sender is told by flow control); with `Drop`, or in `Latest`, it is told it lagged.
 - **Clocks.** No decision about who is a member or what is genuine rests on a clock. The 50 ms hold, the 2 s hold of frames of a channel with no session and the one-second limits are counted on the receiver's monotonic clock and decide only what is kept for a moment and how often a sender is asked.
@@ -582,7 +592,7 @@ No timer decides when a frame leaves. A channel has two **lanes**, the datagram 
 6. **An oversize `Latest` message** (it fits no datagram frame) goes on the stream, in a frame of its own run (of as many consecutive messages as fit the smaller of 1 MiB and `stream_frame_max()`); until the stream took it a newer message of its name replaces it, and an oversize message replaces an unsent small one. On a path with no stream it is refused `TooLarge`; so is a message whose frame fits no frame the stream takes.
 7. **A frame the path's size fell under** (`try_send_datagram` says `TooLarge { max }`) is re-packed once at `max` with **new sequences** (counted `resized`); if that frame falls again, its messages go to the stream (counted `resized`). A message that was replaced meanwhile is not re-sent.
 8. **The stream lane** is written by a task of the node (a stream frame may wait on flow control, which an emitter cannot be cancelled in): one frame at a time, in the order of the sequences, a run of data messages up to 1 MiB (or the carrier's `stream_frame_max()` when smaller) and 255 messages, or one control frame. `Block` waits for **queue room**, not for the stream.
-9. **The ring.** Every frame sent, on either lane, is recorded in the ring of sent frames (`ring.rs`) as a reference to the frame, and **nothing is hashed on the writer's path**: the hash is computed when the ring is drained (stage 5: a checkpoint reads it; `SentFrames::drain` is the whole interface, and the hash definition is `frame_hash`, unchanged). The ring keeps the frames alive, so it is bounded in octets as well as frames (4,096 and 4 MiB per channel: 4,096 frames of up to 1 KiB, fewer of larger ones), **and the octets are resident memory**: a frame is built in a buffer sized for what was pending, and a frame that used less of it than the buffer has to spare (more than a quarter and 64 octets) is copied to an allocation of its own size when it is sealed, at the cost of one more allocation, so the ring never keeps a buffer much larger than the frame in it. A frame pushed out by either bound is forgotten and counted (`forgotten`), which a checkpoint reports as frames it no longer covers. Measured: the hash was a sixth of the writer thread at 1 KiB and 8 KiB; taking it off the path raised throughput 1.16 and 1.18 times (SHAPES-CHANNEL.md 18.x).
+9. **The ring.** Every frame sent, on either lane, is recorded in the ring of sent frames (`ring.rs`) as a reference to the frame, and **nothing is hashed on the writer's path**: the hash is computed when the ring is drained (a checkpoint reads it, §15.3: `SentFrames::take_below` hands it the frames to hash, and the hash definition is `frame_hash`, unchanged). The ring keeps the frames alive, so it is bounded in octets as well as frames (4,096 and 4 MiB per channel: 4,096 frames of up to 1 KiB, fewer of larger ones), **and the octets are resident memory**: a frame is built in a buffer sized for what was pending, and a frame that used less of it than the buffer has to spare (more than a quarter and 64 octets) is copied to an allocation of its own size when it is sealed, at the cost of one more allocation, so the ring never keeps a buffer much larger than the frame in it. A frame pushed out by either bound is forgotten and counted (`forgotten`), and the next checkpoint's range begins past it (§15.3). A `CHECKPOINT` frame is not recorded. Measured: the hash was a sixth of the writer thread at 1 KiB and 8 KiB; taking it off the path raised throughput 1.16 and 1.18 times (SHAPES-CHANNEL.md 18.x).
 
 Cost (measured by `the_64_byte_latest_path_allocates_nothing_per_message_beyond_the_frame`): an idle 64-octet `Latest` message allocates **exactly 2** (its frame's buffer and the shared header `Bytes` freezing adds); 14 messages queued while the carrier is full allocate **0**, and the one frame that carries them **2** in all.
 
@@ -628,11 +638,11 @@ When the sender admits an ask (§3.3 step 11) the session carries the sender's *
 4. `STANDING_BEGIN`; each standing value as a message with the `STANDING` flag, the **original sequence**, its name **inline** (`NAMED`) and `stand seconds` = **what is left** of the lifetime (whole seconds, rounded up; a value with none left is not sent); `STANDING_END`;
 5. in `Window` mode, the window from `ASK_SINCE` (the whole window when the ask names none) as messages with the `REPLAYED` flag, the original sequence and the name inline.
 
-A receiver that is not new and asks with `ASK_SINCE` in `Window` mode is given only step 5, and only if the sender has not replayed such an ask **within the last second on this channel** and the stream's queue has room for the replay under 1 MiB (`queue_bytes`, counting what already waits); otherwise the ask is answered with the session and **no replay** (`replay_refused`; a debug log says which limit), the session's `S_SEQ` tells the receiver the window was not replayed, and its gap stands as `Lagged` until its next ask. A receiver that is new is replayed once whatever the queue holds (§13.10). The frames are queued when the session is built, before the session Data is signed: they may reach the carrier before the receiver has installed the session. The receiver **holds** such frames (§12.1, the hold of frames of a channel with no session) and takes them in, in the order they arrived, when it installs the session, so a `Window` joiner loses neither the `HELLO`, nor the standing values, nor the replay; with fan-out (stage 4) the frames follow the session over the route the ask installed.
+A receiver that is not new and asks with `ASK_SINCE` in `Window` mode is given only step 5, and only if the sender has not replayed such an ask **within the last second on this channel** and the stream's queue has room for the replay under 1 MiB (`queue_bytes`, counting what already waits); otherwise the ask is answered with the session and **no replay** (`replay_refused`; a debug log says which limit), the session's `S_SEQ` tells the receiver the window was not replayed, and its gap stands as `Lagged` until its next ask. A receiver that is new is replayed once whatever the queue holds (§13.10). The frames are queued when the session is built, before the session Data is signed: they may reach the carrier before the receiver has installed the session. The receiver **holds** such frames (§12.1, the hold of frames of a channel with no session) and takes them in, in the order they arrived, when it installs the session, so a `Window` joiner loses neither the `HELLO`, nor the standing values, nor the replay; with the side table (§14) the frames follow the session over the route its Data installed, and a carrier that gates its stream on a route waits for the new receiver's `Keep` before it sends them (§14.10).
 
 ### 13.8 The carrier a face must provide
 
-`ndn-heap` cannot depend on the faces, so the host gives the node a `Carrier` (`NodeHandle::attach_carrier`; until the forwarder's side table routes frames (stage 4) a node has one fixed route, and every frame of every channel goes to it). A carrier MUST:
+`ndn-heap` cannot depend on the faces, so the host gives the node a `Carrier`: `NodeHandle::attach_carrier` for one of its own (one fixed route: every frame of every channel goes to it), or `NodeHandle::attach_forwarder` over a connection to a forwarder, whose side table routes the frames by channel id (§14.10). A carrier MUST:
 
 - `datagram_max()`: the largest datagram frame the path takes **now** (it follows path MTU discovery; the sender reads it for every frame); 0 if there is no datagram class.
 - `has_stream()`: whether it has an ordered, reliable stream.
@@ -640,6 +650,7 @@ A receiver that is not new and asks with `ASK_SINCE` in `Window` mode is given o
 - `try_send_datagram(frame)`: never block. Take the frame, or refuse it: `Full` when the headroom rule says so; `TooLarge { max }` when the path no longer takes a frame this size; `Closed` when the link is gone.
 - `send_stream(frame)`: take a whole frame onto the stream, in the order of the calls, and complete when the stream took it (it waits for flow control). The sender calls it again only after the last call completed and never drops a future in progress, so a frame is written whole or not at all.
 - `on_ready(drain)`: call `drain` **once, from the carrier's own writer task, when `try_send_datagram` would take a frame again** (the next time that task runs if it already would; not from inside `on_ready`). `drain` sends what waits, never blocks, and may call `try_send_datagram` and `on_ready`. The sender asks for it after a refusal, and after an inline write that follows another within `BURST_GAP` (§13.2 item 3; an isolated message asks for nothing), so **a carrier that never calls it stalls the channel**: the emissions after the first two of a burst wait for it. A call on one that is not the attached carrier any more is not waited for.
+- `receiver_added(channel)` (defaulted, does nothing): called when a receiver is judged in as new and the stream frames that follow its session are queued (§13.7). A carrier that gates its stream on a route (§14.10) uses it.
 
 A carrier that meets this is all the sender needs: no timer, no task of its own, no knowledge of channels.
 
@@ -657,6 +668,9 @@ A carrier that meets this is all the sender needs: no timer, no task of its own,
 | Window replay to a receiver that is not new (`ASK_SINCE`) | once a second per channel, and only while the queue's 1 MiB has room for it | no replay, `replay_refused` |
 | Sequence | below 2^62 | `SequenceExhausted`: the channel ends |
 | `Congested` retry | 100 ms | |
+| Checkpoint period | 20 ms by default; 1 ms to 2 s (§15.9) | held to the nearest bound |
+| Frames the checkpoint ring keeps to be listed | 4,096 frames and 4 MiB a channel | the oldest is forgotten, counted `unchecked` (§15.3) |
+| Idle checkpoint | one empty checkpoint every 5 s while a receiver holds the channel (§15.3) | |
 
 ### 13.10 Threat notes for the sender
 
@@ -677,32 +691,427 @@ A channel ends when its sender closes it, and the sender then **seals and sends 
 - **Best effort, never blocking.** The frame is written by the stream's writer task; the call that closes the channel returns at once. `Node::close` first ends every channel of the node and waits for the frames to be written for at most 500 ms, so a stream that takes nothing does not hold the node's close, and then stops every task (`close` returns once each has ended, heap.md §4.5 rule 5); `Node::shutdown` stops at once and sends no `END`.
 - **When no `END` goes.** No receiver holds the channel (`Live::receivers` is 0), the carrier has no stream, no carrier is attached, the key is of another channel, or the sequence space is spent: the channel is over all the same, and a receiver learns it as it always did, by its asks being Nacked and its session's lifetime (§3.6).
 - **Once.** A second close of the same channel sends nothing more; after it the sender takes no emission (`emit` makes the next channel: a new id and a new key).
-- **What `END` is worth.** It is sealed under the channel's key, which every receiver holds, so any receiver, and any holder of the key, can seal one (§12.9): it ends a session at the receiver, which can ask again. It decides nothing about who is a member.
+- **What `END` is worth.** It is sealed under the channel's key, which every receiver holds, so any receiver, and any holder of the key, can seal one (§12.9). On a channel that announces checkpoints (§15) the receiver ends the session only when a verified checkpoint of the sender lists the `END` (§15.6), and the sender queues one right after its own (§15.3), so a forged `END` ends nothing. It decides nothing about who is a member.
 
-### 13.12 Accepted residuals before checkpoints (stage 5)
+### 13.12 Accepted residuals (after stages 4 and 5)
 
-Until the checkpoints of stage 5 exist, one thing is **not** guaranteed: that a frame that opens under a channel's key was sealed by the channel's sender. Every receiver holds the key, so what a holder can do to the channel of **another member** is the following. A holder is any receiver the sender admitted (readers included) and a removed member until the re-key; the review that found this is recorded in the commit history of this section. Each item is expected, bounded as stated, and ends at stage 5 (which authenticates the sender by the signed checkpoint) or at stage 4 (which binds a frame to the face it arrived on).
+Before stages 4 and 5 a frame that opened under a channel's key was not known to be the sender's: every receiver holds the key. Stage 5 authenticates the sender by its signed checkpoints (§15) and stage 4 binds a frame to the face it arrived on (§14.4); §15.11 says what they closed of the earlier list. **A frame that opens is still the work of a holder** until a checkpoint covers it. A holder is any receiver the sender admitted (readers included) and a removed member until the re-key. Each item is expected and bounded as stated.
 
-1. **Forge.** Seal any `DATA` or `CONTROL` frame under the key. Every receiver the frame reaches accepts it, attributed to the sender. A reader of a sealed space can thereby write live data to the other receivers, which `heap.md` does not allow it to write in the space.
-2. **Re-seal old content.** An exact repeat is dropped by the replay window. A holder can seal captured plaintext again under a new `seq0` within 2^24 above what the receiver has seen (§12.2), which delivers old content as newer; in `Latest` a forged sequence on a name within that bound mutes that name's genuine messages until the record is forgotten. Past the bound the frame is refused (`TooFar`), so no frame can make later genuine frames `TooOld`.
-3. **End the session.** A forged `END` closes the session at every receiver it reaches; the receiver can ask again (§13.11), and does not do so by itself.
-4. **Truncate and withhold.** A holder or relay on the route can drop frames: a gap in `Reliable` and `Window`, invisible in `Latest`. A holder racing the genuine frame can deliver its own at the same `seq0`.
-5. **Rename.** A forged `BIND`, `NAMED` message or `UNBIND` rebinds ids, up to 4,096 names a channel; forged `HELLO` and standing brackets are bounded as in §12.9.
-6. **No ingress binding.** `deliver_frame` takes the ingress as an opaque number the host chooses; it decides what the early-frame hold shares between (§12.8), and nothing else. Until stage 4 any face on the host can inject frames, and a host that gives every face one number has one share for all of them; a peer that opens many faces holds many shares and the node's 4 MiB is then the only bound.
-7. **The early-frame hold.** A `Window` joiner's early replay or standing frames beyond one face's share (16 frames or 2 MiB) are lost, and the stream cannot ask for them again.
-8. **Stale grace.** A removed member keeps the old key, and with it the read of what was sealed under it, for the 5 s of grace counted from the answer that gave the others the new key (§3.6).
-9. **Retained memory.** A key holder can keep 4,096 payloads of up to 9,000 octets alive in a `Latest` queue (about 36 MiB) by sending small messages in frames of that size: the queue is charged what each message pins (§12.6), and a frame over 9,000 octets is copied out first.
-10. **A restart empties the ask replay guard.** An ask captured in the 240 s before a sender's restart can be replayed once after it (§3.3 step 5). It yields a session wrapped to the asker's own key and a receiver entry for the ask's lifetime, nothing readable to the replayer.
-11. **Announce.** It is a hint: a device is asked only if the space's record holds an entry of it (§9), so a writer's device that has never written is asked by name, not by hint.
-12. **Fair share is per link, not per person** (`ndn-link.md` §9): a grantee with N links holds N shares, and the floors of more than `capacity / floor` active links add up to more than the capacity. The link layer has a device and no person at the quota.
-13. **The first congestion window is 4 × `path_mtu_max`.** A connection's first congestion window is `max(14,720, 4 × path_mtu_max)` octets, 36,000 at the default 9,000, which exceeds RFC 9002 §7.2 on a real 1,452-octet path (about 25 packets in the first round trip). It is there because quinn gates a `CONNECTION_CLOSE` that has ack-eliciting data pending by the congestion window and an MTU probe in flight uses the window, so a refusal sent right after the handshake needs room (without it the refused peer read a stateless reset, not the reason, about one run in two). It is bounded: before the path is validated the server sends at most three times what it received; quinn paces at window over round trip; after a loss or timeout the window collapses to the minimum; a connection that carries nothing holds none of it. The 4× margin for other data in flight is not measured, so it was not narrowed.
-14. **Stage 4 reminders.** `deliver_frame` waits for room in the caller's task before the frame is authenticated, so a relay must not call it from a face reader without its own bound; relays check the source face and the quota.
+1. **Delivery before a checkpoint.** A frame a holder forged is delivered to a `Prompt` receiver for at most the stated window `W` (§15.9) and is then exposed (§15.5). A reader of a sealed space can thereby write live data to the other receivers for that long, which `heap.md` does not allow it to write in the space. The same holds for old content sealed again under a new `seq0`, for a forged `BIND`, `NAMED` message or `UNBIND` (read until the checkpoint retracts it; up to 4,096 names a channel) and for forged `HELLO` and standing brackets (§12.9). `Trust::Verified` delivers none of them.
+2. **Frames no checkpoint judges.** A frame accepted after the checkpoint that covers it was verified (a datagram that arrives after the stream's checkpoint, or a holder's frame at a sequence the sender used and this receiver has not accepted yet), a frame in the range of a checkpoint that never arrived (a congested relay drops stream frames, §14.4), and a frame the ring forgot (the receiver's 4,096 frames, 2 MiB a channel and 8 MiB a node; the sender's 4,096 frames and 4 MiB) are **not judged**, and are counted `unchecked`. A holder can place a forgery at such a sequence.
+3. **A forgery far ahead.** A frame sealed at a `seq0` above the sender's, within 2^24 of the highest the receiver has seen (§12.2), is judged only when the sender's range reaches it. Until then, in `Latest`, it mutes that name's genuine messages until its record is forgotten, and it moves the replay window; the silence rule holds delivery after `max(4 × period, 100 ms)` and ends the session at 3 s (§15.7). Past the bound the frame is refused (`TooFar`), so no frame can make later genuine frames `TooOld`.
+4. **A holder can end a session.** It seals a checkpoint that does not verify: the session ends `BadCheckpoint`, evidence is made and the face the checkpoint came over is barred, which fails closed (§15.6). Or, when the sender is idle, it makes the receiver accept a frame the sender's next checkpoint does not reach within 3 s: the session ends `Unverifiable` (§15.7). The receiver can ask again (§13.11) and does not do so by itself. A forged `END` alone ends nothing (§15.6).
+5. **Withholding.** A holder or a relay on the route can drop frames and checkpoints. It shows as a gap in `Reliable` and `Window` (§12.6), and not at all in `Latest`; no checkpoint attributes it, because loss is not forgery. The silence rule bounds what flows unchecked, not what is dropped. A holder that replaces a genuine frame with its own at the same `seq0` is exposed (§15.11).
+6. **Attribution is to a link.** Evidence names a holder of the key and the face the frame arrived on at the receiver's forwarder, which is the nearest hop upstream; a hop that carried a holder's frame from further away is the one barred (§14.12). A bar costs that link its channel frames to that forwarder for 60 s, doubling for each repeat to an hour, and is local to that forwarder.
+7. **The ingress is a number the host chooses.** `deliver_frame` takes it. With `attach_forwarder` it is the forwarder's id of the face, which the forwarder sets and not the frame, but a host that gives every face one number has one share of the early-frame hold (§12.8) for all of them, and a peer that opens many faces holds many shares and the node's 4 MiB is then the only bound. Frames of different senders that come over one link share one ingress. A link's identity is a device, never a person.
+8. **The early-frame hold.** A `Window` joiner's early replay or standing frames beyond one face's share (16 frames or 2 MiB) are lost, and the stream cannot ask for them again.
+9. **Stale grace.** A removed member keeps the old key, and with it the read of what was sealed under it, for the 5 s of grace counted from the answer that gave the others the new key (§3.6).
+10. **Retained memory.** A key holder can keep 4,096 payloads of up to 9,000 octets alive in a `Latest` queue (about 36 MiB) by sending small messages in frames of that size: the queue is charged what each message pins (§12.6), and a frame over 9,000 octets is copied out first.
+11. **A restart empties the ask replay guard.** An ask captured in the 240 s before a sender's restart can be replayed once after it (§3.3 step 5). It yields a session wrapped to the asker's own key and a receiver entry for the ask's lifetime, nothing readable to the replayer.
+12. **Announce.** It is a hint: a device is asked only if the space's record holds an entry of it (§9), so a writer's device that has never written is asked by name, not by hint.
+13. **Fair share is per link, not per person** (`ndn-link.md` §9): a grantee with N links holds N shares, and the floors of more than `capacity / floor` active links add up to more than the capacity. The link layer has a device and no person at the quota.
+14. **The first congestion window is 4 × `path_mtu_max`.** A connection's first congestion window is `max(14,720, 4 × path_mtu_max)` octets, 36,000 at the default 9,000, which exceeds RFC 9002 §7.2 on a real 1,452-octet path (about 25 packets in the first round trip). It is there because quinn gates a `CONNECTION_CLOSE` that has ack-eliciting data pending by the congestion window and an MTU probe in flight uses the window, so a refusal sent right after the handshake needs room (without it the refused peer read a stateless reset, not the reason, about one run in two). It is bounded: before the path is validated the server sends at most three times what it received; quinn paces at window over round trip; after a loss or timeout the window collapses to the minimum; a connection that carries nothing holds none of it. The 4× margin for other data in flight is not measured, so it was not narrowed.
+15. **One task reads every channel's frames.** A node's frames reach it through one task (§14.10), which gives each to `deliver_frame` and waits there for room in a blocked `Reliable` or `Window` `Items` (§12.6). While it waits, the frames of the node's other channels queue in the app face's side inbox (256 frames, 8 MiB) and are dropped, counted, when it is full. The forwarder is never stalled by it.
+16. **A path with no stream.** A channel whose carrier has no stream sends no checkpoints (§15.3): nothing exposes a forgery there, `Trust::Verified` is refused, and what is delivered is authenticated only as a holder's. A sender behind a forwarder cannot tell that a hop has no stream: its carrier says it has one, the hop refuses the stream-class frames (`class_unsupported`), and the receivers behind it get no `HELLO`, no `BIND` and no checkpoint (§14.9).
+17. **Deferred carriage.** IPC connections carry no channel frames (§14.10), no radio face is a sink yet, and no node uses the ring carrier (§14.9). The next steps are stated there.
+18. **The engine's idle reaper** does not count channel frames as activity (§14.6): a route over a connectionless on-demand face with no NDN traffic for 5 minutes goes with the face.
 
-## 14. Measured
+## 14. The forwarder's side table
+
+A forwarder that carries channels holds one table for their frames, the **side table**. It copies each frame to the faces that asked for it, once per face, and knows nothing of what a frame is. This section says what the table keeps (§14.1, §14.2), how a route comes to be (§14.3), how a frame and a keep-alive go through it (§14.4, §14.5), how a route is kept and ends (§14.6), how a face is barred (§14.7) and paced (§14.8), what a face has to carry (§14.9), what a node does to use the table (§14.10), the management commands and counters (§14.11) and the threat notes (§14.12).
+
+Implementation: `ndn-packet` (`lp/`: the `SideRoute` header), `ndn-transport` (`Transport::forward_side_from`, `side_header.rs`), `ndn-engine` (`side.rs`: the table; `dispatcher/inbound.rs`: the peel; `dispatcher/outbound.rs`: the install), `ndn-mgmt` (`modules/side.rs`), `ndn-face-local` (the app face's side inbox), `ndn-app` (`Connection`), `ndn-face` (`l2/`: the Ethernet faces), `ndn-heap` (`chan/route.rs`, `chan/bar.rs`: the node's part) and, in ndn-ext, `ndn-link` (`FaceSink`, [ndn-link.md](ndn-link.md) §9).
+
+### 14.1 The table
+
+`SideTable` is owned by the `ForwarderEngine` (`ForwarderEngine::side()`; `EngineConfig::side` sets it). It is **generic**: it holds opaque 64-bit ids, `FaceId`s, times and counters, and nothing else. It never sees a name, a key, a space, a person or a mode; it decrypts and verifies nothing; the one kind of frame it reads is `UP` (§11.5), its own keep-alive. It is not the FIB and not the PIT: routes come and go with sessions, and nothing in the table is a name.
+
+A **route** has an id (the channel id, which the table treats as 64 opaque bits), **one source face**, one to 64 **sink faces**, and counters of the frames and octets it routed. A **sink** is a face, an expiry and the time its last `Keep` was passed upstream. A face may be the source of some routes and a sink of others. The source is the face the setup Data arrived on, the next hop toward the sender; a sink is a face whose Interest that Data answered, a hop toward a receiver.
+
+### 14.2 Limits and refusals
+
+The bounds are `SideLimits`, set by a host in `EngineConfig::side` (`SideConfig`).
+
+| What | Default | Over it |
+|---|---|---|
+| Routes in the table | 4,096 | the install is refused `TableFull` |
+| Routes one source face feeds | 256 | `SourceFull` |
+| Sinks on one route | 64 | `SinkCap` |
+| Routes one face is a sink of | 1,024 | `SinkFaceFull` |
+| TTL of a sink | the header's `ttl_secs`; 0 is 30 s (`ttl_default`) | a TTL over 300 s (`ttl_max`) is clamped to it |
+| `Keep`s passed upstream | a sink's first at once, then at most one per sink every 5 s (`keep_forward_min`) | the `Keep` refreshes the sink and goes no further |
+| Sweep of lapsed sinks | every 1 s, on the engine's clock | |
+| Bar | 60 s, doubling to 1 h (§14.7) | |
+| Rate of a sink face | 1 MB/s on radio kinds, off on Ethernet kinds (§14.8) | the frame is dropped for that sink, `quota` |
+| The app face's side inbox | 256 frames and 8 MiB | `Full`, counted |
+
+`SideTable::install` refuses with a `SideRefusal`, leaves the table as it was, and each refusal is counted (`refused_*`, §14.11):
+
+| Refusal (`label`) | What it says |
+|---|---|
+| `TableFull` (`table_full`) | the table holds its most routes |
+| `SourceFull` (`source_full`) | the upstream face already feeds its most routes |
+| `SinkCap` (`sink_cap`) | the route already fans out to 64 faces |
+| `SinkFaceFull` (`sink_face_full`) | the receiver's face is already a sink of its most routes |
+| `SourceMismatch` (`source_mismatch`) | a route with this id exists with another source: the id is in use or the path changed; wait for the old route to lapse |
+| `SinkIsSource` (`sink_is_source`) | the receiver's face is the face the Data arrived on: a route cannot loop back |
+| `Quarantined` (`quarantined`) | the upstream face is barred (§14.7) |
+| `FaceGone` (`face_gone`) | a face of the route is no longer on this forwarder |
+
+The message of each names what to look at and what to raise or end.
+
+### 14.3 How a route is made
+
+**The label.** A route is made by the session's own Data. The Data carries an NDNLPv2 header, `SideRoute` (`LP_SIDE_ROUTE`, TLV-TYPE **0x0370**; `ndn_packet::lp::SideRoute { id, ttl_secs }` in `LpHeaders::side_route`). Its value is exactly 10 octets: the route id (8, big-endian) then the TTL in seconds (2, big-endian). A value of any other length makes the whole LpPacket a decode error (fail closed). The type is even, so a decoder that predates it skips it (last paragraph of this section). It follows the NDNLPv2 header order: after every header of a lower type (`CachePolicy` 0x0334, `CongestionMark` 0x0340, the A-LAL fields 0x0360 to 0x0364) and before the Fragment; one out of order or twice is a decode error, as for any LP header. On a fragmented Data it counts only on the final fragment, the one the reassembled packet continues as. The registry is the NDNLPv2 table of [README.md](README.md#ndnlpv2-header-numbers). The wire of a header with id `1122334455667788` and TTL `0x99AA` (39,338 s; a forwarder clamps it to 300 s) is:
+
+```
+fd03700a112233445566778899aa
+```
+
+**The install.** The Data pipeline installs routes in the step that sends a matched Data on, after the PIT matched and, where the engine validates Data, after the Data validated. For each face `f` in the PIT entry's in-records other than the face `a` the Data arrived on, and still on this forwarder, it calls `install(id, a, f, ttl)` and sends the Data to `f` **with the header again**, carrying the TTL the table kept (the header's, 0 becoming 30 s and more than 300 s becoming 300 s). The next forwarder does the same. A Data that carries the header goes to a face in an LpPacket even where the face does not use LP framing (as one with a PitToken does). Installing a sink the route already has refreshes its TTL; another face adds a sink.
+
+**A refusal** (§14.2) is counted and logged at `warn` with the route, the two faces and the reason, and that face gets the Data **without** the header: it still gets the session and gets no frames, so its receiver reports `NoPath` after 2 s (§14.10).
+
+**When nothing is installed.** A Data served from the Content Store carries no header (the session Data is `NoCache`, so none is); a Data that matched no PIT entry has no in-record, so no sink; and the arrival face is never offered.
+
+**Where the faces are.** At the sender's own forwarder the Data arrives from the sender's app face, which becomes the source. At the receiver's forwarder it arrives from a link and the receiver's app face is the sink. At a relay both are links. A route therefore runs from the sender's app face through every hop to the app face of every receiver, and exists only where a receiver's Interest went.
+
+**Why a stray or forged header does little.**
+
+- A route is installed only for a Data that matched a PIT entry, so a face becomes a sink only if it **asked**: its Interest is the in-record.
+- The source is the face the Data arrived on, which is a face an Interest to the sender went out of. A frame of the id from any other face is dropped (§14.4).
+- The table counts everything (§14.2). A second Data that names an id already routed from another source is refused `SourceMismatch`. The ids are 64 random bits (§3.2) and a forwarder holds at most 4,096 routes, so two live routes collide by chance with probability about 2^-41.
+- What a hostile next hop can do is send frames into the routes it is the source of. They fail the AEAD at every receiver or, from a key holder, fall to the checkpoints (§15).
+- None of this rests on validation: a forwarder that validates no Data (a relay in transit, ndn-link.md §15.7, or a profile with security off) installs on the PIT match alone.
+
+The label is **not** covered by the Data's signature: it is a claim of the hop that sent the Data on. A hostile next hop is on the path anyway; with the label it can also name an id that is not the channel's (the receiver then reports `NoPath`), or the id of a channel not yet routed here (that channel's own session Data is then refused `SourceMismatch` here until the squatted route lapses, at most 300 s without `Keep`s). The receiver's judgement of the Data (§3.4) is no judgement of the label.
+
+**A forwarder that predates the header.** It skips the even type, forwards the Data without it and installs nothing. No frame crosses it, and the receiver reports `NoPath` with the next step "a forwarder between you and the sender does not carry channel frames: update it". The setup has no other path to fall back to: it **fails closed**.
+
+### 14.4 The data path
+
+**The peel.** The reader of every face looks at the first octet of what it read. If it is `0x00` the frame is a channel frame: the reader adds it to the face's `in_side_frames` and `in_side_bytes`, calls `SideTable::on_frame(face, frame, faces)` and reads on. That is one comparison, made before NDNLPv2 detection, before the activity stamp and before the pipeline's bounded channel, so a channel frame never costs a PIT entry, a task, an `in_drops` count or a malformed-packet verdict, and an NDN packet never takes this path (no NDN packet starts with `0x00`, [ndn-link.md](ndn-link.md) §9 item 7). A frame the table does not route is dropped there, counted.
+
+**A locally originated frame** takes the same path: the sender's node sends it into its app face (`Connection::send_side`, §14.10), the face's reader peels it, and the face is the `from` of `on_frame`.
+
+**`on_frame`** never blocks, so the reader goes on reading the face's NDN packets whatever a sink does with the frame. It does, in this order, and a frame that fails a step costs nothing below it:
+
+1. Parse the 10-octet routing header and, for an `UP`, its 11-octet record: `malformed`.
+2. `from` is barred (§14.7): `quarantined`.
+3. Look the id up (a map read): no route, `unrouted`.
+4. An `UP`: §14.5.
+5. Any other kind: `from` must be the route's source, else `wrong_source`. Then fan out.
+
+**Fan-out.** For each sink:
+
+- A sink whose expiry has passed is skipped, even before the sweep removes it.
+- A sink face with a rate (§14.8) whose bucket is empty is skipped: `quota`.
+- A sink face that is no longer on the forwarder: `sink_full`.
+- Otherwise the table calls `Face::forward_side_from(frame.clone(), class, from)`, `class` being the header's class bit. `Bytes::clone` is a reference count: the frame is **not copied per sink**. A taken frame counts in `frames_out`; the result `Full` counts `sink_full`, `Unsupported`, `NotCarried` and `PeerLacksChannels` count `class_unsupported`, and any other refusal counts `sink_error`.
+
+**`forward_side_from(frame, class, ingress)`** is the non-blocking hand-over of a frame to a transport: `Transport`, `ErasedTransport` and `Face` all have it. `ingress` is the face the frame arrived on at this forwarder. The default ignores it and calls `forward_side` (itself `Unsupported` by default); a transport that delivers into an application keeps it, so that the application can say which link a frame came over (§14.9).
+
+**A sink that cannot take a frame loses it, visibly.** The relay drops it for that sink, counts it (`sink_full`, `quota`, `class_unsupported`, `sink_error`; `side/list` shows them) and goes on. A receiver behind it sees a gap in `Reliable` and `Window` (§12.6); in `Latest` nothing is noticed (§12.1). A relay is lossy under congestion, and says so.
+
+### 14.5 `UP`: keep and unsub
+
+A face sends an `UP` frame (§11.5) to say something about a route it is a sink of. The table reads it as its own, answers nothing, and changes only that face's own sink.
+
+- **`Keep`** from a sink refreshes **that sink's** expiry to its TTL from now (§14.6). If it is that sink's first `Keep`, or the last `Keep` passed upstream for that sink was at least 5 s ago (`keep_forward_min`), the table passes the frame to the route's source face as a datagram (its octets unchanged, the sink's face as the ingress) and notes the time. A `Keep` the source could not take is not noted, so the next one tries again. A sink's first `Keep` goes up at once at every hop, so the sender learns that a receiver's route is up; after that a path costs one frame per sink every 5 s at each hop.
+- **`Unsub`** from a sink removes that face's sink. If the route has no sink left it is removed and the `Unsub` goes on to the source; otherwise nothing goes up.
+- An `UP` from a face that is not a sink of the route is dropped (`wrong_source`); one from a barred face, `quarantined`; one for an unknown id, `unrouted`; one that does not parse, `malformed`.
+
+### 14.6 Lifetime and teardown
+
+- **TTL.** A sink lapses its TTL after its last install or `Keep`. The 1 s sweep removes lapsed sinks and a route left with none, and counts `sinks_lapsed`. A receiver that left or was removed stops sending `Keep`, so its entries lapse at every hop within the TTL. A removed member that goes on sending `Keep` holds a sink and is sent ciphertext it cannot open: the forwarder judges no membership (§14.12).
+- **The session Data asks for 30 s** (`SIDE_TTL`); a node sends a `Keep` for each session it holds every 10 s (`KEEP_EVERY`, a third of the TTL, so two lost ones still leave the sink alive) and an `Unsub` when it lets a session go (§14.10).
+- **A face that goes down takes its routes with it.** `SideTable::remove_face(face)` drops every route the face is the source of and every sink on it, and a route left with no sink. It is called wherever the engine removes a face: `ForwarderEngine::remove_face` and `EngineDiscoveryContext::remove_face`, the tail of the face's reader (the persistent branch too), the idle reaper and the close after a send error. The 1 s sweep also drops every route whose source or sink face is no longer in the face table, as a catch for any other exit. The bar of the face and its history stay (§14.7) and its rate goes.
+- **A link that loses an identity and stays.** When a link loses an identity but another membership still admits it, `Links` calls `FaceSink::side_remove_face(face)` for each of its faces: channel authority is link-wide and a route's id cannot be tied to a namespace, so any identity lost counts, which is the fail-closed reading. No frame then crosses the link on the strength of the lost identity; a receiver behind it asks again and the new Data installs what the remaining identities allow ([ndn-link.md](ndn-link.md) §9 item 8).
+- **The quiet-close rule** counts a face with a side route as routed and counts the octets of channel frames on its stream as activity only while the forwarder holds such a route ([ndn-link.md](ndn-link.md) §16.2). The engine's own idle reaper, for a connectionless on-demand face (UDP and the like, idle after 5 minutes), does **not** count channel frames: the peel comes before the activity stamp. A route over such a face with no NDN traffic for 5 minutes goes with the face (§13.12 item 18).
+- **No route, no send.** `SideTable::sinks(id)` is the number of live sinks. A sender whose route has none sends nothing that reaches anyone (§14.10).
+
+### 14.7 The bar
+
+A face is **barred** when a frame that came over it is shown to be a forgery (§15.5, §15.6). A bar is on what the face **sends** to this forwarder as channel frames; NDN traffic over the face goes on, and the forwarder still sends the face frames of routes it is a sink of.
+
+- **What a barred face loses.** The frames it sends are dropped (`quarantined`), its `Keep` and `Unsub` frames with them, and no route is installed with it as the source (`Quarantined`).
+- **`bar(face, now)`** applies the next length of the face's history: 60 s, doubling for each repeat on the same face (120 s, 240 s, …) to 1 h, and 60 s again once the face has gone an hour after its last bar ended without another. It returns the length applied.
+- **`quarantine(face, until)`** bars until a time and keeps a longer bar the face already has; **`lift(face)`** ends the bar now and keeps the history, so the next `bar` still doubles. Times are nanoseconds on the engine's clock (`SideTable::now()`).
+- **History.** A face's bar and its history are kept per face id and survive `remove_face`, so a face dialled again at the same id is still barred; the sweep forgets a history an hour after its last bar ended.
+- **Who bars.** A node that has evidence (§15.5) asks its forwarder through its `IngressBar` (`NodeHandle::attach_bar`; `attach_forwarder` attaches one over the node's connection, `Connection::side_quarantine`). An embedded engine's connection calls `bar(face, now)` and refuses its own app face, since barring that would cut the app off from its forwarder and no link delivered the frame. An operator or an out-of-process host uses the signed management command `side/quarantine` (§14.11).
+- **The bar is local.** It is made at the forwarder of the node that holds the evidence. Nothing carries it to another forwarder, upstream or beside.
+
+### 14.8 The rate of a face
+
+`SideRate { bytes_per_sec }` is a token bucket on what the table hands one **sink face**, with one second of burst. A frame is admitted while the bucket holds tokens, whatever its size, and charged its length (the bucket may go negative, so a large frame is not refused for ever at a low rate); over it the frame is dropped for that sink and counted `quota`. `UP` records passed upstream are not charged.
+
+The default is 1 MB/s on the radio kinds (`FaceKind::Wfb`, `WifiAware`, `WifiDirect`), so a channel cannot fill a radio, and off on the Ethernet kinds (`Ethernet`, `EtherMulticast`) and on every other kind. `SideConfig::radio_rate` and `ethernet_rate` set it per kind, `SideTable::set_rate(face, rate)` per face; a face gets its kind's rate when it is added. No radio face is a sink yet (§14.9), so the radio default changes no route today.
+
+### 14.9 What a face carries
+
+A face carries channel frames only if it opts in (§11: `side_frame_max()` above 0) and answers `forward_side_from` without waiting.
+
+- **The in-process app face** (`ndn-face-local`). `side_frame_max` is 1 MiB (`STREAM_FRAME_GRANT`: a channel's datagram frame, 9,000 octets, and a shared-memory slot, 8,960, both fit). The engine's `forward_side_from(frame, class, ingress)` pushes `(frame, ingress)` into the face's **side inbox**, apart from the NDN packets (which stay on `recv`), at most 256 frames and 8 MiB. It never waits: a frame that finds either bound is refused `Full` and counted (`InProcHandle::side_dropped`), and its receiver sees the gap as a congested link's. Without an ingress (`forward_side`) the face refuses `Unsupported`. The app's own frames go the other way through the face's reader (`InProcHandle::send`, `try_send`).
+- **QUIC link faces** (ndn-ext `ndn-face-quic`, through `ndn-link`): both classes, the datagram by the headroom rule and the stream through a bounded queue; `Full` when there is no room. Which links carry channel frames at all is [ndn-link.md](ndn-link.md) §9 item 8.
+- **Ethernet faces** (`NamedEtherFace`, `MulticastEtherFace`, ndn-face `l2/`, the Linux `AF_PACKET` faces): the **datagram class only**. `forward_side` pushes into the face's send queue and flushes without waiting: `Full` when the queue has no room, `TooLarge` over the MTU (a frame is never fragmented), `Malformed` for a frame that is not a channel frame, and `NotCarried` for the stream class, so a hop with no stream does not silently carry a reliable channel (the table counts `class_unsupported`). A NIC pads a payload under 46 octets; §11.3 is why no frame is that short. The macOS and Windows Ethernet faces have no `forward_side`. **Known limit, not fixed:** on the TPACKET ring one flush sends every frame queued to one destination, so a `MulticastEtherFace` that has a unicast reply and queued channel frames waiting together may address a queued channel frame to the unicast station.
+- **`MulticastEtherFace` as one sink.** A frame sent to it is **one** Ethernet frame to the NDN multicast group for every station on the segment. A station that is no receiver sees a sealed frame and, holding no route for its id, drops it (`unrouted`). A station that is a receiver holds a route whose source is the face its multicast face is on, learnt from the same session Data (the Data's in-record includes the multicast face). Two receivers behind one multicast face cost the sender's link one frame.
+- **Shared memory** (ndn-ext `ndn-face-shm`, `SpscFace`): a frame is one ring slot (`side_frame_max` is the slot size). The ring is reliable and ordered, so both classes are carried; `send_side` waits for a free slot, and `forward_side` is a non-blocking push (`Full` at once when no slot is free, `Malformed` and `TooLarge` as for any face) that wakes a parked reader. The push side of the ring is exclusive (a lock), because the sender's task and the engine's reader tasks both push.
+- **Radio faces** (`Radio`, `WifiPhy`, `BlePhy`) opt in with the radio's MTU but have **no** `forward_side`: as a sink each refuses `Unsupported`, counted `class_unsupported`, because the phy's send is asynchronous and there is no non-blocking send. A route over a radio face carries nothing yet. The next step is a phy-level try-send and a `forward_side` on each of the three.
+- **The ring carrier** (`RingFace` in ndn-face-shm): a lossy broadcast ring of 256 slots of `frame_max + 256` octets (`frame_max` from 36 octets to 1 MiB) with one writer and at most 32 readers over its life. The writer is a send-only sink: `forward_side` publishes without waiting and is never full, a reader that falls more than 256 frames behind is lapped and counts it (`RingStats::lapped`), and only the datagram class is carried (a stream-class frame is `NotCarried`, counted `class_unsupported`). A reader maps the ring read-only and carries nothing out (`side_frame_max` is 0), so a local reader **cannot forge a frame**: what it reads is what the writer's process wrote. A frame that is not marked or is under 36 octets is dropped and counted; a one-octet `0x00` frame is the writer's end. A reader finds the ring by a control socket named from the ring's name, and the handoff of its descriptors is gated by a capability token bound to a 32-octet secret; the handoff stops serving after 16 connections that failed it (a local process that knows the socket's path can stop new attaches).
+- **TLV-framed streams** (a TCP or Unix socket): `NotCarried`. The codec finds the end of a frame from its first octets read as a TLV header, and the marker is TLV-TYPE 0 followed by a byte read as a length, so a side frame written as is would put the reader out of step with the NDN packets behind it.
+- **The App, Shm and Unix faces and the route label.** Their readers do no LP detection (`uses_lp` stays off: a bare Data is what NLSR's PSync needs), the link service does not unwrap an LpPacket, and decode takes `0x64` on every face kind, so a session Data that an app sends in an LpPacket carrying the label reaches the pipeline intact. A Data that carries the label (or a PitToken) goes **to** such a face in an LpPacket, so the consumer MUST accept one (`ndn-app`'s connections do).
+
+Not built: IPC connections carry no channel frames (§14.10), and no node uses the ring carrier: `CarrierHost` (`offer_ring`, `attach_ring`) is a trait in `ndn-heap` that no host implements, and `ASK_CARRIERS` kind 5 is not carried.
+
+**A hop with no stream.** The carrier a node gets from `attach_forwarder` says it has a stream, whatever the sinks behind its forwarder are, so a sender does not learn that a hop carries datagrams only. Stream-class frames (`HELLO`, `BIND`, standing values, a replay, `END`, checkpoints and every `Reliable` and `Window` frame) are refused there and counted `class_unsupported`: a receiver reached only over such a hop gets the datagrams that name themselves and nothing of the stream, is told `NoPath` after 2 s for want of a `HELLO`, and its channel has no checkpoints (§13.12 item 16). That path is not exercised end to end (AF_PACKET needs `CAP_NET_RAW`; the Ethernet tests run over an in-memory bus). The next step is a carrier that learns what its sinks carry and a session that refuses `Reliable` and `Window` with `NoStream` when no stream reaches a receiver.
+
+### 14.10 What a node does
+
+`NodeHandle::attach_forwarder()` (or `attach_forwarder_with(datagram_max)`) gives a node over a `Connection` that reaches a forwarder (an embedded engine's `app_face`) everything below, over that one connection. It is `HeapError::Local`, with the reason and what to use, if the connection carries no side frames. A node that attached none sends, keeps and tells nothing of this.
+
+**`Connection`** (`ndn-app`) has, for this: `send_with(wire, LpHeaders)` (a Data or Interest in an LpPacket carrying the headers, the default of every connection), `side_frame_max()`, `send_side(frame, class)` (waits for room), `try_send_side` (never waits: `Full`, `NotCarried`, `TooLarge`, `Malformed` for a frame that is no channel frame), `side_ready()` (completes when `try_send_side` may take a frame), `recv_side()` (the next frame the forwarder routed to the connection, with the id of the face it arrived over) and `side_quarantine(face)`. The in-process, engine and demux connections carry them. `IpcConnection` and a bare connection do not: `side_frame_max` is 0 and `send_side` and `side_quarantine` refuse with `AppError::Unsupported` and a sentence that names the next step. The daemon's socket carries TLV packets and a `0x00`-marked frame is none; the next step is a marker-aware carriage on that connection, or to run the node over `EngineAppExt::app_face`. `side_quarantine` there is the signed `side/quarantine` command.
+
+**The sender.**
+
+- The session Data goes out with `SideRoute { id: the channel id, ttl: 30 }` and `NoCache`. `Extension::answer` returns `Option<host::Answer { wire, side: Option<(u64, u16)> }>` ([heap.md](heap.md) §10.9): a plain Data, or one with the label.
+- A datagram frame leaves by `try_send_side`, a stream frame by `send_side`. The carrier reports a datagram limit of 1,200 octets (`DATAGRAM_FRAME_MAX`: what one QUIC datagram carries at the smallest path MTU, because a sink may be a link), which a host with only local sinks may raise, up to the channel's 9,000, with `attach_forwarder_with`; a message that does not fit goes on the stream (§13.2 item 6). Its stream limit is the connection's `side_frame_max`, 1 MiB.
+- **The gate.** A marked frame is peeled in the face reader and can overtake the Data that is still installing the route. So a **stream** frame of a channel waits, for at most `ROUTE_WAIT` (1 s), for an `UP` `Keep` to come back to the sender: the first `Keep` of the channel, and one more after each receiver judged in as new (§13.7). A `Keep` that reached the sender proves every hop holds the route. If none ever comes the frame is dropped and counted, and each later stream frame of that channel is dropped without waiting until a `Keep` comes (**no route, no send**). If the channel already had `Keep`s and only a newcomer's is missing, the frame goes after the wait: the receivers that are routed need it. **Datagrams are never gated**; a datagram with no route is dropped at the forwarder (`unrouted`).
+
+**The receiver.**
+
+- One task of the node reads `recv_side` and gives each frame to `deliver_frame` with the forwarder's face id as the `ingress` (§12). A `Keep` that arrives at a sender is not delivered to the receiver path: it releases the sender's gate. The engine's reader never calls `deliver_frame`, so a blocked `Reliable` queue (§12.6) stalls this task and not the forwarder (§13.12 item 15).
+- **Keep and Unsub.** When a session is installed the node sends one `Keep` for it at once (the gate above waits for it); the maintenance pass sends one every 10 s for each session it holds. When a session ends, is replaced or is removed, and when the last `Items` that takes it is dropped, the node sends one `Unsub` and no `Keep` follows; the last case ends the session as `Left`, and a later `live` over the same sender needs a new ask, which makes a new route. An `UP` the connection had no room for is tried again at the next pass. `UP` frames go as datagrams.
+- **`NoPath`.** A session with no `HELLO` 2 s after it was installed (`NO_PATH_AFTER`), that an `Items` wants, tells that `Items` `LiveEnded(NoPath { why })`, once. The text says that no frame of the sender's channel reached this device in 2 s and that a forwarder between the two does not carry channel frames: update it. It does not say which hop. `LiveEnd::next()` is `FixLocal` for it (and `RetryLater` for an `Ended`). The causes are a forwarder that predates the label (§14.3), an install a hop refused (that hop's `side/list` counts and its log says why), a hop with no stream (§14.9) and a sender that sends nothing.
+- **The bar.** `ConnectionBar` over `Connection::side_quarantine` is attached by `attach_forwarder`; a node with another `IngressBar` (`attach_bar`) bars through that. Without one a node still alerts and bars nothing.
+
+### 14.11 Management and counters
+
+`/localhost/nfd/side/list` and `/localhost/nfd/side/quarantine` (`ndn-mgmt` `modules/side.rs`; module `SIDE`, verbs `LIST` and `QUARANTINE` in `ndn-mgmt-wire`). As every ndn-rs module that is not an NFD one, each requires a **signed** command Interest.
+
+- **`side/list`** is read-only and answers status text: a line of counters (`routes`, `sinks`, `frames_in`, `bytes_in`, `frames_out`, `bytes_out`), the drops by reason (`unrouted`, `wrong_source`, `malformed`, `class_unsupported`, `quota`, `quarantined`, `sink_full`, `sink_error`), the `UP` counters (`keeps`, `keeps_forwarded`, `unsubs`, `sinks_lapsed`), the refused installs by reason (§14.2), one line per route (the id in hex, the source face, each sink with the time left before it lapses, frames, octets, age) and one per barred face (the face, the time left). It is text, not a TLV dataset.
+- **`side/quarantine`** takes `FaceId` (required: it does not default to the requesting face) and, optionally, `ExpirationPeriod` in **milliseconds**. Without it the bar is the face's next one by its history (60 s, doubling, §14.7); with a value, that long; `0` lifts the bar. The answer says `face barred` or `bar lifted` and names the length applied in `ExpirationPeriod`. It refuses with status 400 and a sentence when `FaceId` is missing or names no face on the forwarder (a lift is not refused), and answers 404 to any other verb of the module. The commands are logged at `warn`.
+
+The per-face counters `in_side_frames` and `in_side_bytes` are in the engine's face state; `status` does not show them. [mgmt-trust.md](mgmt-trust.md) lists the module among the management commands.
+
+### 14.12 Threat notes for the side table
+
+- **A relay forges or alters.** It holds no key. Any change fails the AEAD at the receiver (§11.8). What a relay can do is drop, delay or repeat frames: drops are counted at the relay, repeats fall to the replay window (§12.2).
+- **A face that is not the route's source** sends a frame of the id: it is dropped before any sink (`wrong_source`), so it makes no copy. A face that is not a sink sends an `UP`: dropped. Neither changes any entry.
+- **Flooding.** A channel frame costs the reader one comparison, a header parse and a map read, and never a pipeline pass. Unknown ids, barred faces and malformed frames cost no more. A frame from the source of a route costs a fan-out; what bounds it is the sinks (at most 64 a route), the per-face rate on radio faces and the link's own limits ([ndn-link.md](ndn-link.md) §9 item 9).
+- **Table exhaustion.** A route needs a PIT-matched Data, so a face cannot make itself a sink without having asked. The table is bounded in all, per source face, per sink face and per route (§14.2), and a sink lapses in its TTL (30 s as the heap asks, 300 s at most) unless it is kept. A member that opens sessions is bounded by the sender's 64 channels and 256 receivers a channel (§6). One face that reaches its own limit loses its own routes and no other face's; the 4,096 of the table are shared.
+- **Amplification.** One frame in is one frame per sink, at most 64 a route, and a sink exists only if its face asked and keeps asking. One `UP` in is at most one `UP` out. The frame is not copied per sink, only handed to each.
+- **A route squatter.** A frame of an id from a face that is not the route's source is dropped; a second Data for an id routed from another source is refused (`SourceMismatch`). The label itself is a claim of the next hop (§14.3).
+- **A removed member that keeps its sink.** It keeps sending `Keep` and is sent ciphertext: it holds the old key only until the re-key (§3.6) and the forwarder judges no membership. Its sink costs the forwarder one fan-out per frame, within the limits above.
+- **Barring an honest relay.** The bar is made by a receiver's node on the face the contradicted frame **arrived on at that node's forwarder**: the link to the nearest hop upstream (§14.7). A member (a key holder) can inject frames only through a face that is the source of the route at its own forwarder, as any hop can, and a frame goes on from hop to hop with nothing added. So if the member's device is that nearest hop, its own link is barred; if it is further upstream and the hop between is honest, **the honest relay's link is barred** at the receivers' forwarders, because nothing carries attribution upstream. What the bar costs the relay: the channel frames it sends to that forwarder (of every channel) are dropped for 60 s, then 120 s and so on to an hour for each repeat, and routes with the relay as source are not installed; its NDN traffic is untouched and the other forwarders are not told. What the member needs for it: a frame a signed checkpoint contradicts, or a checkpoint that does not verify (§15.6), which a key holder can make at will. A conflict alone (§15.6) bars nobody. The evidence (§15.5) names the face; an operator lifts a bar with `side/quarantine` (length 0). The bar is a response to a **link**, not a verdict on a person.
+- **Clocks.** No decision about who may send rests on a clock. TTLs, bars and the sweep are on the forwarder's monotonic engine clock and decide how long a route or a bar lives.
+
+## 15. Checkpoints
+
+A frame that opens under a channel's key was sealed by **a holder** of the key (§11.8). A checkpoint is how a receiver learns which of the frames it accepted the **sender** sealed: the sender signs, with its device key, a list of the hashes of the frames it sent, and a receiver compares the list with the frames it accepted. This section says what the record is (§15.2), what the sender writes and when (§15.3), what the receiver keeps and does (§15.4 to §15.8), the window in which a forgery can be delivered (§15.9), the bounds (§15.10), what checkpoints do and do not do (§15.11), the vectors (§15.12) and the threat notes (§15.13).
+
+Implementation: `ndn-heap` `chan`: `checkpoint.rs` (the record, its signature and its vectors), `ring.rs` (the sender's frames and `frame_hash`), `tx.rs` and `queues.rs` (the sender's loop), `verify.rs` (the receiver's memory and its judgement), `rx.rs` (what a verified, mismatched or bad checkpoint does), `evidence.rs`, `config.rs`, `bar.rs`.
+
+### 15.1 What a checkpoint is for
+
+**Checkpoints detect; they do not prevent.** Between two checkpoints a key holder that relays or injects frames can alter or invent frames under the sender's key, and a receiver acts on them (`Trust::Prompt`) before the next checkpoint shows it. What a checkpoint buys:
+
+- A forgery by a **non-holder** (a relay, a stranger, a removed member after its re-key) is refused at once by the AEAD (§11.8).
+- A forgery by a **holder** is delivered to a `Prompt` receiver for at most the stated window (§15.9) and is then **exposed** by a signature the holder cannot make, with evidence against the link it came over (§15.5).
+- `Trust::Verified` (§15.8) delivers a frame only once a checkpoint lists it, so it **prevents** delivery of a holder's forgery, at a stated latency.
+- Silence is not trust (§15.7): a relay that drops the checkpoints cannot keep unverified frames flowing.
+
+Ephemeral data only: kept data stays signed per entry.
+
+### 15.2 The record
+
+A `CHECKPOINT` frame (§11.5) is on the stream, sealed under the channel key with `count` 0, and takes one sequence. Its plaintext is the record, then any padding of §11.3:
+
+```
+lo (varint) | hi (varint)             the sequences it covers: [lo, hi)
+n (varint)                            the frames listed, at most 4,096
+n × ( seq0 delta (varint) | h (16) )  the frames sent with lo <= seq0 < hi, in order of seq0
+signature (64)                        Ed25519 by the sender's device key
+```
+
+- **Varints** are the QUIC variable-length integer (§11.4). A writer uses the shortest form and a reader **refuses** a longer one, so that the digest below is the one the sender signed.
+- **The list.** The first `seq0 delta` counts from `lo`, each later one from the entry before it, so the entries rise. A delta of 0 after the first lists a `seq0` twice, which no sender does. Each entry is `seq0` and the 16-octet hash of the frame.
+- **The hash** `h` is the first 16 octets of `H(the frame's octets as they went on the wire: header, ciphertext and tag)`, `H` being SHA-256 for a frame of at most 2,048 octets and BLAKE3 above (the length selects it: nothing is negotiated). A receiver hashes the octets as they came. It is a hash, and not the AEAD tag, because a holder can forge a tag for any content and cannot find a second preimage of a frame the sender sent.
+- **The signature** is made with the **device key the session Data was signed with**, over the message below.
+
+**The signed message** is these octets, in this order, 92 in all:
+
+| Field | Octets |
+|---|---|
+| the label `ndn-channel/checkpoint/1` | 24 |
+| the channel id, big-endian | 8 |
+| the key epoch, the whole of it, big-endian (the header carries only its low octet) | 4 |
+| `lo`, big-endian | 8 |
+| `hi`, big-endian | 8 |
+| `n`, big-endian | 8 |
+| SHA-256 of the list's octets exactly as written (the `n` pairs: for `n` of 0, SHA-256 of nothing) | 32 |
+
+The channel id and the key epoch bind a checkpoint to its channel and its key: sealed again into another channel, or into the same channel under another epoch, it fails its signature (and under another key it fails to open). The range is signed too.
+
+**What a reader refuses.** A reader drops a record (counted `malformed`) that ends inside a field, has a varint not in its shortest form, has `hi` below `lo`, lists more than 4,096 frames, lists a `seq0` outside `[lo, hi)`, or has anything after the signature but padding. A writer refuses to write a list that does not rise or lists a frame outside the range.
+
+**The range is what the sender vouches is complete:** a frame with `lo <= seq0 < hi` that a receiver accepted and the list does not hold, or holds with another hash, was not sent by the sender. A frame the sender sent after the record was built has `seq0 >= hi`.
+
+### 15.3 The sender
+
+- **Who signs.** The channel's sender signs with the device key the session Data is signed with, which the receiver holds a certificate chain for. Only an Ed25519 key signs checkpoints. A sender whose key is of another kind sends none, and so does a sender whose carrier has no stream, since a checkpoint rides the stream. Such a channel announces `S_CKPT_MS` of 0 in its session (§7) and its receivers wait for nothing (§15.7).
+- **What it lists.** The sender records every frame it hands to a carrier, on either lane, **except a `CHECKPOINT` frame** (§13.2 item 9): the data frames and the `CONTROL` frames. A checkpoint covers `[lo, hi)`. `hi` is the **watermark**: below the first sequence still waiting in any queue (a message that waits, or is in a frame being written, may still be sent as a frame whose `seq0` is that low, and a later checkpoint is to judge that frame), below the next sequence to be taken, and never below the last checkpoint's `hi`. `lo` is the last checkpoint's `hi`, raised past anything the ring forgot, so a frame the sender no longer holds is never a mismatch. The checkpoint lists the frames in the ring with `lo <= seq0 < hi` and takes them out of the ring; a frame at `seq0 >= hi` stays for the next. The ranges of successive checkpoints tile the sequences, and a frame is listed by at most one.
+- **The schedule.** The first frame sent since the last checkpoint arms a timer of one **period** (`ChannelConfig::checkpoint`, §15.9). When it fires, a checkpoint is queued on the stream's queue if frames were sent and none is waiting (one that waits lists everything sent by the time it is written). A checkpoint takes the next sequence when it is queued and goes through the stream in the order of the sequences, so it follows every frame sent on the stream before it. What it lists is decided when it is written, and the frames are hashed and signed with no lock held. That is **at most one signature a period and a channel**, whatever the frame rate, and none while nothing was sent.
+- **After an `END`** the sender queues one more checkpoint at once, which lists the frames before it and the `END` itself (§15.6).
+- **While idle**, with a receiver held and a stream, the node's maintenance pass queues one **empty** checkpoint (a range and a signature, no frame) when 5 s have passed since the last. It is a liveness signal; no receiver waits for it.
+- **A checkpoint that cannot be signed or sealed** leaves its frames in the ring for the next (counted `checkpoint_failed`, never expected).
+- **The ring** is bounded (§13.2 item 9, §15.10); frames it forgot are counted `unchecked`.
+
+### 15.4 The receiver
+
+A receiver whose session announces a period (`S_CKPT_MS` above 0, held to 1 ms to 2 s) keeps, **per channel**, one **slot** for each `seq0` it accepted a frame at. A slot holds the frame's octets **as they came** (a copy: the AEAD opens the original in place) until a checkpoint judges it, and then only the frame's hash and the signed checkpoint frame that vouched for it. At most 4,096 slots (the replay window's size), 2 MiB of octets a channel, 8 MiB a node (one budget with the frames held for a lane, §15.7, §15.8). Past a bound the frame with the lowest `seq0` is forgotten and **counted** `unchecked`: a frame nobody judges is not a mismatch. A frame that cannot be kept, because other channels have spent the node's budget, is counted `unchecked` too and is not judged.
+
+A `CHECKPOINT` frame is taken like any frame (§12.1) up to the AEAD; then:
+
+1. The record is read (§15.2); one that does not parse is dropped, `malformed`.
+2. It is verified under the sender's **Ed25519 key**: the key that signed the session Data, which the receiver found in a certificate it vouches for when it took the sender's answer (set at every install and renewal). If no certificate of it was found the checkpoint cannot be verified and says nothing against the sender: it is counted `unverifiable_checkpoints` and the silence rule applies (§15.7). A signature that does not verify is a **bad checkpoint** (§15.6).
+3. A verified checkpoint **judges** the slots. A frame below `lo` that was never judged is forgotten, counted `unchecked` (ranges only rise, so no checkpoint will cover it). Each frame with `lo <= seq0 < hi` is **settled** if the list holds its hash at its `seq0`, and is a **mismatch** if not. A listed frame the receiver does not hold is ignored: **loss is not forgery**. A frame above `hi` is not judged and keeps the silence clock (§15.7).
+4. It then releases what lanes were held for it (§15.7, §15.8).
+
+The sender's key must still stand: the generation check (§12.3) runs before every frame, a checkpoint's included, and a sender that no longer stands ends the session `NotMember`.
+
+### 15.5 A mismatch
+
+A mismatch is **evidence**. Everything below happens at once, for each frame the checkpoint contradicts:
+
+1. **Evidence.** `ChannelEvidence` is made and kept: the last 64 (`EVIDENCE_KEPT`), in memory, readable with `NodeHandle::channel_evidence()` (oldest first). It has a `kind` (`Mismatch`, `Conflict` or `BadCheckpoint`), the channel id, the sender's device, the key epoch, the frame's `seq0`, **the frame octets the node accepted**, the face it came over (`ingress`), **the signed checkpoint frame** that contradicts it (`proof`: for a `Conflict`, the frame accepted first; for a `BadCheckpoint`, empty) and the node's clock. A third party that is given the channel key can open both frames and check the signature against the sender's key. `encode()` writes it (version 1; every integer big-endian; a varint is the QUIC one):
+
+  ```
+  version (1, = 1) | kind (1: 1 Mismatch, 2 Conflict, 3 BadCheckpoint)
+  channel id (8) | key epoch (4) | seq0 (8) | ingress face (8) | when, ms (8)
+  sender: length (varint) | its Name as a complete Name TLV
+  frame: length (varint) | octets
+  proof: length (varint) | octets
+  ```
+2. **`GetNotice::Retracted { writer, from, to }`** is told to every `Prompt` `Items` that took the channel: the items it was given with a `seq` from `from` to `to` (inclusive) are not the writer's. Delivered items stay delivered; the stream takes nothing back, and the application discards. For a data frame `from` and `to` are its sequences. If the contradicted frame **wrote the name table** (a `BIND`, an `UNBIND`, or a data frame with a message that carries its own name) or is another `CONTROL` frame, `to` is the highest sequence accepted at that time, because everything after it may have been read under a table or a state a holder wrote. Only the frame accepted **first** at its sequence (the one that was delivered) is retracted; a second frame was only an event.
+3. **The link is barred** (§14.7): once for each face that carried a contradicted frame, in one checkpoint, through the node's `IngressBar`.
+4. **`Alert::ChannelForgery { writer, channel, key_epoch, seq, via }`** arrives as a `Change::Alert` and as a `warn` log; `via` is the face. The host maps it to the link's key and device with `Links::report()` (ndn-ext) and decides what to do about a person's device; `Node::suspect` stays the only reporting call, applies to a device key the host can name, and a link-level offender gets the bar and not a suspicion.
+5. **A rebinding frame resets the names.** If the contradicted frame wrote the name table, the receiver puts the table back to the session's, counts `resets`, and asks the sender for the session again (at most once a second per sender, as §12.3).
+
+A mismatch does not end the session. A frame the checkpoint contradicts **never reaches a `Trust::Verified` receiver** (§15.8), and a forged frame that is the same as a withheld genuine one is **not** redelivered when the genuine one arrives (the sequence is spent).
+
+### 15.6 Conflicts, replays, `END` and a bad checkpoint
+
+- **A conflict.** The replay window drops a second frame at a `seq0` it has seen (§12.2), which would hide a holder's second frame. So the receiver answers for a frame at a seen sequence: one with the same octets as an accepted frame (or hashing to a settled one) is a copy and is dropped for a comparison; one that **differs** gets **one AEAD attempt**, at most **3 a sequence**, so garbage costs no more, and, if it opens, is a **conflict**. The frame accepted first stays the one delivered; the second is **an event, not a delivery** (`Delivery::Conflict`, counted `conflicts`), and evidence of kind `Conflict` is made at once. **Nobody is barred and no alert is raised**: either face may be the honest one, and the checkpoint that covers the sequence says which frame the sender did not send (the other one is then a mismatch, §15.5). Both frames stay in the slot for that, at most 64 second frames a channel.
+- **A second frame at a sequence a checkpoint already listed** is a mismatch at once: the first frame was settled by a verified checkpoint, so this one is provably not the sender's. Its face is barred and the alert raised.
+- **A replayed checkpoint** changes nothing. It is bound to its channel id, key epoch and range; a record sealed again at a new sequence verifies, covers frames already judged and so judges nothing, and **lifts no hold** (§15.7): the hold lifts only when nothing accepted waits past `unchecked_max`. A record re-sealed for another channel, another key epoch or another range fails its signature. A checkpoint whose own sequence was already seen is read as a second frame and judged as usual, but does not count in the lanes' gap rule.
+- **`END` is held until a checkpoint lists it.** Any holder can seal an `END` (§13.11), so on a channel that announces checkpoints an `END` the receiver accepts ends nothing by itself: it is held, and the session ends `Closed` only when a verified checkpoint **lists** it. The sender queues one right after its `END` (§15.3). A forged `END` is not listed by the sender's checkpoint: it is a mismatch, the hold is forgotten, and the session goes on. A session that announces no checkpoints ends at once, as before.
+- **A bad checkpoint.** A checkpoint that opened under the channel key and does not verify under the sender's key was made by a holder. The receiver makes evidence of kind `BadCheckpoint`, **bars the face it came over**, raises `Alert::ChannelCheckpoint { writer, channel, key_epoch, via }` and **ends the session** with `EndReason::BadCheckpoint` (`LiveEnded`), which says that a holder of the key made it and which face is barred, and that the receiver should ask the sender again once that link is dealt with. This **fails closed**: the session's frames are not to be trusted, and a holder can end a session this way at will (§13.12 item 4).
+
+### 15.7 Silence is not trust
+
+A receiver's **silence clock** starts when a frame is accepted and none is waiting for a verified checkpoint, and each verified checkpoint moves it to the oldest frame still waiting above its range (none: it stops). `unchecked_max` is `max(4 × period, 100 ms)`.
+
+- **Past `unchecked_max`** a `Prompt` receiver **holds** what follows: frames accepted from then on are not delivered, counted `held`, until a verified checkpoint lifts the hold. They are then delivered in the order they were accepted, except any the checkpoint contradicts, which are dropped (and are evidence). The held frames are bounded: 4,096 frames and 2 MiB a channel, and the node's 8 MiB in all; past a bound the oldest is dropped, counted `held_dropped`, and the `Items` are told a gap (`Lagged`).
+- **At 3 s** with no checkpoint that verifies, the session **ends** with `EndReason::Unverifiable` (`LiveEnded`), counted `unverifiable`; the frames still held are told as missed first. The reason says to ask the sender again and why: a link that drops the sender's stream, where checkpoints ride, a sender that stopped signing, or a holder racing the sender.
+- The clock is read at every accepted frame and by the node's maintenance pass (every 250 ms), so a channel that goes quiet is ended too.
+- **A checkpoint the receiver cannot verify** (§15.4 step 2) counts for nothing: the rule applies.
+- **A channel that announces no checkpoints** (no stream, §15.3) has no clock: nothing is waited for, nothing exposes a forgery, and what is delivered is authenticated only as a holder's. `ChannelInfo::checkpoint` is `None` and so is its `detection_window`.
+- **A sender that is idle** gives a receiver nothing to wait for: a receiver with nothing unchecked has no clock, and the idle checkpoint (§15.3) is liveness, not a requirement.
+
+### 15.8 `Trust::Verified`
+
+`GetOptions::trust` is `Trust::Prompt` (the default: §15.1) or `Trust::Verified`. A `Verified` `Items` has a **lane** of its own at the receiver, with its own name table and its own hold queue; a `Prompt` and a `Verified` `Items` of one space share the channel and the slots.
+
+- **What it delivers.** A frame only after a verified checkpoint **lists it with the same hash**, in the order the frames were accepted. A frame the checkpoint does not list is dropped and is evidence (§15.5); it never reaches the lane. No forgery of a holder is ever delivered. The cost is up to one checkpoint period of latency (W of §15.9), so it cannot meet the latency target of a presence channel: use it where a forged cursor is worse than a late one.
+- **When a checkpoint is lost.** A checkpoint covers only its own range, so a frame whose checkpoint was lost is never listed. It is **dropped, counted** (`held_dropped`, and `unchecked` when a later checkpoint's range passes it) and told as `Lagged` as soon as a later checkpoint's `lo` passes it, and after 3 s at the latest; it is **never** delivered unverified. If no checkpoint verifies within 3 s the session ends `Unverifiable` (§15.7), as for `Prompt`.
+- **A channel with no checkpoints** (§15.3) is never delivered to a `Verified` `Items`: each is told once `LiveEnded` with `EndReason::Unverifiable`, whose text says to ask for `Trust::Prompt` or to use a path with a stream.
+
+### 15.9 The stated window
+
+`W = P + d + ε`: the checkpoint **period** `P`, the one-way delay `d` of the stream to this receiver, and verification queueing `ε` of 1 ms (`VERIFY_EPSILON`: one Ed25519 verification, 41 µs, plus scheduling). At the default period and a 1 ms path, **22 ms**.
+
+- **`P`** is `ChannelConfig::checkpoint`, set by `Config::channel` (default `CHECKPOINT_DEFAULT`, **20 ms**), held to **1 ms to 2 s** (`CHECKPOINT_MIN`, `CHECKPOINT_MAX`: a value outside is taken as the nearest bound). A sender signs at most `1 / P` times a second a channel: 50 at the default, 1,000 at 1 ms. It is carried in each session (`S_CKPT_MS`, in ms), which is how a receiver learns it, and a receiver holds it to 1 ms to 2 s too.
+- **`ChannelConfig::detection_window(delay)`** and **`ChannelInfo::detection_window(delay)`** compute `W` (the second for the period the sender announced, `None` for a channel with no checkpoints); the `Items` documentation states it.
+- **What it says.** Inside the window an emission is authenticated as "a holder of the channel key's"; after a covering checkpoint verified it is authenticated as the sender's. A frame a holder forged is delivered to a `Prompt` receiver for at most `W` before the next checkpoint that covers it exposes it, **provided** the checkpoint arrives and the frame is not accepted after the checkpoint that covers it (§15.11).
+- **The period is a liveness bound, never a correctness one.** A checkpoint that is late or lost leaves frames unchecked (held, for `Verified`) and never makes a frame look forged.
+- **Tested** on a paused clock with a real sender at periods of 20 ms, 100 ms and 1 ms: a forgery is not exposed before one period has passed and is exposed within `W`.
+
+### 15.10 Limits and counters
+
+| What | Limit | Over it |
+|---|---|---|
+| Checkpoint period | 20 ms by default; 1 ms to 2 s | held to the nearest bound |
+| Signatures a sender makes | at most one a period for each channel, and none while nothing was sent | |
+| Idle checkpoint | one empty one every 5 s while a receiver holds an idle channel with a stream | |
+| Frames one checkpoint lists | 4,096 | the ring forgot the older ones; `lo` rises past them |
+| The sender's ring | 4,096 frames and 4 MiB a channel (§13.2 item 9) | the oldest is forgotten and counted `unchecked` |
+| The receiver's slots | 4,096 frames, 2 MiB a channel, 8 MiB a node | the lowest `seq0` is forgotten and counted `unchecked` |
+| Second frames kept for a conflict | 64 a channel | not kept (still evidence) |
+| AEAD attempts at a seen sequence | 3 a sequence | compared only |
+| Evidence kept | the last 64 | the oldest goes |
+| Frames held for a lane | 4,096 and 2 MiB a channel, within the node's 8 MiB | the oldest dropped, `held_dropped`, `Lagged` |
+| Silence | hold after `max(4 × period, 100 ms)`; end at 3 s | `held`; `Unverifiable` |
+| Frames a `Verified` lane waits for a listing | 3 s | dropped, `Lagged` |
+
+The receiver's counters in `Stats.rx` (§12.8) gain `checkpoints_verified`, `unverifiable_checkpoints`, `bad_checkpoints`, `mismatches`, `conflicts`, `unchecked`, `held`, `held_dropped`, `resets` and `unverifiable`. The sender's counters in `Stats.tx` gain `checkpoints`, `empty_checkpoints`, `checkpoint_failed` and `unchecked`.
+
+### 15.11 What checkpoints do not do, and what they close
+
+**They do not:** prove delivery, order or completeness (loss is not forgery; `Reliable` and `Window` show a gap by the gap rule, §12.6, and a `Latest` gap is invisible by design); catch a forged frame no receiver accepted; attribute a forgery to a person (only to a **key holder** and to the **link** it came over); stop a forged frame being delivered inside the window; make a path without a stream verifiable (§15.3); or hide a sender that equivocates, which is a holder too.
+
+**What is not judged.**
+
+- **A frame accepted after the checkpoint that covers it was verified** is never judged: the slot is made when the frame is accepted, a checkpoint judges the slots it finds, and the next checkpoint's `lo` is past it (counted `unchecked`). So a datagram that arrives after the stream's checkpoint, or a holder that places its own frame at a sequence the sender used and this receiver has not accepted yet, after the covering checkpoint, is not exposed.
+- **A frame in the range of a checkpoint that never arrived** (a relay dropped a stream frame, §14.4) is never judged either.
+- **A frame forged far ahead of the sender's sequence** is judged only when the sender's range reaches its `seq0`. Until then it is above every range: it can mute that name in `Latest` and advance the replay window (within the 2^24 bound of §12.2), and the silence rule holds delivery after `max(4 × period, 100 ms)` and ends the session at 3 s.
+- **A holder can end a session** with a checkpoint that does not verify (§15.6), or on a channel that is idle by making a receiver accept a frame no checkpoint reaches within 3 s (§15.7); either way the receiver asks again.
+
+**What this closes of the residuals §13.12 listed before stages 4 and 5** (the list as it was: 1 forge, 2 re-seal, 3 end the session, 4 truncate and withhold, 5 rename, 6 no ingress binding, 14 stage 4 reminders; the rest are §13.12 now):
+
+| Was | Closed | What remains (§13.12) |
+|---|---|---|
+| Forge | **Detected**: a frame the sender did not seal is a mismatch with evidence, a bar on its link, an alert and a `Retracted`; never delivered to `Verified` | delivery to `Prompt` inside `W` (item 1); frames no checkpoint judges (item 2); attribution to a link and not a person (item 6); no checkpoints on a path with no stream (item 16) |
+| Re-seal old content | **Detected** as a mismatch (the sender's checkpoint does not list it) | delivery inside `W` (item 1); a far-ahead sequence (item 3) |
+| End the session | A forged `END` ends nothing: it is held until a checkpoint lists it, and is a mismatch if none does | a holder can end a session by a bad checkpoint, or by the silence rule (item 4) |
+| Truncate and withhold | A holder that **replaces** a frame with its own at the same `seq0` is a mismatch; withheld frames of `Reliable` and `Window` show as a gap, and a lost frame is not forgery | pure withholding is not prevented or attributed, and is invisible in `Latest` (item 5) |
+| Rename | A contradicted `BIND`, `UNBIND` or self-naming message retracts everything accepted since, resets the table and asks the sender again | a rename is read until the checkpoint exposes it (item 1) |
+| No ingress binding | The forwarder drops a frame from any face but the route's source (§14.4) and the node is given the forwarder's own face id as the ingress | `deliver_frame` still takes a number the host chooses; the ingress is the nearest hop's face (item 7) |
+| Stage 4 reminders | The engine's reader never calls `deliver_frame`; the source face is checked by the table and the app face's inbox is bounded and counts its drops | one task reads the inbox of every channel (item 15) |
+
+### 15.12 Vectors
+
+Hex, as the implementation writes them (asserted by `chan/checkpoint_tests.rs`). The record was computed independently with Python and `openssl pkeyutl -sign -rawin` (Ed25519) from the layout of §15.2: a wrong label, a missing field, a wrong byte order or a different list digest fails there.
+
+Inputs: the device key is the Ed25519 seed of 32 octets of `42`, whose public key is `2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12`; channel id `0102030405060708`; key epoch 258 (`0x0102`, so the header carries `02`); `lo` 5, `hi` 40; three entries, at `seq0` 5, 9 and 30, whose hashes are the runs of 16 octets `10 11 … 1f`, `20 21 … 2f` and `30 31 … 3f` (stand-ins: not hashes of frames).
+
+**The record,** 118 octets: `lo`, `hi` and `n` are `05 28 03`; then the entries `00` + `101112…1f`, `04` + `202122…2f` (delta 4 from 5) and `15` + `303132…3f` (delta 21 from 9); then the 64-octet signature.
+
+```
+05280300101112131415161718191a1b1c1d1e1f04202122232425262728292a2b2c2d2e2f15303132333435363738393a3b3c3d3e3f1e4039039753d79a846efebc1432d95ca2e74c5144a0cfa066f4849aef5fa2f5ff672d55a3ecd789bd39d1fbefc80b8da11741956099501db2eefcc459776506
+```
+
+**The `CHECKPOINT` frame** of that record, 154 octets: AES-256-GCM, `K` the octets `00 01 02 … 1f`, class stream, kind `CHECKPOINT`, `count` 0, `seq0` `1122334455667788`, the key epoch and channel id above (so the frame key and the nonce are those of §11.7). It opens, in `ring` and in RustCrypto, to the record above.
+
+```
+00310102030405060708021122334455667788007f587c27c5dce02dcb3fd9b8344ca7fcef4f2aeec00cf775253a142c60d2f6041ecc423b0010cb806ef7bee93e3424843e6f4bdba790fd51c5e356718e6ea52a48b62e32ef535e8dca5142d0b55f30765ec9caceefe196969c401d5b9ba2d67f908216f4ba7c0147f0834f65b98700fe03b5927b24adc0d747f104795a4c82527091e4ed14e2
+```
+
+### 15.13 Threat notes for checkpoints
+
+- **A member forges another sender's frames.** It holds `K` (it asked) and can seal, and it can inject into links it is on. It is exposed by the next checkpoint that covers the frame (§15.5), with evidence against the link; `Trust::Verified` never delivers it. A member that **withholds** (drops the genuine frame and delivers its own at the same `seq0`) leaves the receiver with a frame the checkpoint contradicts, which is a mismatch too. What it cannot do is make a checkpoint for the sender: that takes the sender's device key.
+- **A stolen channel key.** The thief reads and forges under the key until the next re-key (the session's lifetime, 1 h by default, or the first removal); its forgeries fall to the checkpoints, and it cannot sign a checkpoint or open a session. It can end a session with a bad checkpoint (§15.6), which fails closed.
+- **A stolen device key** signs sessions and checkpoints as the device until it is revoked or its person is removed; revocation and removal end its sessions on the generation move (§12.3). This is the exposure a device key always has ([heap.md](heap.md) §9.9).
+- **Flooding.** A frame that is oversized, malformed, of an unknown channel, a replay, of a face that is not the route's source or from a barred face costs a comparison or a lookup and no cryptography. A checkpoint from a **non-holder** fails the AEAD first. One from a holder costs an AEAD attempt and, if it opens, one Ed25519 verification (about 41 µs); the first that does not verify ends the session and bars the face, and one that verifies (an old record sealed again) costs a verification and changes nothing (§15.6). The sender signs at most once a period for each channel, whatever the frame rate.
+- **Replay.** A replayed frame is dropped by the replay window; a replayed checkpoint is bound to its channel, key epoch and range (§15.6); a session Data replayed to a receiver fails its fresh ask (§10).
+- **A removed member as a relay** between two others holds the old key until the re-key. For `REKEY_GRACE` (5 s) after a receiver first sees the new epoch, and for the window of §15.9, it can forge under the old key; afterwards its frames fail the AEAD (§3.6).
+- **Memory.** What a receiver keeps for checkpoints is bounded (§15.4: 4,096 slots, 2 MiB a channel, 8 MiB a node) and counted when forgotten; what it holds for a lane is bounded too (§15.7).
+- **Clocks.** No decision about membership, authenticity or replay rests on a clock. The period, the silence clock and the 3 s are counted on the receiver's monotonic clock and decide only how long a frame is waited for.
+
+## 16. Measured
 
 Informative. This section records what was measured of the stage-3 implementation, how, what the figures leave out, and what was tried and removed. Nothing in it is normative. The design note (SHAPES-CHANNEL.md §18 and §19) holds the raw tables, the commits and the scripts.
 
-### 14.1 Method
+### 16.1 Method
 
 - **The rung.** `examples/chan_ping.rs` of `ndn-face-quic` runs `Heap::emit` (`Latest`) into `Heap::live` between two nodes (`/bob/phone` writes, `/carol/tablet` reads). The space and the channel are made by the signed setup of §3. The frames cross **one** QUIC link on loopback. The `Carrier` is an adapter over `LinkFace::forward_side` (the datagram lane), `send_side` (the stream lane) and `side_limits`. The two nodes share one forwarder, so the setup's Interests do not cross the link; the frames do.
 - **Cores.** Pinned to four cores (`taskset -c 10-13`) of a shared 64-core AMD EPYC 7532 host, with two runtimes of one worker each: the sender's writer task and the QUIC driver share a worker.
@@ -710,9 +1119,9 @@ Informative. This section records what was measured of the stage-3 implementatio
 - **Latency.** The half round trip of a 64-octet message: 14 pairs, each the p50 of 10,000 timed round trips after 1,000 warm-up ones, the outer 1 % dropped, against the raw QUIC datagram. *Cold* is the host as it is; *hot* adds four busy loops on other cores.
 - **Per-message CPU.** Without a link: a carrier that records frames and releases one at a time; 64 octets, 14 messages to a frame, 2,000,000 messages, 3 runs; the sender is `Heap::emit` through the sealed frame on one thread, the receiver is `deliver_frame` and the take from `Items`, by `poll_next` or by `next_batch`.
 - **`path_mtu_max`.** 9,000 (datagrams of 8,962 octets) and 1,452 (datagrams of 1,414), so a jumbo-frame path and an Ethernet path are both measured.
-- **Load.** The tuned figures of §14.2 were taken at host load 5.1–6.2 (the host was shared), which put about ±5 µs of noise on single latency pairs.
+- **Load.** The tuned figures of §16.2 were taken at host load 5.1–6.2 (the host was shared), which put about ±5 µs of noise on single latency pairs.
 
-### 14.2 After the stage-3 tuning
+### 16.2 After the stage-3 tuning
 
 At `path_mtu_max` 9,000. The ratio is to the raw QUIC datagram row; the last column names the raw stream row where it was measured.
 
@@ -737,9 +1146,9 @@ The 64-octet half round trip, at 9,000, medians of 14 pairs (the range of the pa
 
 Per message at 64 octets, 14 to a frame: the sender 469 ns (`next_batch`) and 477 ns (`poll_next`); the receiver 280 ns by `next_batch` and 333 ns by `poll_next`. The per-message budget the design set was 500 ns. At 64 octets nothing is allocated per message beyond the frame (asserted by `the_64_byte_latest_path_allocates_nothing_per_message_beyond_the_frame`, §13.2).
 
-These figures are those of the tuning pass that ends at the design note's §18.6. Changes made after it (the one limit `STREAM_FRAME_GRANT`, the receiver keeping its last channel, the sender's one-lock idle decision, and the fixes of the security review: a message in a stream frame over 9,000 octets that is under half of it is copied out of the frame, the hold, the ring's exact-size frames, the setup's bounds) were **not** followed by a new full table; the one latency comparison made after the first three (24 interleaved pairs, for the receiver change) showed no detectable difference. The verdict of §14.6 therefore stands on these figures, and the optimisation pass (§14.6) starts with a fresh table.
+These figures are those of the tuning pass that ends at the design note's §18.6. Changes made after it (the one limit `STREAM_FRAME_GRANT`, the receiver keeping its last channel, the sender's one-lock idle decision, and the fixes of the security review: a message in a stream frame over 9,000 octets that is under half of it is copied out of the frame, the hold, the ring's exact-size frames, the setup's bounds) were **not** followed by a new full table; the one latency comparison made after the first three (24 interleaved pairs, for the receiver change) showed no detectable difference. The verdict of §16.6 therefore stands on these figures, and the optimisation pass (§16.6) starts with a fresh table.
 
-### 14.3 Why the gaps remain
+### 16.3 Why the gaps remain
 
 **Latency.** The channel's code runs cold once a message is alone on the link: the sender spends about 5 µs beyond quinn's `send_datagram` (the call the raw row makes too) and the receiver about 2.5 µs, against 1.4 µs a message when the same path runs hot in the per-message row. The 1.1× allowance is about 3 µs. The call back to the carrier and the wake of the `Items` consumer together are under 1.5 µs of the excess, and an isolated message asks for no call back (`BURST_GAP`, §13.8). The measured cause is the **cold footprint of the idle path**: the name table, the standing map, `Pending`, the ring and the lock are each touched by a lone message. Further measurements:
 
@@ -750,14 +1159,14 @@ These figures are those of the tuning pass that ends at the design note's §18.6
 
 **Throughput.** From 128 octets up the writer thread carries two AEAD passes over every octet: the channel's seal of the frame (§11.2) and quinn's own encryption of the packet, on one worker that also runs quinn's driver. The raw row does only the second. Removing the channel's seal entirely in a scratch run (not shipped) gives the ceiling: the sender's frames a second rise from 82.5 k to 103 k at 1 KiB (+25 %) and from 91.5 k to 107–121 k at 8 KiB, which is about 0.61 times the raw datagram at 1 KiB and about 0.72–0.82 times the raw stream at 8 KiB. So the 0.9 targets at 1 KiB and 8 KiB cannot be met with two AEAD passes on one worker. At 64 octets the same scratch run reaches 1.95–1.98 M messages/s against 1.79–1.87 M with the seal in, so the 1.94 M compared against is reachable only barely even with a free seal.
 
-### 14.4 What the tuning changed in the specified behaviour
+### 16.4 What the tuning changed in the specified behaviour
 
 1. **The stream frame limit (§13.8, §11.6).** At `path_mtu_max` 1,452, 8 KiB messages over 256 paths stalled: 0 messages in the window. The cause was a stream frame of 1,049,252 octets, built from 128 queued messages, over the 1,048,576 octets the face grants. The face refused it, the refusal was taken as a dead stream, and every later emission rebuilt and re-sealed a 1 MiB frame (AES-GCM was 60 % of the sender thread). `Carrier::stream_frame_max()` is the fix: the stream lane packs to the smaller of it and the channel's own limit, and a message whose frame fits no frame the stream takes is refused `TooLarge` at `emit`. After it the same row is 54.7 k messages/s. The limits are now one constant: `ndn_transport::side_header::STREAM_FRAME_GRANT` (1 MiB) is the face's stream-frame limit and the channel's stream-frame default, and the message default is derived from it (the grant less 1 KiB), because a message at the earlier default was refused at `emit` (`TooLarge`, size 1,048,624, max 1,048,576), which the test `a_message_of_the_default_limit_fits_a_frame_the_face_grants` caught.
 2. **The ring hashes lazily (§13.2 item 9).** The checkpoint hash was a sixth of the writer thread at 1 KiB and 8 KiB (16–17 % of its samples). Recording a frame now keeps a reference and the hash is computed when the ring is drained. Interleaved before and after, 6 pairs: 64 B ×1.03, 1 KiB ×1.16 (506 k to 571 k), 8 KiB ×1.18 (74 k to 86 k).
 3. **The receiver keeps its last channel.** A run of frames for one channel takes no session lookup. The saving is small and was not separable in latency: no detectable difference over 24 interleaved pairs.
 4. **The idle write is one lock round.** An emitter that writes inline decides in the same lock round that commits its frame whether the lane is idle; the earlier path packed again and took a third lock. The per-frame message counter is one add. An isolated message asks for no call back (§13.8); that change had no measurable end-to-end effect (p50 median −0.5 µs over 20 interleaved pairs).
 
-### 14.5 Tried and removed
+### 16.5 Tried and removed
 
 **Authenticate-only for unsealed spaces.** The idea was to send the frames of an unsealed (public) space under a MAC and no encryption. It was measured and **dropped**: every frame in every space stays AEAD sealed (AES-256-GCM; ChaCha20-Poly1305 only where `ring` does not build or the CPU has no AES), and nothing of the work reached the wire, the codec or the sources. The reason is cost on the measuring host (AMD EPYC 7532: AES-NI and PCLMULQDQ, no VAES; `ring` 0.17): **no MAC beats `ring`'s AES-GCM seal above about 150 octets**, because the seal is one stitched AES-NI and PCLMUL kernel and every MAC has to process the whole frame as additional data, which `ring` does not stitch. ns a frame, medians:
 
@@ -781,16 +1190,16 @@ The cause is that a drain is about one frame long on a single worker, so nothing
 
 **The copies.** A read of the path from `Heap::emit` to quinn found one copy of a message's payload by the channel (into the frame buffer, which batching needs) and none for the seal, which is in place, nor for the datagram carrier. The one copy that could go is in ndn-ext: a stream frame of 16 KiB or less is copied once behind its 4-octet length prefix. It was not changed.
 
-### 14.6 Where this leaves the gates
+### 16.6 Where this leaves the gates
 
-Against the targets of the design note every performance gate **except 8 B is missed**: the 64-octet half round trip (1.37 cold and 1.24 hot against 1.1), the 64-octet rate (1.837 M, about 5 % under the 1.94 M compared against), 128 octets to 1 KiB (0.23 to 0.449 of the raw datagram against 0.9) and 8 KiB (0.60 of the raw stream at 9,000 and 0.83 at 1,452 against 0.9). 8 B passes (2.110 M at 9,000, 1.07 times the figure compared against). What remains of the gap is the cold footprint of the idle path (latency) and the two AEAD passes on one worker (throughput), both of §14.3. What is not yet done and would help: the receiver's open off the reader thread (which needs `deliver_frame` to stop returning a per-frame result), the 4-octet prefix copy of ndn-ext's `side.rs`, a sender cache in `Heap::sender` (0.07 µs), a smaller cold footprint of the idle path, and striping a link over several connections (the design note's §17.6, undecided).
+Against the targets of the design note every performance gate **except 8 B is missed**: the 64-octet half round trip (1.37 cold and 1.24 hot against 1.1), the 64-octet rate (1.837 M, about 5 % under the 1.94 M compared against), 128 octets to 1 KiB (0.23 to 0.449 of the raw datagram against 0.9) and 8 KiB (0.60 of the raw stream at 9,000 and 0.83 at 1,452 against 0.9). 8 B passes (2.110 M at 9,000, 1.07 times the figure compared against). What remains of the gap is the cold footprint of the idle path (latency) and the two AEAD passes on one worker (throughput), both of §16.3. What is not yet done and would help: the receiver's open off the reader thread (which needs `deliver_frame` to stop returning a per-frame result), the 4-octet prefix copy of ndn-ext's `side.rs`, a sender cache in `Heap::sender` (0.07 µs), a smaller cold footprint of the idle path, and striping a link over several connections (the design note's §17.6, undecided).
 
 **The owner's decision** is to finish stages 4–7 first and then to do **one focused performance pass**; the open items above are left to that pass.
 
-### 14.7 What the figures do not cover
+### 16.7 What the figures do not cover
 
 - A real network interface: every run is loopback.
-- `Reliable` and `Window` (only `Latest` was measured), relays and fan-out, a sealed space's checkpoints, and the setup's Interests crossing the link (the two nodes share one forwarder).
+- `Reliable` and `Window` (only `Latest` was measured); the costs of stages 4 and 5, which no figure here includes: a frame through a relay and its fan-out, the signing and verification of checkpoints at the default period, and the latency of `Trust::Verified` (§14 and §15 are specified from the behaviour the tests exercise, not from a measurement); and the setup's Interests crossing the link (the two nodes share one forwarder).
 - Zenoh was not rerun on this host; comparisons to it use the figures of the design note's baseline (§1.2), taken at another load. Zenoh was not measured at 128 B to 512 B.
-- A full table after the changes made since the tuning pass (§14.2), and the latency with and without an offload.
+- A full table after the changes made since the tuning pass (§16.2), and the latency with and without an offload.
 - A quiet host: the figures were taken at load 5–6 on a shared host, and single latency pairs vary by ±5 µs.
