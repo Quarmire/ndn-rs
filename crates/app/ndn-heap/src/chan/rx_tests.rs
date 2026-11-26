@@ -300,6 +300,17 @@ impl Fx {
         self.carol().inner.chan_deliver(frame, ingress, now).await
     }
 
+    /// Keep the node's own maintenance pass from running. A test that hands frames in at a clock
+    /// of its own, or counts what only a frame should do, is not the pass's to disturb: the pass
+    /// reads the real clock and looks sessions up.
+    fn pause_tick(&self) {
+        self.carol()
+            .inner
+            .chan
+            .tick_paused
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// The datagram frame limit the session says (`S_FRAME_MAX`).
     fn frame_max(&self) -> usize {
         let terms = self
@@ -526,6 +537,7 @@ async fn a_frame_under_an_unknown_key_epoch_costs_no_aead_attempt_and_asks_once_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unknown_bare_id_is_held_50_ms_and_dropped() {
     let mut fx = latest().await;
+    fx.pause_tick();
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
 
@@ -2114,6 +2126,7 @@ async fn stream_frames_that_overtake_the_session_are_not_lost_to_a_window_joiner
         .collect();
     got.sort();
     got.dedup();
+    let stats = &carol.inner.chan.stats.rx;
     assert_eq!(
         got,
         [
@@ -2122,10 +2135,22 @@ async fn stream_frames_that_overtake_the_session_are_not_lost_to_a_window_joiner
             ("/chat".to_string(), vec![b'w', 2]),
             ("/who".to_string(), b"here".to_vec()),
         ],
-        "the joiner got the window's replay and the standing value that came before its session"
+        "the joiner got the window's replay and the standing value that came before its session \
+         (early {early}; held expired {}, full {}, evicted {}; unknown_channel {}, replayed {}, \
+         too_old {}, unauthentic {}, malformed {}, accepted {}, messages {}, unknown_epoch {})",
+        stats.held_unknown_expired.get(),
+        stats.held_unknown_full.get(),
+        stats.held_unknown_evicted.get(),
+        stats.unknown_channel.get(),
+        stats.replayed.get(),
+        stats.too_old.get(),
+        stats.unauthentic.get(),
+        stats.malformed.get(),
+        stats.accepted.get(),
+        stats.messages.get(),
+        stats.unknown_epoch.get(),
     );
     assert!(items.hello_seen(), "and the HELLO");
-    let stats = &carol.inner.chan.stats.rx;
     assert_eq!(
         (
             stats.held_unknown_full.get(),
@@ -2145,6 +2170,7 @@ async fn stream_frames_that_overtake_the_session_are_not_lost_to_a_window_joiner
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn frames_of_an_unknown_channel_are_held_in_bounds_and_expire() {
     let fx = latest().await;
+    fx.pause_tick();
     let genuine = fx.data(SideClass::Datagram, 1, &[named(1, A, b"x")]);
     let (stats, rx) = (fx.stats(), &fx.carol().inner.chan.rx);
     let t0 = Instant::now();
@@ -2206,6 +2232,7 @@ fn early(fx: &Fx, class: SideClass, id: u64, len: usize) -> Bytes {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_flood_from_one_face_does_not_stop_another_faces_early_frames() {
     let fx = latest().await;
+    fx.pause_tick();
     let (stats, rx) = (fx.stats(), &fx.carol().inner.chan.rx);
     let t0 = Instant::now();
     // Face 1 sends 200 frames of random channel ids: 1 KiB each.
@@ -2254,6 +2281,7 @@ async fn a_datagram_of_an_unknown_channel_is_dropped_not_held() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stream_frame_of_the_grant_can_be_held() {
     let fx = latest().await;
+    fx.pause_tick();
     let rx = &fx.carol().inner.chan.rx;
     let grant = ndn_transport::side_header::STREAM_FRAME_GRANT;
     assert_eq!(
@@ -2268,6 +2296,7 @@ async fn a_stream_frame_of_the_grant_can_be_held() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_face_holds_at_most_16_frames_and_two_grants() {
     let fx = latest().await;
+    fx.pause_tick();
     let (stats, rx) = (fx.stats(), &fx.carol().inner.chan.rx);
     let t0 = Instant::now();
     let grant = ndn_transport::side_header::STREAM_FRAME_GRANT;
@@ -2305,6 +2334,7 @@ async fn one_face_holds_at_most_16_frames_and_two_grants() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_hold_pushes_out_the_oldest_frame_of_the_face_that_holds_most() {
     let fx = latest().await;
+    fx.pause_tick();
     let (stats, rx) = (fx.stats(), &fx.carol().inner.chan.rx);
     let t0 = Instant::now();
     let mut id = 1_000u64;
@@ -2356,6 +2386,7 @@ async fn a_full_hold_pushes_out_the_oldest_frame_of_the_face_that_holds_most() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_hold_in_octets_makes_room_for_a_frame_of_the_grant() {
     let fx = latest().await;
+    fx.pause_tick();
     let (stats, rx) = (fx.stats(), &fx.carol().inner.chan.rx);
     let t0 = Instant::now();
     let grant = ndn_transport::side_header::STREAM_FRAME_GRANT;
@@ -2429,6 +2460,7 @@ async fn a_frame_that_arrives_while_held_frames_are_taken_in_queues_behind_them(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_steady_stream_of_frames_takes_no_session_lookup() {
     let fx = latest().await;
+    fx.pause_tick();
     let sessions = &fx.carol().inner.chan.sessions;
     assert!(matches!(
         fx.deliver(fx.data(SideClass::Datagram, 1, &[named(1, A, b"x")]))

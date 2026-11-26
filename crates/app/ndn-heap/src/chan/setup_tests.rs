@@ -791,6 +791,17 @@ async fn a_removed_sender_is_dropped_at_the_generation_move() {
         session.is_current(),
         "judged under the counters as they are"
     );
+    // An entry that is not the removal moves the fold first: a sealed space's removal comes as a
+    // Members entry and an Epoch entry, and either can reach this device ahead of the other.
+    carol
+        .inner
+        .space_of(&space())
+        .unwrap()
+        .log
+        .lock()
+        .fold
+        .version()
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     heap.change(MembersChange {
         remove: vec![n("/bob")],
@@ -798,11 +809,26 @@ async fn a_removed_sender_is_dropped_at_the_generation_move() {
     })
     .await
     .unwrap();
-    eventually(
-        "carol holds the removal: the verdict on bob is stale",
-        || !session.is_current(),
-    )
+    // Wait for the removal itself, not for the verdict to go stale: any move of the fold makes it
+    // stale, and the Members entry of the removal and the Epoch entry it comes with can arrive in
+    // either order, so a stale verdict says nothing yet about bob.
+    eventually("carol holds the record that removes bob", || {
+        !carol
+            .inner
+            .space_of(&space())
+            .unwrap()
+            .log
+            .lock()
+            .fold
+            .is_writer(&n("/bob"))
+    })
     .await;
+    // The fold moved when the removal was applied: the verdict on bob is stale, unless the node's
+    // own pass has judged it already (and ended the session).
+    assert!(
+        !session.is_current() || session.ended().is_some(),
+        "the verdict on a removed sender was neither stale nor ended"
+    );
     // The frame layer, finding it stale, judges the sender again before delivering: it fails.
     match session.recheck(&carol.inner) {
         Err(super::sessions::EndReason::NotMember { why }) => {
