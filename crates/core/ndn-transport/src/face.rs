@@ -699,6 +699,9 @@ mod tests {
             fn send_mtu(&self) -> Option<usize> {
                 Some(120)
             }
+            fn side_frame_max(&self) -> usize {
+                120
+            }
             async fn send_bytes(&self, w: Bytes) -> Result<(), FaceError> {
                 self.sent.lock().unwrap().push(w);
                 Ok(())

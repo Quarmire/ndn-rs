@@ -132,6 +132,13 @@ impl Transport for InProcFace {
             .map_err(|_| FaceError::Closed)
     }
 
+    /// An in-process face carries side frames: the mpsc takes any `Bytes`, so
+    /// the limit is the largest frame the faces grant (one stream frame), the
+    /// same bound every other carrier of a channel applies.
+    fn side_frame_max(&self) -> usize {
+        ndn_transport::side_header::STREAM_FRAME_GRANT
+    }
+
     async fn send_bytes_with_source(&self, pkt: Bytes, source: FaceId) -> Result<(), FaceError> {
         self.app_tx
             .send(TaggedBytes {
@@ -250,15 +257,18 @@ mod tests {
         }
     }
 
-    /// The default `send_side` is right for an in-process face: it pushes the
-    /// frame through the same channel, inline, byte-identical, whatever the
-    /// class; the face has no MTU, so nothing is `TooLarge`.
+    /// An in-process face opts in to side frames: `send_side` pushes the frame
+    /// through the same channel, inline, byte-identical, whatever the class,
+    /// up to the stream frame grant.
     #[tokio::test]
     async fn a_side_frame_reaches_the_handle_unchanged() {
         use ndn_transport::{SIDE_MARKER, SideClass};
 
         let (face, handle) = InProcFace::new(FaceId(5), 4);
-        assert_eq!(face.side_frame_max(), 65_536);
+        assert_eq!(
+            face.side_frame_max(),
+            ndn_transport::side_header::STREAM_FRAME_GRANT
+        );
         for (class, fill) in [(SideClass::Datagram, 1u8), (SideClass::Stream, 2u8)] {
             let mut v = vec![fill; 100_000];
             v[0] = SIDE_MARKER;

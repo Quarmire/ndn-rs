@@ -243,7 +243,7 @@ The sync driver never sees an announce: the sync face's reader takes a name of t
 
 ## 11. The frame
 
-A channel frame is **not an NDN packet and not TLV**: it is a compact binary record, because it is on the hot path and a relay routes on its first ten octets. It travels as a *side frame* on any face ([ndn-link.md](ndn-link.md) §3.1; the face's `send_side`), is marked by a first octet of `0x00` (TLV-TYPE 0 is not assigned: no Interest, Data, Nack or NDNLPv2 packet starts with it), and is never fragmented, retransmitted or judged by the link service.
+A channel frame is **not an NDN packet and not TLV**: it is a compact binary record, because it is on the hot path and a relay routes on its first ten octets. It travels as a *side frame* on a face that carries one ([ndn-link.md](ndn-link.md) §3.1; the face's `send_side`; a face carries side frames only if it opts in, by a `side_frame_max()` above its default of 0, so a face that frames, decodes or codes what it sends refuses every frame `NotCarried`, and a frame that does not start with the marker is refused `Malformed` by every face), is marked by a first octet of `0x00` (TLV-TYPE 0 is not assigned: no Interest, Data, Nack or NDNLPv2 packet starts with it), and is never fragmented, retransmitted or judged by the link service.
 
 Implementation: the routing header and the `UP` record are in `ndn-transport` (`side_header.rs`); the rest of the header, the seal, the messages and the limits are in `ndn-heap` `chan` (`frame.rs`, `aead.rs`, `message.rs`, `varint.rs`, `limits.rs`, and, for the checkpoint hash ring, `ring.rs`).
 

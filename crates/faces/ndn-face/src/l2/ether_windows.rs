@@ -79,6 +79,11 @@ impl Transport for NamedEtherFace {
         Some(self.mtu.load(Ordering::Relaxed))
     }
 
+    /// A channel frame is one Ethernet payload, never fragmented.
+    fn side_frame_max(&self) -> usize {
+        self.mtu.load(Ordering::Relaxed)
+    }
+
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {
         let new = clamp_ether_mtu(mtu)?;
         self.mtu.store(new, Ordering::Relaxed);
@@ -159,6 +164,11 @@ impl Transport for MulticastEtherFace {
 
     fn send_mtu(&self) -> Option<usize> {
         Some(self.mtu.load(Ordering::Relaxed))
+    }
+
+    /// A channel frame is one Ethernet payload, never fragmented.
+    fn side_frame_max(&self) -> usize {
+        self.mtu.load(Ordering::Relaxed)
     }
 
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {

@@ -99,19 +99,21 @@ of the heap crate is the first). `Face::send_side(frame, class)` hands one to
 the transport **without the link service**: no LP header, no fragmentation, no
 reliability, no scope judge. `SideClass` says `Datagram` or `Stream`.
 
-`Transport` defaults are right for most faces: `send_side` refuses a frame that
-does not start with the marker (`SideRefused::Malformed`; an NDN packet never
-takes the side path), sends one that fits `send_mtu()` through `send_bytes` as
-is and refuses a longer one
-(`SideRefused::TooLarge`; nothing is fragmented), ignoring the class;
-`forward_side` (a synchronous send that never waits) is `Unsupported`;
-`side_frame_max()` is `send_mtu()` or 65,536. Override them only when the
-default is wrong: a transport with a second carrier (QUIC's stream), a
-transport whose limit is not `send_mtu` (a ring slot; the smallest phy of a
-multi-phy radio), or a transport that cannot carry the frame at all. A
-TLV-framed byte stream (`StreamFace`) cannot: the codec would read the
-marker as a TLV header and lose its place in the stream, so it answers
-`NotCarried`.
+A transport carries side frames only if it **opts in**: `side_frame_max()` is 0
+by default, and then `send_side` refuses every frame (`SideRefused::NotCarried`),
+so a face that frames, codes or decodes what it sends (a TLV byte stream such as
+`StreamFace`, whose codec would read the marker as a TLV header and lose its place;
+COPE and recoder faces; NDNts-framed BLE) cannot take one by forgetting to say so.
+A face that sends a frame as one unit (a datagram, an Ethernet payload, a ring
+slot, an in-process channel) opts in by overriding `side_frame_max()` with its
+limit, usually `send_mtu()`; the default `send_side` then refuses a frame that does
+not start with the marker (`SideRefused::Malformed`; an NDN packet never takes the
+side path) and one longer than `side_frame_max()` (`SideRefused::TooLarge`; nothing
+is fragmented), sends the rest through `send_bytes` as is, and ignores the class.
+`forward_side` (a synchronous send that never waits) is `Unsupported`. Override
+`send_side` only for a transport with a second carrier (QUIC's stream) or one
+whose limit varies by phy (the smallest phy of a multi-phy radio); an override
+must make the same two refusals (marker, length) itself.
 
 On receipt `LpLinkService::recv` returns a marked frame unchanged, before any
 reliability bookkeeping, and the engine's face reader peels it right after
