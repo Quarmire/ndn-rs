@@ -112,4 +112,37 @@ impl NodeHandle {
         .ok()?;
         seal(&cipher, &header, &record).ok()
     }
+
+    /// What this node's receiver counted so far, as `(name, count)` (node-wide, every channel):
+    /// how many frames it took, how many no checkpoint judged (`unchecked`: forgotten for the
+    /// ring's bounds or below a range verified without them), the checkpoints it read and
+    /// verified, the frames they contradicted. A test reads them to say whether a forged frame
+    /// it made was accepted before the checkpoint that covers its sequence.
+    pub fn adversary_rx_counters(&self) -> Vec<(&'static str, u64)> {
+        let rx = &self.inner.chan.stats.rx;
+        vec![
+            ("frames", rx.frames.get()),
+            ("accepted", rx.accepted.get()),
+            ("replayed", rx.replayed.get()),
+            ("too_old", rx.too_old.get()),
+            ("unauthentic", rx.unauthentic.get()),
+            ("unknown_epoch", rx.unknown_epoch.get()),
+            ("unknown_channel", rx.unknown_channel.get()),
+            ("unchecked", rx.unchecked.get()),
+            ("checkpoints", rx.checkpoints.get()),
+            ("checkpoints_verified", rx.checkpoints_verified.get()),
+            ("checkpoints_over_rate", rx.checkpoints_over_rate.get()),
+            (
+                "unverifiable_checkpoints",
+                rx.unverifiable_checkpoints.get(),
+            ),
+            ("bad_checkpoints", rx.bad_checkpoints.get()),
+            ("mismatches", rx.mismatches.get()),
+            ("conflicts", rx.conflicts.get()),
+            ("held", rx.held.get()),
+            ("held_dropped", rx.held_dropped.get()),
+            ("unverifiable", rx.unverifiable.get()),
+            ("ended", rx.ended.get()),
+        ]
+    }
 }

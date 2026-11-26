@@ -70,7 +70,7 @@ impl Counter {
         self.0.fetch_add(n, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "adversary"))]
     pub(crate) fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
