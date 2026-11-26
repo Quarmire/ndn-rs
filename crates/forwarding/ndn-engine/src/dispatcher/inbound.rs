@@ -112,6 +112,16 @@ pub(crate) async fn run_face_reader(
                     }
                     let outcome = side.on_frame(face_id, raw, &face_table);
                     trace!(target: t::FACE_SYSTEM, face=%face_id, ?outcome, "face-reader: side frame");
+                    // A sink that refused the frame (a link whose send buffer this reader has
+                    // filled without letting the link's own task run) gets its turn before the
+                    // next frame is read, so a burst already queued at this face does not all
+                    // find the link full for lack of a poll. It is a yield, not a wait: the
+                    // fan-out still never blocks on a sink, and a sink that stays full costs
+                    // only the frames it refuses.
+                    if matches!(outcome, crate::side::SideOutcome::Routed { dropped, .. } if dropped > 0)
+                    {
+                        tokio::task::yield_now().await;
+                    }
                     continue;
                 }
                 trace!(target: t::FACE_SYSTEM, face=%face_id, len=raw.len(), "face-reader: recv");

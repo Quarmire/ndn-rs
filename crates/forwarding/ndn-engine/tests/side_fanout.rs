@@ -814,3 +814,37 @@ async fn a_route_tells_the_datagram_limit_of_its_sinks_as_they_are_now() {
     let at_r1 = hr1.wait_side(2).await;
     assert_eq!(at_r1[1].frame, small);
 }
+
+/// A sink that is full when a frame reaches it gets its turn before the reader takes the next
+/// frame: a burst that is already queued at the source does not all find the link full because
+/// the reader never let the link's own task drain it (a relay's fan-out is non-blocking, so what
+/// a full sink refuses is lost). Here the "link" drains when its task runs, which on this
+/// single-threaded runtime is only when the reader yields.
+#[tokio::test]
+async fn a_full_sink_gets_to_drain_between_two_frames_of_a_burst() {
+    let (s, hs) = face(1, FaceKind::App);
+    let (r, hr) = face(2, FaceKind::App);
+    let (e, _sd) = engine(vec![s, r], 1).await;
+    session(&hr, &hs, labelled_data(ID, 30)).await;
+    eventually("the sink is installed", || sinks_of(&e, ID).len() == 1).await;
+
+    const BURST: usize = 50;
+    hr.log.full.store(true, Ordering::Relaxed);
+    for _ in 0..BURST {
+        hs.inject(data_frame(ID, 200));
+    }
+    // The link's task: it runs after the reader has taken the first frame and found the sink full.
+    let log = std::sync::Arc::clone(&hr.log);
+    tokio::spawn(async move { log.full.store(false, Ordering::Relaxed) });
+
+    eventually("the whole burst was routed", || {
+        e.side().stats().frames_in as usize >= BURST
+    })
+    .await;
+    let stats = e.side().stats();
+    assert_eq!(
+        stats.sink_full, 1,
+        "only the frame that found the sink full was lost: {stats:?}"
+    );
+    assert_eq!(hr.side().len(), BURST - 1, "{stats:?}");
+}
