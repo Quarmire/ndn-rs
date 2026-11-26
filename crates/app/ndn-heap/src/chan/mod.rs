@@ -6,6 +6,8 @@
 //! Stage 2 (the setup) and stage 3 (frames and batching) live here: the
 //! session key ([`key`]) is shared by both, each stage adds its own modules.
 
+#[cfg(feature = "adversary")]
+mod adversary;
 pub(crate) mod aead;
 #[cfg(test)]
 mod alloc_probe;

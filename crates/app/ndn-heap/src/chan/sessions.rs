@@ -299,6 +299,17 @@ impl RecvSession {
         self.state.lock().terms.seq
     }
 
+    /// The frame key of the epoch this session holds now, and that whole epoch: what the
+    /// `adversary` feature's holder seals under.
+    #[cfg(feature = "adversary")]
+    pub(crate) fn current_frame_key(&self) -> Option<(FrameKey, u32)> {
+        let state = self.state.lock();
+        state
+            .ended
+            .is_none()
+            .then(|| (state.current.frame.clone(), state.current.epoch))
+    }
+
     /// The 32 octets of the Ed25519 public key checkpoints of this channel are verified under
     /// (see [`Self::set_signer_public`]).
     pub(crate) fn signer_public(&self) -> Option<[u8; 32]> {

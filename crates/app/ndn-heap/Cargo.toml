@@ -58,6 +58,12 @@ tokio      = { workspace = true, features = ["sync"] }
 aes-gcm           = { version = "0.10", default-features = false, features = ["aes"] }
 chacha20poly1305  = { version = "0.10", default-features = false }
 
+[features]
+# Test only: `NodeHandle::adversary_*` seals frames and checkpoints as a compromised holder of a
+# channel's key (a test outside this crate has no other way to forge one). Off by default; the
+# forwarder and the extensions never enable it; it changes nothing for a node that does not call it.
+adversary = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 # The durability cases restart a node on both on-disk engines after a
