@@ -120,8 +120,9 @@ pub async fn run_rib_expiry_task(
                     tracing::debug!(target: t::ENGINE, count = swept, "reflexive routes expired");
                 }
                 // Channel routes: sinks that got no `Keep` within their TTL
-                // lapse, and the routes of faces that left the table go.
-                let lapsed = side.sweep(runtime.unix_nanos());
+                // lapse (on the table's monotonic clock, not the wall clock), and
+                // the routes of faces that left the table go.
+                let lapsed = side.sweep(side.now());
                 if lapsed > 0 {
                     tracing::debug!(target: t::ENGINE, count = lapsed, "side-route sinks lapsed");
                 }
@@ -198,11 +199,16 @@ pub async fn run_idle_face_task(
                     }
                     // A side frame sent over the face counts as activity as
                     // an NDN packet does (the reader stamps what it receives).
-                    let last = entry
-                        .last_activity
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .max(side.last_activity(face_id));
-                    if now.saturating_sub(last) > IDLE_TIMEOUT_NS {
+                    // The table keeps its own (monotonic) clock: its idle time
+                    // is compared, not its stamp.
+                    let idle = now
+                        .saturating_sub(
+                            entry
+                                .last_activity
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                        .min(side.idle_ns(face_id).unwrap_or(u64::MAX));
+                    if idle > IDLE_TIMEOUT_NS {
                         expired.push(face_id);
                     }
                 }
@@ -214,8 +220,8 @@ pub async fn run_idle_face_task(
                     }
                     rib.handle_face_down(face_id, &fib);
                     fib.remove_face(face_id);
-                    side.remove_face(face_id);
                     face_table.remove(face_id);
+                    side.remove_face(face_id);
                     tracing::debug!(target: t::FACE_SYSTEM, face=%face_id, "idle on-demand face removed");
                 }
             }

@@ -188,9 +188,11 @@ impl Connection for EngineConnection {
     }
 
     /// Bar `face` in the engine's side table ([`ndn_engine::side::SideTable::bar`]): the first
-    /// bar is 60 s and each repeat on the same face doubles, to an hour. This connection's own
-    /// face is refused: every channel frame of this app goes over it, so barring it would cut
-    /// the app off from its own forwarder, not a link that delivered a forgery.
+    /// bar is 60 s and each repeat on the same face doubles, to an hour (a call while a bar is
+    /// live changes nothing and names what is left of it). This connection's own face is
+    /// refused: every channel frame of this app goes over it, so barring it would cut the app
+    /// off from its own forwarder, not a link that delivered a forgery. So is a face the engine
+    /// does not hold: a bar is state per face, and the id is the host's to name.
     async fn side_quarantine(&self, face: FaceId) -> Result<std::time::Duration, AppError> {
         if face == self.face_id {
             return Err(AppError::Unsupported(
@@ -199,6 +201,12 @@ impl Connection for EngineConnection {
                  nothing was barred"
                     .into(),
             ));
+        }
+        if self.engine.faces().get(face).is_none() {
+            return Err(AppError::Unsupported(format!(
+                "no face {face} on this forwarder, so nothing was barred: name the face the \
+                 frame came over (the ingress the forwarder reported with it)"
+            )));
         }
         let side = self.engine.side();
         Ok(side.bar(face, side.now()))

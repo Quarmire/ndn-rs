@@ -40,6 +40,8 @@ pub struct Log {
     pub unsupported: AtomicBool,
     /// The face reports that it carries the datagram class only.
     pub datagram_only: AtomicBool,
+    /// The face carries no side frames at all (`side_frame_max` is 0).
+    pub carries_none: AtomicBool,
 }
 
 /// The test's end of a face.
@@ -141,6 +143,14 @@ pub fn datagram_only_face(id: u64, kind: FaceKind) -> (TestFace, Handle) {
     (face, handle)
 }
 
+/// A program face of `kind` that carries no side frames (as a TCP, UDP or Unix socket face): its
+/// `side_frame_max` is 0.
+pub fn no_side_face(id: u64, kind: FaceKind) -> (TestFace, Handle) {
+    let (face, handle) = make(FaceId(id), kind, true);
+    handle.log.carries_none.store(true, Ordering::Relaxed);
+    (face, handle)
+}
+
 /// Two faces joined as a link: what the first sends (NDN or side) arrives on
 /// the second and the other way round. Both are `kind`.
 pub fn pair(a: u64, b: u64, kind: FaceKind) -> ((TestFace, Handle), (TestFace, Handle)) {
@@ -174,11 +184,17 @@ impl Transport for TestFace {
         }
     }
     fn side_frame_max(&self) -> usize {
-        10_000
+        if self.log.carries_none.load(Ordering::Relaxed) {
+            0
+        } else {
+            10_000
+        }
     }
-    /// Both classes, unless the face is a datagram-only one ([`datagram_only_face`]).
+    /// Both classes, unless the face is a datagram-only one ([`datagram_only_face`]) or carries
+    /// none ([`no_side_face`]).
     fn side_carries(&self, class: SideClass) -> bool {
-        class == SideClass::Datagram || !self.log.datagram_only.load(Ordering::Relaxed)
+        self.side_frame_max() != 0
+            && (class == SideClass::Datagram || !self.log.datagram_only.load(Ordering::Relaxed))
     }
     fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
         self.forward_side_from(frame, class, FaceId::INVALID)
@@ -253,12 +269,15 @@ pub enum Warp {
     Frozen,
 }
 
-/// A runtime whose wall clock is the test's (`advance`), so the engine's
-/// periodic tasks (the 1 s sweep, the 30 s idle reaper) act on logical time
-/// the test sets, and whose chosen sleeps are a thousand times shorter, so
-/// the test does not wait for them.
+/// A runtime whose clocks are the test's, so the engine's periodic tasks (the 1 s sweep, the
+/// 30 s idle reaper) act on logical time the test sets, and whose chosen sleeps are a thousand
+/// times shorter, so the test does not wait for them. Its wall clock (`unix_nanos`, `clock`)
+/// and its monotonic clock (`now`) are separate: [`advance`](Self::advance) moves both, as time
+/// passing does; [`step_wall`](Self::step_wall) moves only the wall clock, as a host's clock
+/// being set does (NTP, a VM resuming).
 pub struct WarpRuntime {
     pub clock: Arc<AtomicU64>,
+    mono: AtomicU64,
     warp: Warp,
 }
 
@@ -266,11 +285,20 @@ impl WarpRuntime {
     pub fn new(start_ns: u64, warp: Warp) -> Arc<Self> {
         Arc::new(Self {
             clock: Arc::new(AtomicU64::new(start_ns)),
+            mono: AtomicU64::new(0),
             warp,
         })
     }
 
+    /// Time passes: both clocks move.
     pub fn advance(&self, by: Duration) {
+        self.clock
+            .fetch_add(by.as_nanos() as u64, Ordering::Relaxed);
+        self.mono.fetch_add(by.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// The host's wall clock is set forward by `by`; no time passed.
+    pub fn step_wall(&self, by: Duration) {
         self.clock
             .fetch_add(by.as_nanos() as u64, Ordering::Relaxed);
     }
@@ -296,8 +324,9 @@ impl Sleep for WarpRuntime {
     }
 }
 impl Now for WarpRuntime {
+    /// Real monotonic time plus what the test advanced.
     fn now(&self) -> ndn_runtime::Instant {
-        ndn_runtime::Instant::now()
+        ndn_runtime::Instant::now() + Duration::from_nanos(self.mono.load(Ordering::Relaxed))
     }
     fn unix_nanos(&self) -> u64 {
         self.clock.load(Ordering::Relaxed)

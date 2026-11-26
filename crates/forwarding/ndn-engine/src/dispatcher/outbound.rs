@@ -10,6 +10,7 @@ use crate::observability::targets as t;
 use crate::pipeline::{Action, NackReason, PacketContext};
 use crate::side::{SideId, SideRefusal};
 use crate::stages::decode::SideRouteTag;
+use crate::stages::pit::DataFromUnaskedFace;
 use ndn_packet::Name;
 use ndn_packet::SideRoute;
 use ndn_packet::lp::LpHeaders;
@@ -317,23 +318,31 @@ impl PacketDispatcher {
     /// Install the route a session Data's `SideRoute` header asks for with
     /// `sink` (a face that asked for the Data) as a sink and `source` (the face
     /// the Data arrived on) as the source; returns the header to send on to
-    /// `sink`, with the TTL the table kept. A refusal is counted by the table
-    /// and logged here with its reason; `None` then, and the face gets the Data
-    /// without the header: its receiver reports no path rather than waiting.
+    /// `sink`, with the TTL the table kept. The route is made only when `source`
+    /// is a face the Interest went out of (`asked`) and when both faces are on
+    /// the engine and can carry channel frames: the header is sent on only with an
+    /// installed route, so a face that cannot carry channel frames never gets
+    /// one. A refusal is counted by the table and logged here with its reason;
+    /// `None` then, and the face gets the Data without the header: its receiver
+    /// reports no path rather than waiting.
     fn install_side_route(
         &self,
         label: SideRoute,
         source: FaceId,
         sink: FaceId,
+        asked: bool,
     ) -> Option<SideRoute> {
-        if self.face_table.get(sink).is_none() {
-            self.side.note_refusal(SideRefusal::FaceGone);
-            return None;
-        }
         let ttl = self
             .side
             .clamp_ttl(std::time::Duration::from_secs(u64::from(label.ttl_secs)));
-        match self.side.install(SideId(label.id), source, sink, ttl) {
+        let result = if asked {
+            self.side
+                .install_live(SideId(label.id), source, sink, ttl, &self.face_table)
+        } else {
+            self.side.note_refusal(SideRefusal::NotAsked);
+            Err(SideRefusal::NotAsked)
+        };
+        match result {
             Ok(()) => Some(SideRoute {
                 id: label.id,
                 ttl_secs: u16::try_from(ttl.as_secs()).unwrap_or(u16::MAX),
@@ -366,6 +375,8 @@ impl PacketDispatcher {
         } else {
             ctx.tags.get::<SideRouteTag>().map(|t| t.0)
         };
+        // The PIT stage marks a Data that no out-record of the arrival face accounts for.
+        let asked = ctx.tags.get::<DataFromUnaskedFace>().is_none();
         for (i, face_id) in ctx.out_faces.iter().enumerate() {
             // Don't echo forwarded Data back out the face it arrived on —
             // EXCEPT on ad-hoc links, where re-radiating onto the shared
@@ -409,7 +420,7 @@ impl PacketDispatcher {
             // face the Data without the header.
             let side_route = match side_label {
                 Some(label) if *face_id != ctx.face_id => {
-                    self.install_side_route(label, ctx.face_id, *face_id)
+                    self.install_side_route(label, ctx.face_id, *face_id, asked)
                 }
                 _ => None,
             };

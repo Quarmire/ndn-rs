@@ -4,6 +4,7 @@ use tracing::trace;
 
 use crate::observability::targets as t;
 use crate::pipeline::{Action, DecodedPacket, DownstreamInterest, DropReason, PacketContext};
+use crate::stages::decode::SideRouteTag;
 use ndn_store::{
     DeadNonceList, InRecord, NameHashes, NonceFingerprint, PersistentState, Pit, PitEntry,
     PitKeyDiscriminator, PitToken, deadline_after_ms,
@@ -447,6 +448,30 @@ async fn subscription_validation(
     }
 }
 
+/// Tag on a Data that carries a `SideRoute` header and matched a PIT entry none of whose
+/// out-records is the face the Data arrived on: no Interest of this forwarder went out of that
+/// face, so the face is no source of a channel route (any station on a shared medium, any hop
+/// that does not validate, can send a Data whose name is pending). The Data is forwarded as
+/// ever; only the route is refused (`SideRefusal::NotAsked`).
+#[derive(Clone, Copy, Debug)]
+pub struct DataFromUnaskedFace;
+
+/// Whether the Interest of an entry the Data consumed went out of the face the Data came in on.
+struct ArrivalAsked {
+    face: u64,
+    asked: bool,
+}
+
+impl ArrivalAsked {
+    fn new(face: u64) -> Self {
+        Self { face, asked: false }
+    }
+
+    fn note(&mut self, out_records: &[ndn_store::OutRecord]) {
+        self.asked |= out_records.iter().any(|r| r.face_id == self.face);
+    }
+}
+
 enum PersistentMatchResult {
     /// Persistent entry: faces collected, per-subscriber counter decremented.
     Matched {
@@ -531,6 +556,9 @@ impl PitMatchStage {
         // The Data's arrival is the time we stamp into the Dead-Nonce-List on consume
         // (deterministic under a virtual runtime). (ndn-lab slice 0b.)
         let arrival = ctx.arrival;
+        // The face the Data arrived on, and whether an Interest was sent out of it: the source
+        // of a channel route is a face that was asked.
+        let mut asked = ArrivalAsked::new(ctx.face_id.0);
 
         // Exact-name entries: every in-record matches regardless of CanBePrefix.
         self.consume_entry(
@@ -540,6 +568,7 @@ impl PitMatchStage {
             &mut tokens,
             &mut seen,
             &mut fan_out,
+            &mut asked,
             record.then_some(&mut interests),
             arrival,
         );
@@ -550,6 +579,7 @@ impl PitMatchStage {
             &mut tokens,
             &mut seen,
             &mut fan_out,
+            &mut asked,
             record.then_some(&mut interests),
             arrival,
         );
@@ -561,6 +591,7 @@ impl PitMatchStage {
                 &mut tokens,
                 &mut seen,
                 &mut fan_out,
+                &mut asked,
                 record.then_some(&mut interests),
                 arrival,
             );
@@ -587,6 +618,7 @@ impl PitMatchStage {
                 &mut tokens,
                 &mut seen,
                 &mut fan_out,
+                &mut asked,
                 record.then_some(&mut interests),
                 arrival,
             );
@@ -607,6 +639,7 @@ impl PitMatchStage {
                     &mut tokens,
                     &mut seen,
                     &mut fan_out,
+                    &mut asked,
                     record.then_some(&mut interests),
                     arrival,
                 );
@@ -618,6 +651,9 @@ impl PitMatchStage {
                 crate::observability::fan_out::emit_data_fan_out(fan_out, &data_name.to_string());
             }
             trace!(target: t::FWD_PIT, face=%ctx.face_id, name=%data_name, out_faces=?faces, action="satisfy", "pit op");
+            if !asked.asked && ctx.tags.get::<SideRouteTag>().is_some() {
+                ctx.tags.insert(DataFromUnaskedFace);
+            }
             ctx.out_faces = faces;
             ctx.out_pit_tokens = tokens;
             ctx.out_interests = interests;
@@ -650,6 +686,7 @@ impl PitMatchStage {
         tokens: &mut SmallVec<[Option<bytes::Bytes>; 4]>,
         seen: &mut SmallVec<[u64; 8]>,
         fan_out: &mut Vec<(u64, Vec<ndn_packet::lp::TraceId>)>,
+        asked: &mut ArrivalAsked,
         mut interests: Option<&mut SmallVec<[DownstreamInterest; 1]>>,
         now_ns: u64,
     ) {
@@ -705,6 +742,9 @@ impl PitMatchStage {
             } else {
                 entry_level_exhausted
             };
+            if !f.is_empty() {
+                asked.note(&entry.out_records);
+            }
             PersistentMatchResult::Matched {
                 faces: f,
                 lp_tokens: t,
@@ -751,6 +791,9 @@ impl PitMatchStage {
                         i += 1;
                     }
                 }
+                if !taken.is_empty() {
+                    asked.note(&entry.out_records);
+                }
                 (taken, entry.in_records.is_empty(), Arc::clone(&entry.name))
             });
             if let Some((taken, now_empty, entry_name)) = drained {
@@ -775,6 +818,9 @@ impl PitMatchStage {
         // Exact match: every in-record is satisfied; remove the entry.
         if let Some((_, entry)) = self.pit.remove(token) {
             insert_dead_nonces(&self.dead_nonce_list, &entry, now_ns);
+            if !entry.in_records.is_empty() {
+                asked.note(&entry.out_records);
+            }
             for r in entry.in_records.iter() {
                 if let Some(list) = interests.as_deref_mut() {
                     record_downstream(list, &entry.name, r);

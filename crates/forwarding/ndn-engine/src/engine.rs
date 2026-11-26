@@ -574,8 +574,11 @@ impl ForwarderEngine {
         }
         self.inner.rib.handle_face_down(face_id, &self.inner.fib);
         self.inner.fib.remove_face(face_id);
-        self.inner.side.remove_face(face_id);
+        // Out of the face table first: the side table checks a face's liveness under its own
+        // lock (`SideTable::install_live`), so an install in flight either sees the face gone
+        // or has its sink removed by the call below.
         self.inner.face_table.remove(face_id);
+        self.inner.side.remove_face(face_id);
     }
 
     /// Build and add a face from a **data record**: look up the registered
@@ -1253,8 +1256,8 @@ pub(crate) async fn run_face_sender(
                     }
                     rib.handle_face_down(face_id, &fib);
                     fib.remove_face(face_id);
-                    side.remove_face(face_id);
                     face_table.remove(face_id);
+                    side.remove_face(face_id);
                 }
                 true
             }

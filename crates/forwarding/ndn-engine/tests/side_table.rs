@@ -174,7 +174,7 @@ fn sink_is_source_refuses_a_route_that_loops_back() {
 #[test]
 fn a_quarantined_source_installs_nothing() {
     let fx = Fx::new();
-    fx.table.quarantine(FaceId(10), fx.now() + 60 * SEC);
+    fx.table.quarantine_for(FaceId(10), fx.now(), secs(60));
     assert_eq!(fx.install(1, 10, 20), Err(SideRefusal::Quarantined));
     assert_eq!(fx.table.stats().routes, 0);
     fx.advance(61);
@@ -640,9 +640,9 @@ fn quarantine_doubles_on_repeat_and_resets_after_an_hour() {
 }
 
 #[test]
-fn a_barred_face_has_its_frames_and_keeps_dropped_and_ndn_traffic_is_not_the_tables() {
+fn a_barred_source_has_its_frames_dropped_and_ndn_traffic_is_not_the_tables() {
     let fx = Fx::new();
-    let src = fx.app(10);
+    let _src = fx.app(10);
     let sink = fx.app(20);
     fx.install(1, 10, 20).unwrap();
 
@@ -655,18 +655,15 @@ fn a_barred_face_has_its_frames_and_keeps_dropped_and_ndn_traffic_is_not_the_tab
     );
     assert!(sink.side().is_empty());
     assert_eq!(fx.table.stats().quarantined, 1);
+    assert_eq!(fx.table.sinks(SideId(1)), 1, "the route stays");
 
-    // A barred sink's Keeps are ignored: it lapses on schedule.
+    // A barred sink's frames (it sends none a table routes) are dropped too, but its `UP`
+    // records are its own sinks' management and pass.
     fx.table.bar(FaceId(20), fx.now());
-    fx.advance(20);
     assert_eq!(
-        fx.on_frame(20, up(1, UpOp::Keep)),
+        fx.on_frame(20, data_frame(1, 64)),
         SideOutcome::Dropped(SideDrop::Quarantined)
     );
-    fx.advance(11);
-    fx.table.sweep(fx.now());
-    assert_eq!(fx.table.sinks(SideId(1)), 0);
-    assert!(src.side().is_empty());
     assert_eq!(fx.table.stats().quarantined, 2);
 }
 
@@ -676,7 +673,7 @@ fn an_explicit_quarantine_ends_at_the_time_given() {
     let _src = fx.app(10);
     let sink = fx.app(20);
     fx.install(1, 10, 20).unwrap();
-    fx.table.quarantine(FaceId(10), fx.now() + 5 * SEC);
+    fx.table.quarantine_for(FaceId(10), fx.now(), secs(5));
     fx.on_frame(10, data_frame(1, 64));
     fx.advance(5);
     fx.on_frame(10, data_frame(1, 64));
@@ -771,4 +768,177 @@ fn the_list_shows_each_route_with_its_source_sinks_and_counts() {
     assert_eq!((r.frames, r.bytes), (2, 160));
     assert_eq!(r.age, secs(4));
     assert_eq!(r.sinks[0].expires_in, secs(26));
+}
+
+/// The bar cuts what a face SENDS as a source, not its own sink management: a barred face's
+/// `Keep` and `Unsub` still reach the table (bounded, and `WrongSource` unless it is a sink), so
+/// the routes it receives over stay up and the senders upstream go on sending to it.
+#[test]
+fn a_barred_sinks_keep_and_unsub_still_count_and_its_frames_stay_dropped() {
+    let fx = Fx::new();
+    let src = fx.app(10);
+    let _sink = fx.app(20);
+    let _other = fx.app(30);
+    fx.install(1, 10, 20).unwrap();
+    fx.install(2, 10, 30).unwrap();
+    fx.table.bar(FaceId(20), fx.now());
+    fx.table.bar(FaceId(30), fx.now());
+    // Its Unsub removes its sink (and the route with its last sink).
+    let unsub = fx.on_frame(30, up(2, UpOp::Unsub));
+    assert!(
+        matches!(
+            unsub,
+            SideOutcome::Unsubscribed {
+                route_removed: true,
+                ..
+            }
+        ),
+        "a barred sink's Unsub was refused: {unsub:?}"
+    );
+
+    // 20 s on, the barred sink's Keep holds its route past the 30 s TTL, and goes upstream.
+    fx.advance(20);
+    let kept = fx.on_frame(20, up(1, UpOp::Keep));
+    assert!(
+        matches!(kept, SideOutcome::Kept { forwarded: true }),
+        "a barred sink's Keep was refused: {kept:?}"
+    );
+    fx.advance(11);
+    fx.table.sweep(fx.now());
+    assert_eq!(
+        fx.table.sinks(SideId(1)),
+        1,
+        "the barred face's route lapsed although it kept it"
+    );
+    assert_eq!(
+        src.side().len(),
+        2,
+        "its Unsub and Keep went on to the source"
+    );
+
+    // A barred face that is no sink of the route still cannot touch it.
+    fx.table.bar(FaceId(40), fx.now());
+    assert_eq!(
+        fx.on_frame(40, up(1, UpOp::Keep)),
+        SideOutcome::Dropped(SideDrop::WrongSource)
+    );
+    // And what a barred face sources is still dropped.
+    fx.table.bar(FaceId(10), fx.now());
+    assert_eq!(
+        fx.on_frame(10, data_frame(1, 64)),
+        SideOutcome::Dropped(SideDrop::Quarantined)
+    );
+}
+
+/// A bar asked for while one is live changes nothing: one incident reported twice (checkpoint
+/// lag) costs one bar, not two doublings.
+#[test]
+fn a_bar_asked_for_while_one_is_live_does_not_advance_the_history() {
+    let fx = Fx::new();
+    let _a = fx.app(10);
+    let t = |s: u64| T0 + s * SEC;
+    assert_eq!(fx.table.bar(FaceId(10), t(0)), secs(60));
+    assert_eq!(
+        fx.table.bar(FaceId(10), t(10)),
+        secs(50),
+        "the live bar stands: what is left of it"
+    );
+    assert_eq!(fx.table.bar(FaceId(10), t(20)), secs(40));
+    assert_eq!(
+        fx.table.bar(FaceId(10), t(61)),
+        secs(120),
+        "the next incident, after the bar ended, is the second: doubled once"
+    );
+}
+
+/// An explicit length is capped at the longest bar, so no operator value (`ExpirationPeriod`
+/// u64::MAX) makes a bar that never ends or disables the bar fast path for good.
+#[test]
+fn an_explicit_bar_is_capped_at_the_longest_bar() {
+    let fx = Fx::new();
+    let _a = fx.app(10);
+    let applied = fx
+        .table
+        .quarantine_for(FaceId(10), fx.now(), Duration::from_millis(u64::MAX));
+    assert_eq!(
+        applied,
+        secs(3_600),
+        "the length applied is the longest bar"
+    );
+    assert!(fx.table.is_quarantined(FaceId(10), fx.now() + 3_599 * SEC));
+    assert!(
+        !fx.table.is_quarantined(FaceId(10), fx.now() + 3_601 * SEC),
+        "a bar of u64::MAX milliseconds never ended"
+    );
+}
+
+/// An install in flight when its face goes leaves no sink behind: the face's liveness is checked
+/// under the table's lock, and the teardown removes the face from the face table before the
+/// table's routes, so an install either sees the face gone or is cleaned up after.
+#[test]
+fn an_install_in_flight_when_its_face_goes_leaves_no_sink() {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+
+    let faces = Arc::new(FaceTable::new());
+    for id in [10, 20] {
+        let (f, _h) = face(id, FaceKind::App);
+        faces.insert(f);
+    }
+    // A clock that, once armed, holds the installing thread until the test lets it go: the
+    // install is then between its start and the table's lock.
+    let armed = Arc::new(AtomicBool::new(false));
+    let state = Arc::new((Mutex::new(0u8), std::sync::Condvar::new()));
+    let clock = {
+        let (armed, state) = (Arc::clone(&armed), Arc::clone(&state));
+        move || {
+            if armed.swap(false, Ordering::SeqCst) {
+                let (m, cv) = &*state;
+                *m.lock().unwrap() = 1; // in flight
+                cv.notify_all();
+                let mut s = m.lock().unwrap();
+                while *s != 2 {
+                    s = cv.wait(s).unwrap();
+                }
+            }
+            T0
+        }
+    };
+    let table = Arc::new(SideTable::with_clock(
+        SideConfig::default(),
+        Arc::new(clock),
+    ));
+    armed.store(true, Ordering::SeqCst);
+    let installing = {
+        let (table, faces) = (Arc::clone(&table), Arc::clone(&faces));
+        std::thread::spawn(move || {
+            table.install_live(SideId(1), FaceId(10), FaceId(20), secs(30), &faces)
+        })
+    };
+    {
+        let (m, cv) = &*state;
+        let mut s = m.lock().unwrap();
+        while *s != 1 {
+            s = cv.wait(s).unwrap();
+        }
+    }
+    // The face goes, in the engine's order: out of the face table, then out of the side table.
+    faces.remove(FaceId(20));
+    table.remove_face(FaceId(20));
+    {
+        let (m, cv) = &*state;
+        *m.lock().unwrap() = 2;
+        cv.notify_all();
+    }
+    let result = installing.join().unwrap();
+    assert_eq!(
+        result,
+        Err(SideRefusal::FaceGone),
+        "an install in flight when its face went installed: {result:?}"
+    );
+    assert_eq!(
+        table.routes_to(FaceId(20)),
+        0,
+        "a sink was left for a face that is gone"
+    );
 }

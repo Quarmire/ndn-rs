@@ -17,7 +17,8 @@ use ndn_transport::{FaceId, FaceKind};
 use tokio_util::sync::CancellationToken;
 
 use crate::side_support::{
-    Handle, TestFace, Warp, WarpRuntime, data_frame, datagram_only_face, face, pair, up,
+    Handle, TestFace, Warp, WarpRuntime, data_frame, datagram_only_face, face, no_side_face, pair,
+    up,
 };
 
 const ID: u64 = 0x5E55_10C0_FFEE;
@@ -581,4 +582,111 @@ async fn the_engine_tells_which_side_classes_a_face_carries() {
         !e.face_carries_side(FaceId(2), SideClass::Stream),
         "an Ethernet segment carries no stream"
     );
+}
+
+/// The side table runs on the engine's monotonic clock: a step of the host's wall clock (NTP, a
+/// VM that resumed) neither lapses every sink nor lifts every bar.
+#[tokio::test]
+async fn a_step_of_the_wall_clock_neither_lapses_a_route_nor_lifts_a_bar() {
+    let rt = WarpRuntime::new(1_000_000_000_000_000_000, Warp::All);
+    let (s, _hs) = face(1, FaceKind::App);
+    let (r, _hr) = face(2, FaceKind::App);
+    let (e, _sd) = EngineBuilder::new(EngineConfig::default())
+        .runtime(rt.clone())
+        .face(s)
+        .face(r)
+        .build()
+        .await
+        .expect("engine build");
+    e.side()
+        .install(SideId(ID), FaceId(1), FaceId(2), Duration::from_secs(30))
+        .unwrap();
+    e.side().bar(FaceId(7), e.side().now());
+    assert!(e.side().is_quarantined(FaceId(7), e.side().now()));
+
+    rt.step_wall(Duration::from_secs(301));
+    // The 1 s sweep runs every millisecond here: give it many turns.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        sinks_of(&e, ID).len(),
+        1,
+        "a wall-clock step of 301 s lapsed the route (sinks lapsed: {})",
+        e.side().stats().sinks_lapsed
+    );
+    assert!(
+        e.side().is_quarantined(FaceId(7), e.side().now()),
+        "a wall-clock step of 301 s lifted the bar"
+    );
+
+    // Time that passes still lapses it.
+    rt.advance(Duration::from_secs(31));
+    eventually("the sink lapsed", || e.side().stats().routes == 0).await;
+}
+
+/// A face that cannot carry channel frames (a stream or IPC socket) is never made a sink, and
+/// never a route's source: the Data goes on without the header, bare on a bare-TLV face, and
+/// the refusal is counted.
+#[tokio::test]
+async fn a_face_that_carries_no_channel_frames_is_no_sink_and_no_source_and_gets_the_data_bare() {
+    for (kind, lp) in [(FaceKind::Unix, false), (FaceKind::Tcp, true)] {
+        // The receiver's face carries none.
+        let (s, hs) = face(1, FaceKind::App);
+        let (r, hr) = no_side_face(2, kind);
+        let (e, _sd) = engine(vec![s, r], 1).await;
+        let got = session(&hr, &hs, labelled_data(ID, 30)).await;
+        assert_eq!(
+            e.side().stats().routes,
+            0,
+            "{kind:?}: a route was installed to a face that carries no channel frames"
+        );
+        assert_eq!(e.side().stats().refused_not_carried, 1);
+        if lp {
+            let lp = LpPacket::decode(got).unwrap();
+            assert_eq!(lp.side_route, None, "{kind:?}: the header was echoed");
+        } else {
+            assert!(
+                !is_lp_packet(&got),
+                "{kind:?}: the Data went to a bare-TLV face inside an LpPacket"
+            );
+        }
+
+        // The upstream face carries none.
+        let (s, hs) = no_side_face(1, kind);
+        let (r, hr) = face(2, FaceKind::App);
+        let (e, _sd) = engine(vec![s, r], 1).await;
+        let got = session(&hr, &hs, labelled_data(ID, 30)).await;
+        assert_eq!(
+            e.side().stats().routes,
+            0,
+            "{kind:?}: a route was installed from a face that carries no channel frames"
+        );
+        assert!(
+            !is_lp_packet(&got),
+            "{kind:?}: the header was echoed on a route that was refused"
+        );
+    }
+}
+
+/// The source of a route is a face the Interest went out of: a labelled Data from any other face
+/// installs nothing, and goes on without the header.
+#[tokio::test]
+async fn a_labelled_data_from_a_face_never_sent_the_interest_installs_nothing() {
+    let (s, hs) = face(1, FaceKind::App);
+    let (r, hr) = face(2, FaceKind::App);
+    let (x, hx) = face(3, FaceKind::App);
+    let (e, _sd) = engine(vec![s, r, x], 1).await;
+
+    hr.inject(interest());
+    hs.wait_sent(1).await; // the Interest went out of face 1 only
+    hx.inject(labelled_data(ID, 30)); // the Data comes from face 3
+    let got = hr.wait_sent(1).await.remove(0);
+
+    assert_eq!(
+        e.side().stats().routes,
+        0,
+        "a route was installed from a face the Interest never went out of (source: {:?})",
+        source_of(&e, ID)
+    );
+    assert_eq!(e.side().stats().refused_not_asked, 1);
+    assert!(!is_lp_packet(&got), "the header was echoed");
 }

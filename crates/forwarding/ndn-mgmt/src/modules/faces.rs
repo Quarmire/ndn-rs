@@ -112,6 +112,7 @@ fn faces_destroy(
     } else {
         engine.fib().remove_face(face_id);
         engine.faces().remove(face_id);
+        engine.side().remove_face(face_id);
     }
 
     tracing::info!(target: "mgmt.face", face = face_id.0, "faces/destroy");

@@ -12,10 +12,15 @@
 //!   default to the requesting face) and an optional `ExpirationPeriod` in
 //!   **milliseconds** (the NFD field). Without it the bar is the face's next
 //!   one by its history (60 s, doubling for each repeat up to 1 h, back to 60 s
-//!   after an hour clean); with a value, that long; `0` lifts the bar. A barred
-//!   face has the side frames it sends dropped (`quarantined`), its `Keep`s
-//!   ignored and no route installed from it; the NDN traffic over it goes on.
-//!   The response names the length applied in `ExpirationPeriod`.
+//!   after an hour clean; a call while a bar is live changes nothing and names
+//!   what is left of it); with a value, that long, at most 1 h; `0` lifts the
+//!   bar. A barred face has the side frames it sends dropped (`quarantined`)
+//!   and no route installed from it; its own sinks' `Keep`s and `Unsub`s still
+//!   count, and the NDN traffic over it goes on. The response names the length
+//!   applied in `ExpirationPeriod`.
+//!
+//! Local operators only: a command for this module over `/localhop` is refused
+//! (that path is for a neighbour's `rib/register` and `rib/unregister`).
 //!
 //! Being an ndn-rs-only module, every verb requires a signed command Interest
 //! (the dispatcher enforces this for non-NFD-canonical modules).
@@ -64,7 +69,8 @@ fn side_list(engine: &ForwarderEngine) -> ControlResponse {
     let _ = writeln!(
         text,
         "refused installs: table_full={} source_full={} sink_cap={} sink_face_full={} \
-         source_mismatch={} sink_is_source={} quarantined={} face_gone={}",
+         source_mismatch={} sink_is_source={} quarantined={} face_gone={} not_carried={} \
+         not_asked={}",
         s.refused_table_full,
         s.refused_source_full,
         s.refused_sink_cap,
@@ -72,7 +78,9 @@ fn side_list(engine: &ForwarderEngine) -> ControlResponse {
         s.refused_source_mismatch,
         s.refused_sink_is_source,
         s.refused_quarantined,
-        s.refused_face_gone
+        s.refused_face_gone,
+        s.refused_not_carried,
+        s.refused_not_asked
     );
     for route in side.list() {
         let sinks: Vec<String> = route
@@ -125,8 +133,8 @@ fn side_quarantine(params: ControlParameters, engine: &ForwarderEngine) -> Contr
             if engine.faces().get(face).is_none() {
                 return no_such_face(face);
             }
-            side.quarantine(face, now.saturating_add(ms.saturating_mul(1_000_000)));
-            ms
+            side.quarantine_for(face, now, Duration::from_millis(ms))
+                .as_millis() as u64
         }
         None => {
             if engine.faces().get(face).is_none() {
@@ -315,8 +323,13 @@ mod tests {
         assert!(first.is_ok(), "{}", first.status_text);
         assert_eq!(first.body.unwrap().expiration_period, Some(60_000));
         assert!(engine.side().is_quarantined(FaceId(1), engine.side().now()));
-        let second = call(&engine, b"quarantine", face_param(1, None)).await;
-        assert_eq!(second.body.unwrap().expiration_period, Some(120_000));
+        // A call while the bar is live changes nothing: it names what is left, not a doubling.
+        let again = call(&engine, b"quarantine", face_param(1, None)).await;
+        let left = again.body.unwrap().expiration_period.unwrap();
+        assert!(
+            (59_000..=60_000).contains(&left),
+            "a repeat while a bar is live names what is left of it, got {left} ms"
+        );
 
         // An explicit length bars for that long; zero lifts the bar.
         let explicit = call(&engine, b"quarantine", face_param(1, Some(5_000))).await;
@@ -327,6 +340,9 @@ mod tests {
             !engine.side().is_quarantined(FaceId(1), engine.side().now()),
             "a bar of zero length lifts the bar"
         );
+        // The history stays: the next bar, after the first ended, is doubled.
+        let second = call(&engine, b"quarantine", face_param(1, None)).await;
+        assert_eq!(second.body.unwrap().expiration_period, Some(120_000));
         shutdown.shutdown().await;
     }
 
@@ -350,6 +366,30 @@ mod tests {
         let bogus = call(&engine, b"bogus", ControlParameters::default()).await;
         assert_eq!(bogus.status_code, status::NOT_FOUND);
         assert!(engine.side().quarantined().is_empty(), "nothing was barred");
+        shutdown.shutdown().await;
+    }
+
+    /// An `ExpirationPeriod` too long for a bar is the longest bar (an hour), and the answer
+    /// names the length applied: no operator value bars a face for good.
+    #[tokio::test]
+    async fn an_expiration_period_longer_than_the_longest_bar_is_capped_and_says_so() {
+        let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+            .face(Quiet(FaceId(1)))
+            .build()
+            .await
+            .unwrap();
+        let resp = call(&engine, b"quarantine", face_param(1, Some(u64::MAX))).await;
+        assert!(resp.is_ok(), "{}", resp.status_text);
+        assert_eq!(
+            resp.body.unwrap().expiration_period,
+            Some(3_600_000),
+            "the length applied is the longest bar"
+        );
+        let side = engine.side();
+        assert!(
+            !side.is_quarantined(FaceId(1), side.now() + 3_601 * 1_000_000_000),
+            "a bar of u64::MAX milliseconds never ended"
+        );
         shutdown.shutdown().await;
     }
 }

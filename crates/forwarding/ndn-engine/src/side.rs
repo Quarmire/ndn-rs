@@ -16,11 +16,14 @@
 //! The interface is an NDNLPv2 header on a Data ([`ndn_packet::lp::SideRoute`],
 //! TLV 0x0370: id and TTL). In the Data pipeline, after the PIT matched and after
 //! validation, for each in-record face `f` other than the arrival face `a` the
-//! engine calls [`SideTable::install`]`(id, a, f, ttl)` and sends the Data to
+//! engine calls [`SideTable::install_live`]`(id, a, f, ttl)` and sends the Data to
 //! `f` with the header again, so the next forwarder does the same. A Data that
-//! matched no PIT entry installs nothing; a refusal is counted, logged with its
-//! reason, and that face gets the Data **without** the header (the receiver then
-//! sees no frames and reports `NoPath`).
+//! matched no PIT entry installs nothing, nor does one from a face the Interest
+//! was not sent out of ([`SideRefusal::NotAsked`]), nor between faces that cannot
+//! carry channel frames or are gone ([`SideRefusal::NotCarried`],
+//! [`SideRefusal::FaceGone`]); a refusal is counted, logged with its reason, and
+//! that face gets the Data **without** the header (bare TLV on a bare-TLV face; the
+//! receiver then sees no frames and reports `NoPath`).
 //!
 //! # Rules the table keeps
 //!
@@ -41,18 +44,23 @@
 //!   `Unsub` is forwarded to the source.
 //! - Bounds ([`SideLimits`]): routes, routes per source face, sinks per route,
 //!   routes per sink face. A refusal names which ([`SideRefusal`]).
-//! - Time is the engine's clock (nanoseconds, `Runtime::unix_nanos`), read
-//!   through the table's clock; `sweep(now)`, `quarantine(face, until)` and
-//!   `bar(face, now)` take it explicitly so a caller or a test can supply it.
+//! - Time is the engine's **monotonic** clock (nanoseconds since the table was made,
+//!   [`SideTable::new`]), read through the table's clock, never the wall clock: a step
+//!   of the host's time must not lapse every sink or lift every bar. `sweep(now)`,
+//!   `bar(face, now)` and `quarantine_for(face, now, length)` take it explicitly so a
+//!   caller or a test can supply it.
 //! - A face that goes down takes its routes with it
 //!   ([`remove_face`](SideTable::remove_face), called at every site where the
 //!   engine drops a face; [`drop_gone_faces`](SideTable::drop_gone_faces) in the
 //!   1 s sweep catches any other).
-//! - **Quarantine.** A barred face has the frames it sends dropped
-//!   (`quarantined`), its `Keep`s ignored and no route installed from it; the
-//!   NDN traffic over it is not the table's and goes on. [`bar`](SideTable::bar)
-//!   is 60 s, doubling for each repeat on the same face up to 1 h, back to 60 s
-//!   after an hour clean.
+//! - **Quarantine.** A barred face has the frames it **sends** dropped
+//!   (`quarantined`) and no route installed from it; the NDN traffic over it is not
+//!   the table's and goes on. Its `UP` records (`Keep`, `Unsub`) are its own sinks'
+//!   management and still count (a route to a barred face is not cut by the bar; it
+//!   lapses only if the face stops sending `Keep`s). [`bar`](SideTable::bar) is 60 s,
+//!   doubling for each repeat on the same face up to 1 h, back to 60 s after an hour
+//!   clean; a call while a bar is live changes nothing. An explicit length is capped
+//!   at 1 h.
 //! - **Rate.** [`SideRate`] is a bytes-per-second token bucket on what the table
 //!   hands one sink face; over it a frame is dropped and counted `quota`.
 //!   Default off on the Ethernet kinds, 1 MB/s on the radio kinds
@@ -71,8 +79,8 @@ use ndn_runtime::Runtime;
 use ndn_transport::side_header::{SideHeader, SideKind, UpOp, UpRecord};
 use ndn_transport::{FaceId, FaceKind, FaceTable, SideClass, SideRefused};
 
-/// The clock a [`SideTable`] reads: nanoseconds, the engine's
-/// `Runtime::unix_nanos`.
+/// The clock a [`SideTable`] reads: monotonic nanoseconds ([`SideTable::new`] builds it from the
+/// engine runtime's `Now::now`, not the wall clock).
 pub type SideClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// A route's id: the 8 octets after the marker and the kind of every frame, and
@@ -204,6 +212,18 @@ pub enum SideRefusal {
     /// A face of the route is not on this forwarder.
     #[error("a face of the route is no longer on this forwarder")]
     FaceGone,
+    /// A face of the route cannot carry channel frames (a stream socket such as TCP, a bare
+    /// IPC socket, a face with no datagram carrier): a route over it could never carry a frame
+    /// or a `Keep`.
+    #[error(
+        "a face of the route cannot carry channel frames (a stream or IPC socket has no datagram carrier for them): the receiver is reached over a link that does, or a relay"
+    )]
+    NotCarried,
+    /// The Data did not come from a face this forwarder sent the Interest out of.
+    #[error(
+        "the Data did not come from a face its Interest was sent out of: a route is installed only from the face that answered the request"
+    )]
+    NotAsked,
 }
 
 impl SideRefusal {
@@ -218,10 +238,12 @@ impl SideRefusal {
             SideRefusal::SinkIsSource => "sink_is_source",
             SideRefusal::Quarantined => "quarantined",
             SideRefusal::FaceGone => "face_gone",
+            SideRefusal::NotCarried => "not_carried",
+            SideRefusal::NotAsked => "not_asked",
         }
     }
 
-    const COUNT: usize = 8;
+    const COUNT: usize = 10;
 
     const fn index(self) -> usize {
         self as usize
@@ -330,6 +352,8 @@ pub struct SideStats {
     pub refused_sink_is_source: u64,
     pub refused_quarantined: u64,
     pub refused_face_gone: u64,
+    pub refused_not_carried: u64,
+    pub refused_not_asked: u64,
 }
 
 #[derive(Default)]
@@ -367,6 +391,9 @@ const BAR_MAX: Duration = Duration::from_secs(3600);
 /// A face that stays unbarred this long after a bar ended starts again at
 /// [`BAR_BASE`].
 const BAR_CLEAN: Duration = Duration::from_secs(3600);
+
+/// Where a table's own clock starts, so that 0 can mean "never" in the stamps it keeps.
+pub const CLOCK_ORIGIN: u64 = 1_000_000_000;
 
 fn ns(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
@@ -507,9 +534,18 @@ pub struct SideTable {
 }
 
 impl SideTable {
-    /// A table on the engine's clock.
+    /// A table on the engine's monotonic clock ([`Now::now`](ndn_runtime::Now::now)): its time
+    /// is the nanoseconds since the table was made, offset by [`CLOCK_ORIGIN`] so that 0 stays
+    /// "never". Not the wall clock: a step of the host's clock (NTP, a VM that resumed) must
+    /// neither lapse every sink nor lift every bar.
     pub fn new(config: SideConfig, runtime: Arc<dyn Runtime>) -> Self {
-        Self::with_clock(config, Arc::new(move || runtime.unix_nanos()))
+        let start = runtime.now();
+        Self::with_clock(
+            config,
+            Arc::new(move || {
+                CLOCK_ORIGIN.saturating_add(ns(runtime.now().saturating_duration_since(start)))
+            }),
+        )
     }
 
     /// A table on `clock` (nanoseconds).
@@ -589,11 +625,45 @@ impl SideTable {
         sink: FaceId,
         ttl: Duration,
     ) -> Result<(), SideRefusal> {
-        let result = self.install_inner(id, source, sink, ttl);
+        let result = self.install_inner(id, source, sink, ttl, None);
         if let Err(refusal) = result {
             self.note_refusal(refusal);
         }
         result
+    }
+
+    /// [`install`](Self::install) for the forwarder's own data path: `faces` is the engine's
+    /// face table, and the route is installed only between two faces that are on it and that
+    /// can carry channel frames ([`SideRefusal::FaceGone`], [`SideRefusal::NotCarried`]).
+    /// Liveness is read under the table's lock, and the teardown of a face leaves the face table
+    /// *before* [`remove_face`](Self::remove_face) takes that lock: an install either sees the
+    /// face gone, or its sink is removed by the teardown that follows. No route is left to a
+    /// face that went while the install was in flight.
+    pub fn install_live(
+        &self,
+        id: SideId,
+        source: FaceId,
+        sink: FaceId,
+        ttl: Duration,
+        faces: &FaceTable,
+    ) -> Result<(), SideRefusal> {
+        let result = self.install_inner(id, source, sink, ttl, Some(faces));
+        if let Err(refusal) = result {
+            self.note_refusal(refusal);
+        }
+        result
+    }
+
+    fn check_faces(faces: &FaceTable, source: FaceId, sink: FaceId) -> Result<(), SideRefusal> {
+        for face in [source, sink] {
+            let Some(f) = faces.get(face) else {
+                return Err(SideRefusal::FaceGone);
+            };
+            if f.side_frame_max() == 0 || !f.side_carries(SideClass::Datagram) {
+                return Err(SideRefusal::NotCarried);
+            }
+        }
+        Ok(())
     }
 
     /// Count an install refusal the caller decided (a face the table cannot
@@ -608,6 +678,7 @@ impl SideTable {
         source: FaceId,
         sink: FaceId,
         ttl: Duration,
+        live: Option<&FaceTable>,
     ) -> Result<(), SideRefusal> {
         let limits = &self.config.limits;
         if source == sink {
@@ -619,6 +690,11 @@ impl SideTable {
         }
         let ttl = self.clamp_ttl(ttl);
         let ttl_ns = ns(ttl);
+
+        let mut q = self.quota.lock().unwrap();
+        if let Some(faces) = live {
+            Self::check_faces(faces, source, sink)?;
+        }
         let sink_entry = self.entry(sink);
         let new_sink = || {
             Arc::new(Sink {
@@ -629,8 +705,6 @@ impl SideTable {
                 kept: AtomicU64::new(NEVER),
             })
         };
-
-        let mut q = self.quota.lock().unwrap();
         let existing = self.routes.get(&id.0).map(|r| Arc::clone(&r));
         match existing {
             Some(route) => {
@@ -707,7 +781,12 @@ impl SideTable {
             None
         };
         let now = self.now();
-        if self.is_quarantined(from, now) {
+        // A bar is on what a face SENDS as a source. Its `UP` records are its own sinks'
+        // management (`Keep`, `Unsub`): they pass, bounded as ever, and name no route they
+        // are not a sink of (`WrongSource`). Dropping them would let the sinks the face holds
+        // lapse within the TTL and end the senders' routes to it: the bar would cut the link
+        // in both directions.
+        if op.is_none() && self.is_quarantined(from, now) {
             return self.dropped(SideDrop::Quarantined);
         }
         let Some(route) = self.routes.get(&header.id()).map(|r| Arc::clone(&r)) else {
@@ -906,7 +985,8 @@ impl SideTable {
     }
 
     /// Drop every route `face` is the source of and every sink on `face`; a
-    /// route left without sinks goes. Call when a face goes down. Keeps the
+    /// route left without sinks goes. Call when a face goes down, **after** it has
+    /// left the face table (see [`install_live`](Self::install_live)). Keeps the
     /// face's bar history (a barred link that is dialed again at the same id
     /// is still barred) and drops its rate.
     pub fn remove_face(&self, face: FaceId) {
@@ -980,13 +1060,19 @@ impl SideTable {
                 .is_some_and(|e| e.barred_until.load(Ordering::Relaxed) > now)
     }
 
-    /// Bar `face` until `until` (ns): frames it sends are dropped
-    /// (`quarantined`), its `Keep`s ignored, no route installed from it. An
-    /// existing longer bar is kept. NDN traffic over the face is not affected.
-    pub fn quarantine(&self, face: FaceId, until: u64) {
-        self.entry(face)
-            .barred_until
-            .fetch_max(until, Ordering::Relaxed);
+    /// Bar `face` for `length` from `now` (ns): frames it sends are dropped (`quarantined`) and
+    /// no route is installed from it; its `UP` records (its own sinks' `Keep`s and `Unsub`s)
+    /// still count. A `length` over the longest bar (1 h) is that: no value makes a bar that
+    /// never ends. An existing longer bar is kept. NDN traffic over the face is not affected.
+    /// Returns the length applied.
+    pub fn quarantine_for(&self, face: FaceId, now: u64, length: Duration) -> Duration {
+        let length = length.min(BAR_MAX);
+        self.bar_until(&self.entry(face), now.saturating_add(ns(length)));
+        length
+    }
+
+    fn bar_until(&self, entry: &FaceEntry, until: u64) {
+        entry.barred_until.fetch_max(until, Ordering::Relaxed);
         self.latest_bar_end.fetch_max(until, Ordering::Relaxed);
     }
 
@@ -1001,23 +1087,26 @@ impl SideTable {
     /// Bar `face` for the next length of its history: 60 s, doubling for each
     /// repeat on the same face up to 1 h, and back to 60 s once the face has
     /// been clean for an hour since its last bar ended. Returns the length
-    /// applied.
+    /// applied. While a bar is live a call changes nothing, not even the history (one
+    /// incident that is reported twice, as a checkpoint lags the frames, is one bar, not two
+    /// doublings), and returns what is left of the live bar.
     pub fn bar(&self, face: FaceId, now: u64) -> Duration {
         let entry = self.entry(face);
-        let length = {
-            let mut strikes = entry.strikes.lock().unwrap();
-            if strikes.count > 0 && now >= strikes.last_end.saturating_add(ns(BAR_CLEAN)) {
-                strikes.count = 0;
-            }
-            let doubled = BAR_BASE
-                .checked_mul(1u32 << strikes.count.min(16))
-                .unwrap_or(BAR_MAX);
-            let length = doubled.min(BAR_MAX);
-            strikes.count = strikes.count.saturating_add(1);
-            strikes.last_end = strikes.last_end.max(now.saturating_add(ns(length)));
-            length
-        };
-        self.quarantine(face, now.saturating_add(ns(length)));
+        let mut strikes = entry.strikes.lock().unwrap();
+        let live_until = entry.barred_until.load(Ordering::Relaxed);
+        if live_until > now {
+            return Duration::from_nanos(live_until - now);
+        }
+        if strikes.count > 0 && now >= strikes.last_end.saturating_add(ns(BAR_CLEAN)) {
+            strikes.count = 0;
+        }
+        let doubled = BAR_BASE
+            .checked_mul(1u32 << strikes.count.min(16))
+            .unwrap_or(BAR_MAX);
+        let length = doubled.min(BAR_MAX);
+        strikes.count = strikes.count.saturating_add(1);
+        strikes.last_end = strikes.last_end.max(now.saturating_add(ns(length)));
+        self.bar_until(&entry, now.saturating_add(ns(length)));
         length
     }
 
@@ -1028,14 +1117,13 @@ impl SideTable {
         self.routes.get(&id.0).map_or(0, |r| r.sinks.load().len())
     }
 
-    /// When a side frame last went out over `face` (to it as a sink, or an
-    /// `UP` record to it as a source), on the table's clock in ns; 0 if never.
-    /// The idle reaper counts it as the face's activity, as it does an NDN
-    /// packet: frames the face *receives* are stamped by the reader.
-    pub fn last_activity(&self, face: FaceId) -> u64 {
-        self.faces
-            .get(&face)
-            .map_or(0, |e| e.last_sent.load(Ordering::Relaxed))
+    /// How long ago a side frame last went out over `face` (to it as a sink, or an `UP` record
+    /// to it as a source), in ns on the table's clock; `None` if never. The idle reaper counts
+    /// it as the face's activity, as it does an NDN packet: frames the face *receives* are
+    /// stamped by the reader.
+    pub fn idle_ns(&self, face: FaceId) -> Option<u64> {
+        let last = self.faces.get(&face)?.last_sent.load(Ordering::Relaxed);
+        (last != 0).then(|| self.now().saturating_sub(last))
     }
 
     /// Routes that have `face` as their source or as a sink.
@@ -1124,6 +1212,8 @@ impl SideTable {
             refused_sink_is_source: refused(SideRefusal::SinkIsSource),
             refused_quarantined: refused(SideRefusal::Quarantined),
             refused_face_gone: refused(SideRefusal::FaceGone),
+            refused_not_carried: refused(SideRefusal::NotCarried),
+            refused_not_asked: refused(SideRefusal::NotAsked),
         }
     }
 }

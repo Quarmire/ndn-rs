@@ -217,8 +217,8 @@ pub(crate) async fn run_face_reader(
             }
             rib.handle_face_down(face_id, &fib);
             fib.remove_face(face_id);
-            side.remove_face(face_id);
             face_table.remove(face_id);
+            side.remove_face(face_id);
             pit.remove_face(face_id.0);
             debug!(target: t::FACE_SYSTEM, face=%face_id, "app face removed");
         }
@@ -259,8 +259,8 @@ pub(crate) async fn run_face_reader(
                 }
                 rib.handle_face_down(face_id, &fib);
                 fib.remove_face(face_id);
-                side.remove_face(face_id);
                 face_table.remove(face_id);
+                side.remove_face(face_id);
                 debug!(target: t::FACE_SYSTEM, face=%face_id, "on-demand face removed from table (FIB routes cleaned)");
             }
         },

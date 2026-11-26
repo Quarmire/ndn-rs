@@ -802,8 +802,9 @@ mod tests {
     }
 
     /// An embedded engine's connection bars a face in the engine's side table (60 s the first
-    /// time, doubling on a repeat), and NDN traffic is not part of it; a bare in-process
-    /// connection, which knows no engine, refuses and says where to go.
+    /// time; a call while the bar is live names what is left, a repeat after it doubles), and
+    /// NDN traffic is not part of it; a bare in-process connection, which knows no engine,
+    /// refuses and says where to go.
     #[tokio::test]
     async fn an_engine_connection_bars_a_face_in_the_engines_side_table() {
         use crate::EngineAppExt;
@@ -814,16 +815,24 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let conn = engine.app_face(cancel.child_token());
         let link = FaceId(4242);
+        let (link_face, _link_handle) = InProcFace::new(link, 4);
+        engine.add_face(link_face, cancel.child_token());
         let side = engine.side();
         assert!(!side.is_quarantined(link, side.now()));
         let first = conn.side_quarantine(link).await.unwrap();
         assert_eq!(first, std::time::Duration::from_secs(60));
         assert!(side.is_quarantined(link, side.now()));
+        let live = conn.side_quarantine(link).await.unwrap();
+        assert!(
+            live <= std::time::Duration::from_secs(60) && live > std::time::Duration::from_secs(59),
+            "a call while the bar is live names what is left of it: {live:?}"
+        );
+        side.lift(link);
         let second = conn.side_quarantine(link).await.unwrap();
         assert_eq!(
             second,
             std::time::Duration::from_secs(120),
-            "a repeat doubles"
+            "a repeat after the bar ended doubles"
         );
 
         let (_face, handle) = InProcFace::new(FaceId(1), 4);
@@ -831,5 +840,25 @@ mod tests {
             InProcConnection::new(handle).side_quarantine(link).await,
             Err(AppError::Unsupported(m)) if m.contains("side/quarantine")
         ));
+    }
+
+    /// A face the engine does not hold is refused, and nothing is created for it: the id is
+    /// the host's to choose, and a bar is state per face.
+    #[tokio::test]
+    async fn an_engine_connection_refuses_to_bar_a_face_the_engine_does_not_hold() {
+        use crate::EngineAppExt;
+        let (engine, _shutdown) = ndn_engine::EngineBuilder::new(Default::default())
+            .build()
+            .await
+            .unwrap();
+        let conn = engine.app_face(tokio_util::sync::CancellationToken::new());
+        let gone = FaceId(4242);
+        let refused = conn.side_quarantine(gone).await;
+        assert!(
+            matches!(&refused, Err(AppError::Unsupported(m)) if m.contains("4242")),
+            "a face the engine does not hold was barred: {refused:?}"
+        );
+        assert!(engine.side().quarantined().is_empty());
+        assert!(!engine.side().is_quarantined(gone, engine.side().now()));
     }
 }

@@ -674,23 +674,42 @@ require a signed command Interest. They are not trust-admin verbs and carry
 no refusal **code**: a refusal is a ControlResponse with a status and a plain
 sentence, which names what to do.
 
+**What `/localhop` accepts.** The `/localhop/nfd` path is a neighbour's route
+registration, as NFD's rib-manager serves it: `rib/register` and
+`rib/unregister`, signed by a key the localhop trust anchors vouch for, and
+nothing else. Every other module and verb (`side/*`, `faces/*`, `fib/*`,
+`strategy/*`, `security/*`, and the rest) is the local operator's and is
+answered `403` with a sentence that says it is not accepted over `/localhop`
+and to send it on the node's local management socket (`/localhost/nfd`) as its
+operator; the command never reaches its module, whoever signed it. The
+trust-change verbs keep their own, more specific refusal
+(`trust-change-over-localhop`, above). A signer a neighbour's anchors accept
+to register routes can therefore not bar a link, read the channel routes or
+change the forwarder.
+
 | verb | parameters | answer |
 |---|---|---|
-| `side/list` | none | status text, read-only: the counters (routes, sinks, frames and octets in and out), the drops by reason (`unrouted`, `wrong_source`, `malformed`, `class_unsupported`, `quota`, `quarantined`, `sink_full`, `sink_error`), the `UP` counters (`keeps`, `keeps_forwarded`, `unsubs`, `sinks_lapsed`), the installs refused by reason (`table_full`, `source_full`, `sink_cap`, `sink_face_full`, `source_mismatch`, `sink_is_source`, `quarantined`, `face_gone`), one line for each route (id in hex, source face, each sink with the time left before it lapses, frames, octets, age) and one for each barred face (the time left) |
-| `side/quarantine` | `FaceId` (required); `ExpirationPeriod` in milliseconds (optional) | bars the face from carrying channel frames; the answer is `face barred` or `bar lifted` with `FaceId` and `ExpirationPeriod` set to the length applied |
+| `side/list` | none | status text, read-only: the counters (routes, sinks, frames and octets in and out), the drops by reason (`unrouted`, `wrong_source`, `malformed`, `class_unsupported`, `quota`, `quarantined`, `sink_full`, `sink_error`), the `UP` counters (`keeps`, `keeps_forwarded`, `unsubs`, `sinks_lapsed`), the installs refused by reason (`table_full`, `source_full`, `sink_cap`, `sink_face_full`, `source_mismatch`, `sink_is_source`, `quarantined`, `face_gone`, `not_carried`, `not_asked`), one line for each route (id in hex, source face, each sink with the time left before it lapses, frames, octets, age) and one for each barred face (the time left) |
+| `side/quarantine` | `FaceId` (required); `ExpirationPeriod` in milliseconds (optional) | bars the face from sourcing channel frames; the answer is `face barred` or `bar lifted` with `FaceId` and `ExpirationPeriod` set to the length applied |
 
 `side/quarantine` without `ExpirationPeriod` applies the face's next bar by
 its history: 60 s, doubling for each repeat on the same face up to 1 h, and 60 s
-again after an hour clean. With a value the bar lasts that long and keeps a
+again after an hour clean. A call while a bar is live changes nothing, not even
+the history (one incident reported twice is one bar, not two doublings), and
+the answer names what is left of the live bar. With a value the bar lasts that
+long, at most 1 h (`ExpirationPeriod` is clamped to the longest bar and the
+answer names the length applied, so no value bars a face for good), and keeps a
 longer one the face already has; `0` lifts the bar and keeps the history. A
-barred face has the channel frames it sends dropped and its keep-alives
-ignored, and no route is installed with it as the upstream face; the NDN
-traffic over it goes on.
+barred face has the channel frames it sends dropped and no route is installed
+with it as the upstream face; the `Keep` and `Unsub` it sends for the routes it
+is a sink of still count (its own sink management: the bar does not cut the
+routes to it), and the NDN traffic over it goes on.
 
 | status | when | sentence says |
 |---|---|---|
 | 400 | `side/quarantine` names no `FaceId` (or 0) | to name the face to bar and where to find it (`faces/list`, `side/list`) |
 | 400 | the `FaceId` is no face on this forwarder (a bar of length 0 is not refused) | the face is not on this forwarder; name one from `faces/list` |
+| 403 | any `side/*` command arriving over `/localhop` (whoever signed it) | that it is not accepted over `/localhop`, and to send it on the local management socket as the node's operator |
 | 404 | any other verb of the module | the verb is unknown |
 
 ## Invites

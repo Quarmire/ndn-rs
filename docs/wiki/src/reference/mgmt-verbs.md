@@ -152,12 +152,14 @@ Unknown TLVs inside the dataset are skipped.
 | `info` | Settings, live route count, and counters. |
 
 `side` (ndn-rs extension; the fan-out table for side (channel) frames in
-`ndn-engine`'s `side` module; every verb needs a signed command):
+`ndn-engine`'s `side` module; every verb needs a signed command, on the local
+management socket only: over `/localhop` (route registration alone) it is
+answered 403):
 
 | Verb | Effect |
 |---|---|
 | `list` | Read-only status text: the counters (routes, sinks, frames and octets in and out, each drop by reason: `unrouted`, `wrong_source`, `malformed`, `class_unsupported`, `quota`, `quarantined`, `sink_full`, `sink_error`; `UP` keeps and unsubs; each refused install by reason), one line per route (id in hex, source face, each sink with the time left before it lapses, frames, octets, age) and the faces barred now. Changes nothing. |
-| `quarantine` | Bar a face's side frames: `FaceId` (required; never defaults to the requesting face) and an optional `ExpirationPeriod` in **milliseconds**. Without it the bar is the face's next by its history (60 s, doubling per repeat on the same face up to 1 h, back to 60 s after an hour clean); with a value, that long; `0` lifts the bar. A barred face has the side frames it sends dropped (`quarantined`), its `Keep`s ignored and no route installed from it; the NDN traffic over it is untouched. Answers the length applied in `ExpirationPeriod`. |
+| `quarantine` | Bar a face's side frames: `FaceId` (required; never defaults to the requesting face) and an optional `ExpirationPeriod` in **milliseconds**. Without it the bar is the face's next by its history (60 s, doubling per repeat on the same face up to 1 h, back to 60 s after an hour clean); a call while a bar is live changes nothing and names what is left; with a value, that long, at most 1 h; `0` lifts the bar. A barred face has the side frames it sends dropped (`quarantined`) and no route installed from it; its own sinks' `Keep` and `Unsub` still count and the NDN traffic over it is untouched. Answers the length applied in `ExpirationPeriod`. |
 
 `security` (selected; the trust verbs and their answers are specified in
 `docs/specs/mgmt-trust.md`):

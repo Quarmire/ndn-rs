@@ -182,8 +182,8 @@ impl FaceLifecycleContext for EngineDiscoveryContext {
         }
         inner.rib.handle_face_down(face_id, &inner.fib);
         inner.fib.remove_face(face_id);
-        inner.side.remove_face(face_id);
         inner.face_table.remove(face_id);
+        inner.side.remove_face(face_id);
     }
 }
 
