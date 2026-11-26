@@ -59,19 +59,17 @@ impl Bus {
         self.stalled.store(false, Ordering::SeqCst);
         let stations = self.stations.lock().unwrap().clone();
         for station in stations {
-            let dst = *station.last_dst.lock().unwrap();
-            if let Some(dst) = dst {
-                self.drain(&station, dst);
-            }
+            self.drain(&station);
         }
     }
 
-    /// Send what `from` has queued to `dst`: a multicast address reaches every station that joined
-    /// the group but the sender; a unicast address, the station that owns it; broadcast, every
-    /// station but the sender. The payload is padded to 46 octets, as a NIC pads it.
-    fn drain(&self, from: &Arc<Station>, dst: MacAddr) {
+    /// Send what `from` has queued, each frame to the address it was queued for: a multicast
+    /// address reaches every station that joined the group but the sender; a unicast address,
+    /// the station that owns it; broadcast, every station but the sender. The payload is padded
+    /// to 46 octets, as a NIC pads it.
+    fn drain(&self, from: &Arc<Station>) {
         loop {
-            let Some(payload) = from.txq.lock().unwrap().pop_front() else {
+            let Some((dst, payload)) = from.txq.lock().unwrap().pop_front() else {
                 break;
             };
             self.wire.lock().unwrap().push(Wire {
@@ -113,11 +111,9 @@ struct Station {
     bus: Arc<Bus>,
     inbox: Mutex<VecDeque<(Bytes, MacAddr)>>,
     rx: Notify,
-    txq: Mutex<VecDeque<Bytes>>,
+    txq: Mutex<VecDeque<(MacAddr, Bytes)>>,
     tx_cap: usize,
     tx_room: Notify,
-    /// The address of the last flush: what the medium sends to when it resumes.
-    last_dst: Mutex<Option<MacAddr>>,
 }
 
 #[derive(Clone)]
@@ -134,7 +130,6 @@ impl MockPort {
             txq: Mutex::default(),
             tx_cap,
             tx_room: Notify::new(),
-            last_dst: Mutex::new(None),
         });
         bus.stations.lock().unwrap().push(Arc::clone(&station));
         Self(station)
@@ -154,19 +149,18 @@ impl EtherPort for MockPort {
         self.0.inbox.lock().unwrap().pop_front()
     }
 
-    fn try_push_tx(&self, payload: &[u8]) -> bool {
+    fn try_push_tx(&self, payload: &[u8], dst: &MacAddr) -> bool {
         let mut q = self.0.txq.lock().unwrap();
         if q.len() >= self.0.tx_cap {
             return false;
         }
-        q.push_back(Bytes::copy_from_slice(payload));
+        q.push_back((*dst, Bytes::copy_from_slice(payload)));
         true
     }
 
-    fn flush_tx(&self, dst: &MacAddr) -> std::io::Result<()> {
-        *self.0.last_dst.lock().unwrap() = Some(*dst);
+    fn flush_tx(&self) -> std::io::Result<()> {
         if !self.0.bus.stalled.load(Ordering::SeqCst) {
-            self.0.bus.drain(&self.0, *dst);
+            self.0.bus.drain(&self.0);
         }
         Ok(())
     }

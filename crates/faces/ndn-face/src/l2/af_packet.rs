@@ -132,6 +132,26 @@ pub(crate) unsafe fn write_tp_status(frame: *mut u8, val: u32) {
     unsafe { (*AtomicU32::from_ptr(frame as *mut u32)).store(val, Ordering::Release) }
 }
 
+/// What the TX ring holds that the kernel's frame headers do not: where each queued frame goes.
+///
+/// A `SOCK_DGRAM` packet socket takes the link-layer destination of every frame a `sendto` sends
+/// from that call's address (the `sockaddr_ll` in a TPACKET_V2 TX frame is the RX layout, never
+/// read on TX), so one call can address only one destination. The ring therefore keeps the
+/// destination of each frame itself and hands the kernel one run of frames with the same
+/// destination per call. The queued frames are the slots `[next - released - staged, next)` (mod
+/// the frame count), oldest first: first the `released` ones the kernel was told to send and has
+/// not yet taken (all one destination), then the `staged` ones that wait for their own call.
+struct TxQueue {
+    /// The slot the next pushed frame is written to.
+    next: u32,
+    /// Frames marked `TP_STATUS_SEND_REQUEST` that the kernel has not taken.
+    released: u32,
+    /// Frames written to a slot but not yet marked: their slot still reads as available.
+    staged: u32,
+    /// The destination of each slot's frame.
+    dst: Box<[MacAddr]>,
+}
+
 /// Mmap'd `PACKET_RX_RING` + `PACKET_TX_RING` for zero-copy packet I/O.
 pub struct PacketRing {
     map: *mut u8,
@@ -141,13 +161,32 @@ pub struct PacketRing {
     tx_frame_nr: u32,
     tx_offset: usize,
     rx_head: AtomicU32,
-    tx_head: std::sync::Mutex<u32>,
+    tx: std::sync::Mutex<TxQueue>,
 }
 
 unsafe impl Send for PacketRing {}
 unsafe impl Sync for PacketRing {}
 
 impl PacketRing {
+    /// A ring over `map`, `map_len` bytes: the RX ring, then a TX ring of the same size.
+    pub(crate) fn new(map: *mut u8, map_len: usize) -> Self {
+        Self {
+            map,
+            map_len,
+            frame_size: RING_FRAME_SIZE as usize,
+            rx_frame_nr: RING_FRAME_NR,
+            tx_frame_nr: RING_FRAME_NR,
+            tx_offset: map_len / 2,
+            rx_head: AtomicU32::new(0),
+            tx: std::sync::Mutex::new(TxQueue {
+                next: 0,
+                released: 0,
+                staged: 0,
+                dst: vec![MacAddr::new([0; 6]); RING_FRAME_NR as usize].into_boxed_slice(),
+            }),
+        }
+    }
+
     fn rx_frame(&self, idx: u32) -> *mut u8 {
         unsafe { self.map.add(idx as usize * self.frame_size) }
     }
@@ -208,7 +247,9 @@ impl PacketRing {
         Some((bytes, src_mac))
     }
 
-    pub fn try_push_tx(&self, data: &[u8]) -> bool {
+    /// Queue `data` for `dst`; `false` when the ring has no room. The frame is only queued:
+    /// [`flush_with`](Self::flush_with) sends it, to `dst` and no other address.
+    pub fn try_push_tx(&self, data: &[u8], dst: &MacAddr) -> bool {
         // ETH-2: the mmap TX frame is a fixed RING_FRAME_SIZE slot. The unsafe
         // copy must not trust the caller's length — reject anything that would
         // overflow the frame, even though the paired LP fragmenter clamps to the
@@ -218,11 +259,17 @@ impl PacketRing {
             _ => return false,
         }
 
-        let mut head = self.tx_head.lock().unwrap();
-        let frame = self.tx_frame(*head);
+        let mut q = self.tx.lock().unwrap();
+        self.reap(&mut q);
+        // Every queued frame holds its slot, whether or not the slot reads as available yet.
+        if q.released + q.staged >= self.tx_frame_nr {
+            return false;
+        }
+        let slot = q.next;
+        let frame = self.tx_frame(slot);
 
         let status = unsafe { read_tp_status(frame) };
-        if status != 0 {
+        if status != libc::TP_STATUS_AVAILABLE {
             return false;
         }
 
@@ -234,10 +281,72 @@ impl PacketRing {
             (*hdr).tp_snaplen = data.len() as u32;
         }
 
-        unsafe { write_tp_status(frame, libc::TP_STATUS_SEND_REQUEST) };
-
-        *head = (*head + 1) % self.tx_frame_nr;
+        q.dst[slot as usize] = *dst;
+        q.staged += 1;
+        q.next = (slot + 1) % self.tx_frame_nr;
         true
+    }
+
+    /// Send every queued frame, each to its own destination: `send` is called once per run of
+    /// consecutive frames with one destination, after marking exactly that run for the kernel,
+    /// and must have the kernel send the marked frames to the address it is given (`sendto`).
+    /// A run the kernel did not take (a send that would block) stays marked and is sent again,
+    /// to its own destination, by the next flush before any frame queued after it.
+    ///
+    /// The queue stays locked across `send`: a frame another thread queues cannot be marked, and
+    /// so cannot be sent to this call's address, while this run is still the kernel's.
+    pub fn flush_with(
+        &self,
+        mut send: impl FnMut(&MacAddr) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut q = self.tx.lock().unwrap();
+        loop {
+            self.reap(&mut q);
+            if q.released == 0 {
+                if q.staged == 0 {
+                    return Ok(());
+                }
+                let first = self.oldest(&q);
+                let dst = q.dst[first as usize];
+                let mut run = 0;
+                while run < q.staged {
+                    let slot = (first + run) % self.tx_frame_nr;
+                    if q.dst[slot as usize] != dst {
+                        break;
+                    }
+                    unsafe {
+                        write_tp_status(self.tx_frame(slot), libc::TP_STATUS_SEND_REQUEST);
+                    }
+                    run += 1;
+                }
+                q.staged -= run;
+                q.released = run;
+            }
+            let dst = q.dst[self.oldest(&q) as usize];
+            send(&dst)?;
+            self.reap(&mut q);
+            if q.released > 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The slot of the oldest queued frame.
+    fn oldest(&self, q: &TxQueue) -> u32 {
+        (q.next + 2 * self.tx_frame_nr - q.released - q.staged) % self.tx_frame_nr
+    }
+
+    /// Drop from the queue the released frames the kernel has taken (their slot is no longer
+    /// marked `TP_STATUS_SEND_REQUEST`).
+    fn reap(&self, q: &mut TxQueue) {
+        while q.released > 0 {
+            let oldest = self.oldest(q);
+            let status = unsafe { read_tp_status(self.tx_frame(oldest)) };
+            if status == libc::TP_STATUS_SEND_REQUEST {
+                break;
+            }
+            q.released -= 1;
+        }
     }
 }
 
@@ -283,16 +392,7 @@ pub fn setup_packet_ring(fd: RawFd) -> std::io::Result<PacketRing> {
         return Err(std::io::Error::last_os_error());
     }
 
-    Ok(PacketRing {
-        map: map as *mut u8,
-        map_len,
-        frame_size: RING_FRAME_SIZE as usize,
-        rx_frame_nr: RING_FRAME_NR,
-        tx_frame_nr: RING_FRAME_NR,
-        tx_offset: rx_ring_size,
-        rx_head: AtomicU32::new(0),
-        tx_head: std::sync::Mutex::new(0),
-    })
+    Ok(PacketRing::new(map as *mut u8, map_len))
 }
 
 /// Hardware (MAC) address of `iface` via `SIOCGIFHWADDR`.
@@ -409,5 +509,142 @@ mod tests {
 
         let data_slice = &buf[payload_offset..payload_offset + payload.len()];
         assert_eq!(data_slice, payload);
+    }
+
+    /// A TX ring over anonymous memory instead of a socket's: the ring logic runs without
+    /// `CAP_NET_RAW`, and [`kernel_sendto`] plays the kernel's side of it.
+    fn memory_ring() -> PacketRing {
+        let map_len = 2 * (RING_BLOCK_SIZE as usize) * (RING_BLOCK_NR as usize);
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED);
+        PacketRing::new(map as *mut u8, map_len)
+    }
+
+    /// The kernel's `sendto` on a TX ring: it addresses every frame it takes to `dst` (the
+    /// address of the call, the only one a `SOCK_DGRAM` ring has), takes the frames marked
+    /// `TP_STATUS_SEND_REQUEST` in ring order up to `limit` of them (a send that would block
+    /// takes fewer), and hands each slot back. `head` is the kernel's own position in the ring.
+    struct Kernel {
+        head: u32,
+        wire: Vec<(MacAddr, Vec<u8>)>,
+    }
+
+    impl Kernel {
+        fn sendto(&mut self, ring: &PacketRing, dst: &MacAddr, limit: usize) {
+            for _ in 0..limit {
+                let frame = ring.tx_frame(self.head);
+                if unsafe { read_tp_status(frame) } != libc::TP_STATUS_SEND_REQUEST {
+                    break;
+                }
+                let len = unsafe { (*(frame as *const libc::tpacket2_hdr)).tp_len } as usize;
+                let payload = unsafe { std::slice::from_raw_parts(frame.add(TX_DATA_OFFSET), len) };
+                self.wire.push((*dst, payload.to_vec()));
+                unsafe { write_tp_status(frame, libc::TP_STATUS_AVAILABLE) };
+                self.head = (self.head + 1) % ring.tx_frame_nr;
+            }
+        }
+    }
+
+    fn station(n: u8) -> MacAddr {
+        MacAddr::new([0x02, 0, 0, 0, 0, n])
+    }
+
+    const MCAST: MacAddr = MacAddr::new([0x01, 0x00, 0x5e, 0x00, 0x17, 0xaa]);
+
+    /// One flush sends each queued frame to the destination it was queued for: a unicast frame
+    /// queued beside multicast frames is not sent to the group, a multicast frame is not sent
+    /// to the station of the frame before it, and a second unicast reaches its own station.
+    #[test]
+    fn one_flush_sends_every_queued_frame_to_its_own_destination() {
+        let ring = memory_ring();
+        let queued = [
+            (station(1), 1u8),
+            (MCAST, 2),
+            (MCAST, 3),
+            (station(2), 4),
+            (MCAST, 5),
+        ];
+        for (dst, tag) in &queued {
+            assert!(ring.try_push_tx(&[*tag; 60], dst));
+        }
+        let mut kernel = Kernel {
+            head: 0,
+            wire: Vec::new(),
+        };
+        ring.flush_with(|dst| {
+            kernel.sendto(&ring, dst, usize::MAX);
+            Ok(())
+        })
+        .unwrap();
+        let expected: Vec<_> = queued
+            .iter()
+            .map(|(dst, tag)| (*dst, vec![*tag; 60]))
+            .collect();
+        assert_eq!(kernel.wire, expected);
+    }
+
+    /// A flush the kernel did not take (it would block) leaves the frames queued for the
+    /// destination they were queued for: a frame queued after it for another station does
+    /// not change where they go.
+    #[test]
+    fn frames_the_kernel_did_not_take_keep_their_destination() {
+        let ring = memory_ring();
+        let mut kernel = Kernel {
+            head: 0,
+            wire: Vec::new(),
+        };
+        assert!(ring.try_push_tx(&[1; 60], &station(1)));
+        ring.flush_with(|dst| {
+            kernel.sendto(&ring, dst, 0);
+            Ok(())
+        })
+        .unwrap();
+        assert!(kernel.wire.is_empty());
+
+        assert!(ring.try_push_tx(&[2; 60], &MCAST));
+        ring.flush_with(|dst| {
+            kernel.sendto(&ring, dst, usize::MAX);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            kernel.wire,
+            vec![(station(1), vec![1; 60]), (MCAST, vec![2; 60])]
+        );
+    }
+
+    /// A frame queued but not yet flushed is never overwritten by a later push: a full ring
+    /// refuses the push, and every frame leaves intact once it drains.
+    #[test]
+    fn a_full_ring_refuses_a_push_instead_of_overwriting_a_queued_frame() {
+        let ring = memory_ring();
+        let n = RING_FRAME_NR as usize;
+        for i in 0..n {
+            assert!(ring.try_push_tx(&[i as u8; 60], &station(i as u8)));
+        }
+        assert!(!ring.try_push_tx(&[0xff; 60], &MCAST));
+        let mut kernel = Kernel {
+            head: 0,
+            wire: Vec::new(),
+        };
+        ring.flush_with(|dst| {
+            kernel.sendto(&ring, dst, usize::MAX);
+            Ok(())
+        })
+        .unwrap();
+        let expected: Vec<_> = (0..n)
+            .map(|i| (station(i as u8), vec![i as u8; 60]))
+            .collect();
+        assert_eq!(kernel.wire, expected);
+        assert!(ring.try_push_tx(&[0xff; 60], &MCAST));
     }
 }

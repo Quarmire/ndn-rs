@@ -169,11 +169,11 @@ impl<P: EtherPort> Transport for MulticastEtherFace<P> {
     /// the channel codec guarantees; the face sends what it is given.
     fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
         check_side_frame(&frame, class, self.side_frame_max())?;
-        if !self.port.try_push_tx(&frame) {
+        if !self.port.try_push_tx(&frame, &NDN_ETHER_MCAST_MAC) {
             return Err(SideRefused::Full);
         }
         self.port
-            .flush_tx(&NDN_ETHER_MCAST_MAC)
+            .flush_tx()
             .map_err(|e| SideRefused::Io(e.to_string()))
     }
 
@@ -210,12 +210,12 @@ impl<P: EtherPort> MulticastEtherFace<P> {
     /// counterpart).
     async fn send_to_mac(&self, pkt: &[u8], dst: &MacAddr) -> Result<(), FaceError> {
         loop {
-            if self.port.try_push_tx(pkt) {
+            if self.port.try_push_tx(pkt, dst) {
                 break;
             }
             self.port.writable().await?;
         }
-        self.port.flush_tx(dst)?;
+        self.port.flush_tx()?;
         Ok(())
     }
 }

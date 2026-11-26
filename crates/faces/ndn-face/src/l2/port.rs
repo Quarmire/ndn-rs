@@ -20,12 +20,14 @@ pub trait EtherPort: Send + Sync + 'static {
     /// The next received payload and the station that sent it, if one is waiting.
     fn try_pop_rx(&self) -> Option<(Bytes, MacAddr)>;
 
-    /// Queue one payload for sending; `false` when the send queue has no room.
-    fn try_push_tx(&self, payload: &[u8]) -> bool;
+    /// Queue one payload to be sent to `dst`; `false` when the send queue has no room. Every
+    /// payload leaves for the `dst` it was queued with, whatever else is queued beside it.
+    fn try_push_tx(&self, payload: &[u8], dst: &MacAddr) -> bool;
 
-    /// Have the queued payload sent to `dst` now. An error is the port's own (the interface is
-    /// down); a send that would block is not one: the payload stays queued for the kernel.
-    fn flush_tx(&self, dst: &MacAddr) -> std::io::Result<()>;
+    /// Have what is queued sent now, each payload to its own destination. An error is the
+    /// port's own (the interface is down); a send that would block is not one: the payloads
+    /// stay queued for the kernel.
+    fn flush_tx(&self) -> std::io::Result<()>;
 
     /// Complete when a payload may be waiting.
     fn readable(&self) -> impl Future<Output = std::io::Result<()>> + Send;
@@ -47,29 +49,31 @@ impl EtherPort for AfPacketPort {
         self.ring.try_pop_rx_with_source()
     }
 
-    fn try_push_tx(&self, payload: &[u8]) -> bool {
-        self.ring.try_push_tx(payload)
+    fn try_push_tx(&self, payload: &[u8], dst: &MacAddr) -> bool {
+        self.ring.try_push_tx(payload, dst)
     }
 
-    fn flush_tx(&self, dst: &MacAddr) -> std::io::Result<()> {
-        let dst = make_sockaddr_ll(self.ifindex, dst, NDN_ETHERTYPE);
-        let ret = unsafe {
-            libc::sendto(
-                self.socket.get_ref().as_raw_fd(),
-                std::ptr::null(),
-                0,
-                0,
-                &dst as *const libc::sockaddr_ll as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if ret == -1 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::WouldBlock {
-                return Err(err);
+    fn flush_tx(&self) -> std::io::Result<()> {
+        self.ring.flush_with(|dst| {
+            let dst = make_sockaddr_ll(self.ifindex, dst, NDN_ETHERTYPE);
+            let ret = unsafe {
+                libc::sendto(
+                    self.socket.get_ref().as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    0,
+                    &dst as *const libc::sockaddr_ll as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                )
+            };
+            if ret == -1 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(err);
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn readable(&self) -> std::io::Result<()> {
