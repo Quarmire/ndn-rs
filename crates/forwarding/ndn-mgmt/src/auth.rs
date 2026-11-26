@@ -81,6 +81,16 @@ pub(crate) fn is_extended_module(module: &[u8]) -> bool {
     !standard.contains(&module)
 }
 
+/// Whether a command for `module`/`verb` may arrive over `/localhop`. The path exists for a
+/// neighbour's route registration, as NFD's rib-manager serves it (`rib/register`,
+/// `rib/unregister`), against the localhop trust anchors; those anchors authorise nothing else.
+/// Every other command (bar a link, list channel routes, create a face, edit the FIB, …) is
+/// the local operator's, on `/localhost`.
+pub(crate) fn localhop_allows(module: &[u8], verb: &[u8]) -> bool {
+    use ndn_mgmt_wire::nfd_command::{module as m, verb as v};
+    module == m::RIB && (verb == v::REGISTER || verb == v::UNREGISTER)
+}
+
 /// Effective auth gate: extended modules always require signed commands;
 /// standard modules follow the operator's `require_signed_commands` flag.
 pub(crate) fn effective_require_signed(module: &[u8], require_signed_global: bool) -> bool {

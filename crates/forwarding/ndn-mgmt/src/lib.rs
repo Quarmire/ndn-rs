@@ -68,7 +68,8 @@ pub use notification::{NotificationEvent, NotificationStream};
 
 use auth::{
     CommandAuth, authorize_command, authorize_trust_change, effective_require_signed,
-    is_public_dataset_verb, local_command_auth, resolve_control_parameters, trust_change,
+    is_public_dataset_verb, local_command_auth, localhop_allows, resolve_control_parameters,
+    trust_change,
 };
 use wire::{HeldDatasets, send_dataset, send_response};
 
@@ -1059,6 +1060,36 @@ pub async fn run_ndn_mgmt_handler(
                      device decides another node's requests on its own node)",
                 )
                 .with("operation", operation),
+            );
+            send_response(
+                &handle,
+                &interest.name,
+                &resp,
+                mgmt_handles.response_signer().as_deref(),
+            )
+            .await;
+            continue;
+        }
+        // `/localhop` is for a neighbour's route registration (NFD's rib-manager serves it
+        // for `rib/register` and `rib/unregister` only). Every other module is reachable only
+        // on the local management socket: a signer the localhop anchors accept to register
+        // routes must not bar a link, list the channel routes, create faces or change the
+        // FIB.
+        if is_localhop_command && !localhop_allows(&parsed.module, &parsed.verb) {
+            tracing::warn!(
+                target: "mgmt.security",
+                name = %interest.name,
+                "nfd-mgmt: command for a module other than route registration refused over /localhop"
+            );
+            let resp = ControlResponse::error(
+                status::UNAUTHORIZED,
+                format!(
+                    "`{}/{}` is not accepted over /localhop: only a neighbour's route \
+                     registration (rib/register, rib/unregister) is. Send it on this node's \
+                     local management socket (/localhost/nfd), as its operator",
+                    String::from_utf8_lossy(&parsed.module),
+                    String::from_utf8_lossy(&parsed.verb)
+                ),
             );
             send_response(
                 &handle,

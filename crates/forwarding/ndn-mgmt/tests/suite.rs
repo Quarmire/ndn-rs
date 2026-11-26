@@ -28,6 +28,8 @@ mod faces_update_tier2;
 mod ipc_seam;
 #[path = "local_operator_commands.rs"]
 mod local_operator_commands;
+#[path = "localhop_modules.rs"]
+mod localhop_modules;
 #[path = "ndnsd_adapter.rs"]
 mod ndnsd_adapter;
 #[path = "notifications.rs"]
