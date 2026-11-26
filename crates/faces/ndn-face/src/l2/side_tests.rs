@@ -640,3 +640,33 @@ async fn a_unicast_reply_on_the_multicast_face_reaches_one_station() {
         "a reply by MAC reaches that station only"
     );
 }
+
+/// On a shared segment a unicast face stands for its one named peer: a frame another station
+/// addresses to this station's MAC never reaches the forwarder as this face's, so a third station
+/// cannot send frames of a route this face is the source of, or `UP` records for its sinks.
+#[tokio::test]
+async fn a_unicast_face_hears_only_its_named_peer() {
+    let bus = Arc::new(Bus::default());
+    let (face, a_port) = unicast(&bus, 0xA0, 8);
+    let peer = MockPort::on(&bus, 0xA1, false, 8);
+    let third = MockPort::on(&bus, 0xC0, false, 8);
+
+    let from_third = marked(60, 0xEE);
+    assert!(third.try_push_tx(&from_third, &a_port.mac()));
+    third.flush_tx().unwrap();
+    let from_peer = marked(60, 0x11);
+    assert!(peer.try_push_tx(&from_peer, &a_port.mac()));
+    peer.flush_tx().unwrap();
+
+    assert_eq!(
+        recv(&face).await,
+        from_peer,
+        "the face handed the forwarder a frame its named peer did not send"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), face.recv_bytes())
+            .await
+            .is_err(),
+        "the third station's frame reached the forwarder as the face's"
+    );
+}

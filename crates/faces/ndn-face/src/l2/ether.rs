@@ -169,10 +169,17 @@ impl<P: EtherPort> Transport for NamedEtherFace<P> {
         Ok(Some(new as u64))
     }
 
+    /// Only the named peer's frames: on a shared segment any station can address this
+    /// station's MAC, and a unicast face stands for one peer, not for the segment. A frame whose
+    /// source is another station is dropped here, before the forwarder sees it (as on macOS and
+    /// Windows), so a third station cannot speak as this face (forge an `UP` for a sink, send
+    /// frames of a route this face sources).
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
         loop {
-            if let Some((pkt, _)) = self.port.try_pop_rx() {
-                return Ok(pkt);
+            while let Some((pkt, src)) = self.port.try_pop_rx() {
+                if src == self.peer_mac {
+                    return Ok(pkt);
+                }
             }
             self.port.readable().await?;
         }
