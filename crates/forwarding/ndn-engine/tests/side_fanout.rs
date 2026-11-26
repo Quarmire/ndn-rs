@@ -251,19 +251,31 @@ async fn a_refused_install_still_delivers_the_data_without_the_header() {
 }
 
 #[tokio::test]
-async fn a_header_on_a_data_from_a_quarantined_face_installs_nothing_and_ndn_traffic_goes_on() {
+async fn a_header_on_a_data_from_a_quarantined_face_installs_nothing() {
     let (s, hs) = face(1, FaceKind::App);
     let (r, hr) = face(2, FaceKind::App);
     let (e, _sd) = engine(vec![s, r], 1).await;
     let barred = e.side().bar(FaceId(1), e.side().now());
     assert_eq!(barred, Duration::from_secs(60));
 
-    // The Interest and the Data still cross the barred face; the Data is
-    // delivered without the header, and no route stands.
+    // The Data still crosses the barred face and is delivered, without the
+    // header; no route stands, and the refusal says why.
     let got = session(&hr, &hs, labelled_data(ID, 30)).await;
     assert!(!is_lp_packet(&got));
     let stats = e.side().stats();
     assert_eq!((stats.routes, stats.refused_quarantined), (0, 1));
+}
+
+#[tokio::test]
+async fn a_quarantined_face_still_carries_ndn_traffic() {
+    let (s, hs) = face(1, FaceKind::App);
+    let (r, hr) = face(2, FaceKind::App);
+    let (e, _sd) = engine(vec![s, r], 1).await;
+    // A route stands from the face; then the face is barred.
+    e.side()
+        .install(SideId(ID), FaceId(1), FaceId(2), Duration::from_secs(30))
+        .unwrap();
+    e.side().bar(FaceId(1), e.side().now());
 
     // A marked frame from the barred face is dropped `quarantined`.
     hs.inject(data_frame(ID, 64));
@@ -273,7 +285,13 @@ async fn a_header_on_a_data_from_a_quarantined_face_installs_nothing_and_ndn_tra
     .await;
     assert!(hr.side().is_empty());
 
-    // A second exchange over the same face still works.
+    // NDN packets still cross it, in both directions: an Interest from the
+    // receiver reaches the barred face's peer and the Data comes back.
+    let got = session(&hr, &hs, data()).await;
+    assert!(!is_lp_packet(&got));
+    let delivered = Data::decode(got).unwrap();
+    assert_eq!(*delivered.name, name());
+    // And a second exchange over the same face.
     let second = InterestBuilder::new("/chan/sess/2".parse::<Name>().unwrap())
         .lifetime(Duration::from_secs(4))
         .build();
