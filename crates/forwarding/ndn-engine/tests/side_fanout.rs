@@ -425,6 +425,75 @@ async fn a_face_that_goes_down_takes_its_routes_with_it_at_each_cleanup_site() {
     }
 }
 
+/// A connectionless on-demand face that carries only channel frames, in either
+/// direction, is not idle: the reaper (which removes a face after 5 minutes
+/// without traffic) leaves it and its routes alone; one that carries nothing
+/// is still reaped.
+#[tokio::test]
+async fn a_face_that_carries_only_channel_frames_is_not_reaped() {
+    let start = 1_000_000_000_000_000_000;
+    let rt = WarpRuntime::new(start, Warp::ReaperOnly);
+    let (e, _sd) = engine_on(rt.clone()).await; // sender app, face 1
+
+    // Face 2 is a sink of a route fed by the app; face 3 is the source of a
+    // route the app is a sink of. Both are Udp faces added on demand.
+    let (sink, _hsink) = face(2, FaceKind::Udp);
+    let (source, hsource) = face(3, FaceKind::Udp);
+    e.add_face(sink, CancellationToken::new());
+    e.add_face(source, CancellationToken::new());
+    let (_app2, happ) = face(4, FaceKind::App);
+    e.add_face(_app2, CancellationToken::new());
+    e.side()
+        .install(SideId(ID), FaceId(4), FaceId(2), Duration::from_secs(300))
+        .unwrap();
+    e.side()
+        .install(
+            SideId(ID + 1),
+            FaceId(3),
+            FaceId(1),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+
+    // Eight minutes pass in two-minute steps; each step one frame goes out
+    // to face 2 and one comes in from face 3. Neither face sees an NDN packet.
+    for step in 1..=4 {
+        rt.advance(Duration::from_secs(120));
+        // A receiver's Keeps would hold the sinks (TTL is at most 300 s);
+        // refresh them as a Data or a Keep does.
+        for (id, src, sink) in [(ID, 4, 2), (ID + 1, 3, 1)] {
+            e.side()
+                .install(
+                    SideId(id),
+                    FaceId(src),
+                    FaceId(sink),
+                    Duration::from_secs(300),
+                )
+                .unwrap();
+        }
+        happ.inject(data_frame(ID, 64));
+        hsource.inject(data_frame(ID + 1, 64));
+        // Let the frames be routed and the reaper (30 ms real) run.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            e.faces().get(FaceId(2)).is_some(),
+            "the sink face was reaped at step {step}"
+        );
+        assert!(
+            e.faces().get(FaceId(3)).is_some(),
+            "the source face was reaped at step {step}"
+        );
+    }
+    assert_eq!(e.side().stats().routes, 2);
+
+    // Control: with no traffic at all the reaper does remove them.
+    rt.advance(Duration::from_secs(6 * 60));
+    eventually("idle faces are still reaped", || {
+        e.faces().get(FaceId(2)).is_none() && e.faces().get(FaceId(3)).is_none()
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn the_engines_sweep_lapses_a_sink_on_the_engine_clock() {
     let rt = WarpRuntime::new(1_000_000_000_000_000_000, Warp::All);

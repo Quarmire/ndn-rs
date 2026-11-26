@@ -196,7 +196,12 @@ pub async fn run_idle_face_task(
                     {
                         continue;
                     }
-                    let last = entry.last_activity.load(std::sync::atomic::Ordering::Relaxed);
+                    // A side frame sent over the face counts as activity as
+                    // an NDN packet does (the reader stamps what it receives).
+                    let last = entry
+                        .last_activity
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .max(side.last_activity(face_id));
                     if now.saturating_sub(last) > IDLE_TIMEOUT_NS {
                         expired.push(face_id);
                     }

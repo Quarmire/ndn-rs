@@ -102,6 +102,13 @@ pub(crate) async fn run_face_reader(
                             .counters
                             .in_side_bytes
                             .fetch_add(raw.len() as u64, Ordering::Relaxed);
+                        // A side frame is traffic on the face as an NDN packet is:
+                        // it keeps a connectionless on-demand face from idling out.
+                        if track_activity {
+                            state
+                                .last_activity
+                                .store(runtime.unix_nanos(), Ordering::Relaxed);
+                        }
                     }
                     let outcome = side.on_frame(face_id, raw, &face_table);
                     trace!(target: t::FACE_SYSTEM, face=%face_id, ?outcome, "face-reader: side frame");

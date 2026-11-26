@@ -380,6 +380,8 @@ struct FaceEntry {
     /// The face is barred until this time (ns); 0: never was.
     barred_until: AtomicU64,
     strikes: Mutex<Strikes>,
+    /// The last time a side frame was handed to this face (ns).
+    last_sent: AtomicU64,
 }
 
 struct Bucket {
@@ -401,6 +403,7 @@ impl FaceEntry {
             rate_on: AtomicBool::new(false),
             bucket: Mutex::new(None),
             barred_until: AtomicU64::new(0),
+            last_sent: AtomicU64::new(0),
             strikes: Mutex::new(Strikes::default()),
         }
     }
@@ -464,6 +467,8 @@ struct Route {
     frames: AtomicU64,
     bytes: AtomicU64,
     created: u64,
+    /// The source face's state, stamped when an `UP` record goes to it.
+    source_entry: Arc<FaceEntry>,
 }
 
 #[derive(Default)]
@@ -669,6 +674,7 @@ impl SideTable {
                         frames: AtomicU64::new(0),
                         bytes: AtomicU64::new(0),
                         created: now,
+                        source_entry: self.entry(source),
                     }),
                 );
                 *q.per_source.entry(source).or_insert(0) += 1;
@@ -760,6 +766,7 @@ impl SideTable {
                 Ok(()) => {
                     delivered += 1;
                     bump(&c.frames_out);
+                    sink.entry.last_sent.store(now, Ordering::Relaxed);
                     c.bytes_out.fetch_add(frame.len() as u64, Ordering::Relaxed);
                 }
                 Err(refused) => self.refused_by_sink(&refused),
@@ -834,7 +841,13 @@ impl SideTable {
             return false;
         };
         match source.forward_side_from(frame, SideClass::Datagram, from) {
-            Ok(()) => true,
+            Ok(()) => {
+                route
+                    .source_entry
+                    .last_sent
+                    .store(self.now(), Ordering::Relaxed);
+                true
+            }
             Err(refused) => {
                 self.refused_by_sink(&refused);
                 false
@@ -1013,6 +1026,16 @@ impl SideTable {
     /// Live sinks of route `id`; a sender with none sends nothing.
     pub fn sinks(&self, id: SideId) -> usize {
         self.routes.get(&id.0).map_or(0, |r| r.sinks.load().len())
+    }
+
+    /// When a side frame last went out over `face` (to it as a sink, or an
+    /// `UP` record to it as a source), on the table's clock in ns; 0 if never.
+    /// The idle reaper counts it as the face's activity, as it does an NDN
+    /// packet: frames the face *receives* are stamped by the reader.
+    pub fn last_activity(&self, face: FaceId) -> u64 {
+        self.faces
+            .get(&face)
+            .map_or(0, |e| e.last_sent.load(Ordering::Relaxed))
     }
 
     /// Routes that have `face` as their source or as a sink.
