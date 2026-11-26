@@ -322,13 +322,33 @@ pub enum Live {
     Off,
 }
 
-/// How far a receiver trusts frames before a signed checkpoint covers them.
+/// How far a receiver trusts frames before a signed checkpoint covers them (docs/specs/channel.md,
+/// Checkpoints).
+///
+/// **Checkpoints detect; they do not prevent.** Between two checkpoints a holder of the channel
+/// key (any receiver the sender admitted, or a member relaying) can alter or invent frames under
+/// the sender's key, and a [`Trust::Prompt`] receiver delivers them: authenticated as "a holder of
+/// the key's" inside the window [`ChannelConfig::checkpoint`](super::config::ChannelConfig)
+/// states, as the sender's after a checkpoint that lists the frame verified. Silence is not trust
+/// either way: frames older than `max(4 x period, 100 ms)` that no verified checkpoint has been
+/// received for make a `Prompt` receiver hold what follows, and none within 3 s ends the session
+/// ([`EndReason::Unverifiable`](super::sessions::EndReason)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Trust {
-    /// Deliver a frame as soon as its AEAD opens (the default). Checkpoints: stage 5.
+    /// Deliver a frame as soon as its AEAD opens (the default): lowest latency, forgeries by a
+    /// key holder are delivered for at most the stated window and then exposed
+    /// ([`GetNotice::Retracted`], [`crate::Alert::ChannelForgery`], evidence).
     #[default]
     Prompt,
-    /// Hold delivery until a signed checkpoint covers the frame. Checkpoints: stage 5.
+    /// Deliver a frame only after a signed checkpoint that lists it (with the same hash)
+    /// verified: it **prevents** delivery of a holder's forgeries, at up to one checkpoint period
+    /// of latency (so it cannot meet the latency target). A frame the checkpoint does not list is
+    /// dropped and is evidence. A checkpoint that was lost leaves its frames unlisted for good (a
+    /// checkpoint covers only its own range): they are **dropped**, counted and told as
+    /// [`GetNotice::Lagged`], never delivered unverified, as soon as a later checkpoint shows the
+    /// range passed and after 3 s at the latest. A channel whose sender sends no checkpoints (its
+    /// path has no stream) is never delivered to a `Verified` receiver: the `Items` are told
+    /// [`EndReason::Unverifiable`](super::sessions::EndReason).
     Verified,
 }
 
@@ -341,7 +361,7 @@ pub struct GetOptions {
     pub live: Live,
     /// Which channel modes to join (default: all the senders offer).
     pub modes: Modes,
-    /// Whether to wait for a signed checkpoint (default [`Trust::Prompt`]). Checkpoints: stage 5.
+    /// Whether to wait for a signed checkpoint (default [`Trust::Prompt`]).
     pub trust: Trust,
     /// What a `Reliable` or `Window` receiver does when its queue is full: [`Congestion::Block`]
     /// stalls the stream (back pressure to the sender), [`Congestion::Drop`] discards the oldest and
@@ -432,7 +452,12 @@ pub enum GetNotice {
     },
     /// The live part ended; kept data goes on.
     LiveEnded(LiveEnd),
-    /// A signed checkpoint contradicted these emissions. Checkpoints: stage 5.
+    /// A signed checkpoint contradicted these emissions: a frame this `Items` was given for the
+    /// writer's channel is not one the writer's checkpoint lists. Discard what was delivered with
+    /// a `seq` from `from` to `to` (inclusive); delivered items stay delivered, nothing is taken
+    /// back by the stream itself. When a frame that is not data (a `BIND`, a `HELLO`, a standing
+    /// bracket) was contradicted, `to` is the highest sequence accepted at that time: what
+    /// followed was read under a table or a state a key holder wrote.
     Retracted {
         /// The writer's device.
         writer: Name,

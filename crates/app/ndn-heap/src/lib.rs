@@ -41,9 +41,19 @@ mod sync;
 mod test_kit;
 mod trust;
 
-pub use crate::chan::carrier::{Carrier, CarrierFuture, CarrierRefused};
+pub use crate::chan::bar::IngressBar;
+pub use crate::chan::carrier::{
+    Carrier, CarrierFuture, CarrierHost, CarrierRefused, RingOffered, RingRefused,
+};
+pub use crate::chan::config::{
+    CHECKPOINT_DEFAULT, CHECKPOINT_MAX, CHECKPOINT_MIN, ChannelConfig, VERIFY_EPSILON,
+};
 pub use crate::chan::error::ChanError;
+pub use crate::chan::evidence::{
+    ChannelEvidence, EVIDENCE_KEPT, EVIDENCE_VERSION, EvidenceError, EvidenceKind,
+};
 pub use crate::chan::items::Items;
+pub use crate::chan::route::{DATAGRAM_FRAME_MAX, SIDE_TTL};
 pub use crate::chan::rx::{Delivery, Dropped};
 pub use crate::chan::sessions::{ChannelInfo, EndReason};
 pub use crate::chan::verbs::{

@@ -24,7 +24,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use super::answer::{ASK_CLOCK_WINDOW_MS, ChanAnswer};
+use super::bar::BarSlot;
 use super::channels::Channels;
+use super::evidence::EvidenceLog;
+use super::route::Routes;
 use super::rx::{Receivers, RxStats};
 use super::sessions::{EndReason, RecvSessions};
 use super::standing::{Who, gate, standing};
@@ -176,6 +179,17 @@ pub(crate) struct Chan {
     pub(crate) replay: ReplayGuard,
     /// What was counted.
     pub(crate) stats: Stats,
+    /// The node's routes in the forwarder it runs on ([`super::route`]).
+    pub(crate) route: Arc<Routes>,
+    /// What bars a face from channel frames when a frame it carried was forged.
+    pub(crate) bar: BarSlot,
+    /// The last [`super::evidence::EVIDENCE_KEPT`] frames shown not to be a sender's.
+    pub(crate) evidence: EvidenceLog,
+    /// Test seam: while set, the node's channels send no checkpoints (their sessions say
+    /// `S_CKPT_MS` 0), so the tests of frames and batching see the frames they sent and nothing
+    /// else. The checkpoint tests clear it.
+    #[cfg(test)]
+    pub(crate) checkpoints_off: std::sync::atomic::AtomicBool,
     wake: Arc<Notify>,
     listening: Mutex<HashMap<Name, usize>>,
     heard: Mutex<Heard>,
@@ -194,6 +208,11 @@ impl Chan {
             rx: Receivers::default(),
             replay: ReplayGuard::new(REPLAY_PER_KEY, false),
             stats: Stats::default(),
+            route: Arc::new(Routes::default()),
+            bar: BarSlot::default(),
+            evidence: EvidenceLog::default(),
+            #[cfg(test)]
+            checkpoints_off: std::sync::atomic::AtomicBool::new(true),
             wake: Arc::new(Notify::new()),
             listening: Mutex::new(HashMap::new()),
             heard: Mutex::new(Heard::default()),
@@ -432,6 +451,10 @@ impl NodeInner {
             }
         }
         let (_lapsed, _ended) = self.chan.channels.expire(now);
+        // An idle channel says it is alive: an empty checkpoint every 5 s, nothing else.
+        for tx in self.chan.tx.all() {
+            tx.idle_checkpoint(now);
+        }
         announce.extend(self.chan.channels.announce_due(now));
         announce.sort();
         announce.dedup();
@@ -446,6 +469,9 @@ impl NodeInner {
                 let _ = session.recheck(self);
             }
         }
+        // The routes of the forwarder the node runs on, if it attached one: `Keep`s due, a
+        // session nobody takes any more, `Unsub`s, `NoPath`.
+        self.chan_route_tick(now);
         // The channels whose session ended or was replaced tell their `Items`; held messages
         // past 50 ms are dropped.
         self.chan.rx.sweep(self, now);

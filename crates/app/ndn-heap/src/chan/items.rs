@@ -48,6 +48,9 @@ pub(crate) struct SinkState {
     fifo: Fifo<Got>,
     /// Sessions that ended, told after what is queued.
     ends: VecDeque<LiveEnd>,
+    /// Notices that say something about items already given (a retraction), told after what is
+    /// queued and before a session's end.
+    notices: VecDeque<GetNotice>,
     closed: bool,
 }
 
@@ -64,6 +67,9 @@ impl SinkState {
         }
         if let Some((_, _, got)) = self.latest.take() {
             return Some(Ok(got));
+        }
+        if let Some(notice) = self.notices.pop_front() {
+            return Some(Err(notice));
         }
         self.ends
             .pop_front()
@@ -95,6 +101,8 @@ pub(crate) struct Sink {
     select: Select,
     modes: Modes,
     overflow: Congestion,
+    /// Whether this sink waits for a signed checkpoint to cover a frame before it is given it.
+    pub(crate) trust: Trust,
     /// A `HELLO` came on a channel this sink takes: the path to a sender works.
     hello: AtomicBool,
     state: Mutex<SinkState>,
@@ -104,17 +112,25 @@ pub(crate) struct Sink {
 }
 
 impl Sink {
-    pub(crate) fn new(space: Name, select: Select, modes: Modes, overflow: Congestion) -> Sink {
+    pub(crate) fn new(
+        space: Name,
+        select: Select,
+        modes: Modes,
+        overflow: Congestion,
+        trust: Trust,
+    ) -> Sink {
         Sink {
             space,
             select,
             modes,
             overflow,
+            trust,
             hello: AtomicBool::new(false),
             state: Mutex::new(SinkState {
                 latest: Coalescing::new(PAIRS_MAX, LATEST_BYTES),
                 fifo: Fifo::new(QUEUE_BYTES),
                 ends: VecDeque::new(),
+                notices: VecDeque::new(),
                 closed: false,
             }),
             waker: AtomicWaker::new(),
@@ -195,6 +211,24 @@ impl Sink {
         self.waker.wake();
     }
 
+    /// A signed checkpoint contradicted the frames of `writer`'s channel with sequences `from` to
+    /// `to`: told after what is queued, so a consumer that read the items reads the retraction
+    /// next.
+    pub(crate) fn retract(&self, writer: &Name, from: u64, to: u64) {
+        {
+            let mut st = self.state.lock();
+            if st.closed {
+                return;
+            }
+            st.notices.push_back(GetNotice::Retracted {
+                writer: writer.clone(),
+                from,
+                to,
+            });
+        }
+        self.waker.wake();
+    }
+
     /// A `HELLO` came.
     pub(crate) fn hello_seen(&self) {
         self.hello.store(true, Ordering::Release);
@@ -251,6 +285,23 @@ impl Sink {
 ///   record.
 /// * **Dropping it** cancels the sink: nothing more is queued for it, and a stalled stream is
 ///   freed.
+/// * **What a delivery is worth** (docs/specs/channel.md, Checkpoints). With
+///   [`Trust::Prompt`] (the default) an item is delivered as soon as its AEAD opens: it is
+///   authenticated as "a holder of the channel key's". A signed checkpoint of the sender then
+///   covers it, at most `W = P + d + epsilon` later (the checkpoint period `P`, 20 ms by default,
+///   the stream's one-way delay `d` and 1 ms of verification: about **22 ms** on a 1 ms path;
+///   [`crate::ChannelInfo::detection_window`] computes it, and
+///   [`crate::ChannelConfig::checkpoint`] sets `P`), and the item is the sender's. A frame a key
+///   holder forged is exposed by the next checkpoint instead: a
+///   [`GetNotice::Retracted`] for its sequences follows what was delivered, evidence is kept
+///   ([`crate::NodeHandle::channel_evidence`]), the face it came over is barred from channel
+///   frames ([`crate::IngressBar`]) and [`crate::Alert::ChannelForgery`] is raised. With
+///   [`Trust::Verified`] nothing is delivered before its checkpoint verified: no forgery of a
+///   holder is ever delivered, at up to one period of latency. **Checkpoints detect; `Prompt` does
+///   not prevent.**
+/// * **Silence is not trust.** A `Prompt` receiver that holds frames no verified checkpoint
+///   covers for `max(4 x period, 100 ms)` holds what follows until one verifies, and ends the
+///   session when none does within 3 s ([`crate::EndReason::Unverifiable`]).
 ///
 /// The stream ends when the node stops. Poll it with [`futures::StreamExt::next`], or take
 /// everything queued at once with [`Items::next_batch`].
@@ -323,6 +374,8 @@ impl Drop for Items {
     fn drop(&mut self) {
         self.sink.close();
         self.node.chan.rx.remove_sink(&self.sink);
+        // A session no other `Items` takes lapses, and its route is given up.
+        self.node.chan_route_release(&self.sink);
     }
 }
 
@@ -345,9 +398,7 @@ impl Heap {
     ///
     /// [`HeapError::NotAllowed`] for a space this device only follows (a follower takes no part in
     /// channels: open the space as a member); [`HeapError::BadRequest`] for `opts.live` of
-    /// [`Live::Off`] (it asks for no emissions: read the kept value) and for `opts.trust` of
-    /// [`Trust::Verified`] (it holds delivery until a signed checkpoint covers a frame, which
-    /// this version does not have: ask for `Trust::Prompt`, or wait for checkpoints).
+    /// [`Live::Off`] (it asks for no emissions: read the kept value).
     pub fn live(&self, what: Select, opts: GetOptions) -> Result<Items, HeapError> {
         if self.inner.follower {
             return Err(HeapError::NotAllowed {
@@ -364,19 +415,12 @@ impl Heap {
                     .into(),
             });
         }
-        if opts.trust == Trust::Verified {
-            return Err(HeapError::BadRequest {
-                why:
-                    "`Trust::Verified` holds delivery until a signed checkpoint covers the frame, \
-                      and this version has no checkpoints to check: ask for `Trust::Prompt`"
-                        .into(),
-            });
-        }
         let sink = Arc::new(Sink::new(
             self.inner.name.clone(),
             what,
             opts.modes,
             opts.congestion,
+            opts.trust,
         ));
         let listen = self.node.chan_listen(&self.inner.name);
         self.node.chan.rx.add_sink(Arc::clone(&sink));

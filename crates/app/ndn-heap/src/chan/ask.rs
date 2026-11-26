@@ -271,12 +271,12 @@ impl NodeInner {
             Answer::Session(s) => s.certs.clone(),
             Answer::Refusal(_) => Vec::new(),
         };
-        let key = match self
+        let (key, key_digest) = match self
             .judge
             .validate_asker_packet(&data, sender, space, &carried)
             .await
         {
-            Judged::Valid(v) => v.key,
+            Judged::Valid(v) => (v.key, v.key_digest),
             Judged::Refused(why) => {
                 return Err(bad_answer(
                     sender,
@@ -293,6 +293,9 @@ impl NodeInner {
                 ));
             }
         };
+        // The key checkpoints of this channel are verified under: the public key of the
+        // certificate that vouched for the key the answer was signed with.
+        let signer_public = self.judge.ed25519_key_of(&data.name, space, &key_digest);
         let held = self
             .space_of(space)
             .filter(|s| !s.follower)
@@ -368,6 +371,7 @@ impl NodeInner {
             let (session, replay) = match existing {
                 Some(session) => {
                     session.renewed(&record, channel_key, key, judged_at, now);
+                    session.set_signer_public(signer_public);
                     (session, None)
                 }
                 None => {
@@ -380,6 +384,7 @@ impl NodeInner {
                         judged_at,
                         now,
                     ));
+                    session.set_signer_public(signer_public);
                     // Frames of this channel that reached this device before its session did are
                     // held; from here they are taken in first, in the order they arrived, and a frame
                     // that arrives meanwhile queues behind them.
@@ -401,6 +406,8 @@ impl NodeInner {
             self.chan.stats.installed.bump();
             (session, replay)
         };
+        // The route this session came over is kept from now: the first `Keep` goes out at once.
+        self.chan_route_installed(&session);
         if let Some(replay) = replay {
             self.chan_replay_held(session.id(), replay).await;
         }

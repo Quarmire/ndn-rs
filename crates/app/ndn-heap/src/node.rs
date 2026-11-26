@@ -124,6 +124,8 @@ pub struct Config {
     /// What the host does so that persons a space lists can be judged
     /// (adopting their trust contexts for the data layer alone).
     pub adopter: Option<Arc<dyn Adopter>>,
+    /// What tunes the node's channels: the checkpoint period and the window it states.
+    pub channel: crate::chan::config::ChannelConfig,
 }
 
 impl Config {
@@ -150,6 +152,7 @@ impl Config {
             watch_queue: 4096,
             holders: Vec::new(),
             adopter: None,
+            channel: crate::chan::config::ChannelConfig::default(),
         }
     }
 }

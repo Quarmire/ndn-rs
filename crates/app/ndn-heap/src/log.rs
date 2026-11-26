@@ -321,6 +321,37 @@ pub enum Alert {
         /// The disk's reason.
         why: String,
     },
+    /// A frame of a channel was shown not to be the channel's sender's: a signed checkpoint of the
+    /// sender does not list it (or lists another frame at its sequence), or two authentic frames
+    /// came at one sequence. Only a holder of the channel key can make such a frame (the sender
+    /// itself, equivocating, or a receiver or member relaying under the key); `via` is the face
+    /// the frame came over, which is the link to bar or to look at. Evidence is kept
+    /// ([`crate::NodeHandle::channel_evidence`]); the host maps `via` to a link and a key.
+    ChannelForgery {
+        /// The sender's device, whose channel it is.
+        writer: Name,
+        /// The channel id.
+        channel: u64,
+        /// The channel's key epoch.
+        key_epoch: u32,
+        /// The first sequence of the frame.
+        seq: u64,
+        /// The face the frame came over.
+        via: ndn_transport::FaceId,
+    },
+    /// A checkpoint of a channel did not verify under the sender's key, though it opened under
+    /// the channel key: a holder of the key made it. The session was dropped
+    /// ([`crate::EndReason::BadCheckpoint`]); `via` is the face it came over.
+    ChannelCheckpoint {
+        /// The sender's device, whose channel it is.
+        writer: Name,
+        /// The channel id.
+        channel: u64,
+        /// The channel's key epoch.
+        key_epoch: u32,
+        /// The face the checkpoint came over.
+        via: ndn_transport::FaceId,
+    },
 }
 
 /// Who a space lists.

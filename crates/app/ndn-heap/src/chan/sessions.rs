@@ -63,6 +63,23 @@ pub enum EndReason {
     Left,
     /// The sender ended the channel (a `CONTROL` frame `END`): nothing more will come under it.
     Closed,
+    /// A checkpoint of the channel did not verify under the sender's key: some holder of the
+    /// channel key made it (the sender signs with a key no receiver holds), so the frames of this
+    /// session are not to be trusted. The session was dropped, evidence kept
+    /// ([`crate::NodeHandle::channel_evidence`]) and [`crate::Alert::ChannelCheckpoint`] raised.
+    /// Ask the sender again for a new session once the face that carried it is dealt with.
+    BadCheckpoint {
+        /// What was wrong, and what to do.
+        why: String,
+    },
+    /// Frames came and no checkpoint that verifies came for them within 3 s: this receiver cannot
+    /// tell the sender's frames from a key holder's, so it ended the session instead of trusting
+    /// them. Ask the sender again: the cause is a link that drops the sender's stream (where
+    /// checkpoints ride), a sender that stopped signing, or a key holder racing the sender.
+    Unverifiable {
+        /// What was waited for, and what to do.
+        why: String,
+    },
 }
 
 impl fmt::Display for EndReason {
@@ -73,6 +90,10 @@ impl fmt::Display for EndReason {
             EndReason::Lapsed => f.write_str("its lifetime ran out and it was not renewed"),
             EndReason::Left => f.write_str("this device left the space"),
             EndReason::Closed => f.write_str("the sender ended the channel"),
+            EndReason::BadCheckpoint { why } => {
+                write!(f, "a checkpoint was not the sender's: {why}")
+            }
+            EndReason::Unverifiable { why } => write!(f, "frames could not be verified: {why}"),
         }
     }
 }
@@ -97,8 +118,7 @@ pub(crate) struct Terms {
     pub(crate) carriers: Vec<CarrierOffer>,
     /// The name ids bound so far.
     pub(crate) table: Vec<Bind>,
-    /// The checkpoint period in milliseconds.
-    #[allow(dead_code)] // stage 5: checkpoints are taken at the period the sender announced
+    /// The checkpoint period in milliseconds, 0 when the sender sends none.
     pub(crate) ckpt_ms: u64,
     /// `Window` mode: what is replayed.
     #[allow(dead_code)]
@@ -134,6 +154,10 @@ struct State {
     terms: Terms,
     /// The key that signed the sender's last answer.
     sender_key: Name,
+    /// The 32 octets of that key's Ed25519 public key, as a certificate this device vouches for
+    /// carries it: what a checkpoint's signature is verified under. `None` when no such
+    /// certificate was found (checkpoints then cannot be verified, which is not forgery).
+    signer_public: Option<[u8; 32]>,
     /// When a failed renewal may be tried again.
     retry_at: Option<Instant>,
     ended: Option<EndReason>,
@@ -154,6 +178,23 @@ pub struct ChannelInfo {
     pub key_epoch: u32,
     /// How long the session lasts from receipt.
     pub lifetime: Duration,
+    /// The checkpoint period the sender's last answer announced, or `None` when its channel sends
+    /// no checkpoints (its carrier has no stream): such a channel cannot be
+    /// [`crate::Trust::Verified`], and what it delivers is authenticated only as a holder of the
+    /// channel key's. See [`ChannelInfo::detection_window`].
+    pub checkpoint: Option<Duration>,
+}
+
+impl ChannelInfo {
+    /// The stated detection window of this channel for a stream whose one-way delay is `delay`:
+    /// `W = P + d + ε` with the sender's period `P` and ε of 1 ms (see
+    /// [`crate::ChannelConfig`]). A frame a key holder forged is delivered to a
+    /// [`crate::Trust::Prompt`] receiver for at most this long before a signed checkpoint exposes
+    /// it. `None` for a channel that sends no checkpoints: nothing ever exposes a forgery there.
+    pub fn detection_window(&self, delay: Duration) -> Option<Duration> {
+        self.checkpoint
+            .map(|period| period + delay + super::config::VERIFY_EPSILON)
+    }
 }
 
 /// One sender's channel as this device holds it.
@@ -215,6 +256,7 @@ impl RecvSession {
                 lifetime: Duration::from_secs(record.lifetime),
                 terms: Terms::of(record),
                 sender_key,
+                signer_public: None,
                 retry_at: None,
                 ended: None,
             }),
@@ -257,6 +299,19 @@ impl RecvSession {
         self.state.lock().terms.seq
     }
 
+    /// The 32 octets of the Ed25519 public key checkpoints of this channel are verified under
+    /// (see [`Self::set_signer_public`]).
+    pub(crate) fn signer_public(&self) -> Option<[u8; 32]> {
+        self.state.lock().signer_public
+    }
+
+    /// The sender's key, as this device found it in a certificate it vouches for when the answer
+    /// was taken (an answer's own key is the one that signed it: the digest the validator
+    /// resolved to a certificate names exactly this key). Set at each install and renewal.
+    pub(crate) fn set_signer_public(&self, public: Option<[u8; 32]>) {
+        self.state.lock().signer_public = public;
+    }
+
     /// The key epoch of the key held now.
     #[cfg(test)]
     pub(crate) fn key_epoch(&self) -> u32 {
@@ -273,12 +328,19 @@ impl RecvSession {
             mode: self.mode,
             key_epoch: state.current.epoch,
             lifetime: state.lifetime,
+            checkpoint: (state.terms.ckpt_ms > 0)
+                .then(|| Duration::from_millis(state.terms.ckpt_ms.clamp(1, 2_000))),
         }
     }
 
     /// Why the session ended, if it did.
     pub(crate) fn ended(&self) -> Option<EndReason> {
         self.state.lock().ended.clone()
+    }
+
+    /// When the session was installed (the answer was taken, or the last renewal began).
+    pub(crate) fn installed(&self) -> Instant {
+        self.state.lock().installed
     }
 
     pub(crate) fn end(&self, why: EndReason) {
@@ -314,7 +376,14 @@ impl RecvSession {
     /// `low`, at `now`: the key held now, or the one before it for [`REKEY_GRACE`] after the
     /// receiver first saw the next epoch. `None` when the session is not usable, or the epoch is
     /// not held.
+    #[cfg(test)]
     pub(crate) fn frame_key(&self, low: u8, now: Instant) -> Option<FrameKey> {
+        self.frame_key_epoch(low, now).map(|(key, _)| key)
+    }
+
+    /// [`Self::frame_key`] and the whole key epoch it was derived for (a frame's header carries
+    /// only its low octet; a checkpoint's signature covers all 32 bits).
+    pub(crate) fn frame_key_epoch(&self, low: u8, now: Instant) -> Option<(FrameKey, u32)> {
         let state = self.state.lock();
         if state.ended.is_some()
             || now.saturating_duration_since(state.installed)
@@ -323,11 +392,11 @@ impl RecvSession {
             return None;
         }
         if state.current.epoch as u8 == low {
-            return Some(state.current.frame.clone());
+            return Some((state.current.frame.clone(), state.current.epoch));
         }
         match &state.previous {
             Some((held, until)) if held.epoch as u8 == low && now < *until => {
-                Some(held.frame.clone())
+                Some((held.frame.clone(), held.epoch))
             }
             _ => None,
         }

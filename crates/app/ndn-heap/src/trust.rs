@@ -910,6 +910,25 @@ impl Judge {
         out
     }
 
+    /// The 32 octets of the Ed25519 public key whose SHA-256 is `digest`, from a certificate this
+    /// node's validator **vouches for** (the view that judged `name` about `space`, then the
+    /// node's own): what a channel's checkpoints are verified under, once the answer's signature
+    /// was judged to be of the key with this digest (`Verified::key_digest`). `None` when no
+    /// vouched certificate carries it, or the key is not an Ed25519 key.
+    pub(crate) fn ed25519_key_of(
+        &self,
+        name: &Name,
+        space: &Name,
+        digest: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        let cert = self
+            .view_for(name, space, true)
+            .cert_cache()
+            .get_by_key_digest(digest)
+            .or_else(|| self.validator.cert_cache().get_by_key_digest(digest))?;
+        <[u8; 32]>::try_from(&cert.public_key[..]).ok()
+    }
+
     async fn device_packet(&self, data: &Data, device: &Name, space: &Name, fetch: bool) -> Judged {
         let view = self.view_for(&data.name, space, true);
         match decide(&view, data, space, fetch).await {

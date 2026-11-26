@@ -31,7 +31,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::encode::DataBuilder;
-use ndn_packet::{CachePolicyType, Interest, LpHeaders, NackReason};
+use ndn_packet::{Interest, NackReason};
 use ndn_security::ReplayCheck;
 use ndn_security::Signer;
 use ndn_security::cert_name::key_name_of;
@@ -52,9 +52,6 @@ use crate::rt::Instant;
 use crate::seal;
 use crate::trust::InterestJudged;
 use crate::wire::{device_of, parse_chan_name, parse_space_name};
-
-/// The checkpoint period a session names (milliseconds): the default of the checkpoint stage.
-pub(crate) const CKPT_MS: u64 = 20;
 
 /// The largest frame a session names for a datagram carrier: what one QUIC datagram carries at
 /// the smallest path MTU.
@@ -78,22 +75,20 @@ const WRAP_LEN: usize = 32 + 12 + 16 + 32;
 /// What the sender answers an ask with.
 #[derive(Debug)]
 pub(crate) enum ChanAnswer {
-    /// A signed Data: a session or a refusal. Send it with [`no_cache`].
+    /// A signed Data that sets up no route: a refusal. Sent with `NoCache` and no route label
+    /// ([`setup_headers`](super::route::setup_headers)).
     Data(Bytes),
+    /// The signed session of channel `id`: sent with `NoCache` and the route label
+    /// `SideRoute { id, ttl: SIDE_TTL }`, so each forwarder on its reverse path installs a route
+    /// for the frames that follow.
+    Session {
+        /// The signed Data.
+        wire: Bytes,
+        /// The channel id the label names.
+        id: u64,
+    },
     /// A Nack and nothing else.
     Nack(NackReason),
-}
-
-/// `wire`, a Data, in an NDNLPv2 packet that says `CachePolicy = NoCache`: nothing of a channel's
-/// setup is ever cached.
-pub(crate) fn no_cache(wire: &Bytes) -> Bytes {
-    ndn_packet::lp::encode_lp_with_headers(
-        wire,
-        &LpHeaders {
-            cache_policy: Some(CachePolicyType::NoCache),
-            ..LpHeaders::default()
-        },
-    )
 }
 
 /// A signed Data `name` with `content`, `FreshnessPeriod` 0, by `signer`.
@@ -177,7 +172,10 @@ impl NodeInner {
                     self.signatures
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.chan.stats.answered.bump();
-                    ChanAnswer::Data(wire)
+                    ChanAnswer::Session {
+                        wire,
+                        id: admitted.id,
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("a channel session cannot be signed: {e}");
@@ -216,7 +214,7 @@ impl NodeInner {
             aead: Aead::preferred(),
             carriers,
             table: terms.table,
-            ckpt_ms: CKPT_MS,
+            ckpt_ms: terms.ckpt_ms,
             window: terms.window,
             lifetime: admitted.lifetime,
             audience_epoch: admitted.audience.clone(),

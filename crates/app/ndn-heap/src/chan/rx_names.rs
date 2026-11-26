@@ -187,7 +187,6 @@ impl<T> Names<T> {
     }
 
     /// Messages held now.
-    #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
         self.held.len()
     }
