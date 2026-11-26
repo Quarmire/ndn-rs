@@ -227,6 +227,18 @@ impl Heap {
         let space = &self.inner.name;
         let node = &self.node;
         let generation = node.judge.generation();
+        // Read before the sender is looked up: a replacement that races leaves the entry stale.
+        let senders_at = node.chan.tx.epoch();
+        let kept = self.inner.senders.get(&node.chan.tx, mode);
+        if let Some(held) = kept
+            && held.gate_valid(generation)
+            && !held
+                .live()
+                .closed
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(held);
+        }
         if let Some(held) = node.chan.tx.get(space, mode)
             && held.gate_valid(generation)
             && !held
@@ -234,6 +246,7 @@ impl Heap {
                 .closed
                 .load(std::sync::atomic::Ordering::Acquire)
         {
+            self.inner.senders.keep(senders_at, mode, &held);
             return Ok(held);
         }
         let log = self.inner.log.lock();
@@ -280,6 +293,7 @@ impl Heap {
         drop(log);
         let channel = node.chan_tx_for(space, mode, &key, version);
         channel.set_gate(judged_at.0, judged_at.1);
+        self.inner.senders.keep(senders_at, mode, &channel);
         Ok(channel)
     }
 }

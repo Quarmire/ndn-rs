@@ -80,6 +80,8 @@ pub(crate) struct LinkStats {
     pub control_frames: u64,
     /// [`Carrier::receiver_added`] calls: how often the stream's gate was armed.
     pub receivers_added: u64,
+    /// [`Carrier::datagram_max`] calls: how often the sender asked for the path's size.
+    pub datagram_max_reads: u64,
 }
 
 struct LinkState {
@@ -166,6 +168,11 @@ impl Link {
         self.state.lock().shrinks.push_back(max);
     }
 
+    /// The path's size is `max` from now on (it grew, or fell, with no datagram refused).
+    pub(crate) fn set_datagram_max(&self, max: usize) {
+        self.state.lock().cfg.datagram_max = max;
+    }
+
     /// Datagrams waiting to be received.
     pub(crate) fn queued_datagrams(&self) -> usize {
         self.state.lock().datagrams.len()
@@ -231,7 +238,9 @@ impl Link {
 
 impl Carrier for Link {
     fn datagram_max(&self) -> usize {
-        self.state.lock().cfg.datagram_max
+        let mut st = self.state.lock();
+        st.stats.datagram_max_reads += 1;
+        st.cfg.datagram_max
     }
 
     fn has_stream(&self) -> bool {

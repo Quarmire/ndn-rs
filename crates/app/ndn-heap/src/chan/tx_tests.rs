@@ -585,6 +585,46 @@ async fn an_oversize_latest_message_goes_on_the_stream_and_still_replaces_an_uns
 }
 
 #[tokio::test]
+async fn emissions_do_not_ask_the_carrier_for_the_paths_size_message_by_message() {
+    let rig = rig(ChannelMode::Latest, LinkConfig::default());
+    let latest = EmitOptions::latest();
+    // The carrier is full: the emissions queue, so only emissions ask anything.
+    rig.link.set_full(true);
+    for i in 0..200 {
+        send(&rig, &name(i), b"payload", &latest, at(&rig, 1)).await;
+    }
+    let reads = rig.link.stats().datagram_max_reads;
+    assert!(
+        reads <= 3,
+        "200 emissions made the carrier say the path's size {reads} times (a frame attempt and the first message read it, no more)"
+    );
+}
+
+#[tokio::test]
+async fn a_path_that_grew_takes_the_message_the_kept_size_refused_as_a_datagram() {
+    let mut rig = rig(
+        ChannelMode::Latest,
+        LinkConfig {
+            datagram_max: 400,
+            ..LinkConfig::default()
+        },
+    );
+    let latest = EmitOptions::latest();
+    let big = vec![5u8; 800];
+    // The path takes 400: an 800 octet message goes on the stream.
+    send(&rig, &name(1), &big, &latest, at(&rig, 1)).await;
+    settle(&rig.tx).await;
+    assert_eq!(messages(&stream(&mut rig)).len(), 1);
+    assert!(messages(&datagrams(&mut rig)).is_empty());
+    // The path grows to 1,400 with nothing refused: the next one asks again and is a datagram.
+    rig.link.set_datagram_max(1_400);
+    send(&rig, &name(1), &big, &latest, at(&rig, 2)).await;
+    settle(&rig.tx).await;
+    assert_eq!(messages(&datagrams(&mut rig)).len(), 1);
+    assert!(messages(&stream(&mut rig)).is_empty());
+}
+
+#[tokio::test]
 async fn a_frame_the_paths_size_fell_under_is_repacked_once_under_new_sequences_then_goes_on_the_stream()
  {
     let mut rig = rig(ChannelMode::Latest, LinkConfig::default());
@@ -2033,5 +2073,41 @@ async fn an_inline_writer_that_left_nothing_waiting_is_idle_when_emit_returns() 
         rig.link.queued_datagrams(),
         1,
         "written inline by its own caller"
+    );
+}
+
+#[tokio::test]
+async fn a_kept_sender_is_given_only_while_the_node_still_holds_it() {
+    use super::tx::{SenderCache, Tx};
+    let (first, second) = (
+        rig(ChannelMode::Latest, LinkConfig::default()).tx,
+        rig(ChannelMode::Latest, LinkConfig::default()).tx,
+    );
+    let (tx, cache, space) = (Tx::default(), SenderCache::default(), name(0));
+    let latest = ChannelMode::Latest;
+    assert!(cache.get(&tx, latest).is_none(), "nothing kept yet");
+
+    let before = tx.epoch();
+    let held = tx.get_or_make(&space, latest, CHANNEL, || first.clone());
+    assert!(Arc::ptr_eq(&held, &first));
+    // The lookup raced no replacement of another sender: but `before` was read before this one
+    // was made, so the entry is stale at birth (conservative, never wrong).
+    cache.keep(before, latest, &held);
+    assert!(cache.get(&tx, latest).is_none());
+    cache.keep(tx.epoch(), latest, &held);
+    assert!(Arc::ptr_eq(&cache.get(&tx, latest).unwrap(), &first));
+    // Asking for the same channel again replaces nothing.
+    let again = tx.get_or_make(&space, latest, CHANNEL, || unreachable!("held"));
+    assert!(Arc::ptr_eq(&again, &first));
+    assert!(Arc::ptr_eq(&cache.get(&tx, latest).unwrap(), &first));
+    // Another mode is another slot.
+    assert!(cache.get(&tx, ChannelMode::Reliable).is_none());
+
+    // The node makes another sender (a new channel id): the kept one is no longer given.
+    let replaced = tx.get_or_make(&space, latest, CHANNEL + 1, || second.clone());
+    assert!(Arc::ptr_eq(&replaced, &second));
+    assert!(
+        cache.get(&tx, latest).is_none(),
+        "a kept sender the node replaced is never used"
     );
 }

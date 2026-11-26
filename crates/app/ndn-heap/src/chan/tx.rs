@@ -396,6 +396,13 @@ pub(crate) struct TxChannel {
     room: Notify,
     /// A callback is registered with the carrier ([`Carrier::on_ready`]).
     drain_requested: AtomicU64,
+    /// The datagram room the carrier last gave, with the carrier it was given by (the low 32 bits
+    /// of [`CarrierSlot::generation`] over the room): what an emission checks a message against
+    /// instead of asking the carrier, which for a link takes the connection's lock. Every frame
+    /// written reads the carrier again and keeps what it says, and so does a message that does
+    /// not fit what is kept, so a kept room that is too large costs one frame a repack (a path
+    /// that shrank, which the writer handles) and one that is too small costs one read.
+    datagram_room: AtomicU64,
     queue_bytes: usize,
     message_limit: usize,
     /// The space's fold version, to tell when the writer gate must be passed again.
@@ -513,6 +520,7 @@ impl TxChannel {
             }),
             room: Notify::new(),
             drain_requested: AtomicU64::new(0),
+            datagram_room: AtomicU64::new(0),
             queue_bytes: QUEUE_BYTES,
             message_limit: MESSAGE_DEFAULT,
             fold_version,
@@ -845,6 +853,28 @@ impl TxChannel {
         }
     }
 
+    /// The room a datagram frame has, as the carrier said it last, for a message that needs
+    /// `need`: the kept room if it is the attached carrier's and holds `need`, else the carrier is
+    /// asked and what it says is kept (see [`Self::datagram_room`]).
+    fn fitting_room(&self, carrier: &Arc<dyn Carrier>, need: usize) -> usize {
+        let kept = self.datagram_room.load(Ordering::Relaxed);
+        let room = (kept & u64::from(u32::MAX)) as usize;
+        if kept >> 32 == self.slot.generation() & u64::from(u32::MAX) && room >= need {
+            return room;
+        }
+        let room = limits::datagram_limit(carrier.datagram_max_for(self.id), FRAME_CAP);
+        self.remember_room(room);
+        room
+    }
+
+    /// Keep the room the carrier gave.
+    fn remember_room(&self, room: usize) {
+        let generation = self.slot.generation() & u64::from(u32::MAX);
+        let room = (room as u64).min(u64::from(u32::MAX));
+        self.datagram_room
+            .store(generation << 32 | room, Ordering::Relaxed);
+    }
+
     fn kicks(&self, st: &mut State) -> Kick {
         let mut kick = Kick::default();
         let blocked = self.drain_requested.load(Ordering::Acquire) == self.slot.generation();
@@ -963,13 +993,17 @@ impl TxChannel {
                         _ => self.message_limit,
                     },
                 })?;
-        let big = self.mode == ChannelMode::Latest
-            && need > limits::datagram_limit(carrier.datagram_max(), FRAME_CAP);
+        let datagram_room = if self.mode == ChannelMode::Latest {
+            self.fitting_room(carrier, need)
+        } else {
+            usize::MAX
+        };
+        let big = self.mode == ChannelMode::Latest && need > datagram_room;
         if big && (!stream || degraded) {
             return Err(EmitError::TooLarge {
                 what: "message that fits no datagram on a path with no stream",
                 size: need,
-                max: limits::datagram_limit(carrier.datagram_max(), FRAME_CAP),
+                max: datagram_room,
             }
             .into());
         }
@@ -1229,6 +1263,7 @@ impl TxChannel {
                 Err(CarrierRefused::TooLarge { max }) => {
                     let repacked_before = shrunk.is_some();
                     shrunk = Some(max);
+                    self.remember_room(limits::datagram_limit(max, FRAME_CAP));
                     self.resize(scratch, repacked_before);
                 }
                 Err(CarrierRefused::Closed) => {
@@ -1342,7 +1377,8 @@ impl TxChannel {
                 st.datagram_writing = false;
                 return Pack::Idle;
             };
-            let mut room = limits::datagram_limit(carrier.datagram_max(), FRAME_CAP);
+            let mut room = limits::datagram_limit(carrier.datagram_max_for(self.id), FRAME_CAP);
+            self.remember_room(room);
             if let Some(cap) = cap {
                 room = room.min(cap.max(MIN_FRAME_LEN));
             }
@@ -2173,6 +2209,34 @@ pub(crate) struct Tx {
     /// What the frame layer counted.
     pub(crate) stats: Arc<TxStats>,
     channels: parking_lot::RwLock<super::FastMap<Name, [Option<Arc<TxChannel>>; 3]>>,
+    /// Counts every time a slot of `channels` was given another sender: what [`SenderCache`]
+    /// checks to know its sender is still the one held here.
+    epoch: AtomicU64,
+}
+
+/// The senders one space handle emits on, by mode, so that an emission does not look the sender
+/// up by hashing the space's name: valid while [`Tx::epoch`] is what it was when it was kept.
+#[derive(Default)]
+pub(crate) struct SenderCache(parking_lot::Mutex<[Option<Kept>; 3]>);
+
+/// A sender and the [`Tx::epoch`] it was kept at.
+type Kept = (u64, Arc<TxChannel>);
+
+impl SenderCache {
+    /// The sender kept for `mode` if `tx` has not replaced any sender since it was kept.
+    pub(crate) fn get(&self, tx: &Tx, mode: ChannelMode) -> Option<Arc<TxChannel>> {
+        let epoch = tx.epoch();
+        match &self.0.lock()[index(mode)] {
+            Some((at, held)) if *at == epoch => Some(Arc::clone(held)),
+            _ => None,
+        }
+    }
+
+    /// Keep `sender` for `mode`; `epoch` is [`Tx::epoch`] as read **before** the sender was
+    /// looked up, so a replacement that raced the lookup leaves the entry stale, never wrong.
+    pub(crate) fn keep(&self, epoch: u64, mode: ChannelMode, sender: &Arc<TxChannel>) {
+        self.0.lock()[index(mode)] = Some((epoch, Arc::clone(sender)));
+    }
 }
 
 fn index(mode: ChannelMode) -> usize {
@@ -2184,6 +2248,11 @@ fn index(mode: ChannelMode) -> usize {
 }
 
 impl Tx {
+    /// How many times a slot was given another sender (see [`SenderCache`]).
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
     /// The sender of `(space, mode)`, if there is one.
     pub(crate) fn get(&self, space: &Name, mode: ChannelMode) -> Option<Arc<TxChannel>> {
         self.channels.read().get(space)?[index(mode)].clone()
@@ -2218,6 +2287,7 @@ impl Tx {
         }
         let made = make();
         *slot = Some(Arc::clone(&made));
+        self.epoch.fetch_add(1, Ordering::Release);
         made
     }
 }

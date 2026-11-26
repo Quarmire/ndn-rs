@@ -680,6 +680,8 @@ pub(crate) struct SpaceInner {
     /// by this node's clock ([`LOSS_EPOCH_INTERVAL_MS`]): in memory only, so a restart allows
     /// one more.
     last_loss_epoch: Mutex<Option<u64>>,
+    /// The senders `Heap::emit` uses, kept so an emission does not look one up by the space's name.
+    pub(crate) senders: crate::chan::tx::SenderCache,
 }
 
 /// The most standing alerts a space keeps for watchers that begin later.
@@ -777,6 +779,7 @@ impl SpaceInner {
             lapsed: Mutex::new(BTreeSet::new()),
             pending: Mutex::new(BTreeMap::new()),
             last_loss_epoch: Mutex::new(None),
+            senders: crate::chan::tx::SenderCache::default(),
         }
     }
 
