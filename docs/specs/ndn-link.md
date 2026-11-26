@@ -1393,10 +1393,11 @@ A relay's link is, in addition, wanted only while the relay is chosen or retried
 ### 16.2 Idle close and the Asleep close
 
 A device checks each link it keeps: an on-demand link every `idle` / 4, clamped to 250 ms – 30 s; other links every 60 s; and at once when the host changes something. *Activity* is the NDN datagrams and the channel datagrams sent or received on the link (QUIC DATAGRAM frames), and the octets of channel frames on its stream in either direction (ndn-rs `LinkHandle::side_stats`, §9 item 7); keep-alive PINGs and control-stream messages are not activity, so keep-alives do not hold an idle link open. A link another device dialled here with no activity for `quiet_close` is closed with **0x02** (Idle), unless the host's forwarder routes to its face — an NDN route, or a *side route* (`FaceSink::side_routes`: the routes the forwarder holds for channel frames; zero for a forwarder that has none) — or the link carries a namespace in transit (§15.7); a link this device dialled is its mode's own. The device closes the link:
-
 - with **0x05** (Asleep), when an `on-demand` link is not asked for, the host is not active, and the link carried no datagram for `idle` (the close comes within one check after that);
 - with **0x05**, when an `off` link is no longer asked for;
 - with **0x06** (Released), when a relay is no longer chosen (§15.6) or the peer was removed.
+
+**Channel stream bytes and the quiet close.** For the quiet-close rule of a link another device dialled here, the octets of channel frames on its stream are activity **only while the forwarder holds a side route to its face**: a peer that sends channel frames the forwarder would drop (nothing routes them) does not keep an unrouted link open by it, and once the route goes the quiet period runs from the last such octet. (For the on-demand idle rule of a link this device dials they count always.) Channel datagrams count with every datagram, as an NDN datagram the scope drops does: the rule asks whether the link carried anything, and `datagrams()` is not told what became of it.
 
 A host going inactive (`set_active(false)`) closes nothing at once: its on-demand links close once idle. After closing a link itself, the device dials again as soon as the link is wanted again (§13.1). A relay that sees a device's link end may count it asleep (§17.2).
 
