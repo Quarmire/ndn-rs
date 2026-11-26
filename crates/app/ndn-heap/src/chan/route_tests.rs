@@ -49,8 +49,10 @@ impl Sleep for Offset {
     }
 }
 impl Now for Offset {
+    /// The monotonic clock moves with the offset, as the wall clock does: the forwarder's
+    /// side table runs on it, not on the wall clock.
     fn now(&self) -> RtInstant {
-        TokioRuntime.now()
+        TokioRuntime.now() + Duration::from_nanos(self.0.load(Ordering::Relaxed))
     }
     fn unix_nanos(&self) -> u64 {
         TokioRuntime.unix_nanos() + self.0.load(Ordering::Relaxed)
@@ -595,13 +597,19 @@ async fn a_bar_call_reaches_the_forwarders_side_table() {
         .expect("attaching the forwarder attached the bar");
     let side = rig.engine.side();
     let link = FaceId(4_242);
+    // The link is a face the engine holds: a bar of an id it does not hold is refused.
+    let (link_face, _link_handle) = ndn_face_local::InProcFace::new(link, 1);
+    rig.engine.add_face(link_face, CancellationToken::new());
     assert!(!side.is_quarantined(link, side.now()));
     bar.bar(link.0);
     eventually("the face is barred", || {
         side.is_quarantined(link, side.now())
     })
     .await;
-    // The bar is the table's doubling: the next one on the same face is twice as long.
+    // A bar asked for while one is live changes nothing; once it ended the next one doubles:
+    // the table's doubling, twice as long on the same face.
+    assert!(side.bar(link, side.now()) <= Duration::from_secs(60));
+    side.lift(link);
     assert_eq!(side.bar(link, side.now()), Duration::from_secs(120));
 }
 

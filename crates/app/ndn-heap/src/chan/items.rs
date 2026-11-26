@@ -294,8 +294,9 @@ impl Sink {
 ///   [`crate::ChannelConfig::checkpoint`] sets `P`), and the item is the sender's. A frame a key
 ///   holder forged is exposed by the next checkpoint instead: a
 ///   [`GetNotice::Retracted`] for its sequences follows what was delivered, evidence is kept
-///   ([`crate::host::NodeHandle::channel_evidence`]), the face it came over is barred from channel
-///   frames ([`crate::IngressBar`]) and [`crate::Alert::ChannelForgery`] is raised. With
+///   ([`crate::host::NodeHandle::channel_evidence`]), the face it came over is asked to be barred
+///   from channel frames ([`crate::IngressBar`]; with none attached nothing is barred) and
+///   [`crate::Alert::ChannelForgery`] is raised. With
 ///   [`Trust::Verified`] nothing is delivered before its checkpoint verified: no forgery of a
 ///   holder is ever delivered, at up to one period of latency. **Checkpoints detect; `Prompt` does
 ///   not prevent.**

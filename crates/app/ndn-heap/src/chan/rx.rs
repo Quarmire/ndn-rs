@@ -53,7 +53,10 @@ use super::rx_hold::Hold;
 use super::rx_names::{Held, Names, Seen};
 use super::sessions::{EndReason, RecvSession, RecvSessions, Unknown};
 use super::verbs::{Emitted, Got, Kind, LiveEnd, Trust};
-use super::verify::{Accepted, Budget, Dup, Judged, Mismatch, Silence, Verify};
+use super::verify::{
+    Accepted, Bucket, Budget, Ceiling, Charge, Dup, Judged, Mismatch, NotKept, Share, Silence,
+    Verify,
+};
 use super::wire::{Bind, ChannelMode};
 use crate::error::Timestamp;
 use crate::host::NodeHandle;
@@ -63,6 +66,35 @@ use crate::rt::Instant;
 
 /// The shortest time between two re-asks of a `Window` sender made because of a gap.
 pub(crate) const REASK_EVERY: Duration = Duration::from_secs(1);
+
+/// How often budget starvation is told as a warning: every 30 s at most.
+const STARVED_NOTICE: Duration = Duration::from_secs(30);
+
+/// How long a channel without checkpoints does not ask the sender where it stands again after an
+/// answer showed its replay window is not ahead of it (the frames it refused as too old were
+/// old): 30 s.
+const PROBE_QUIET: Duration = Duration::from_secs(30);
+
+/// What a node says of the bar of the face a forged frame came over, from what it knows when it
+/// raises the alert: the bar is asked of the node's [`IngressBar`](super::bar::IngressBar), and
+/// whether the forwarder applied it is told by the bar when its answer comes (the face is this
+/// node's own, which is never barred; the forwarder holds no such face). Without a bar attached
+/// nothing is barred, and the text says so and what to do.
+pub(crate) fn bar_said(attached: bool, face: u64) -> String {
+    if attached {
+        format!(
+            "this node asked its forwarder to bar face {face} from channel frames (the bar's own \
+             log line says whether the forwarder did, and why not if it could not: the face is \
+             this node's own, or the forwarder holds no such face)"
+        )
+    } else {
+        format!(
+            "no IngressBar is attached to this node, so face {face} is NOT barred: attach one \
+             (`attach_forwarder` or `attach_bar`), or bar that link at the forwarder (the \
+             `side/quarantine` management verb)"
+        )
+    }
+}
 
 /// What the receiver counted: the proof of what a frame cost and why it was not delivered.
 #[derive(Default)]
@@ -105,6 +137,9 @@ pub(crate) struct RxStats {
     /// seen and the sender's last answer said: refused, and the sender is asked again (a
     /// genuine frame can only be that far after the receiver was cut off).
     pub(crate) too_far: Counter,
+    /// Times the replay window of a channel without checkpoints was put back at the sender's
+    /// signed sequence because an authentic frame far above it had moved it past the sender.
+    pub(crate) window_rebased: Counter,
     /// AEAD attempts: the only cryptography a frame costs.
     pub(crate) aead_attempts: Counter,
     /// Attempts that failed: not this session's key, or altered.
@@ -140,6 +175,12 @@ pub(crate) struct RxStats {
     pub(crate) checkpoints: Counter,
     /// Checkpoints whose signature verified under the sender's key.
     pub(crate) checkpoints_verified: Counter,
+    /// Checkpoints dropped unread because the channel's or the node's bucket was empty
+    /// ([`Bucket`]): each verification costs a hash and an Ed25519 verify, and a holder of the
+    /// channel key can seal a genuine checkpoint again at any number of fresh sequences. A
+    /// dropped checkpoint is neither a forgery nor a bad checkpoint: what waited for it stays
+    /// held, and the silence rule applies.
+    pub(crate) checkpoints_over_rate: Counter,
     /// Checkpoints that could not be verified because this device holds no certificate of the
     /// sender's key (not a forgery: the silence rule applies).
     pub(crate) unverifiable_checkpoints: Counter,
@@ -175,6 +216,12 @@ pub(crate) struct RxStats {
     pub(crate) held_unknown_evicted: Counter,
     /// Frames of an unknown channel id that were held 2 s without a session coming: dropped.
     pub(crate) held_unknown_expired: Counter,
+    /// Frames the node could not keep for checkpoints (`unchecked` too) or hold for a `Verified`
+    /// lane because the node's 8 MiB is taken by channels that hold more than their equal part,
+    /// while this channel was within its own: the other channels give the excess back at the
+    /// next maintenance pass. A count that keeps rising says a peer holds the keys of many
+    /// channels. Told once in 30 s as a warning.
+    pub(crate) budget_starved: Counter,
 }
 
 /// Why a frame was not delivered. Every reason is counted by the node (channel.md §12.8).
@@ -286,6 +333,9 @@ struct Post {
     alerts: Vec<Alert>,
     /// A holder of the key wrote the names this receiver reads by: ask the sender again.
     resync: bool,
+    /// A genuine-looking frame was refused as too old on a channel that sends no checkpoints: the
+    /// window's highest then, to compare with what the sender's next answer says. Ask again.
+    wedge: Option<u64>,
 }
 
 /// The class of sinks a frame is applied for.
@@ -409,9 +459,26 @@ struct RxState {
     highest: u64,
     /// `Verified` sinks already told that this channel cannot be verified (by address).
     refused: Vec<usize>,
+    /// No frame asks the sender where it stands before this (a channel without checkpoints whose
+    /// window is not ahead of the sender, or one that was asked a moment ago): see
+    /// [`ChannelRx::window_checked`].
+    probe_quiet_until: Option<Instant>,
+    /// How many checkpoints this channel may have verified: [`Bucket::for_period`].
+    checkpoint_bucket: Bucket,
+    /// This channel's part of the node's bytes for frames kept for checkpoints and frames held:
+    /// present when the sender checkpoints.
+    share: Option<Arc<Share>>,
 }
 
 impl RxState {
+    /// Held octets leave the hold: the node's budget has them back.
+    fn give_back(&mut self, octets: usize) {
+        self.held_bytes -= octets;
+        if let Some(share) = &self.share {
+            share.release(octets);
+        }
+    }
+
     fn cipher_index(&mut self, key: &FrameKey, aead: Aead) -> usize {
         if let Some(at) = self
             .ciphers
@@ -460,6 +527,7 @@ impl ChannelRx {
         let frame_max = usize::try_from(terms.frame_max).unwrap_or(usize::MAX);
         let period =
             (terms.ckpt_ms > 0).then(|| Duration::from_millis(terms.ckpt_ms.clamp(1, 2_000)));
+        let share = period.map(|_| node.chan.rx.budget.share());
         ChannelRx {
             channel: session.id(),
             space: session.space().clone(),
@@ -491,13 +559,18 @@ impl ChannelRx {
                 parsed: Vec::new(),
                 last_ingress: 0,
                 ended: false,
-                verify: period.map(|p| Verify::new(p, Arc::clone(&node.chan.rx.budget))),
+                verify: period
+                    .zip(share.as_ref())
+                    .map(|(p, share)| Verify::new(p, Arc::clone(share))),
                 held: VecDeque::new(),
                 held_bytes: 0,
                 hold_active: false,
                 pending_end: None,
                 highest: 0,
                 refused: Vec::new(),
+                probe_quiet_until: None,
+                checkpoint_bucket: Bucket::for_period(period.unwrap_or(Duration::from_secs(1))),
+                share,
             }),
             session: Arc::clone(session),
         }
@@ -598,13 +671,14 @@ impl ChannelRx {
         for (seq0, sequences) in expired {
             self.lose_lane(&mut st, stats, &lanes, Lane::Verified, seq0, sequences);
         }
-        self.drop_done(&mut st, rx);
+        self.shed(&mut st, stats, &lanes);
+        self.drop_done(&mut st);
         let (silence, period) = st.verify.as_ref().map(|v| (v.silence(now), v.period()))?;
         match silence {
             Silence::End => {
                 // The session ends with frames still waiting: each lane that was to be given one
                 // is told it missed it, before the end.
-                self.lose_all_held(&mut st, rx, stats, &lanes);
+                self.lose_all_held(&mut st, stats, &lanes);
                 stats.unverifiable.bump();
                 Some(unverifiable(period))
             }
@@ -673,7 +747,9 @@ impl ChannelRx {
             bars,
             alerts,
             resync,
+            wedge,
         } = post;
+        let bar_attached = node.chan.bar.get().is_some();
         for alert in alerts {
             match &alert {
                 Alert::ChannelForgery {
@@ -684,7 +760,8 @@ impl ChannelRx {
                     ..
                 } => tracing::warn!(
                     %writer, channel = format_args!("{channel:016x}"), seq, via = via.0,
-                    "a frame of this channel is not the sender's: a key holder made it; the face it came over is barred"
+                    "a frame of this channel is not the sender's: a key holder made it; {}",
+                    bar_said(bar_attached, via.0)
                 ),
                 Alert::ChannelCheckpoint {
                     writer,
@@ -693,7 +770,8 @@ impl ChannelRx {
                     ..
                 } => tracing::warn!(
                     %writer, channel = format_args!("{channel:016x}"), via = via.0,
-                    "a checkpoint of this channel is not the sender's: the session was dropped"
+                    "a checkpoint of this channel is not the sender's: the session was dropped; {}",
+                    bar_said(bar_attached, via.0)
                 ),
                 _ => {}
             }
@@ -718,13 +796,27 @@ impl ChannelRx {
             self.reask(node, since);
         }
         if far {
-            self.ask_again(node, now, "a frame came far ahead of the sequences held");
+            self.ask_again(
+                node,
+                now,
+                "a frame came far ahead of the sequences held",
+                None,
+            );
+        }
+        if wedge.is_some() {
+            self.ask_again(
+                node,
+                now,
+                "frames of the sender's sequences are refused as too old",
+                wedge,
+            );
         }
         if resync {
             self.ask_again(
                 node,
                 now,
                 "a key holder wrote the names this device reads by",
+                None,
             );
         }
         delivery
@@ -735,7 +827,7 @@ impl ChannelRx {
     fn unknown_epoch(&self, node: &NodeInner, now: Instant) -> Delivery {
         let stats = &node.chan.stats.rx;
         stats.unknown_epoch.bump();
-        if !self.ask_again(node, now, "a frame came under a new key epoch") {
+        if !self.ask_again(node, now, "a frame came under a new key epoch", None) {
             stats.unknown_channel.bump();
             return Delivery::Dropped(Dropped::UnknownChannel);
         }
@@ -745,8 +837,16 @@ impl ChannelRx {
     /// Ask the sender for the session again, at most once a second per sender (one limit for every
     /// cause: a frame under an unknown key epoch, and an authentic frame far ahead of the
     /// sequences held). The answer brings the key epoch it holds and the sequence it has reached.
+    /// With `probed` (the replay window's highest when frames were refused as too old) the answer
+    /// is also what the window is checked against ([`Self::window_checked`]).
     /// False when this node holds no session of the channel any more.
-    fn ask_again(&self, node: &NodeInner, now: Instant, why: &'static str) -> bool {
+    fn ask_again(
+        &self,
+        node: &NodeInner,
+        now: Instant,
+        why: &'static str,
+        probed: Option<u64>,
+    ) -> bool {
         let stats = &node.chan.stats.rx;
         match node.chan.sessions.unknown_epoch(self.channel, now) {
             Unknown::Ask {
@@ -755,11 +855,21 @@ impl ChannelRx {
                 mode,
             } => {
                 stats.epoch_asks.bump();
+                let channel = self.channel;
                 let node = node.arc();
                 let task = Arc::clone(&node);
                 node.tasks.spawn(async move {
-                    if let Err(error) = task.chan_ask(&space, &sender, mode).await {
-                        tracing::debug!(%space, %sender, ?mode, "asking again ({why}) failed: {error}");
+                    match task.chan_ask(&space, &sender, mode).await {
+                        Err(error) => {
+                            tracing::debug!(%space, %sender, ?mode, "asking again ({why}) failed: {error}");
+                        }
+                        Ok(_) => {
+                            if let Some(probed) = probed
+                                && let Some(ch) = task.chan.rx.channel(channel)
+                            {
+                                ch.window_checked(&task, probed);
+                            }
+                        }
                     }
                 });
                 true
@@ -769,6 +879,33 @@ impl ChannelRx {
                 true
             }
             Unknown::NoSession => false,
+        }
+    }
+
+    /// The sender answered after frames of its sequences were refused as too old on a channel
+    /// that sends no checkpoints. `probed` is the window's highest when the sender was asked: every
+    /// frame accepted by then was sent before the answer was made, so it is below the sequence
+    /// the answer says the sender has reached ([`RecvSession::seq`], signed). A window that is
+    /// not below it was moved by a frame the sender did not send (a holder of the key sealed one
+    /// far ahead, within the jump bound): it is put back at the sender's sequence, and the
+    /// frames the sender sends from there are taken again. Otherwise the refusals were of
+    /// genuinely old frames, and nobody asks again for a while.
+    fn window_checked(&self, node: &NodeInner, probed: u64) {
+        let signed = self.session.seq();
+        let mut st = self.state.lock();
+        if st.ended {
+            return;
+        }
+        if probed >= signed && st.replay.ahead_of(signed) {
+            st.replay.rebase(signed);
+            node.chan.stats.rx.window_rebased.bump();
+            tracing::warn!(
+                writer = %self.writer, channel = format_args!("{:016x}", self.channel),
+                window = probed, sender = signed,
+                "the replay window of this channel was ahead of the sender (a holder of the channel key sealed a frame far above the sender's): put back at the sender's sequence"
+            );
+        } else {
+            st.probe_quiet_until = Some(Instant::now() + PROBE_QUIET);
         }
     }
 
@@ -838,6 +975,16 @@ impl ChannelRx {
             },
             Replay::TooOld => {
                 stats.too_old.bump();
+                // On a channel with checkpoints the silence rule ends a session a far frame wedged;
+                // on one without, nothing would: a frame at or above what the sender last signed
+                // that the window calls too old is a reason to ask the sender where it stands.
+                if st.verify.is_none()
+                    && st.probe_quiet_until.is_none_or(|until| now >= until)
+                    && header.seq0 >= self.session.seq()
+                {
+                    post.wedge = st.replay.highest();
+                    st.probe_quiet_until = Some(now + REASK_EVERY);
+                }
                 return Delivery::Dropped(Dropped::TooOld);
             }
         }
@@ -999,7 +1146,7 @@ impl ChannelRx {
         };
         if let (Some(v), Some(kept)) = (st.verify.as_mut(), kept) {
             v.note_accepted(now);
-            let (forgot, ok) = v.offer(
+            let (forgot, kept) = v.offer(
                 header.seq0,
                 Accepted {
                     frame: kept,
@@ -1011,12 +1158,15 @@ impl ChannelRx {
                     rebinds,
                 },
             );
-            stats.unchecked.add(forgot + u64::from(!ok));
+            stats.unchecked.add(forgot + u64::from(kept.is_err()));
+            if kept == Err(NotKept::Starved) {
+                node.chan.rx.starved(self, stats, now);
+            }
             let (silence, period) = (v.silence(now), v.period());
             match silence {
                 Silence::End => {
                     let why = unverifiable(period);
-                    self.lose_all_held(st, &node.chan.rx, stats, lanes);
+                    self.lose_all_held(st, stats, lanes);
                     post.end = Some(why.clone());
                     stats.unverifiable.bump();
                     return Delivery::Ended(why);
@@ -1070,7 +1220,7 @@ impl ChannelRx {
                 lanes: waiting,
                 bytes: plain,
             };
-            self.defer(st, &node.chan.rx, stats, lanes, deferred);
+            self.defer(st, node, now, lanes, deferred);
         }
         delivery
     }
@@ -1102,24 +1252,58 @@ impl ChannelRx {
     }
 
     /// Put a frame the lanes wait for in the hold, within its bounds: at most 4,096 frames and 2
-    /// MiB of the channel's, and the node's 8 MiB across channels. Past a bound the oldest is
-    /// dropped, counted and told as a `Lagged` to the lanes that had not been given it.
-    fn defer(&self, st: &mut RxState, rx: &Receivers, stats: &RxStats, lanes: &Lanes, d: Deferred) {
-        while st.held.len() >= HELD_MAX
-            || st.held_bytes + d.bytes > super::verify::CHANNEL_BYTES
-            || !rx.budget.try_charge(d.bytes)
-        {
+    /// MiB of the channel's, and the channel's part of the node's 8 MiB (its share, equal to every
+    /// other channel's, [`Budget`]). Past a bound the oldest is dropped, counted and told as a
+    /// `Lagged` to the lanes that had not been given it; when the node's bytes are taken by
+    /// channels over their part the frame itself is dropped, and counted `budget_starved`.
+    fn defer(&self, st: &mut RxState, node: &NodeInner, now: Instant, lanes: &Lanes, d: Deferred) {
+        let stats = &node.chan.stats.rx;
+        let Some(share) = st.share.clone() else {
+            // Nothing is held for a channel without checkpoints.
+            self.lose(st, stats, lanes, &d);
+            return;
+        };
+        loop {
+            if st.held.len() < HELD_MAX && st.held_bytes + d.bytes <= super::verify::CHANNEL_BYTES {
+                match share.try_charge(d.bytes) {
+                    Charge::Granted => break,
+                    Charge::Starved => {
+                        node.chan.rx.starved(self, stats, now);
+                        self.lose(st, stats, lanes, &d);
+                        return;
+                    }
+                    Charge::OverShare => {}
+                }
+            }
             let Some(old) = st.held.pop_front() else {
                 // Nothing of this channel's to give up: the frame itself cannot be held.
                 self.lose(st, stats, lanes, &d);
                 return;
             };
-            st.held_bytes -= old.bytes;
-            rx.budget.release(old.bytes);
+            st.give_back(old.bytes);
             self.lose(st, stats, lanes, &old);
         }
         st.held_bytes += d.bytes;
         st.held.push_back(d);
+    }
+
+    /// Give back what the channel holds above its part of the node's bytes: its frames kept for
+    /// checkpoints (farthest first), then its held frames, oldest first (told as lost). The part
+    /// shrinks when a channel is added, so the channels that came first make room for it here.
+    fn shed(&self, st: &mut RxState, stats: &RxStats, lanes: &Lanes) {
+        if let Some(v) = st.verify.as_mut() {
+            stats.unchecked.add(v.shed());
+        }
+        let Some(share) = st.share.clone() else {
+            return;
+        };
+        while share.over() > 0 {
+            let Some(old) = st.held.pop_front() else {
+                break;
+            };
+            st.give_back(old.bytes);
+            self.lose(st, stats, lanes, &old);
+        }
     }
 
     /// A held frame is dropped: each lane that had not been given it says so.
@@ -1161,16 +1345,15 @@ impl ChannelRx {
 
     /// The session ends with frames still held: every lane that had not been given one is told it
     /// missed it (counted), and the octets go back.
-    fn lose_all_held(&self, st: &mut RxState, rx: &Receivers, stats: &RxStats, lanes: &Lanes) {
+    fn lose_all_held(&self, st: &mut RxState, stats: &RxStats, lanes: &Lanes) {
         for d in std::mem::take(&mut st.held) {
             self.lose(st, stats, lanes, &d);
-            st.held_bytes -= d.bytes;
-            rx.budget.release(d.bytes);
+            st.give_back(d.bytes);
         }
     }
 
     /// Drop held frames no lane waits for any more, giving their octets back.
-    fn drop_done(&self, st: &mut RxState, rx: &Receivers) {
+    fn drop_done(&self, st: &mut RxState) {
         let mut freed = 0;
         st.held.retain(|d| {
             let keep = d.lanes != 0;
@@ -1179,8 +1362,7 @@ impl ChannelRx {
             }
             keep
         });
-        st.held_bytes -= freed;
-        rx.budget.release(freed);
+        st.give_back(freed);
     }
 
     /// A second frame opened under the key at a sequence that already holds one of other octets.
@@ -1260,7 +1442,7 @@ impl ChannelRx {
         Delivery::Conflict
     }
 
-    /// Keep evidence: the last 64 are readable ([`NodeHandle::channel_evidence`]).
+    /// Keep evidence: the last 64 are readable ([`NodeHandle::channel_evidence`]), within 4 MiB.
     #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
@@ -1272,17 +1454,17 @@ impl ChannelRx {
         ingress: u64,
         epoch: u32,
     ) {
-        node.chan.evidence.push(ChannelEvidence {
+        node.chan.evidence.push(ChannelEvidence::new(
             kind,
-            channel: self.channel,
-            sender: self.writer.clone(),
-            key_epoch: epoch,
+            self.channel,
+            self.writer.clone(),
+            epoch,
             seq0,
             frame,
-            ingress: FaceId(ingress),
+            FaceId(ingress),
             proof,
-            when: Timestamp(node.now()),
-        });
+            Timestamp(node.now()),
+        ));
     }
 
     /// A `CHECKPOINT` frame that authenticated under the channel key (see
@@ -1340,6 +1522,13 @@ impl ChannelRx {
             // The sender announced none: there is nothing to judge by, and nothing to refuse.
             return Delivery::Checkpoint;
         };
+        // The cost is bounded before it is paid: a channel and the node verify so many a second,
+        // and the rest are dropped here, read by nobody. The checkpoint took its sequence and
+        // opened under the key; nothing is concluded about it.
+        if !st.checkpoint_bucket.take(now) || !node.chan.rx.ceiling.take(now) {
+            stats.checkpoints_over_rate.bump();
+            return Delivery::Checkpoint;
+        }
         let record = match Record::decode(plaintext) {
             Ok(record) => record,
             Err(error) => {
@@ -1413,8 +1602,9 @@ impl ChannelRx {
         let why = EndReason::BadCheckpoint {
             why: format!(
                 "a checkpoint of {w}'s channel opened under the channel key and its signature does \
-                 not verify under {w}'s key, so a holder of the channel key made it; the face it \
-                 came over ({ingress}) is barred: ask {w} again once that link is dealt with",
+                 not verify under {w}'s key, so a holder of the channel key made it; {}: ask {w} \
+                 again once that link is dealt with",
+                bar_said(node.chan.bar.get().is_some(), ingress),
                 w = self.writer
             ),
         };
@@ -1507,7 +1697,6 @@ impl ChannelRx {
         now: Instant,
         post: &mut Post,
     ) {
-        let rx = &node.chan.rx;
         let stats = &node.chan.stats.rx;
         // The hold is over when nothing accepted waits past `unchecked_max` any more: a checkpoint
         // that covers none of what waits (an old one, sealed again by a holder of the key) lifts
@@ -1584,8 +1773,7 @@ impl ChannelRx {
             if d.lanes != 0 {
                 st.held.push_back(d);
             } else {
-                st.held_bytes -= d.bytes;
-                rx.budget.release(d.bytes);
+                st.give_back(d.bytes);
             }
         }
     }
@@ -1875,9 +2063,33 @@ pub(crate) struct Receivers {
     /// The octets of accepted frames and held messages all channels keep for checkpoints, against
     /// the node's 8 MiB.
     pub(crate) budget: Arc<Budget>,
+    /// The node's ceiling on verified checkpoints across its channels.
+    ceiling: Ceiling,
+    /// When the last warning of budget starvation was told.
+    starved_noted: Mutex<Option<Instant>>,
 }
-
 impl Receivers {
+    /// A channel could not keep or hold a frame because the node's bytes for checkpoints and holds
+    /// are taken by channels that hold more than their equal part while this one holds less:
+    /// counted every time, and told as a warning once in [`STARVED_NOTICE`]. The channels over
+    /// their part give the excess back at the next maintenance pass.
+    fn starved(&self, ch: &ChannelRx, stats: &RxStats, now: Instant) {
+        stats.budget_starved.bump();
+        let mut noted = self.starved_noted.lock();
+        if noted.is_some_and(|at| now.saturating_duration_since(at) < STARVED_NOTICE) {
+            return;
+        }
+        *noted = Some(now);
+        tracing::warn!(
+            writer = %ch.writer, channel = format_args!("{:016x}", ch.channel),
+            "the node's 8 MiB for frames kept for checkpoints and frames held is taken by channels \
+             that hold more than their equal part: frames of this channel go unchecked or are \
+             dropped from the hold until they give it back (counted `budget_starved`). If it keeps \
+             on, a peer holds the keys of many channels: look at which senders and links the \
+             channels come from, and remove the member that is not expected"
+        );
+    }
+
     pub(crate) fn add_sink(&self, sink: Arc<Sink>) {
         self.sinks.lock().push(sink);
         self.generation.fetch_add(1, Ordering::AcqRel);
@@ -1949,7 +2161,6 @@ impl Receivers {
     }
 
     /// The channel of `id`, if it has received a frame.
-    #[cfg(test)]
     pub(crate) fn channel(&self, id: u64) -> Option<Arc<ChannelRx>> {
         self.channels.lock().get(&id).cloned()
     }

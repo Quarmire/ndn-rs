@@ -8,6 +8,13 @@
 //! `seq0` cannot burn it, because a sequence is marked seen only once a frame of that sequence
 //! authenticated.
 //!
+//! The window follows what authenticated, and a holder of the channel key can authenticate a
+//! frame at any `seq0` (within [`SEQ_JUMP_MAX`] of the highest): one such frame moves `highest`
+//! past every genuine frame still to come. On a channel with checkpoints the silence rule ends
+//! the session at 3 s; on one without, the only thing the sender signed about its position is
+//! `S_SEQ` of its last answer, and [`ReplayWindow::rebase`] puts the window back at it once the
+//! receiver has asked the sender again and the answer shows the window is ahead of the sender.
+//!
 //! No clock is read.
 
 /// How many frame sequences the window remembers.
@@ -16,10 +23,11 @@ pub(crate) const REPLAY_WINDOW: u64 = 4_096;
 /// The most a frame's `seq0` may be above the highest the window has marked (or above the
 /// session's `S_SEQ`, before it has marked any): 2^24 sequences. A key holder can seal a frame
 /// of any `seq0` below 2^63, and the window's `highest` follows the highest it ever marked, so
-/// one such frame would make every genuine frame after it [`Replay::TooOld`]; the bound turns
-/// that into a wedge of at most this many sequences. Large enough that a sender at its fastest
-/// (about 2 million messages a second) does not pass it during the ask and install of a
-/// session (seconds), and that a receiver cut off for a few seconds does not either.
+/// one such frame would make every genuine frame after it [`Replay::TooOld`]; the bound limits
+/// the jump (the window is put back by [`ReplayWindow::rebase`], or the session ends, when it
+/// happens). Large enough that a sender at its fastest (about 2 million messages a second)
+/// does not pass it during the ask and install of a session (seconds), and that a receiver cut
+/// off for a few seconds does not either.
 pub(crate) const SEQ_JUMP_MAX: u64 = 1 << 24;
 
 const WORDS: usize = (REPLAY_WINDOW / 64) as usize;
@@ -42,6 +50,9 @@ pub(crate) struct ReplayWindow {
     highest: Option<u64>,
     /// Bit `seq0 % 4096` is set when that sequence was marked and is inside the window.
     bits: [u64; WORDS],
+    /// No sequence below this is ever fresh: what the sender's answer said it had not reached
+    /// when the window was put back ([`Self::rebase`]). 0 for a window never put back.
+    floor: u64,
 }
 
 impl Default for ReplayWindow {
@@ -56,13 +67,30 @@ impl ReplayWindow {
         Self {
             highest: None,
             bits: [0; WORDS],
+            floor: 0,
         }
     }
 
     /// The highest `seq0` marked, if any.
-    #[cfg(test)]
     pub(crate) fn highest(&self) -> Option<u64> {
         self.highest
+    }
+
+    /// Whether the window has marked a sequence at or above `signed`, the sequence the sender
+    /// said (signed) its next frame takes: no genuine frame the sender sent before it said so can
+    /// be there, so a window that has is ahead of the sender.
+    pub(crate) fn ahead_of(&self, signed: u64) -> bool {
+        self.highest.is_some_and(|highest| highest >= signed)
+    }
+
+    /// Forget everything marked and refuse every sequence below `floor` from now on: the window
+    /// starts again where the sender said it stood. Called only when [`Self::ahead_of`] holds for
+    /// a signed sequence, so nothing the sender sent is lost to it but what the window had
+    /// already refused.
+    pub(crate) fn rebase(&mut self, floor: u64) {
+        self.highest = None;
+        self.bits = [0; WORDS];
+        self.floor = floor;
     }
 
     /// Whether `seq0` is further above what this window has seen than a genuine frame can be:
@@ -76,6 +104,9 @@ impl ReplayWindow {
     /// What the window says of `seq0`. Marks nothing: call [`Self::mark`] once the frame
     /// authenticated.
     pub(crate) fn check(&self, seq0: u64) -> Replay {
+        if seq0 < self.floor {
+            return Replay::TooOld;
+        }
         let Some(highest) = self.highest else {
             return Replay::Fresh;
         };
@@ -271,5 +302,43 @@ mod tests {
         // The window itself is not moved by asking.
         assert_eq!(w.highest(), Some(1_000));
         assert!(!w.beyond(u64::MAX, u64::MAX), "no overflow at the top");
+    }
+
+    /// A window moved past the sender by one authentic frame far above it (security review M4) is
+    /// put back at what the sender signed: it is ahead of the sender exactly when it marked
+    /// something at or above the signed sequence, it forgets what it marked, and it refuses
+    /// whatever is below the floor from then on (the frames it had refused as too old were old).
+    #[test]
+    fn a_window_put_back_forgets_its_marks_and_refuses_what_is_below_the_floor() {
+        let mut w = ReplayWindow::new();
+        assert!(!w.ahead_of(0), "nothing marked: not ahead of anything");
+        assert_eq!(w.mark(10), Replay::Fresh);
+        assert_eq!(w.mark(10 + SEQ_JUMP_MAX - 1), Replay::Fresh);
+        assert_eq!(
+            w.check(11),
+            Replay::TooOld,
+            "the far frame wedged the window"
+        );
+        assert!(w.ahead_of(11) && w.ahead_of(10 + SEQ_JUMP_MAX - 1));
+        assert!(
+            !w.ahead_of(10 + SEQ_JUMP_MAX),
+            "not ahead of a sender above it"
+        );
+
+        w.rebase(11);
+        assert_eq!(w.highest(), None, "what it marked is forgotten");
+        assert_eq!(
+            w.check(10),
+            Replay::TooOld,
+            "below the floor is never fresh"
+        );
+        assert_eq!(w.check(11), Replay::Fresh);
+        assert_eq!(w.mark(11), Replay::Fresh);
+        assert_eq!(w.check(11), Replay::Replayed);
+        assert_eq!(
+            w.mark(12),
+            Replay::Fresh,
+            "the sender's frames are taken again"
+        );
     }
 }

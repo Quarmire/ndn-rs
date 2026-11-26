@@ -2550,3 +2550,44 @@ async fn a_session_installed_over_the_held_one_is_taken_up_by_the_next_frame() {
         "the frame after an install looked the sessions up again"
     );
 }
+
+// -- A far-ahead frame on a channel with no checkpoints (security review M4) --------------------
+
+/// One authentic frame at `highest + 2^24 - 1` (inside the jump bound) moved the replay window's
+/// `highest` past every genuine frame still to come, and on a channel that sends no checkpoints
+/// nothing ended it: no silence clock, no `TooFar` re-ask, every genuine frame `TooOld` until
+/// the sender passed `highest - 4095` (hours at a thousand frames a second). The refusal of
+/// genuine frames now asks the sender where it stands (its answer is signed); an answer that
+/// puts the sender below the window's highest puts the window back at the sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_far_authentic_frame_does_not_mute_a_channel_without_checkpoints_for_good() {
+    let fx = latest().await;
+    let start = fx.start();
+    let first = fx.data(SideClass::Datagram, start, &[named(1, A, b"first")]);
+    assert_eq!(fx.deliver(first).await, Delivery::Delivered { messages: 1 });
+    // A holder of the key seals one frame as far ahead as the bound lets it: it is taken.
+    let far = fx.data(
+        SideClass::Datagram,
+        start + SEQ_JUMP_MAX - 1,
+        &[msg(1, b"forged")],
+    );
+    assert_eq!(fx.deliver(far).await, Delivery::Delivered { messages: 1 });
+    // The sender's own next frame is refused as too old at first; the receiver asks the sender
+    // where it stands, and takes the frame once the answer put the window back.
+    let genuine = fx.data(SideClass::Datagram, start + 1, &[named(1, A, b"second")]);
+    let mut last = fx.deliver(genuine.clone()).await;
+    for _ in 0..300 {
+        if matches!(last, Delivery::Delivered { .. }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        last = fx.deliver(genuine.clone()).await;
+    }
+    assert_eq!(
+        last,
+        Delivery::Delivered { messages: 1 },
+        "the sender's next frame was refused for 15 s after one authentic far-ahead frame (too_old {})",
+        fx.stats().too_old.get()
+    );
+    assert!(fx.stats().too_old.get() >= 1);
+}

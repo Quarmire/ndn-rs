@@ -325,8 +325,12 @@ pub enum Alert {
     /// the sender does not list it (or lists another frame at its sequence), or a second authentic
     /// frame came at a sequence a verified checkpoint already listed. Only a holder of the channel
     /// key can make such a frame (the sender itself, equivocating, or a receiver or member
-    /// relaying under the key); `via` is the face that frame came over, which is barred and is
-    /// the link to look at. Two authentic frames at a sequence **no** checkpoint has settled are
+    /// relaying under the key); `via` is the face that frame came over, the link to look at. The
+    /// node asks its [`crate::IngressBar`] to bar that face, and the alert does not say the bar
+    /// was applied: with no bar attached nothing is barred (the node logs `NOT barred`), and a
+    /// bar of the node's own face, or of a face the forwarder does not hold, is refused (the bar
+    /// logs `could NOT be barred` and why). Two authentic frames at a sequence **no** checkpoint
+    /// has settled are
     /// a conflict: evidence only, no alert and no bar, since either face may be the honest one;
     /// the next checkpoint that covers the sequence raises this alert for the face of the frame
     /// it contradicts. Evidence is kept ([`crate::host::NodeHandle::channel_evidence`]); the host maps
@@ -345,8 +349,9 @@ pub enum Alert {
     },
     /// A checkpoint of a channel did not verify under the sender's key, though it opened under
     /// the channel key (a holder made it, or one for another channel, key epoch or range was
-    /// sealed again). The session was dropped ([`crate::EndReason::BadCheckpoint`]), the face it
-    /// came over (`via`) is barred and evidence is kept.
+    /// sealed again). The session was dropped ([`crate::EndReason::BadCheckpoint`]) and evidence
+    /// is kept; the face it came over (`via`) is asked to be barred, with the same outcomes as
+    /// for [`Alert::ChannelForgery`] (the alert does not say it was).
     ChannelCheckpoint {
         /// The sender's device, whose channel it is.
         writer: Name,

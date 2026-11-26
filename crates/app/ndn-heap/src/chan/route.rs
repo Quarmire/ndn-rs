@@ -348,7 +348,10 @@ impl Carrier for ConnectionCarrier {
 }
 
 /// [`IngressBar`] over a connection: the bar is the forwarder's quarantine of the face
-/// ([`Connection::side_quarantine`]), asked in a task of its own because a bar never blocks.
+/// ([`Connection::side_quarantine`]), asked in a task of its own because a bar never blocks. The
+/// outcome is the answer's: the face is barred for the time the forwarder says, or it is not and
+/// the log says why (the connection's own face, which is never barred; a face the forwarder does
+/// not hold; a connection that cannot ask its forwarder).
 pub(crate) struct ConnectionBar {
     conn: Arc<dyn Connection>,
 }
@@ -362,11 +365,15 @@ impl IngressBar for ConnectionBar {
                 Ok(length) => tracing::warn!(
                     face,
                     barred_secs = length.as_secs(),
-                    "a face delivered a forged channel frame: barred from channel frames"
+                    "a face delivered a forged channel frame: the forwarder barred it from channel \
+                     frames (barred for {} s from now at most: NDN traffic over it is untouched)",
+                    length.as_secs()
                 ),
                 Err(e) => tracing::warn!(
                     face,
-                    "a face delivered a forged channel frame and could not be barred: {e}"
+                    "a face delivered a forged channel frame and could NOT be barred, so channel \
+                     frames still come over it: {e}; bar that link at the forwarder \
+                     (`side/quarantine`) if it should be"
                 ),
             }
         });

@@ -50,7 +50,8 @@ pub use crate::chan::config::{
 };
 pub use crate::chan::error::ChanError;
 pub use crate::chan::evidence::{
-    ChannelEvidence, EVIDENCE_KEPT, EVIDENCE_VERSION, EvidenceError, EvidenceKind,
+    ChannelEvidence, EVIDENCE_KEPT, EVIDENCE_OCTETS, EVIDENCE_PART_KEPT, EVIDENCE_VERSION,
+    EvidenceDigest, EvidenceError, EvidenceKind,
 };
 pub use crate::chan::items::Items;
 pub use crate::chan::route::{DATAGRAM_FRAME_MAX, SIDE_TTL};

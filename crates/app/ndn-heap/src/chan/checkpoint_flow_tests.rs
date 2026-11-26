@@ -457,7 +457,7 @@ async fn a_forgery_by_a_key_holder_is_exposed_by_the_next_checkpoint_with_eviden
 
     // The layout round-trips, so evidence can be kept and shown.
     let octets = e.encode();
-    assert_eq!(octets[0], 1, "version 1");
+    assert_eq!(octets[0], 2, "version 2");
     assert_eq!(octets[1], 1, "kind Mismatch");
     assert_eq!(&octets[2..10], &ck.info.channel.to_be_bytes());
     assert_eq!(&octets[10..14], &ck.send.key_epoch.to_be_bytes());
@@ -1774,4 +1774,115 @@ async fn a_frame_taken_for_a_verified_only_reader_is_deferred_until_a_checkpoint
     let cp = ck.checkpoint(s + 1, s, s + 1, &[&g0]);
     ck.checkpoint_in(&cp, HONEST, 22).await;
     assert_eq!(ck.got(), vec![(path(0), b"one".to_vec())]);
+}
+
+/// A holder of the key seals the sender's genuine checkpoint again at fresh sequences, as fast as
+/// it likes (security review M1): each would cost a hash and an Ed25519 verification on the one
+/// task that reads every channel. A channel verifies a burst and then so many a second, and the
+/// rest are dropped and counted, never taken for a forgery: nothing is barred, no evidence is
+/// made, the session stands, and the sender's own next checkpoint is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_genuine_checkpoint_sealed_again_at_fresh_sequences_is_bounded_before_it_is_verified() {
+    let mut ck = ck(ChannelMode::Latest, latest(), LinkConfig::default()).await;
+    ck.pause_tick();
+    let s = ck.start();
+    let g0 = ck.data(s, 0, b"one");
+    ck.data_in(&g0, HONEST, 1).await;
+    let before = ck.stats().checkpoints_verified.get();
+    for i in 0..400u64 {
+        let again = ck.checkpoint(s + 1 + i, s, s + 1, &[&g0]);
+        assert_eq!(
+            ck.deliver(&again, HOLDER, ck.at(2)).await,
+            Delivery::Checkpoint,
+            "re-sealed checkpoint {i}"
+        );
+    }
+    let verified = ck.stats().checkpoints_verified.get() - before;
+    assert_eq!(
+        verified,
+        super::verify::CHECKPOINT_BURST as u64,
+        "a burst was verified, no more"
+    );
+    assert_eq!(ck.stats().checkpoints_over_rate.get(), 400 - verified);
+    assert_eq!(
+        ck.stats().checkpoints.get(),
+        400,
+        "every one was a checkpoint frame taken"
+    );
+    assert_eq!(ck.stats().bad_checkpoints.get(), 0, "dropped is not forged");
+    assert!(ck.evidence().is_empty() && ck.bars().is_empty() && ck.alerts().is_empty());
+    assert!(ck.session_held(), "the session stands");
+
+    // A second later the channel verifies again: the sender's next checkpoint is read.
+    let next = ck.checkpoint(s + 1_000, s, s + 1, &[&g0]);
+    let verified = ck.stats().checkpoints_verified.get();
+    ck.checkpoint_in(&next, HONEST, 1_100).await;
+    assert_eq!(ck.stats().checkpoints_verified.get(), verified + 1);
+    assert_eq!(
+        ck.stats().checkpoints_over_rate.get(),
+        400 - super::verify::CHECKPOINT_BURST as u64,
+        "the sender's own was not over the rate"
+    );
+}
+
+/// Channels that came earlier hold more than an equal part of the node's 8 MiB (the part shrinks
+/// when a channel is added): a channel within its own part that finds the node's bytes taken
+/// says so, with `budget_starved` (security review M7), and keeps what it can once they give
+/// the excess back. What it could not keep is `unchecked`; nothing is delivered or judged wrongly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_channel_within_its_part_that_finds_the_node_taken_counts_budget_starved() {
+    let ck = ck(ChannelMode::Latest, latest(), LinkConfig::default()).await;
+    ck.pause_tick();
+    let s = ck.start();
+    let budget = Arc::clone(&ck.carol().inner.chan.rx.budget);
+    // Three channels with 2 MiB each and a fourth with what the node's fifth part allows, taken
+    // while there were fewer channels to divide among.
+    let mut earlier = Vec::new();
+    for mine in [2 << 20, 2 << 20, 2 << 20, 8_388_608 / 5] {
+        let share = budget.share();
+        assert_eq!(share.try_charge(mine), super::verify::Charge::Granted);
+        earlier.push((share, mine));
+    }
+    assert_eq!(ck.stats().budget_starved.get(), 0);
+    let free = 8 * 1024 * 1024 - budget.used();
+    let mut frames = 0u64;
+    let mut seq0 = s;
+    while ck.stats().budget_starved.get() == 0 {
+        let frame = ck.data(seq0, 0, &[7u8; 1_000]);
+        // All inside the silence rule's 100 ms: nothing is held back for want of a checkpoint.
+        ck.data_in(&frame, HONEST, 1).await;
+        seq0 += 1;
+        frames += 1;
+        assert!(frames < 2_000, "{free} octets free, {frames} frames kept");
+    }
+    assert!(
+        ck.stats().unchecked.get() >= 1,
+        "the frame the node had no room for is unchecked"
+    );
+    assert!(budget.used() <= 8 * 1024 * 1024, "the node's bound holds");
+    // The channels over their part give the excess back, and the channel keeps frames again.
+    for (share, mine) in &earlier {
+        share.release(*mine - 100_000);
+    }
+    let starved = ck.stats().budget_starved.get();
+    let frame = ck.data(seq0, 0, &[7u8; 1_000]);
+    ck.data_in(&frame, HONEST, 2).await;
+    assert_eq!(ck.stats().budget_starved.get(), starved, "kept again");
+}
+
+/// The text of an alert says what is known of the bar (security review L3): with no bar attached
+/// the face is NOT barred, and it says what to do; with one, the node asked.
+#[test]
+fn the_forgery_text_states_the_bar_outcome_it_knows() {
+    let without = super::rx::bar_said(false, 9);
+    assert!(
+        without.contains("NOT barred") && without.contains("attach"),
+        "{without}"
+    );
+    assert!(!without.contains("asked its forwarder"), "{without}");
+    let with = super::rx::bar_said(true, 9);
+    assert!(
+        with.contains("asked its forwarder to bar face 9") && !with.contains("NOT barred"),
+        "{with}"
+    );
 }
