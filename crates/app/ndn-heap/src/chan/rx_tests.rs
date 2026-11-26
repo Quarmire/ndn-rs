@@ -295,6 +295,11 @@ impl Fx {
         self.carol().inner.chan_deliver(frame, 7, now).await
     }
 
+    /// `frame` handed over as read from face `ingress`.
+    async fn deliver_from(&self, frame: Bytes, ingress: u64, now: Instant) -> Delivery {
+        self.carol().inner.chan_deliver(frame, ingress, now).await
+    }
+
     /// The datagram frame limit the session says (`S_FRAME_MAX`).
     fn frame_max(&self) -> usize {
         let terms = self
@@ -474,11 +479,17 @@ async fn junk_is_dropped_before_any_cryptography() {
     for (what, frame, why) in cases {
         assert_eq!(fx.deliver(frame).await, Delivery::Dropped(why), "{what}");
     }
-    // A channel nobody holds is kept for the session that may be coming, and is opened by no one.
+    // A channel nobody holds: a stream frame is kept for the session that may be coming, a
+    // datagram is lost, and neither is opened by anyone.
     assert_eq!(
         fx.deliver(patched(5, genuine[5] ^ 0xff)).await,
+        Delivery::Dropped(Dropped::UnknownChannel),
+        "a datagram of a channel nobody holds"
+    );
+    assert_eq!(
+        fx.deliver(early(&fx, SideClass::Stream, 5, 0)).await,
         Delivery::Held,
-        "a channel nobody holds"
+        "a stream frame of a channel nobody holds"
     );
     assert_eq!(
         fx.stats().aead_attempts.get(),
@@ -977,7 +988,7 @@ async fn a_senders_end_ends_the_session_and_tells_the_items_after_what_is_queued
     assert_eq!(
         fx.deliver(fx.data(SideClass::Datagram, 3, &[msg(1, b"after")]))
             .await,
-        Delivery::Held
+        Delivery::Dropped(Dropped::UnknownChannel)
     );
 }
 
@@ -1083,8 +1094,8 @@ async fn the_items_are_told_a_sender_was_removed_whichever_pass_notices_first() 
             );
         }
         // The node's own pass judged the sender between two frames: the session is gone, the
-        // frame finds no session. The `Items` are told either way.
-        Delivery::Held => {}
+        // datagram finds no session and is lost. The `Items` are told either way.
+        Delivery::Dropped(Dropped::UnknownChannel) => {}
         other => panic!("the first frame after the removal must be refused, not {other:?}"),
     }
     let refused_seq = seq - 1;
@@ -1110,7 +1121,7 @@ async fn the_items_are_told_a_sender_was_removed_whichever_pass_notices_first() 
     assert_eq!(
         fx.deliver(fx.data(SideClass::Datagram, seq, &[msg(1, b"after")]))
             .await,
-        Delivery::Held
+        Delivery::Dropped(Dropped::UnknownChannel)
     );
 }
 
@@ -1181,7 +1192,7 @@ async fn the_first_frame_after_a_removal_is_refused_and_the_items_say_not_a_memb
     assert_eq!(
         fx.deliver(fx.data(SideClass::Datagram, 3, &[msg(1, b"after")]))
             .await,
-        Delivery::Held
+        Delivery::Dropped(Dropped::UnknownChannel)
     );
 }
 
@@ -2129,32 +2140,32 @@ async fn stream_frames_that_overtake_the_session_are_not_lost_to_a_window_joiner
     );
 }
 
-/// The hold of frames of an unknown channel is bounded in frames, in octets and in time, and a
-/// frame of a session this device holds never goes into it.
+/// The hold of frames of an unknown channel is bounded in frames (per face and in all) and in
+/// time, and a frame of a session this device holds never goes into it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn frames_of_an_unknown_channel_are_held_in_bounds_and_expire() {
     let fx = latest().await;
     let genuine = fx.data(SideClass::Datagram, 1, &[named(1, A, b"x")]);
-    let channel = |id: u64, len: usize| {
-        let mut v = genuine.to_vec();
-        v[3..11].copy_from_slice(&id.to_be_bytes());
-        v.resize(len.max(v.len()), 0);
-        Bytes::from(v)
-    };
     let (stats, rx) = (fx.stats(), &fx.carol().inner.chan.rx);
     let t0 = Instant::now();
 
-    // 64 frames are held; the 65th is dropped and counted.
-    for id in 1..=64u64 {
-        assert_eq!(
-            fx.deliver_at(channel(id, 0), t0).await,
-            Delivery::Held,
-            "frame {id}"
-        );
+    // Four faces hold their 16 frames each: 64 in all. A face's 17th is dropped and counted.
+    let mut id = 0u64;
+    for face in 1..=4u64 {
+        for _ in 0..16 {
+            id += 1;
+            assert_eq!(
+                fx.deliver_from(early(&fx, SideClass::Stream, id, 0), face, t0)
+                    .await,
+                Delivery::Held,
+                "frame {id} of face {face}"
+            );
+        }
     }
     assert_eq!(rx.unknown_held().0, 64);
     assert_eq!(
-        fx.deliver_at(channel(65, 0), t0).await,
+        fx.deliver_from(early(&fx, SideClass::Stream, 65, 0), 1, t0)
+            .await,
         Delivery::Dropped(Dropped::UnknownChannel)
     );
     assert_eq!(stats.held_unknown_full.get(), 1);
@@ -2171,33 +2182,212 @@ async fn frames_of_an_unknown_channel_are_held_in_bounds_and_expire() {
 
     // Past 2 s each is dropped and counted, swept by the next frame.
     let later = t0 + Duration::from_secs(3);
-    assert_eq!(fx.deliver_at(channel(100, 0), later).await, Delivery::Held);
+    assert_eq!(
+        fx.deliver_from(early(&fx, SideClass::Stream, 100, 0), 1, later)
+            .await,
+        Delivery::Held
+    );
     assert_eq!(stats.held_unknown_expired.get(), 64);
     assert_eq!(rx.unknown_held().0, 1);
+}
 
-    // The octets are bounded too: 512 KiB in all.
-    let fresh = later + Duration::from_secs(10);
-    assert_eq!(fx.deliver_at(channel(101, 0), fresh).await, Delivery::Held);
-    let mut kept = 1;
-    for id in 200..300u64 {
-        if fx.deliver_at(channel(id, 10_000), fresh).await == Delivery::Held {
-            kept += 1;
-        }
+/// A frame of a channel nobody holds, as the stream carries it: the id patched into a sealed
+/// frame's header and the frame padded to `len` (a held frame is never opened).
+fn early(fx: &Fx, class: SideClass, id: u64, len: usize) -> Bytes {
+    let mut v = fx.data(class, 1, &[named(1, A, b"x")]).to_vec();
+    assert_ne!(id, fx.info.channel, "an id nobody holds");
+    v[2..10].copy_from_slice(&id.to_be_bytes());
+    v.resize(len.max(v.len()), 0);
+    Bytes::from(v)
+}
+
+/// One face that floods the node with frames of unknown channels must not stop another face's
+/// early frames from being held (security review M3): the hold is shared by faces fairly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_from_one_face_does_not_stop_another_faces_early_frames() {
+    let fx = latest().await;
+    let (stats, rx) = (fx.stats(), &fx.carol().inner.chan.rx);
+    let t0 = Instant::now();
+    // Face 1 sends 200 frames of random channel ids: 1 KiB each.
+    for id in 1_000..1_200u64 {
+        fx.deliver_from(early(&fx, SideClass::Stream, id, 1_024), 1, t0)
+            .await;
     }
-    let (frames, octets) = rx.unknown_held();
-    assert_eq!(frames, kept);
+    // Face 2's session comes, and its HELLO, a bind and a standing value come ahead of the Data.
+    for seq in 0..8u64 {
+        assert_eq!(
+            fx.deliver_from(early(&fx, SideClass::Stream, 5, 200 + seq as usize), 2, t0)
+                .await,
+            Delivery::Held,
+            "face 2's early frame {seq}, behind face 1's flood of {} held and {} refused",
+            rx.unknown_held().0,
+            stats.held_unknown_full.get()
+        );
+    }
     assert!(
-        octets <= 512 * 1024,
-        "{octets} octets held: the bound is 512 KiB"
-    );
-    assert!(
-        (50..=53).contains(&kept),
-        "about 52 frames of 10,000 octets fit: {kept}"
+        stats.held_unknown_full.get() > 0,
+        "face 1's flood was refused, not all held"
     );
 }
 
-/// While the frames held for a session are taken in, a frame that arrives queues behind them: the
-/// channel takes frames directly only once the held ones are in, so the order of arrival is kept.
+/// A datagram that is early is lost, as a datagram may be: the hold is for the stream's frames,
+/// which cannot be asked for again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_datagram_of_an_unknown_channel_is_dropped_not_held() {
+    let fx = latest().await;
+    let (stats, rx) = (fx.stats(), &fx.carol().inner.chan.rx);
+    assert_eq!(
+        fx.deliver(early(&fx, SideClass::Datagram, 5, 0)).await,
+        Delivery::Dropped(Dropped::UnknownChannel)
+    );
+    assert_eq!(rx.unknown_held(), (0, 0), "nothing was held");
+    assert_eq!(stats.unknown_channel.get(), 1);
+    assert_eq!(
+        stats.held_unknown_full.get(),
+        0,
+        "it was not refused for room"
+    );
+}
+
+/// The hold covers the frame the faces grant the stream (1 MiB): a window's replay is a frame of
+/// that size, and the sender packs to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_frame_of_the_grant_can_be_held() {
+    let fx = latest().await;
+    let rx = &fx.carol().inner.chan.rx;
+    let grant = ndn_transport::side_header::STREAM_FRAME_GRANT;
+    assert_eq!(
+        fx.deliver(early(&fx, SideClass::Stream, 5, grant)).await,
+        Delivery::Held,
+        "a frame of {grant} octets"
+    );
+    assert_eq!(rx.unknown_held(), (1, grant));
+}
+
+/// One face holds at most 16 frames and 2 MiB, whatever room the node has left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_face_holds_at_most_16_frames_and_two_grants() {
+    let fx = latest().await;
+    let (stats, rx) = (fx.stats(), &fx.carol().inner.chan.rx);
+    let t0 = Instant::now();
+    let grant = ndn_transport::side_header::STREAM_FRAME_GRANT;
+    for id in 1_000..1_020u64 {
+        fx.deliver_from(early(&fx, SideClass::Stream, id, 200), 1, t0)
+            .await;
+    }
+    assert_eq!(rx.unknown_held_by(1).0, 16, "16 of 20 frames of one face");
+    assert_eq!(stats.held_unknown_full.get(), 4, "the other 4 were refused");
+    assert_eq!(
+        stats.held_unknown_evicted.get(),
+        0,
+        "and nothing was pushed out"
+    );
+    // Another face: 2 MiB in frames of the grant, the third is refused.
+    let mut verdicts = Vec::new();
+    for id in 2_000..2_003u64 {
+        let frame = early(&fx, SideClass::Stream, id, grant);
+        verdicts.push(fx.deliver_from(frame, 2, t0).await);
+    }
+    assert_eq!(
+        verdicts,
+        [
+            Delivery::Held,
+            Delivery::Held,
+            Delivery::Dropped(Dropped::UnknownChannel)
+        ],
+        "face 2's three frames of {grant} octets"
+    );
+    assert_eq!(rx.unknown_held_by(2), (2, 2 * grant));
+}
+
+/// The node's hold is full: a frame of a face that holds less pushes out the oldest frame of the
+/// face that holds most; a frame of a face that holds as much as any other is the one refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_hold_pushes_out_the_oldest_frame_of_the_face_that_holds_most() {
+    let fx = latest().await;
+    let (stats, rx) = (fx.stats(), &fx.carol().inner.chan.rx);
+    let t0 = Instant::now();
+    let mut id = 1_000u64;
+    // Faces 1 to 4 hold 15 frames each and face 5 four: 64, the node's bound.
+    for (face, frames) in [(1u64, 15), (2, 15), (3, 15), (4, 15), (5, 4)] {
+        for _ in 0..frames {
+            id += 1;
+            let held = fx
+                .deliver_from(early(&fx, SideClass::Stream, id, 200), face, t0)
+                .await;
+            assert_eq!(held, Delivery::Held, "face {face}");
+        }
+    }
+    assert_eq!(rx.unknown_held().0, 64);
+    let mut send = async |face: u64| {
+        id += 1;
+        fx.deliver_from(early(&fx, SideClass::Stream, id, 200), face, t0)
+            .await
+    };
+    // Face 1 holds as much as any face: its own frame is the one refused.
+    assert_eq!(send(1).await, Delivery::Dropped(Dropped::UnknownChannel));
+    assert_eq!(
+        (
+            stats.held_unknown_full.get(),
+            stats.held_unknown_evicted.get()
+        ),
+        (1, 0)
+    );
+    // Face 5 holds 4: its frame pushes out the oldest frame of the faces that hold 15, face 1's.
+    assert_eq!(send(5).await, Delivery::Held);
+    assert_eq!(stats.held_unknown_evicted.get(), 1);
+    assert_eq!(
+        [1, 2, 3, 4, 5].map(|face| rx.unknown_held_by(face).0),
+        [14, 15, 15, 15, 5]
+    );
+    // Face 1 holds 14, below faces 2 to 4: its frame pushes out face 2's oldest.
+    assert_eq!(send(1).await, Delivery::Held);
+    assert_eq!(stats.held_unknown_evicted.get(), 2);
+    assert_eq!(
+        [1, 2, 3, 4, 5].map(|face| rx.unknown_held_by(face).0),
+        [15, 14, 15, 15, 5]
+    );
+    assert_eq!(rx.unknown_held().0, 64, "the hold stayed at its bound");
+    assert_eq!(stats.aead_attempts.get(), 0, "a held frame is never opened");
+}
+
+/// The same in octets: the node holds 4 MiB, and a frame of the grant from a third face gets room
+/// by pushing out one of the two frames of a face that holds 2 MiB.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_hold_in_octets_makes_room_for_a_frame_of_the_grant() {
+    let fx = latest().await;
+    let (stats, rx) = (fx.stats(), &fx.carol().inner.chan.rx);
+    let t0 = Instant::now();
+    let grant = ndn_transport::side_header::STREAM_FRAME_GRANT;
+    let mut id = 1_000u64;
+    for face in [1u64, 2] {
+        for _ in 0..2 {
+            id += 1;
+            let held = fx
+                .deliver_from(early(&fx, SideClass::Stream, id, grant), face, t0)
+                .await;
+            assert_eq!(held, Delivery::Held, "face {face}");
+        }
+    }
+    assert_eq!(rx.unknown_held(), (4, 4 * grant));
+    assert_eq!(
+        fx.deliver_from(early(&fx, SideClass::Stream, 5, grant), 3, t0)
+            .await,
+        Delivery::Held,
+        "a frame of the grant from a face that holds nothing"
+    );
+    assert_eq!(stats.held_unknown_evicted.get(), 1);
+    assert_eq!(rx.unknown_held(), (4, 4 * grant));
+    assert_eq!(
+        [1, 2, 3].map(|face| rx.unknown_held_by(face).0),
+        [1, 2, 1],
+        "face 1 held the oldest of the largest shares"
+    );
+}
+
+/// While the frames held for a session are taken in, a stream frame that arrives queues behind
+/// them: the channel takes frames directly only once the held ones are in, so the order of
+/// arrival is kept. A datagram would overtake them, so it is lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_that_arrives_while_held_frames_are_taken_in_queues_behind_them() {
     let mut fx = latest().await;
@@ -2205,18 +2395,28 @@ async fn a_frame_that_arrives_while_held_frames_are_taken_in_queues_behind_them(
     let rx = &node.chan.rx;
     let replay = rx.begin_replay(channel);
     assert_eq!(
-        fx.deliver(fx.data(SideClass::Datagram, 1, &[named(1, A, b"after")]))
+        fx.deliver(fx.data(SideClass::Stream, 1, &[named(1, A, b"after")]))
             .await,
         Delivery::Held,
         "queued behind the replay, though the session is held"
     );
+    assert_eq!(
+        fx.deliver(fx.data(SideClass::Datagram, 2, &[named(1, A, b"overtaking")]))
+            .await,
+        Delivery::Dropped(Dropped::UnknownChannel),
+        "a datagram is not queued: it is lost, as a datagram may be"
+    );
     assert!(nothing(&mut fx.items), "and not delivered yet");
     node.chan_replay_held(channel, replay).await;
     assert_eq!(payload(&next(&mut fx.items).await.unwrap()), b"after");
+    assert!(
+        nothing(&mut fx.items),
+        "the datagram was not delivered after it"
+    );
     assert_eq!(rx.unknown_held(), (0, 0));
     // The replay is over: frames are taken directly again.
     assert!(matches!(
-        fx.deliver(fx.data(SideClass::Datagram, 2, &[msg(1, b"direct")]))
+        fx.deliver(fx.data(SideClass::Datagram, 3, &[msg(1, b"direct")]))
             .await,
         Delivery::Delivered { .. }
     ));
@@ -2252,7 +2452,8 @@ async fn a_steady_stream_of_frames_takes_no_session_lookup() {
 }
 
 /// What the receiver kept does not outlive the session: once it is dropped from the store the
-/// next frame of its channel is held as one of an unknown channel, not taken.
+/// next frame of its channel is one of an unknown channel, not taken: a stream frame is held, a
+/// datagram is lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_removed_session_takes_no_frame_though_the_channel_was_kept() {
     let fx = latest().await;
@@ -2263,10 +2464,16 @@ async fn a_removed_session_takes_no_frame_though_the_channel_was_kept() {
     ));
     fx.carol().inner.chan.sessions.remove(fx.info.channel);
     assert_eq!(
-        fx.deliver(fx.data(SideClass::Datagram, 2, &[msg(1, b"late")]))
+        fx.deliver(fx.data(SideClass::Stream, 2, &[msg(1, b"late")]))
             .await,
         Delivery::Held,
-        "a frame of a channel whose session is gone is held, not delivered"
+        "a stream frame of a channel whose session is gone is held, not delivered"
+    );
+    assert_eq!(
+        fx.deliver(fx.data(SideClass::Datagram, 3, &[msg(1, b"later")]))
+            .await,
+        Delivery::Dropped(Dropped::UnknownChannel),
+        "a datagram is lost, not delivered"
     );
 }
 

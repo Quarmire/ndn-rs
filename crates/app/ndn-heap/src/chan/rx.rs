@@ -4,8 +4,9 @@
 //! **Before any cryptography**, each costs at most a length test, a header parse or one lookup:
 //! a frame under 46 octets or over the largest any session may grant; a marker, version, kind or
 //! class that is not assigned; a count or sequence the kind does not allow; a channel id this
-//! device holds no session of (the frame is **held**, copied, and taken in when a session of that
-//! id is installed: [`rx_hold`](super::rx_hold)); a frame over the limit that session grants for its class; a
+//! device holds no session of (a **stream** frame is **held**, copied, and taken in when a session
+//! of that id is installed: [`rx_hold`](super::rx_hold); a datagram is lost); a frame over the
+//! limit that session grants for its class; a
 //! `Reliable` or `Window` frame on a datagram; a session whose sender no longer stands (the
 //! generation check: **the first frame after the node holds the removing record is refused**, the
 //! session ends and the `Items` are told); a key epoch the session does not hold (no AEAD attempt:
@@ -43,7 +44,7 @@ use super::latest::Pair;
 use super::limits::{MIN_FRAME_LEN, STREAM_FRAME_DEFAULT, STREAM_FRAME_MAX, message_limit_for};
 use super::message::{Message, Origin};
 use super::replay::{Replay, ReplayWindow};
-use super::rx_hold::{Full, Hold};
+use super::rx_hold::Hold;
 use super::rx_names::{Held, Names, Seen};
 use super::sessions::{EndReason, RecvSession, RecvSessions, Unknown};
 use super::verbs::{Emitted, Got, Kind, LiveEnd};
@@ -133,9 +134,13 @@ pub(crate) struct RxStats {
     pub(crate) no_sink: Counter,
     /// Sessions ended by the receiver (a removed sender, the sender's `END`).
     pub(crate) ended: Counter,
-    /// Frames of a channel id this device holds no session of that were dropped because the hold
-    /// was full (64 frames or 512 KiB).
+    /// Frames of a channel id this device holds no session of that were refused because the hold
+    /// had no room for them: their own face held the most already, or the frame is larger than a
+    /// face's share.
     pub(crate) held_unknown_full: Counter,
+    /// Frames held for an unknown channel id that were pushed out, before they were claimed or
+    /// expired, to make room for a frame of a face that held less.
+    pub(crate) held_unknown_evicted: Counter,
     /// Frames of an unknown channel id that were held 2 s without a session coming: dropped.
     pub(crate) held_unknown_expired: Counter,
 }
@@ -160,7 +165,8 @@ pub enum Dropped {
     Sequence,
     /// Over the limit of its class.
     Oversize,
-    /// No session of that channel is held (or it ended while the frame waited).
+    /// No session of that channel is held (or it ended while the frame waited): a datagram is
+    /// lost, and so is a stream frame the hold has no room for (a face's share, §12.1 row 4).
     UnknownChannel,
     /// A `Reliable` or `Window` data frame on a datagram.
     WrongClass,
@@ -201,9 +207,9 @@ pub enum Delivery {
     /// The session ended with this frame: the sender no longer stands, or said `END`. The frame is
     /// not delivered, and every `Items` of the space is told.
     Ended(EndReason),
-    /// A frame of a channel id this device holds no session of: kept at most 2 s for the session
-    /// to be installed (it is the session Data that tells the channel's key; the frame is not
-    /// decrypted and decides nothing), then dropped.
+    /// A **stream** frame of a channel id this device holds no session of: kept at most 2 s for
+    /// the session to be installed (it is the session Data that tells the channel's key; the frame
+    /// is not decrypted and decides nothing), then dropped.
     Held,
 }
 
@@ -1007,9 +1013,11 @@ impl Receivers {
         self.replaying.load(Ordering::Acquire) > 0 && self.unknown.lock().replaying.contains(&id)
     }
 
-    /// Hold a frame of channel `channel`, which no session takes frames of now. `None`: a
+    /// Hold a stream frame of channel `channel`, which no session takes frames of now. `None`: a
     /// session of it was installed since (and no replay is under way), so the frame is taken
-    /// the usual way.
+    /// the usual way. A frame the hold has no room for is dropped, and counted: its own face
+    /// holds its share already or the most of a full hold (`held_unknown_full`); frames of other
+    /// faces pushed out for it are counted too (`held_unknown_evicted`).
     fn hold_unknown(
         &self,
         sessions: &RecvSessions,
@@ -1032,9 +1040,18 @@ impl Receivers {
             stats.held_unknown_expired.bump();
         }
         Some(match kept {
-            Ok(()) => Delivery::Held,
-            Err(Full) => {
+            Ok(evicted) => {
+                for _ in 0..evicted {
+                    stats.held_unknown_evicted.bump();
+                }
+                Delivery::Held
+            }
+            Err(why) => {
                 stats.held_unknown_full.bump();
+                tracing::debug!(
+                    "frame of channel {channel:016x} from face {ingress} not held: {}",
+                    why.why()
+                );
                 Delivery::Dropped(Dropped::UnknownChannel)
             }
         })
@@ -1084,6 +1101,13 @@ impl Receivers {
     #[cfg(test)]
     pub(crate) fn unknown_held(&self) -> (usize, usize) {
         self.unknown.lock().hold.size()
+    }
+
+    /// How many frames of unknown channels face `ingress` has held, and their octets (a test
+    /// asks).
+    #[cfg(test)]
+    pub(crate) fn unknown_held_by(&self, ingress: u64) -> (usize, usize) {
+        self.unknown.lock().hold.share_of(ingress)
     }
 }
 
@@ -1138,14 +1162,23 @@ impl NodeInner {
         }
         loop {
             let known = self.chan.sessions.get(header.channel);
-            // A session whose held frames are being taken in is not yet taking frames: a frame
-            // that arrives meanwhile queues behind them, so the order of arrival is kept.
+            // A session whose held frames are being taken in is not yet taking frames: a stream
+            // frame that arrives meanwhile queues behind them, so the order of arrival is kept.
             if let Some(session) = known.filter(|_| !rx.replaying(header.channel)) {
                 let channel = rx.channel_for(&session, self);
                 rx.remember(generation, &channel);
                 return channel.receive(self, header, frame, ingress, now).await;
             }
             let unknown = self.chan.sessions.get(header.channel).is_none();
+            // A datagram is not held: it is lost, as a datagram may be, whether it is early or
+            // arrives while the held frames are taken in (it would overtake them). A `Latest`
+            // channel is told by its next emission, and what stands is replayed on the stream.
+            if header.class == SideClass::Datagram {
+                if unknown {
+                    stats.unknown_channel.bump();
+                }
+                return Delivery::Dropped(Dropped::UnknownChannel);
+            }
             if let Some(delivery) = rx.hold_unknown(
                 &self.chan.sessions,
                 header.channel,
@@ -1227,12 +1260,15 @@ impl NodeInner {
 impl NodeHandle {
     /// Hand the node one channel frame the host read from a link: a datagram, or a frame of the
     /// stream (one whole frame; the host reads the stream's own framing). `ingress` is an opaque
-    /// id of the face it came over, kept for the evidence of checkpoints.
+    /// id of the face it came over: the hold of early frames is shared fairly between faces by it
+    /// (a host that gives every frame of every face one id gives up that fairness), and it is kept
+    /// for the evidence of checkpoints.
     ///
     /// The node does the peel-time work (docs/specs/channel.md, The receiver): a frame that is
     /// short, over its limit, malformed, a repeat, or under a key epoch it does not hold costs
-    /// no cryptography; a frame of a channel it holds no session of is **held** (a copy, at
-    /// most 64 frames and 512 KiB in all, 2 s each: [`Delivery::Held`]) and taken in, in order,
+    /// no cryptography; a stream frame of a channel it holds no session of is **held** (a copy,
+    /// at most 16 frames and 2 MiB from one face, 64 frames and 4 MiB in all, 2 s each:
+    /// [`Delivery::Held`]) and taken in, in order,
     /// when a session of that channel is installed; a frame of a session whose sender
     /// no longer stands is refused and the session ends; the first AEAD attempt is the first
     /// cryptography; messages go to the `Items` of the space.
