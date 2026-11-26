@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::side_support::{Handle, TestFace, Warp, WarpRuntime, data_frame, face, pair, up};
 
-const ID: u64 = 0x5E55_10_C0FFEE;
+const ID: u64 = 0x5E55_10C0_FFEE;
 
 fn name() -> Name {
     "/chan/sess/1".parse().unwrap()

@@ -236,6 +236,7 @@ impl Ck {
 
     /// A checkpoint of `frames` over `[lo, hi)` at sequence `seq`, signed by `signer`, sealed under
     /// the channel's key.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn signed(
         &self,
         signer: &dyn ndn_security::Signer,
@@ -1581,7 +1582,7 @@ async fn checkpoints_under_loss_duplication_and_reorder() {
 async fn window(period_ms: u64) {
     const DELAY_MS: u64 = 1;
     let period = Duration::from_millis(period_ms);
-    let mut ck = ck_with(ChannelMode::Latest, latest(), LinkConfig::default(), period).await;
+    let ck = ck_with(ChannelMode::Latest, latest(), LinkConfig::default(), period).await;
     ck.pause_tick();
     tokio::time::pause();
     assert_eq!(
@@ -1603,7 +1604,7 @@ async fn window(period_ms: u64) {
     ck.advance(period_ms + 5).await;
     ck.link.take_stream();
     ck.link.take_datagrams();
-    let s = ck.start();
+    ck.start();
     // t = 0: bob sends his first message; it reaches Carol.
     ck.emit(0, b"first").await;
     for d in ck.link.take_datagrams() {
@@ -1683,7 +1684,7 @@ async fn the_detection_window_follows_a_configured_period_of_1_ms() {
 /// sent since the last.
 #[tokio::test(flavor = "current_thread")]
 async fn a_flood_of_frames_costs_one_signature_per_period() {
-    let mut ck = ck(ChannelMode::Latest, latest(), LinkConfig::default()).await;
+    let ck = ck(ChannelMode::Latest, latest(), LinkConfig::default()).await;
     ck.pause_tick();
     tokio::time::pause();
     let signed = || ck.bob().inner.chan.tx.stats.checkpoints.get();

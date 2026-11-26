@@ -554,16 +554,6 @@ impl ChannelRx {
         (st.held.len(), st.held_bytes)
     }
 
-    /// Slots and octets the checkpoint ring holds (a test asks).
-    #[cfg(test)]
-    pub(crate) fn ring(&self) -> (usize, usize) {
-        self.state
-            .lock()
-            .verify
-            .as_ref()
-            .map_or((0, 0), |v| (v.slots(), v.bytes()))
-    }
-
     /// Whether this channel is holding frames for the `Prompt` lane for want of a verified
     /// checkpoint (a test asks).
     #[cfg(test)]
