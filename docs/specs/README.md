@@ -17,13 +17,14 @@ define the bytes on the wire:
 | [trust-envelope.md](trust-envelope.md) | `ndn-trust://` envelopes: kinds, TLV 0x0470–0x049F, carriage forms incl. QR |
 | [recovery-kit.md](recovery-kit.md) | Recovery kits: BIP39 → Ed25519 recovery key, key naming, file kit (PBES2), hardware kit |
 | [local-refusal.md](local-refusal.md) | NackReason 170–176 for local faces |
-| [mgmt-trust.md](mgmt-trust.md) | Trust management outcomes: refusal codes, next-step classes, details, per-verb catalogues (trust-admin, approvals, links, invites, root-device operations, notifications) |
+| [mgmt-trust.md](mgmt-trust.md) | Trust management outcomes: refusal codes, next-step classes, details, per-verb catalogues (trust-admin, approvals, links, side routes, invites, root-device operations, notifications) |
 
 ## Other specifications
 
 | Spec | Covers |
 |---|---|
 | [heap.md](heap.md) | Heap (`ndn-heap`, the data layer; the specification of the former `ndn-data` crate is kept in [history/](history/)): a signed hash-chained log per writer and space, entries and their TLVs, names, membership as an operation fold in which removal wins, epoch seals and grants, durability by sequence reservation with recovery from peers and a signed gap statement, the TLV registry 0x0600–0x063F |
+| [channel.md](channel.md) | Channel (`ndn-heap` `chan`): ephemeral live data of a space, set up by signed NDN (ask, session, wrapped key, judging, renewal, re-keying), the sealed frame and its messages, the receiver and sender, the forwarder's side table that fans frames out (the `SideRoute` LP header 0x0370, routes, `UP`, the bar), signed checkpoints (the record, evidence, `Trust::Verified`, the stated window), residuals, threat notes; the TLV registry 0x0660–0x06BF |
 | [invite.md](invite.md) | Invite (`ndn-invite`, introductions on top of heap.md; the introductions of the former data layer carried over to the `ndn-heap` space): a one-use offer as a signed packet `<D>/32=intro/32=offer/<id>` served by an extension (not a log entry), the code (link, words, short code with its hint record), the sealed ask and the answer that names the one members entry that admitted the joiner, wrong-try counters and the use mark, grants and mirror grants that follow the members, departures, the host trait, the introduction surface and folder-scope predicates, policy, refusals and threat notes; the TLV numbers of §16 (kept from the former data layer) |
 | [signals.md](signals.md) | Signals: ephemeral live data (presence, cursors, live edits) between the members of a folder; run keys and run headers, packets signed by the run key and sealed under the folder epoch's signal key, the push into the namespaces' sync groups, the local leg over shared-memory rings, receiver checks, limits, threat notes; TLV 0x0580–0x05AF |
 | [did-ndn-spec.md](did-ndn-spec.md) | `did:ndn` method |
@@ -67,6 +68,19 @@ here before using it.
 | 0x0660–0x06BF | [channel.md](channel.md) §7 (the channel setup: `CHAN_ASK` 0x0661 and its `ASK_*` fields 0x0663–0x0671, `CHAN_SESSION` 0x0673 and its `S_*` fields 0x0675–0x0697, `CHAN_REFUSAL` 0x0699 with `R_CODE` 0x069B, `R_TEXT` 0x069D, `R_RETRY` 0x069F, `CHAN_ANNOUNCE` 0x06A1, `B_ID` 0x06A3, `B_NAME` 0x06A5, `W_MESSAGES` 0x06A7, `W_BYTES` 0x06A9, `W_MS` 0x06AB; odd numbers critical, even numbers skippable and reserved for additive fields) |
 
 The blocks 0x05C0–0x05DF and 0x05E0–0x05FE are unallocated: their numbers were retired when answers and device events were removed from the former data layer (the old specifications are kept in [history/answers.md](history/answers.md) and [history/data-layer-events.md](history/data-layer-events.md)), and they MUST NOT be reused.
+
+### NDNLPv2 header numbers
+
+NDNLPv2 headers are TLV-TYPEs of their own, below the application blocks above and ordered by number inside an LpPacket. Odd numbers are critical, even numbers are skipped by a decoder that does not know them. The base set is NDNLPv2's own (Fragment 0x50, PitToken 0x62, Nack 0x0320 and NackReason 0x0321 (see [local-refusal.md](local-refusal.md)), IncomingFaceId 0x032C, NextHopFaceId 0x0330, CachePolicy 0x0334, CongestionMark 0x0340, Ack 0x0344, TxSequence 0x0348, NonDiscovery 0x034C, PrefixAnnouncement 0x0350). The headers ndn-rs adds, and where each is specified:
+
+| Type | Name | Owner |
+|---|---|---|
+| 0x0334 | `CachePolicy`, `NoCache` (1) | NDNLPv2; the channel's setup Data carries it ([channel.md](channel.md) §3.2) |
+| 0x0360, 0x0362, 0x0364 | A-LAL `Presence`, previous-hop location, data location (even, non-critical, ndn-rs experimental) | `ndn-packet` `lp/al_lal.rs` |
+| 0x0370 | `SideRoute`: the route id (8 octets) and a TTL in seconds (2), exactly 10 octets, on a channel session Data (even: a forwarder that predates it skips it) | [channel.md](channel.md) §14.3 (`ndn_packet::tlv_type::LP_SIDE_ROUTE`) |
+| 0x0520 | `TraceContext` | [trace-context-lp-tlv.md](trace-context-lp-tlv.md) |
+
+0x0370 was free. Before `SideRoute` no spec and no code of `ndn-rs`, `ndn-ext`, `ndn-radio` or `ndn-fwd` named it (`grep` for `0x0370` and `LP_SIDE_ROUTE`, build directories excluded, finds only `ndn-packet`'s definition and codec and the doc comments of `ndn-engine`), and this registry had no NDNLPv2 table.
 
 ### Name-component types
 

@@ -663,6 +663,36 @@ A punch refused for an admission reason carries that refusal's detail
 Quotas are the params `links_total`, `links_per_namespace`,
 `interests_per_key` and `interests_per_namespace` (per second).
 
+## Side routes
+
+The side module (`/localhost/nfd/side/*`, local operators only, an ndn-rs
+module that is not an NFD one) shows and bars what the forwarder's **side
+table** does with channel frames: the routes it holds for them, its counters,
+and the faces it refuses them from (the table is specified in
+[channel.md §14](channel.md#14-the-forwarders-side-table)). Both verbs
+require a signed command Interest. They are not trust-admin verbs and carry
+no refusal **code**: a refusal is a ControlResponse with a status and a plain
+sentence, which names what to do.
+
+| verb | parameters | answer |
+|---|---|---|
+| `side/list` | none | status text, read-only: the counters (routes, sinks, frames and octets in and out), the drops by reason (`unrouted`, `wrong_source`, `malformed`, `class_unsupported`, `quota`, `quarantined`, `sink_full`, `sink_error`), the `UP` counters (`keeps`, `keeps_forwarded`, `unsubs`, `sinks_lapsed`), the installs refused by reason (`table_full`, `source_full`, `sink_cap`, `sink_face_full`, `source_mismatch`, `sink_is_source`, `quarantined`, `face_gone`), one line for each route (id in hex, source face, each sink with the time left before it lapses, frames, octets, age) and one for each barred face (the time left) |
+| `side/quarantine` | `FaceId` (required); `ExpirationPeriod` in milliseconds (optional) | bars the face from carrying channel frames; the answer is `face barred` or `bar lifted` with `FaceId` and `ExpirationPeriod` set to the length applied |
+
+`side/quarantine` without `ExpirationPeriod` applies the face's next bar by
+its history: 60 s, doubling for each repeat on the same face up to 1 h, and 60 s
+again after an hour clean. With a value the bar lasts that long and keeps a
+longer one the face already has; `0` lifts the bar and keeps the history. A
+barred face has the channel frames it sends dropped and its keep-alives
+ignored, and no route is installed with it as the upstream face; the NDN
+traffic over it goes on.
+
+| status | when | sentence says |
+|---|---|---|
+| 400 | `side/quarantine` names no `FaceId` (or 0) | to name the face to bar and where to find it (`faces/list`, `side/list`) |
+| 400 | the `FaceId` is no face on this forwarder (a bar of length 0 is not refused) | the face is not on this forwarder; name one from `faces/list` |
+| 404 | any other verb of the module | the verb is unknown |
+
 ## Invites
 
 A device that runs CAs (one per namespace it is the root of, `[[ca]]`) makes

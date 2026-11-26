@@ -3086,7 +3086,13 @@ the node's own: dropped when it stops and waited for by `close` (§4.5 rule 5).
 ```rust
 pub trait Extension: Send + Sync {
     fn keywords(&self) -> &'static [&'static str];
-    fn answer<'a>(&'a self, interest: &'a Interest) -> AnswerFuture<'a>; // Option<Bytes>
+    fn answer<'a>(&'a self, interest: &'a Interest) -> AnswerFuture<'a>; // Option<Answer>
+}
+
+pub struct Answer { pub wire: Bytes, pub side: Option<(u64, u16)> }  // the Data, and the route label it carries
+impl Answer {
+    pub fn plain(wire: Bytes) -> Answer;                              // no label
+    pub fn routed(wire: Bytes, id: u64, ttl_secs: u16) -> Answer;     // the label (id, ttl)
 }
 
 impl Node { pub fn handle(&self) -> NodeHandle; }          // and Deref<Target = NodeHandle>
@@ -3127,6 +3133,17 @@ in a task of its own (it may sign, wait for the store or ask the network), a
 reach it. The router of §2.4 is otherwise unchanged. A sibling's records live
 in the store under `/localhost/ndn-<crate>/`, which no device serves and this
 layer neither scans nor writes; `flush` makes them durable.
+
+**The answer.** `answer` returns an `Answer { wire, side }`: the signed Data, and
+optionally a **route label** `(id, ttl_secs)`. A label goes out as the NDNLPv2
+`SideRoute` header (TLV-TYPE 0x0370, [channel.md](channel.md) §14.3) on the Data,
+so that each forwarder on the Data's reverse path installs a route for the
+channel frames of `id` that the extension then sends over its connection; an
+answer with no label (`Answer::plain`) goes out bare, as before. Before channel
+stage 4 `answer` returned the Data's octets alone (`Option<Bytes>`); an
+extension that sets up no route changes only by wrapping them in
+`Answer::plain`. The channel's own session Data is the label's user (`NoCache`,
+TTL 30 s).
 
 **Signing.** `sign_packet` signs with the device's key, and **only** a Data
 named `<D>/32=<keyword>/…` where `D` is this device, the keyword is the
