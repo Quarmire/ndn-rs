@@ -1109,7 +1109,7 @@ Inputs: the device key is the Ed25519 seed of 32 octets of `42`, whose public ke
 
 ## 16. Measured
 
-Informative. This section records what was measured of the stage-3 implementation, how, what the figures leave out, and what was tried and removed. Nothing in it is normative. The design note (SHAPES-CHANNEL.md §18 and §19) holds the raw tables, the commits and the scripts.
+Informative. This section records what was measured of the stage-3 implementation (§16.1 to §16.6) and of stages 4 and 5 (§16.7), how, what the figures leave out, and what was tried and removed. Nothing in it is normative. The design note (SHAPES-CHANNEL.md §18 and §19) holds the raw tables, the commits and the scripts.
 
 ### 16.1 Method
 
@@ -1196,10 +1196,63 @@ Against the targets of the design note every performance gate **except 8 B is mi
 
 **The owner's decision** is to finish stages 4–7 first and then to do **one focused performance pass**; the open items above are left to that pass.
 
-### 16.7 What the figures do not cover
+### 16.7 Stages 4 and 5
+
+**Method.** The **baseline** is the stage-3 tree of §16.1, ndn-rs `33a2fd95` with ndn-ext `407bbaf`, built in scratch worktrees; **current** is the tree with stages 4 and 5. Pinned to cores 10 to 13 (`taskset -c 10-13`), 3 s a row, baseline and current alternating in pairs with the order flipped each pair. The whole table was run twice, before and after the fix of `ASK_NEW` (§3.1), and the two runs agree. The host was shared and **busier than §16.1's**: the 1-minute load was 11.7 to 16.5 (median 14.5). **Read every figure as ±5 %.** The raw logs are not in the repository.
+
+**One link, `chan_ping`, baseline against current** (the rung of §16.1; the nodes use the one-link carrier of that rung, not a forwarder):
+
+| row | baseline | current | ratio of medians | pair ratios |
+|---|---|---|---|---|
+| 8 B messages/s | 2.151 M | 1.882 M | 0.875 | .92 .90 .86 |
+| 64 B messages/s | 1.909 M | 1.681 M | 0.881 | .84 .90 .87 |
+| 1 KiB messages/s | 626 k | 539 k | 0.861 | .87 .84 .87 |
+| 8 KiB messages/s | 91.0 k | 82.7 k | 0.909 | .92 .84 .93 |
+| 64 B half round trip p50, cold (14 pairs) | 33.3 µs | 33.0 µs | 0.985 | range 0.61 to 1.60 |
+| 64 B half round trip p50, hot (14 pairs) | 34.1 µs | 41.0 µs | 1.21 | range 0.96 to 1.98 |
+| 64 B p99, cold / hot | 52.0 / 50.8 µs | 48.8 / 63.6 µs | | |
+| per-message CPU, sender (`poll_next` / `next_batch`) | 532 / 448 ns | 553 / 467 ns | 1.040 / 1.043 | |
+| per-message CPU, receiver (`poll_next` / `next_batch`) | 304 / 276 ns | 314 / 279 ns | 1.033 / 1.009 | |
+
+- **Throughput is 0.86 to 0.91 of the baseline at every size.** It is real (both runs, every pair). The first run read 0.83 to 0.90.
+- **Hot latency read +18 % and +21 % in the two runs. Cold latency is not separable:** the first run read +21 %, the second −1.5 %, and the range of the pair ratios is wide.
+- **Per-message CPU moves 1 to 4 %.** That row uses a carrier with no stream, so it carries no checkpoints.
+- **The raw carrier is unchanged**, which clears the carrier and the host: a separate `carrier_bench` control (defaults, MTU 1,452, so not comparable to §16.2's raw rows) read 28.5 µs cold and 28.9 µs hot, and baseline against current throughput 0.974 (1 KiB datagram), 0.999 (1 KiB stream) and 1.009 (8 KiB stream). The channel against the raw half round trip: cold 1.16 in both trees, hot 1.17 in the baseline and 1.39 now.
+- **The cause was not isolated.** The checkpoint rows below point at checkpoints [INFERENCE: not shown].
+- **An oddity, not diagnosed:** in the current tree the per-message row delivers 99.97 to 99.99 % of the messages (the baseline 100 %), and the shortfall grows with the run [INFERENCE: a non-data frame takes a tap's release slot and `Latest` supersedes that round].
+
+**The cost of checkpoints** was measured in a forwarder-attached direct shape (a sender and a receiver, each on its own forwarder, over one real QUIC link), comparing the default period of 20 ms with the largest, 2,000 ms, 3 interleaved pairs. It is the **difference** between two periods, not against a build with no checkpoints, and it includes the stream writes, the wake-ups and the hashing of frames, not only the signatures. Share of one core:
+
+| rate (64 B) | sender, 20 ms | sender, 2,000 ms | receiver, 20 ms | receiver, 2,000 ms | difference |
+|---|---|---|---|---|---|
+| 1,000 messages/s | 3.75 % | 3.87 % | 5.54 % | 3.83 % | sender −0.12, **receiver +1.71** |
+| 100 messages/s | 1.48 % | 1.11 % | 1.77 % | 1.04 % | sender +0.37, **receiver +0.73** |
+
+- **The design target** was under 0.5 % of a core for each active sender, on both sides. **The sender meets it** (+0.37 % at worst). **The receiver misses it:** +0.73 % at 100 messages/s and +1.71 % at 1,000.
+- **Throughput** in the same shape at 20 ms is 0.75 (64 B) and 0.77 (1 KiB) of the 2,000 ms run; the 64 B p50 is 39.6 against 35.9 µs and p99 56 against 46 µs. Part of the 2 s gain is probably that the sender's ring evicts frames before they are hashed, so it is not a clean cost of signing [INFERENCE: the cost follows the rate of frames, which is frame hashing, §15.3].
+
+**Through a relay** (`chan_relay`: a sender, a relay and receivers A and B, each on its own forwarder, joined by real QUIC links; the relay holds no identity, trust or data layer, only routes and the side table; forwarder-attached nodes). Medians of 3 runs (14 for the latency rows); ranges in brackets:
+
+| | direct | one relay, one receiver | one relay, two receivers (A / B) |
+|---|---|---|---|
+| 64 B messages/s | 1.276 M | 529 k [527 k, 715 k] | 949 k / 981 k, 1.91 M in all |
+| 1 KiB messages/s | 208 k | 146 k [95 k, 189 k] | 108 k / 120 k |
+| 64 B half round trip p50 | 36.2 µs | 72.0 µs | 83.9 µs |
+| 1 KiB half round trip p50 | 45.5 µs | 97.9 µs | 86.4 µs |
+
+- **One relay hop roughly doubles the half round trip.**
+- **The sender's link carries one copy of each frame** with two receivers behind the relay (the relay's frames out are twice its frames in; a test asserts it). Each receiver gets about what the single one does, so the total is about twice.
+- **The relay rows are noisy**, and one relay against two inverts on throughput and on the 1 KiB latency: read no order into them. At saturation the receivers' app-face inboxes also drop (`sink_full`).
+- **The 1 KiB gap to the one-link row (208 k against 539 k)** is the default datagram frame of a forwarder-attached node, 1,200 octets (`DATAGRAM_FRAME_MAX`, §14.10): a 1 KiB message fills a frame, where the one-link carrier packs several. `attach_forwarder_with` raises it when every sink is local. That is a setting of the host, not of the table.
+
+**Not run.** N1 (there is no such harness in ndn-ext: the `ndn-link` ladder measures something else) and any radio path (no radio face is a sink yet, §14.9). `Trust::Verified`'s latency and a real network interface were not measured.
+
+**The gates.** The gate of stage 4 and 5 that the one-link rung stays within 3 % of stage 3 (SHAPES-CHANNEL.md §13) is **not met**: throughput is 9 to 14 % down and hot latency up about 20 %. The checkpoint gate of under 0.5 % of a core per active sender is met by the sender and **missed by the receiver**. **Nothing was tuned**, by the owner's decision (§16.6): the performance pass after stage 7 owns these figures.
+
+### 16.8 What the figures do not cover
 
 - A real network interface: every run is loopback.
-- `Reliable` and `Window` (only `Latest` was measured); the costs of stages 4 and 5, which no figure here includes: a frame through a relay and its fan-out, the signing and verification of checkpoints at the default period, and the latency of `Trust::Verified` (§14 and §15 are specified from the behaviour the tests exercise, not from a measurement); and the setup's Interests crossing the link (the two nodes share one forwarder).
+- `Reliable` and `Window` (only `Latest` was measured); `Trust::Verified`'s latency; and the setup's Interests crossing the link in the one-link rung (its two nodes share one forwarder; the relay rows of §16.7 do cross the links).
 - Zenoh was not rerun on this host; comparisons to it use the figures of the design note's baseline (§1.2), taken at another load. Zenoh was not measured at 128 B to 512 B.
 - A full table after the changes made since the tuning pass (§16.2), and the latency with and without an offload.
 - A quiet host: the figures were taken at load 5–6 on a shared host, and single latency pairs vary by ±5 µs.
