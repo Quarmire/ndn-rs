@@ -59,11 +59,6 @@ pub(crate) const SEQ_REKEY: u64 = limits::SEQUENCE_LIMIT;
 const ASKS_PER_SEC: f64 = 4.0;
 const ASKS_BURST: f64 = 8.0;
 
-/// The asks per second whose signature the sender verifies, whoever they name, and its burst: a
-/// whole channel's receivers (256) asking after a re-key pass at once.
-const VERIFIES_PER_SEC: f64 = 64.0;
-const VERIFIES_BURST: f64 = RECEIVERS_PER_CHANNEL as f64;
-
 /// The most askers a rate limiter keeps a bucket of: those past it that were idle longest go.
 const BUCKETS_MAX: usize = 4096;
 
@@ -88,13 +83,13 @@ pub(crate) fn lifetime_for(wanted: u64) -> u64 {
 struct Receiver {
     /// The key that signed its last ask: what is judged again when the record changes.
     key: Name,
-    /// The person its key belongs to.
-    person: Name,
     /// The key epoch of the key it was last given.
     delivered: u32,
     /// When it was last given a key, and for how long.
     issued: Instant,
     lifetime: Duration,
+    /// The person its key belongs to.
+    person: Name,
     /// The receiver is given the stream's frames; `false`: its path has none.
     stream: bool,
 }
@@ -175,22 +170,22 @@ pub(crate) struct Admitted {
 
 /// Which cap a refused ask hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    /// [`RECEIVERS_PER_PERSON`]: the asker's person already has that many devices as receivers.
-    Person,
 pub(crate) enum Cap {
     /// [`CHANNELS_PER_SENDER`].
     Channels,
     /// [`RECEIVERS_PER_CHANNEL`].
     Receivers,
+    /// [`RECEIVERS_PER_PERSON`]: the asker's person already has that many devices as receivers.
+    Person,
 }
-    /// The person the asker's key belongs to, as the caller's judgement named her: receivers are
-    /// counted per person ([`RECEIVERS_PER_PERSON`]).
-    pub(crate) person: &'a Name,
 
 /// What the table needs to know of an asker the caller judged.
 pub(crate) struct Asker<'a> {
     /// The asker's device: one receiver per device.
     pub(crate) device: &'a Name,
+    /// The person the asker's key belongs to, as the caller's judgement named her: receivers are
+    /// counted per person ([`RECEIVERS_PER_PERSON`]).
+    pub(crate) person: &'a Name,
     /// The key that signed the ask.
     pub(crate) key: &'a Name,
     /// The lifetime the ask wants, in seconds (0: none named).
@@ -292,8 +287,6 @@ impl Buckets {
 struct Table {
     channels: BTreeMap<(Name, ChannelMode), Channel>,
     buckets: Buckets,
-    /// The bucket of asks that reach the signature: none until the first.
-    unverified: Option<Bucket>,
 }
 
 /// A sender's channels.
@@ -404,17 +397,6 @@ impl Channels {
         self.table.lock().buckets.take(key, now)
     }
 
-    /// Whether one more ask may have its signature verified now, whoever it names: one token of
-    /// the one bucket every ask passes before the signature (64 a second, burst
-    /// [`RECEIVERS_PER_CHANNEL`]). It bounds what verifying costs; it charges no asker.
-    pub(crate) fn throttle_unverified(&self, now: Instant) -> bool {
-        let mut table = self.table.lock();
-        table
-            .unverified
-            .get_or_insert_with(|| Bucket::full(VERIFIES_BURST, now))
-            .take(VERIFIES_PER_SEC, VERIFIES_BURST, now)
-    }
-
     /// Give `asker`, which the caller judged, the key of the channel of `(space, mode)`: the
     /// channel is made if there is none; the asker is added, or renewed. A receiver that already
     /// holds the current key and asks again after half its lifetime has the channel re-keyed if
@@ -467,7 +449,6 @@ impl Channels {
             if channel.receivers.len() >= RECEIVERS_PER_CHANNEL {
                 return Err(Cap::Receivers);
             }
-            person: asker.person.clone(),
         }
         // A receiver that holds the current key and asks after half its lifetime renews: the
         // channel is re-keyed, unless it was re-keyed less than [`REKEY_MIN`] ago. Then the
@@ -486,6 +467,7 @@ impl Channels {
             delivered: channel.key_epoch,
             issued: now,
             lifetime,
+            person: asker.person.clone(),
             stream: asker.stream,
         };
         channel

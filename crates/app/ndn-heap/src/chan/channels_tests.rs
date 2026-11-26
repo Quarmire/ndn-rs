@@ -329,27 +329,6 @@ fn renewals_and_lapses_rekey_at_most_once_per_rekey_min_and_a_removal_at_once() 
     assert_eq!(epoch(), 2);
 }
 
-/// Every ask passes one global bucket before its signature is checked; it charges no asker, so a
-/// flood that names a member leaves that member's own bucket whole.
-#[test]
-fn the_budget_of_verifications_is_global_and_charges_no_askers_bucket() {
-    let table = Channels::default();
-    let t0 = Instant::now();
-    let bob = n("/bob/phone/KEY/1");
-    let passed = (0..1000).filter(|_| table.throttle_unverified(t0)).count();
-    assert_eq!(
-        passed, RECEIVERS_PER_CHANNEL,
-        "a burst of one channel's receivers"
-    );
-    assert!(!table.throttle_unverified(t0 + Duration::from_millis(10)));
-    assert!(
-        table.throttle_unverified(t0 + Duration::from_millis(20)),
-        "64 a second: a token every 15.6 ms"
-    );
-    let own = (0..20).filter(|_| table.throttle(&bob, t0)).count();
-    assert_eq!(own, 8, "bob's bucket is whole: the budget charged nobody's");
-}
-
 #[test]
 fn the_lifetime_is_the_asks_clamped_between_a_minute_and_24_hours_and_never_refused() {
     assert_eq!(lifetime_for(0), 3600);
@@ -402,6 +381,27 @@ fn a_sender_keeps_64_channels_and_a_channel_256_receivers() {
         table
             .admit(
                 &n("/alice/32=data/s0"),
+                ChannelMode::Reliable,
+                &ask(&bob, &person_of(&bob), &bob_key, 0),
+                None,
+                (1, 1),
+                t0
+            )
+            .err(),
+        Some(Cap::Channels)
+    );
+    let table = Channels::default();
+    for i in 0..RECEIVERS_PER_CHANNEL {
+        let (d, k) = (n(&format!("/p{i}/dev")), n(&format!("/p{i}/dev/KEY/1")));
+        admit(&table, &d, &k, 0, t0).unwrap();
+    }
+    let (d, k) = (n("/late/dev"), n("/late/dev/KEY/1"));
+    assert_eq!(admit(&table, &d, &k, 0, t0).err(), Some(Cap::Receivers));
+    // A receiver the channel already has is not over the cap by asking again.
+    let (d0, k0) = (n("/p0/dev"), n("/p0/dev/KEY/1"));
+    assert!(admit(&table, &d0, &k0, 0, t0).is_ok());
+}
+
 /// One person's devices are bounded in a channel's places: a member with many device keys cannot
 /// fill the channel for the other members. Her extra device is refused by `Cap::Person` (a place
 /// is not taken), the devices she has still renew, and every other person still finds a place up
@@ -443,27 +443,6 @@ fn one_person_cannot_fill_a_channels_receiver_places() {
         admit(&table, &late, &late_key, 0, t0).err(),
         Some(Cap::Receivers)
     );
-}
-
-                ChannelMode::Reliable,
-                &ask(&bob, &person_of(&bob), &bob_key, 0),
-                None,
-                (1, 1),
-                t0
-            )
-            .err(),
-        Some(Cap::Channels)
-    );
-    let table = Channels::default();
-    for i in 0..RECEIVERS_PER_CHANNEL {
-        let (d, k) = (n(&format!("/p{i}/dev")), n(&format!("/p{i}/dev/KEY/1")));
-        admit(&table, &d, &k, 0, t0).unwrap();
-    }
-    let (d, k) = (n("/late/dev"), n("/late/dev/KEY/1"));
-    assert_eq!(admit(&table, &d, &k, 0, t0).err(), Some(Cap::Receivers));
-    // A receiver the channel already has is not over the cap by asking again.
-    let (d0, k0) = (n("/p0/dev"), n("/p0/dev/KEY/1"));
-    assert!(admit(&table, &d0, &k0, 0, t0).is_ok());
 }
 
 #[test]
@@ -566,7 +545,6 @@ fn a_session_names_the_next_sequence_and_the_audience_epoch_the_receiver_was_jud
         .unwrap();
     table.note_seq(&space(), ChannelMode::Latest, 77);
     let (carol, carol_key) = (n("/carol/tablet"), n("/carol/tablet/KEY/1"));
-        person: &person_of(&bob),
     let given = admit(&table, &carol, &carol_key, 0, now).unwrap();
     assert_eq!(given.seq, 77);
     assert_eq!(given.audience, Some(epoch));
@@ -588,10 +566,10 @@ fn a_receiver_that_says_it_holds_no_session_claims_to_be_new_and_is_not_fresh() 
     // ask says so.
     let asker = Asker {
         device: &bob,
+        person: &person_of(&bob),
         key: &key,
         wanted: 3600,
         new: true,
-        person: &person_of(&carol.0),
         stream: true,
     };
     let again = table
@@ -613,6 +591,7 @@ fn a_receiver_that_says_it_holds_no_session_claims_to_be_new_and_is_not_fresh() 
     let carol = (n("/carol/tablet"), n("/carol/tablet/KEY/1"));
     let asker = Asker {
         device: &carol.0,
+        person: &person_of(&carol.0),
         key: &carol.1,
         wanted: 3600,
         new: true,

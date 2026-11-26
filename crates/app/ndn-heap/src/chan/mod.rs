@@ -25,6 +25,7 @@ pub(crate) mod error;
 pub mod evidence;
 pub(crate) mod fifo;
 pub(crate) mod frame;
+pub(crate) mod gates;
 pub(crate) mod history;
 pub(crate) mod hub;
 pub(crate) mod items;

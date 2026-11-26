@@ -8,12 +8,14 @@
 //! 1. the name is `<this device>/32=chan/<digest>`, the ApplicationParameters are at most 8 KiB
 //!    and hash to the digest, the ask parses;
 //! 2. the KeyLocator names a device key and the space is open here as a member;
-//! 3. the key **stands** ([`standing`], `Who::Listed`: a person the space lists, owner-capable,
-//!    not revoked, not suspected) by the entries held now: else `NoRoute`;
+//! 3. the lookup budget (per ingress face and for the node: [`super::gates`]), then the key
+//!    **stands** ([`standing`], `Who::Listed`: a person the space lists, owner-capable, not
+//!    revoked, not suspected) by the entries held now: else `NoRoute`; over the budget,
+//!    `Congestion`;
 //! 4. the ask's `SignatureTime` is within 120 s of this device's clock (the one wall-clock
 //!    reading of the setup): else `NoRoute`;
-//! 5. the budget of signature verifications (64 a second, whoever the asks name): else
-//!    `Congestion`;
+//! 5. the budget of signature verifications (per ingress face, under a ceiling of the node's):
+//!    else `Congestion`;
 //! 6. the signature verifies from the certificates held and the at most four carried, fetching
 //!    nothing ([`Judge::validate_interest`]): `Pending` is `NotYet`, a refusal `NoRoute`;
 //! 7. the ask is no replay (the replay guard of the signed Interest): `Duplicate`;
@@ -329,6 +331,14 @@ impl NodeInner {
             stats.malformed.bump();
             return nack(NackReason::NoRoute);
         }
+        // The lookup budget (per ingress face and for the node) stands before the record is
+        // read: the lookup takes the space's lock, which no flood at wire rate may hold against
+        // the space's other work.
+        let now = Instant::now();
+        if !self.chan.gates.lookup(ingress, now) {
+            stats.shed.bump();
+            return nack(NackReason::Congestion);
+        }
         let Some(held) = self.space_of(&ask.space).filter(|s| !s.follower) else {
             stats.strangers.bump();
             return nack(NackReason::NoRoute);
@@ -354,11 +364,11 @@ impl NodeInner {
             return nack(NackReason::NoRoute);
         }
 
-        // 5. The budget of signature verifications. The key an unverified ask names is whatever
-        // its sender wrote, so no asker's bucket is charged here: one bucket bounds what verifying
-        // costs, whoever the asks name.
-        let now = Instant::now();
-        if !self.chan.channels.throttle_unverified(now) {
+        // 5. The budget of signature verifications, per ingress face and for the node. The key
+        // an unverified ask names is whatever its sender wrote, so no asker's bucket is charged
+        // here: what a face has not used is every other face's, and the node's ceiling bounds
+        // what verifying costs the CPU.
+        if !self.chan.gates.verify(ingress, now) {
             stats.shed.bump();
             return nack(NackReason::Congestion);
         }
@@ -489,6 +499,7 @@ impl NodeInner {
         );
         let asker = Asker {
             device: &asker_device,
+            person: &person,
             key: &key,
             wanted: ask.lifetime,
             new: ask.new,
@@ -499,7 +510,6 @@ impl NodeInner {
             .channels
             .admit(&ask.space, ask.mode, &asker, audience, judged_at, now)
         {
-            person: &person,
             Ok(admitted) => {
                 if admitted.rekeyed {
                     self.chan.stats.rekeys.bump();
@@ -519,9 +529,6 @@ impl NodeInner {
                  receiver has gone",
                 30_000,
             ),
-        }
-    }
-}
             Err(Cap::Person) => refuse(
                 RefusalCode::TooMany,
                 "this channel already has as many receivers of your person as it may (32 \
@@ -529,3 +536,6 @@ impl NodeInner {
                  session of one of your other devices has lapsed (at most its lifetime)",
                 30_000,
             ),
+        }
+    }
+}

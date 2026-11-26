@@ -28,6 +28,7 @@ use super::answer::{ASK_CLOCK_WINDOW_MS, ChanAnswer};
 use super::bar::BarSlot;
 use super::channels::Channels;
 use super::evidence::EvidenceLog;
+use super::gates::Gates;
 use super::route::Routes;
 use super::rx::{Receivers, RxStats};
 use super::sessions::{EndReason, RecvSessions};
@@ -167,6 +168,9 @@ impl Heard {
 pub(crate) struct Chan {
     /// This device's channels as a sender.
     pub(crate) channels: Channels,
+    /// The budgets an ask passes before its signature is known good, per ingress face and for
+    /// the node ([`super::gates`]).
+    pub(crate) gates: Gates,
     /// The sessions this device holds as a receiver.
     pub(crate) sessions: RecvSessions,
     /// The sender's frame layer: its channels' writers and the fixed route's carrier.
@@ -204,6 +208,7 @@ impl Chan {
     pub(crate) fn new() -> Chan {
         Chan {
             channels: Channels::default(),
+            gates: Gates::default(),
             sessions: RecvSessions::default(),
             tx: Tx::default(),
             rx: Receivers::default(),

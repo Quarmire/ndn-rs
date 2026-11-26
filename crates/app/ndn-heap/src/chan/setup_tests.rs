@@ -1384,6 +1384,52 @@ async fn forged_asks_naming_a_member_do_not_throttle_that_members_real_ask() {
     );
 }
 
+/// A stranger that sends more forged asks than the verification budget holds (each names a
+/// listed key, so it passes the lookup and reaches the signature) must not use up what every
+/// genuine asker needs: a member's own ask, arriving over another face, is answered after them.
+/// The budget of verifications is kept per ingress face, under a ceiling of the node sized for
+/// its CPU, so one face cannot drain it for the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_of_forged_asks_from_one_face_does_not_starve_a_genuine_ask() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/dave/pc"]).await;
+    let (share, change) = public_with(&["/bob"], &[]);
+    shared(&rig, share, change).await;
+    let (alice, bob, dave) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
+    let params = ask_of(bob, ChannelMode::Latest).encode().unwrap();
+    let forged_count = 600;
+    // Signed first, and judged all at once: the flood arrives faster than any budget refills.
+    let flood: Vec<Interest> = (0..forged_count)
+        .map(|_| Interest::decode(signed_as(dave, bob.writer(), alice, &params)).unwrap())
+        .collect();
+    // A verification takes milliseconds, so the flood runs on every worker at once: asks judged
+    // one after another would let the budget refill between them.
+    let tasks: Vec<_> = flood
+        .into_iter()
+        .map(|interest| {
+            let node = Arc::clone(&alice.inner);
+            tokio::spawn(async move {
+                node.chan_answer(&interest, Some(ndn_transport::FaceId(7_000)))
+                    .await
+            })
+        })
+        .collect();
+    let mut answers = Vec::new();
+    for task in tasks {
+        answers.push(task.await.unwrap());
+    }
+    let shed = answers
+        .iter()
+        .filter(|a| matches!(a, ChanAnswer::Nack(NackReason::Congestion)))
+        .count();
+    assert!(
+        shed > 0,
+        "{forged_count} forged asks over one face were all verified: nothing bounds one face"
+    );
+    bob.ask_channel(&space(), alice.name())
+        .await
+        .expect("bob's genuine ask is answered after the flood of forgeries from another face");
+}
+
 /// An ask signed long ago, or in the far future, by a member the sender never saw ask: the
 /// sender's clock (the one wall-clock reading of the setup) refuses it before any signature
 /// is checked. Within ±120 s it is answered.
