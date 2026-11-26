@@ -32,10 +32,11 @@
 //!   must not wait. A sink that cannot take it costs that sink the frame and is
 //!   counted `sink_full`: relays are lossy under congestion, visibly.
 //! - `UP` `Keep` refreshes that sink's expiry (its TTL after the Keep) and, when
-//!   this route's last forwarded Keep was at least
-//!   [`keep_forward_min`](SideLimits::keep_forward_min) ago (the first one of a
-//!   route: at once), forwards one Keep to the route's source: one frame per
-//!   5 s per hop keeps a path alive however many receivers there are. `Unsub`
+//!   that sink's last forwarded Keep was at least
+//!   [`keep_forward_min`](SideLimits::keep_forward_min) ago (a sink's first
+//!   Keep: at once, so the source learns the route to that receiver is up),
+//!   forwards one Keep to the route's source: at most one frame per 5 s per
+//!   sink per hop keeps a path alive. `Unsub`
 //!   removes that face's sink; when none is left the route is removed and the
 //!   `Unsub` is forwarded to the source.
 //! - Bounds ([`SideLimits`]): routes, routes per source face, sinks per route,
@@ -356,7 +357,7 @@ fn bump(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
 
-/// A route's last forwarded `Keep`, before there was one.
+/// A sink's last forwarded `Keep`, before there was one.
 const NEVER: u64 = u64::MAX;
 
 /// The first bar of a face, doubling per repeat.
@@ -442,6 +443,10 @@ struct Sink {
     ttl_ns: AtomicU64,
     /// Lapses at this time (ns).
     expires: AtomicU64,
+    /// When this sink's last `Keep` was forwarded to the route's source
+    /// ([`NEVER`] before the first): a sink's first Keep goes upstream at
+    /// once, later ones at most every `keep_forward_min`.
+    kept: AtomicU64,
 }
 
 impl Sink {
@@ -459,8 +464,6 @@ struct Route {
     frames: AtomicU64,
     bytes: AtomicU64,
     created: u64,
-    /// When this route last forwarded a `Keep` to its source ([`NEVER`]).
-    kept: AtomicU64,
 }
 
 #[derive(Default)]
@@ -618,6 +621,7 @@ impl SideTable {
                 entry: Arc::clone(&sink_entry),
                 ttl_ns: AtomicU64::new(ttl_ns),
                 expires: AtomicU64::new(now.saturating_add(ttl_ns)),
+                kept: AtomicU64::new(NEVER),
             })
         };
 
@@ -665,7 +669,6 @@ impl SideTable {
                         frames: AtomicU64::new(0),
                         bytes: AtomicU64::new(0),
                         created: now,
-                        kept: AtomicU64::new(NEVER),
                     }),
                 );
                 *q.per_source.entry(source).or_insert(0) += 1;
@@ -799,12 +802,12 @@ impl SideTable {
             UpOp::Keep => {
                 bump(&self.counters.keeps);
                 sink.refresh(now);
-                let last = route.kept.load(Ordering::Relaxed);
+                let last = sink.kept.load(Ordering::Relaxed);
                 let due = last == NEVER
                     || now.saturating_sub(last) >= ns(self.config.limits.keep_forward_min);
                 let forwarded = due && self.up_to_source(route, frame, from, faces);
                 if forwarded {
-                    route.kept.store(now, Ordering::Relaxed);
+                    sink.kept.store(now, Ordering::Relaxed);
                     bump(&self.counters.keeps_forwarded);
                 }
                 SideOutcome::Kept { forwarded }

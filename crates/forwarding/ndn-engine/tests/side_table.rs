@@ -446,6 +446,46 @@ fn a_sink_lapses_after_its_ttl_and_keep_refreshes_it_through_each_hop_once_per_5
 }
 
 #[test]
+fn a_sinks_first_keep_goes_upstream_at_once_even_when_another_sink_just_kept() {
+    let fx = Fx::new();
+    let src = fx.app(10);
+    let _a = fx.app(20);
+    let _b = fx.app(21);
+    fx.install(1, 10, 20).unwrap();
+    fx.install(1, 10, 21).unwrap();
+
+    // The first receiver's Keep is forwarded; so is the second's, a moment
+    // later: the source learns each receiver's route is up.
+    assert_eq!(
+        fx.on_frame(20, up(1, UpOp::Keep)),
+        SideOutcome::Kept { forwarded: true }
+    );
+    fx.advance(1);
+    assert_eq!(
+        fx.on_frame(21, up(1, UpOp::Keep)),
+        SideOutcome::Kept { forwarded: true }
+    );
+    assert_eq!(src.side().len(), 2);
+    // Each sink's later Keeps are spaced 5 s apart, independently.
+    fx.advance(1);
+    assert_eq!(
+        fx.on_frame(20, up(1, UpOp::Keep)),
+        SideOutcome::Kept { forwarded: false }
+    );
+    fx.advance(3);
+    assert_eq!(
+        fx.on_frame(20, up(1, UpOp::Keep)),
+        SideOutcome::Kept { forwarded: true }
+    );
+    assert_eq!(
+        fx.on_frame(21, up(1, UpOp::Keep)),
+        SideOutcome::Kept { forwarded: false },
+        "4 s after its own forwarded Keep"
+    );
+    assert_eq!(src.side().len(), 3);
+}
+
+#[test]
 fn a_keep_from_a_face_that_is_not_a_sink_changes_nothing() {
     let fx = Fx::new();
     let src = fx.app(10);
