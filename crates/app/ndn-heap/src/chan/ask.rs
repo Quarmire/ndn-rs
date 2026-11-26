@@ -31,7 +31,7 @@ use ndn_security::confidentiality::Sealed;
 use super::channels::LIFETIME_DEFAULT;
 use super::error::ChanError;
 use super::key::ChannelKey;
-use super::sessions::RecvSession;
+use super::sessions::{Asking, NotInstalled, RecvSession};
 use super::standing::{Who, gate, standing};
 use super::wire::{Answer, ChanAsk, ChannelMode, SessionRecord, carrier};
 use crate::error::HeapError;
@@ -191,6 +191,9 @@ impl NodeInner {
             })?;
             log.sealed().then(|| log.fold.in_force()).flatten()
         };
+        // The ask is in flight from here: the channel being let go after this point makes its
+        // answer stale (see `Asking`).
+        let asking = self.chan.sessions.asking(space, mode);
         // A session held is renewed; with none (a first ask, or the last `Items` let it go) the
         // sender must treat this device as new whatever it remembers of it: its `HELLO`, its
         // names, its replay.
@@ -246,12 +249,15 @@ impl NodeInner {
                 }
                 other => bad_answer(sender, other.to_string()),
             })?;
-        self.chan_take_answer(space, sender, mode, &name, data, generation)
+        self.chan_take_answer(space, sender, mode, &name, data, generation, &asking)
             .await
     }
 
     /// Judge the answer `data` to the ask named `name`, and install what it gives (the module docs
-    /// list the steps). `generation` is what [`Judge::generation`] read before the ask went out.
+    /// list the steps). `generation` is what [`Judge::generation`] read before the ask went out;
+    /// `asking` is the ask's ticket ([`Asking`]): an answer to an ask that began before the
+    /// channel was let go installs no session ([`ChanError::Superseded`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn chan_take_answer(
         &self,
         space: &Name,
@@ -260,6 +266,7 @@ impl NodeInner {
         name: &Name,
         data: Data,
         generation: u64,
+        asking: &Asking<'_>,
     ) -> Result<Arc<RecvSession>, ChanError> {
         // 1. The name.
         if *data.name != *name {
@@ -396,16 +403,26 @@ impl NodeInner {
                     // held; from here they are taken in first, in the order they arrived, and a frame
                     // that arrives meanwhile queues behind them.
                     let replay = self.chan.rx.begin_replay(record.id);
-                    if let Err(held) = self.chan.sessions.insert(Arc::clone(&session)) {
-                        return Err(bad_answer(
-                            sender,
-                            format!(
-                                "its session names the channel id {:016x}, which this device \
-                                 holds for {}'s {:?} channel over {}: an id belongs to one \
-                                 channel, so nothing was installed",
-                                record.id, held.sender, held.mode, held.space
-                            ),
-                        ));
+                    match self
+                        .chan
+                        .sessions
+                        .insert_asked(Arc::clone(&session), asking)
+                    {
+                        Ok(()) => {}
+                        Err(NotInstalled::Stale) => {
+                            return Err(self.chan_route_abandon(record.id, sender, asking));
+                        }
+                        Err(NotInstalled::IdHeld(held)) => {
+                            return Err(bad_answer(
+                                sender,
+                                format!(
+                                    "its session names the channel id {:016x}, which this device \
+                                     holds for {}'s {:?} channel over {}: an id belongs to one \
+                                     channel, so nothing was installed",
+                                    record.id, held.sender, held.mode, held.space
+                                ),
+                            ));
+                        }
                     }
                     (session, Some(replay))
                 }

@@ -266,6 +266,11 @@ async fn judge(
             name,
             data,
             node.inner.judge.generation(),
+            &node
+                .inner
+                .chan
+                .sessions
+                .asking(&space(), ChannelMode::Latest),
         )
         .await
 }

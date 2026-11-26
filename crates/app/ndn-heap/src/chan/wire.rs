@@ -148,6 +148,13 @@ pub enum ChannelMode {
 }
 
 impl ChannelMode {
+    /// Every mode.
+    pub(crate) const ALL: [ChannelMode; 3] = [
+        ChannelMode::Latest,
+        ChannelMode::Reliable,
+        ChannelMode::Window,
+    ];
+
     /// The mode's code on the wire.
     pub(crate) fn code(self) -> u64 {
         match self {

@@ -47,9 +47,11 @@ use tokio::sync::Notify;
 
 use super::bar::IngressBar;
 use super::carrier::{Carrier, CarrierFuture, CarrierRefused};
+use super::error::ChanError;
 use super::items::Sink;
-use super::sessions::{EndReason, RecvSession};
+use super::sessions::{Asking, EndReason, RecvSession};
 use super::verbs::LiveEnd;
+use super::wire::ChannelMode;
 use crate::error::HeapError;
 use crate::host::NodeHandle;
 use crate::node::NodeInner;
@@ -398,6 +400,12 @@ impl NodeInner {
         if self.chan.route.conn().is_none() {
             return;
         }
+        // The channel is let go for every ask that began before: its answer installs nothing.
+        for mode in ChannelMode::ALL {
+            if sink.takes(&sink.space, mode) && !self.chan.rx.wanted(&sink.space, mode) {
+                self.chan.sessions.released(&sink.space, mode);
+            }
+        }
         for session in self.chan.sessions.all() {
             let (space, mode) = (session.space(), session.mode());
             if sink.takes(space, mode) && !self.chan.rx.wanted(space, mode) {
@@ -407,11 +415,39 @@ impl NodeInner {
         self.chan_route_tick(Instant::now());
     }
 
-    /// An ask the receiver made for its `Items` was answered after the last of them was dropped
-    /// (an announce-driven ask in flight): the session it installed is let go as
-    /// [`Self::chan_route_release`] lets one go. Left held, it would be a session nobody takes,
-    /// with its route and `Keep` entry standing, and the next ask of that sender would be made
-    /// as a renewal (no `ASK_NEW`), so the sender would send no `HELLO`.
+    /// The answer to an ask that began before the channel was let go is discarded
+    /// ([`ChanError::Superseded`]); the route it laid at the forwarders on its way here is given
+    /// up with an `Unsub`, unless another ask of the channel is on its way (its answer lays the
+    /// route again and an `Unsub` now could take that one) or a session holds the channel. The
+    /// `Unsub` is best effort: a route left standing lapses at its TTL, and nothing the receiver
+    /// does next depends on it.
+    pub(crate) fn chan_route_abandon(
+        &self,
+        id: u64,
+        sender: &Name,
+        asking: &Asking<'_>,
+    ) -> ChanError {
+        let routes = &self.chan.route;
+        if let Some(conn) = routes.conn()
+            && asking.alone()
+            && self.chan.sessions.get(id).is_none()
+            && conn
+                .try_send_side(up_frame(id, UpOp::Unsub), SideClass::Datagram)
+                .is_ok()
+        {
+            routes.unsubs.bump();
+        }
+        ChanError::Superseded {
+            sender: sender.clone(),
+        }
+    }
+
+    /// An announce-driven ask (one that began after the last `Items` was dropped, since one that
+    /// began before is stale, [`Asking`](super::sessions::Asking)) installed a session that no
+    /// `Items` takes: it is let go as [`Self::chan_route_release`] lets one go. Left held, it
+    /// would be a session nobody takes, with its route and `Keep` entry standing, and the next
+    /// ask of that sender would be made as a renewal (no `ASK_NEW`), so the sender would send no
+    /// `HELLO`.
     pub(crate) fn chan_release_unwanted(&self, session: &RecvSession) {
         if self.chan.route.conn().is_none() || self.chan.rx.wanted(session.space(), session.mode())
         {

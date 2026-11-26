@@ -69,6 +69,17 @@ pub enum ChanError {
         /// The device asked.
         sender: Name,
     },
+    /// The channel was let go while this ask was on its way.
+    #[error(
+        "the channel of {sender} was let go (the last `Items` taking it was dropped) while this \
+         ask was on its way, so its answer was not taken, and the route it laid was given up: \
+         ask again if a stream still wants the channel (the next ask is a new one: HELLO, \
+         names and standing values follow)"
+    )]
+    Superseded {
+        /// The device asked.
+        sender: Name,
+    },
     /// The sender declined for a reason of its own, in a signed answer.
     #[error("{sender} refused the ask ({code:?}): {text}")]
     Refused {
@@ -119,6 +130,7 @@ impl ChanError {
             | ChanError::NotAnswered { .. }
             | ChanError::Unreachable { .. }
             | ChanError::Busy { .. }
+            | ChanError::Superseded { .. }
             | ChanError::BadAnswer { .. } => NextStep::RetryLater,
             ChanError::NotAllowed { .. } => NextStep::AskOwner,
             ChanError::Refused { code, .. } => match code {

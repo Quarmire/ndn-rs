@@ -523,10 +523,72 @@ pub(crate) struct IdHeld {
     pub(crate) mode: ChannelMode,
 }
 
+/// Why an ask's session was not installed ([`RecvSessions::insert_asked`]).
+pub(crate) enum NotInstalled {
+    /// The channel was let go after the ask began.
+    Stale,
+    /// The id belongs to another channel.
+    IdHeld(IdHeld),
+}
+
+/// What the asks of one `(space, mode)` in flight share.
+#[derive(Default)]
+struct Lane {
+    /// The value of [`Store::releases`] at the last release of the channel while an ask was in
+    /// flight.
+    released: u64,
+    /// Asks in flight.
+    asking: u32,
+}
+
+/// An ask of `(space, mode)` in flight ([`RecvSessions::asking`]); its drop ends it.
+///
+/// **The invariant.** A session is installed from an answer only if the channel was not let go
+/// (the last `Items` taking `(space, mode)` dropped: [`RecvSessions::released`]) since the ask
+/// began. The ask's `new` flag, its Interest and so the route its answer lays at every forwarder
+/// all come after `began`; a release after it gives up the route by an `Unsub` that the answer's
+/// route may or may not have beaten, so the answer says nothing of what the receiver holds and
+/// is discarded ([`ChanError::Superseded`](super::error::ChanError::Superseded)), whatever the
+/// timing of the links. Which asks are stale is decided by one counter under the store's lock,
+/// not by clocks.
+pub(crate) struct Asking<'a> {
+    sessions: &'a RecvSessions,
+    key: (Name, ChannelMode),
+    began: u64,
+}
+
+impl Asking<'_> {
+    /// Whether no other ask of this `(space, mode)` is in flight.
+    pub(crate) fn alone(&self) -> bool {
+        self.sessions
+            .store
+            .lock()
+            .lanes
+            .get(&self.key)
+            .is_none_or(|lane| lane.asking <= 1)
+    }
+}
+
+impl Drop for Asking<'_> {
+    fn drop(&mut self) {
+        let mut store = self.sessions.store.lock();
+        if let Some(lane) = store.lanes.get_mut(&self.key) {
+            lane.asking -= 1;
+            if lane.asking == 0 {
+                store.lanes.remove(&self.key);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Store {
     by_id: FastMap<u64, Arc<RecvSession>>,
     asked_for_epoch: FastMap<Name, Instant>,
+    /// Releases so far (a counter, not a clock).
+    releases: u64,
+    /// The `(space, mode)` that have an ask in flight.
+    lanes: FastMap<(Name, ChannelMode), Lane>,
 }
 
 /// The sessions this device holds as a receiver.
@@ -591,8 +653,59 @@ impl RecvSessions {
     /// frame header, so a session that names an id another channel holds is refused with
     /// [`IdHeld`] and nothing changes: otherwise a second writer could take the frames of the
     /// first.
+    #[cfg(test)]
     pub(crate) fn insert(&self, session: Arc<RecvSession>) -> Result<(), IdHeld> {
         let mut store = self.store.lock();
+        self.insert_in(&mut store, session)
+    }
+
+    /// [`Self::insert`] of the session an ask installs, refused as [`NotInstalled::Stale`] when
+    /// the channel was let go ([`Self::released`]) after the ask began. The check and the
+    /// insertion are one step under the store's lock, so a release either comes first (the
+    /// session is refused) or after (the release finds the session and lets it go).
+    pub(crate) fn insert_asked(
+        &self,
+        session: Arc<RecvSession>,
+        asking: &Asking<'_>,
+    ) -> Result<(), NotInstalled> {
+        let mut store = self.store.lock();
+        let stale = store
+            .lanes
+            .get(&asking.key)
+            .is_some_and(|lane| lane.released > asking.began);
+        if stale {
+            return Err(NotInstalled::Stale);
+        }
+        self.insert_in(&mut store, session)
+            .map_err(NotInstalled::IdHeld)
+    }
+
+    /// The last `Items` taking `(space, mode)` was dropped: every ask of it that began before is
+    /// stale ([`Asking`]).
+    pub(crate) fn released(&self, space: &Name, mode: ChannelMode) {
+        let mut store = self.store.lock();
+        store.releases += 1;
+        let at = store.releases;
+        if let Some(lane) = store.lanes.get_mut(&(space.clone(), mode)) {
+            lane.released = at;
+        }
+    }
+
+    /// An ask of `(space, mode)` is about to go out: read before the ask's `new` flag is decided
+    /// and before its Interest leaves, and held until its answer was taken or refused.
+    pub(crate) fn asking(&self, space: &Name, mode: ChannelMode) -> Asking<'_> {
+        let mut store = self.store.lock();
+        let began = store.releases;
+        let key = (space.clone(), mode);
+        store.lanes.entry(key.clone()).or_default().asking += 1;
+        Asking {
+            sessions: self,
+            key,
+            began,
+        }
+    }
+
+    fn insert_in(&self, store: &mut Store, session: Arc<RecvSession>) -> Result<(), IdHeld> {
         if let Some(holder) = store.by_id.get(&session.id)
             && (holder.space != session.space
                 || holder.sender != session.sender

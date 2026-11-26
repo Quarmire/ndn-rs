@@ -2126,6 +2126,11 @@ async fn stream_frames_that_overtake_the_session_are_not_lost_to_a_window_joiner
             &name,
             data,
             generation,
+            &carol
+                .inner
+                .chan
+                .sessions
+                .asking(&space(), ChannelMode::Window),
         )
         .await
         .expect("the session is installed");

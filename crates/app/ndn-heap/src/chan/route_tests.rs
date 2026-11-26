@@ -797,3 +797,104 @@ async fn an_items_made_after_the_last_one_let_go_is_not_told_that_the_session_en
     let got = next(&mut again).await.expect("an item");
     assert_eq!(&got.bytes[..], b"y");
 }
+
+/// An ask of a sender, signed and answered by it, whose answer is not handed to the asker yet: what
+/// an ask that is still on its way holds. Returns the ask's name, the answer, the judges'
+/// generation read before the ask went out and the ask's ticket.
+async fn ask_in_flight<'a>(
+    asker: &'a Node,
+    sender: &Node,
+) -> (Name, ndn_packet::Data, u64, super::sessions::Asking<'a>) {
+    use super::answer::ChanAnswer;
+    use super::wire::{ChanAsk, ChannelMode, carrier};
+    let asking = asker
+        .inner
+        .chan
+        .sessions
+        .asking(&space(), ChannelMode::Latest);
+    let ask = ChanAsk {
+        space: space(),
+        prefix: Name::root(),
+        mode: ChannelMode::Latest,
+        recipient: asker.recipient().public(),
+        carriers: vec![carrier::DATAGRAM, carrier::STREAM],
+        lifetime: 3600,
+        epoch: None,
+        since: None,
+        new: false,
+        chain: asker.inner.signer_chain(),
+    };
+    let wire = asker
+        .inner
+        .sign_ask(sender.name(), &ask.encode().unwrap())
+        .unwrap();
+    let interest = ndn_packet::Interest::decode(wire).unwrap();
+    let generation = asker.inner.judge.generation();
+    let ChanAnswer::Session { wire, .. } = sender.inner.chan_answer(&interest).await else {
+        panic!("a member's ask is answered");
+    };
+    (
+        (*interest.name).clone(),
+        ndn_packet::Data::decode(wire).unwrap(),
+        generation,
+        asking,
+    )
+}
+
+/// Case B of a receiver that lets the channel go while an ask of it is on its way (the ask an
+/// announce started, answered after the test's own): the last `Items` is dropped, a new one is
+/// made, and the old ask's answer comes. That answer is for `Items` that are gone and its route
+/// is no longer the one the new `Items` will ask for: it installs no session, so the next ask is
+/// made as a new one (`ASK_NEW`), the sender sends its `HELLO` again and the new `Items` sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_to_an_ask_made_before_the_channel_was_let_go_installs_no_session() {
+    use super::wire::ChannelMode;
+    let rig = rig(true).await;
+    let (carol, bob) = (rig.carol(), rig.bob());
+    let items = live(carol);
+    let info = carol.ask_channel(&space(), bob.name()).await.unwrap();
+    eventually("HELLO", || items.hello_seen()).await;
+
+    // An ask goes out, and is answered, while the session is held.
+    let (name, data, generation, asking) = ask_in_flight(carol, bob).await;
+
+    // The last `Items` is dropped (the session and its route go), a new one is made.
+    drop(items);
+    eventually("the route is gone", || rig.sinks(info.channel) == 0).await;
+    let mut again = live(carol);
+    let unsubs = carol.inner.chan.route.unsubs.get();
+
+    // The answer of the ask that began before comes now.
+    let late = carol
+        .inner
+        .chan_take_answer(
+            &space(),
+            bob.name(),
+            ChannelMode::Latest,
+            &name,
+            data,
+            generation,
+            &asking,
+        )
+        .await;
+    assert!(
+        matches!(late, Err(super::error::ChanError::Superseded { .. })),
+        "an answer to an ask made before the channel was let go: {late:?}"
+    );
+    assert_eq!(
+        carol.inner.chan.route.unsubs.get(),
+        unsubs + 1,
+        "no other ask is on its way: the route the answer laid is given up"
+    );
+    assert!(
+        carol.inner.chan.sessions.get(info.channel).is_none(),
+        "the stale answer left a session nobody asked for"
+    );
+
+    // The next ask is a new one: HELLO and a frame reach the new `Items`.
+    carol.ask_channel(&space(), bob.name()).await.unwrap();
+    eventually("HELLO again", || again.hello_seen()).await;
+    emit(bob, "/late", b"z").await;
+    let got = next(&mut again).await.expect("an item");
+    assert_eq!(&got.bytes[..], b"z");
+}

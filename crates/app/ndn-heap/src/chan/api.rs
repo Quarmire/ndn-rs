@@ -28,7 +28,9 @@ impl NodeHandle {
     /// or its record not held: retry), [`ChanError::NotAllowed`] (this device is no member: ask the
     /// owner), [`ChanError::NotAnswered`], [`ChanError::Unreachable`], [`ChanError::Busy`] (retry),
     /// [`ChanError::Refused`] (the sender's own words), [`ChanError::SenderNotWriter`] (ask a
-    /// writer's device), [`ChanError::BadAnswer`] (retry), [`ChanError::Local`] (fix this device).
+    /// writer's device), [`ChanError::BadAnswer`] (retry), [`ChanError::Superseded`] (the last
+    /// `Items` of the channel was dropped while the ask was on its way: ask again if a stream
+    /// still wants it), [`ChanError::Local`] (fix this device).
     pub async fn ask_channel(&self, space: &Name, device: &Name) -> Result<ChannelInfo, ChanError> {
         self.ask_channel_in(space, device, ChannelMode::Latest)
             .await
