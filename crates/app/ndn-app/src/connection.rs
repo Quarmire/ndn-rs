@@ -586,7 +586,7 @@ mod tests {
         let mut routes = conn.routes().expect("an engine's connection tells routes");
         let group = ndn_packet::name!("/alice/32=sync");
 
-        // Its own registration: the FIB, no RIB route.
+        // Its own registration (a RIB route, on its own face).
         conn.register_prefix(&group).await.unwrap();
         assert_eq!(routes.next_ready(), None, "its own registration");
 
@@ -614,6 +614,59 @@ mod tests {
         engine.rib().add(&group, route(FaceId(9999)));
         engine.rib().apply_to_fib(&group, &engine.fib());
         assert_eq!(routes.next_ready(), None, "a face that is gone");
+        cancel.cancel();
+    }
+
+    /// An application's registration of a prefix under a namespace a link routes keeps the
+    /// link's route, whichever came first: what the application sends for the prefix (a sync
+    /// group under the namespace a relay is used for) leaves over the link, as it does when the
+    /// application registers through a daemon's management interface. A registration that left
+    /// only the application's face in the FIB entry shadowed the namespace's route (the longest
+    /// prefix is the whole match).
+    #[tokio::test]
+    async fn a_registration_under_a_routed_namespace_keeps_the_link_route() {
+        use crate::EngineAppExt;
+        let (engine, _shutdown) = ndn_engine::EngineBuilder::new(Default::default())
+            .build()
+            .await
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let namespace = ndn_packet::name!("/alice");
+        let link = engine.faces().alloc_id();
+        engine.add_face(Link(link), cancel.child_token());
+        let toward = |prefix: &Name| -> Vec<FaceId> {
+            let entry = engine.fib().lpm(prefix).expect("a route");
+            entry.nexthops.iter().map(|n| n.face_id).collect()
+        };
+
+        // The link's route first, the registration after it.
+        engine.rib().add(&namespace, route(link));
+        engine.rib().apply_to_fib(&namespace, &engine.fib());
+        let conn = engine.app_face(cancel.child_token());
+        let group = ndn_packet::name!("/alice/32=sync");
+        conn.register_prefix(&group).await.unwrap();
+        let sent = ndn_packet::name!("/alice/32=sync/doc/v=1");
+        let faces = toward(&sent);
+        assert_eq!(
+            faces.len(),
+            2,
+            "the application's face and the link: {faces:?}"
+        );
+        assert!(faces.contains(&link), "the link is routed: {faces:?}");
+
+        // The registration first, the link's route after it.
+        let other = ndn_packet::name!("/bob");
+        let group = ndn_packet::name!("/bob/32=sync");
+        conn.register_prefix(&group).await.unwrap();
+        engine.rib().add(&other, route(link));
+        engine.rib().apply_to_fib(&other, &engine.fib());
+        let faces = toward(&ndn_packet::name!("/bob/32=sync/doc/v=1"));
+        assert_eq!(
+            faces.len(),
+            2,
+            "the application's face and the link: {faces:?}"
+        );
+        assert!(faces.contains(&link), "the link is routed: {faces:?}");
         cancel.cancel();
     }
 

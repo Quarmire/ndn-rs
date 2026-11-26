@@ -28,6 +28,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use ndn_engine::ForwarderEngine;
+use ndn_engine::rib::RibRoute;
 // Same `InProcFace` type on both targets; the wasm path imports it straight
 // from `ndn-face-local` to avoid `ndn-face`'s OS-socket transports.
 #[cfg(not(target_arch = "wasm32"))]
@@ -150,10 +151,28 @@ impl Connection for EngineConnection {
         self.inner.recv_with_meta().await
     }
 
+    /// Through the RIB, as a daemon's `rib/register` does for an application on a unix face
+    /// (origin APP, `CHILD_INHERIT`, cost 0): the entry this makes in the FIB also carries the
+    /// routes of the prefixes above it that `CHILD_INHERIT`, so a registration under a
+    /// namespace a link routes (a sync group under the namespace a relay is used for) does not
+    /// shadow that route. The FIB written directly held the application's face alone and the
+    /// longest-prefix match stopped there: what the application sent for the group never left
+    /// the forwarder. The route is no route that came up on another face
+    /// ([`Connection::routes`] leaves this face out).
     async fn register_prefix(&self, prefix: &Name) -> Result<(), AppError> {
-        // The FIB directly, not the RIB: this face's own registration is
-        // no route that came up on another face ([`Connection::routes`]).
-        self.engine.fib().add_nexthop(prefix, self.face_id, 0);
+        const ORIGIN_APP: u64 = 0;
+        const CHILD_INHERIT: u64 = 1;
+        self.engine.rib().add(
+            prefix,
+            RibRoute {
+                face_id: self.face_id,
+                origin: ORIGIN_APP,
+                cost: 0,
+                flags: CHILD_INHERIT,
+                expires_at: None,
+            },
+        );
+        self.engine.rib().apply_to_fib(prefix, &self.engine.fib());
         Ok(())
     }
 
