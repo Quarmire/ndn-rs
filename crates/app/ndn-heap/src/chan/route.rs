@@ -307,10 +307,7 @@ impl Carrier for ConnectionCarrier {
 
     fn datagram_max_for(&self, channel: u64) -> usize {
         let sinks = self.conn.side_sink_limit(channel).unwrap_or(self.unknown);
-        self.conn
-            .side_frame_max()
-            .min(sinks)
-            .min(self.ceiling)
+        self.conn.side_frame_max().min(sinks).min(self.ceiling)
     }
 
     /// Whether the node's own face on its forwarder carries the stream class (read once: it is
