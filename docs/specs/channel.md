@@ -38,7 +38,7 @@ The key words "MUST", "MUST NOT", "SHOULD" and "MAY" are as in BCP 14, in capita
 
 The ask is an Interest named `<sender>/32=chan/<digest>`, `MustBeFresh`, InterestLifetime 4 s, ApplicationParameters = one `CHAN_ASK` (§7), at most 8 KiB. It is signed: an `InterestSignatureInfo` with the receiver's device key name as KeyLocator, a `SignatureNonce` and a `SignatureTime`. A node signs no Interest but this one (and only for a `CHAN_ASK`, and for a device that lies under neither `/localhost` nor `/localhop`): a signed Interest of a device's key is a command wherever that key is trusted.
 
-The ask names the space, the path prefix the receiver wants (empty: everything), the mode (`Latest`, `Reliable`, `Window`), the receiver's X25519 recipient key (the key `K` is wrapped to), the carriers it can use, the lifetime it wants in seconds, in a sealed space the epoch it holds in force, and up to four certificates (`ASKER_CERT`: 4,096 octets each, 6,144 in all) of its signer's chain, so the sender judges the signature from what is held and carried and **fetches nothing**.
+The ask names the space, the path prefix the receiver wants (empty: everything), the mode (`Latest`, `Reliable`, `Window`), the receiver's X25519 recipient key (the key `K` is wrapped to), the carriers it can use, the lifetime it wants in seconds, in a sealed space the epoch it holds in force, whether it holds **no session** of the channel (`ASK_NEW`), and up to four certificates (`ASKER_CERT`: 4,096 octets each, 6,144 in all) of its signer's chain, so the sender judges the signature from what is held and carried and **fetches nothing**. A receiver sets `ASK_NEW` when it holds no live session of that (sender, space, mode): a first ask, or one after it let the session go. The sender is not told when a receiver lets go, so a device it remembers is **new again** when the ask says so: it is given what a new receiver is given (§13.7) whatever the sender's table says.
 
 ### 3.2 The session
 
@@ -155,7 +155,7 @@ The setup's TLV-TYPEs are the block **0x0660–0x06BF**, registered to this file
 
 | Type | Name | Value |
 |---|---|---|
-| 0x0661 | `CHAN_ASK` | `ASK_SPACE`, `ASK_PREFIX`, `ASK_MODE`, `ASK_RECIPIENT`, `ASK_CARRIERS`, `ASK_LIFETIME`, `ASK_EPOCH`?, `ASK_SINCE`?, `ASKER_CERT`* (0x063D) |
+| 0x0661 | `CHAN_ASK` | `ASK_SPACE`, `ASK_PREFIX`, `ASK_MODE`, `ASK_RECIPIENT`, `ASK_CARRIERS`, `ASK_LIFETIME`, `ASK_EPOCH`?, `ASK_SINCE`?, `ASK_NEW`?, `ASKER_CERT`* (0x063D) |
 | 0x0663 | `ASK_SPACE` | Name |
 | 0x0665 | `ASK_PREFIX` | Name: the path prefix the receiver wants (a filter and a hint for the table; the channel carries the whole space's emissions of the sender) |
 | 0x0667 | `ASK_MODE` | 1 `Latest`, 2 `Reliable`, 3 `Window` |
@@ -164,6 +164,7 @@ The setup's TLV-TYPEs are the block **0x0660–0x06BF**, registered to this file
 | 0x066D | `ASK_LIFETIME` | seconds the asker wants (clamped by the sender to 60 to 86,400; 0: none named, an hour) |
 | 0x066F | `ASK_EPOCH` | an EpochId (`Name(creator)`, `SEQ` 0x060B): the epoch the asker holds in force (sealed spaces) |
 | 0x0671 | `ASK_SINCE` | `Window` only: the first sequence the asker still needs replayed |
+| 0x0672 | `ASK_NEW` | empty (even, skippable by an older sender): the asker holds no session of the channel, so the sender treats the device as a new receiver (`HELLO`, binds, standing values, replay) even if its table lists the device; a value or a second `ASK_NEW` is malformed |
 | 0x0673 | `CHAN_SESSION` | the Data's Content: the fields below |
 | 0x0675 | `S_ID` | 8 octets: the channel id (random, CSPRNG) |
 | 0x0677 | `S_SENDER` | Name: the sender's device |
@@ -630,7 +631,7 @@ With `opts.stand` the sender holds the **last emission of the path** for the sta
 
 ### 13.7 What a new receiver is given
 
-When the sender admits an ask (§3.3 step 11) the session carries the sender's **table** (§13.3), its **window** (`Window` channels), `S_FRAME_MAX` (9,000: the most a datagram frame carries; the sender sends `min(path size now, 9,000)`) and the next sequence. If the carrier has a stream and the asker's **device was not a receiver before** (a renewal is not new), these frames follow on the stream, in this order, taking sequences in this order:
+When the sender admits an ask (§3.3 step 11) the session carries the sender's **table** (§13.3), its **window** (`Window` channels), `S_FRAME_MAX` (9,000: the most a datagram frame carries; the sender sends `min(path size now, 9,000)`) and the next sequence. If the carrier has a stream and the asker's **device was not a receiver before**, or its ask says `ASK_NEW` (a renewal is not new), these frames follow on the stream, in this order, taking sequences in this order:
 
 1. `HELLO` (the sequence the next message takes);
 2. a `BIND` for each live bind the session's table did not take;
@@ -879,7 +880,7 @@ Not built: IPC connections carry no channel frames (§14.10), and no node uses t
 **The receiver.**
 
 - One task of the node reads `recv_side` and gives each frame to `deliver_frame` with the forwarder's face id as the `ingress` (§12). A `Keep` that arrives at a sender is not delivered to the receiver path: it releases the sender's gate. The engine's reader never calls `deliver_frame`, so a blocked `Reliable` queue (§12.6) stalls this task and not the forwarder (§13.12 item 15).
-- **Keep and Unsub.** When a session is installed the node sends one `Keep` for it at once (the gate above waits for it); the maintenance pass sends one every 10 s for each session it holds. When a session ends, is replaced or is removed, and when the last `Items` that takes it is dropped, the node sends one `Unsub` and no `Keep` follows; the last case ends the session as `Left`, and a later `live` over the same sender needs a new ask, which makes a new route. An `UP` the connection had no room for is tried again at the next pass. `UP` frames go as datagrams.
+- **Keep and Unsub.** When a session is installed the node sends one `Keep` for it at once (the gate above waits for it); the maintenance pass sends one every 10 s for each session it holds. When a session ends, is replaced or is removed, and when the last `Items` that takes it is dropped, the node sends one `Unsub` and no `Keep` follows. The last case ends the session as `Left` and **drops the channel's receiving state at once**: nobody is told (an `Items` made later has not seen the session it would be told of, so it gets no `LiveEnded(Left)`), and a later `live` over the same sender needs a new ask, which says `ASK_NEW` (§3.1) and makes a new route. An `UP` the connection had no room for is tried again at the next pass. `UP` frames go as datagrams.
 - **`NoPath`.** A session with no `HELLO` 2 s after it was installed (`NO_PATH_AFTER`), that an `Items` wants, tells that `Items` `LiveEnded(NoPath { why })`, once. The text says that no frame of the sender's channel reached this device in 2 s and that a forwarder between the two does not carry channel frames: update it. It does not say which hop. `LiveEnd::next()` is `FixLocal` for it (and `RetryLater` for an `Ended`). The causes are a forwarder that predates the label (§14.3), an install a hop refused (that hop's `side/list` counts and its log says why), a hop with no stream (§14.9) and a sender that sends nothing.
 - **The bar.** `ConnectionBar` over `Connection::side_quarantine` is attached by `attach_forwarder`; a node with another `IngressBar` (`attach_bar`) bars through that. Without one a node still alerts and bars nothing.
 
