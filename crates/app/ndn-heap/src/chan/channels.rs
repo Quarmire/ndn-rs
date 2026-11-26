@@ -37,6 +37,12 @@ pub(crate) const CHANNELS_PER_SENDER: usize = 64;
 /// The most receivers one channel keeps.
 pub(crate) const RECEIVERS_PER_CHANNEL: usize = 256;
 
+/// The most receivers of one channel one person's devices may hold. A person chooses how many
+/// devices ask with her keys, so the channel's places are bounded per person: no member can fill
+/// them for the others (the channel keeps 256, so at least eight people can always be receivers).
+/// A person has few devices; 32 is the bound the owner device keeps of one person's grantees too.
+pub(crate) const RECEIVERS_PER_PERSON: usize = 32;
+
 /// The lifetime of a session when the ask names none that is usable (seconds): one hour.
 pub(crate) const LIFETIME_DEFAULT: u64 = 3600;
 
@@ -82,6 +88,8 @@ pub(crate) fn lifetime_for(wanted: u64) -> u64 {
 struct Receiver {
     /// The key that signed its last ask: what is judged again when the record changes.
     key: Name,
+    /// The person its key belongs to.
+    person: Name,
     /// The key epoch of the key it was last given.
     delivered: u32,
     /// When it was last given a key, and for how long.
@@ -167,12 +175,17 @@ pub(crate) struct Admitted {
 
 /// Which cap a refused ask hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    /// [`RECEIVERS_PER_PERSON`]: the asker's person already has that many devices as receivers.
+    Person,
 pub(crate) enum Cap {
     /// [`CHANNELS_PER_SENDER`].
     Channels,
     /// [`RECEIVERS_PER_CHANNEL`].
     Receivers,
 }
+    /// The person the asker's key belongs to, as the caller's judgement named her: receivers are
+    /// counted per person ([`RECEIVERS_PER_PERSON`]).
+    pub(crate) person: &'a Name,
 
 /// What the table needs to know of an asker the caller judged.
 pub(crate) struct Asker<'a> {
@@ -440,8 +453,21 @@ impl Channels {
         }
         let lifetime = Duration::from_secs(lifetime_for(asker.wanted));
         let known = channel.receivers.get(asker.device).cloned();
-        if known.is_none() && channel.receivers.len() >= RECEIVERS_PER_CHANNEL {
-            return Err(Cap::Receivers);
+        if known.is_none() {
+            // A place is taken only by a device the channel does not have. One person's
+            // devices are bounded first (she can do something about that), then the channel.
+            let hers = channel
+                .receivers
+                .values()
+                .filter(|r| r.person == *asker.person)
+                .count();
+            if hers >= RECEIVERS_PER_PERSON {
+                return Err(Cap::Person);
+            }
+            if channel.receivers.len() >= RECEIVERS_PER_CHANNEL {
+                return Err(Cap::Receivers);
+            }
+            person: asker.person.clone(),
         }
         // A receiver that holds the current key and asks after half its lifetime renews: the
         // channel is re-keyed, unless it was re-keyed less than [`REKEY_MIN`] ago. Then the

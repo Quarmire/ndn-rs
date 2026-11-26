@@ -1232,6 +1232,7 @@ async fn a_sender_over_its_receiver_cap_gives_a_signed_refusal_that_says_to_retr
         let (device, key) = (n(&format!("/p{i}/dev")), n(&format!("/p{i}/dev/KEY/1")));
         let asker = Asker {
             device: &device,
+            person: &n(&format!("/p{i}")),
             key: &key,
             wanted: 0,
             new: false,

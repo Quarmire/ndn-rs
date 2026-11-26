@@ -16,9 +16,15 @@ fn space() -> Name {
     n("/alice/32=data/notes")
 }
 
-fn ask<'a>(device: &'a Name, key: &'a Name, wanted: u64) -> Asker<'a> {
+/// The person of a test device: its first name component (`/bob/phone` is `/bob`'s).
+fn person_of(device: &Name) -> Name {
+    Name::from_components(device.components()[..1].iter().cloned())
+}
+
+fn ask<'a>(device: &'a Name, person: &'a Name, key: &'a Name, wanted: u64) -> Asker<'a> {
     Asker {
         device,
+        person,
         key,
         wanted,
         new: false,
@@ -36,7 +42,7 @@ fn admit(
     table.admit(
         &space(),
         ChannelMode::Latest,
-        &ask(device, key, wanted),
+        &ask(device, &person_of(device), key, wanted),
         None,
         (1, 1),
         now,
@@ -144,7 +150,7 @@ fn a_sealed_space_with_no_epoch_in_force_moves_no_audience_and_drops_only_who_no
             .admit(
                 &space(),
                 ChannelMode::Latest,
-                &ask(device, key, 3600),
+                &ask(device, &person_of(device), key, 3600),
                 Some(old.clone()),
                 (1, 1),
                 t0,
@@ -370,7 +376,7 @@ fn a_sender_keeps_64_channels_and_a_channel_256_receivers() {
             .admit(
                 &s,
                 ChannelMode::Latest,
-                &ask(&bob, &bob_key, 0),
+                &ask(&bob, &person_of(&bob), &bob_key, 0),
                 None,
                 (1, 1),
                 t0,
@@ -383,7 +389,7 @@ fn a_sender_keeps_64_channels_and_a_channel_256_receivers() {
             .admit(
                 &over,
                 ChannelMode::Latest,
-                &ask(&bob, &bob_key, 0),
+                &ask(&bob, &person_of(&bob), &bob_key, 0),
                 None,
                 (1, 1),
                 t0
@@ -396,8 +402,51 @@ fn a_sender_keeps_64_channels_and_a_channel_256_receivers() {
         table
             .admit(
                 &n("/alice/32=data/s0"),
+/// One person's devices are bounded in a channel's places: a member with many device keys cannot
+/// fill the channel for the other members. Her extra device is refused by `Cap::Person` (a place
+/// is not taken), the devices she has still renew, and every other person still finds a place up
+/// to the channel's own cap.
+#[test]
+fn one_person_cannot_fill_a_channels_receiver_places() {
+    let table = Channels::default();
+    let t0 = Instant::now();
+    for i in 0..RECEIVERS_PER_PERSON {
+        let (d, k) = (n(&format!("/mallory/d{i}")), n(&format!("/mallory/d{i}/KEY/1")));
+        admit(&table, &d, &k, 0, t0).unwrap();
+    }
+    let (extra, extra_key) = (n("/mallory/extra"), n("/mallory/extra/KEY/1"));
+    assert_eq!(
+        admit(&table, &extra, &extra_key, 0, t0).err(),
+        Some(Cap::Person),
+        "a person's {}th device took a place of the channel",
+        RECEIVERS_PER_PERSON + 1
+    );
+    assert_eq!(
+        table.receiver_count(&space(), ChannelMode::Latest),
+        RECEIVERS_PER_PERSON,
+        "a refused ask took a place"
+    );
+    let (d0, k0) = (n("/mallory/d0"), n("/mallory/d0/KEY/1"));
+    assert!(
+        admit(&table, &d0, &k0, 0, t0).is_ok(),
+        "a device she has is not over the cap by asking again"
+    );
+    for i in 0..RECEIVERS_PER_CHANNEL - RECEIVERS_PER_PERSON {
+        let (d, k) = (n(&format!("/p{i}/dev")), n(&format!("/p{i}/dev/KEY/1")));
+        assert!(
+            admit(&table, &d, &k, 0, t0).is_ok(),
+            "person {i} found no place: one person filled the channel"
+        );
+    }
+    let (late, late_key) = (n("/late/dev"), n("/late/dev/KEY/1"));
+    assert_eq!(
+        admit(&table, &late, &late_key, 0, t0).err(),
+        Some(Cap::Receivers)
+    );
+}
+
                 ChannelMode::Reliable,
-                &ask(&bob, &bob_key, 0),
+                &ask(&bob, &person_of(&bob), &bob_key, 0),
                 None,
                 (1, 1),
                 t0
@@ -509,7 +558,7 @@ fn a_session_names_the_next_sequence_and_the_audience_epoch_the_receiver_was_jud
         .admit(
             &space(),
             ChannelMode::Latest,
-            &ask(&bob, &bob_key, 0),
+            &ask(&bob, &person_of(&bob), &bob_key, 0),
             Some(epoch.clone()),
             (1, 1),
             now,
@@ -517,6 +566,7 @@ fn a_session_names_the_next_sequence_and_the_audience_epoch_the_receiver_was_jud
         .unwrap();
     table.note_seq(&space(), ChannelMode::Latest, 77);
     let (carol, carol_key) = (n("/carol/tablet"), n("/carol/tablet/KEY/1"));
+        person: &person_of(&bob),
     let given = admit(&table, &carol, &carol_key, 0, now).unwrap();
     assert_eq!(given.seq, 77);
     assert_eq!(given.audience, Some(epoch));
@@ -541,6 +591,7 @@ fn a_receiver_that_says_it_holds_no_session_claims_to_be_new_and_is_not_fresh() 
         key: &key,
         wanted: 3600,
         new: true,
+        person: &person_of(&carol.0),
         stream: true,
     };
     let again = table

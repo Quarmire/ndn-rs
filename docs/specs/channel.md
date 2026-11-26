@@ -66,7 +66,7 @@ The asker is now a verified member, and what follows is answered with a **signed
 7. **This device is a writer** of the space (`standing` for its own key, writers only). It always is, or it would have no channel; if it is not, a `NoRoute` Nack and its channels of that space end.
 8. **A sealed space's audience.** The sender's epoch in force must exist (else `NotReady`); if the ask names an epoch that is not the epoch in force, a sender that has never seen it answers `StaleEpoch` and one that has seen it and has moved on answers `NotReady`; the asker's person must be in the audience of the epoch in force (else a signed `NotAudience` refusal: an authenticated asker learns only what a plain read of a sealed path tells it).
 9. **The mode needs a stream.** A `Reliable` or `Window` ask whose carriers list no stream is a `NoStream` refusal. So is one whose first hop toward the asker has none: the sender's forwarder says whether the face the ask came in over carries the stream class (§14.9), and the refusal says that no ordered stream reaches the asker and to ask with `Latest`, or put the value instead. A `Latest` ask over such a hop is answered, with a session whose carriers are the datagram alone (§14.9).
-10. **The caps** ([§6](#6-limits-and-refusals)): channels per sender and receivers per channel; else a signed `TooMany`.
+10. **The caps** ([§6](#6-limits-and-refusals)): channels per sender, receivers per channel and receivers of one person per channel (a person's devices are counted together: her new device is refused, one she has still renews); else a signed `TooMany`.
 11. The channel of the asked mode is found or made; the asker is added to it (§3.5); the key is wrapped; the Data is signed.
 
 ### 3.4 Judging the sender
@@ -126,7 +126,7 @@ On a node's handle: `ask_channel(space, device)` and `ask_channel_in(space, devi
 |---|---|---|
 | Ask size / session size | 8 KiB / 8,000 octets | Nacked unread / the sender drops the certificates it carries |
 | Asks per asker key | 4 a second, burst 8, charged after the signature verified | a `Congestion` Nack |
-| Channels per sender / receivers per channel | 64 / 256 | a signed `TooMany` refusal, retry in 30 s |
+| Channels per sender / receivers per channel / receivers of one person per channel | 64 / 256 / 32 | a signed `TooMany` refusal, retry in 30 s; the per-person refusal says to ask from a device that already receives the channel, or when the session of another of her devices has lapsed (at most its lifetime). One person holds at most an eighth of a channel's places |
 | Session lifetime | 1 h default, at least 1 min, at most 24 h, renewed at 75 % | the ask's lifetime is clamped, not refused; a receiver refuses a session that names another |
 | Re-keys of one channel from a renewal or a lapsed lease | one per 5 min | the renewing receiver is given the key as it is; a lapse waits (the lapses of a stretch are one re-key) |
 | Asks whose signature is verified | 64 a second, burst 256, whoever they name | a `Congestion` Nack, before the signature |

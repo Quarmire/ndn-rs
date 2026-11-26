@@ -499,6 +499,7 @@ impl NodeInner {
             .channels
             .admit(&ask.space, ask.mode, &asker, audience, judged_at, now)
         {
+            person: &person,
             Ok(admitted) => {
                 if admitted.rekeyed {
                     self.chan.stats.rekeys.bump();
@@ -521,3 +522,10 @@ impl NodeInner {
         }
     }
 }
+            Err(Cap::Person) => refuse(
+                RefusalCode::TooMany,
+                "this channel already has as many receivers of your person as it may (32 \
+                 devices): ask from a device that already receives it, or ask again when the \
+                 session of one of your other devices has lapsed (at most its lifetime)",
+                30_000,
+            ),
