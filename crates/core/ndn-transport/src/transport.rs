@@ -136,18 +136,18 @@ pub trait Transport: Send + Sync + 'static {
     /// start with the marker [`Malformed`](SideRefused::Malformed) (so an NDN
     /// packet never takes the side path) and one longer than `side_frame_max`
     /// [`TooLarge`](SideRefused::TooLarge), and sends the rest through
-    /// [`send_bytes`](Transport::send_bytes); `class` is ignored. A transport
-    /// with more than one carrier (QUIC datagram and stream) overrides this and
-    /// must enforce the same refusals.
+    /// [`send_bytes`](Transport::send_bytes); a class the transport does not carry
+    /// ([`side_carries`](Transport::side_carries)) is refused
+    /// [`NotCarried`](SideRefused::NotCarried) first. A transport with more than one carrier
+    /// (QUIC datagram and stream) overrides this and must enforce the same refusals.
     fn send_side(
         &self,
         frame: Bytes,
         class: SideClass,
     ) -> impl Future<Output = Result<(), SideRefused>> + Send {
-        let _ = class;
         async move {
             let max = self.side_frame_max();
-            if max == 0 {
+            if max == 0 || !self.side_carries(class) {
                 return Err(SideRefused::NotCarried);
             }
             if frame.first() != Some(&crate::side::SIDE_MARKER) {
@@ -194,6 +194,20 @@ pub trait Transport: Send + Sync + 'static {
     /// usually [`send_mtu`](Transport::send_mtu).
     fn side_frame_max(&self) -> usize {
         0
+    }
+
+    /// Whether this transport carries side frames of `class` (see [`crate::side`]): what a
+    /// sender that learns of a hop needs to know before it relies on the class. The default
+    /// follows [`side_frame_max`](Transport::side_frame_max): a transport that opted in takes
+    /// both classes (a frame is sent as is, in order or not, as the medium is), one that did
+    /// not takes none. A transport whose medium has no ordered, reliable stream (an Ethernet
+    /// segment, a lossy ring) overrides this to say `false` for [`SideClass::Stream`], and
+    /// then its `send_side` and `forward_side` refuse that class
+    /// [`NotCarried`](SideRefused::NotCarried). It is a fact about the medium, not about the
+    /// queue's room now.
+    fn side_carries(&self, class: SideClass) -> bool {
+        let _ = class;
+        self.side_frame_max() != 0
     }
 
     fn send_bytes(&self, wire: Bytes) -> impl Future<Output = Result<(), FaceError>> + Send;
@@ -302,6 +316,7 @@ pub trait ErasedTransport: Send + Sync + 'static {
         ingress: FaceId,
     ) -> Result<(), SideRefused>;
     fn side_frame_max(&self) -> usize;
+    fn side_carries(&self, class: SideClass) -> bool;
 
     fn send_bytes(
         &self,
@@ -389,6 +404,9 @@ impl<T: Transport> ErasedTransport for T {
     }
     fn side_frame_max(&self) -> usize {
         Transport::side_frame_max(self)
+    }
+    fn side_carries(&self, class: SideClass) -> bool {
+        Transport::side_carries(self, class)
     }
 
     fn send_bytes(

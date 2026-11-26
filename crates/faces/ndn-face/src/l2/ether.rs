@@ -136,6 +136,11 @@ impl<P: EtherPort> Transport for NamedEtherFace<P> {
         self.mtu.load(Ordering::Relaxed)
     }
 
+    /// An Ethernet segment is no ordered, reliable stream: only the datagram class.
+    fn side_carries(&self, class: SideClass) -> bool {
+        class == SideClass::Datagram
+    }
+
     /// Hand a channel frame to the send queue for the peer without waiting: a
     /// frame that is not a channel frame is
     /// [`Malformed`](SideRefused::Malformed), one over the MTU

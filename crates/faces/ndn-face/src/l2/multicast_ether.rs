@@ -154,6 +154,11 @@ impl<P: EtherPort> Transport for MulticastEtherFace<P> {
         self.mtu.load(Ordering::Relaxed)
     }
 
+    /// An Ethernet segment is no ordered, reliable stream: only the datagram class.
+    fn side_carries(&self, class: SideClass) -> bool {
+        class == SideClass::Datagram
+    }
+
     /// Hand a channel frame to the send queue for the NDN multicast group
     /// without waiting: **one** frame for every station on the segment (a
     /// station that is no receiver sees the sealed frame and routes nothing).

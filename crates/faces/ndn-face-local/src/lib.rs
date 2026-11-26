@@ -421,6 +421,8 @@ mod tests {
             face.side_frame_max(),
             ndn_transport::side_header::STREAM_FRAME_GRANT
         );
+        // An app's face is no lossy medium: both classes are carried.
+        assert!(face.side_carries(SideClass::Datagram) && face.side_carries(SideClass::Stream));
         for (class, fill) in [(SideClass::Datagram, 1u8), (SideClass::Stream, 2u8)] {
             let mut v = vec![fill; 100_000];
             v[0] = SIDE_MARKER;

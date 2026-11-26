@@ -84,6 +84,11 @@ impl Transport for NamedEtherFace {
         self.mtu.load(Ordering::Relaxed)
     }
 
+    /// An Ethernet segment is no ordered, reliable stream: only the datagram class.
+    fn side_carries(&self, class: ndn_transport::SideClass) -> bool {
+        class == ndn_transport::SideClass::Datagram
+    }
+
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {
         let new = clamp_ether_mtu(mtu)?;
         self.mtu.store(new, Ordering::Relaxed);
@@ -169,6 +174,11 @@ impl Transport for MulticastEtherFace {
     /// A channel frame is one Ethernet payload, never fragmented.
     fn side_frame_max(&self) -> usize {
         self.mtu.load(Ordering::Relaxed)
+    }
+
+    /// An Ethernet segment is no ordered, reliable stream: only the datagram class.
+    fn side_carries(&self, class: ndn_transport::SideClass) -> bool {
+        class == ndn_transport::SideClass::Datagram
     }
 
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {

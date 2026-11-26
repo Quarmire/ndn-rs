@@ -475,6 +475,31 @@ async fn an_ethernet_side_frame_over_the_mtu_is_refused_and_nothing_is_queued() 
     }
 }
 
+/// An Ethernet segment has no ordered, reliable stream, and the face says so as a fact of its
+/// medium (`side_carries`), as the forwarder and a sender that asks it see it: the datagram class
+/// only. `send_side` refuses the stream class by that fact too (it does not put it on the wire as
+/// a datagram), as `forward_side` does.
+#[tokio::test]
+async fn an_ethernet_face_reports_that_it_carries_the_datagram_class_only() {
+    for multicast_face in [false, true] {
+        let bus = Arc::new(Bus::default());
+        let face: Box<dyn ndn_transport::ErasedTransport> = if multicast_face {
+            Box::new(multicast(&bus, 0x10, 0x10, 8).0)
+        } else {
+            Box::new(unicast(&bus, 0x10, 8).0)
+        };
+        let who = format!("multicast: {multicast_face}");
+        assert!(face.side_carries(SideClass::Datagram), "{who}");
+        assert!(!face.side_carries(SideClass::Stream), "{who}");
+        assert_eq!(
+            face.send_side(marked(100, 5), SideClass::Stream).await,
+            Err(SideRefused::NotCarried),
+            "{who}"
+        );
+        assert!(bus.frames_on_wire().is_empty(), "{who}: nothing was sent");
+    }
+}
+
 /// A NIC pads a payload under 46 octets, so a receiver sees a short frame with trailing zeros:
 /// the face does not hide that (it sends what it is given), which is why the channel codec makes
 /// every frame self-delimiting or at least 46 octets. A frame of exactly 46 (an `UP` record) is

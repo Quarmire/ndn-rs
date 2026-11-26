@@ -399,6 +399,17 @@ impl ForwarderEngine {
         })
     }
 
+    /// Whether `face` carries side frames of `class` ([`Face::side_carries`]): what the face's
+    /// medium can do, not whether its queue has room. `false` for a face this engine does not
+    /// hold (gone). The engine learns nothing of what the frames mean; a sender that routes
+    /// frames through the side table asks this of the first hop toward its receiver.
+    pub fn face_carries_side(&self, face: FaceId, class: ndn_transport::SideClass) -> bool {
+        self.inner
+            .face_table
+            .get(face)
+            .is_some_and(|f| f.side_carries(class))
+    }
+
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
     pub fn pit(&self) -> Arc<Pit> {
         Arc::clone(&self.inner.pit)

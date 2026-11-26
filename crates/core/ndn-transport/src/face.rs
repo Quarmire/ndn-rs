@@ -560,6 +560,12 @@ impl Face {
         self.transport.side_frame_max()
     }
 
+    /// Whether the face's transport carries side frames of `class` (see
+    /// [`Transport::side_carries`]).
+    pub fn side_carries(&self, class: SideClass) -> bool {
+        self.transport.side_carries(class)
+    }
+
     /// Send tagged with its originating face id. Passthrough routes the tag
     /// through the in-process tag-bag; LpLinkService drops it for now.
     pub async fn send_bytes_with_source(
@@ -750,6 +756,101 @@ mod tests {
             face.forward_side(Bytes::from_static(&[SIDE_MARKER]), SideClass::Datagram),
             Err(SideRefused::Unsupported)
         );
+    }
+
+    /// What a face carries is a fact of its medium, told through `Face` and the erased
+    /// transport alike: a transport that opted in carries both classes by default, one that did
+    /// not carries none, and one whose medium has no stream says so; the default `send_side`
+    /// refuses the class it does not carry instead of sending it as a datagram.
+    #[tokio::test]
+    async fn a_face_reports_which_side_classes_it_carries_and_send_side_refuses_the_others() {
+        use crate::{LpLinkService, SIDE_MARKER, SideClass, SideRefused};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Wire {
+            max: usize,
+            datagram_only: bool,
+            sent: AtomicUsize,
+        }
+        impl Transport for Wire {
+            fn id(&self) -> FaceId {
+                FaceId(4)
+            }
+            fn kind(&self) -> FaceKind {
+                FaceKind::Udp
+            }
+            fn side_frame_max(&self) -> usize {
+                self.max
+            }
+            fn side_carries(&self, class: SideClass) -> bool {
+                if self.datagram_only && class == SideClass::Stream {
+                    return false;
+                }
+                self.max != 0
+            }
+            async fn send_bytes(&self, _w: Bytes) -> Result<(), FaceError> {
+                self.sent.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+                Err(FaceError::Closed)
+            }
+        }
+        struct Plain;
+        impl Transport for Plain {
+            fn id(&self) -> FaceId {
+                FaceId(5)
+            }
+            fn kind(&self) -> FaceKind {
+                FaceKind::Udp
+            }
+            fn side_frame_max(&self) -> usize {
+                100
+            }
+            async fn send_bytes(&self, _w: Bytes) -> Result<(), FaceError> {
+                Ok(())
+            }
+            async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
+                Err(FaceError::Closed)
+            }
+        }
+
+        let frame = Bytes::from_static(&[SIDE_MARKER, 1, 2, 3]);
+        let face = |wire: Arc<dyn ErasedTransport>| Face::new(wire, Arc::new(LpLinkService::new()));
+        let carries = |face: &Face| {
+            (
+                face.side_carries(SideClass::Datagram),
+                face.side_carries(SideClass::Stream),
+            )
+        };
+
+        // The default follows `side_frame_max`.
+        assert_eq!(carries(&face(Arc::new(Plain))), (true, true));
+        let none = Arc::new(Wire {
+            max: 0,
+            datagram_only: false,
+            sent: AtomicUsize::new(0),
+        });
+        assert_eq!(carries(&face(none)), (false, false));
+
+        // A medium with no stream says so, and its `send_side` sends the datagram class only.
+        let ether = Arc::new(Wire {
+            max: 100,
+            datagram_only: true,
+            sent: AtomicUsize::new(0),
+        });
+        let on_ether = face(ether.clone());
+        assert_eq!(carries(&on_ether), (true, false));
+        assert_eq!(
+            on_ether.send_side(frame.clone(), SideClass::Stream).await,
+            Err(SideRefused::NotCarried)
+        );
+        assert_eq!(ether.sent.load(Ordering::SeqCst), 0, "nothing was sent");
+        on_ether
+            .send_side(frame, SideClass::Datagram)
+            .await
+            .unwrap();
+        assert_eq!(ether.sent.load(Ordering::SeqCst), 1);
     }
 
     /// `forward_side_from` tells a transport which face a frame came over. A

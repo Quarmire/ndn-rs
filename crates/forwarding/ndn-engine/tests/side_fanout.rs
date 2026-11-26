@@ -16,7 +16,9 @@ use ndn_transport::side_header::UpOp;
 use ndn_transport::{FaceId, FaceKind};
 use tokio_util::sync::CancellationToken;
 
-use crate::side_support::{Handle, TestFace, Warp, WarpRuntime, data_frame, face, pair, up};
+use crate::side_support::{
+    Handle, TestFace, Warp, WarpRuntime, data_frame, datagram_only_face, face, pair, up,
+};
 
 const ID: u64 = 0x5E55_10C0_FFEE;
 
@@ -552,5 +554,31 @@ async fn a_side_rate_is_configurable_per_face_in_the_engine_config_and_defaults_
         hradio.side().len(),
         2,
         "100 kB/s: two 60 kB frames of the burst"
+    );
+}
+
+/// The forwarder tells what a face carries, as the face's medium says it (the engine learns
+/// nothing of what a frame means): a face with a stream carries both classes, an Ethernet
+/// segment's face the datagram class only, and a face the engine does not hold carries nothing.
+#[tokio::test]
+async fn the_engine_tells_which_side_classes_a_face_carries() {
+    use ndn_transport::SideClass;
+    let (app, _app) = face(1, FaceKind::App);
+    let (ether, _ether) = datagram_only_face(2, FaceKind::Ethernet);
+    let (e, _sd) = engine(vec![app, ether], 1).await;
+    for class in [SideClass::Datagram, SideClass::Stream] {
+        assert!(
+            e.face_carries_side(FaceId(1), class),
+            "{class:?} on a face with a stream"
+        );
+        assert!(
+            !e.face_carries_side(FaceId(99), class),
+            "a face the engine does not hold"
+        );
+    }
+    assert!(e.face_carries_side(FaceId(2), SideClass::Datagram));
+    assert!(
+        !e.face_carries_side(FaceId(2), SideClass::Stream),
+        "an Ethernet segment carries no stream"
     );
 }

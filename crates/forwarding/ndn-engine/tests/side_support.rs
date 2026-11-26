@@ -38,6 +38,8 @@ pub struct Log {
     pub full: AtomicBool,
     /// `forward_side` answers `Unsupported` while set.
     pub unsupported: AtomicBool,
+    /// The face reports that it carries the datagram class only.
+    pub datagram_only: AtomicBool,
 }
 
 /// The test's end of a face.
@@ -131,6 +133,14 @@ pub fn face(id: u64, kind: FaceKind) -> (TestFace, Handle) {
     make(FaceId(id), kind, true)
 }
 
+/// A program face of `kind` whose medium has no ordered stream (as an Ethernet segment): it
+/// reports that it carries the datagram class only.
+pub fn datagram_only_face(id: u64, kind: FaceKind) -> (TestFace, Handle) {
+    let (face, handle) = make(FaceId(id), kind, true);
+    handle.log.datagram_only.store(true, Ordering::Relaxed);
+    (face, handle)
+}
+
 /// Two faces joined as a link: what the first sends (NDN or side) arrives on
 /// the second and the other way round. Both are `kind`.
 pub fn pair(a: u64, b: u64, kind: FaceKind) -> ((TestFace, Handle), (TestFace, Handle)) {
@@ -165,6 +175,10 @@ impl Transport for TestFace {
     }
     fn side_frame_max(&self) -> usize {
         10_000
+    }
+    /// Both classes, unless the face is a datagram-only one ([`datagram_only_face`]).
+    fn side_carries(&self, class: SideClass) -> bool {
+        class == SideClass::Datagram || !self.log.datagram_only.load(Ordering::Relaxed)
     }
     fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
         self.forward_side_from(frame, class, FaceId::INVALID)
