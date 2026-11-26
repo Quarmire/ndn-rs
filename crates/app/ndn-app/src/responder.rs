@@ -45,6 +45,17 @@ impl Responder {
         self.conn.send(wire).await
     }
 
+    /// [`respond_bytes`](Self::respond_bytes) with NDNLPv2 headers on the reply
+    /// ([`Connection::send_with`](crate::Connection::send_with)): `wire` is a bare Data, which
+    /// goes out in an LpPacket that carries `headers` (a `CachePolicy`, a `SideRoute`).
+    pub async fn respond_bytes_with(
+        self,
+        wire: Bytes,
+        headers: ndn_packet::lp::LpHeaders,
+    ) -> Result<(), AppError> {
+        self.conn.send_with(wire, headers).await
+    }
+
     /// Build and send a `Data` for `name` + `content`. If the producer was
     /// configured with a signer, the reply is **signed**: with that signer,
     /// or — for [`with_signers`](crate::Producer::with_signers) — with the

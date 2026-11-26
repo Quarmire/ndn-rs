@@ -20,8 +20,8 @@ use ndn_face_local::InProcHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ndn_ipc::ForwarderClient;
 use ndn_packet::Name;
-use ndn_packet::lp::{LpPacket, is_lp_packet};
-use ndn_transport::FaceId;
+use ndn_packet::lp::{LpHeaders, LpPacket, encode_lp_with_headers, is_lp_packet};
+use ndn_transport::{FaceId, SideClass, SideRefused};
 
 use crate::AppError;
 use crate::demux::Replies;
@@ -187,6 +187,61 @@ pub trait Connection: Send + Sync {
         None
     }
 
+    /// Send `wire` (a bare Data, Interest or Nack) wrapped in an NDNLPv2 packet that carries
+    /// `headers`: a Data that goes out with `CachePolicy = NoCache`, or with a
+    /// [`SideRoute`](ndn_packet::lp::SideRoute) that makes each forwarder on its reverse path
+    /// route the channel frames that follow. A connection that carries LP packets (every one
+    /// here does) needs nothing but this default.
+    async fn send_with(&self, wire: Bytes, headers: LpHeaders) -> Result<(), AppError> {
+        self.send(encode_lp_with_headers(&wire, &headers)).await
+    }
+
+    /// The longest side frame (a channel frame: [`ndn_transport::SIDE_MARKER`] first) this
+    /// connection carries to its forwarder, `0` for one that carries none (the default).
+    fn side_frame_max(&self) -> usize {
+        0
+    }
+
+    /// Send one side frame into the forwarder, which routes it by its channel id
+    /// (`ndn_engine::side::SideTable`); `class` is the carrier the frame asks for, which the
+    /// sink faces honour. Waits for room in the connection's queue. A connection that carries
+    /// no side frames refuses with [`AppError::Unsupported`], which says what to do instead.
+    async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), AppError> {
+        let _ = (frame, class);
+        Err(AppError::Unsupported(NO_SIDE.into()))
+    }
+
+    /// [`send_side`](Self::send_side) that never waits: [`SideRefused::Full`] when the queue
+    /// has no room (wait for [`side_ready`](Self::side_ready) and try again),
+    /// [`SideRefused::NotCarried`] for a connection that carries none (the default),
+    /// [`SideRefused::TooLarge`] over [`side_frame_max`](Self::side_frame_max).
+    fn try_send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        let _ = (frame, class);
+        Err(SideRefused::NotCarried)
+    }
+
+    /// Completes when [`try_send_side`](Self::try_send_side) may take a frame again (at once
+    /// if it may now). Room is not reserved.
+    async fn side_ready(&self) {}
+
+    /// The next side frame the forwarder routed to this connection, with the id of the face it
+    /// arrived over at the forwarder (a link's, for a frame from afar): what a heap node's
+    /// receiver reads. `None` when the connection is closed. A connection that carries no side
+    /// frames never yields one (it waits, as an idle one does); check
+    /// [`side_frame_max`](Self::side_frame_max) first.
+    async fn recv_side(&self) -> Option<(Bytes, FaceId)> {
+        std::future::pending().await
+    }
+
+    /// Bar `face` from carrying channel frames (the forwarder's quarantine: 60 s, doubling on
+    /// each repeat to an hour; NDN traffic over the face is untouched) and return how long.
+    /// Used when a node holds evidence that a frame that came over `face` was forged. A
+    /// connection that cannot ask its forwarder refuses with [`AppError::Unsupported`].
+    async fn side_quarantine(&self, face: FaceId) -> Result<std::time::Duration, AppError> {
+        let _ = face;
+        Err(AppError::Unsupported(NO_QUARANTINE.into()))
+    }
+
     /// The routes that come up at this connection's forwarder (see
     /// [`RouteEvents`]), when it can tell: an embedded engine's connection
     /// ([`EngineAppExt::app_face`](crate::EngineAppExt::app_face)) can, as
@@ -201,6 +256,39 @@ pub trait Connection: Send + Sync {
     /// periodic work, which is correct and slower.
     fn routes(&self) -> Option<RouteEvents> {
         None
+    }
+}
+
+/// Why a connection carries no side frames, and what to do.
+const NO_SIDE: &str = "this connection carries no channel frames: it does not reach a forwarder \
+     that routes them. Run the heap node over a connection to an embedded engine \
+     (`EngineAppExt::app_face`), or over a forwarder face that carries marked frames";
+
+/// Why a connection cannot bar a face, and what to do.
+const NO_QUARANTINE: &str = "this connection cannot ask its forwarder to bar a face: it has no \
+     handle on the forwarder's side table. Use `EngineAppExt::app_face` (an embedded engine) or \
+     the forwarder's `side/quarantine` management command";
+
+/// Whether `frame` may go on the side path of a connection whose limit is `max`: it starts with
+/// the marker, so an NDN packet never takes the side path by mistake, and fits.
+pub(crate) fn side_check(frame: &Bytes, max: usize) -> Result<(), SideRefused> {
+    if frame.first() != Some(&ndn_transport::SIDE_MARKER) {
+        return Err(SideRefused::Malformed);
+    }
+    if frame.len() > max {
+        return Err(SideRefused::TooLarge {
+            size: frame.len(),
+            max,
+        });
+    }
+    Ok(())
+}
+
+/// A refused side frame as the error of an awaiting send.
+pub(crate) fn side_error(refused: SideRefused) -> AppError {
+    match refused {
+        SideRefused::Closed => AppError::Closed,
+        other => AppError::Protocol(format!("side frame refused: {other}")),
     }
 }
 
@@ -314,6 +402,32 @@ impl Connection for IpcConnection {
         crate::rt::spawn(follow_route_stream(self.client.event_client(), news));
         Some(RouteEvents::pushed(rx))
     }
+
+    /// A channel frame does not travel on this connection: the daemon's unix-socket and
+    /// shared-memory faces carry NDN packets, framed as TLV, and a side frame (first octet
+    /// `0x00`) is none. Nothing is sent.
+    async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), AppError> {
+        let _ = (frame, class);
+        Err(AppError::Unsupported(
+            "this connection to an ndn-fwd daemon carries NDN packets only: its socket and \
+             shared-memory faces frame what they carry as TLV packets, which a channel frame \
+             (marker octet 0x00) is not. Run the heap node over an embedded engine \
+             (`EngineAppExt::app_face`), or inside the daemon's own process"
+                .into(),
+        ))
+    }
+
+    /// The bar is the daemon's `side/quarantine` management command, which is signed: this
+    /// connection holds no management key.
+    async fn side_quarantine(&self, face: FaceId) -> Result<std::time::Duration, AppError> {
+        let _ = face;
+        Err(AppError::Unsupported(
+            "this connection cannot bar a face of the daemon: `side/quarantine` is a signed \
+             management command and this connection holds no management key. Send it with a \
+             management client that has one"
+                .into(),
+        ))
+    }
 }
 
 /// App owns one end of an [`InProcHandle`] pair; the engine owns the
@@ -355,6 +469,28 @@ impl Connection for InProcConnection {
 
     async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
         Ok(())
+    }
+
+    fn side_frame_max(&self) -> usize {
+        ndn_transport::side_header::STREAM_FRAME_GRANT
+    }
+
+    async fn send_side(&self, frame: Bytes, _class: SideClass) -> Result<(), AppError> {
+        side_check(&frame, self.side_frame_max()).map_err(side_error)?;
+        self.handle.send(frame).await.map_err(|_| AppError::Closed)
+    }
+
+    fn try_send_side(&self, frame: Bytes, _class: SideClass) -> Result<(), SideRefused> {
+        side_check(&frame, self.side_frame_max())?;
+        self.handle.try_send(frame).map_err(SideRefused::from)
+    }
+
+    async fn side_ready(&self) {
+        self.handle.send_ready().await;
+    }
+
+    async fn recv_side(&self) -> Option<(Bytes, FaceId)> {
+        self.handle.recv_side().await
     }
 }
 
@@ -482,5 +618,195 @@ mod tests {
     fn a_bare_in_process_connection_tells_no_routes() {
         let (_face, handle) = InProcFace::new(FaceId(1), 4);
         assert!(InProcConnection::new(handle).routes().is_none());
+    }
+
+    fn marked(n: u8) -> Bytes {
+        Bytes::from(vec![
+            ndn_transport::SIDE_MARKER,
+            0x20,
+            n,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+        ])
+    }
+
+    /// A marked frame the app sends reaches the face reader unchanged (where the engine peels it),
+    /// and one the engine routes to the app comes back through `recv_side` with the face it
+    /// arrived over, never through `recv`.
+    #[tokio::test]
+    async fn side_frames_go_out_to_the_face_reader_and_come_back_with_their_ingress() {
+        let (face, handle) = InProcFace::new(FaceId(7), 4);
+        let conn = InProcConnection::new(handle);
+        assert_eq!(
+            conn.side_frame_max(),
+            ndn_transport::side_header::STREAM_FRAME_GRANT
+        );
+        conn.send_side(marked(1), SideClass::Datagram)
+            .await
+            .unwrap();
+        conn.try_send_side(marked(2), SideClass::Stream).unwrap();
+        assert_eq!(face.recv_bytes().await.unwrap(), marked(1));
+        assert_eq!(face.recv_bytes().await.unwrap(), marked(2));
+
+        face.forward_side_from(marked(3), SideClass::Datagram, FaceId(42))
+            .unwrap();
+        assert_eq!(conn.recv_side().await, Some((marked(3), FaceId(42))));
+        let data = DataBuilder::new(ndn_packet::name!("/m/d"), b"x").sign_digest_sha256();
+        face.send_bytes(data.clone()).await.unwrap();
+        assert_eq!(conn.recv().await, Some(data), "NDN packets stay on recv");
+    }
+
+    /// What does not belong on the side path is refused before it is sent: an NDN packet (the
+    /// marker decides), a frame over the limit; and a full queue is `Full`, with `side_ready`
+    /// completing once the engine took a packet.
+    #[tokio::test]
+    async fn side_sends_refuse_ndn_packets_and_say_full_when_the_queue_is_full() {
+        let (face, handle) = InProcFace::new(FaceId(7), 1);
+        let conn = InProcConnection::new(handle);
+        let ndn = DataBuilder::new(ndn_packet::name!("/m/d"), b"x").sign_digest_sha256();
+        assert_eq!(
+            conn.try_send_side(ndn.clone(), SideClass::Datagram),
+            Err(SideRefused::Malformed)
+        );
+        assert!(matches!(
+            conn.send_side(ndn, SideClass::Datagram).await,
+            Err(AppError::Protocol(m)) if m.contains("not a side frame")
+        ));
+        let mut huge = vec![0u8; conn.side_frame_max() + 1];
+        huge[0] = ndn_transport::SIDE_MARKER;
+        assert!(matches!(
+            conn.try_send_side(Bytes::from(huge), SideClass::Stream),
+            Err(SideRefused::TooLarge { .. })
+        ));
+        conn.try_send_side(marked(1), SideClass::Datagram).unwrap();
+        assert_eq!(
+            conn.try_send_side(marked(2), SideClass::Datagram),
+            Err(SideRefused::Full)
+        );
+        let waiting =
+            tokio::time::timeout(std::time::Duration::from_millis(50), conn.side_ready()).await;
+        assert!(waiting.is_err(), "no room yet");
+        face.recv_bytes().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), conn.side_ready())
+            .await
+            .expect("room after the engine took one");
+        conn.try_send_side(marked(2), SideClass::Datagram).unwrap();
+    }
+
+    /// A connection that does not reach a forwarder with a side table says so and what to do:
+    /// nothing is faked, nothing is sent.
+    #[tokio::test]
+    async fn a_connection_that_carries_no_side_frames_refuses_and_names_the_next_step() {
+        struct Plain;
+        #[async_trait]
+        impl Connection for Plain {
+            async fn send(&self, _wire: Bytes) -> Result<(), AppError> {
+                Ok(())
+            }
+            async fn recv(&self) -> Option<Bytes> {
+                None
+            }
+            async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+                Ok(())
+            }
+        }
+        let conn = Plain;
+        assert_eq!(conn.side_frame_max(), 0);
+        assert!(matches!(
+            conn.send_side(marked(1), SideClass::Datagram).await,
+            Err(AppError::Unsupported(m)) if m.contains("app_face")
+        ));
+        assert_eq!(
+            conn.try_send_side(marked(1), SideClass::Datagram),
+            Err(SideRefused::NotCarried)
+        );
+        assert!(matches!(
+            conn.side_quarantine(FaceId(3)).await,
+            Err(AppError::Unsupported(m)) if m.contains("side/quarantine")
+        ));
+    }
+
+    /// `send_with` puts the Data in an LpPacket that carries the headers, so the forwarder
+    /// reads the route label (and the `NoCache`) off the wire.
+    #[tokio::test]
+    async fn send_with_wraps_the_data_with_the_headers() {
+        use ndn_packet::lp::SideRoute;
+        let (face, handle) = InProcFace::new(FaceId(7), 4);
+        let conn = InProcConnection::new(handle);
+        let data = DataBuilder::new(ndn_packet::name!("/m/d"), b"x").sign_digest_sha256();
+        let headers = LpHeaders {
+            cache_policy: Some(ndn_packet::CachePolicyType::NoCache),
+            side_route: Some(SideRoute {
+                id: 0x0102_0304_0506_0708,
+                ttl_secs: 30,
+            }),
+            ..LpHeaders::default()
+        };
+        conn.send_with(data.clone(), headers).await.unwrap();
+        let lp = LpPacket::decode(face.recv_bytes().await.unwrap()).unwrap();
+        assert_eq!(
+            lp.side_route,
+            Some(SideRoute {
+                id: 0x0102_0304_0506_0708,
+                ttl_secs: 30
+            })
+        );
+        assert_eq!(lp.fragment, Some(data));
+    }
+
+    /// A `DemuxConnection` (what a node's `connection()` is) hands the side calls to its
+    /// connection, and its own `recv` is not where side frames appear.
+    #[tokio::test]
+    async fn a_demux_connection_carries_the_side_calls_of_the_connection_under_it() {
+        let (face, handle) = InProcFace::new(FaceId(7), 4);
+        let conn = crate::DemuxConnection::new(Arc::new(InProcConnection::new(handle)));
+        assert_eq!(
+            conn.side_frame_max(),
+            ndn_transport::side_header::STREAM_FRAME_GRANT
+        );
+        conn.send_side(marked(1), SideClass::Datagram)
+            .await
+            .unwrap();
+        assert_eq!(face.recv_bytes().await.unwrap(), marked(1));
+        face.forward_side_from(marked(2), SideClass::Stream, FaceId(9))
+            .unwrap();
+        assert_eq!(conn.recv_side().await, Some((marked(2), FaceId(9))));
+    }
+
+    /// An embedded engine's connection bars a face in the engine's side table (60 s the first
+    /// time, doubling on a repeat), and NDN traffic is not part of it; a bare in-process
+    /// connection, which knows no engine, refuses and says where to go.
+    #[tokio::test]
+    async fn an_engine_connection_bars_a_face_in_the_engines_side_table() {
+        use crate::EngineAppExt;
+        let (engine, _shutdown) = ndn_engine::EngineBuilder::new(Default::default())
+            .build()
+            .await
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let conn = engine.app_face(cancel.child_token());
+        let link = FaceId(4242);
+        let side = engine.side();
+        assert!(!side.is_quarantined(link, side.now()));
+        let first = conn.side_quarantine(link).await.unwrap();
+        assert_eq!(first, std::time::Duration::from_secs(60));
+        assert!(side.is_quarantined(link, side.now()));
+        let second = conn.side_quarantine(link).await.unwrap();
+        assert_eq!(
+            second,
+            std::time::Duration::from_secs(120),
+            "a repeat doubles"
+        );
+
+        let (_face, handle) = InProcFace::new(FaceId(1), 4);
+        assert!(matches!(
+            InProcConnection::new(handle).side_quarantine(link).await,
+            Err(AppError::Unsupported(m)) if m.contains("side/quarantine")
+        ));
     }
 }

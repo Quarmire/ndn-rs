@@ -35,7 +35,7 @@ use ndn_face::local::InProcFace;
 #[cfg(target_arch = "wasm32")]
 use ndn_face_local::InProcFace;
 use ndn_packet::Name;
-use ndn_transport::FaceId;
+use ndn_transport::{FaceId, SideClass, SideRefused};
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::{Connection, InProcConnection, LpInfo, RouteEvents};
@@ -155,6 +155,43 @@ impl Connection for EngineConnection {
         // no route that came up on another face ([`Connection::routes`]).
         self.engine.fib().add_nexthop(prefix, self.face_id, 0);
         Ok(())
+    }
+
+    fn side_frame_max(&self) -> usize {
+        self.inner.side_frame_max()
+    }
+
+    async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), AppError> {
+        self.inner.send_side(frame, class).await
+    }
+
+    fn try_send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        self.inner.try_send_side(frame, class)
+    }
+
+    async fn side_ready(&self) {
+        self.inner.side_ready().await;
+    }
+
+    async fn recv_side(&self) -> Option<(Bytes, FaceId)> {
+        self.inner.recv_side().await
+    }
+
+    /// Bar `face` in the engine's side table ([`ndn_engine::side::SideTable::bar`]): the first
+    /// bar is 60 s and each repeat on the same face doubles, to an hour. This connection's own
+    /// face is refused: every channel frame of this app goes over it, so barring it would cut
+    /// the app off from its own forwarder, not a link that delivered a forgery.
+    async fn side_quarantine(&self, face: FaceId) -> Result<std::time::Duration, AppError> {
+        if face == self.face_id {
+            return Err(AppError::Unsupported(
+                "this is the connection's own face, not a link a frame came over: a frame \
+                 delivered with no ingress of another face cannot be attributed to a link, so \
+                 nothing was barred"
+                    .into(),
+            ));
+        }
+        let side = self.engine.side();
+        Ok(side.bar(face, side.now()))
     }
 
     /// The engine RIB's routes that come up on a face that is not this one

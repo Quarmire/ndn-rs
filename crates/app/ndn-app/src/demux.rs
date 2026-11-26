@@ -54,6 +54,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use ndn_packet::lp::{LpPacket, is_lp_packet};
 use ndn_packet::{Data, Interest, NackReason, Name};
+use ndn_transport::{FaceId, SideClass, SideRefused};
 use parking_lot::Mutex as SyncMutex;
 
 use crate::connection::{Connection, LpInfo};
@@ -425,6 +426,30 @@ impl Connection for DemuxConnection {
 
     fn routes(&self) -> Option<crate::RouteEvents> {
         self.inner.routes()
+    }
+
+    fn side_frame_max(&self) -> usize {
+        self.inner.side_frame_max()
+    }
+
+    async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), AppError> {
+        self.inner.send_side(frame, class).await
+    }
+
+    fn try_send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        self.inner.try_send_side(frame, class)
+    }
+
+    async fn side_ready(&self) {
+        self.inner.side_ready().await;
+    }
+
+    async fn recv_side(&self) -> Option<(Bytes, FaceId)> {
+        self.inner.recv_side().await
+    }
+
+    async fn side_quarantine(&self, face: FaceId) -> Result<std::time::Duration, AppError> {
+        self.inner.side_quarantine(face).await
     }
 
     fn replies(&self) -> Option<Replies> {
