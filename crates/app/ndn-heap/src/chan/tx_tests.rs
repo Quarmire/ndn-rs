@@ -511,7 +511,12 @@ async fn reliable_with_drop_leaves_a_gap_and_says_congested_when_nothing_can_be_
         },
     );
     rig.tx
-        .emit(&path, &Bytes::from(vec![1u8; MESSAGE_DEFAULT]), &opts, rig.t0)
+        .emit(
+            &path,
+            &Bytes::from(vec![1u8; MESSAGE_DEFAULT]),
+            &opts,
+            rig.t0,
+        )
         .await
         .unwrap();
     for _ in 0..10 {
@@ -1662,4 +1667,56 @@ async fn an_isolated_message_asks_no_call_back_and_a_burst_does() {
     let seen = datagrams(&mut rig);
     assert_eq!(seen.len(), 2);
     settle(&rig.tx).await;
+}
+
+/// An inline writer whose frame left nothing waiting releases the lane under the same lock that
+/// took the frame out of the queue (it used to look again: a second pack and a third lock round
+/// per message): when `emit` returns the channel is idle, an isolated message asked for no call
+/// back, one that followed within `BURST_GAP` asked for exactly one, and the next emission is
+/// written inline by its own caller again.
+#[tokio::test]
+async fn an_inline_writer_that_left_nothing_waiting_is_idle_when_emit_returns() {
+    let mut rig = rig(
+        ChannelMode::Latest,
+        LinkConfig {
+            datagram_capacity: 1_000_000,
+            ..LinkConfig::default()
+        },
+    );
+    let latest = EmitOptions::latest();
+    prebind(&mut rig, 0..13).await;
+    for i in 0..5u64 {
+        send(&rig, &name(i as usize), b"x", &latest, at(&rig, 10 + i)).await;
+        assert!(rig.tx.is_idle(), "the lane was released by the writer");
+        assert_eq!(
+            rig.link.waiting_drains(),
+            0,
+            "an isolated message asks for nothing"
+        );
+        assert_eq!(datagrams(&mut rig).len(), 1, "left inline");
+    }
+    // A loop of emissions: the second follows the first within the gap.
+    send(&rig, &name(10), b"x", &latest, at(&rig, 100)).await;
+    send(
+        &rig,
+        &name(11),
+        b"x",
+        &latest,
+        at(&rig, 100) + BURST_GAP / 2,
+    )
+    .await;
+    assert!(rig.tx.is_idle());
+    assert_eq!(
+        rig.link.waiting_drains(),
+        1,
+        "a burst asks for one call back"
+    );
+    assert_eq!(datagrams(&mut rig).len(), 2);
+    settle(&rig.tx).await;
+    send(&rig, &name(12), b"x", &latest, at(&rig, 200)).await;
+    assert_eq!(
+        rig.link.queued_datagrams(),
+        1,
+        "written inline by its own caller"
+    );
 }

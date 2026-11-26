@@ -130,9 +130,7 @@ impl TxStats {
             SideClass::Datagram => self.datagram_frames.bump(),
             SideClass::Stream => self.stream_frames.bump(),
         }
-        for _ in 0..count {
-            self.messages.bump();
-        }
+        self.messages.add(count as u64);
         let bucket = match count {
             0 | 1 => 0,
             2 => 1,
@@ -941,15 +939,30 @@ impl TxChannel {
                 Ok(frame) => frame,
                 Err(_) => {
                     self.stats.seal_failed.bump();
-                    self.finish_datagram(scratch, seq0, None, 0);
+                    self.finish_datagram(scratch, seq0, None, 0, None);
                     continue;
                 }
             };
             match carrier.try_send_datagram(frame.clone()) {
                 Ok(()) => {
                     shrunk = None;
-                    self.finish_datagram(scratch, seq0, Some(&frame), count);
                     frames += 1;
+                    let idle = self.finish_datagram(
+                        scratch,
+                        seq0,
+                        Some(&frame),
+                        count,
+                        inline.then_some(now),
+                    );
+                    if let Some(burst) = idle {
+                        // The lane is empty and the writer's flag is clear, decided under the same
+                        // lock that took the frame out of the queue (as `Pack::Idle` does, with
+                        // two more lock rounds): a loop of emissions asks for a call back.
+                        if burst {
+                            self.request_drain(carrier);
+                        }
+                        return;
+                    }
                 }
                 Err(CarrierRefused::Full) => {
                     self.stats.full.bump();
@@ -984,13 +997,20 @@ impl TxChannel {
 
     /// The frame was handed over (`frame` is `Some`) or could not be sealed: the messages in it
     /// leave the queue.
+    ///
+    /// An inline writer passes the emission's clock reading as `idle_at`: if nothing else waits
+    /// and the channel stands, the lane is released here, under the same lock, and the result
+    /// says whether this write followed another within [`BURST_GAP`] (`Some(burst)`), which is
+    /// what the next `pack_datagram` would have found and set with two more lock rounds. `None`:
+    /// the writer looks again.
     fn finish_datagram(
         &self,
         scratch: Vec<(u64, u64)>,
         seq0: u64,
         frame: Option<&Bytes>,
         count: usize,
-    ) {
+        idle_at: Option<Instant>,
+    ) -> Option<bool> {
         let mut st = self.state.lock();
         for &(id, seq) in &scratch {
             st.latest.commit(id, seq);
@@ -1000,6 +1020,20 @@ impl TxChannel {
             self.stats.note_frame(SideClass::Datagram, count);
         }
         st.scratch = scratch;
+        let now = idle_at?;
+        if st.ended || self.live.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        st.latest.prune_front();
+        if !st.latest.is_empty() {
+            return None;
+        }
+        st.datagram_writing = false;
+        let burst = st
+            .last_inline
+            .is_some_and(|at| now.saturating_duration_since(at) < BURST_GAP);
+        st.last_inline = Some(now);
+        Some(burst)
     }
 
     /// The path's size fell under a frame: its messages take **new** sequences and are packed
