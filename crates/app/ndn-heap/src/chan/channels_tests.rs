@@ -22,6 +22,7 @@ fn ask<'a>(device: &'a Name, key: &'a Name, wanted: u64) -> Asker<'a> {
         key,
         wanted,
         new: false,
+        stream: true,
     }
 }
 
@@ -543,6 +544,7 @@ fn a_receiver_that_says_it_holds_no_session_is_new_again_and_one_that_says_nothi
         key: &key,
         wanted: 3600,
         new: true,
+        stream: true,
     };
     let again = table
         .admit(

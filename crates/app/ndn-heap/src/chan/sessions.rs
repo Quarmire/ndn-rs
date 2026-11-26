@@ -114,7 +114,6 @@ pub(crate) struct Terms {
     /// The largest frame on a datagram carrier.
     pub(crate) frame_max: u64,
     /// The carriers on offer.
-    #[allow(dead_code)] // stage 4: the side table routes by the carriers a session offers
     pub(crate) carriers: Vec<CarrierOffer>,
     /// The name ids bound so far.
     pub(crate) table: Vec<Bind>,
@@ -290,6 +289,17 @@ impl RecvSession {
     /// What the sender's last answer set.
     pub(crate) fn terms(&self) -> Terms {
         self.state.lock().terms.clone()
+    }
+
+    /// Whether the sender's last answer offers the stream carrier. A session that does not (the
+    /// path from the sender has no stream) is given no `HELLO`, so none is waited for.
+    pub(crate) fn offers_stream(&self) -> bool {
+        self.state
+            .lock()
+            .terms
+            .carriers
+            .iter()
+            .any(|c| c.kind == super::wire::carrier::STREAM)
     }
 
     /// The sequence the sender's last answer said its next message takes (`S_SEQ`): where this

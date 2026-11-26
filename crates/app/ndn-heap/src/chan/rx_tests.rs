@@ -2084,7 +2084,8 @@ async fn stream_frames_that_overtake_the_session_are_not_lost_to_a_window_joiner
     let interest = Interest::decode(wire_ask).unwrap();
     let name = (*interest.name).clone();
     let generation = carol.inner.judge.generation();
-    let ChanAnswer::Session { wire: answer, .. } = bob_node.inner.chan_answer(&interest).await
+    let ChanAnswer::Session { wire: answer, .. } =
+        bob_node.inner.chan_answer(&interest, None).await
     else {
         panic!("a member's ask is answered");
     };

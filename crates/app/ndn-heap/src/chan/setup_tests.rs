@@ -493,7 +493,7 @@ async fn the_session_key_opens_only_with_the_askers_recipient_key_and_the_data_n
     let (alice, bob, carol) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
 
     let (_, interest) = signed_ask(bob, alice, &ask_of(bob, ChannelMode::Latest));
-    let ChanAnswer::Session { wire, .. } = alice.inner.chan_answer(&interest).await else {
+    let ChanAnswer::Session { wire, .. } = alice.inner.chan_answer(&interest, None).await else {
         panic!("a member's ask is answered");
     };
     let data = Data::decode(wire).unwrap();
@@ -612,7 +612,7 @@ async fn an_ask_naming_an_epoch_the_sender_does_not_have_in_force_is_refused_sta
     };
     let answer = |ask: ChanAsk| async move {
         let (_, interest) = signed_ask(bob, alice, &ask);
-        alice.inner.chan_answer(&interest).await
+        alice.inner.chan_answer(&interest, None).await
     };
     // An epoch alice has never seen: she has not caught up, ask again soon.
     let unknown = crate::wire::EpochId {
@@ -760,7 +760,7 @@ async fn an_asker_over_its_rate_is_nacked_congestion_after_its_signature_verifie
     let mut nacks = Vec::new();
     for _ in 0..30 {
         let (_, interest) = signed_ask(bob, alice, &ask_of(bob, ChannelMode::Latest));
-        if let ChanAnswer::Nack(reason) = alice.inner.chan_answer(&interest).await {
+        if let ChanAnswer::Nack(reason) = alice.inner.chan_answer(&interest, None).await {
             nacks.push(reason);
         }
     }
@@ -776,7 +776,7 @@ async fn an_asker_over_its_rate_is_nacked_congestion_after_its_signature_verifie
     let walks = alice.inner.judge.interest_walks();
     let (_, interest) = signed_ask(dave, alice, &ask_of(dave, ChannelMode::Latest));
     assert!(matches!(
-        alice.inner.chan_answer(&interest).await,
+        alice.inner.chan_answer(&interest, None).await,
         ChanAnswer::Nack(NackReason::NoRoute)
     ));
     assert_eq!(alice.inner.judge.interest_walks(), walks);
@@ -966,12 +966,12 @@ async fn a_replayed_ask_yields_a_session_only_the_asker_can_open() {
     let (_, interest) = signed_ask(bob, alice, &ask_of(bob, ChannelMode::Latest));
 
     assert!(matches!(
-        alice.inner.chan_answer(&interest).await,
+        alice.inner.chan_answer(&interest, None).await,
         ChanAnswer::Session { .. }
     ));
     // The same signed Interest again, within what the replay guard remembers: Nacked Duplicate.
     assert!(matches!(
-        alice.inner.chan_answer(&interest).await,
+        alice.inner.chan_answer(&interest, None).await,
         ChanAnswer::Nack(NackReason::Duplicate)
     ));
     assert_eq!(alice.inner.chan.stats.replays.get(), 1);
@@ -979,7 +979,7 @@ async fn a_replayed_ask_yields_a_session_only_the_asker_can_open() {
     // A sender that forgot (restarted) answers it: a session wrapped to bob's recipient key,
     // which only bob opens; the one who replayed it (carol) cannot.
     alice.inner.chan.replay.forget_all();
-    let ChanAnswer::Session { wire, .. } = alice.inner.chan_answer(&interest).await else {
+    let ChanAnswer::Session { wire, .. } = alice.inner.chan_answer(&interest, None).await else {
         panic!("a replay is answered once the guard forgot it");
     };
     let data = Data::decode(wire).unwrap();
@@ -1235,6 +1235,7 @@ async fn a_sender_over_its_receiver_cap_gives_a_signed_refusal_that_says_to_retr
             key: &key,
             wanted: 0,
             new: false,
+            stream: true,
         };
         alice
             .inner
@@ -1275,7 +1276,7 @@ async fn an_ask_with_a_chain_the_sender_does_not_hold_is_nacked_not_yet_and_the_
     bare.chain.clear();
     let (_, interest) = signed_ask(bob, alice, &bare);
     assert!(matches!(
-        alice.inner.chan_answer(&interest).await,
+        alice.inner.chan_answer(&interest, None).await,
         ChanAnswer::Nack(NackReason::NotYet)
     ));
     assert_eq!(alice.inner.chan.stats.pending.get(), 1);
@@ -1364,7 +1365,7 @@ async fn forged_asks_naming_a_member_do_not_throttle_that_members_real_ask() {
         // Dave signs, naming bob's key in the KeyLocator: the signature cannot verify.
         let forged = signed_as(dave, bob.writer(), alice, &params);
         let interest = Interest::decode(forged).unwrap();
-        let answer = alice.inner.chan_answer(&interest).await;
+        let answer = alice.inner.chan_answer(&interest, None).await;
         assert!(
             matches!(answer, ChanAnswer::Nack(NackReason::NoRoute)),
             "forged ask {i} was answered {answer:?}: a forgery is judged, not charged to bob"

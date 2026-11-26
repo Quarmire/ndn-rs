@@ -22,7 +22,9 @@
 //!
 //! Then the asker is a verified member and may be answered with a **signed** record:
 //! standing again (the entries may have moved while the signature was checked), this device a
-//! writer of the space, a sealed space's audience of the epoch in force, the carriers, the caps;
+//! writer of the space, a sealed space's audience of the epoch in force, the carriers (the stream
+//! is dropped from what an ask lists when the first hop toward the asker has none, and a mode
+//! that needs one is then refused `NoStream`), the caps;
 //! a refusal here is a signed `CHAN_REFUSAL` that says why and what to do. Otherwise the key is
 //! wrapped to the ask's recipient and the session is signed, `FreshnessPeriod` 0.
 
@@ -36,6 +38,7 @@ use ndn_security::ReplayCheck;
 use ndn_security::Signer;
 use ndn_security::cert_name::key_name_of;
 use ndn_security::confidentiality::{ContentKey, wrap_ck_to};
+use ndn_transport::FaceId;
 use sha2::{Digest, Sha256};
 
 use super::aead::Aead;
@@ -149,9 +152,13 @@ fn refuse(code: RefusalCode, text: impl Into<String>, retry_ms: u64) -> Verdict 
 
 impl NodeInner {
     /// Answer one ask (see the module docs for the order of the judgement).
-    pub(crate) async fn chan_answer(&self, interest: &Interest) -> ChanAnswer {
+    pub(crate) async fn chan_answer(
+        &self,
+        interest: &Interest,
+        ingress: Option<FaceId>,
+    ) -> ChanAnswer {
         let name = (*interest.name).clone();
-        match self.chan_judge(interest).await {
+        match self.chan_judge(interest, ingress).await {
             Verdict::Nack(reason) => ChanAnswer::Nack(reason),
             Verdict::Refuse(refusal) => {
                 self.chan.stats.refused.bump();
@@ -235,7 +242,7 @@ impl NodeInner {
         session_data(&*self.signer, name, session, &admitted.key, &ask.recipient)
     }
 
-    async fn chan_judge(&self, interest: &Interest) -> Verdict {
+    async fn chan_judge(&self, interest: &Interest, ingress: Option<FaceId>) -> Verdict {
         let stats = &self.chan.stats;
         stats.asks.bump();
         let nack = |reason| Verdict::Nack(reason);
@@ -263,7 +270,7 @@ impl NodeInner {
             stats.malformed.bump();
             return nack(NackReason::NoRoute);
         }
-        let Ok(ask) = ChanAsk::decode(params) else {
+        let Ok(mut ask) = ChanAsk::decode(params) else {
             stats.malformed.bump();
             return nack(NackReason::NoRoute);
         };
@@ -413,6 +420,25 @@ impl NodeInner {
         } else {
             None
         };
+        // The first hop toward the asker is the one face this device's forwarder routes the
+        // channel's frames to for it. A hop with no stream (an Ethernet segment) takes the
+        // datagram class only: the receiver is told so by a session that offers no stream, and
+        // a mode that needs one is refused, instead of an answer whose stream frames the hop
+        // would drop (and a `NoPath` two seconds on).
+        if ask.carriers.contains(&carrier::STREAM)
+            && ingress.is_some_and(|face| !self.chan.route.path_carries_stream(face))
+        {
+            if ask.mode.needs_stream() {
+                return refuse(
+                    RefusalCode::NoStream,
+                    "the path from this sender to you has no ordered stream (a hop carries \
+                     datagrams only, as an Ethernet segment does), and a Reliable or Window \
+                     channel needs one: ask with Latest, or put the value instead",
+                    0,
+                );
+            }
+            ask.carriers.retain(|kind| *kind != carrier::STREAM);
+        }
         if ask.mode.needs_stream() && !ask.carriers.contains(&carrier::STREAM) {
             return refuse(
                 RefusalCode::NoStream,
@@ -430,6 +456,7 @@ impl NodeInner {
             key: &key,
             wanted: ask.lifetime,
             new: ask.new,
+            stream: ask.carriers.contains(&carrier::STREAM),
         };
         match self
             .chan

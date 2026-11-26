@@ -196,7 +196,7 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
 /// answers is never cached (`CachePolicy = NoCache`).
 async fn chan(port: Arc<dyn ChanPort>, interest: Interest, responder: Responder) {
     let name = (*interest.name).clone();
-    let sent = match port.answer(interest).await {
+    let sent = match port.answer(interest, responder.incoming_face()).await {
         ChanAnswer::Data(wire) => {
             responder
                 .respond_bytes_with(wire, setup_headers(None))

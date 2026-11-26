@@ -60,12 +60,15 @@ impl Runtime for Offset {}
 
 /// A node's connection, with switches: it strips the route label off what it sends (the
 /// forwarder between that predates the header), cuts every side frame (a receiver that cannot or
-/// will not send `Keep` or `Unsub`), or carries no side frames at all.
+/// will not send `Keep` or `Unsub`), carries no side frames at all, or says that its own face
+/// (`no_stream_here`) or the first hop toward each receiver (`no_stream_hop`) has no stream.
 struct Switch {
     inner: Arc<dyn Connection>,
     strip: AtomicBool,
     cut: AtomicBool,
     no_side: AtomicBool,
+    no_stream_hop: AtomicBool,
+    no_stream_here: AtomicBool,
 }
 
 impl Switch {
@@ -75,6 +78,8 @@ impl Switch {
             strip: AtomicBool::new(false),
             cut: AtomicBool::new(false),
             no_side: AtomicBool::new(false),
+            no_stream_hop: AtomicBool::new(false),
+            no_stream_here: AtomicBool::new(false),
         })
     }
 }
@@ -143,6 +148,21 @@ impl Connection for Switch {
     }
     async fn side_quarantine(&self, face: FaceId) -> Result<Duration, AppError> {
         self.inner.side_quarantine(face).await
+    }
+    /// What the engine's faces say, unless `no_stream_hop` says the first hop toward every
+    /// receiver is an Ethernet segment: datagrams only.
+    fn side_carries(&self, face: FaceId, class: SideClass) -> bool {
+        if class == SideClass::Stream && self.no_stream_hop.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.inner.side_carries(face, class)
+    }
+    /// What this connection's own face says, unless `no_stream_here` says it has none.
+    fn side_carries_here(&self, class: SideClass) -> bool {
+        if class == SideClass::Stream && self.no_stream_here.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.inner.side_carries_here(class)
     }
 }
 
@@ -830,7 +850,7 @@ async fn ask_in_flight<'a>(
         .unwrap();
     let interest = ndn_packet::Interest::decode(wire).unwrap();
     let generation = asker.inner.judge.generation();
-    let ChanAnswer::Session { wire, .. } = sender.inner.chan_answer(&interest).await else {
+    let ChanAnswer::Session { wire, .. } = sender.inner.chan_answer(&interest, None).await else {
         panic!("a member's ask is answered");
     };
     (
@@ -897,4 +917,116 @@ async fn an_answer_to_an_ask_made_before_the_channel_was_let_go_installs_no_sess
     emit(bob, "/late", b"z").await;
     let got = next(&mut again).await.expect("an item");
     assert_eq!(&got.bytes[..], b"z");
+}
+
+/// The first hop toward a receiver is an Ethernet segment: it carries datagrams only. The sender
+/// learns that from the forwarder's face when the receiver asks, so a `Reliable` or `Window` ask
+/// is refused `NoStream` there (with what to do), instead of being answered and ending in
+/// `NoPath` two seconds on, once the hop dropped the stream frames. A `Latest` ask over the same
+/// hop is answered with a session that offers no stream: it is sent no `HELLO` and told no
+/// `NoPath`, its messages name themselves, and a standing value, which needs the stream, is
+/// refused at the emission while that receiver holds the channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reliable_ask_over_a_hop_with_no_stream_is_refused_no_stream_and_latest_still_works() {
+    use super::error::ChanError;
+    use super::verbs::EmitError;
+    use super::wire::{ChannelMode, RefusalCode};
+    let rig = rig(true).await;
+    let (carol, bob) = (rig.carol(), rig.bob());
+    rig.links[1].no_stream_hop.store(true, Ordering::SeqCst);
+
+    for mode in [ChannelMode::Reliable, ChannelMode::Window] {
+        let refused = carol
+            .ask_channel_in(&space(), bob.name(), mode)
+            .await
+            .expect_err("no stream reaches this receiver");
+        let ChanError::Refused { code, text, .. } = &refused else {
+            panic!("a signed refusal, not {refused:?}");
+        };
+        assert_eq!(*code, RefusalCode::NoStream, "{mode:?}");
+        assert!(
+            text.contains("no ordered stream") && text.contains("Latest") && text.contains("put"),
+            "the refusal says why and what to do: {text}"
+        );
+        assert_eq!(refused.next(), NextStep::FixRequest);
+    }
+    assert_eq!(
+        rig.engine.side().stats().routes,
+        0,
+        "a refusal lays no route"
+    );
+
+    // `Latest` over the same hop is answered, with no stream on offer.
+    let mut items = live(carol);
+    let info = carol
+        .ask_channel(&space(), bob.name())
+        .await
+        .expect("a Latest ask is answered");
+    let session = carol.inner.chan.sessions.get(info.channel).expect("held");
+    assert!(!session.offers_stream(), "the session offers no stream");
+    assert_eq!(info.checkpoint, None, "no stream, no checkpoints");
+    emit(bob, "/a", b"x").await;
+    let got = next(&mut items).await.expect("a datagram arrives");
+    assert_eq!(
+        (got.path.to_string(), &got.bytes[..]),
+        ("/a".into(), &b"x"[..])
+    );
+    assert!(
+        !items.hello_seen(),
+        "no HELLO is sent over a hop with no stream"
+    );
+    // Nothing is waited for: a quiet path is no missing path.
+    carol
+        .inner
+        .chan_route_tick(Instant::now() + 3 * NO_PATH_AFTER);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), items.next())
+            .await
+            .is_err(),
+        "a session with no stream is told no `NoPath`"
+    );
+
+    // What needs the stream cannot reach this receiver: refused at the emission, with the next
+    // step, not sent to be dropped at the hop.
+    let standing = EmitOptions::latest().standing(Duration::from_secs(60));
+    let refused = bob
+        .space(&space())
+        .unwrap()
+        .emit(&n("/s"), Bytes::from_static(b"v"), standing)
+        .await
+        .expect_err("a standing value needs the stream");
+    assert_eq!(
+        refused,
+        EmitError::NoStream {
+            what: "a standing value"
+        }
+    );
+    assert_eq!(refused.next(), NextStep::FixRequest);
+}
+
+/// A node whose own face on its forwarder has no stream says so at the carrier: `Reliable`,
+/// `Window` and a standing value are refused `NoStream` at the emission, with no receiver asked
+/// yet, and `Latest` goes on working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn emit_reliable_over_a_face_with_no_stream_is_refused_no_stream_and_latest_still_works() {
+    use super::verbs::EmitError;
+    let rig = rig(false).await;
+    rig.links[1].no_stream_here.store(true, Ordering::SeqCst);
+    rig.bob().attach_forwarder().expect("side frames");
+    let heap = rig.bob().space(&space()).unwrap();
+
+    let refused = heap
+        .emit(&n("/a"), Bytes::from_static(b"x"), EmitOptions::reliable())
+        .await
+        .expect_err("Reliable needs the stream");
+    assert_eq!(refused, EmitError::NoStream { what: "Reliable" });
+    assert_eq!(refused.next(), NextStep::FixRequest);
+    let said = refused.to_string();
+    assert!(
+        said.contains("no ordered stream") && said.contains("emit with Mode::Latest, or put"),
+        "{said}"
+    );
+    heap.emit(&n("/a"), Bytes::from_static(b"x"), EmitOptions::latest())
+        .await
+        .expect("Latest needs no stream");
 }

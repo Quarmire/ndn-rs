@@ -17,7 +17,7 @@ use super::channels::{Admitted, Cap, SendKey};
 use super::standing::{Who, gate};
 use super::tx::{Checkpointing, KeySource, Refused, Terms, TxChannel};
 use super::verbs::{EmitError, EmitOptions};
-use super::wire::{ChanAsk, ChannelMode};
+use super::wire::{ChanAsk, ChannelMode, carrier};
 use crate::error::HeapError;
 use crate::node::NodeInner;
 use crate::rt::{self, Instant};
@@ -115,7 +115,8 @@ impl NodeInner {
         };
         let version = held.log.lock().fold.version();
         let tx = self.chan_tx_for(&ask.space, ask.mode, &key, version);
-        let terms = tx.welcome(admitted.fresh, ask.since, Instant::now());
+        let stream_path = ask.carriers.contains(&carrier::STREAM);
+        let terms = tx.welcome(admitted.fresh, ask.since, stream_path, Instant::now());
         // The table's own copy of the next sequence is what a re-key at the limit is decided on.
         self.chan.channels.note_seq(&ask.space, ask.mode, terms.seq);
         terms

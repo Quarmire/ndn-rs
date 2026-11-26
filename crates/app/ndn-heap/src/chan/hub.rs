@@ -19,6 +19,7 @@ use ndn_foundation_types::Name;
 use ndn_packet::Interest;
 use ndn_packet::encode::InterestBuilder;
 use ndn_security::ReplayGuard;
+use ndn_transport::FaceId;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
@@ -260,8 +261,9 @@ pub(crate) type PortFuture<'a> = futures::future::LocalBoxFuture<'a, ChanAnswer>
 /// What the network half asks of the node for channels: the answer to an ask, and an announce
 /// heard. The network half holds it weakly and only once the node is whole.
 pub(crate) trait ChanPort: Send + Sync {
-    /// Answer an ask (`serve::chan`).
-    fn answer(&self, interest: Interest) -> PortFuture<'_>;
+    /// Answer an ask (`serve::chan`) that arrived over the forwarder's face `ingress`, when the
+    /// connection says which.
+    fn answer(&self, interest: Interest, ingress: Option<FaceId>) -> PortFuture<'_>;
     /// An announce was heard on the sync face (never answered).
     fn heard(&self, interest: &Interest);
 }
@@ -270,8 +272,8 @@ pub(crate) trait ChanPort: Send + Sync {
 pub(crate) type PortCell = Arc<OnceLock<Weak<dyn ChanPort>>>;
 
 impl ChanPort for NodeInner {
-    fn answer(&self, interest: Interest) -> PortFuture<'_> {
-        Box::pin(async move { self.chan_answer(&interest).await })
+    fn answer(&self, interest: Interest, ingress: Option<FaceId>) -> PortFuture<'_> {
+        Box::pin(async move { self.chan_answer(&interest, ingress).await })
     }
 
     fn heard(&self, interest: &Interest) {

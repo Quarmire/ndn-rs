@@ -87,6 +87,8 @@ struct Receiver {
     /// When it was last given a key, and for how long.
     issued: Instant,
     lifetime: Duration,
+    /// The receiver is given the stream's frames; `false`: its path has none.
+    stream: bool,
 }
 
 impl Receiver {
@@ -100,6 +102,9 @@ impl Receiver {
 pub(crate) struct Live {
     /// How many receivers the channel has now.
     pub(crate) receivers: AtomicUsize,
+    /// How many of them are reached over a path with no stream (datagram class only): while
+    /// there is one, every message names itself and nothing that needs the stream is sent.
+    pub(crate) datagram_only: AtomicUsize,
     /// The key epoch (whole) frames are sealed under now.
     pub(crate) key_epoch: AtomicU32,
     /// The channel ended: it was closed or expired, or its space ended it.
@@ -174,6 +179,10 @@ pub(crate) struct Asker<'a> {
     /// remembers, which let the session go and asks again, is new again (the sender is not told
     /// when a receiver lets go, unless it was the last one behind the forwarder).
     pub(crate) new: bool,
+    /// The ask's carriers, once the first hop toward the asker is judged, include a stream: the
+    /// receiver is given the stream's frames (`HELLO`, binds, checkpoints, `END`). A receiver
+    /// reached over a path with no stream is given the datagram class only.
+    pub(crate) stream: bool,
 }
 
 /// What a channel gives the frame layer: the id and the key frames are sealed under now.
@@ -321,6 +330,18 @@ impl Channel {
         }
     }
 
+    /// Publish what the frame layer reads of the receivers: how many there are, and how many of
+    /// them are reached over a path with no stream.
+    fn sync_live(&self) {
+        self.live
+            .receivers
+            .store(self.receivers.len(), Ordering::Release);
+        self.live.datagram_only.store(
+            self.receivers.values().filter(|r| !r.stream).count(),
+            Ordering::Release,
+        );
+    }
+
     fn admitted(&self, receiver: &Receiver, rekeyed: bool, fresh: bool) -> Admitted {
         Admitted {
             id: self.id,
@@ -430,15 +451,13 @@ impl Channels {
             delivered: channel.key_epoch,
             issued: now,
             lifetime,
+            stream: asker.stream,
         };
         channel
             .receivers
             .insert(asker.device.clone(), receiver.clone());
         channel.empty_since = None;
-        channel
-            .live
-            .receivers
-            .store(channel.receivers.len(), Ordering::Release);
+        channel.sync_live();
         Ok(channel.admitted(&receiver, rekeyed, known.is_none() || asker.new))
     }
 
@@ -549,10 +568,7 @@ impl Channels {
                 channel.receivers.remove(device);
                 out.dropped.push((*mode, device.clone()));
             }
-            channel
-                .live
-                .receivers
-                .store(channel.receivers.len(), Ordering::Release);
+            channel.sync_live();
             let epoch_moved = audience.is_some_and(|a| channel.audience.as_ref() != Some(a));
             if !gone.is_empty() || epoch_moved {
                 if audience.is_some() {
@@ -597,10 +613,7 @@ impl Channels {
             if channel.rekey_owed && channel.rekey_allowed(now) {
                 channel.rekey(now);
             }
-            channel
-                .live
-                .receivers
-                .store(channel.receivers.len(), Ordering::Release);
+            channel.sync_live();
             if channel.receivers.is_empty() {
                 let since = *channel.empty_since.get_or_insert(now);
                 if now.saturating_duration_since(since) >= Duration::from_secs(LIFETIME_DEFAULT) {

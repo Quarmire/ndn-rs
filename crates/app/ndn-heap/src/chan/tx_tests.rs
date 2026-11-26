@@ -767,7 +767,7 @@ async fn window_keeps_at_most_its_limits_and_replays_them_to_a_joiner() {
         settle(&rig.tx).await;
         let _ = rig.link.take_stream();
     }
-    let terms = rig.tx.welcome(true, None, rig.t0);
+    let terms = rig.tx.welcome(true, None, true, rig.t0);
     assert_eq!(terms.window.unwrap().messages, 256);
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
@@ -797,7 +797,7 @@ async fn window_keeps_at_most_its_limits_and_replays_them_to_a_joiner() {
     // The replay takes new sequences, after HELLO's.
     assert!(replayed[0].seq > ops[0].0);
     // `since` names the start: a re-ask by a receiver that is not new gets only the replay.
-    let terms = rig.tx.welcome(false, Some(300), rig.t0);
+    let terms = rig.tx.welcome(false, Some(300), true, rig.t0);
     let _ = terms;
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
@@ -818,12 +818,12 @@ async fn window_keeps_at_most_its_limits_and_replays_them_to_a_joiner() {
         settle(&rig.tx).await;
         let _ = rig.link.take_stream();
     }
-    rig.tx.welcome(true, None, rig.t0);
+    rig.tx.welcome(true, None, true, rig.t0);
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
     assert_eq!(messages(&seen).len(), 10);
     // Age: eleven seconds later none of a 10 s window is left.
-    rig.tx.welcome(true, None, at(&rig, 11));
+    rig.tx.welcome(true, None, true, at(&rig, 11));
     settle(&rig.tx).await;
     assert!(messages(&stream(&mut rig)).is_empty());
     // A window over its maximum is clamped, not refused.
@@ -835,7 +835,7 @@ async fn window_keeps_at_most_its_limits_and_replays_them_to_a_joiner() {
         at(&rig, 12),
     )
     .await;
-    let terms = rig.tx.welcome(false, None, at(&rig, 12));
+    let terms = rig.tx.welcome(false, None, true, at(&rig, 12));
     let window = terms.window.unwrap();
     assert_eq!(
         (window.messages, window.bytes, window.ms),
@@ -864,7 +864,7 @@ async fn stalled_window(messages: usize, size: usize) -> Rig {
         let _ = rig.link.take_stream();
     }
     // The first welcome binds the name and fills the stalled stream.
-    rig.tx.welcome(true, None, rig.t0);
+    rig.tx.welcome(true, None, true, rig.t0);
     rig
 }
 
@@ -874,7 +874,7 @@ async fn stalled_window(messages: usize, size: usize) -> Rig {
 async fn repeated_since_asks_do_not_grow_the_fifo_past_queue_bytes() {
     let rig = stalled_window(256, 4_000).await;
     for second in 1..=100u64 {
-        rig.tx.welcome(false, Some(0), at(&rig, 2 * second));
+        rig.tx.welcome(false, Some(0), true, at(&rig, 2 * second));
         tokio::task::yield_now().await;
     }
     let queued = rig.tx.queued_bytes();
@@ -909,11 +909,11 @@ async fn a_since_replay_is_given_once_a_second_per_channel() {
     }
     let replayed = |rig: &mut Rig| messages(&stream(rig)).len();
     let asked = |rig: &mut Rig, at: Instant| {
-        rig.tx.welcome(false, Some(0), at);
+        rig.tx.welcome(false, Some(0), true, at);
         replayed(rig)
     };
     let t = rig.t0 + Duration::from_secs(5);
-    rig.tx.welcome(false, Some(0), t);
+    rig.tx.welcome(false, Some(0), true, t);
     settle(&rig.tx).await;
     assert_eq!(replayed(&mut rig), 20, "the first ask is replayed");
     let again = asked(&mut rig, t + SINCE_REPLAY_EVERY / 2);
@@ -924,7 +924,7 @@ async fn a_since_replay_is_given_once_a_second_per_channel() {
         "a second ask within the second is not"
     );
     assert_eq!(rig.stats.replay_refused.get(), 1);
-    rig.tx.welcome(false, Some(0), t + SINCE_REPLAY_EVERY);
+    rig.tx.welcome(false, Some(0), true, t + SINCE_REPLAY_EVERY);
     settle(&rig.tx).await;
     assert_eq!(
         replayed(&mut rig),
@@ -932,7 +932,7 @@ async fn a_since_replay_is_given_once_a_second_per_channel() {
         "a second later it is replayed again"
     );
     // A joiner that was not a receiver before is given its replay whenever it comes.
-    rig.tx.welcome(true, None, t + SINCE_REPLAY_EVERY);
+    rig.tx.welcome(true, None, true, t + SINCE_REPLAY_EVERY);
     settle(&rig.tx).await;
     assert_eq!(replayed(&mut rig), 20);
 }
@@ -962,7 +962,7 @@ async fn stand_is_limited_and_replays_between_its_brackets_with_what_is_left() {
     settle(&rig.tx).await;
     let _ = datagrams(&mut rig);
     let _ = stream(&mut rig);
-    rig.tx.welcome(true, None, at(&rig, 20));
+    rig.tx.welcome(true, None, true, at(&rig, 20));
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
     let ops = controls(&seen);
@@ -984,14 +984,14 @@ async fn stand_is_limited_and_replays_between_its_brackets_with_what_is_left() {
     // Between the brackets, in the order of the sequences: BEGIN < a < b < END.
     assert!(ops[1].0 < standing[0].seq && standing[1].seq < ops[2].0);
     // b is gone a minute later; the replay carries a alone.
-    rig.tx.welcome(true, None, at(&rig, 60));
+    rig.tx.welcome(true, None, true, at(&rig, 60));
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
     assert_eq!(messages(&seen).len(), 1);
     assert_eq!(messages(&seen)[0].stand_secs, Some(40));
     // A later emission that does not stand takes the standing value of its name away.
     send(&rig, &name(1), b"new", &EmitOptions::latest(), at(&rig, 61)).await;
-    rig.tx.welcome(true, None, at(&rig, 62));
+    rig.tx.welcome(true, None, true, at(&rig, 62));
     settle(&rig.tx).await;
     assert!(messages(&stream(&mut rig)).is_empty());
 
@@ -1107,6 +1107,73 @@ async fn a_path_with_no_stream_refuses_the_modes_that_need_one() {
     assert!(rig.link.take_stream().is_empty());
 }
 
+/// One receiver of a channel is behind a hop with no stream (it was welcomed with
+/// `stream_path` false): it is sent no stream frame and its session announces no checkpoints;
+/// while it holds the channel every message names itself (it is given no `BIND`), and what needs
+/// the stream, a standing value or a message that fits no datagram, is refused at the emission.
+/// The carrier itself has a stream: the others on the channel keep it.
+#[tokio::test]
+async fn a_receiver_behind_a_hop_with_no_stream_degrades_the_channel_to_what_it_can_take() {
+    let mut rig = rig(ChannelMode::Latest, LinkConfig::default());
+    let stand = EmitOptions::latest().standing(Duration::from_secs(60));
+    // Before it joined, a name was bound and a value stood.
+    send(&rig, &name(1), b"a", &stand, rig.t0).await;
+    settle(&rig.tx).await;
+    let _ = (datagrams(&mut rig), stream(&mut rig));
+
+    let terms = rig.tx.welcome(true, None, false, at(&rig, 1));
+    rig.live.datagram_only.store(1, Ordering::SeqCst);
+    settle(&rig.tx).await;
+    assert_eq!(terms.ckpt_ms, 0, "its session announces no checkpoint");
+    assert!(
+        stream(&mut rig).is_empty(),
+        "no HELLO, no bind, no standing value: they would be dropped at the hop"
+    );
+
+    // Every message names itself, even long after the bind.
+    for i in 0..5 {
+        send(
+            &rig,
+            &name(1),
+            b"x",
+            &EmitOptions::latest(),
+            at(&rig, 10 + i),
+        )
+        .await;
+    }
+    let seen = datagrams(&mut rig);
+    assert!(messages(&seen).iter().all(|m| m.name.is_some()));
+
+    // What needs the stream is refused, with the next step.
+    let refused = error_of(
+        rig.tx
+            .emit(&name(2), &Bytes::from_static(b"v"), &stand, at(&rig, 20))
+            .await,
+    );
+    assert_eq!(
+        refused,
+        EmitError::NoStream {
+            what: "a standing value"
+        }
+    );
+    assert_eq!(refused.next(), crate::NextStep::FixRequest);
+    let refused = error_of(
+        rig.tx
+            .emit(
+                &name(1),
+                &Bytes::from(vec![0u8; 3_000]),
+                &EmitOptions::latest(),
+                at(&rig, 21),
+            )
+            .await,
+    );
+    assert!(matches!(refused, EmitError::TooLarge { .. }), "{refused:?}");
+
+    // It left: the channel has its stream again.
+    rig.live.datagram_only.store(0, Ordering::SeqCst);
+    send(&rig, &name(2), b"v", &stand, at(&rig, 22)).await;
+}
+
 #[tokio::test]
 async fn a_sender_with_no_receiver_sends_nothing_and_keeps_what_a_joiner_needs() {
     let mut rig = rig(ChannelMode::Window, LinkConfig::default());
@@ -1128,7 +1195,7 @@ async fn a_sender_with_no_receiver_sends_nothing_and_keeps_what_a_joiner_needs()
     assert_eq!(rig.stats.unrouted.get(), 3);
     // A receiver joins: the window is replayed.
     rig.live.receivers.store(1, Ordering::SeqCst);
-    rig.tx.welcome(true, None, rig.t0);
+    rig.tx.welcome(true, None, true, rig.t0);
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
     let payloads: Vec<u8> = messages(&seen).iter().map(|m| m.payload[0]).collect();

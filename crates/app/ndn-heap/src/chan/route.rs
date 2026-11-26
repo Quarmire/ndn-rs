@@ -15,6 +15,9 @@
 //!   the face reader and can overtake the Data that is still in the pipeline installing the
 //!   route, and a `Keep` that reached the sender proves that every hop holds the route. A channel
 //!   that got none in that time sends no stream frame until one comes (**no route, no send**).
+//!   A receiver asks over some face of the sender's forwarder; the sender asks the connection
+//!   whether that face carries the stream ([`Connection::side_carries`]) and refuses a mode that
+//!   needs one, `NoStream`, or answers a `Latest` ask with a session that offers none.
 //! * **The receiver.** One task reads `Connection::recv_side` and hands each frame to the node
 //!   ([`deliver_frame`](NodeHandle::deliver_frame), with the forwarder's face id as the ingress):
 //!   the engine's face reader never calls it, so the wait of a blocked `Reliable` queue stalls
@@ -24,9 +27,11 @@
 //!   the last one. When the session ends, is replaced or is removed, and when the last `Items`
 //!   that takes it is dropped (which ends the session), the node sends `UP Unsub` and no
 //!   `Keep` follows.
-//! * **No path.** A session whose `HELLO` has not come [`NO_PATH_AFTER`] (2 s) after it was
-//!   installed tells every `Items` that takes it `LiveEnded(NoPath)`: a forwarder between the
-//!   two does not carry channel frames.
+//! * **No path.** A session that offers a stream and whose `HELLO` has not come [`NO_PATH_AFTER`]
+//!   (2 s) after it was installed tells every `Items` that takes it `LiveEnded(NoPath)`: a
+//!   forwarder between the two does not carry channel frames. A session that offers none (the
+//!   first hop toward this node, judged by the sender, has no stream) is sent no `HELLO` and
+//!   is told nothing.
 //! * **The bar.** [`ConnectionBar`] asks the forwarder to bar a face
 //!   (`Connection::side_quarantine`) when a frame that came over it was shown to be forged.
 //!
@@ -137,6 +142,15 @@ impl Routes {
         self.conn.lock().clone()
     }
 
+    /// Whether the first hop toward a receiver, the forwarder's face `face` that its ask came
+    /// in over, carries the stream class ([`Connection::side_carries`]). `true` when no
+    /// forwarder is attached (the node's carrier is a link of its own, and the ask's face is
+    /// not where its frames go) or the connection cannot see the face.
+    pub(crate) fn path_carries_stream(&self, face: FaceId) -> bool {
+        self.conn()
+            .is_none_or(|conn| conn.side_carries(face, SideClass::Stream))
+    }
+
     /// A receiver's `Keep` for channel `id` reached this node: every hop holds its route.
     pub(super) fn note_keep(&self, id: u64) {
         {
@@ -217,6 +231,7 @@ pub(crate) struct ConnectionCarrier {
     conn: Arc<dyn Connection>,
     routes: Arc<Routes>,
     datagram_max: usize,
+    stream: bool,
     ready: Arc<Mutex<Ready>>,
 }
 
@@ -233,10 +248,12 @@ impl ConnectionCarrier {
         routes: Arc<Routes>,
         datagram_max: usize,
     ) -> ConnectionCarrier {
+        let stream = conn.side_carries_here(SideClass::Stream);
         ConnectionCarrier {
             conn,
             routes,
             datagram_max,
+            stream,
             ready: Arc::new(Mutex::new(Ready::default())),
         }
     }
@@ -260,8 +277,12 @@ impl Carrier for ConnectionCarrier {
         self.conn.side_frame_max().min(self.datagram_max)
     }
 
+    /// Whether the node's own face on its forwarder carries the stream class (read once: it is
+    /// a fact about the face's medium). The hop toward each receiver is judged when the
+    /// receiver asks ([`Routes::path_carries_stream`]), and a receiver behind a hop with no
+    /// stream is given a session that offers none.
     fn has_stream(&self) -> bool {
-        true
+        self.stream
     }
 
     fn stream_frame_max(&self) -> usize {
@@ -494,7 +515,10 @@ impl NodeInner {
                 routes.keeps.bump();
             }
             if !entry.path_settled {
-                if self.chan.rx.path_seen(id) {
+                // A session that offers no stream is sent no `HELLO` (the path from the sender
+                // carries datagrams only): there is nothing to wait for, and a quiet sender is
+                // not a missing path.
+                if self.chan.rx.path_seen(id) || !session.offers_stream() {
                     entry.path_settled = true;
                 } else if now.saturating_duration_since(session.installed()) >= NO_PATH_AFTER
                     && wanted

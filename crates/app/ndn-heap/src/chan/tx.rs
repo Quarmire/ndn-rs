@@ -876,7 +876,9 @@ impl TxChannel {
                 }
                 .into());
             }
-            if opts.stand.is_some() && !c.has_stream() {
+            if opts.stand.is_some()
+                && (!c.has_stream() || self.live.datagram_only.load(Ordering::Acquire) > 0)
+            {
                 return Err(EmitError::NoStream {
                     what: "a standing value",
                 }
@@ -895,6 +897,9 @@ impl TxChannel {
             return self.quiet(st, path, payload, opts, stand_secs, now);
         };
         let stream = carrier.has_stream();
+        // A receiver behind a hop with no stream is given no `BIND`, so no message of the
+        // channel may rely on one; and nothing that needs the stream can reach it.
+        let degraded = self.live.datagram_only.load(Ordering::Acquire) > 0;
 
         // What the message would be, without changing anything.
         let peeked = st.table.peek(path, now);
@@ -915,7 +920,7 @@ impl TxChannel {
             }
             .into());
         }
-        let named = named_wanted || !stream;
+        let named = named_wanted || !stream || degraded;
         let zeros = [0u8; NAME_MAX];
         let probe = OutMessage {
             name_id: peeked.map_or(limits::NAMES_PER_CHANNEL, |(id, _, _)| id),
@@ -937,7 +942,7 @@ impl TxChannel {
                 })?;
         let big = self.mode == ChannelMode::Latest
             && need > limits::datagram_limit(carrier.datagram_max(), FRAME_CAP);
-        if big && !stream {
+        if big && (!stream || degraded) {
             return Err(EmitError::TooLarge {
                 what: "message that fits no datagram on a path with no stream",
                 size: need,
@@ -1015,7 +1020,7 @@ impl TxChannel {
             seq,
             id: used.id,
             name: used.octets,
-            named: used.named || !stream,
+            named: used.named || !stream || degraded,
             stand: stand_secs,
             origin: None,
             payload: payload.clone(),
@@ -1788,14 +1793,20 @@ impl TxChannel {
     ///
     /// `fresh`: the device was not a receiver before; others (a renewal, a re-ask) are given
     /// nothing but the replay of a window they name a start for.
+    ///
+    /// `stream_path`: the path to this receiver carries the stream class (the first hop toward
+    /// it was judged when it asked). A receiver behind a hop that does not is given the table
+    /// the session holds and no frame of the stream (`HELLO`, binds, standing values, a replay),
+    /// and a session that announces no checkpoints: those frames would be dropped at the hop.
     pub(crate) fn welcome(
         self: &Arc<Self>,
         fresh: bool,
         since: Option<u64>,
+        stream_path: bool,
         now: Instant,
     ) -> Terms {
         let carrier = self.slot.get();
-        let stream = carrier.as_ref().is_some_and(|c| c.has_stream());
+        let stream = stream_path && carrier.as_ref().is_some_and(|c| c.has_stream());
         // What follows the session on the stream waits, on a carrier that routes by a table the
         // answer fills, until this receiver's route is up.
         if stream
