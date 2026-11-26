@@ -44,8 +44,9 @@ use ndn_packet::{Data, Interest, NackReason};
 use ndn_security::cert_name::{is_cert_name, is_key_name, key_name_of};
 use parking_lot::Mutex;
 
-use crate::chan::answer::{ChanAnswer, no_cache};
+use crate::chan::answer::ChanAnswer;
 use crate::chan::hub::ChanPort;
+use crate::chan::route::setup_headers;
 use crate::limit::Counts;
 use crate::seal::seal_key_matches;
 use crate::sync::{HostRef, Net, Shared};
@@ -168,8 +169,19 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
         None => match shared.extensions.answering(&me, &name) {
             Some(extension) if !is_local(&name) => {
                 shared.tasks.spawn(async move {
-                    let wire = extension.answer(&interest).await;
-                    reply(&name, responder, wire).await;
+                    let answer = extension.answer(&interest).await;
+                    let Some(answer) = answer else {
+                        reply(&name, responder, None).await;
+                        return;
+                    };
+                    // A label rides on an LpPacket; an answer without one goes out bare.
+                    let sent = match answer.headers() {
+                        Some(headers) => responder.respond_bytes_with(answer.wire, headers).await,
+                        None => responder.respond_bytes(answer.wire).await,
+                    };
+                    if let Err(e) = sent {
+                        tracing::debug!(%name, "reply not sent: {e}");
+                    }
                 });
                 return;
             }
@@ -185,7 +197,16 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
 async fn chan(port: Arc<dyn ChanPort>, interest: Interest, responder: Responder) {
     let name = (*interest.name).clone();
     let sent = match port.answer(interest).await {
-        ChanAnswer::Data(wire) => responder.respond_bytes(no_cache(&wire)).await,
+        ChanAnswer::Data(wire) => {
+            responder
+                .respond_bytes_with(wire, setup_headers(None))
+                .await
+        }
+        ChanAnswer::Session { wire, id } => {
+            responder
+                .respond_bytes_with(wire, setup_headers(Some(id)))
+                .await
+        }
         ChanAnswer::Nack(reason) => responder.nack(reason).await,
     };
     if let Err(e) = sent {

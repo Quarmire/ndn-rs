@@ -16,7 +16,7 @@ use ndn_security::ValidationResult;
 
 use super::*;
 use crate::error::{NextStep, Refusal};
-use crate::host::{AnswerFuture, Extension, NodeHandle};
+use crate::host::{Answer, AnswerFuture, Extension, NodeHandle};
 use crate::node::tests::{Counting, boot, solo};
 use crate::space::MembersChange;
 use crate::store::Kind;
@@ -38,7 +38,10 @@ impl Extension for Pinger {
         Box::pin(async move {
             self.asked.fetch_add(1, Ordering::SeqCst);
             let name = (*interest.name).clone();
-            self.node.sign_packet(DataBuilder::new(name, b"pong")).ok()
+            self.node
+                .sign_packet(DataBuilder::new(name, b"pong"))
+                .ok()
+                .map(Answer::plain)
         })
     }
 }

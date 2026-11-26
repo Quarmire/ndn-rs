@@ -72,6 +72,10 @@ ndn-engine = { workspace = true }
 # `sync_group::carry` runs a namespace's sync group on the cluster's engine;
 # the devices' faces end with their cancellation token.
 ndn-namespace = { workspace = true }
+# The stage-4 tests run the nodes on an engine whose clock they move (`Runtime::unix_nanos`) and
+# drive the carrier over an in-process face.
+ndn-runtime = { workspace = true }
+ndn-face-local = { workspace = true }
 
 [lints]
 workspace = true

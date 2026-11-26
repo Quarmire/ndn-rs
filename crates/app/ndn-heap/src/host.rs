@@ -54,12 +54,52 @@ use crate::space::Heap;
 use crate::store::Kind;
 use crate::wire::{CORE_KEYWORDS, parse_log_name};
 
+/// What an [`Extension`] answers an Interest with: the Data wire, and, if the answer sets up a
+/// route in the forwarders on its reverse path, the label that does it.
+///
+/// The label is an NDNLPv2 `SideRoute { id, ttl }` on the Data (channel.md, The forwarder's side
+/// table): each forwarder that matched the Interest installs a route for the 64-bit `id` and
+/// sends the Data on with the label, so frames of that id that the extension then sends over its
+/// connection (`ndn_app::Connection::send_side`) reach whoever asked. The heap's own channel
+/// setup uses it; an extension carrying frames of its own may.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Answer {
+    /// The signed Data.
+    pub wire: Bytes,
+    /// The route label `(id, ttl in seconds)`, if the answer carries one.
+    pub side: Option<(u64, u16)>,
+}
+
+impl Answer {
+    /// A Data that sets up no route.
+    pub fn plain(wire: Bytes) -> Answer {
+        Answer { wire, side: None }
+    }
+
+    /// A Data that carries the route label `(id, ttl_secs)`.
+    pub fn routed(wire: Bytes, id: u64, ttl_secs: u16) -> Answer {
+        Answer {
+            wire,
+            side: Some((id, ttl_secs)),
+        }
+    }
+
+    /// The LP headers the answer goes out with, `None` for a plain one (it goes out bare).
+    pub(crate) fn headers(&self) -> Option<ndn_packet::lp::LpHeaders> {
+        let (id, ttl_secs) = self.side?;
+        Some(ndn_packet::lp::LpHeaders {
+            side_route: Some(ndn_packet::lp::SideRoute { id, ttl_secs }),
+            ..ndn_packet::lp::LpHeaders::default()
+        })
+    }
+}
+
 /// The future of an [`Extension::answer`].
 #[cfg(not(target_arch = "wasm32"))]
-pub type AnswerFuture<'a> = futures::future::BoxFuture<'a, Option<Bytes>>;
+pub type AnswerFuture<'a> = futures::future::BoxFuture<'a, Option<Answer>>;
 /// The future of an [`Extension::answer`].
 #[cfg(target_arch = "wasm32")]
-pub type AnswerFuture<'a> = futures::future::LocalBoxFuture<'a, Option<Bytes>>;
+pub type AnswerFuture<'a> = futures::future::LocalBoxFuture<'a, Option<Answer>>;
 
 /// A protocol a sibling crate adds to a device: it answers the Interests under
 /// `<D>/32=<keyword>` (`D` the device) for each of its [`keywords`](Self::keywords).
@@ -73,8 +113,8 @@ pub trait Extension: Send + Sync {
     /// extension registered. Read once, when it is registered.
     fn keywords(&self) -> &'static [&'static str];
 
-    /// The Data wire that answers `interest`, or `None`: the Interest is then
-    /// Nacked, as one nothing answers is.
+    /// The answer to `interest` (the Data wire, and a route label if it sets one up), or `None`:
+    /// the Interest is then Nacked, as one nothing answers is.
     fn answer<'a>(&'a self, interest: &'a Interest) -> AnswerFuture<'a>;
 }
 

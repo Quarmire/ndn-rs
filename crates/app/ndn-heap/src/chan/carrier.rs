@@ -43,6 +43,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use ndn_foundation_types::Name;
 use parking_lot::RwLock;
 
 use crate::host::NodeHandle;
@@ -89,6 +90,15 @@ pub trait Carrier: Send + Sync {
 
     /// Call `drain` once, from the carrier's writer task, when a datagram would be taken again.
     fn on_ready(&self, drain: Box<dyn FnOnce() + Send>);
+
+    /// A receiver of `channel` was judged in and its session is being answered: the stream frames
+    /// the sender queues for it (`HELLO`, the binds, the standing values) follow in the next
+    /// moments. A carrier whose path routes frames by a table that the answer itself fills (the
+    /// forwarder's side table) holds them until the receiver's route is up; one with a fixed
+    /// route does nothing (the default). Never blocks.
+    fn receiver_added(&self, channel: u64) {
+        let _ = channel;
+    }
 }
 
 /// The node's fixed route: the carrier frames go to, if one was attached.
@@ -123,4 +133,57 @@ impl NodeHandle {
     pub fn attach_carrier(&self, carrier: Arc<dyn Carrier>) {
         self.inner.chan.tx.carrier.set(carrier);
     }
+}
+
+/// The ring a sender offered, as the host reports it.
+pub struct RingOffered {
+    /// The 32-octet secret that gates the ring's attach: it travels inside the channel's sealed
+    /// session record (`S_WRAP`), so only the session's audience can attach.
+    pub secret: [u8; 32],
+    /// The carrier that publishes frames into the ring: datagram class only (a lossy ring has no
+    /// ordered stream), `has_stream` false, never blocking.
+    pub carrier: Arc<dyn Carrier>,
+}
+
+/// Why a host did not offer or attach a ring.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RingRefused {
+    /// No ring of that name is served on this host (the sender is on another host, or has ended):
+    /// use the link carriers.
+    NotHere,
+    /// The ring's owner and the host do not share the ring's secret: the session record the secret
+    /// came from is not this ring's.
+    Refused,
+    /// The host cannot run a ring now; the text says why and what to do.
+    Unavailable(String),
+}
+
+/// What a host that can run same-host **rings** gives a node, beside its [`Carrier`]s
+/// (docs/specs/channel.md, the ring carrier). `ndn-heap` cannot depend on the faces that implement
+/// a ring (`ndn-face-shm`'s `RingFace`, in `ndn-ext`), so the host does: the sender asks it to
+/// **offer** a ring for a channel and lists it in the session's `S_CARRIER`; a receiver on the
+/// same host asks it to **attach**, with the secret from the sealed session, and the host adds the
+/// ring's face to its forwarder, whose side table routes the frames from it.
+///
+/// A ring name is `<sender>/32=chan/32=ring/<channel id hex>`, unique per channel.
+pub trait CarrierHost: Send + Sync {
+    /// Offer a ring named `ring` for frames of at most `frame_max` octets: create it, add its
+    /// writer face to the forwarder as a sink, and return the attach secret with the carrier that
+    /// publishes to it.
+    fn offer_ring(
+        &self,
+        ring: &Name,
+        frame_max: usize,
+    ) -> CarrierFuture<'_, Result<RingOffered, RingRefused>>;
+
+    /// Attach to the ring named `ring` with `secret` iff it is served on this host
+    /// ([`RingRefused::NotHere`] otherwise, at once): add a reader face to the forwarder, which
+    /// becomes the source of the route its frames take. Returns the forwarder's face id of the
+    /// reader, the `ingress` the node's
+    /// [`deliver_frame`](crate::host::NodeHandle::deliver_frame) takes for frames that came over it.
+    fn attach_ring(
+        &self,
+        ring: &Name,
+        secret: [u8; 32],
+    ) -> CarrierFuture<'_, Result<u64, RingRefused>>;
 }

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
-use ndn_heap::host::{AnswerFuture, Extension, NodeHandle};
+use ndn_heap::host::{Answer, AnswerFuture, Extension, NodeHandle};
 use ndn_heap::{Node, Timestamp};
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::{Data, Interest};
@@ -273,7 +273,10 @@ impl Extension for Served {
     }
 
     fn answer<'a>(&'a self, interest: &'a Interest) -> AnswerFuture<'a> {
-        Box::pin(async move { self.0.upgrade()?.serve(interest).await })
+        Box::pin(async move {
+            let wire = self.0.upgrade()?.serve(interest).await?;
+            Some(Answer::plain(wire))
+        })
     }
 }
 
