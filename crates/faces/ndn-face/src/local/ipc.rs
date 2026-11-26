@@ -14,14 +14,16 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use ndn_transport::{FaceId, FaceKind, PeerCredentials, StreamFace, TlvCodec};
+use ndn_transport::{FaceId, FaceKind, PeerCredentials, SideTlvCodec, StreamFace};
 
 use super::operators::ProgramPeers;
 
 type DynRead = Box<dyn AsyncRead + Send + Sync + Unpin>;
 type DynWrite = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
-pub type IpcFace = StreamFace<DynRead, DynWrite, TlvCodec>;
+/// An IPC face carries NDN packets as TLV elements and channel (side) frames as records
+/// ([`ndn_transport::side_stream`]); both ends of the socket are IPC faces.
+pub type IpcFace = StreamFace<DynRead, DynWrite, SideTlvCodec>;
 
 /// An IPC face. `creds` are the peer credentials the operating system
 /// reported for the socket, or `None` where it reports none (a Windows named
@@ -29,6 +31,9 @@ pub type IpcFace = StreamFace<DynRead, DynWrite, TlvCodec>;
 /// ([`ndn_transport::FaceTrust::Program`]) only when the credentials exist
 /// and `peers` admits them; otherwise its Data is validated. The socket is
 /// world-connectable, so being identified is not enough.
+///
+/// The face carries side frames: its pump (the task that writes queued records) is spawned
+/// here and ends when the face is dropped. Call it from within a Tokio runtime.
 fn make_face(
     id: FaceId,
     kind: FaceKind,
@@ -39,11 +44,14 @@ fn make_face(
     peers: &ProgramPeers,
 ) -> IpcFace {
     let face =
-        StreamFace::new(id, kind, None, Some(uri), r, w, TlvCodec).with_peer_credentials(creds);
-    match creds {
+        StreamFace::new(id, kind, None, Some(uri), r, w, SideTlvCodec).with_peer_credentials(creds);
+    let face = match creds {
         Some(c) if peers.contains(&c) => face.program_peer(),
         _ => face,
-    }
+    };
+    let (face, pump) = face.with_side_lane();
+    tokio::spawn(pump.run());
+    face
 }
 
 /// Kernel-attested credentials of the process at the other end of `stream`

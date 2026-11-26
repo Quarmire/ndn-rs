@@ -26,7 +26,7 @@
 //! and later exchange with [`ForwarderError::Closed`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use parking_lot::Mutex as SyncMutex;
@@ -34,8 +34,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use ndn_face::local::IpcFace;
+use ndn_face::local::in_proc::{SIDE_INBOX_BYTES, SIDE_INBOX_FRAMES};
 use ndn_packet::{Data, Name};
-use ndn_transport::Transport;
+use ndn_transport::{FaceId, SIDE_MARKER};
 
 use crate::forwarder_client::{ForwarderError, strip_lp};
 
@@ -43,12 +44,24 @@ use crate::forwarder_client::{ForwarderError, strip_lp};
 /// later exchange waits for a reply that can no longer arrive.
 type Pending = Arc<SyncMutex<Option<Vec<(Name, oneshot::Sender<Bytes>)>>>>;
 
+/// The side frames the forwarder routed to this connection, held for the one that reads them:
+/// bounded in frames and in octets like an in-process app's inbox, and a frame that finds it full is
+/// dropped and counted (the sender's receiver sees the gap, as a congested link's would; the
+/// reader of the face cannot wait without holding up management replies).
+#[derive(Default)]
+struct SideGauge {
+    queued: AtomicUsize,
+    dropped: AtomicU64,
+}
+
 /// One reader of an [`IpcFace`], demultiplexing management responses from the
 /// data stream. See the module docs.
 pub(crate) struct FaceMux {
     pending: Pending,
     deliver_data: Arc<AtomicBool>,
     fallback: Mutex<mpsc::UnboundedReceiver<Bytes>>,
+    side: Mutex<mpsc::Receiver<(Bytes, FaceId)>>,
+    side_gauge: Arc<SideGauge>,
 }
 
 /// A management exchange's reply, routed by the reader.
@@ -64,7 +77,8 @@ impl Reply {
 
 impl FaceMux {
     /// Start the reader over `face`. It runs until `cancel` fires or the face
-    /// closes; on a close it sets `dead` and cancels `cancel`. Must be called
+    /// closes (or the peer sends what the framing does not allow, which closes the
+    /// face); on a close it sets `dead` and cancels `cancel`. Must be called
     /// from within a Tokio runtime.
     pub(crate) fn new(
         face: Arc<IpcFace>,
@@ -72,16 +86,19 @@ impl FaceMux {
         dead: Arc<AtomicBool>,
     ) -> Arc<Self> {
         let (fb_tx, fb_rx) = mpsc::unbounded_channel();
+        let (side_tx, side_rx) = mpsc::channel(SIDE_INBOX_FRAMES);
+        let side_gauge = Arc::new(SideGauge::default());
         let pending: Pending = Arc::new(SyncMutex::new(Some(Vec::new())));
         let deliver_data = Arc::new(AtomicBool::new(true));
         {
             let pending = Arc::clone(&pending);
             let deliver_data = Arc::clone(&deliver_data);
+            let side_gauge = Arc::clone(&side_gauge);
             tokio::spawn(async move {
                 loop {
-                    let raw = tokio::select! {
+                    let inbound = tokio::select! {
                         _ = cancel.cancelled() => break,
-                        r = face.recv_bytes() => match r {
+                        r = face.recv_inbound() => match r {
                             Ok(b) => b,
                             Err(_) => {
                                 dead.store(true, Ordering::Relaxed);
@@ -90,7 +107,25 @@ impl FaceMux {
                             }
                         },
                     };
-                    let pkt = strip_lp(raw);
+                    // A side frame is no NDN packet: it goes to the side inbox, with the face it
+                    // arrived over at the forwarder, before anything reads it as one.
+                    if inbound.wire.first() == Some(&SIDE_MARKER) {
+                        let len = inbound.wire.len();
+                        let before = side_gauge.queued.fetch_add(len, Ordering::AcqRel);
+                        let admitted = before.saturating_add(len) <= SIDE_INBOX_BYTES
+                            && side_tx
+                                .try_send((
+                                    inbound.wire,
+                                    inbound.ingress.unwrap_or(FaceId::INVALID),
+                                ))
+                                .is_ok();
+                        if !admitted {
+                            side_gauge.queued.fetch_sub(len, Ordering::AcqRel);
+                            side_gauge.dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                    let pkt = strip_lp(inbound.wire);
                     // Route a Data that satisfies a pending management exchange.
                     if let Ok(data) = Data::decode(pkt.clone()) {
                         let taken = pending.lock().as_mut().and_then(|pend| {
@@ -119,6 +154,8 @@ impl FaceMux {
             pending,
             deliver_data,
             fallback: Mutex::new(fb_rx),
+            side: Mutex::new(side_rx),
+            side_gauge,
         })
     }
 
@@ -145,5 +182,20 @@ impl FaceMux {
     /// exchange). `None` when the face has closed.
     pub(crate) async fn recv(&self) -> Option<Bytes> {
         self.fallback.lock().await.recv().await
+    }
+
+    /// The next side frame the forwarder routed to this connection, with the id of the face it
+    /// arrived over at the forwarder. `None` when the face has closed.
+    pub(crate) async fn recv_side(&self) -> Option<(Bytes, FaceId)> {
+        let item = self.side.lock().await.recv().await?;
+        self.side_gauge
+            .queued
+            .fetch_sub(item.0.len(), Ordering::AcqRel);
+        Some(item)
+    }
+
+    /// How many side frames were dropped because the inbox was full.
+    pub(crate) fn side_dropped(&self) -> u64 {
+        self.side_gauge.dropped.load(Ordering::Relaxed)
     }
 }

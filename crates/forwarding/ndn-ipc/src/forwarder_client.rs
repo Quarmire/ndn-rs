@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use ndn_face::local::IpcFace;
 use ndn_packet::Name;
 use ndn_packet::lp::encode_lp_packet;
-use ndn_transport::{FaceId, Transport};
+use ndn_transport::{FaceId, SideClass, SideRefused, Transport};
 
 use crate::face_mux::FaceMux;
 use crate::mgmt_client::MgmtClient;
@@ -302,6 +302,54 @@ impl ForwarderClient {
             DataTransport::External(dp) => dp.recv().await,
             DataTransport::Unix => self.mux.recv().await,
         }
+    }
+
+    /// The longest side frame (a channel frame, [`SIDE_MARKER`] first) this client carries to
+    /// the forwarder: what its control face grants on the Unix data plane. `0` over an external
+    /// data plane (shared memory): a channel frame must reach the forwarder over the face its
+    /// Data went out on, which is the data plane's, and no data plane here carries one. Connect
+    /// with [`connect_unix_only`](Self::connect_unix_only) to carry channel frames.
+    pub fn side_frame_max(&self) -> usize {
+        match &self.transport {
+            DataTransport::Unix => Transport::side_frame_max(&*self.control),
+            DataTransport::External(_) => 0,
+        }
+    }
+
+    /// Send one side frame to the forwarder, waiting for room in the face's queue. Refused
+    /// [`NotCarried`](SideRefused::NotCarried) over an external data plane, and
+    /// [`Malformed`](SideRefused::Malformed) or [`TooLarge`](SideRefused::TooLarge) for a frame
+    /// that is none or over [`side_frame_max`](Self::side_frame_max).
+    pub async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        if self.side_frame_max() == 0 {
+            return Err(SideRefused::NotCarried);
+        }
+        Transport::send_side(&*self.control, frame, class).await
+    }
+
+    /// [`send_side`](Self::send_side) that never waits: [`Full`](SideRefused::Full) when the
+    /// face's queue has no room.
+    pub fn try_send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        if self.side_frame_max() == 0 {
+            return Err(SideRefused::NotCarried);
+        }
+        Transport::forward_side(&*self.control, frame, class)
+    }
+
+    /// Completes when [`try_send_side`](Self::try_send_side) may take a frame again.
+    pub async fn side_ready(&self) {
+        self.control.side_ready().await;
+    }
+
+    /// The next side frame the forwarder routed to this client, with the id of the face it
+    /// arrived over at the forwarder. `None` when the control face has closed.
+    pub async fn recv_side(&self) -> Option<(Bytes, FaceId)> {
+        self.mux.recv_side().await
+    }
+
+    /// How many side frames were dropped because this client did not read them fast enough.
+    pub fn side_dropped(&self) -> u64 {
+        self.mux.side_dropped()
     }
 
     /// True when an external fast data plane (e.g. SHM) is attached, rather than

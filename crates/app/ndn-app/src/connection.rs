@@ -287,6 +287,14 @@ const NO_SIDE: &str = "this connection carries no channel frames: it does not re
      that routes them. Run the heap node over a connection to an embedded engine \
      (`EngineAppExt::app_face`), or over a forwarder face that carries marked frames";
 
+/// Why an IPC connection on a shared-memory data plane carries no side frames, and what to do.
+#[cfg(not(target_arch = "wasm32"))]
+const NO_SIDE_SHM: &str = "this connection to an ndn-fwd daemon uses a shared-memory data plane, \
+     which carries NDN packets only, and a channel frame must reach the daemon over the face its \
+     Data went out on. Connect over the unix socket alone (`ForwarderClient::connect_unix_only`, \
+     or do not install the shared-memory data plane in this process), or run the heap node over \
+     an embedded engine (`EngineAppExt::app_face`)";
+
 /// Why a connection cannot bar a face, and what to do.
 const NO_QUARANTINE: &str = "this connection cannot ask its forwarder to bar a face: it has no \
      handle on the forwarder's side table. Use `EngineAppExt::app_face` (an embedded engine) or \
@@ -426,18 +434,35 @@ impl Connection for IpcConnection {
         Some(RouteEvents::pushed(rx))
     }
 
-    /// A channel frame does not travel on this connection: the daemon's unix-socket and
-    /// shared-memory faces carry NDN packets, framed as TLV, and a side frame (first octet
-    /// `0x00`) is none. Nothing is sent.
+    /// The longest channel frame this connection carries: what the daemon's unix-socket face
+    /// grants (`0` when the client's data plane is shared memory, which carries none).
+    fn side_frame_max(&self) -> usize {
+        self.client.side_frame_max()
+    }
+
+    /// A channel frame goes to the daemon on the connection's socket, as a side record beside
+    /// its NDN packets, and the daemon routes it by its channel id like any other face's.
     async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), AppError> {
-        let _ = (frame, class);
-        Err(AppError::Unsupported(
-            "this connection to an ndn-fwd daemon carries NDN packets only: its socket and \
-             shared-memory faces frame what they carry as TLV packets, which a channel frame \
-             (marker octet 0x00) is not. Run the heap node over an embedded engine \
-             (`EngineAppExt::app_face`), or inside the daemon's own process"
-                .into(),
-        ))
+        if self.side_frame_max() == 0 {
+            return Err(AppError::Unsupported(NO_SIDE_SHM.into()));
+        }
+        side_check(&frame, self.side_frame_max()).map_err(side_error)?;
+        self.client
+            .send_side(frame, class)
+            .await
+            .map_err(side_error)
+    }
+
+    fn try_send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        self.client.try_send_side(frame, class)
+    }
+
+    async fn side_ready(&self) {
+        self.client.side_ready().await;
+    }
+
+    async fn recv_side(&self) -> Option<(Bytes, FaceId)> {
+        self.client.recv_side().await
     }
 
     /// The bar is the daemon's `side/quarantine` management command, which is signed: this

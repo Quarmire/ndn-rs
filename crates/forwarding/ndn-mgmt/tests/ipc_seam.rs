@@ -93,3 +93,129 @@ async fn client_over_socketpair_fetches_from_engine() {
 
     cancel.cancel();
 }
+
+/// A channel frame crosses the seam in both directions: two bare clients ride two socketpairs
+/// into one engine (each end an IPC face, mounted by `mount_app_face_from_fd` and
+/// `ForwarderClient::from_raw_fd`). The sender answers the receiver's Interest with a Data that
+/// carries a `SideRoute`, the engine installs the route from the sender's face to the
+/// receiver's, the sender's frame reaches the receiver's `recv_side` byte for byte with the
+/// sender's face as its ingress, and the receiver's `UP` record goes back the other way. NDN
+/// traffic between the frames is untouched.
+#[tokio::test]
+async fn channel_frames_cross_the_ipc_seam_in_both_directions() {
+    use bytes::Bytes;
+    use ndn_app::Connection;
+    use ndn_packet::encode::{DataBuilder, InterestBuilder};
+    use ndn_packet::lp::{LpHeaders, SideRoute};
+    use ndn_transport::SideClass;
+    use ndn_transport::side_header::{STREAM_FRAME_GRANT, UpOp, UpRecord};
+    use std::time::Duration;
+
+    const ID: u64 = 0x1BC5_1DE0_0000_0001;
+
+    let (engine, _shutdown) = EngineBuilder::new(Default::default())
+        .build()
+        .await
+        .expect("build engine");
+    let cancel = CancellationToken::new();
+
+    let (engine_s, client_s) = stream_socketpair();
+    let (engine_r, client_r) = stream_socketpair();
+    let face_s = mount_app_face_from_fd(engine_s, &engine, cancel.child_token()).unwrap();
+    let face_r = mount_app_face_from_fd(engine_r, &engine, cancel.child_token()).unwrap();
+    engine
+        .fib()
+        .add_nexthop(&ndn_packet::name!("/chan"), face_s, 0);
+
+    let sender = IpcConnection::new(ForwarderClient::from_raw_fd(client_s).unwrap());
+    let receiver = IpcConnection::new(ForwarderClient::from_raw_fd(client_r).unwrap());
+    assert_eq!(sender.side_frame_max(), STREAM_FRAME_GRANT);
+    assert!(receiver.side_carries_here(SideClass::Stream));
+
+    // The receiver asks, the sender answers with the route header.
+    let name = ndn_packet::name!("/chan/sess/1");
+    receiver
+        .send(
+            InterestBuilder::new(name.clone())
+                .lifetime(Duration::from_secs(4))
+                .build(),
+        )
+        .await
+        .unwrap();
+    let asked = tokio::time::timeout(Duration::from_secs(5), sender.recv())
+        .await
+        .expect("the Interest reaches the sender")
+        .expect("the sender's connection is open");
+    assert!(!asked.is_empty());
+    sender
+        .send_with(
+            DataBuilder::new(name, b"session").sign_digest_sha256(),
+            LpHeaders {
+                side_route: Some(SideRoute {
+                    id: ID,
+                    ttl_secs: 30,
+                }),
+                ..LpHeaders::default()
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("the Data reaches the receiver")
+        .expect("the receiver's connection is open");
+
+    // A frame from the sender reaches the receiver byte for byte, over the sender's face.
+    let mut frame = vec![0x5A; 200];
+    frame[0] = ndn_transport::SIDE_MARKER;
+    frame[1] = 0x20; // version 1, datagram, DATA
+    frame[2..10].copy_from_slice(&ID.to_be_bytes());
+    let frame = Bytes::from(frame);
+    sender
+        .send_side(frame.clone(), SideClass::Datagram)
+        .await
+        .unwrap();
+    let (got, ingress) = tokio::time::timeout(Duration::from_secs(5), receiver.recv_side())
+        .await
+        .expect("the frame reaches the receiver")
+        .expect("the receiver's connection is open");
+    assert_eq!(got, frame);
+    assert_eq!(
+        ingress, face_s,
+        "the receiver is told the face it came over"
+    );
+
+    // The receiver's keep-alive goes back to the sender, over the receiver's face, by the
+    // non-waiting path.
+    let keep = Bytes::copy_from_slice(
+        &UpRecord {
+            id: ID,
+            op: UpOp::Keep,
+        }
+        .encode(),
+    );
+    receiver
+        .try_send_side(keep.clone(), SideClass::Datagram)
+        .unwrap();
+    let (got, ingress) = tokio::time::timeout(Duration::from_secs(5), sender.recv_side())
+        .await
+        .expect("the Keep reaches the sender")
+        .expect("the sender's connection is open");
+    assert_eq!(got, keep);
+    assert_eq!(ingress, face_r);
+
+    // What is not a channel frame is refused at the app, and nothing is written.
+    assert!(
+        sender
+            .send_side(Bytes::from_static(&[0x05, 0x01, 0xAB]), SideClass::Datagram)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sender.try_send_side(Bytes::new(), SideClass::Datagram),
+        Err(ndn_transport::SideRefused::Malformed)
+    );
+    assert_eq!(engine.side().stats().frames_out, 1);
+
+    cancel.cancel();
+}

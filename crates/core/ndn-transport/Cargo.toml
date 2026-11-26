@@ -37,7 +37,7 @@ dashmap    = { workspace = true }
 ndn-packet = { workspace = true, features = ["std-wasm"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "macros", "rt", "io-util"] }
+tokio = { workspace = true, features = ["sync", "macros", "rt", "io-util", "time"] }
 # Face-system Tier 4 §9.9 — TraceContextFeature OTel-overhead bench.
 # Native-only because Criterion does not run on wasm32.
 
