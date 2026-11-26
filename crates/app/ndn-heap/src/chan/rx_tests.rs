@@ -191,7 +191,13 @@ async fn fixture(mode: ChannelMode, opts: GetOptions, select: Select) -> Fx {
     let items = carol
         .space(&space())
         .unwrap()
-        .live(select, opts)
+        .get(
+            select,
+            GetOptions {
+                kept: false,
+                ..opts
+            },
+        )
         .expect("carol is a member");
     Fx {
         rig,
@@ -1039,7 +1045,13 @@ async fn a_path_filter_keeps_only_what_it_matches() {
         .carol()
         .space(&space())
         .unwrap()
-        .live(Select::Prefix(n("/a")), GetOptions::default())
+        .get(
+            Select::Prefix(n("/a")),
+            GetOptions {
+                kept: false,
+                ..GetOptions::default()
+            },
+        )
         .unwrap();
     fx.deliver(fx.data(
         SideClass::Datagram,
@@ -1548,7 +1560,13 @@ impl Wire {
         self.carol()
             .space(&space())
             .unwrap()
-            .live(everything(), opts)
+            .get(
+                everything(),
+                GetOptions {
+                    kept: false,
+                    ..opts
+                },
+            )
             .unwrap()
     }
 

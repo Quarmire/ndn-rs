@@ -1018,13 +1018,13 @@ async fn rolled_back_laptop() -> RolledBack {
     assert!(written, "the phone never wrote into the space");
     let mine = heap(&a.laptop, &notebook());
     for _ in 0..300 {
-        if matches!(mine.get(&n("/note")).await, Ok(Some(_))) {
+        if matches!(mine.kept(&n("/note")).await, Ok(Some(_))) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        matches!(mine.get(&n("/note")).await, Ok(Some(_))),
+        matches!(mine.kept(&n("/note")).await, Ok(Some(_))),
         "the laptop never held the phone's entry"
     );
     drop(mine);

@@ -400,7 +400,7 @@ impl Heap {
     /// [`HeapError::NotAllowed`] for a space this device only follows (a follower takes no part in
     /// channels: open the space as a member); [`HeapError::BadRequest`] for `opts.live` of
     /// [`Live::Off`] (it asks for no emissions: read the kept value).
-    pub fn live(&self, what: Select, opts: GetOptions) -> Result<Items, HeapError> {
+    pub fn get(&self, what: Select, opts: GetOptions) -> Result<Items, HeapError> {
         if self.inner.follower {
             return Err(HeapError::NotAllowed {
                 space: self.inner.name.clone(),

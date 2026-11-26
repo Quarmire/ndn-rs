@@ -340,7 +340,7 @@ impl Rig {
             .await
             .expect("B puts");
         for _ in 0..1500 {
-            if matches!(a.get(&hello).await, Ok(Some(_))) {
+            if matches!(a.kept(&hello).await, Ok(Some(_))) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -709,7 +709,7 @@ async fn cold_open(dir: &Path, entries: usize, paths: usize) -> String {
         let started = t.elapsed();
         let heap = node.space(&space).expect("start restored the space");
         let t = Instant::now();
-        let got = heap.get(&probe).await.expect("a get");
+        let got = heap.kept(&probe).await.expect("a get");
         let first_get = t.elapsed();
         assert!(got.is_some(), "the first get finds the entry");
         // A watcher's first listing reads every head's entry from the store.

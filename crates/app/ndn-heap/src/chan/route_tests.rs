@@ -302,7 +302,13 @@ async fn shared(rig: &Rig) {
 fn live(node: &Node) -> Items {
     node.space(&space())
         .unwrap()
-        .live(Select::Prefix(Name::root()), GetOptions::default())
+        .get(
+            Select::Prefix(Name::root()),
+            GetOptions {
+                kept: false,
+                ..GetOptions::default()
+            },
+        )
         .expect("a member")
 }
 

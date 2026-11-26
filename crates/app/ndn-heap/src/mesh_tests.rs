@@ -146,7 +146,7 @@ async fn eventually<F: Future<Output = bool>>(what: &str, mut f: impl FnMut() ->
 }
 
 async fn has(heap: &Heap, path: &str, value: &str) -> bool {
-    matches!(heap.get(&n(path)).await, Ok(Some(i)) if i.bytes == bytes(value))
+    matches!(heap.kept(&n(path)).await, Ok(Some(i)) if i.bytes == bytes(value))
 }
 
 fn entry_of(store: &Arc<dyn DataStore>, device: &Name, seq: u64) -> Entry {
@@ -296,7 +296,7 @@ async fn d9_a_crash_between_put_and_flush_never_re_signs_a_seq_a_peer_saw() {
         has(&theirs, "/b", "after").await
     })
     .await;
-    assert!(has(&theirs, "/a", "seen").await || theirs.get(&n("/a")).await.unwrap().is_none());
+    assert!(has(&theirs, "/a", "seen").await || theirs.kept(&n("/a")).await.unwrap().is_none());
     while let Ok(Some(Ok(change))) =
         tokio::time::timeout(Duration::from_millis(300), changes.next()).await
     {

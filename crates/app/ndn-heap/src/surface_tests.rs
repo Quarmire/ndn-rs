@@ -99,7 +99,7 @@ async fn a_forged_entry_of_a_peer_device_is_applied_by_the_node() {
     assert!(!heap.applied(&id), "not held before it arrives");
     assert_eq!(take(&node, packet).await, Outcome::Applied);
 
-    let item = heap.get(&n("/forged")).await.unwrap().expect("applied");
+    let item = heap.kept(&n("/forged")).await.unwrap().expect("applied");
     assert_eq!(item.bytes, bytes("from the phone"));
     assert_eq!(item.id, id);
     assert!(heap.applied(&id), "applied after a peer's entry arrived");
@@ -189,7 +189,7 @@ async fn applied_says_which_entries_this_node_has_applied() {
         .unwrap();
     assert!(heap.applied(&one), "an own entry");
     assert!(heap.applied(&two), "the head");
-    assert_eq!(heap.get(&n("/a")).await.unwrap().unwrap().id, two);
+    assert_eq!(heap.kept(&n("/a")).await.unwrap().unwrap().id, two);
     assert!(heap.applied(&one), "the superseded one is still applied");
 
     let (peer, packet) = forge(&devs[1], 1, None, vec![], put_body("/p", "peer"));

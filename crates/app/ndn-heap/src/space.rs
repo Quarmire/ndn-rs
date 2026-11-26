@@ -1231,7 +1231,7 @@ impl Heap {
     /// is outside its audience, or when an entry is held closed (its path is
     /// unknown); [`HeapError::Unavailable`] for a value in pieces not yet
     /// whole here.
-    pub async fn get(&self, path: &Name) -> Result<Option<Item>, HeapError> {
+    pub async fn kept(&self, path: &Name) -> Result<Option<Item>, HeapError> {
         let inner = &self.inner;
         let blob = {
             let log = inner.log.lock();

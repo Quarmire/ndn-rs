@@ -198,7 +198,7 @@ async fn a_removed_reader_is_refused_every_later_grant() {
     let theirs = phone.open(&space()).await.unwrap();
     for _ in 0..3 {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let asked = theirs.get(&n("/history")).await;
+        let asked = theirs.kept(&n("/history")).await;
         assert!(
             matches!(asked, Err(HeapError::Sealed { .. }) | Ok(None)),
             "a removed reader's device reads nothing: {asked:?}"
@@ -589,7 +589,7 @@ async fn an_unsealed_entry_in_a_sealed_space_is_refused() {
         ),
         "{taken:?}"
     );
-    assert_eq!(heap.get(&n("/x")).await.unwrap(), None, "nothing applied");
+    assert_eq!(heap.kept(&n("/x")).await.unwrap(), None, "nothing applied");
 }
 
 /// A device that was away and comes back asks only for what changed while it
@@ -670,7 +670,7 @@ async fn a_1_mib_payload_reaches_the_peer_in_pieces() {
         &payload[..],
         "the watcher's first sight of the put carries the whole value"
     );
-    let read = theirs.get(&n("/big")).await.unwrap().expect("held");
+    let read = theirs.kept(&n("/big")).await.unwrap().expect("held");
     assert_eq!(&read.bytes[..], &payload[..]);
 }
 
@@ -695,7 +695,7 @@ async fn a_sealed_value_in_pieces_reaches_a_device_that_opens_the_space_after_th
     let theirs = phone.open(&space()).await.unwrap();
     eventually("the phone reads the whole value", || async {
         matches!(
-            theirs.get(&n("/big")).await,
+            theirs.kept(&n("/big")).await,
             Ok(Some(item)) if item.bytes[..] == payload[..]
         )
     })
@@ -764,7 +764,7 @@ async fn a_late_device_reads_what_a_revocation_cut_keeps_below_a_counter_nobody_
     }
     eventually(
         "the phone's third entry is refused by the laptop",
-        || async { matches!(mine.get(&n("/c")).await, Ok(None)) },
+        || async { matches!(mine.kept(&n("/c")).await, Ok(None)) },
     )
     .await;
 
@@ -775,7 +775,7 @@ async fn a_late_device_reads_what_a_revocation_cut_keeps_below_a_counter_nobody_
         has(&late, "/a", "one").await && has(&late, "/b", "two").await
     })
     .await;
-    assert_eq!(late.get(&n("/c")).await.unwrap(), None);
+    assert_eq!(late.kept(&n("/c")).await.unwrap(), None);
 }
 
 /// Every device of the mesh adopts version `version` of the namespace's context, which revokes
@@ -842,11 +842,11 @@ async fn a_late_device_reads_what_a_tip_cut_keeps_below_a_counter_nobody_answers
     adopt_revoking(&m, &key, 2, &proposal.cut);
     eventually(
         "the phone's third entry is refused by the laptop",
-        || async { matches!(mine.get(&n("/c")).await, Ok(None)) },
+        || async { matches!(mine.kept(&n("/c")).await, Ok(None)) },
     )
     .await;
     assert_eq!(
-        mine.get(&n("/a")).await.unwrap().unwrap().bytes,
+        mine.kept(&n("/a")).await.unwrap().unwrap().bytes,
         bytes("one")
     );
 
@@ -857,7 +857,7 @@ async fn a_late_device_reads_what_a_tip_cut_keeps_below_a_counter_nobody_answers
         has(&late, "/a", "one").await && has(&late, "/b", "two").await
     })
     .await;
-    assert_eq!(late.get(&n("/c")).await.unwrap(), None);
+    assert_eq!(late.kept(&n("/c")).await.unwrap(), None);
 }
 
 /// A cut that names a tip, adopted after the node took the key's entries, withdraws the ones off
@@ -961,7 +961,7 @@ async fn a_tip_cut_adopted_later_withdraws_the_entries_off_the_chain_of_its_tip(
 
     adopt_revoking(&m, &key, 2, &proposal.cut);
     eventually("the laptop withdraws the entry off the chain", || async {
-        matches!(mine.get(&n("/fork")).await, Ok(None))
+        matches!(mine.kept(&n("/fork")).await, Ok(None))
     })
     .await;
     for path in ["/a", "/b", "/c", "/d"] {
@@ -1039,7 +1039,7 @@ async fn an_entry_the_owner_readmits_by_name_and_digest_returns_to_every_node() 
     };
     adopt(2, proposal.cut.clone());
     eventually("the laptop refuses what the cut leaves out", || async {
-        matches!(mine.get(&n("/c")).await, Ok(None))
+        matches!(mine.kept(&n("/c")).await, Ok(None))
     })
     .await;
     eventually(
@@ -1138,7 +1138,7 @@ async fn the_honest_copy_kept_as_evidence_is_applied_when_the_owner_readmits_it(
     };
     adopt(2, proposal.cut.clone());
     eventually("the reader withdraws the thief's entry", || async {
-        matches!(mine.get(&n("/thief")).await, Ok(None))
+        matches!(mine.kept(&n("/thief")).await, Ok(None))
     })
     .await;
     let named = honest_full(&phone, &honest);
@@ -1149,7 +1149,7 @@ async fn the_honest_copy_kept_as_evidence_is_applied_when_the_owner_readmits_it(
         has(&mine, "/honest", "mine").await
     })
     .await;
-    assert_eq!(mine.get(&n("/thief")).await.unwrap(), None);
+    assert_eq!(mine.kept(&n("/thief")).await.unwrap(), None);
 }
 
 /// The name a cut re-admits `wire` by: its entry name with the implicit digest.

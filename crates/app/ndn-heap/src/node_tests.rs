@@ -511,7 +511,7 @@ async fn start_restores_held_spaces() {
     assert_eq!(node.spaces(), vec![space()], "the space is held again");
     let heap = node.space(&space()).expect("the space is open");
     let item = heap
-        .get(&n("/a"))
+        .kept(&n("/a"))
         .await
         .unwrap()
         .expect("the value is held");
@@ -526,7 +526,7 @@ async fn start_restores_held_spaces() {
         .await
         .unwrap();
     assert_eq!(
-        heap.get(&n("/b")).await.unwrap().unwrap().bytes,
+        heap.kept(&n("/b")).await.unwrap().unwrap().bytes,
         bytes("two")
     );
 }
@@ -641,11 +641,11 @@ async fn d11_with_no_peer_the_hole_is_signed_and_readers_do_not_wait() {
     let (node, _) = boot(&dev, slow).await;
     let heap = node.space(&space()).unwrap();
     assert_eq!(
-        heap.get(&n("/kept")).await.unwrap().unwrap().bytes,
+        heap.kept(&n("/kept")).await.unwrap().unwrap().bytes,
         bytes("kept")
     );
     assert_eq!(
-        heap.get(&n("/lost")).await.unwrap(),
+        heap.kept(&n("/lost")).await.unwrap(),
         None,
         "what no flush covered is gone"
     );
@@ -690,7 +690,7 @@ async fn d15_a_durable_put_survives_crash() {
     let (node, _) = boot(&after_cut(&dev, image), cfg()).await;
     let heap = node.space(&space()).unwrap();
     assert_eq!(
-        heap.get(&n("/a")).await.unwrap().unwrap().bytes,
+        heap.kept(&n("/a")).await.unwrap().unwrap().bytes,
         bytes("durable")
     );
 }
@@ -728,7 +728,7 @@ async fn d14_a_failed_reservation_flush_refuses_puts_past_r_with_the_disks_reaso
     );
     assert_eq!(refused.next(), NextStep::FixLocal);
     assert_eq!(
-        heap.get(&n("/before")).await.unwrap().unwrap().bytes,
+        heap.kept(&n("/before")).await.unwrap().unwrap().bytes,
         bytes("before"),
         "reads continue"
     );
@@ -1029,7 +1029,7 @@ fn d13(engine: Engine) {
         let heap = node.space(&space()).expect("the space is held again");
         for k in 1..=put {
             let item = heap
-                .get(&n(&format!("/p/{k}")))
+                .kept(&n(&format!("/p/{k}")))
                 .await
                 .unwrap()
                 .unwrap_or_else(|| {
@@ -1067,7 +1067,7 @@ async fn a_key_revoked_while_the_node_was_off_is_withdrawn_at_start() {
         .unwrap();
     deliver(&devs[1], &laptop).await;
     let heap = laptop.space(&space()).unwrap();
-    assert!(heap.get(&n("/from-phone")).await.unwrap().is_some());
+    assert!(heap.kept(&n("/from-phone")).await.unwrap().is_some());
     laptop.close().await;
 
     // While the laptop is off, its keyring adopts a context that revokes the
@@ -1085,7 +1085,7 @@ async fn a_key_revoked_while_the_node_was_off_is_withdrawn_at_start() {
     let (laptop, _) = boot(&devs[0], cfg()).await;
     let heap = laptop.space(&space()).unwrap();
     assert_eq!(
-        heap.get(&n("/from-phone")).await.unwrap(),
+        heap.kept(&n("/from-phone")).await.unwrap(),
         None,
         "what a revoked key signed is judged again at start and withdrawn"
     );

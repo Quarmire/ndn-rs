@@ -20,7 +20,7 @@ use super::frame::Header;
 use super::items::Items;
 use super::rx::{Delivery, Dropped};
 use super::sessions::EndReason;
-use super::verbs::{EmitOptions, GetNotice, LiveEnd, Select};
+use super::verbs::{EmitOptions, GetNotice, GetOptions, LiveEnd, Select};
 use super::wire::ChannelMode;
 use crate::log::Alert;
 use crate::node::tests::space;
@@ -59,7 +59,13 @@ fn prompt_reader(ck: &Ck) -> Items {
     ck.carol()
         .space(&space())
         .expect("carol is a member")
-        .live(Select::Prefix(Name::root()), latest())
+        .get(
+            Select::Prefix(Name::root()),
+            GetOptions {
+                kept: false,
+                ..latest()
+            },
+        )
         .expect("carol may read")
 }
 

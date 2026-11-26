@@ -496,7 +496,7 @@ async fn fetch_entry_admits_one_entry_by_name() {
     assert!(theirs.applied(&id), "admitted by the ordinary judge");
     assert!(theirs.members_known(), "and it was the creation");
     assert_eq!(phone.held(), 1, "nothing else came with it");
-    assert!(theirs.get(&n("/a")).await.unwrap().is_none());
+    assert!(theirs.kept(&n("/a")).await.unwrap().is_none());
 
     let by_name = wire::log_name(&m.devs[0].name, &space(), put.seq);
     assert_eq!(phone.fetch_entry(&by_name).await.unwrap(), put);

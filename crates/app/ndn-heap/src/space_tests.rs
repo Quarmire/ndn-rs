@@ -36,7 +36,7 @@ async fn create_put_get_watch_remove_round_trip() {
         .put(&n("/a"), bytes("one"), PutOptions::default())
         .await
         .unwrap();
-    let item = heap.get(&n("/a")).await.unwrap().expect("held");
+    let item = heap.kept(&n("/a")).await.unwrap().expect("held");
     assert_eq!(item.bytes, bytes("one"));
     assert_eq!((&item.by, &item.writer), (&n("/alice"), &dev.name));
     assert_eq!(item.id, id);
@@ -53,8 +53,8 @@ async fn create_put_get_watch_remove_round_trip() {
         Change::Removed(removed) => assert_eq!(removed.id, gone),
         other => panic!("a removal is told as Removed, got {other:?}"),
     }
-    assert_eq!(heap.get(&n("/a")).await.unwrap(), None);
-    assert_eq!(heap.get(&n("/never")).await.unwrap(), None);
+    assert_eq!(heap.kept(&n("/a")).await.unwrap(), None);
+    assert_eq!(heap.kept(&n("/never")).await.unwrap(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -75,7 +75,7 @@ async fn a_put_never_waits_on_the_network() {
         .unwrap_or_else(|_| panic!("a put with {opts:?} waited for a peer that is not there"))
         .unwrap();
     }
-    assert!(heap.get(&n("/a")).await.unwrap().is_some());
+    assert!(heap.kept(&n("/a")).await.unwrap().is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -242,7 +242,7 @@ async fn a_writer_in_a_private_space_seals_and_a_reader_outside_the_audience_get
         "the entry holds no plaintext"
     );
     assert_eq!(
-        heap.get(&n("/secret")).await.unwrap().unwrap().bytes,
+        heap.kept(&n("/secret")).await.unwrap().unwrap().bytes,
         bytes("for carol"),
         "the writer reads what it sealed"
     );
@@ -251,13 +251,13 @@ async fn a_writer_in_a_private_space_seals_and_a_reader_outside_the_audience_get
     let theirs = bob.open(&space()).await.unwrap();
     deliver(&devs[0], &bob).await;
     let sealed = theirs
-        .get(&n("/secret"))
+        .kept(&n("/secret"))
         .await
         .expect_err("bob is not in the audience");
     assert!(matches!(sealed, HeapError::Sealed { .. }), "{sealed:?}");
     assert_eq!(sealed.next(), NextStep::AskOwner);
     assert!(
-        theirs.get(&n("/other")).await.is_err(),
+        theirs.kept(&n("/other")).await.is_err(),
         "a closed entry's path is unknown, so no path reads"
     );
 }
@@ -1172,7 +1172,7 @@ async fn a_payload_over_the_inline_limit_round_trips_in_pieces_in_one_entry_batc
         .put(&n("/big"), Bytes::from(big.clone()), PutOptions::default())
         .await
         .unwrap();
-    let item = heap.get(&n("/big")).await.unwrap().expect("assembled");
+    let item = heap.kept(&n("/big")).await.unwrap().expect("assembled");
     assert_eq!(&item.bytes[..], &big[..], "sealed, split, joined, opened");
     assert_eq!(item.id, id);
     match next(&mut changes).await {
@@ -1303,7 +1303,7 @@ async fn an_audience_member_waiting_for_its_key_is_told_to_retry_not_sealed() {
     let theirs = bob.open(&space()).await.unwrap();
     deliver(&devs[0], &bob).await;
     let waiting = theirs
-        .get(&n("/secret"))
+        .kept(&n("/secret"))
         .await
         .expect_err("the entry is held closed: bob has no key yet");
     assert!(matches!(waiting, HeapError::NotReady { .. }), "{waiting:?}");
@@ -1337,7 +1337,7 @@ async fn a_reader_that_lacks_the_epoch_entry_of_a_closed_entry_is_told_to_retry_
         bob.inner.take(&space(), wire, false).await;
     }
     let waiting = theirs
-        .get(&n("/secret"))
+        .kept(&n("/secret"))
         .await
         .expect_err("the entry is held closed: bob holds no epoch entry and no key");
     assert!(matches!(waiting, HeapError::NotReady { .. }), "{waiting:?}");
@@ -1545,7 +1545,7 @@ async fn a_value_whose_piece_the_store_lost_is_unavailable_and_gathered_again() 
         .await
         .unwrap();
     assert_eq!(
-        heap.get(&n("/big")).await.unwrap().unwrap().bytes.len(),
+        heap.kept(&n("/big")).await.unwrap().unwrap().bytes.len(),
         50_000
     );
     let entry = log_name(&id.device, &space(), id.seq);
@@ -1558,13 +1558,13 @@ async fn a_value_whose_piece_the_store_lost_is_unavailable_and_gathered_again() 
     let chunk = crate::wire::piece_name(&entry, crate::wire::PieceKind::Chunk(3));
     assert!(dev.store.contains(&chunk));
     dev.store.remove(&chunk);
-    let lost = heap.get(&n("/big")).await.unwrap_err();
+    let lost = heap.kept(&n("/big")).await.unwrap_err();
     assert!(matches!(lost, HeapError::Unavailable { .. }), "{lost:?}");
     assert!(
         !dev.store.contains(&marker),
         "the record that the value was whole is dropped with the piece"
     );
-    let again = heap.get(&n("/big")).await.unwrap_err();
+    let again = heap.kept(&n("/big")).await.unwrap_err();
     assert!(matches!(again, HeapError::Unavailable { .. }), "{again:?}");
 }
 

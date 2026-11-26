@@ -115,7 +115,13 @@ pub(super) async fn ck_with(
     let heap = rig.nodes[2].space(&space()).expect("carol is a member");
     let changes = heap.watch(&Frontier::default()).await.expect("a watch");
     let items = heap
-        .live(Select::Prefix(Name::root()), opts)
+        .get(
+            Select::Prefix(Name::root()),
+            GetOptions {
+                kept: false,
+                ..opts
+            },
+        )
         .expect("carol may read");
     let info = rig.nodes[2]
         .ask_channel_in(&space(), rig.nodes[1].name(), mode)
@@ -1162,7 +1168,13 @@ async fn a_reader_forging_a_data_frame_is_exposed_and_never_reaches_a_verified_r
         .carol()
         .space(&space())
         .unwrap()
-        .live(Select::Prefix(Name::root()), verified())
+        .get(
+            Select::Prefix(Name::root()),
+            GetOptions {
+                kept: false,
+                ..verified()
+            },
+        )
         .expect("a verified reader of a channel with checkpoints");
     let s = ck.start();
     let genuine = ck.data(s, 0, b"genuine");
