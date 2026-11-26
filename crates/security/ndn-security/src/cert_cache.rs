@@ -292,6 +292,19 @@ impl CertCache {
         self.matching(name).any(|(_, vouched)| vouched)
     }
 
+    /// The newest certificate vouched for under `name` (see [`get`](Self::get)), one valid now
+    /// before an expired one; never an unverified one, which anyone who is asked may have
+    /// served: a lookup in what is held, never a fetch. For a caller that reads a certificate's
+    /// fields (its issuer) to decide something about a key and has no walk of its own.
+    pub fn get_vouched(&self, name: &Name) -> Option<Certificate> {
+        pick_newest(
+            self.matching(name)
+                .filter(|(_, vouched)| *vouched)
+                .map(|(c, _)| c),
+            now_ns(),
+        )
+    }
+
     /// The certificates `name` resolves to, each with whether it is vouched
     /// for.
     fn matching(&self, name: &Name) -> impl Iterator<Item = (Certificate, bool)> + '_ {
@@ -823,8 +836,17 @@ mod tests {
         let fetched = cert("/a/KEY/k/self/v=1", 1, u64::MAX);
         assert!(cache.insert_unverified(fetched.clone()));
         assert!(cache.all(&key).len() == 1 && !cache.holds_vouched(&key));
+        assert!(
+            cache.get_vouched(&key).is_none(),
+            "a fetched copy was read as vouched for"
+        );
         cache.insert(cert("/a/KEY/k/self/v=2", 2, 5)); // vouched for, and long expired
         assert!(cache.holds_vouched(&key));
         assert!(!cache.holds_vouched(&"/a/KEY/other".parse().unwrap()));
+        assert_eq!(
+            cache.get_vouched(&key).unwrap().name.to_string(),
+            "/a/KEY/k/self/v=2",
+            "the newer fetched copy answered, or the expired certificate vouched for did not"
+        );
     }
 }

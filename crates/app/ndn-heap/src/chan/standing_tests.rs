@@ -400,6 +400,143 @@ async fn a_key_certified_by_a_revoked_issuer_does_not_stand() {
     );
 }
 
+/// A key of `/bob` certified through an intermediate issuer (`/bob/KEY/mid`, which the person's
+/// anchor key certified): the key, its certificate and the intermediate's. Nothing is cached.
+async fn bobs_key_under_an_intermediate(
+    world: &World,
+    device: &str,
+) -> (Name, Certificate, Certificate) {
+    let bob = &world.people[1];
+    let mid = bob
+        .keys
+        .generate_ed25519(n("/bob").append("KEY").append("mid"))
+        .unwrap();
+    let mid_public = bob
+        .keys
+        .get_signer_sync(&mid)
+        .unwrap()
+        .public_key()
+        .unwrap();
+    let mid_cert = bob
+        .keys
+        .certify(&mid, mid_public, &bob.issuer, VALIDITY_MS)
+        .await
+        .unwrap();
+    let keys = SecurityManager::new();
+    let key = keys
+        .generate_ed25519(n(device).append("KEY").append("1"))
+        .unwrap();
+    let public = keys.get_signer_sync(&key).unwrap().public_key().unwrap();
+    let cert = bob
+        .keys
+        .certify(&key, public, &mid, VALIDITY_MS)
+        .await
+        .unwrap();
+    (key, cert, mid_cert)
+}
+
+/// A certificate no one vouched for was written by whoever served it, its `issuer` included: it
+/// neither revokes a key (a forged one naming a revoked issuer) nor hides a revoked issuer (a
+/// forged one naming a good issuer). Where no certificate vouched for answers for a key and the
+/// context revokes keys, the chain is unknown and the key does not stand, whatever a fetched
+/// copy says.
+#[tokio::test]
+async fn a_certificate_no_one_vouched_for_neither_revokes_nor_hides_an_issuer() {
+    let world = World::new(false).await;
+    let alice = world.seat("/alice/laptop").await;
+    let bob = world.seat("/bob/phone").await;
+    let one = alice
+        .members(Some(true), vec![add(1, "/bob", Role::Writer)])
+        .await;
+    alice.relay(one, &bob);
+    let cache = world.validator.cert_cache();
+    let (lost, good) = (n("/bob/KEY/lost"), n("/bob/KEY/good"));
+
+    // The context revokes a key nothing here was certified by, then the person's own issuer.
+    world
+        .validator
+        .keyring()
+        .adopt_update(world.people[1].context(2, Some(&lost)))
+        .unwrap();
+    let (tablet, forged, _) = bobs_key_under_an_intermediate(&world, "/bob/tablet").await;
+    let mut names_revoked = forged.clone();
+    names_revoked.issuer = Some(Arc::new(lost.clone()));
+    assert!(cache.insert_unverified(names_revoked));
+    let got = alice.stands(&tablet, Who::Writer);
+    assert!(
+        matches!(&got, Err(why) if *why != Unstanding::Revoked),
+        "{got:?}: a fetched certificate naming a revoked issuer revoked the key it is for"
+    );
+
+    let bobs_issuer = world.people[1].issuer.clone();
+    world
+        .validator
+        .keyring()
+        .adopt_update(world.people[1].context(3, Some(&bobs_issuer)))
+        .unwrap();
+    let (hider, real, _) = bobs_key_under_an_intermediate(&world, "/bob/watch").await;
+    let mut names_good = real.clone();
+    names_good.issuer = Some(Arc::new(good));
+    assert!(cache.insert_unverified(names_good));
+    assert!(
+        alice.stands(&hider, Who::Writer).is_err(),
+        "a fetched certificate naming a good issuer hid the revoked issuer of the chain"
+    );
+}
+
+/// A chain of vouched certificates that does not reach an anchor of the context (an intermediate
+/// certificate is not held) cannot be read for a revoked issuer. While the context revokes
+/// nothing there is nothing to find and the key stands (a fresh ask is judged by a walk that
+/// vouches its chain); once the context revokes a key the chain may hold, the key does not stand
+/// until the chain is complete, so a session is not kept alive by a gap in what is cached. A
+/// complete chain is followed to the revoked key above it.
+#[tokio::test]
+async fn a_chain_that_cannot_be_followed_does_not_stand_while_the_context_revokes() {
+    let world = World::new(false).await;
+    let alice = world.seat("/alice/laptop").await;
+    let bob = world.seat("/bob/phone").await;
+    let one = alice
+        .members(Some(true), vec![add(1, "/bob", Role::Writer)])
+        .await;
+    alice.relay(one, &bob);
+    let (key, cert, mid_cert) = bobs_key_under_an_intermediate(&world, "/bob/tablet").await;
+    let cache = world.validator.cert_cache();
+    cache.insert(cert);
+    assert!(
+        alice.stands(&key, Who::Writer).is_ok(),
+        "nothing is revoked: the gap hides nothing"
+    );
+
+    world
+        .validator
+        .keyring()
+        .adopt_update(world.people[1].context(2, Some(&n("/bob/KEY/lost"))))
+        .unwrap();
+    let got = alice.stands(&key, Who::Writer);
+    assert!(
+        got.is_err(),
+        "an intermediate issuer is not held and the context revokes a key: the chain is unknown, \
+         yet the key stood"
+    );
+    cache.insert(mid_cert);
+    assert!(
+        alice.stands(&key, Who::Writer).is_ok(),
+        "the chain reaches the anchor, no revoked key on it"
+    );
+
+    let bobs_issuer = world.people[1].issuer.clone();
+    world
+        .validator
+        .keyring()
+        .adopt_update(world.people[1].context(3, Some(&bobs_issuer)))
+        .unwrap();
+    assert_eq!(
+        alice.stands(&key, Who::Writer),
+        Err(Unstanding::Revoked),
+        "the anchor key two hops above is revoked"
+    );
+}
+
 /// A reader the record lists stands as **listed** and never as a writer; a person a public
 /// space does not list at all stands in neither role (everybody may read a public space's kept
 /// data, but a channel's key is wrapped only to a listed person's key), and the owner always
