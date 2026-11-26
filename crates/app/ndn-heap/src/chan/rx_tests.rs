@@ -93,6 +93,11 @@ impl Drop for Rig {
 }
 
 pub(super) async fn rig_of(devs: Vec<Dev>) -> Rig {
+    rig_with(devs, super::config::ChannelConfig::default()).await
+}
+
+/// A rig whose nodes are tuned by `channel` (the checkpoint period).
+pub(super) async fn rig_with(devs: Vec<Dev>, channel: super::config::ChannelConfig) -> Rig {
     let (engine, shutdown) = EngineBuilder::new(Default::default())
         .build()
         .await
@@ -106,6 +111,8 @@ pub(super) async fn rig_of(devs: Vec<Dev>) -> Rig {
     let mut nodes = Vec::new();
     for dev in &devs {
         let sync = engine.app_face(cancel.child_token());
+        let mut config = fast();
+        config.channel = channel;
         nodes.push(
             Node::start(
                 Transport {
@@ -116,7 +123,7 @@ pub(super) async fn rig_of(devs: Vec<Dev>) -> Rig {
                 std::sync::Arc::clone(&dev.keys),
                 std::sync::Arc::clone(&dev.validator),
                 std::sync::Arc::clone(&dev.store),
-                fast(),
+                config,
             )
             .await
             .expect("the node starts"),
@@ -2076,7 +2083,8 @@ async fn stream_frames_that_overtake_the_session_are_not_lost_to_a_window_joiner
     let interest = Interest::decode(wire_ask).unwrap();
     let name = (*interest.name).clone();
     let generation = carol.inner.judge.generation();
-    let ChanAnswer::Data(answer) = bob_node.inner.chan_answer(&interest).await else {
+    let ChanAnswer::Session { wire: answer, .. } = bob_node.inner.chan_answer(&interest).await
+    else {
         panic!("a member's ask is answered");
     };
     let data = Data::decode(answer).unwrap();

@@ -487,7 +487,7 @@ async fn the_session_key_opens_only_with_the_askers_recipient_key_and_the_data_n
     let (alice, bob, carol) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
 
     let (_, interest) = signed_ask(bob, alice, &ask_of(bob, ChannelMode::Latest));
-    let ChanAnswer::Data(wire) = alice.inner.chan_answer(&interest).await else {
+    let ChanAnswer::Session { wire, .. } = alice.inner.chan_answer(&interest).await else {
         panic!("a member's ask is answered");
     };
     let data = Data::decode(wire).unwrap();
@@ -621,7 +621,7 @@ async fn an_ask_naming_an_epoch_the_sender_does_not_have_in_force_is_refused_sta
     // The epoch in force is answered with a session.
     assert!(matches!(
         answer(ask_with(in_force_of(alice))).await,
-        ChanAnswer::Data(_)
+        ChanAnswer::Session { .. }
     ));
     assert_eq!(alice.inner.chan.stats.refused.get(), 2);
 }
@@ -961,7 +961,7 @@ async fn a_replayed_ask_yields_a_session_only_the_asker_can_open() {
 
     assert!(matches!(
         alice.inner.chan_answer(&interest).await,
-        ChanAnswer::Data(_)
+        ChanAnswer::Session { .. }
     ));
     // The same signed Interest again, within what the replay guard remembers: Nacked Duplicate.
     assert!(matches!(
@@ -973,7 +973,7 @@ async fn a_replayed_ask_yields_a_session_only_the_asker_can_open() {
     // A sender that forgot (restarted) answers it: a session wrapped to bob's recipient key,
     // which only bob opens; the one who replayed it (carol) cannot.
     alice.inner.chan.replay.forget_all();
-    let ChanAnswer::Data(wire) = alice.inner.chan_answer(&interest).await else {
+    let ChanAnswer::Session { wire, .. } = alice.inner.chan_answer(&interest).await else {
         panic!("a replay is answered once the guard forgot it");
     };
     let data = Data::decode(wire).unwrap();
