@@ -397,6 +397,20 @@ impl Channels {
         self.table.lock().buckets.take(key, now)
     }
 
+    /// Whether `key` has used up its bucket now (it holds less than one token). Charges nothing:
+    /// the bucket drains only by asks whose signature verified, so no stranger can empty it by
+    /// naming the key, and an ask that names a key in this state is the key's own flood or
+    /// someone's copy of it: refused before its signature is checked, for it would be refused
+    /// after.
+    pub(crate) fn over_rate(&self, key: &Name, now: Instant) -> bool {
+        self.table
+            .lock()
+            .buckets
+            .by_key
+            .get(key)
+            .is_some_and(|b| b.held(ASKS_PER_SEC, ASKS_BURST, now) < 1.0)
+    }
+
     /// Give `asker`, which the caller judged, the key of the channel of `(space, mode)`: the
     /// channel is made if there is none; the asker is added, or renewed. A receiver that already
     /// holds the current key and asks again after half its lifetime has the channel re-keyed if

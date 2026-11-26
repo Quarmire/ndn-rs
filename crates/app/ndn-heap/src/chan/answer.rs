@@ -364,7 +364,15 @@ impl NodeInner {
             return nack(NackReason::NoRoute);
         }
 
-        // 5. The budget of signature verifications, per ingress face and for the node. The key
+        // 5. A key that has used up its own bucket (by asks whose signature verified: nobody
+        // else can drain it) is refused here, before a token of the face's budget is spent on
+        // its next ask: a member flooding over a face she shares costs it one verification per
+        // token of hers, and the others behind the face are still judged.
+        if self.chan.channels.over_rate(&key, now) {
+            stats.throttled.bump();
+            return nack(NackReason::Congestion);
+        }
+        // The budget of signature verifications, per ingress face and for the node. The key
         // an unverified ask names is whatever its sender wrote, so no asker's bucket is charged
         // here: what a face has not used is every other face's, and the node's ceiling bounds
         // what verifying costs the CPU.

@@ -770,8 +770,14 @@ async fn an_asker_over_its_rate_is_nacked_congestion_after_its_signature_verifie
         "{nacks:?}"
     );
     assert_eq!(stats.throttled.get() as usize, nacks.len());
-    // The rate is the asker's, charged once the signature verified: every ask cost its walk.
-    assert_eq!(alice.inner.judge.interest_walks(), 30);
+    // The rate is the asker's, charged once the signature verified: the 8 asks of her burst
+    // (and the few tokens refilled meanwhile) cost their walk; once her bucket is empty the
+    // others are refused before their signature is checked.
+    let walks = alice.inner.judge.interest_walks();
+    assert!(
+        (8..=14).contains(&walks),
+        "{walks} walks for 30 asks of one key"
+    );
     // A stranger is told nothing of the rate: his Nack is the stranger's, and costs no walk.
     let walks = alice.inner.judge.interest_walks();
     let (_, interest) = signed_ask(dave, alice, &ask_of(dave, ChannelMode::Latest));
@@ -1428,6 +1434,36 @@ async fn a_flood_of_forged_asks_from_one_face_does_not_starve_a_genuine_ask() {
     bob.ask_channel(&space(), alice.name())
         .await
         .expect("bob's genuine ask is answered after the flood of forgeries from another face");
+}
+
+/// A member that asks over her key's rate (4 a second, burst 8) with asks she really signed is
+/// refused `Congestion` **before** her signature is checked once her bucket is empty: the bucket
+/// only drains by her own verified asks, so no stranger can empty it by naming her, and a member
+/// flooding over a face she shares with others costs that face one verification per token, not
+/// one per ask. Otherwise her flood takes every token of the face's verification budget and the
+/// others behind the same face are never judged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_over_her_rate_is_refused_before_her_signature_is_checked() {
+    let rig = rig(&["/alice/laptop", "/bob/phone"]).await;
+    let (share, change) = public_with(&["/bob"], &[]);
+    shared(&rig, share, change).await;
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    let face = Some(ndn_transport::FaceId(9_000));
+    let params = ask_of(bob, ChannelMode::Latest).encode().unwrap();
+    let asks: Vec<Interest> = (0..60)
+        .map(|_| Interest::decode(signed_as(bob, bob.writer(), alice, &params)).unwrap())
+        .collect();
+    for interest in &asks {
+        let _ = alice.inner.chan_answer(interest, face).await;
+    }
+    // The 8 asks her bucket let through cost a walk each (the refill during the 60 asks adds a
+    // few); the others, over it, none.
+    let walks = alice.inner.judge.interest_walks();
+    assert!(
+        walks <= 16,
+        "{walks} signature walks for 60 asks of one member over her rate: her asks over it were \
+         verified one by one"
+    );
 }
 
 /// An ask signed long ago, or in the far future, by a member the sender never saw ask: the
