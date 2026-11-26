@@ -377,8 +377,11 @@ impl NodeInner {
                 if held.is_some_and(|s| s.usable(Instant::now())) {
                     continue;
                 }
-                if let Err(why) = node.chan_ask(&space, &sender, mode).await {
-                    tracing::debug!(%space, %sender, ?mode, "announce-driven ask failed: {why}");
+                match node.chan_ask(&space, &sender, mode).await {
+                    Ok(session) => node.chan_release_unwanted(&session),
+                    Err(why) => {
+                        tracing::debug!(%space, %sender, ?mode, "announce-driven ask failed: {why}");
+                    }
                 }
             }
             node.chan.heard.lock().done(&space);

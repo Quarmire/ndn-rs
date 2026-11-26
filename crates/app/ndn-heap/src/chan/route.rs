@@ -401,14 +401,32 @@ impl NodeInner {
         for session in self.chan.sessions.all() {
             let (space, mode) = (session.space(), session.mode());
             if sink.takes(space, mode) && !self.chan.rx.wanted(space, mode) {
-                session.end(EndReason::Left);
-                self.chan.sessions.remove(session.id());
-                // Nobody takes the channel now, so nobody is told it ended: an `Items` made
-                // later has not seen the session it would be told of.
-                self.chan.rx.release_channel(session.id());
+                self.chan_let_go(&session);
             }
         }
         self.chan_route_tick(Instant::now());
+    }
+
+    /// An ask the receiver made for its `Items` was answered after the last of them was dropped
+    /// (an announce-driven ask in flight): the session it installed is let go as
+    /// [`Self::chan_route_release`] lets one go. Left held, it would be a session nobody takes,
+    /// with its route and `Keep` entry standing, and the next ask of that sender would be made
+    /// as a renewal (no `ASK_NEW`), so the sender would send no `HELLO`.
+    pub(crate) fn chan_release_unwanted(&self, session: &RecvSession) {
+        if self.chan.route.conn().is_none() || self.chan.rx.wanted(session.space(), session.mode())
+        {
+            return;
+        }
+        self.chan_let_go(session);
+        self.chan_route_tick(Instant::now());
+    }
+
+    /// End `session` as left and drop it; nobody is told it ended, since an `Items` made later has
+    /// not seen the session it would be told of.
+    fn chan_let_go(&self, session: &RecvSession) {
+        session.end(EndReason::Left);
+        self.chan.sessions.remove(session.id());
+        self.chan.rx.release_channel(session.id());
     }
 
     /// The route maintenance of one pass of the node's task at `now`: `Keep`s due, the `Unsub`
