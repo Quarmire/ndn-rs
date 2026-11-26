@@ -767,7 +767,7 @@ async fn window_keeps_at_most_its_limits_and_replays_them_to_a_joiner() {
         settle(&rig.tx).await;
         let _ = rig.link.take_stream();
     }
-    let terms = rig.tx.welcome(true, None, true, rig.t0);
+    let terms = rig.tx.welcome(true, false, None, true, rig.t0).unwrap();
     assert_eq!(terms.window.unwrap().messages, 256);
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
@@ -797,7 +797,10 @@ async fn window_keeps_at_most_its_limits_and_replays_them_to_a_joiner() {
     // The replay takes new sequences, after HELLO's.
     assert!(replayed[0].seq > ops[0].0);
     // `since` names the start: a re-ask by a receiver that is not new gets only the replay.
-    let terms = rig.tx.welcome(false, Some(300), true, rig.t0);
+    let terms = rig
+        .tx
+        .welcome(false, false, Some(300), true, rig.t0)
+        .unwrap();
     let _ = terms;
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
@@ -818,12 +821,14 @@ async fn window_keeps_at_most_its_limits_and_replays_them_to_a_joiner() {
         settle(&rig.tx).await;
         let _ = rig.link.take_stream();
     }
-    rig.tx.welcome(true, None, true, rig.t0);
+    rig.tx.welcome(true, false, None, true, rig.t0).unwrap();
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
     assert_eq!(messages(&seen).len(), 10);
     // Age: eleven seconds later none of a 10 s window is left.
-    rig.tx.welcome(true, None, true, at(&rig, 11));
+    rig.tx
+        .welcome(true, false, None, true, at(&rig, 11))
+        .unwrap();
     settle(&rig.tx).await;
     assert!(messages(&stream(&mut rig)).is_empty());
     // A window over its maximum is clamped, not refused.
@@ -835,7 +840,10 @@ async fn window_keeps_at_most_its_limits_and_replays_them_to_a_joiner() {
         at(&rig, 12),
     )
     .await;
-    let terms = rig.tx.welcome(false, None, true, at(&rig, 12));
+    let terms = rig
+        .tx
+        .welcome(false, false, None, true, at(&rig, 12))
+        .unwrap();
     let window = terms.window.unwrap();
     assert_eq!(
         (window.messages, window.bytes, window.ms),
@@ -864,7 +872,7 @@ async fn stalled_window(messages: usize, size: usize) -> Rig {
         let _ = rig.link.take_stream();
     }
     // The first welcome binds the name and fills the stalled stream.
-    rig.tx.welcome(true, None, true, rig.t0);
+    rig.tx.welcome(true, false, None, true, rig.t0).unwrap();
     rig
 }
 
@@ -874,7 +882,9 @@ async fn stalled_window(messages: usize, size: usize) -> Rig {
 async fn repeated_since_asks_do_not_grow_the_fifo_past_queue_bytes() {
     let rig = stalled_window(256, 4_000).await;
     for second in 1..=100u64 {
-        rig.tx.welcome(false, Some(0), true, at(&rig, 2 * second));
+        rig.tx
+            .welcome(false, false, Some(0), true, at(&rig, 2 * second))
+            .unwrap();
         tokio::task::yield_now().await;
     }
     let queued = rig.tx.queued_bytes();
@@ -909,11 +919,11 @@ async fn a_since_replay_is_given_once_a_second_per_channel() {
     }
     let replayed = |rig: &mut Rig| messages(&stream(rig)).len();
     let asked = |rig: &mut Rig, at: Instant| {
-        rig.tx.welcome(false, Some(0), true, at);
+        rig.tx.welcome(false, false, Some(0), true, at).unwrap();
         replayed(rig)
     };
     let t = rig.t0 + Duration::from_secs(5);
-    rig.tx.welcome(false, Some(0), true, t);
+    rig.tx.welcome(false, false, Some(0), true, t).unwrap();
     settle(&rig.tx).await;
     assert_eq!(replayed(&mut rig), 20, "the first ask is replayed");
     let again = asked(&mut rig, t + SINCE_REPLAY_EVERY / 2);
@@ -924,7 +934,9 @@ async fn a_since_replay_is_given_once_a_second_per_channel() {
         "a second ask within the second is not"
     );
     assert_eq!(rig.stats.replay_refused.get(), 1);
-    rig.tx.welcome(false, Some(0), true, t + SINCE_REPLAY_EVERY);
+    rig.tx
+        .welcome(false, false, Some(0), true, t + SINCE_REPLAY_EVERY)
+        .unwrap();
     settle(&rig.tx).await;
     assert_eq!(
         replayed(&mut rig),
@@ -932,9 +944,140 @@ async fn a_since_replay_is_given_once_a_second_per_channel() {
         "a second later it is replayed again"
     );
     // A joiner that was not a receiver before is given its replay whenever it comes.
-    rig.tx.welcome(true, None, true, t + SINCE_REPLAY_EVERY);
+    rig.tx
+        .welcome(true, false, None, true, t + SINCE_REPLAY_EVERY)
+        .unwrap();
     settle(&rig.tx).await;
     assert_eq!(replayed(&mut rig), 20);
+}
+
+/// A `Window` channel that sent 20 messages and has one receiver (welcomed at `t0`), its stream
+/// drained.
+async fn window_with_a_receiver() -> Rig {
+    let mut rig = rig(ChannelMode::Window, LinkConfig::default());
+    for i in 0..20u8 {
+        send(
+            &rig,
+            &name(1),
+            &[i; 10],
+            &EmitOptions::window(Window::DEFAULT),
+            rig.t0,
+        )
+        .await;
+        settle(&rig.tx).await;
+        let _ = rig.link.take_stream();
+    }
+    rig.tx.welcome(true, false, None, true, rig.t0).unwrap();
+    settle(&rig.tx).await;
+    let _ = stream(&mut rig);
+    rig
+}
+
+fn hellos(seen: &[Seen]) -> usize {
+    controls(seen)
+        .iter()
+        .filter(|(_, c)| matches!(c, Control::Hello { .. }))
+        .count()
+}
+
+/// `ASK_NEW` from a device the sender lists is a claim ("I let the channel go"): the sender
+/// cannot check it, and its welcome goes to every receiver on the route. In a burst of eight, one
+/// is welcomed (one `HELLO`, one replay of the window, one arming of the stream's gate) and the
+/// others are refused with the time to wait, queue nothing and arm nothing. The claim is judged
+/// by the limiter an `ASK_SINCE` is (once a second per channel), and what it queued is not
+/// replayed again until the second has passed.
+#[tokio::test]
+async fn a_burst_of_claims_is_welcomed_once_a_second_and_arms_the_gate_once() {
+    let mut rig = window_with_a_receiver().await;
+    let armed = rig.link.stats().receivers_added;
+    let t = at(&rig, 5);
+    let mut told = Vec::new();
+    for k in 0..8u64 {
+        let at = t + Duration::from_millis(k * 10);
+        if let Err(refused) = rig.tx.welcome(false, true, None, true, at) {
+            told.push(refused);
+        }
+        settle(&rig.tx).await;
+    }
+    let seen = stream(&mut rig);
+    assert_eq!(
+        (hellos(&seen), messages(&seen).len()),
+        (1, 20),
+        "8 claims in 70 ms: one HELLO and one replay of the 20 messages"
+    );
+    assert_eq!(told.len(), 7, "the other seven are refused");
+    for refused in &told {
+        assert!(refused.soon);
+        assert!(
+            refused.retry_ms > 0 && refused.retry_ms <= SINCE_REPLAY_EVERY.as_millis() as u64,
+            "{refused:?}"
+        );
+    }
+    assert_eq!(rig.stats.replay_refused.get(), 7);
+    assert_eq!(
+        rig.link.stats().receivers_added - armed,
+        1,
+        "a refused claim does not arm the stream's gate"
+    );
+    assert!(rig.tx.queued_bytes() <= QUEUE_BYTES);
+
+    // A second after the one that was welcomed the next claim is.
+    rig.tx
+        .welcome(false, true, None, true, t + SINCE_REPLAY_EVERY)
+        .expect("a second on");
+    settle(&rig.tx).await;
+    let seen = stream(&mut rig);
+    assert_eq!((hellos(&seen), messages(&seen).len()), (1, 20));
+    // A device that was never a receiver is welcomed whenever it comes, whatever the claims.
+    rig.tx
+        .welcome(true, false, None, true, t + SINCE_REPLAY_EVERY)
+        .unwrap();
+    settle(&rig.tx).await;
+    assert_eq!(hellos(&stream(&mut rig)), 1);
+}
+
+/// Claims against a stalled stream: the FIFO holds the welcome of the first receiver, so a claim
+/// that would not fit under `queue_bytes` is refused (with a second to wait), however many come
+/// and however far apart.
+#[tokio::test]
+async fn claims_do_not_grow_the_fifo_past_queue_bytes() {
+    let rig = stalled_window(256, 4_000).await;
+    let armed = rig.link.stats().receivers_added;
+    for second in 1..=20u64 {
+        let refused = rig
+            .tx
+            .welcome(false, true, None, true, at(&rig, 2 * second))
+            .expect_err("the queue has no room for the replay");
+        assert!(!refused.soon, "{refused:?}");
+        tokio::task::yield_now().await;
+    }
+    let queued = rig.tx.queued_bytes();
+    assert!(
+        queued <= QUEUE_BYTES,
+        "20 claims for a window of {} octets (a stalled stream) left {queued} octets in a queue \
+         of {QUEUE_BYTES}",
+        256 * 4_000
+    );
+    assert_eq!(rig.stats.replay_refused.get(), 20);
+    assert_eq!(
+        rig.link.stats().receivers_added,
+        armed,
+        "refused claims arm nothing"
+    );
+}
+
+/// A claim after a real release, the first for a while, is welcomed like a new receiver: `HELLO`,
+/// the binds, the replay.
+#[tokio::test]
+async fn a_claim_the_limiter_admits_gets_its_hello_binds_and_replay() {
+    let mut rig = window_with_a_receiver().await;
+    rig.tx
+        .welcome(false, true, None, true, at(&rig, 8))
+        .expect("the first claim in a while");
+    settle(&rig.tx).await;
+    let seen = stream(&mut rig);
+    assert_eq!(hellos(&seen), 1, "HELLO");
+    assert_eq!(messages(&seen).len(), 20, "the window");
 }
 
 #[tokio::test]
@@ -962,7 +1105,9 @@ async fn stand_is_limited_and_replays_between_its_brackets_with_what_is_left() {
     settle(&rig.tx).await;
     let _ = datagrams(&mut rig);
     let _ = stream(&mut rig);
-    rig.tx.welcome(true, None, true, at(&rig, 20));
+    rig.tx
+        .welcome(true, false, None, true, at(&rig, 20))
+        .unwrap();
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
     let ops = controls(&seen);
@@ -984,14 +1129,18 @@ async fn stand_is_limited_and_replays_between_its_brackets_with_what_is_left() {
     // Between the brackets, in the order of the sequences: BEGIN < a < b < END.
     assert!(ops[1].0 < standing[0].seq && standing[1].seq < ops[2].0);
     // b is gone a minute later; the replay carries a alone.
-    rig.tx.welcome(true, None, true, at(&rig, 60));
+    rig.tx
+        .welcome(true, false, None, true, at(&rig, 60))
+        .unwrap();
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
     assert_eq!(messages(&seen).len(), 1);
     assert_eq!(messages(&seen)[0].stand_secs, Some(40));
     // A later emission that does not stand takes the standing value of its name away.
     send(&rig, &name(1), b"new", &EmitOptions::latest(), at(&rig, 61)).await;
-    rig.tx.welcome(true, None, true, at(&rig, 62));
+    rig.tx
+        .welcome(true, false, None, true, at(&rig, 62))
+        .unwrap();
     settle(&rig.tx).await;
     assert!(messages(&stream(&mut rig)).is_empty());
 
@@ -1121,7 +1270,10 @@ async fn a_receiver_behind_a_hop_with_no_stream_degrades_the_channel_to_what_it_
     settle(&rig.tx).await;
     let _ = (datagrams(&mut rig), stream(&mut rig));
 
-    let terms = rig.tx.welcome(true, None, false, at(&rig, 1));
+    let terms = rig
+        .tx
+        .welcome(true, false, None, false, at(&rig, 1))
+        .unwrap();
     rig.live.datagram_only.store(1, Ordering::SeqCst);
     settle(&rig.tx).await;
     assert_eq!(terms.ckpt_ms, 0, "its session announces no checkpoint");
@@ -1195,7 +1347,7 @@ async fn a_sender_with_no_receiver_sends_nothing_and_keeps_what_a_joiner_needs()
     assert_eq!(rig.stats.unrouted.get(), 3);
     // A receiver joins: the window is replayed.
     rig.live.receivers.store(1, Ordering::SeqCst);
-    rig.tx.welcome(true, None, true, rig.t0);
+    rig.tx.welcome(true, false, None, true, rig.t0).unwrap();
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
     let payloads: Vec<u8> = messages(&seen).iter().map(|m| m.payload[0]).collect();

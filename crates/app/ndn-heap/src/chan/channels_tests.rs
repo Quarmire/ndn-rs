@@ -523,18 +523,15 @@ fn a_session_names_the_next_sequence_and_the_audience_epoch_the_receiver_was_jud
 }
 
 #[test]
-fn a_receiver_that_says_it_holds_no_session_is_new_again_and_one_that_says_nothing_is_not() {
+fn a_receiver_that_says_it_holds_no_session_claims_to_be_new_and_is_not_fresh() {
     let table = Channels::default();
     let t0 = Instant::now();
     let (bob, key) = (n("/bob/phone"), n("/bob/phone/KEY/1"));
+    let first = admit(&table, &bob, &key, 3600, t0).unwrap();
+    assert!(first.fresh && !first.claim, "the first ask: a new device");
+    let renewal = admit(&table, &bob, &key, 3600, t0 + Duration::from_secs(1)).unwrap();
     assert!(
-        admit(&table, &bob, &key, 3600, t0).unwrap().fresh,
-        "the first ask"
-    );
-    assert!(
-        !admit(&table, &bob, &key, 3600, t0 + Duration::from_secs(1))
-            .unwrap()
-            .fresh,
+        !renewal.fresh && !renewal.claim,
         "an ask that holds its session is a renewal"
     );
     // The receiver let the channel go and asks again: the sender does not know it left, the
@@ -557,8 +554,29 @@ fn a_receiver_that_says_it_holds_no_session_is_new_again_and_one_that_says_nothi
         )
         .unwrap();
     assert!(
-        again.fresh,
-        "a receiver with no session is new to the sender's HELLO and names"
+        !again.fresh && again.claim,
+        "a listed device that says ASK_NEW makes a claim, which the sender's limiter judges; \
+         only a device that was never a receiver is fresh"
     );
-    assert_eq!(table.receiver_count(&space(), ChannelMode::Latest), 1);
+    // A device that was never listed is fresh whatever it says.
+    let carol = (n("/carol/tablet"), n("/carol/tablet/KEY/1"));
+    let asker = Asker {
+        device: &carol.0,
+        key: &carol.1,
+        wanted: 3600,
+        new: true,
+        stream: true,
+    };
+    let joined = table
+        .admit(
+            &space(),
+            ChannelMode::Latest,
+            &asker,
+            None,
+            (1, 1),
+            t0 + Duration::from_secs(3),
+        )
+        .unwrap();
+    assert!(joined.fresh && !joined.claim);
+    assert_eq!(table.receiver_count(&space(), ChannelMode::Latest), 2);
 }

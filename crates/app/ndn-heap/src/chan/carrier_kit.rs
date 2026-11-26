@@ -78,6 +78,8 @@ pub(crate) struct LinkStats {
     pub by_count: BTreeMap<u8, u64>,
     /// `CONTROL` frames taken.
     pub control_frames: u64,
+    /// [`Carrier::receiver_added`] calls: how often the stream's gate was armed.
+    pub receivers_added: u64,
 }
 
 struct LinkState {
@@ -311,5 +313,9 @@ impl Carrier for Link {
     /// this call: a carrier's writer task calls the closure, not the emitter that asked.
     fn on_ready(&self, drain: Box<dyn FnOnce() + Send>) {
         self.state.lock().ready.push(drain);
+    }
+
+    fn receiver_added(&self, _channel: u64) {
+        self.state.lock().stats.receivers_added += 1;
     }
 }

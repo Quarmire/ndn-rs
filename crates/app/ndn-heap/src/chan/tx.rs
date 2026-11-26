@@ -75,8 +75,9 @@ pub(crate) const FRAME_CAP: usize = 9_000;
 /// When a `Drop` emission that found the queue full of what cannot be dropped may try again.
 pub(crate) const CONGESTED_RETRY: Duration = Duration::from_millis(100);
 
-/// The shortest time between two replays of the window to a receiver that is not new (an ask with
-/// `ASK_SINCE`), per channel.
+/// The shortest time between two replays to receivers that are not new, per channel: the window
+/// replay of an ask with `ASK_SINCE`, and the welcome (`HELLO`, binds, standing values, replay)
+/// of an ask whose `ASK_NEW` the sender cannot check (a [claim](super::channels::Admitted::claim)).
 pub(crate) const SINCE_REPLAY_EVERY: Duration = Duration::from_secs(1);
 
 /// Sequences are below this: 2^62 − 1, the largest value of the varint in which `HELLO` and a
@@ -214,6 +215,27 @@ pub(crate) struct Terms {
     pub(crate) ckpt_ms: u64,
 }
 
+/// What a welcome queues on the stream (decided before anything is queued).
+#[derive(Default)]
+struct Plan {
+    /// `HELLO`, the binds the session's table did not take and the standing values.
+    hello: bool,
+    /// The replay of the window.
+    replay: bool,
+    /// Something is queued: the stream's frames wait for this receiver's route.
+    arm: bool,
+}
+
+/// An `ASK_NEW` claim the channel's replay limiter did not admit ([`TxChannel::welcome`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClaimRefused {
+    /// How long to wait before asking again, in milliseconds.
+    pub(crate) retry_ms: u64,
+    /// The channel replayed to a receiver within [`SINCE_REPLAY_EVERY`] (otherwise its stream's
+    /// queue had no room for the welcome).
+    pub(crate) soon: bool,
+}
+
 /// What the checkpoint writer keeps between checkpoints.
 #[derive(Default)]
 struct Ckpt {
@@ -265,7 +287,8 @@ struct State {
     /// `ending` was set where the stream's writer could not be spawned (the state's lock is held
     /// by the emission): the emission spawns it once the lock is released.
     end_kick: bool,
-    /// When the window was last replayed to a receiver that is not new (an `ASK_SINCE`).
+    /// When a replay was last queued for a receiver that is not new: the window for an
+    /// `ASK_SINCE`, the welcome for an `ASK_NEW` claim. One limiter for both.
     since_replayed: Option<Instant>,
     ckpt: Ckpt,
 }
@@ -1794,23 +1817,37 @@ impl TxChannel {
     /// `fresh`: the device was not a receiver before; others (a renewal, a re-ask) are given
     /// nothing but the replay of a window they name a start for.
     ///
+    /// `claim`: the device is listed and its ask says `ASK_NEW` ("I let the channel go, start me
+    /// again"). The sender cannot check it, and what it asks for goes to every receiver on the
+    /// route, so it is given the welcome like a fresh device only when the channel's replay
+    /// limiter admits it (at most once per [`SINCE_REPLAY_EVERY`], and only while the FIFO has
+    /// room: the one limiter an `ASK_SINCE` is judged by). Otherwise `Err(ClaimRefused)`: nothing
+    /// is queued and the stream's gate is not armed, and the caller refuses the ask `Busy` with
+    /// the time to wait, since a session with no `HELLO` would end `NoPath` two seconds on.
+    ///
     /// `stream_path`: the path to this receiver carries the stream class (the first hop toward
     /// it was judged when it asked). A receiver behind a hop that does not is given the table
     /// the session holds and no frame of the stream (`HELLO`, binds, standing values, a replay),
     /// and a session that announces no checkpoints: those frames would be dropped at the hop.
+    /// Such a claim is no claim on the stream and is never refused.
     pub(crate) fn welcome(
         self: &Arc<Self>,
         fresh: bool,
+        claim: bool,
         since: Option<u64>,
         stream_path: bool,
         now: Instant,
-    ) -> Terms {
+    ) -> Result<Terms, ClaimRefused> {
         let carrier = self.slot.get();
         let stream = stream_path && carrier.as_ref().is_some_and(|c| c.has_stream());
+        let plan = if stream {
+            self.plan_welcome(fresh, claim, since, now)?
+        } else {
+            Plan::default()
+        };
         // What follows the session on the stream waits, on a carrier that routes by a table the
-        // answer fills, until this receiver's route is up.
-        if stream
-            && (fresh || since.is_some())
+        // answer fills, until this receiver's route is up: only what is queued below does.
+        if plan.arm
             && let Some(carrier) = &carrier
         {
             carrier.receiver_added(self.id);
@@ -1838,12 +1875,12 @@ impl TxChannel {
                 _ => 0,
             },
         };
-        let replay_window = self.mode == ChannelMode::Window && (fresh || since.is_some());
-        if !stream || st.ended || !(fresh || replay_window) {
-            return terms;
+        let (hello, replay_window) = (plan.hello, plan.replay);
+        if !stream || st.ended || !(hello || replay_window) {
+            return Ok(terms);
         }
         let room = |st: &State, n: u64| st.next_seq + n + SEQ_HEADROOM < SEQ_END;
-        if fresh && room(&st, 1) {
+        if hello && room(&st, 1) {
             let next = st.next_seq + 1;
             st.control(&Control::Hello { seq: next });
             for bound in rest {
@@ -1858,7 +1895,7 @@ impl TxChannel {
         // What is replayed names itself, but its names are bound first, so the brackets of the
         // standing values hold messages and nothing else.
         let mut standing = Vec::new();
-        if fresh {
+        if hello {
             for (stood, left) in st.standing.replay(now) {
                 if let Some(used) = self.replay_binding(&mut st, &stood.name, now) {
                     standing.push((stood, left, used));
@@ -1868,12 +1905,9 @@ impl TxChannel {
         let mut replay = Vec::new();
         if replay_window {
             let window = st.window;
-            let held = st.history.since(since, &window, now);
-            if fresh || self.since_replay_allowed(&mut st, &held, now) {
-                for held in held {
-                    if let Some(used) = self.replay_binding(&mut st, &held.name, now) {
-                        replay.push((held, used));
-                    }
+            for held in st.history.since(since, &window, now) {
+                if let Some(used) = self.replay_binding(&mut st, &held.name, now) {
+                    replay.push((held, used));
                 }
             }
         }
@@ -1920,38 +1954,118 @@ impl TxChannel {
         if kick.stream {
             self.spawn_stream();
         }
-        terms
+        Ok(terms)
+    }
+
+    /// What a welcome queues, decided under one lock before anything is queued or the gate is
+    /// armed: `hello` (the `HELLO`, the binds and the standing values: a fresh device, or a claim
+    /// the limiter admitted), `replay` (the window from `since`) and `arm` (something is queued,
+    /// so the stream's frames wait for the receiver's route). A claim the limiter refuses is
+    /// `Err`: it changes nothing, so it cannot stall the stream.
+    fn plan_welcome(
+        &self,
+        fresh: bool,
+        claim: bool,
+        since: Option<u64>,
+        now: Instant,
+    ) -> Result<Plan, ClaimRefused> {
+        let mut st = self.state.lock();
+        self.refresh_key(&mut st);
+        if st.ended {
+            return Ok(Plan::default());
+        }
+        let hello = fresh || claim;
+        let replay_wanted = self.mode == ChannelMode::Window && (hello || since.is_some());
+        let held = if replay_wanted {
+            let window = st.window;
+            st.history.since(since, &window, now)
+        } else {
+            Vec::new()
+        };
+        if fresh {
+            return Ok(Plan {
+                hello,
+                replay: replay_wanted,
+                arm: true,
+            });
+        }
+        if claim {
+            let standing: usize = st
+                .standing
+                .replay(now)
+                .iter()
+                .map(|(stood, _)| stood.payload.len())
+                .sum();
+            let wanted = held
+                .iter()
+                .map(|h| h.payload.len())
+                .sum::<usize>()
+                .saturating_add(standing);
+            self.replay_allowed(&mut st, wanted, now, "ASK_NEW")?;
+            return Ok(Plan {
+                hello,
+                replay: replay_wanted,
+                arm: true,
+            });
+        }
+        let replay = replay_wanted && self.since_replay_allowed(&mut st, &held, now);
+        Ok(Plan {
+            hello: false,
+            replay,
+            arm: replay && !held.is_empty(),
+        })
     }
 
     /// Whether a receiver that is not new may be replayed `held` (what its `ASK_SINCE` asked
-    /// for): at most once per [`SINCE_REPLAY_EVERY`] per channel, and only while the stream's
-    /// FIFO has room for it under `queue_bytes`. A receiver asks as often as its signature
-    /// allows, and each replay goes to every receiver on the route and waits in the FIFO behind a
-    /// stream that may be stalled; what is refused is counted (`replay_refused`) and the
-    /// receiver's gap stands as `Lagged` until its next ask (the session's `S_SEQ` tells it the
-    /// window was not replayed).
+    /// for): see [`Self::replay_allowed`]. A replay of nothing is no replay.
     fn since_replay_allowed(&self, st: &mut State, held: &[Held], now: Instant) -> bool {
         if held.is_empty() {
             return true;
         }
         let wanted: usize = held.iter().map(|h| h.payload.len()).sum();
-        let soon = st
+        self.replay_allowed(st, wanted, now, "ASK_SINCE").is_ok()
+    }
+
+    /// Whether `wanted` octets of replay may be queued for a receiver the sender was not asked
+    /// to welcome as a new one: at most once per [`SINCE_REPLAY_EVERY`] per channel, and only
+    /// while the stream's FIFO has room for it under `queue_bytes`. A receiver asks as often as
+    /// its signature allows, and each replay goes to every receiver on the route and waits in
+    /// the FIFO behind a stream that may be stalled; what is refused is counted
+    /// (`replay_refused`). An `ASK_SINCE` is then answered without the replay (the session's
+    /// `S_SEQ` tells it the window was not replayed and its gap stands as `Lagged` until its next
+    /// ask); an `ASK_NEW` claim is refused `Busy` (the caller turns `ClaimRefused` into that).
+    /// `what` names the ask for the log.
+    fn replay_allowed(
+        &self,
+        st: &mut State,
+        wanted: usize,
+        now: Instant,
+        what: &'static str,
+    ) -> Result<(), ClaimRefused> {
+        let since = st
             .since_replayed
-            .is_some_and(|at| now.saturating_duration_since(at) < SINCE_REPLAY_EVERY);
+            .map(|at| now.saturating_duration_since(at))
+            .filter(|elapsed| *elapsed < SINCE_REPLAY_EVERY);
         let fits = st.fifo.data_bytes().saturating_add(wanted) <= self.queue_bytes;
-        if soon || !fits {
+        if since.is_some() || !fits {
             self.stats.replay_refused.bump();
             tracing::debug!(
                 channel = self.id,
-                soon,
+                soon = since.is_some(),
                 fits,
                 wanted,
-                "a window replay asked for with ASK_SINCE was not queued"
+                "a replay asked for with {what} was not queued"
             );
-            return false;
+            // The wait the limiter names: what is left of its second, or a second for a FIFO to
+            // drain.
+            let wait = since.map_or(SINCE_REPLAY_EVERY, |elapsed| SINCE_REPLAY_EVERY - elapsed);
+            return Err(ClaimRefused {
+                retry_ms: u64::try_from(wait.as_millis().max(1)).unwrap_or(u64::MAX),
+                soon: since.is_some(),
+            });
         }
         st.since_replayed = Some(now);
-        true
+        Ok(())
     }
 
     /// The id a replayed message of the name with these octets carries (it names itself, so the

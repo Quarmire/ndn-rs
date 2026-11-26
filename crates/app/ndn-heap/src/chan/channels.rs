@@ -154,8 +154,15 @@ pub(crate) struct Admitted {
     pub(crate) lifetime: u64,
     /// Whether this ask re-keyed the channel.
     pub(crate) rekeyed: bool,
-    /// Whether the asker's device was not a receiver of the channel before this ask.
+    /// Whether the asker's device was never a receiver of the channel before this ask (it takes
+    /// a place in the table, which [`RECEIVERS_PER_CHANNEL`] bounds): the sender's welcome
+    /// follows on the stream.
     pub(crate) fresh: bool,
+    /// The ask says `ASK_NEW` and the device is already listed: a claim the sender cannot check
+    /// ("I let this channel go, start me again"). It is given the welcome only when the channel's
+    /// replay limiter lets it through, like an `ASK_SINCE`, so no asker makes the stream replay
+    /// at its own rate.
+    pub(crate) claim: bool,
 }
 
 /// Which cap a refused ask hit.
@@ -176,8 +183,9 @@ pub(crate) struct Asker<'a> {
     /// The lifetime the ask wants, in seconds (0: none named).
     pub(crate) wanted: u64,
     /// The ask says the asker holds no session of the channel (`ASK_NEW`): a receiver the sender
-    /// remembers, which let the session go and asks again, is new again (the sender is not told
-    /// when a receiver lets go, unless it was the last one behind the forwarder).
+    /// remembers, which let the session go and asks again, says it is new again (the sender is not
+    /// told when a receiver lets go, unless it was the last one behind the forwarder). It is a
+    /// claim, not a fact: [`Admitted::claim`].
     pub(crate) new: bool,
     /// The ask's carriers, once the first hop toward the asker is judged, include a stream: the
     /// receiver is given the stream's frames (`HELLO`, binds, checkpoints, `END`). A receiver
@@ -342,7 +350,7 @@ impl Channel {
         );
     }
 
-    fn admitted(&self, receiver: &Receiver, rekeyed: bool, fresh: bool) -> Admitted {
+    fn admitted(&self, receiver: &Receiver, rekeyed: bool, fresh: bool, claim: bool) -> Admitted {
         Admitted {
             id: self.id,
             key_epoch: self.key_epoch,
@@ -352,6 +360,7 @@ impl Channel {
             lifetime: receiver.lifetime.as_secs(),
             rekeyed,
             fresh,
+            claim,
         }
     }
 }
@@ -458,7 +467,8 @@ impl Channels {
             .insert(asker.device.clone(), receiver.clone());
         channel.empty_since = None;
         channel.sync_live();
-        Ok(channel.admitted(&receiver, rekeyed, known.is_none() || asker.new))
+        let fresh = known.is_none();
+        Ok(channel.admitted(&receiver, rekeyed, fresh, !fresh && asker.new))
     }
 
     /// Make the channel of `(space, mode)` if there is none (the sender's own start, before

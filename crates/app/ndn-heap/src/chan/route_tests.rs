@@ -1030,3 +1030,85 @@ async fn emit_reliable_over_a_face_with_no_stream_is_refused_no_stream_and_lates
         .await
         .expect("Latest needs no stream");
 }
+
+/// A listed receiver that says `ASK_NEW` over and over (each ask signed, 4 a second allowed) is
+/// not a new receiver each time: the sender cannot check the claim, and its welcome (`HELLO`,
+/// names, standing values, the window's replay) goes to every receiver on the route. One claim a
+/// second per channel is welcomed; the others are refused `Busy`, with why and the time to wait,
+/// and queue nothing (H1 of the stage 4 and 5 review: every ask used to be a full replay).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_ask_new_from_a_listed_receiver_is_welcomed_once_and_the_rest_are_told_busy() {
+    use super::answer::ChanAnswer;
+    use super::verbs::Window;
+    use super::wire::{Answer, ChanAsk, ChannelMode, RefusalCode, carrier};
+    let rig = rig(true).await;
+    let (carol, bob) = (rig.carol(), rig.bob());
+    carol
+        .ask_channel_in(&space(), bob.name(), ChannelMode::Window)
+        .await
+        .expect("a first ask is welcomed");
+    for i in 0..5u8 {
+        bob.space(&space())
+            .unwrap()
+            .emit(
+                &n("/w"),
+                Bytes::from(vec![i; 10]),
+                EmitOptions::window(Window::DEFAULT),
+            )
+            .await
+            .expect("bob is a writer");
+    }
+    let tx = &bob.inner.chan.tx.stats;
+    let replayed = tx.replayed.get();
+
+    let (mut welcomed, mut busy) = (0, Vec::new());
+    for _ in 0..6 {
+        let ask = ChanAsk {
+            space: space(),
+            prefix: Name::root(),
+            mode: ChannelMode::Window,
+            recipient: carol.recipient().public(),
+            carriers: vec![carrier::DATAGRAM, carrier::STREAM],
+            lifetime: 3600,
+            epoch: None,
+            since: None,
+            new: true,
+            chain: carol.inner.signer_chain(),
+        };
+        let wire = carol
+            .inner
+            .sign_ask(bob.name(), &ask.encode().unwrap())
+            .unwrap();
+        let interest = ndn_packet::Interest::decode(wire).unwrap();
+        match bob.inner.chan_answer(&interest, None).await {
+            ChanAnswer::Session { .. } => welcomed += 1,
+            ChanAnswer::Data(wire) => {
+                let data = ndn_packet::Data::decode(wire).unwrap();
+                match Answer::decode(data.content().unwrap().clone()) {
+                    Ok(Answer::Refusal(r)) => busy.push(r),
+                    other => panic!("a refusal, not {other:?}"),
+                }
+            }
+            other => panic!("a session or a refusal, not {other:?}"),
+        }
+    }
+    assert_eq!(
+        (welcomed, busy.len()),
+        (1, 5),
+        "6 asks that say ASK_NEW in a burst: one is welcomed, the rest are refused Busy"
+    );
+    assert_eq!(
+        tx.replayed.get() - replayed,
+        5,
+        "the window (5 messages) is replayed once, not once for each ask"
+    );
+    for r in &busy {
+        assert_eq!(r.code, RefusalCode::Busy);
+        assert!(r.retry_ms > 0 && r.retry_ms <= 1000, "{}", r.retry_ms);
+        assert!(
+            r.text.contains("ask again after") && r.text.contains("hold no session"),
+            "the refusal says why and what to do: {}",
+            r.text
+        );
+    }
+}

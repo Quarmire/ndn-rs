@@ -15,7 +15,7 @@ use ndn_foundation_types::Name;
 use super::answer::FRAME_MAX;
 use super::channels::{Admitted, Cap, SendKey};
 use super::standing::{Who, gate};
-use super::tx::{Checkpointing, KeySource, Refused, Terms, TxChannel};
+use super::tx::{Checkpointing, ClaimRefused, KeySource, Refused, Terms, TxChannel};
 use super::verbs::{EmitError, EmitOptions};
 use super::wire::{ChanAsk, ChannelMode, carrier};
 use crate::error::HeapError;
@@ -98,8 +98,13 @@ impl NodeInner {
 
     /// A receiver was judged in (`ChanAsk` `ask`, admitted as `admitted`): what the session says of
     /// this sender, and the frames that follow the session on the stream are queued (the channel's
-    /// `welcome`).
-    pub(crate) fn chan_tx_welcome(&self, ask: &ChanAsk, admitted: &Admitted) -> Terms {
+    /// `welcome`). `Err`: the ask is an `ASK_NEW` claim the channel's replay limiter did not
+    /// admit, and nothing was queued.
+    pub(crate) fn chan_tx_welcome(
+        &self,
+        ask: &ChanAsk,
+        admitted: &Admitted,
+    ) -> Result<Terms, ClaimRefused> {
         let fallback = || Terms {
             table: Vec::new(),
             window: (ask.mode == ChannelMode::Window).then_some(super::answer::WINDOW),
@@ -108,18 +113,24 @@ impl NodeInner {
             ckpt_ms: 0,
         };
         let Some(key) = self.chan.channels.current(&ask.space, ask.mode) else {
-            return fallback();
+            return Ok(fallback());
         };
         let Some(held) = self.space_of(&ask.space) else {
-            return fallback();
+            return Ok(fallback());
         };
         let version = held.log.lock().fold.version();
         let tx = self.chan_tx_for(&ask.space, ask.mode, &key, version);
         let stream_path = ask.carriers.contains(&carrier::STREAM);
-        let terms = tx.welcome(admitted.fresh, ask.since, stream_path, Instant::now());
+        let terms = tx.welcome(
+            admitted.fresh,
+            admitted.claim,
+            ask.since,
+            stream_path,
+            Instant::now(),
+        )?;
         // The table's own copy of the next sequence is what a re-key at the limit is decided on.
         self.chan.channels.note_seq(&ask.space, ask.mode, terms.seq);
-        terms
+        Ok(terms)
     }
 
     /// End the channel of `(space, mode)`: its receivers are sent an `END` on the stream, sealed

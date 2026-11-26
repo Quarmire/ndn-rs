@@ -25,8 +25,10 @@
 //! writer of the space, a sealed space's audience of the epoch in force, the carriers (the stream
 //! is dropped from what an ask lists when the first hop toward the asker has none, and a mode
 //! that needs one is then refused `NoStream`), the caps;
-//! a refusal here is a signed `CHAN_REFUSAL` that says why and what to do. Otherwise the key is
-//! wrapped to the ask's recipient and the session is signed, `FreshnessPeriod` 0.
+//! a refusal here is a signed `CHAN_REFUSAL` that says why and what to do. Otherwise the sender's
+//! welcome is queued on the stream (an `ASK_NEW` claim by a listed device only if the channel's
+//! replay limiter admits it, else `Busy` with the time to wait), the key is wrapped to the ask's
+//! recipient and the session is signed, `FreshnessPeriod` 0.
 
 use std::time::Duration;
 
@@ -46,6 +48,7 @@ use super::aead::Aead;
 use super::channels::{Admitted, Asker, Cap};
 use super::key::ChannelKey;
 use super::standing::{Who, gate, standing};
+use super::tx::{ClaimRefused, Terms};
 use super::wire::{
     ASK_MAX, CarrierOffer, ChanAsk, RefusalCode, RefusalRecord, SessionRecord, Window, carrier,
 };
@@ -150,6 +153,21 @@ fn refuse(code: RefusalCode, text: impl Into<String>, retry_ms: u64) -> Verdict 
     })
 }
 
+/// What a refused `ASK_NEW` claim is told: why and what to do (the refusal is `Busy`).
+fn claim_refused_text(claim: ClaimRefused) -> String {
+    let why = if claim.soon {
+        "this channel was replayed to a receiver in the last second"
+    } else {
+        "this channel's stream queue has no room for what a new receiver is sent"
+    };
+    format!(
+        "your ask says you hold no session, and the sender welcomes one such ask a second for \
+         a channel (HELLO, names, standing values, replay): {why}; ask again after {} ms, with \
+         the same ask",
+        claim.retry_ms
+    )
+}
+
 impl NodeInner {
     /// Answer one ask (see the module docs for the order of the judgement).
     pub(crate) async fn chan_answer(
@@ -160,44 +178,65 @@ impl NodeInner {
         let name = (*interest.name).clone();
         match self.chan_judge(interest, ingress).await {
             Verdict::Nack(reason) => ChanAnswer::Nack(reason),
-            Verdict::Refuse(refusal) => {
-                self.chan.stats.refused.bump();
-                match refusal_data(&*self.signer, &name, &refusal) {
+            Verdict::Refuse(refusal) => self.chan_refusal(&name, &refusal),
+            Verdict::Admit(admitted, ask) => {
+                // What the session says of this sender, and the frames queued on the stream
+                // after it. A claim the limiter refuses queues nothing and is told so.
+                let terms = match self.chan_tx_welcome(&ask, &admitted) {
+                    Ok(terms) => terms,
+                    Err(claim) => {
+                        return self.chan_refusal(
+                            &name,
+                            &RefusalRecord {
+                                code: RefusalCode::Busy,
+                                text: claim_refused_text(claim),
+                                retry_ms: claim.retry_ms,
+                            },
+                        );
+                    }
+                };
+                match self.chan_session(&name, &admitted, &ask, terms) {
                     Ok(wire) => {
                         self.signatures
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        ChanAnswer::Data(wire)
+                        self.chan.stats.answered.bump();
+                        ChanAnswer::Session {
+                            wire,
+                            id: admitted.id,
+                        }
                     }
                     Err(e) => {
-                        tracing::warn!("a channel refusal cannot be signed: {e}");
+                        tracing::warn!("a channel session cannot be signed: {e}");
                         ChanAnswer::Nack(NackReason::NoRoute)
                     }
                 }
             }
-            Verdict::Admit(admitted, ask) => match self.chan_session(&name, &admitted, &ask) {
-                Ok(wire) => {
-                    self.signatures
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.chan.stats.answered.bump();
-                    ChanAnswer::Session {
-                        wire,
-                        id: admitted.id,
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("a channel session cannot be signed: {e}");
-                    ChanAnswer::Nack(NackReason::NoRoute)
-                }
-            },
         }
     }
 
-    /// The signed session for `ask`, as `admitted` gives it.
+    /// The signed refusal `refusal` as the answer to the ask named `name`.
+    fn chan_refusal(&self, name: &Name, refusal: &RefusalRecord) -> ChanAnswer {
+        self.chan.stats.refused.bump();
+        match refusal_data(&*self.signer, name, refusal) {
+            Ok(wire) => {
+                self.signatures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                ChanAnswer::Data(wire)
+            }
+            Err(e) => {
+                tracing::warn!("a channel refusal cannot be signed: {e}");
+                ChanAnswer::Nack(NackReason::NoRoute)
+            }
+        }
+    }
+
+    /// The signed session for `ask`, as `admitted` gives it, saying `terms` of this sender.
     fn chan_session(
         &self,
         name: &Name,
         admitted: &Admitted,
         ask: &ChanAsk,
+        terms: Terms,
     ) -> Result<Bytes, HeapError> {
         let carriers = [carrier::DATAGRAM, carrier::STREAM]
             .into_iter()
@@ -207,9 +246,6 @@ impl NodeInner {
                 params: Bytes::new(),
             })
             .collect();
-        // What the sender says of itself (its name table, its window, its frame size and next
-        // sequence), and the frames that follow the session on the stream, queued now.
-        let terms = self.chan_tx_welcome(ask, admitted);
         let mut session = SessionRecord {
             id: admitted.id,
             sender: self.device.clone(),
