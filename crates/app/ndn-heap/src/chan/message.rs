@@ -113,6 +113,12 @@ pub(crate) enum MessageError {
     /// After the messages, octets that are not padding.
     #[error("{octets} octets follow the last message and are not padding: drop the frame")]
     Trailing { octets: usize },
+    /// An original sequence that is not below the message's own: a replay carries a sequence the
+    /// message went out under before, so the message's own is later.
+    #[error(
+        "the original sequence {original} is not below the message's own sequence {seq}: drop the frame (a writer: replay only what was sent before)"
+    )]
+    OriginalSequence { original: u64, seq: u64 },
     /// Stand seconds over what a sender may stand an emission for.
     #[error(
         "a message stands for {secs} s, over the {max} s a sender may stand an emission for: drop the frame (a writer: stand for less)"
@@ -324,6 +330,16 @@ impl MessageWriter {
         if need > room {
             return Err(WriteError::Full { need, room });
         }
+        if let Some(origin) = message.origin {
+            let seq = self.frame.seq0() + self.count as u64;
+            if origin.sequence() >= seq {
+                return Err(MessageError::OriginalSequence {
+                    original: origin.sequence(),
+                    seq,
+                }
+                .into());
+            }
+        }
         message
             .write(self.frame.plaintext_mut())
             .map_err(|_| MessageError::Overflow { what: "message" })?;
@@ -447,6 +463,14 @@ impl Messages {
         } else {
             None
         };
+        if let Some(origin) = origin
+            && origin.sequence() >= self.seq
+        {
+            return Err(MessageError::OriginalSequence {
+                original: origin.sequence(),
+                seq: self.seq,
+            });
+        }
         let name_id = self.varint("name id")?;
         if !(1..=NAMES_PER_CHANNEL).contains(&name_id) {
             return Err(MessageError::NameId { id: name_id });
@@ -666,9 +690,10 @@ mod tests {
                 + standing.encoded_len(MESSAGE_DEFAULT).unwrap(),
             plain.len()
         );
-        let got = read_all(plain, 1_000, 2).unwrap();
-        assert_eq!(got[0].seq, 1_000);
-        assert_eq!(got[1].seq, 1_001);
+        // The messages are at 2^41 and above: a replay's original sequence is below its own.
+        let got = read_all(plain, 1 << 41, 2).unwrap();
+        assert_eq!(got[0].seq, 1 << 41);
+        assert_eq!(got[1].seq, (1 << 41) + 1);
         assert_eq!(got[0].name_id, 4_096);
         assert_eq!(got[0].name.as_deref(), Some(&name[..]));
         assert_eq!(got[0].stand_secs, Some(300));
@@ -689,7 +714,11 @@ mod tests {
             payload in proptest::collection::vec(any::<u8>(), 0..300),
             seq0 in 0u64..(SEQUENCE_LIMIT - 1),
         ) {
-            let origin = origin.map(|(standing, s)| if standing { Origin::Standing(s) } else { Origin::Replayed(s) });
+            // A replay's original sequence is below the message's own.
+            let origin = origin.filter(|_| seq0 > 0).map(|(standing, s)| {
+                let s = s % seq0;
+                if standing { Origin::Standing(s) } else { Origin::Replayed(s) }
+            });
             let m = OutMessage { name_id: id, name: name.as_deref(), stand_secs: stand, origin, payload: &payload };
             let plain = plaintext_of(&[m]);
             prop_assert_eq!(m.encoded_len(MESSAGE_DEFAULT).unwrap(), plain.len());
@@ -929,6 +958,55 @@ mod tests {
         m.stand_secs = Some(max);
         let got = read_all(plaintext_of(&[m]), 0, 1).unwrap();
         assert_eq!(got[0].stand_secs, Some(max));
+    }
+
+    /// A replay carries the sequence its message went out under before, so that is below the
+    /// message's own. A reader that took any original would let a key holder mute a name in
+    /// `Latest` by replaying it under a sequence no genuine message reaches (security review M7).
+    #[test]
+    fn an_original_sequence_not_below_the_messages_own_is_refused_by_the_reader_and_the_writer() {
+        for (own, original) in [(10u64, 10u64), (10, 11), (10, 1 << 60), (5, varint::MAX)] {
+            for standing in [true, false] {
+                let origin = if standing {
+                    Origin::Standing(original)
+                } else {
+                    Origin::Replayed(original)
+                };
+                let mut m = OutMessage::new(1, b"x");
+                m.origin = Some(origin);
+                let mut plain = Vec::new();
+                m.write(&mut plain).unwrap();
+                let want = MessageError::OriginalSequence { original, seq: own };
+                assert_eq!(
+                    read_all(plain, own, 1).err(),
+                    Some(want),
+                    "reading {origin:?} at {own}"
+                );
+                let mut w = MessageWriter::new(
+                    SideClass::Datagram,
+                    77,
+                    0,
+                    own,
+                    1_200,
+                    1_200,
+                    MESSAGE_DEFAULT,
+                )
+                .unwrap();
+                assert_eq!(
+                    w.push(&m),
+                    Err(WriteError::Invalid(want)),
+                    "writing {origin:?} at {own}"
+                );
+                assert!(w.is_empty(), "nothing was written");
+            }
+        }
+        // Below is read: the second message of a frame is at seq0 + 1.
+        let mut m = OutMessage::new(1, b"x");
+        m.origin = Some(Origin::Replayed(10));
+        let plain = plaintext_of(&[OutMessage::new(1, b"y"), m]);
+        let got = read_all(plain, 10, 2).unwrap();
+        assert_eq!(got[1].seq, 11);
+        assert_eq!(got[1].origin, Some(Origin::Replayed(10)));
     }
 
     #[test]

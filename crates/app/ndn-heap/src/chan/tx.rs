@@ -1698,6 +1698,13 @@ impl TxChannel {
     pub(crate) fn table_lookups(&self) -> u64 {
         self.state.lock().table.lookups()
     }
+
+    /// The channel's next sequence moves `n` ahead, as if that many messages had been sent (a test
+    /// stands in for a sender that has been busy while a receiver was away).
+    #[cfg(test)]
+    pub(crate) fn skip_sequences(&self, n: u64) {
+        self.state.lock().next_seq += n;
+    }
 }
 
 /// What `enqueue` decided.

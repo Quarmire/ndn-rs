@@ -243,7 +243,6 @@ impl FrameBuf {
     }
 
     /// The sequence of the frame's first message.
-    #[cfg(test)]
     pub(crate) fn seq0(&self) -> u64 {
         self.seq0
     }

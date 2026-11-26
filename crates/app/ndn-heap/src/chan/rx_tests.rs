@@ -22,6 +22,7 @@ use super::frame::{Header, seal};
 use super::items::Items;
 use super::limits::{FRAME_OVERHEAD, MESSAGE_DEFAULT, STREAM_FRAME_DEFAULT, STREAM_FRAME_MAX};
 use super::message::{MessageWriter, Origin, OutMessage, PAD};
+use super::replay::SEQ_JUMP_MAX;
 use super::rx::{Delivery, Dropped, RxStats};
 use super::sessions::{ChannelInfo, EndReason};
 use super::standing::{Who, gate};
@@ -1371,6 +1372,121 @@ async fn a_message_that_stands_for_more_than_an_hour_is_refused_with_its_frame()
         Kind::Emitted(e) => assert_eq!(e.stands, Some(Duration::from_secs(3_600))),
         other => panic!("not an emission: {other:?}"),
     }
+}
+
+// -- A key holder's sequences (security review M7) --------------------------------------------
+
+/// One authentic frame of a huge `seq0` used to set the replay window's `highest`, and every
+/// genuine frame after it was `TooOld`. A frame more than 2^24 above what the window has seen
+/// and the sender's last answer said is refused (and not marked); the genuine frames go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_authentic_frame_with_a_huge_seq0_does_not_make_later_genuine_frames_too_old() {
+    let mut fx = latest().await;
+    let start = fx.start();
+    let first = fx.data(SideClass::Datagram, start, &[named(1, A, b"first")]);
+    assert_eq!(fx.deliver(first).await, Delivery::Delivered { messages: 1 });
+    // A holder of the key seals frames far above anything the sender has sent.
+    let bound = SEQ_JUMP_MAX;
+    for (n, forged) in [1u64 << 62, (1 << 63) - 10, start + bound + 1]
+        .into_iter()
+        .enumerate()
+    {
+        let frame = fx.data(SideClass::Datagram, forged, &[msg(1, b"forged")]);
+        assert_eq!(
+            fx.deliver(frame).await,
+            Delivery::Dropped(Dropped::TooFar),
+            "seq0 {forged} (forgery {n})"
+        );
+    }
+    assert_eq!(fx.stats().too_far.get(), 3);
+    assert_eq!(fx.stats().too_old.get(), 0);
+    // The genuine frames are still taken, in order and out of order.
+    let second = fx.data(SideClass::Datagram, start + 1, &[msg(1, b"second")]);
+    assert_eq!(
+        fx.deliver(second).await,
+        Delivery::Delivered { messages: 1 }
+    );
+    // The most a frame may jump is taken: a quiet stretch of 2^24 sequences, then a frame.
+    let at_the_bound = fx.data(
+        SideClass::Datagram,
+        start + 1 + bound,
+        &[msg(1, b"after a gap")],
+    );
+    assert_eq!(
+        fx.deliver(at_the_bound).await,
+        Delivery::Delivered { messages: 1 }
+    );
+    let got = queued(&mut fx.items);
+    assert_eq!(got.len(), 1, "Latest keeps the newest message of the name");
+    assert_eq!(&got[0].bytes[..], b"after a gap");
+}
+
+/// A receiver cut off for more than 2^24 sequences sees an authentic frame it must refuse; the
+/// refusal asks the sender again, and the answer's `S_SEQ` moves the floor, so the next frame
+/// is taken: the receiver is not stuck until the session ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receiver_cut_off_beyond_the_bound_takes_the_senders_sequence_from_its_next_answer() {
+    let mut fx = latest().await;
+    let start = fx.start();
+    let tx = fx
+        .bob()
+        .inner
+        .chan
+        .tx
+        .get(&space(), ChannelMode::Latest)
+        .expect("bob's sender exists once he answered");
+    let gone = 3 * SEQ_JUMP_MAX;
+    tx.skip_sequences(gone);
+    let frame = fx.data(SideClass::Datagram, start + gone, &[named(1, A, b"back")]);
+    assert_eq!(
+        fx.deliver(frame.clone()).await,
+        Delivery::Dropped(Dropped::TooFar)
+    );
+    let session = fx.carol().inner.chan.sessions.get(fx.info.channel).unwrap();
+    eventually("the sender's answer moved the floor", || {
+        session.seq() >= start + gone
+    })
+    .await;
+    assert_eq!(
+        fx.deliver(frame).await,
+        Delivery::Delivered { messages: 1 },
+        "the same frame is taken once the answer said where the sender is"
+    );
+    assert_eq!(queued(&mut fx.items).len(), 1);
+}
+
+/// The same bound for `Latest`'s per-name comparison: a replayed or standing message whose
+/// original sequence is a number no genuine message has yet reached is refused with its frame,
+/// so it cannot mute the name for the genuine messages that follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_original_sequence_does_not_mute_a_name_in_latest() {
+    let mut fx = latest().await;
+    let start = fx.start();
+    let mut plain = vec![0x01 | 0x08];
+    super::varint::write(&mut plain, 1 << 60).unwrap();
+    plain.extend_from_slice(&[1, 3, 0x08, 0x01, b'a', 1, b'x']);
+    let header = Header::new(
+        SideClass::Datagram,
+        SideKind::Data,
+        fx.info.channel,
+        fx.epoch(),
+        start,
+        1,
+    )
+    .unwrap();
+    let forged = seal(&fx.cipher, &header, &plain).unwrap();
+    assert_eq!(
+        fx.deliver(forged).await,
+        Delivery::Dropped(Dropped::Malformed)
+    );
+    let genuine = fx.data(SideClass::Datagram, start + 1, &[named(1, A, b"genuine")]);
+    assert_eq!(
+        fx.deliver(genuine).await,
+        Delivery::Delivered { messages: 1 }
+    );
+    let got = queued(&mut fx.items);
+    assert_eq!(got.len(), 1);
+    assert_eq!(&got[0].bytes[..], b"genuine");
 }
 
 // -- End to end: the real sender over a carrier that loses, duplicates and reorders -------------

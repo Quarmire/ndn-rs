@@ -13,6 +13,15 @@
 /// How many frame sequences the window remembers.
 pub(crate) const REPLAY_WINDOW: u64 = 4_096;
 
+/// The most a frame's `seq0` may be above the highest the window has marked (or above the
+/// session's `S_SEQ`, before it has marked any): 2^24 sequences. A key holder can seal a frame
+/// of any `seq0` below 2^63, and the window's `highest` follows the highest it ever marked, so
+/// one such frame would make every genuine frame after it [`Replay::TooOld`]; the bound turns
+/// that into a wedge of at most this many sequences. Large enough that a sender at its fastest
+/// (about 2 million messages a second) does not pass it during the ask and install of a
+/// session (seconds), and that a receiver cut off for a few seconds does not either.
+pub(crate) const SEQ_JUMP_MAX: u64 = 1 << 24;
+
 const WORDS: usize = (REPLAY_WINDOW / 64) as usize;
 
 /// What the window says of a `seq0` that is about to be opened.
@@ -54,6 +63,14 @@ impl ReplayWindow {
     #[cfg(test)]
     pub(crate) fn highest(&self) -> Option<u64> {
         self.highest
+    }
+
+    /// Whether `seq0` is further above what this window has seen than a genuine frame can be:
+    /// more than [`SEQ_JUMP_MAX`] above the higher of `highest` and `floor` (the session's
+    /// `S_SEQ`). Marks nothing.
+    pub(crate) fn beyond(&self, floor: u64, seq0: u64) -> bool {
+        let reference = self.highest.map_or(floor, |highest| highest.max(floor));
+        seq0 > reference.saturating_add(SEQ_JUMP_MAX)
     }
 
     /// What the window says of `seq0`. Marks nothing: call [`Self::mark`] once the frame
@@ -232,5 +249,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_seq0_is_beyond_when_it_is_over_the_jump_bound_above_the_higher_of_highest_and_the_floor() {
+        let mut w = ReplayWindow::new();
+        // Nothing marked: measured from the floor (the session's `S_SEQ`).
+        assert!(!w.beyond(100, 100 + SEQ_JUMP_MAX));
+        assert!(w.beyond(100, 100 + SEQ_JUMP_MAX + 1));
+        assert!(
+            !w.beyond(100, 5),
+            "a frame below the floor is not beyond anything"
+        );
+        // Marked: measured from the highest when that is above the floor.
+        w.mark(1_000);
+        assert!(!w.beyond(100, 1_000 + SEQ_JUMP_MAX));
+        assert!(w.beyond(100, 1_000 + SEQ_JUMP_MAX + 1));
+        // And from the floor when the sender's last answer is above it.
+        assert!(!w.beyond(5_000, 5_000 + SEQ_JUMP_MAX));
+        assert!(w.beyond(5_000, 5_000 + SEQ_JUMP_MAX + 1));
+        // The window itself is not moved by asking.
+        assert_eq!(w.highest(), Some(1_000));
+        assert!(!w.beyond(u64::MAX, u64::MAX), "no overflow at the top");
     }
 }

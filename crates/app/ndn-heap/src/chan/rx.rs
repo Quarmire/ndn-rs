@@ -92,6 +92,10 @@ pub(crate) struct RxStats {
     pub(crate) replayed: Counter,
     /// Frames whose `seq0` is below the replay window: dropped before the AEAD.
     pub(crate) too_old: Counter,
+    /// Frames that authenticated and whose `seq0` is more than 2^24 above what the window has
+    /// seen and the sender's last answer said: refused, and the sender is asked again (a
+    /// genuine frame can only be that far after the receiver was cut off).
+    pub(crate) too_far: Counter,
     /// AEAD attempts: the only cryptography a frame costs.
     pub(crate) aead_attempts: Counter,
     /// Attempts that failed: not this session's key, or altered.
@@ -167,6 +171,11 @@ pub enum Dropped {
     Replayed,
     /// A sequence below the replay window.
     TooOld,
+    /// Authenticated, and its sequence is more than 2^24 above the highest this receiver has
+    /// seen and the sender's last answer said (a receiver cut off longer than that is told by
+    /// the sender's next answer, which this frame makes the receiver ask for, at most once a
+    /// second).
+    TooFar,
     /// The tag did not verify.
     Unauthentic,
     /// Authenticated, and a message or record in it does not parse.
@@ -217,6 +226,8 @@ struct Post {
     reask: Option<u64>,
     /// The sender said `END`.
     end: bool,
+    /// An authentic frame was too far ahead of the sequences held: ask the sender again.
+    far: bool,
 }
 
 struct RxState {
@@ -431,6 +442,9 @@ impl ChannelRx {
         if let Some(since) = post.reask {
             self.reask(node, since);
         }
+        if post.far {
+            self.ask_again(node, now, "a frame came far ahead of the sequences held");
+        }
         delivery
     }
 
@@ -439,6 +453,19 @@ impl ChannelRx {
     fn unknown_epoch(&self, node: &NodeInner, now: Instant) -> Delivery {
         let stats = &node.chan.stats.rx;
         stats.unknown_epoch.bump();
+        if !self.ask_again(node, now, "a frame came under a new key epoch") {
+            stats.unknown_channel.bump();
+            return Delivery::Dropped(Dropped::UnknownChannel);
+        }
+        Delivery::Dropped(Dropped::UnknownEpoch)
+    }
+
+    /// Ask the sender for the session again, at most once a second per sender (one limit for every
+    /// cause: a frame under an unknown key epoch, and an authentic frame far ahead of the
+    /// sequences held). The answer brings the key epoch it holds and the sequence it has reached.
+    /// False when this node holds no session of the channel any more.
+    fn ask_again(&self, node: &NodeInner, now: Instant, why: &'static str) -> bool {
+        let stats = &node.chan.stats.rx;
         match node.chan.sessions.unknown_epoch(self.channel, now) {
             Unknown::Ask {
                 space,
@@ -449,18 +476,18 @@ impl ChannelRx {
                 let node = node.arc();
                 let task = Arc::clone(&node);
                 node.tasks.spawn(async move {
-                    if let Err(why) = task.chan_ask(&space, &sender, mode).await {
-                        tracing::debug!(%space, %sender, ?mode, "asking again after a new key epoch failed: {why}");
+                    if let Err(error) = task.chan_ask(&space, &sender, mode).await {
+                        tracing::debug!(%space, %sender, ?mode, "asking again ({why}) failed: {error}");
                     }
                 });
+                true
             }
-            Unknown::Limited => stats.epoch_limited.bump(),
-            Unknown::NoSession => {
-                stats.unknown_channel.bump();
-                return Delivery::Dropped(Dropped::UnknownChannel);
+            Unknown::Limited => {
+                stats.epoch_limited.bump();
+                true
             }
+            Unknown::NoSession => false,
         }
-        Delivery::Dropped(Dropped::UnknownEpoch)
     }
 
     /// Ask the `Window` sender again for the sequences from `since`.
@@ -534,6 +561,20 @@ impl ChannelRx {
                 return Delivery::Dropped(Dropped::Malformed);
             }
         };
+        // A frame far above everything this receiver has seen and the sender last said is refused
+        // and marks nothing: a holder of the key can seal any `seq0`, and one such frame marked
+        // would make every genuine frame after it too old. The sender's last answer moves the
+        // floor (the receiver is asked again), so a receiver cut off for longer than the bound is
+        // not stuck.
+        if st.replay.beyond(self.start, header.seq0)
+            && st
+                .replay
+                .beyond(self.start.max(self.session.seq()), header.seq0)
+        {
+            stats.too_far.bump();
+            post.far = true;
+            return Delivery::Dropped(Dropped::TooFar);
+        }
         // Marked only now: a forged frame of a genuine `seq0` burned nothing.
         st.replay.mark(header.seq0);
         st.last_ingress = ingress;
