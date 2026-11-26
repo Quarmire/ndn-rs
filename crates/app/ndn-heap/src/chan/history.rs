@@ -181,6 +181,11 @@ impl Standing {
         Ok(())
     }
 
+    /// Whether nothing stands (an expired value that was not purged yet still counts).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+
     /// The last emission of `name` did not stand: nothing of it stands any more.
     pub(crate) fn clear(&mut self, name: &[u8]) {
         // Nothing stands for most paths: such an emission hashes nothing here.

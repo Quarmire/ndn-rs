@@ -15,7 +15,7 @@ use ndn_foundation_types::Name;
 use super::answer::FRAME_MAX;
 use super::channels::{Admitted, Cap, SendKey};
 use super::standing::{Who, gate};
-use super::tx::{Checkpointing, ClaimRefused, KeySource, Refused, Terms, TxChannel};
+use super::tx::{Attempt, Checkpointing, ClaimRefused, KeySource, Refused, Terms, TxChannel};
 use super::verbs::{EmitError, EmitOptions};
 use super::wire::{ChanAsk, ChannelMode, carrier};
 use crate::error::HeapError;
@@ -201,15 +201,18 @@ impl Heap {
     pub async fn emit(
         &self,
         path: &Name,
-        bytes: Bytes,
+        mut bytes: Bytes,
         opts: EmitOptions,
     ) -> Result<(), EmitError> {
         TxChannel::validate(&opts)?;
         let mode = opts.mode.channel();
         let now = Instant::now();
+        if let Some(done) = self.emit_kept(mode, path, &mut bytes, &opts, now) {
+            return done;
+        }
         for _ in 0..2 {
             let channel = self.sender(mode, now)?;
-            match channel.emit(path, &bytes, &opts, now).await {
+            match channel.emit_taking(path, &mut bytes, &opts, now).await {
                 Ok(()) => return Ok(()),
                 Err(Refused::Error(e)) => return Err(e),
                 // The channel ended (a re-judging, its sequence): the next one is made.
@@ -222,6 +225,48 @@ impl Heap {
         })
     }
 
+    /// The emission on the sender this handle keeps, if it is still the node's and passes the
+    /// writer gate, with no reference counted on it and nothing awaited. `None`: there is no such
+    /// sender, the message must wait for room, or the channel ended; the general path decides.
+    fn emit_kept(
+        &self,
+        mode: ChannelMode,
+        path: &Name,
+        bytes: &mut Bytes,
+        opts: &EmitOptions,
+        now: Instant,
+    ) -> Option<Result<(), EmitError>> {
+        let node = &self.node;
+        let generation = node.judge.generation();
+        let tried = self.inner.senders.with(&node.chan.tx, mode, |held| {
+            let live = held.gate_valid(generation)
+                && !held
+                    .live()
+                    .closed
+                    .load(std::sync::atomic::Ordering::Acquire);
+            if !live {
+                return None;
+            }
+            match held.attempt(path, bytes, opts, now) {
+                Ok(Attempt::Done { kick, carrier }) => {
+                    // The writer runs after the cache is released: it calls the carrier.
+                    let runner = kick.any().then(|| Arc::clone(held));
+                    Some(Ok((runner, kick, carrier)))
+                }
+                Ok(Attempt::Wait(_)) | Err(Refused::Gone) => None,
+                Err(Refused::Error(e)) => Some(Err(e)),
+            }
+        })??;
+        let (runner, kick, carrier) = match tried {
+            Ok(done) => done,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Some(runner) = runner {
+            runner.run(kick, carrier.as_ref(), now);
+        }
+        Some(Ok(()))
+    }
+
     /// The sender of the channel of `mode`, after the writer gate.
     fn sender(&self, mode: ChannelMode, now: Instant) -> Result<Arc<TxChannel>, EmitError> {
         let space = &self.inner.name;
@@ -229,16 +274,6 @@ impl Heap {
         let generation = node.judge.generation();
         // Read before the sender is looked up: a replacement that races leaves the entry stale.
         let senders_at = node.chan.tx.epoch();
-        let kept = self.inner.senders.get(&node.chan.tx, mode);
-        if let Some(held) = kept
-            && held.gate_valid(generation)
-            && !held
-                .live()
-                .closed
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Ok(held);
-        }
         if let Some(held) = node.chan.tx.get(space, mode)
             && held.gate_valid(generation)
             && !held

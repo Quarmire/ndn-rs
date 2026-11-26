@@ -253,11 +253,30 @@ struct Ckpt {
 
 /// What an emission asks the caller to do once the lock is released.
 #[derive(Default)]
-struct Kick {
+pub(crate) struct Kick {
     /// The caller is the datagram lane's writer.
     datagram: bool,
     /// The stream lane's `writing` flag was set for a task the caller must spawn.
     stream: bool,
+}
+
+/// What one try of an emission came to ([`TxChannel::attempt`]).
+pub(crate) enum Attempt<'a> {
+    /// The message is queued: what the caller does now. `carrier` is set when the caller is the
+    /// datagram lane's writer.
+    Done {
+        kick: Kick,
+        carrier: Option<Arc<dyn Carrier>>,
+    },
+    /// The queue has no room: wait for it, then try again.
+    Wait(tokio::sync::futures::Notified<'a>),
+}
+
+impl Kick {
+    /// Whether the caller has anything to do.
+    pub(crate) fn any(&self) -> bool {
+        self.datagram || self.stream
+    }
 }
 
 struct State {
@@ -279,6 +298,9 @@ struct State {
     standing: Standing,
     sent: SentFrames,
     scratch: Vec<(u64, u64)>,
+    /// The attached carrier and [`CarrierSlot::generation`] it was read at: an emission reads it
+    /// here (under the lock it takes anyway) instead of the slot's lock and a reference count.
+    carrier: Option<(u64, Arc<dyn Carrier>)>,
     ended: bool,
     /// The channel's `END` is queued on the stream: the lane sends what waits, then it, under the
     /// key in force when the channel ended, and goes idle. (`ended` alone means nothing more is
@@ -509,6 +531,7 @@ impl TxChannel {
                 standing: Standing::default(),
                 sent: SentFrames::new(),
                 scratch: Vec::new(),
+                carrier: None,
                 ended: false,
                 ending: false,
                 end_kick: false,
@@ -805,7 +828,74 @@ impl TxChannel {
     /// Returns when the message is queued: at once for `Latest` and for `Drop`; for `Block`, when
     /// the queue has room. A channel with no receiver, or no carrier attached, sends nothing and
     /// returns at once; its standing values and, in `Window` mode, its window are still kept for
-    /// a receiver that joins later.
+    /// a receiver that joins later. `payload` is taken (left empty) when the message is queued; a
+    /// refusal leaves it.
+    pub(crate) async fn emit_taking(
+        self: &Arc<Self>,
+        path: &Name,
+        payload: &mut Bytes,
+        opts: &EmitOptions,
+        now: Instant,
+    ) -> Result<(), Refused> {
+        Self::validate(opts)?;
+        loop {
+            match self.attempt(path, payload, opts, now)? {
+                Attempt::Done { kick, carrier } => {
+                    self.run(kick, carrier.as_ref(), now);
+                    return Ok(());
+                }
+                Attempt::Wait(notified) => notified.await,
+            }
+        }
+    }
+
+    /// One try of an emission: the queue step under the lock. Nothing changes when it is refused
+    /// or must wait. The carrier is read from the state (kept by generation), and handed back
+    /// only when the caller is to write datagrams.
+    pub(crate) fn attempt<'a>(
+        self: &'a Arc<Self>,
+        path: &Name,
+        payload: &mut Bytes,
+        opts: &EmitOptions,
+        now: Instant,
+    ) -> Result<Attempt<'a>, Refused> {
+        let mut st = self.state.lock();
+        let generation = self.slot.generation();
+        if st.carrier.as_ref().is_none_or(|(at, _)| *at != generation) {
+            st.carrier = self.slot.get().map(|carrier| (generation, carrier));
+        }
+        let carrier = st.carrier.take();
+        let step = self.enqueue(
+            &mut st,
+            path,
+            payload,
+            opts,
+            now,
+            carrier.as_ref().map(|(_, c)| c),
+        );
+        let end = std::mem::take(&mut st.end_kick);
+        // Created under the lock: a wake-up between the lock and the wait is not lost.
+        let waiting = matches!(step, Ok(Step::Wait)).then(|| self.room.notified());
+        let writer = match &step {
+            Ok(Step::Done(kick)) if kick.datagram => carrier.as_ref().map(|(_, c)| Arc::clone(c)),
+            _ => None,
+        };
+        st.carrier = carrier;
+        drop(st);
+        if end {
+            self.spawn_stream();
+        }
+        Ok(match step? {
+            Step::Done(kick) => Attempt::Done {
+                kick,
+                carrier: writer,
+            },
+            Step::Wait => Attempt::Wait(waiting.unwrap_or_else(|| self.room.notified())),
+        })
+    }
+
+    /// `emit_taking` for a payload the caller keeps (the tests').
+    #[cfg(test)]
     pub(crate) async fn emit(
         self: &Arc<Self>,
         path: &Name,
@@ -813,36 +903,17 @@ impl TxChannel {
         opts: &EmitOptions,
         now: Instant,
     ) -> Result<(), Refused> {
-        Self::validate(opts)?;
-        let carrier = self.slot.get();
-        loop {
-            let (kick, waiting) = {
-                let mut st = self.state.lock();
-                let step = self.enqueue(&mut st, path, payload, opts, now, carrier.as_ref());
-                let end = std::mem::take(&mut st.end_kick);
-                // Created under the lock: a wake-up between the lock and the wait is not lost.
-                let waiting = matches!(step, Ok(Step::Wait)).then(|| self.room.notified());
-                drop(st);
-                if end {
-                    self.spawn_stream();
-                }
-                match step? {
-                    Step::Done(kick) => (kick, None),
-                    Step::Wait => (Kick::default(), waiting),
-                }
-            };
-            match waiting {
-                None => {
-                    self.run(kick, carrier.as_ref(), now);
-                    return Ok(());
-                }
-                Some(notified) => notified.await,
-            }
-        }
+        self.emit_taking(path, &mut payload.clone(), opts, now)
+            .await
     }
 
     /// Do what the kick says: spawn the stream's writer, or be the datagram lane's.
-    fn run(self: &Arc<Self>, kick: Kick, carrier: Option<&Arc<dyn Carrier>>, now: Instant) {
+    pub(crate) fn run(
+        self: &Arc<Self>,
+        kick: Kick,
+        carrier: Option<&Arc<dyn Carrier>>,
+        now: Instant,
+    ) {
         if kick.stream {
             self.spawn_stream();
         }
@@ -895,7 +966,7 @@ impl TxChannel {
         &self,
         st: &mut State,
         path: &Name,
-        payload: &Bytes,
+        payload: &mut Bytes,
         opts: &EmitOptions,
         now: Instant,
         carrier: Option<&Arc<dyn Carrier>>,
@@ -1057,7 +1128,13 @@ impl TxChannel {
 
         // Nothing can refuse the emission now.
         // The id `peek` read under this same lock: the path is not hashed again.
-        let used = match peeked.and_then(|(id, _, _)| st.table.touch_id(id, now)) {
+        // Only a message that carries its name, a window's record, and a standing value read the
+        // name's octets after this: another one does not take a reference to them.
+        let keep_name = named
+            || self.mode == ChannelMode::Window
+            || opts.stand.is_some()
+            || !st.standing.is_empty();
+        let used = match peeked.and_then(|(id, _, _)| st.table.touch_id(id, now, keep_name)) {
             Some(used) => used,
             None => {
                 let octets = fresh_octets.unwrap_or_else(|| table::name_octets(path));
@@ -1080,7 +1157,7 @@ impl TxChannel {
             named: used.named || !stream || degraded,
             stand: stand_secs,
             origin: None,
-            payload: payload.clone(),
+            payload: std::mem::take(payload),
             repacked: false,
             at: now,
             inflight: false,
@@ -2223,11 +2300,18 @@ pub(crate) struct SenderCache(parking_lot::Mutex<[Option<Kept>; 3]>);
 type Kept = (u64, Arc<TxChannel>);
 
 impl SenderCache {
-    /// The sender kept for `mode` if `tx` has not replaced any sender since it was kept.
-    pub(crate) fn get(&self, tx: &Tx, mode: ChannelMode) -> Option<Arc<TxChannel>> {
+    /// Run `f` on the sender kept for `mode`, if `tx` has not replaced any sender since it was
+    /// kept; `None` when there is none to run it on. The cache is locked while `f` runs: `f` must
+    /// not call anything that emits (take the sender out by a clone to do that).
+    pub(crate) fn with<R>(
+        &self,
+        tx: &Tx,
+        mode: ChannelMode,
+        f: impl FnOnce(&Arc<TxChannel>) -> R,
+    ) -> Option<R> {
         let epoch = tx.epoch();
         match &self.0.lock()[index(mode)] {
-            Some((at, held)) if *at == epoch => Some(Arc::clone(held)),
+            Some((at, held)) if *at == epoch => Some(f(held)),
             _ => None,
         }
     }

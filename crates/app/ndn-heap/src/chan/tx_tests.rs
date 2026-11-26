@@ -2085,7 +2085,8 @@ async fn a_kept_sender_is_given_only_while_the_node_still_holds_it() {
     );
     let (tx, cache, space) = (Tx::default(), SenderCache::default(), name(0));
     let latest = ChannelMode::Latest;
-    assert!(cache.get(&tx, latest).is_none(), "nothing kept yet");
+    let given = |tx: &Tx, mode| cache.with(tx, mode, Arc::clone);
+    assert!(given(&tx, latest).is_none(), "nothing kept yet");
 
     let before = tx.epoch();
     let held = tx.get_or_make(&space, latest, CHANNEL, || first.clone());
@@ -2093,21 +2094,145 @@ async fn a_kept_sender_is_given_only_while_the_node_still_holds_it() {
     // The lookup raced no replacement of another sender: but `before` was read before this one
     // was made, so the entry is stale at birth (conservative, never wrong).
     cache.keep(before, latest, &held);
-    assert!(cache.get(&tx, latest).is_none());
+    assert!(given(&tx, latest).is_none());
     cache.keep(tx.epoch(), latest, &held);
-    assert!(Arc::ptr_eq(&cache.get(&tx, latest).unwrap(), &first));
+    assert!(Arc::ptr_eq(&given(&tx, latest).unwrap(), &first));
     // Asking for the same channel again replaces nothing.
     let again = tx.get_or_make(&space, latest, CHANNEL, || unreachable!("held"));
     assert!(Arc::ptr_eq(&again, &first));
-    assert!(Arc::ptr_eq(&cache.get(&tx, latest).unwrap(), &first));
+    assert!(Arc::ptr_eq(&given(&tx, latest).unwrap(), &first));
     // Another mode is another slot.
-    assert!(cache.get(&tx, ChannelMode::Reliable).is_none());
+    assert!(given(&tx, ChannelMode::Reliable).is_none());
 
     // The node makes another sender (a new channel id): the kept one is no longer given.
     let replaced = tx.get_or_make(&space, latest, CHANNEL + 1, || second.clone());
     assert!(Arc::ptr_eq(&replaced, &second));
     assert!(
-        cache.get(&tx, latest).is_none(),
+        given(&tx, latest).is_none(),
         "a kept sender the node replaced is never used"
+    );
+}
+
+#[tokio::test]
+async fn emit_taking_takes_the_payload_it_queues_and_leaves_one_it_refuses() {
+    let mut rig = rig(ChannelMode::Latest, LinkConfig::default());
+    let latest = EmitOptions::latest();
+    let mut payload = Bytes::from(vec![0xC3u8; 200]);
+    rig.tx
+        .emit_taking(&name(1), &mut payload, &latest, rig.t0)
+        .await
+        .unwrap();
+    assert!(payload.is_empty(), "the queued message holds the payload");
+    settle(&rig.tx).await;
+    let seen = datagrams(&mut rig);
+    let sent = messages(&seen);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        &sent[0].payload[..],
+        &[0xC3u8; 200][..],
+        "the same bytes leave"
+    );
+    // A message over the limit is refused, and the caller still has it.
+    let mut too_big = Bytes::from(vec![1u8; MESSAGE_MAX + 1]);
+    let refused = rig
+        .tx
+        .emit_taking(&name(1), &mut too_big, &latest, rig.t0)
+        .await;
+    assert!(matches!(
+        refused,
+        Err(Refused::Error(EmitError::TooLarge { .. }))
+    ));
+    assert_eq!(
+        too_big.len(),
+        MESSAGE_MAX + 1,
+        "a refusal leaves the payload"
+    );
+}
+
+#[tokio::test]
+async fn a_plain_emission_ends_the_standing_value_of_its_path_though_it_carries_no_name() {
+    let mut rig = rig(ChannelMode::Latest, LinkConfig::default());
+    let stand = EmitOptions::latest().standing(Duration::from_secs(100));
+    prebind(&mut rig, 1..3).await;
+    // Past its first messages and its bind window a message under the path is bare: it carries
+    // no name, and still must end what stood under that name.
+    send(&rig, &name(1), b"stands", &stand, at(&rig, 10)).await;
+    send(&rig, &name(2), b"stays", &stand, at(&rig, 10)).await;
+    send(
+        &rig,
+        &name(1),
+        b"plain",
+        &EmitOptions::latest(),
+        at(&rig, 11),
+    )
+    .await;
+    settle(&rig.tx).await;
+    let _ = datagrams(&mut rig);
+    let _ = stream(&mut rig);
+    rig.tx
+        .welcome(true, false, None, true, at(&rig, 20))
+        .unwrap();
+    settle(&rig.tx).await;
+    let seen = stream(&mut rig);
+    let standing = messages(&seen);
+    assert_eq!(standing.len(), 1, "only the second path still stands");
+    assert_eq!(standing[0].payload, Bytes::from_static(b"stays"));
+}
+
+#[tokio::test]
+async fn the_carrier_the_node_attaches_in_place_of_another_gets_the_next_emissions_frames() {
+    let rig = rig(ChannelMode::Latest, LinkConfig::default());
+    let (first, second) = (
+        Link::new(LinkConfig::default()),
+        Link::new(LinkConfig::default()),
+    );
+    let slot = Arc::new(CarrierSlot::default());
+    slot.set(first.clone());
+    let tx = TxChannel::new(
+        ChannelMode::Latest,
+        &SendKey {
+            id: CHANNEL,
+            key_epoch: 0,
+            frame_key: ChannelKey::random().frame_key(CHANNEL, 0),
+            live: Arc::clone(&rig.live),
+        },
+        rig.keys.clone(),
+        Tasks::new(),
+        Arc::clone(&slot),
+        Arc::new(TxStats::default()),
+        Arc::new(AtomicU64::new(0)),
+    );
+    let latest = EmitOptions::latest();
+    tx.emit(&name(1), &Bytes::from_static(b"one"), &latest, rig.t0)
+        .await
+        .unwrap();
+    settle(&tx).await;
+    assert_eq!(
+        (first.queued_datagrams(), second.queued_datagrams()),
+        (1, 0)
+    );
+    // A second emission under the same carrier reads it from the channel's own copy.
+    tx.emit(&name(1), &Bytes::from_static(b"two"), &latest, at(&rig, 1))
+        .await
+        .unwrap();
+    settle(&tx).await;
+    assert_eq!(
+        (first.queued_datagrams(), second.queued_datagrams()),
+        (2, 0)
+    );
+    // Another carrier is attached: the next frame goes to it, and no more to the first.
+    slot.set(second.clone());
+    tx.emit(
+        &name(1),
+        &Bytes::from_static(b"three"),
+        &latest,
+        at(&rig, 2),
+    )
+    .await
+    .unwrap();
+    settle(&tx).await;
+    assert_eq!(
+        (first.queued_datagrams(), second.queued_datagrams()),
+        (2, 1)
     );
 }

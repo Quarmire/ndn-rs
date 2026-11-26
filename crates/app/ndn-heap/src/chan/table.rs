@@ -148,11 +148,13 @@ impl Table {
     /// name.
     pub(crate) fn touch(&mut self, name: &Name, now: Instant) -> Option<Use> {
         let id = self.id_of(name)?;
-        self.touch_id(id, now)
+        self.touch_id(id, now, true)
     }
 
     /// [`Self::touch`] for an id that was just read from [`Self::peek`] under the same lock.
-    pub(crate) fn touch_id(&mut self, id: u64, now: Instant) -> Option<Use> {
+    /// `keep_octets` false: the answer holds no reference to the name's octets (empty), for a
+    /// message that will not read them.
+    pub(crate) fn touch_id(&mut self, id: u64, now: Instant, keep_octets: bool) -> Option<Use> {
         let entry = self.entry_mut(id)?;
         entry.last_used = now;
         let early = now.saturating_duration_since(entry.bound_at) < BIND_WINDOW;
@@ -160,7 +162,11 @@ impl Table {
         entry.named_left = entry.named_left.saturating_sub(1);
         Some(Use {
             id,
-            octets: entry.octets.clone(),
+            octets: if keep_octets {
+                entry.octets.clone()
+            } else {
+                Bytes::new()
+            },
             named,
         })
     }
@@ -286,6 +292,33 @@ mod tests {
     fn bound(t: &mut Table, i: usize, now: Instant) -> Use {
         let n = name(i);
         t.bind(&n, name_octets(&n), now).unwrap().unwrap()
+    }
+
+    #[test]
+    fn touching_an_id_without_its_octets_answers_the_same_and_holds_no_reference_to_them() {
+        let (mut t, now) = (Table::default(), Instant::now());
+        let first = bound(&mut t, 0, now);
+        let later = now + Duration::from_secs(5);
+        let (id, _, _) = t.peek(&name(0), later).unwrap();
+        let bare = t.touch_id(id, later, false).unwrap();
+        assert_eq!(
+            (bare.id, bare.named),
+            (first.id, true),
+            "the second of three named"
+        );
+        assert!(bare.octets.is_empty());
+        let kept = t.touch_id(id, later, true).unwrap();
+        assert_eq!(
+            (kept.id, kept.named),
+            (first.id, true),
+            "the third of three named"
+        );
+        assert_eq!(kept.octets, first.octets);
+        let after = t.touch_id(id, later, true).unwrap();
+        assert!(
+            !after.named,
+            "the fourth, late: the flags do not depend on the octets"
+        );
     }
 
     #[test]
