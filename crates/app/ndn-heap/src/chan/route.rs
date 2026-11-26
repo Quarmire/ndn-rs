@@ -80,11 +80,12 @@ pub(crate) const NO_PATH_AFTER: Duration = Duration::from_secs(2);
 /// (below [`NO_PATH_AFTER`], so a receiver that waited is not yet told it has no path).
 pub(crate) const ROUTE_WAIT: Duration = Duration::from_secs(1);
 
-/// The largest datagram frame a `ConnectionCarrier` reports by default: what one QUIC
-/// datagram carries at the smallest path MTU (the figure a session names in its answer),
-/// because the sinks of a route may be links. A frame over what a sink takes is refused there
-/// and counted, and a larger message goes on the stream instead. A host whose sinks are all
-/// local may raise it ([`NodeHandle::attach_forwarder_with`]).
+/// What a `ConnectionCarrier` sends as a datagram frame where it cannot know what the sinks of
+/// a route take: the connection does not see its forwarder's faces (a socket to a daemon), or
+/// the route has no sink yet: 1,200 octets, about what one QUIC datagram carries at the
+/// smallest path MTU, because the sinks of a route may be links. Where the forwarder can say, the
+/// frame is sized to the live limit of the sinks instead ([`NodeHandle::attach_forwarder`]).
+/// A frame over what a sink takes is refused there and counted, never cut.
 pub const DATAGRAM_FRAME_MAX: usize = 1_200;
 
 /// The most channels whose first `Keep` a node remembers (the forwarder's own route limit).
@@ -229,12 +230,31 @@ fn frame_id(frame: &Bytes) -> Option<u64> {
 
 /// A node's way to send channel frames over its connection to a forwarder: the node's
 /// [`Carrier`] ([`NodeHandle::attach_forwarder`]).
+///
+/// Its datagram limit for a channel is what the forwarder says the sinks of that channel's route
+/// take **now** ([`Connection::side_sink_limit`]: the smallest live limit of the faces the
+/// forwarder fans the channel out to), read for every frame, never over the connection's own
+/// face's limit or the host's `ceiling`. Where the forwarder cannot say (a connection to a
+/// daemon, or a route with no sink yet) it is `unknown`.
 pub(crate) struct ConnectionCarrier {
     conn: Arc<dyn Connection>,
     routes: Arc<Routes>,
-    datagram_max: usize,
+    /// The most a datagram frame is, whatever the sinks take.
+    ceiling: usize,
+    /// The limit when the sinks' own cannot be known.
+    unknown: usize,
     stream: bool,
     ready: Arc<Mutex<Ready>>,
+}
+
+/// How a [`ConnectionCarrier`] sizes its datagram frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DatagramSize {
+    /// From the live limits of the route's sinks; [`DATAGRAM_FRAME_MAX`] where they are unknown.
+    Live,
+    /// At most this, for every channel, and exactly this where the sinks' limits are unknown
+    /// ([`NodeHandle::attach_forwarder_with`]).
+    Host(usize),
 }
 
 /// The closures waiting for room, and whether the task that calls them runs.
@@ -248,13 +268,18 @@ impl ConnectionCarrier {
     pub(crate) fn new(
         conn: Arc<dyn Connection>,
         routes: Arc<Routes>,
-        datagram_max: usize,
+        size: DatagramSize,
     ) -> ConnectionCarrier {
         let stream = conn.side_carries_here(SideClass::Stream);
+        let (ceiling, unknown) = match size {
+            DatagramSize::Live => (usize::MAX, DATAGRAM_FRAME_MAX),
+            DatagramSize::Host(max) => (max, max),
+        };
         ConnectionCarrier {
             conn,
             routes,
-            datagram_max,
+            ceiling,
+            unknown,
             stream,
             ready: Arc::new(Mutex::new(Ready::default())),
         }
@@ -275,8 +300,17 @@ fn refused(e: SideRefused, max: usize) -> CarrierRefused {
 }
 
 impl Carrier for ConnectionCarrier {
+    /// The limit when no channel is named: the connection's own face, and `unknown`.
     fn datagram_max(&self) -> usize {
-        self.conn.side_frame_max().min(self.datagram_max)
+        self.conn.side_frame_max().min(self.unknown)
+    }
+
+    fn datagram_max_for(&self, channel: u64) -> usize {
+        let sinks = self.conn.side_sink_limit(channel).unwrap_or(self.unknown);
+        self.conn
+            .side_frame_max()
+            .min(sinks)
+            .min(self.ceiling)
     }
 
     /// Whether the node's own face on its forwarder carries the stream class (read once: it is
@@ -608,21 +642,31 @@ impl NodeHandle {
     /// Run this node's channels through its connection's forwarder: the session Data carries the
     /// route label, frames leave through the forwarder's side table and the ones routed to the
     /// node come back through the app face (see the module docs of the channel routes). Needs a connection
-    /// that carries side frames (an embedded engine's `app_face`); with `datagram_max`
-    /// [`DATAGRAM_FRAME_MAX`]. Calling it again changes nothing.
+    /// that carries side frames (an embedded engine's `app_face`). A datagram frame is sized to
+    /// what the sinks of its channel's route take **now**, read from the forwarder for every
+    /// frame (a link's follows its path MTU search, so a frame is never built over it and a
+    /// frame the link refused for its size is not sent again as one); [`DATAGRAM_FRAME_MAX`]
+    /// where the connection cannot see the sinks (a socket to a daemon) or the route has none
+    /// yet. Calling it again changes nothing.
     ///
     /// # Errors
     ///
     /// [`HeapError::Local`]: the connection carries no side frames; the reason names what to
     /// use instead.
     pub fn attach_forwarder(&self) -> Result<(), HeapError> {
-        self.attach_forwarder_with(DATAGRAM_FRAME_MAX)
+        self.attach_forwarder_sized(DatagramSize::Live)
     }
 
-    /// [`attach_forwarder`](Self::attach_forwarder) with the largest datagram frame the sinks of
-    /// the node's routes take: [`DATAGRAM_FRAME_MAX`] when any is a QUIC link, up to the
-    /// channel's own 9,000 when all are local.
+    /// [`attach_forwarder`](Self::attach_forwarder) with the largest datagram frame the node
+    /// sends set by the host: at most `datagram_max` for every channel (the live limit of the
+    /// sinks can lower it, never raise it), and exactly that where the connection cannot see the
+    /// sinks. Use it when a hop beyond the forwarder (a relay's link toward a receiver) takes
+    /// less than the first hop does: the node reads the first hop's limit only.
     pub fn attach_forwarder_with(&self, datagram_max: usize) -> Result<(), HeapError> {
+        self.attach_forwarder_sized(DatagramSize::Host(datagram_max))
+    }
+
+    fn attach_forwarder_sized(&self, size: DatagramSize) -> Result<(), HeapError> {
         let inner = &self.inner;
         let conn = Arc::clone(&inner.conn);
         if conn.side_frame_max() == 0 {
@@ -641,7 +685,7 @@ impl NodeHandle {
         inner.chan.tx.carrier.set(Arc::new(ConnectionCarrier::new(
             Arc::clone(&conn),
             routes,
-            datagram_max,
+            size,
         )));
         self.attach_bar(Arc::new(ConnectionBar {
             conn: Arc::clone(&conn),

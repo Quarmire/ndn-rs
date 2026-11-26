@@ -22,7 +22,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::carrier::{Carrier, CarrierRefused};
 use super::items::Items;
-use super::route::{ConnectionCarrier, DATAGRAM_FRAME_MAX, NO_PATH_AFTER, ROUTE_WAIT, Routes};
+use super::route::{
+    ConnectionCarrier, DATAGRAM_FRAME_MAX, DatagramSize, NO_PATH_AFTER, ROUTE_WAIT, Routes,
+};
 use super::rx_tests::eventually;
 use super::standing::{Who, gate};
 use super::verbs::{EmitOptions, GetNotice, GetOptions, Got, LiveEnd, Select};
@@ -165,6 +167,10 @@ impl Connection for Switch {
             return false;
         }
         self.inner.side_carries_here(class)
+    }
+    /// What the engine's side table says of the sinks of the channel's route.
+    fn side_sink_limit(&self, channel: u64) -> Option<usize> {
+        self.inner.side_sink_limit(channel)
     }
 }
 
@@ -681,7 +687,7 @@ async fn a_stream_frame_waits_for_the_first_keep_and_a_channel_that_got_none_sen
     let carrier = Arc::new(ConnectionCarrier::new(
         Arc::clone(&conn) as Arc<dyn Connection>,
         Arc::clone(&routes),
-        DATAGRAM_FRAME_MAX,
+        DatagramSize::Live,
     ));
 
     // A `Keep` for channel 7 arrives while the first frame waits: the frame goes.
@@ -716,13 +722,79 @@ async fn a_stream_frame_waits_for_the_first_keep_and_a_channel_that_got_none_sen
     assert_eq!(conn.sent.lock().len(), 3);
 }
 
+/// A connection whose own face takes 100,000 octets and whose forwarder says, as a test moves it,
+/// what the sinks of a channel's route take.
+struct Sinks {
+    sink: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Connection for Sinks {
+    async fn send(&self, _wire: Bytes) -> Result<(), AppError> {
+        Ok(())
+    }
+    async fn recv(&self) -> Option<Bytes> {
+        None
+    }
+    async fn register_prefix(&self, _prefix: &Name) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn side_frame_max(&self) -> usize {
+        100_000
+    }
+    /// 0: the forwarder cannot say.
+    fn side_sink_limit(&self, _channel: u64) -> Option<usize> {
+        match self.sink.load(Ordering::SeqCst) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+}
+
+/// A forwarder-attached node's datagram limit for a channel is the live limit of the route's sinks
+/// (read at every call, so a limit that moves is followed at once), never over its own face's or
+/// the host's; where the sinks' limit is unknown it is `DATAGRAM_FRAME_MAX`, or the host's figure.
+#[test]
+fn the_carrier_follows_the_live_limit_of_the_sinks_and_never_exceeds_it() {
+    let conn = Arc::new(Sinks {
+        sink: Default::default(),
+    });
+    let live = ConnectionCarrier::new(
+        Arc::clone(&conn) as Arc<dyn Connection>,
+        Arc::new(Routes::default()),
+        DatagramSize::Live,
+    );
+    let host = ConnectionCarrier::new(
+        Arc::clone(&conn) as Arc<dyn Connection>,
+        Arc::new(Routes::default()),
+        DatagramSize::Host(1_500),
+    );
+    let set = |n: usize| conn.sink.store(n, Ordering::SeqCst);
+
+    // The forwarder cannot say (a socket to a daemon, a route with no sink yet).
+    assert_eq!(live.datagram_max_for(7), DATAGRAM_FRAME_MAX);
+    assert_eq!(host.datagram_max_for(7), 1_500, "the host's figure");
+    // A link of 8,962: what it takes, to the octet, and a limit that moves is followed at once.
+    set(8_962);
+    assert_eq!(live.datagram_max_for(7), 8_962);
+    assert_eq!(host.datagram_max_for(7), 1_500, "the host's ceiling");
+    set(1_300);
+    assert_eq!(live.datagram_max_for(7), 1_300);
+    assert_eq!(host.datagram_max_for(7), 1_300, "the sinks can lower it");
+    set(8_962);
+    assert_eq!(live.datagram_max_for(7), 8_962, "and raise it again");
+    // Sinks that take more than the node's own face: the face's.
+    set(1_000_000);
+    assert_eq!(live.datagram_max_for(7), 100_000);
+}
+
 #[tokio::test]
 async fn the_carrier_says_full_and_calls_back_once_the_face_took_a_frame() {
     use ndn_face_local::InProcFace;
     use ndn_transport::Transport as _;
     let (face, handle) = InProcFace::new(FaceId(9), 1);
     let conn: Arc<dyn Connection> = Arc::new(ndn_app::InProcConnection::new(handle));
-    let carrier = ConnectionCarrier::new(conn, Arc::new(Routes::default()), DATAGRAM_FRAME_MAX);
+    let carrier = ConnectionCarrier::new(conn, Arc::new(Routes::default()), DatagramSize::Live);
     assert_eq!(
         carrier.datagram_max(),
         DATAGRAM_FRAME_MAX,

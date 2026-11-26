@@ -414,6 +414,15 @@ impl ForwarderEngine {
             .is_some_and(|f| f.side_carries(class))
     }
 
+    /// The largest datagram frame the live sinks of side route `id` take now
+    /// ([`SideTable::datagram_limit`](crate::side::SideTable::datagram_limit)), without taking
+    /// a reference to the table or the face table: a sender reads it for each frame.
+    pub fn side_datagram_limit(&self, id: u64) -> Option<usize> {
+        self.inner
+            .side
+            .datagram_limit(crate::side::SideId(id), &self.inner.face_table)
+    }
+
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
     pub fn pit(&self) -> Arc<Pit> {
         Arc::clone(&self.inner.pit)

@@ -75,6 +75,17 @@ pub trait Carrier: Send + Sync {
     /// The largest datagram frame the path takes now; 0 if the carrier has no datagram class.
     fn datagram_max(&self) -> usize;
 
+    /// The largest datagram frame the path takes now for the frames of `channel`; 0 if the
+    /// carrier has no datagram class. The sender reads it for every frame it builds and every
+    /// message it takes, so a limit that moves is followed at once and a frame is never built
+    /// over it. A carrier whose path differs by channel (a forwarder's side table: the sinks of
+    /// one channel's route are not another's) narrows it; the default is
+    /// [`datagram_max`](Self::datagram_max).
+    fn datagram_max_for(&self, channel: u64) -> usize {
+        let _ = channel;
+        self.datagram_max()
+    }
+
     /// Whether the carrier has an ordered, reliable stream.
     fn has_stream(&self) -> bool;
 

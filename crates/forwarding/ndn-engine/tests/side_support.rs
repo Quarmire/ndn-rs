@@ -42,6 +42,9 @@ pub struct Log {
     pub datagram_only: AtomicBool,
     /// The face carries no side frames at all (`side_frame_max` is 0).
     pub carries_none: AtomicBool,
+    /// The datagram limit the face reports and enforces, as a link does (a datagram frame over
+    /// it is refused `TooLarge`, never cut); 0: the default 10,000, enforced by nothing.
+    pub side_max: std::sync::atomic::AtomicUsize,
 }
 
 /// The test's end of a face.
@@ -60,6 +63,11 @@ impl Handle {
     /// Close the face's receive side: the engine's reader sees `Closed`.
     pub fn close(self) {
         drop(self.tx);
+    }
+
+    /// Set the datagram limit the face reports from now on, and enforces.
+    pub fn set_side_max(&self, max: usize) {
+        self.log.side_max.store(max, Ordering::Relaxed);
     }
 
     pub fn sent(&self) -> Vec<Bytes> {
@@ -185,9 +193,11 @@ impl Transport for TestFace {
     }
     fn side_frame_max(&self) -> usize {
         if self.log.carries_none.load(Ordering::Relaxed) {
-            0
-        } else {
-            10_000
+            return 0;
+        }
+        match self.log.side_max.load(Ordering::Relaxed) {
+            0 => 10_000,
+            max => max,
         }
     }
     /// Both classes, unless the face is a datagram-only one ([`datagram_only_face`]) or carries
@@ -210,6 +220,13 @@ impl Transport for TestFace {
         }
         if self.log.unsupported.load(Ordering::Relaxed) {
             return Err(SideRefused::Unsupported);
+        }
+        let limit = self.log.side_max.load(Ordering::Relaxed);
+        if limit != 0 && class == SideClass::Datagram && frame.len() > limit {
+            return Err(SideRefused::TooLarge {
+                size: frame.len(),
+                max: limit,
+            });
         }
         self.log.side.lock().unwrap().push(SideRecord {
             frame: frame.clone(),

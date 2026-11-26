@@ -272,6 +272,17 @@ pub trait Connection: Send + Sync {
         self.side_frame_max() != 0
     }
 
+    /// The largest datagram frame the sinks of the route of channel `channel` take **now**, as
+    /// the forwarder knows it: the smallest live limit over the faces it fans the channel's
+    /// frames out to (a link's follows its path MTU search). `None` (the default) for a
+    /// connection that cannot see its forwarder's faces (a socket to a daemon), or a channel
+    /// whose route has no sink that carries datagrams; the node then keeps its default. It is
+    /// the first hop's limit: a relay's own sinks are that relay's.
+    fn side_sink_limit(&self, channel: u64) -> Option<usize> {
+        let _ = channel;
+        None
+    }
+
     /// The routes that come up at this connection's forwarder (see
     /// [`RouteEvents`]), when it can tell: an embedded engine's connection
     /// ([`EngineAppExt::app_face`](crate::EngineAppExt::app_face)) can, as

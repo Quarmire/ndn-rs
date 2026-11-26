@@ -206,6 +206,11 @@ impl Connection for EngineConnection {
         self.engine.face_carries_side(self.face_id, class)
     }
 
+    /// What the engine's side table says the sinks of the channel's route take now.
+    fn side_sink_limit(&self, channel: u64) -> Option<usize> {
+        self.engine.side_datagram_limit(channel)
+    }
+
     /// Bar `face` in the engine's side table ([`ndn_engine::side::SideTable::bar`]): the first
     /// bar is 60 s and each repeat on the same face doubles, to an hour (a call while a bar is
     /// live changes nothing and names what is left of it). This connection's own face is

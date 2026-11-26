@@ -1129,6 +1129,32 @@ impl SideTable {
         self.routes.get(&id.0).map_or(0, |r| r.sinks.load().len())
     }
 
+    /// The largest datagram frame route `id`'s sinks take **now**: the smallest
+    /// [`side_frame_max`](ndn_transport::Face::side_frame_max) over the sink faces that carry
+    /// datagrams, each read live (a link's follows its path MTU search). `None`: the route has
+    /// no such sink (or no route), so the table knows no limit. It names the first hop only:
+    /// what a relay's own sinks take is that relay's table's to say. A sender asks it for each
+    /// frame it builds, so a frame is never built over what a sink takes at that moment; a
+    /// limit that falls after, a frame already built is refused by the link (counted
+    /// `sink_error`) and lost like any datagram, never cut. A lapsed sink still counts until the
+    /// sweep removes it, which only makes the answer smaller.
+    pub fn datagram_limit(&self, id: SideId, faces: &FaceTable) -> Option<usize> {
+        let route = self.routes.get(&id.0)?;
+        let sinks = route.sinks.load();
+        let mut limit: Option<usize> = None;
+        for sink in sinks.iter() {
+            let Some(face) = faces.get(sink.face) else {
+                continue;
+            };
+            if !face.side_carries(SideClass::Datagram) {
+                continue;
+            }
+            let max = face.side_frame_max();
+            limit = Some(limit.map_or(max, |l| l.min(max)));
+        }
+        limit
+    }
+
     /// How long ago a side frame last went out over `face` (to it as a sink, or an `UP` record
     /// to it as a source), in ns on the table's clock; `None` if never. The idle reaper counts
     /// it as the face's activity, as it does an NDN packet: frames the face *receives* are

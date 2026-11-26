@@ -465,6 +465,10 @@ impl Connection for DemuxConnection {
         self.inner.side_carries_here(class)
     }
 
+    fn side_sink_limit(&self, channel: u64) -> Option<usize> {
+        self.inner.side_sink_limit(channel)
+    }
+
     async fn side_quarantine(&self, face: FaceId) -> Result<std::time::Duration, AppError> {
         self.inner.side_quarantine(face).await
     }

@@ -761,3 +761,56 @@ async fn a_labelled_data_from_a_face_never_sent_the_interest_installs_nothing() 
     assert_eq!(e.side().stats().refused_not_asked, 1);
     assert!(!is_lp_packet(&got), "the header was echoed");
 }
+
+/// A route tells the datagram limit of its sinks as they are now (a sender sizes its frames to it),
+/// the smallest over the sinks, following a face whose limit moves; a frame over what a sink takes
+/// is refused to that sink whole, never cut, and counted, while the others get it.
+#[tokio::test]
+async fn a_route_tells_the_datagram_limit_of_its_sinks_as_they_are_now() {
+    let (s, hs) = face(1, FaceKind::App);
+    let (r1, hr1) = face(2, FaceKind::App);
+    let (r2, hr2) = face(3, FaceKind::App);
+    let (e, _sd) = engine(vec![s, r1, r2], 1).await;
+    assert_eq!(e.side_datagram_limit(ID), None, "no route yet");
+
+    // Both ask for the same name: one Interest goes to the sender, one Data comes back and
+    // installs a sink for each.
+    hr1.inject(interest());
+    hr2.inject(interest());
+    hs.wait_sent(1).await;
+    hs.inject(labelled_data(ID, 30));
+    eventually("both receivers are sinks", || sinks_of(&e, ID).len() == 2).await;
+    assert_eq!(e.side_datagram_limit(ID), Some(10_000));
+    assert_eq!(e.side_datagram_limit(ID + 1), None, "another route");
+
+    // The smallest, read live.
+    hr2.set_side_max(1_300);
+    assert_eq!(e.side_datagram_limit(ID), Some(1_300));
+    hr2.set_side_max(8_962);
+    assert_eq!(e.side_datagram_limit(ID), Some(8_962));
+    hr1.set_side_max(2_000);
+    assert_eq!(e.side_datagram_limit(ID), Some(2_000));
+
+    // A frame over one sink's limit is refused there, whole and counted; the other takes it.
+    hr1.set_side_max(9_000);
+    hr2.set_side_max(1_300);
+    let big = data_frame(ID, 2_000);
+    hs.inject(big.clone());
+    let seen = hr1.wait_side(1).await;
+    assert_eq!(seen[0].frame, big, "the frame a sink took is whole");
+    eventually("the refusal is counted", || {
+        e.side().stats().sink_error == 1
+    })
+    .await;
+    assert!(hr2.side().is_empty(), "nothing reached the smaller sink");
+    let stats = e.side().stats();
+    assert_eq!((stats.frames_in, stats.frames_out), (1, 1), "{stats:?}");
+
+    // A frame within the smallest goes to both, byte for byte.
+    let small = data_frame(ID, 1_300);
+    hs.inject(small.clone());
+    let at_r2 = hr2.wait_side(1).await;
+    assert_eq!(at_r2[0].frame, small);
+    let at_r1 = hr1.wait_side(2).await;
+    assert_eq!(at_r1[1].frame, small);
+}
