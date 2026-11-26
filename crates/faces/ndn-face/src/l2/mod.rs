@@ -29,12 +29,18 @@ pub mod multicast_ether;
 
 #[cfg(target_os = "linux")]
 pub mod neighbor;
+#[cfg(target_os = "linux")]
+mod port;
 pub mod radio;
+#[cfg(all(test, target_os = "linux"))]
+mod side_tests;
 
 #[cfg(target_os = "linux")]
 pub use af_packet::MacAddr;
 #[cfg(target_os = "linux")]
 pub use af_packet::get_interface_mac;
+#[cfg(target_os = "linux")]
+pub use port::{AfPacketPort, EtherPort};
 
 #[cfg(target_os = "linux")]
 pub use ether::NamedEtherFace;
@@ -80,4 +86,29 @@ pub(crate) fn clamp_ether_mtu(mtu: Option<u64>) -> Result<usize, ndn_transport::
         }),
         Some(n) => Ok(n as usize),
     }
+}
+
+/// What the side path of an Ethernet face refuses before it touches the send queue: the stream
+/// class (an Ethernet hop has no ordered, reliable stream), a frame that is not a channel frame
+/// (an NDN packet never takes the side path), and one over `max` (never fragmented).
+#[allow(dead_code)]
+pub(crate) fn check_side_frame(
+    frame: &[u8],
+    class: ndn_transport::SideClass,
+    max: usize,
+) -> Result<(), ndn_transport::SideRefused> {
+    use ndn_transport::{SIDE_MARKER, SideClass, SideRefused};
+    if class == SideClass::Stream || max == 0 {
+        return Err(SideRefused::NotCarried);
+    }
+    if frame.first() != Some(&SIDE_MARKER) {
+        return Err(SideRefused::Malformed);
+    }
+    if frame.len() > max {
+        return Err(SideRefused::TooLarge {
+            size: frame.len(),
+            max,
+        });
+    }
+    Ok(())
 }

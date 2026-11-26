@@ -83,6 +83,9 @@ windows-sys = { workspace = true }
 [dev-dependencies]
 ndn-tlv    = { workspace = true, features = ["std"] }
 ndn-engine = { workspace = true }
+# The package's own test build turns its `l2` feature on (the Ethernet faces' tests run over an
+# in-memory bus, no `CAP_NET_RAW`), as `cargo test -p ndn-face` builds it with no `--features`.
+ndn-face   = { workspace = true, features = ["l2"] }
 ndn-app    = { workspace = true }
 ndn-discovery-core = { workspace = true }
 tokio      = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "time"] }

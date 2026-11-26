@@ -5,14 +5,16 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use ndn_transport::{FaceAddr, FaceError, FaceId, FaceKind, LinkType, MtuError, Transport};
+use ndn_transport::{
+    FaceAddr, FaceError, FaceId, FaceKind, LinkType, MtuError, SideClass, SideRefused, Transport,
+};
 use tokio::io::unix::AsyncFd;
 
 use super::af_packet::{
-    MacAddr, PacketRing, get_ifindex, make_sockaddr_ll, open_packet_socket, setsockopt_val,
-    setup_packet_ring,
+    MacAddr, get_ifindex, open_packet_socket, setsockopt_val, setup_packet_ring,
 };
-use super::{ETHER_PAYLOAD_MTU, clamp_ether_mtu};
+use super::port::{AfPacketPort, EtherPort};
+use super::{ETHER_PAYLOAD_MTU, check_side_frame, clamp_ether_mtu};
 use crate::NDN_ETHERTYPE;
 
 /// IANA-assigned NDN-over-Ethernet multicast MAC (matches NFD's
@@ -22,12 +24,14 @@ pub const NDN_ETHER_MCAST_MAC: MacAddr = MacAddr([0x01, 0x00, 0x5E, 0x00, 0x17, 
 /// L2 multicast NDN face (`AF_PACKET` `SOCK_DGRAM` + TPACKET_V2). Joins the
 /// NDN multicast group on `iface`; outgoing packets are sent to the
 /// multicast MAC. Requires `CAP_NET_RAW`; Linux only.
-pub struct MulticastEtherFace {
+///
+/// Generic over its [`EtherPort`] so that the side path is the same code over
+/// the kernel ring and over a test bus; every caller uses the default,
+/// [`AfPacketPort`].
+pub struct MulticastEtherFace<P: EtherPort = AfPacketPort> {
     id: FaceId,
     iface: String,
-    ifindex: i32,
-    socket: AsyncFd<std::os::unix::io::OwnedFd>,
-    ring: PacketRing,
+    port: P,
     mtu: AtomicUsize,
 }
 
@@ -75,14 +79,27 @@ impl MulticastEtherFace {
         let ring = setup_packet_ring(fd.as_raw_fd())?;
         let socket = AsyncFd::new(fd)?;
 
-        Ok(Self {
+        Ok(Self::with_port(
             id,
             iface,
-            ifindex,
-            socket,
-            ring,
+            AfPacketPort {
+                ifindex,
+                socket,
+                ring,
+            },
+        ))
+    }
+}
+
+impl<P: EtherPort> MulticastEtherFace<P> {
+    /// A face over `port`, which must deliver the frames of the NDN multicast group.
+    pub fn with_port(id: FaceId, iface: impl Into<String>, port: P) -> Self {
+        Self {
+            id,
+            iface: iface.into(),
+            port,
             mtu: AtomicUsize::new(ETHER_PAYLOAD_MTU),
-        })
+        }
     }
 
     pub fn iface(&self) -> &str {
@@ -91,16 +108,15 @@ impl MulticastEtherFace {
 
     pub async fn recv_with_source(&self) -> Result<(Bytes, MacAddr), ndn_transport::FaceError> {
         loop {
-            if let Some(result) = self.ring.try_pop_rx_with_source() {
+            if let Some(result) = self.port.try_pop_rx() {
                 return Ok(result);
             }
-            let mut guard = self.socket.readable().await?;
-            guard.clear_ready();
+            self.port.readable().await?;
         }
     }
 }
 
-impl Transport for MulticastEtherFace {
+impl<P: EtherPort> Transport for MulticastEtherFace<P> {
     fn id(&self) -> FaceId {
         self.id
     }
@@ -121,13 +137,7 @@ impl Transport for MulticastEtherFace {
     }
 
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
-        loop {
-            if let Some(pkt) = self.ring.try_pop_rx() {
-                return Ok(pkt);
-            }
-            let mut guard = self.socket.readable().await?;
-            guard.clear_ready();
-        }
+        Ok(self.recv_with_source().await?.0)
     }
 
     async fn recv_bytes_with_addr(&self) -> Result<(Bytes, Option<FaceAddr>), FaceError> {
@@ -144,6 +154,29 @@ impl Transport for MulticastEtherFace {
         self.mtu.load(Ordering::Relaxed)
     }
 
+    /// Hand a channel frame to the send queue for the NDN multicast group
+    /// without waiting: **one** frame for every station on the segment (a
+    /// station that is no receiver sees the sealed frame and routes nothing).
+    /// A frame that is not a channel frame is
+    /// [`Malformed`](SideRefused::Malformed), one over the MTU
+    /// [`TooLarge`](SideRefused::TooLarge) (never fragmented), and a queue with
+    /// no room [`Full`](SideRefused::Full) (the caller drops the frame and counts
+    /// it). Only the datagram class exists on Ethernet: the stream class is
+    /// [`NotCarried`](SideRefused::NotCarried). A NIC pads a payload under 46
+    /// octets, so the receiver sees a shorter frame with trailing zero octets: a
+    /// frame this face is given must be self-delimiting or at least
+    /// [`MIN_FRAME_LEN`](ndn_transport::side_header::MIN_FRAME_LEN) octets, which
+    /// the channel codec guarantees; the face sends what it is given.
+    fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        check_side_frame(&frame, class, self.side_frame_max())?;
+        if !self.port.try_push_tx(&frame) {
+            return Err(SideRefused::Full);
+        }
+        self.port
+            .flush_tx(&NDN_ETHER_MCAST_MAC)
+            .map_err(|e| SideRefused::Io(e.to_string()))
+    }
+
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {
         let new = clamp_ether_mtu(mtu)?;
         self.mtu.store(new, Ordering::Relaxed);
@@ -154,62 +187,35 @@ impl Transport for MulticastEtherFace {
     /// fragmented to `send_mtu()`. Wrapping again here would double-encode the
     /// NDNLPv2 header on the wire.
     async fn send_bytes(&self, pkt: Bytes) -> Result<(), FaceError> {
-        loop {
-            if self.ring.try_push_tx(&pkt) {
-                break;
-            }
-            let mut guard = self.socket.writable().await?;
-            guard.clear_ready();
-        }
-
-        let dst = make_sockaddr_ll(self.ifindex, &NDN_ETHER_MCAST_MAC, NDN_ETHERTYPE);
-        self.tx_to(dst)
+        self.send_to_mac(&pkt, &NDN_ETHER_MCAST_MAC).await
     }
 
     /// Reply-to-source: unicast `pkt` to the specific peer MAC that a prior
     /// [`recv_bytes_with_addr`](Transport::recv_bytes_with_addr) surfaced via
     /// [`FaceAddr::Ether`], instead of sending to the NDN multicast group.
     /// Mirrors [`send_bytes`](Self::send_bytes) (same TX-ring push then
-    /// `sendto`); only the destination `sockaddr_ll` differs. A non-`Ether`
-    /// `FaceAddr` cannot come from this socket, so it falls back to multicast.
+    /// `sendto`); only the destination differs. A non-`Ether` `FaceAddr`
+    /// cannot come from this socket, so it falls back to multicast.
     async fn send_bytes_to(&self, addr: FaceAddr, pkt: Bytes) -> Result<(), FaceError> {
         let FaceAddr::Ether(mac) = addr else {
             return self.send_bytes(pkt).await;
         };
-        loop {
-            if self.ring.try_push_tx(&pkt) {
-                break;
-            }
-            let mut guard = self.socket.writable().await?;
-            guard.clear_ready();
-        }
-        let dst = make_sockaddr_ll(self.ifindex, &MacAddr(mac), NDN_ETHERTYPE);
-        self.tx_to(dst)
+        self.send_to_mac(&pkt, &MacAddr(mac)).await
     }
 }
 
-impl MulticastEtherFace {
-    /// Flush the already-queued TX frame to `dst` (shared egress syscall for
-    /// [`send_bytes`](MulticastEtherFace::send_bytes) and its unicast
-    /// reply-to-source counterpart).
-    fn tx_to(&self, dst: libc::sockaddr_ll) -> Result<(), FaceError> {
-        let fd = self.socket.get_ref().as_raw_fd();
-        let ret = unsafe {
-            libc::sendto(
-                fd,
-                std::ptr::null(),
-                0,
-                0,
-                &dst as *const libc::sockaddr_ll as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if ret == -1 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::WouldBlock {
-                return Err(FaceError::Io(err));
+impl<P: EtherPort> MulticastEtherFace<P> {
+    /// Queue `pkt` (waiting for room) and flush it to `dst` (shared egress for
+    /// [`send_bytes`](Transport::send_bytes) and its unicast reply-to-source
+    /// counterpart).
+    async fn send_to_mac(&self, pkt: &[u8], dst: &MacAddr) -> Result<(), FaceError> {
+        loop {
+            if self.port.try_push_tx(pkt) {
+                break;
             }
+            self.port.writable().await?;
         }
+        self.port.flush_tx(dst)?;
         Ok(())
     }
 }

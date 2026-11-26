@@ -3,28 +3,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use ndn_packet::Name;
-use ndn_transport::{FaceError, FaceId, FaceKind, MtuError, Transport};
+use ndn_transport::{FaceError, FaceId, FaceKind, MtuError, SideClass, SideRefused, Transport};
 use tokio::io::unix::AsyncFd;
 
-use super::af_packet::{
-    MacAddr, PacketRing, get_ifindex, make_sockaddr_ll, open_packet_socket, setup_packet_ring,
-};
+use super::af_packet::{MacAddr, get_ifindex, open_packet_socket, setup_packet_ring};
+use super::port::{AfPacketPort, EtherPort};
 use super::radio::RadioFaceMetadata;
-use super::{ETHER_PAYLOAD_MTU, clamp_ether_mtu};
+use super::{ETHER_PAYLOAD_MTU, check_side_frame, clamp_ether_mtu};
 use crate::NDN_ETHERTYPE;
 
 /// NDN face over raw Ethernet (`AF_PACKET` `SOCK_DGRAM` + TPACKET_V2 mmap'd
 /// ring). The kernel strips/builds the Ethernet header, so I/O is the NDN
 /// TLV payload only. Requires `CAP_NET_RAW`.
-pub struct NamedEtherFace {
+///
+/// Generic over its [`EtherPort`] so that the side path (channel frames) is
+/// the same code over the kernel ring and over a test bus; every caller uses
+/// the default, [`AfPacketPort`].
+pub struct NamedEtherFace<P: EtherPort = AfPacketPort> {
     id: FaceId,
     pub node_name: Name,
     peer_mac: MacAddr,
     iface: String,
-    ifindex: i32,
     pub radio: RadioFaceMetadata,
-    socket: AsyncFd<std::os::unix::io::OwnedFd>,
-    ring: PacketRing,
+    port: P,
     mtu: AtomicUsize,
 }
 
@@ -61,17 +62,40 @@ impl NamedEtherFace {
         let ring = setup_packet_ring(fd.as_raw_fd())?;
         let socket = AsyncFd::new(fd)?;
 
-        Ok(Self {
+        Ok(Self::with_port(
             id,
             node_name,
             peer_mac,
             iface,
-            ifindex,
             radio,
-            socket,
-            ring,
+            AfPacketPort {
+                ifindex,
+                socket,
+                ring,
+            },
+        ))
+    }
+}
+
+impl<P: EtherPort> NamedEtherFace<P> {
+    /// A face over `port`, sending to `peer_mac`.
+    pub fn with_port(
+        id: FaceId,
+        node_name: Name,
+        peer_mac: MacAddr,
+        iface: impl Into<String>,
+        radio: RadioFaceMetadata,
+        port: P,
+    ) -> Self {
+        Self {
+            id,
+            node_name,
+            peer_mac,
+            iface: iface.into(),
+            radio,
+            port,
             mtu: AtomicUsize::new(ETHER_PAYLOAD_MTU),
-        })
+        }
     }
 
     pub fn set_peer_mac(&mut self, mac: MacAddr) {
@@ -87,7 +111,7 @@ impl NamedEtherFace {
     }
 }
 
-impl Transport for NamedEtherFace {
+impl<P: EtherPort> Transport for NamedEtherFace<P> {
     fn id(&self) -> FaceId {
         self.id
     }
@@ -112,6 +136,28 @@ impl Transport for NamedEtherFace {
         self.mtu.load(Ordering::Relaxed)
     }
 
+    /// Hand a channel frame to the send queue for the peer without waiting: a
+    /// frame that is not a channel frame is
+    /// [`Malformed`](SideRefused::Malformed), one over the MTU
+    /// [`TooLarge`](SideRefused::TooLarge) (never fragmented), and a queue with
+    /// no room [`Full`](SideRefused::Full) (the caller drops the frame and counts
+    /// it). Only the datagram class exists on Ethernet: the stream class is
+    /// [`NotCarried`](SideRefused::NotCarried), so a reliable channel is not
+    /// silently carried by a lossy hop. A NIC pads a payload under 46 octets, so
+    /// the receiver sees a shorter frame with trailing zero octets: a frame this
+    /// face is given must be self-delimiting or at least
+    /// [`MIN_FRAME_LEN`](ndn_transport::side_header::MIN_FRAME_LEN) octets, which
+    /// the channel codec guarantees; the face sends what it is given.
+    fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        check_side_frame(&frame, class, self.side_frame_max())?;
+        if !self.port.try_push_tx(&frame) {
+            return Err(SideRefused::Full);
+        }
+        self.port
+            .flush_tx(&self.peer_mac)
+            .map_err(|e| SideRefused::Io(e.to_string()))
+    }
+
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {
         let new = clamp_ether_mtu(mtu)?;
         self.mtu.store(new, Ordering::Relaxed);
@@ -120,41 +166,21 @@ impl Transport for NamedEtherFace {
 
     async fn recv_bytes(&self) -> Result<Bytes, FaceError> {
         loop {
-            if let Some(pkt) = self.ring.try_pop_rx() {
+            if let Some((pkt, _)) = self.port.try_pop_rx() {
                 return Ok(pkt);
             }
-            let mut guard = self.socket.readable().await?;
-            guard.clear_ready();
+            self.port.readable().await?;
         }
     }
 
     async fn send_bytes(&self, pkt: Bytes) -> Result<(), FaceError> {
         loop {
-            if self.ring.try_push_tx(&pkt) {
+            if self.port.try_push_tx(&pkt) {
                 break;
             }
-            let mut guard = self.socket.writable().await?;
-            guard.clear_ready();
+            self.port.writable().await?;
         }
-
-        let dst = make_sockaddr_ll(self.ifindex, &self.peer_mac, NDN_ETHERTYPE);
-        let fd = self.socket.get_ref().as_raw_fd();
-        let ret = unsafe {
-            libc::sendto(
-                fd,
-                std::ptr::null(),
-                0,
-                0,
-                &dst as *const libc::sockaddr_ll as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if ret == -1 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::WouldBlock {
-                return Err(FaceError::Io(err));
-            }
-        }
+        self.port.flush_tx(&self.peer_mac)?;
         Ok(())
     }
 }
