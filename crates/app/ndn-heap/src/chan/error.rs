@@ -41,8 +41,9 @@ pub enum ChanError {
     #[error(
         "{sender} does not answer this device's ask: it lists no member of the space whose key \
          signed the ask, or it holds no channel to give, or no certificate it trusts vouches for \
-         this device's key; ask the owner of the space to add this device's person, or ask \
-         again once the sender holds the record"
+         this device's key, or this device's clock is more than 120 s from the sender's (an ask \
+         carries the time it was signed); ask the owner of the space to add this device's person, \
+         set the clock right, or ask again once the sender holds the record"
     )]
     NotAnswered {
         /// The device asked.

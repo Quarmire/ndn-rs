@@ -7,9 +7,11 @@
 //! ([`answer`](super::answer)). A channel is re-keyed
 //!
 //! * when a receiver that holds the current key asks again after half its lifetime (a renewal),
+//!   unless the channel was re-keyed in the last [`REKEY_MIN`],
 //! * at once when a receiver is dropped because it no longer stands, or left the audience, or
 //!   the sealed space's epoch in force moved ([`Channels::rejudged`]),
-//! * when a receiver's lease ran out ([`Channels::expire`]), and
+//! * when a receiver's lease ran out ([`Channels::expire`]), once [`REKEY_MIN`] has passed since
+//!   the last re-key (the lapses of a stretch are one re-key), and
 //! * before the sequence passes 2^63 ([`Channels::note_seq`]).
 //!
 //! Re-keying is pulled: nothing is sent to a receiver. One that sees a frame under a key epoch
@@ -25,7 +27,7 @@ use parking_lot::Mutex;
 
 use super::key::{ChannelKey, FrameKey};
 use super::limits;
-use super::wire::{ChannelMode, LIFETIME_MAX};
+use super::wire::{ChannelMode, LIFETIME_MAX, LIFETIME_MIN};
 use crate::rt::Instant;
 use crate::wire::EpochId;
 
@@ -51,15 +53,27 @@ pub(crate) const SEQ_REKEY: u64 = limits::SEQUENCE_LIMIT;
 const ASKS_PER_SEC: f64 = 4.0;
 const ASKS_BURST: f64 = 8.0;
 
+/// The asks per second whose signature the sender verifies, whoever they name, and its burst: a
+/// whole channel's receivers (256) asking after a re-key pass at once.
+const VERIFIES_PER_SEC: f64 = 64.0;
+const VERIFIES_BURST: f64 = RECEIVERS_PER_CHANNEL as f64;
+
 /// The most askers a rate limiter keeps a bucket of: those past it that were idle longest go.
 const BUCKETS_MAX: usize = 4096;
 
-/// A session's lifetime for an ask of `wanted` seconds: the ask's, at most 24 hours, and an
-/// ask of none is the default. Clamped, never refused.
+/// The shortest time between two re-keys that a receiver's renewal or lapsed lease causes. A
+/// re-key makes every other receiver ask again, so what an asker can do must not make it
+/// frequent: a receiver's ask is a re-key at most every 5 minutes. A removed or revoked receiver,
+/// a moved audience epoch and the sequence limit re-key at once, whenever they happen.
+pub(crate) const REKEY_MIN: Duration = Duration::from_secs(300);
+
+/// A session's lifetime for an ask of `wanted` seconds: the ask's, at least a minute and at most
+/// 24 hours, and an ask of none is the default. Clamped, never refused: a lifetime of a second
+/// would make every ask a renewal and the receiver's lease run out in six.
 pub(crate) fn lifetime_for(wanted: u64) -> u64 {
     match wanted {
         0 => LIFETIME_DEFAULT,
-        w => w.min(LIFETIME_MAX),
+        w => w.clamp(LIFETIME_MIN, LIFETIME_MAX),
     }
 }
 
@@ -107,6 +121,11 @@ pub(crate) struct Channel {
     /// space's fold version)`.
     judged_at: (u64, u64),
     last_announce: Option<Instant>,
+    /// When the key was last made: the channel's start, or its last re-key.
+    last_rekey: Instant,
+    /// A receiver's lease ran out since the last re-key, and the channel is to be re-keyed once
+    /// [`REKEY_MIN`] allows.
+    rekey_owed: bool,
     /// Since when the channel has had no receiver.
     empty_since: Option<Instant>,
     /// What the frame layer reads on every emission.
@@ -175,34 +194,32 @@ pub(crate) struct Rejudged {
     pub(crate) rekeyed: Vec<ChannelMode>,
 }
 
-/// The token bucket of each asker key.
-#[derive(Default)]
-struct Buckets {
-    by_key: HashMap<Name, (f64, Instant)>,
+/// A token bucket: how many tokens it held at `at`.
+#[derive(Clone, Copy)]
+struct Bucket {
+    tokens: f64,
+    at: Instant,
 }
 
-impl Buckets {
-    /// Whether `key` may ask now: one token of its bucket.
-    fn take(&mut self, key: &Name, now: Instant) -> bool {
-        if self.by_key.len() >= BUCKETS_MAX && !self.by_key.contains_key(key) {
-            // Every bucket that has refilled is the same as none: drop those, then the idlest.
-            self.by_key.retain(|_, (tokens, at)| {
-                *tokens + now.saturating_duration_since(*at).as_secs_f64() * ASKS_PER_SEC
-                    < ASKS_BURST
-            });
-            if self.by_key.len() >= BUCKETS_MAX {
-                let idlest = self.by_key.iter().min_by_key(|(_, (_, at))| *at);
-                if let Some(idlest) = idlest.map(|(k, _)| k.clone()) {
-                    self.by_key.remove(&idlest);
-                }
-            }
+impl Bucket {
+    fn full(burst: f64, now: Instant) -> Bucket {
+        Bucket {
+            tokens: burst,
+            at: now,
         }
-        let entry = self.by_key.entry(key.clone()).or_insert((ASKS_BURST, now));
-        let refill = now.saturating_duration_since(entry.1).as_secs_f64() * ASKS_PER_SEC;
-        entry.0 = (entry.0 + refill).min(ASKS_BURST);
-        entry.1 = now;
-        if entry.0 >= 1.0 {
-            entry.0 -= 1.0;
+    }
+
+    /// What it holds at `now`: refilled at `rate` a second, at most `burst`.
+    fn held(&self, rate: f64, burst: f64, now: Instant) -> f64 {
+        (self.tokens + now.saturating_duration_since(self.at).as_secs_f64() * rate).min(burst)
+    }
+
+    /// One token, if it holds one.
+    fn take(&mut self, rate: f64, burst: f64, now: Instant) -> bool {
+        self.tokens = self.held(rate, burst, now);
+        self.at = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
             true
         } else {
             false
@@ -210,10 +227,39 @@ impl Buckets {
     }
 }
 
+/// The token bucket of each asker key.
+#[derive(Default)]
+struct Buckets {
+    by_key: HashMap<Name, Bucket>,
+}
+
+impl Buckets {
+    /// Whether `key` may ask now: one token of its bucket.
+    fn take(&mut self, key: &Name, now: Instant) -> bool {
+        if self.by_key.len() >= BUCKETS_MAX && !self.by_key.contains_key(key) {
+            // Every bucket that has refilled is the same as none: drop those, then the idlest.
+            self.by_key
+                .retain(|_, b| b.held(ASKS_PER_SEC, ASKS_BURST, now) < ASKS_BURST);
+            if self.by_key.len() >= BUCKETS_MAX {
+                let idlest = self.by_key.iter().min_by_key(|(_, b)| b.at);
+                if let Some(idlest) = idlest.map(|(k, _)| k.clone()) {
+                    self.by_key.remove(&idlest);
+                }
+            }
+        }
+        self.by_key
+            .entry(key.clone())
+            .or_insert_with(|| Bucket::full(ASKS_BURST, now))
+            .take(ASKS_PER_SEC, ASKS_BURST, now)
+    }
+}
+
 #[derive(Default)]
 struct Table {
     channels: BTreeMap<(Name, ChannelMode), Channel>,
     buckets: Buckets,
+    /// The bucket of asks that reach the signature: none until the first.
+    unverified: Option<Bucket>,
 }
 
 /// A sender's channels.
@@ -230,7 +276,7 @@ fn random_id() -> u64 {
 }
 
 impl Channel {
-    fn new(audience: Option<EpochId>, judged_at: (u64, u64)) -> Channel {
+    fn new(audience: Option<EpochId>, judged_at: (u64, u64), now: Instant) -> Channel {
         Channel {
             id: random_id(),
             key: ChannelKey::random(),
@@ -240,16 +286,26 @@ impl Channel {
             audience,
             judged_at,
             last_announce: None,
+            last_rekey: now,
+            rekey_owed: false,
             empty_since: None,
             live: Arc::new(Live::default()),
         }
     }
 
-    /// A new key: the next key epoch. Every receiver must ask again to hold it.
-    fn rekey(&mut self) {
+    /// A new key at `now`: the next key epoch. Every receiver must ask again to hold it.
+    fn rekey(&mut self, now: Instant) {
         self.key = ChannelKey::random();
         self.key_epoch = self.key_epoch.wrapping_add(1);
         self.live.key_epoch.store(self.key_epoch, Ordering::Release);
+        self.last_rekey = now;
+        self.rekey_owed = false;
+    }
+
+    /// Whether a renewal or a lapsed lease may re-key the channel at `now`: [`REKEY_MIN`] has
+    /// passed since the key was made.
+    fn rekey_allowed(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_rekey) >= REKEY_MIN
     }
 
     fn send_key(&self) -> SendKey {
@@ -294,16 +350,30 @@ impl Ended {
 }
 
 impl Channels {
-    /// Whether `key` may ask now: one token of its bucket (4 a second, burst 8).
+    /// Whether `key` may ask now: one token of its bucket (4 a second, burst 8). Charged only for
+    /// an ask whose signature verified: the key an unverified ask names is whatever its sender
+    /// wrote, so a bucket charged before the signature is an asker's for anyone to empty.
     pub(crate) fn throttle(&self, key: &Name, now: Instant) -> bool {
         self.table.lock().buckets.take(key, now)
     }
 
+    /// Whether one more ask may have its signature verified now, whoever it names: one token of
+    /// the one bucket every ask passes before the signature (64 a second, burst
+    /// [`RECEIVERS_PER_CHANNEL`]). It bounds what verifying costs; it charges no asker.
+    pub(crate) fn throttle_unverified(&self, now: Instant) -> bool {
+        let mut table = self.table.lock();
+        table
+            .unverified
+            .get_or_insert_with(|| Bucket::full(VERIFIES_BURST, now))
+            .take(VERIFIES_PER_SEC, VERIFIES_BURST, now)
+    }
+
     /// Give `asker`, which the caller judged, the key of the channel of `(space, mode)`: the
     /// channel is made if there is none; the asker is added, or renewed. A receiver that already
-    /// holds the current key and asks again after half its lifetime has the channel re-keyed
-    /// (a renewal re-keys; an ask sooner, or by one that holds an older key, is given the key
-    /// as it is, so no receiver can make the others ask again at will).
+    /// holds the current key and asks again after half its lifetime has the channel re-keyed if
+    /// the last re-key was [`REKEY_MIN`] ago or more (a renewal re-keys; an ask sooner, or by one
+    /// that holds an older key, is given the key as it is, and so is a renewal soon after a
+    /// re-key: no receiver can make the others ask again at will).
     /// `judged_at` is what the judges said when the asker was judged.
     pub(crate) fn admit(
         &self,
@@ -322,7 +392,7 @@ impl Channels {
             }
             table
                 .channels
-                .insert(at.clone(), Channel::new(audience.clone(), judged_at));
+                .insert(at.clone(), Channel::new(audience.clone(), judged_at, now));
         }
         let channel = table
             .channels
@@ -339,12 +409,17 @@ impl Channels {
         if known.is_none() && channel.receivers.len() >= RECEIVERS_PER_CHANNEL {
             return Err(Cap::Receivers);
         }
+        // A receiver that holds the current key and asks after half its lifetime renews: the
+        // channel is re-keyed, unless it was re-keyed less than [`REKEY_MIN`] ago. Then the
+        // receiver is given the key as it is: a lifetime short enough to make every ask a
+        // renewal makes no re-key either.
         let renewal = known.as_ref().is_some_and(|r| {
             r.delivered == channel.key_epoch
                 && now.saturating_duration_since(r.issued) >= r.lifetime / 2
         });
-        if renewal {
-            channel.rekey();
+        let rekeyed = renewal && channel.rekey_allowed(now);
+        if rekeyed {
+            channel.rekey(now);
         }
         let receiver = Receiver {
             key: asker.key.clone(),
@@ -360,7 +435,7 @@ impl Channels {
             .live
             .receivers
             .store(channel.receivers.len(), Ordering::Release);
-        Ok(channel.admitted(&receiver, renewal, known.is_none()))
+        Ok(channel.admitted(&receiver, rekeyed, known.is_none()))
     }
 
     /// Make the channel of `(space, mode)` if there is none (the sender's own start, before
@@ -379,7 +454,7 @@ impl Channels {
             if table.channels.len() >= CHANNELS_PER_SENDER {
                 return Err(Cap::Channels);
             }
-            let mut channel = Channel::new(audience, judged_at);
+            let mut channel = Channel::new(audience, judged_at, now);
             channel.empty_since = Some(now);
             table.channels.insert(at.clone(), channel);
         }
@@ -479,7 +554,7 @@ impl Channels {
                 if audience.is_some() {
                     channel.audience = audience.cloned();
                 }
-                channel.rekey();
+                channel.rekey(now);
                 out.rekeyed.push(*mode);
             }
             if channel.receivers.is_empty() && channel.empty_since.is_none() {
@@ -490,8 +565,9 @@ impl Channels {
         out
     }
 
-    /// End what ran out at `now`: a receiver whose lease passed (its channel is re-keyed: it
-    /// held a key and did not renew), and a channel with no receiver for a default lifetime.
+    /// End what ran out at `now`: a receiver whose lease passed (its channel is re-keyed once
+    /// [`REKEY_MIN`] has passed since its last re-key: the receiver held a key and did not renew),
+    /// and a channel with no receiver for a default lifetime.
     /// Returns the receivers dropped and the channels ended, as `(space, mode)`.
     #[allow(clippy::type_complexity)]
     pub(crate) fn expire(
@@ -510,7 +586,12 @@ impl Channels {
             for device in gone {
                 channel.receivers.remove(&device);
                 lapsed.push((space.clone(), *mode, device));
-                channel.rekey();
+                channel.rekey_owed = true;
+            }
+            // A lapse is a key an absent receiver may still hold, not an emergency: the lapses of
+            // a stretch are one re-key, made when [`REKEY_MIN`] has passed since the last.
+            if channel.rekey_owed && channel.rekey_allowed(now) {
+                channel.rekey(now);
             }
             channel
                 .live
@@ -568,7 +649,8 @@ impl Channels {
         };
         channel.next_seq = next_seq;
         if next_seq >= SEQ_REKEY {
-            channel.rekey();
+            // Read here, not passed in: a channel gets this far once in 2^63 frames.
+            channel.rekey(Instant::now());
             return true;
         }
         false

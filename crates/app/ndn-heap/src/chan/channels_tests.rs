@@ -186,22 +186,168 @@ fn a_receiver_that_does_not_renew_is_dropped_after_its_lifetime_and_grace_and_th
     let (lapsed, ended) = table.expire(t0 + Duration::from_secs(66));
     assert_eq!(lapsed, vec![(space(), ChannelMode::Latest, bob)]);
     assert!(ended.is_empty());
-    assert_eq!(
+    let epoch = || {
         table
             .current(&space(), ChannelMode::Latest)
             .unwrap()
-            .key_epoch,
-        1
-    );
+            .key_epoch
+    };
+    assert_eq!(epoch(), 0, "the re-key it owes waits for REKEY_MIN");
+    let _ = table.expire(t0 + REKEY_MIN);
+    assert_eq!(epoch(), 1);
     // A channel nobody holds ends after a default lifetime.
     let (_, ended) = table.expire(t0 + Duration::from_secs(66 + 3600));
     assert_eq!(ended, vec![(space(), ChannelMode::Latest)]);
     assert_eq!(table.count(), 0);
 }
 
+/// The asker names its lifetime: a lifetime of 1 s would make the renewal threshold half a
+/// second and every ask a re-key, and each re-key makes every other receiver ask again.
 #[test]
-fn the_lifetime_is_the_asks_clamped_to_24_hours_and_never_refused() {
+fn a_receiver_asking_with_a_lifetime_of_one_second_cannot_rekey_twice_in_30_s() {
+    let table = Channels::default();
+    let t0 = Instant::now();
+    let (bob, bob_key) = (n("/bob/phone"), n("/bob/phone/KEY/1"));
+    let (carol, carol_key) = (n("/carol/tablet"), n("/carol/tablet/KEY/1"));
+    // Bob holds epoch 0 of the channel.
+    let first = admit(&table, &bob, &bob_key, 3600, t0).unwrap();
+    assert_eq!(first.key_epoch, 0);
+    // Carol asks every 600 ms for 30 s with a lifetime of one second.
+    let mut rekeys = 0;
+    for i in 1..=50u64 {
+        let given = admit(
+            &table,
+            &carol,
+            &carol_key,
+            1,
+            t0 + Duration::from_millis(600 * i),
+        )
+        .unwrap();
+        rekeys += u32::from(given.rekeyed);
+    }
+    assert_eq!(
+        rekeys, 0,
+        "carol re-keyed the channel {rekeys} times in 30 s"
+    );
+    assert_eq!(
+        table
+            .current(&space(), ChannelMode::Latest)
+            .unwrap()
+            .key_epoch,
+        0,
+        "bob's key epoch is still the channel's"
+    );
+}
+
+/// What a receiver's renewal or a lapsed lease may do is bounded: one re-key per [`REKEY_MIN`],
+/// whatever the receivers' lifetimes and rhythm. A removal re-keys at once, always.
+#[test]
+fn renewals_and_lapses_rekey_at_most_once_per_rekey_min_and_a_removal_at_once() {
+    let table = Channels::default();
+    let t0 = Instant::now();
+    let epoch = || {
+        table
+            .current(&space(), ChannelMode::Latest)
+            .unwrap()
+            .key_epoch
+    };
+    let (bob, bob_key) = (n("/bob/phone"), n("/bob/phone/KEY/1"));
+    let (carol, carol_key) = (n("/carol/tablet"), n("/carol/tablet/KEY/1"));
+    let at = |s: u64| t0 + Duration::from_secs(s);
+    admit(&table, &bob, &bob_key, 3600, t0).unwrap();
+
+    // Carol asks every 31 s with the shortest lifetime (60 s: every ask after the first is a
+    // renewal). Nothing re-keys before REKEY_MIN has passed since the channel's key was made.
+    let step = 31;
+    let mut rekeys = Vec::new();
+    let mut s = 0;
+    while s <= 2 * REKEY_MIN.as_secs() + 40 {
+        let given = admit(&table, &carol, &carol_key, 1, at(s)).unwrap();
+        if given.rekeyed {
+            rekeys.push(s);
+        }
+        s += step;
+    }
+    assert_eq!(
+        rekeys.len(),
+        2,
+        "two re-keys in two REKEY_MIN and a bit, at {rekeys:?}"
+    );
+    assert!(
+        rekeys[0] >= REKEY_MIN.as_secs() && rekeys[1] - rekeys[0] >= REKEY_MIN.as_secs(),
+        "each at least REKEY_MIN after the one before: {rekeys:?}"
+    );
+    assert_eq!(epoch(), 2);
+
+    // Lapsed leases: three receivers vanish one second apart; they are dropped when they lapse,
+    // and the channel is re-keyed once, when REKEY_MIN allows.
+    let table = Channels::default();
+    let epoch = || {
+        table
+            .current(&space(), ChannelMode::Latest)
+            .unwrap()
+            .key_epoch
+    };
+    for (i, who) in ["/a/dev", "/b/dev", "/c/dev"].into_iter().enumerate() {
+        admit(
+            &table,
+            &n(who),
+            &n(&format!("{who}/KEY/1")),
+            60,
+            at(i as u64),
+        )
+        .unwrap();
+    }
+    let (lapsed, _) = table.expire(at(70));
+    assert_eq!(lapsed.len(), 3);
+    assert_eq!(epoch(), 0, "the lapses are owed a re-key, not made at once");
+    let _ = table.expire(at(REKEY_MIN.as_secs() - 1));
+    assert_eq!(epoch(), 0);
+    let _ = table.expire(at(REKEY_MIN.as_secs()));
+    assert_eq!(epoch(), 1, "one re-key for the three");
+    let _ = table.expire(at(REKEY_MIN.as_secs() + 10));
+    assert_eq!(epoch(), 1, "and no second");
+
+    // A removal, a moment after a re-key, re-keys at once.
+    admit(&table, &bob, &bob_key, 3600, at(REKEY_MIN.as_secs() + 11)).unwrap();
+    let done = table.rejudged(
+        &space(),
+        (2, 2),
+        None,
+        at(REKEY_MIN.as_secs() + 12),
+        |_, _| false,
+    );
+    assert_eq!(done.rekeyed, vec![ChannelMode::Latest]);
+    assert_eq!(epoch(), 2);
+}
+
+/// Every ask passes one global bucket before its signature is checked; it charges no asker, so a
+/// flood that names a member leaves that member's own bucket whole.
+#[test]
+fn the_budget_of_verifications_is_global_and_charges_no_askers_bucket() {
+    let table = Channels::default();
+    let t0 = Instant::now();
+    let bob = n("/bob/phone/KEY/1");
+    let passed = (0..1000).filter(|_| table.throttle_unverified(t0)).count();
+    assert_eq!(
+        passed, RECEIVERS_PER_CHANNEL,
+        "a burst of one channel's receivers"
+    );
+    assert!(!table.throttle_unverified(t0 + Duration::from_millis(10)));
+    assert!(
+        table.throttle_unverified(t0 + Duration::from_millis(20)),
+        "64 a second: a token every 15.6 ms"
+    );
+    let own = (0..20).filter(|_| table.throttle(&bob, t0)).count();
+    assert_eq!(own, 8, "bob's bucket is whole: the budget charged nobody's");
+}
+
+#[test]
+fn the_lifetime_is_the_asks_clamped_between_a_minute_and_24_hours_and_never_refused() {
     assert_eq!(lifetime_for(0), 3600);
+    assert_eq!(lifetime_for(1), 60);
+    assert_eq!(lifetime_for(59), 60);
+    assert_eq!(lifetime_for(60), 60);
     assert_eq!(lifetime_for(90), 90);
     assert_eq!(lifetime_for(86_400), 86_400);
     assert_eq!(lifetime_for(10_000_000), 86_400);

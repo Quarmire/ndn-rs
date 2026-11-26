@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
-use super::answer::ChanAnswer;
+use super::answer::{ASK_CLOCK_WINDOW_MS, ChanAnswer};
 use super::channels::Channels;
 use super::rx::{Receivers, RxStats};
 use super::sessions::{EndReason, RecvSessions};
@@ -45,6 +45,13 @@ pub(crate) const ANNOUNCE_PENDING_MAX: usize = 32;
 
 /// The most octets of an announce's ApplicationParameters.
 const ANNOUNCE_MAX: usize = 1024;
+
+/// The asks of one key the replay guard remembers: an ask is good for 240 s
+/// ([`ASK_CLOCK_WINDOW_MS`] either side of the sender's clock), and a key's asks are admitted at
+/// 4 a second after a burst of 8, which is 968 in that time.
+pub(crate) const REPLAY_PER_KEY: usize = 1024;
+
+const _: () = assert!(REPLAY_PER_KEY as u64 >= 8 + 4 * (2 * ASK_CLOCK_WINDOW_MS / 1000));
 
 /// A counter.
 #[derive(Default)]
@@ -76,8 +83,12 @@ pub(crate) struct Stats {
     pub(crate) oversize: Counter,
     /// Asks of a key that stands for no space of this device.
     pub(crate) strangers: Counter,
-    /// Asks over the asker's rate.
+    /// Asks over the asker's rate (counted after the signature verified).
     pub(crate) throttled: Counter,
+    /// Asks whose `SignatureTime` was more than 120 s from this device's clock.
+    pub(crate) stale: Counter,
+    /// Asks over the budget of signature verifications (64 a second, whoever they name).
+    pub(crate) shed: Counter,
     /// Asks whose signer's chain could not be judged yet.
     pub(crate) pending: Counter,
     /// Asks whose signature did not verify.
@@ -157,8 +168,10 @@ pub(crate) struct Chan {
     pub(crate) tx: Tx,
     /// The receiver: the channels this device takes frames of, and the `Items` it pushes to.
     pub(crate) rx: Receivers,
-    /// The replay guard of the signed asks: it remembers the last 512 asks of each key, which is
-    /// more than the 120 s the rate of 4 a second lets one key make.
+    /// The replay guard of the signed asks: it remembers the last [`REPLAY_PER_KEY`] asks of each
+    /// key, which is the 240 s an ask is good for ([`ASK_CLOCK_WINDOW_MS`]) at the rate of 4 a
+    /// second after a burst of 8. It is empty after a restart: what covers a restart is the clock
+    /// window alone.
     pub(crate) replay: ReplayGuard,
     /// What was counted.
     pub(crate) stats: Stats,
@@ -178,7 +191,7 @@ impl Chan {
             sessions: RecvSessions::default(),
             tx: Tx::default(),
             rx: Receivers::default(),
-            replay: ReplayGuard::new(512, false),
+            replay: ReplayGuard::new(REPLAY_PER_KEY, false),
             stats: Stats::default(),
             wake: Arc::new(Notify::new()),
             listening: Mutex::new(HashMap::new()),

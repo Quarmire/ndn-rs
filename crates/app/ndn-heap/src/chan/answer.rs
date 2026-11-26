@@ -10,10 +10,15 @@
 //! 2. the KeyLocator names a device key and the space is open here as a member;
 //! 3. the key **stands** ([`standing`], `Who::Listed`: a person the space lists, owner-capable,
 //!    not revoked, not suspected) by the entries held now: else `NoRoute`;
-//! 4. the asker key's token bucket (4 a second, burst 8): else `Congestion`;
-//! 5. the signature verifies from the certificates held and the at most four carried, fetching
+//! 4. the ask's `SignatureTime` is within 120 s of this device's clock (the one wall-clock
+//!    reading of the setup): else `NoRoute`;
+//! 5. the budget of signature verifications (64 a second, whoever the asks name): else
+//!    `Congestion`;
+//! 6. the signature verifies from the certificates held and the at most four carried, fetching
 //!    nothing ([`Judge::validate_interest`]): `Pending` is `NotYet`, a refusal `NoRoute`;
-//! 6. the ask is no replay (the replay guard of the signed Interest): `Duplicate`.
+//! 7. the ask is no replay (the replay guard of the signed Interest): `Duplicate`;
+//! 8. the asker key's token bucket (4 a second, burst 8), charged only now that the key is the
+//!    asker's: else `Congestion`.
 //!
 //! Then the asker is a verified member and may be answered with a **signed** record:
 //! standing again (the entries may have moved while the signature was checked), this device a
@@ -54,6 +59,11 @@ pub(crate) const CKPT_MS: u64 = 20;
 /// The largest frame a session names for a datagram carrier: what one QUIC datagram carries at
 /// the smallest path MTU.
 pub(crate) const FRAME_MAX: u64 = 1200;
+
+/// How far (milliseconds) an ask's `SignatureTime` may be from this device's clock: 120 s. An ask
+/// is therefore good for 240 s in all, which the replay guard remembers
+/// ([`REPLAY_PER_KEY`](super::hub::REPLAY_PER_KEY)).
+pub(crate) const ASK_CLOCK_WINDOW_MS: u64 = 120_000;
 
 /// What a `Window` channel replays when the asker asked for no more: 256 messages, 1 MiB, 10 s.
 pub(crate) const WINDOW: Window = Window {
@@ -289,14 +299,30 @@ impl NodeInner {
             return nack(NackReason::NoRoute);
         }
 
-        // 4. The asker's bucket.
+        // 4. The clock: the one wall-clock reading of the setup. An ask signed more than 120 s
+        // from this device's clock is not one an honest asker has just made (it is a copy of an
+        // old one, or the asker's clock is off): refused before a signature is checked, so what
+        // the replay guard must remember is bounded by the window, restart or not.
+        let Some(signed_at) = sig_info.sig_time else {
+            stats.malformed.bump();
+            return nack(NackReason::NoRoute);
+        };
+        if self.now().abs_diff(signed_at) > ASK_CLOCK_WINDOW_MS {
+            tracing::debug!(%key, signed_at, "ask signed more than 120 s from this device's clock");
+            stats.stale.bump();
+            return nack(NackReason::NoRoute);
+        }
+
+        // 5. The budget of signature verifications. The key an unverified ask names is whatever
+        // its sender wrote, so no asker's bucket is charged here: one bucket bounds what verifying
+        // costs, whoever the asks name.
         let now = Instant::now();
-        if !self.chan.channels.throttle(&key, now) {
-            stats.throttled.bump();
+        if !self.chan.channels.throttle_unverified(now) {
+            stats.shed.bump();
             return nack(NackReason::Congestion);
         }
 
-        // 5. The signature: the one expensive step.
+        // 6. The signature: the one expensive step.
         let generation = self.judge.generation();
         match self
             .judge
@@ -316,7 +342,8 @@ impl NodeInner {
             }
         }
 
-        // 6. A replay.
+        // 7. A replay. A copy of a verified ask costs the asker nothing: it is no new ask of its
+        // key's bucket.
         match self.chan.replay.check(sig_info) {
             ReplayCheck::Fresh => {}
             ReplayCheck::Replay => {
@@ -327,6 +354,13 @@ impl NodeInner {
                 stats.malformed.bump();
                 return nack(NackReason::NoRoute);
             }
+        }
+
+        // 8. The asker's bucket, now that the key is the asker's: the asker is known to be a
+        // member, so the Nack says "slower".
+        if !self.chan.channels.throttle(&key, now) {
+            stats.throttled.bump();
+            return nack(NackReason::Congestion);
         }
 
         // The asker is a verified member: what follows is answered with a signed record. The

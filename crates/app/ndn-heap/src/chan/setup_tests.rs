@@ -64,6 +64,11 @@ impl Drop for Rig {
 }
 
 async fn rig_of(devs: Vec<Dev>) -> Rig {
+    rig_with(devs, |_, _| {}).await
+}
+
+/// [`rig_of`], each node's `Config` (after [`fast`]) changed by `tweak(index, config)`.
+async fn rig_with(devs: Vec<Dev>, tweak: impl Fn(usize, &mut Config)) -> Rig {
     let (engine, shutdown) = EngineBuilder::new(Default::default())
         .build()
         .await
@@ -75,9 +80,11 @@ async fn rig_of(devs: Vec<Dev>) -> Rig {
     }
     let cancel = CancellationToken::new();
     let (mut nodes, mut syncs) = (Vec::new(), Vec::new());
-    for dev in &devs {
+    for (i, dev) in devs.iter().enumerate() {
         let sync = engine.app_face(cancel.child_token());
         syncs.push(Arc::clone(&sync));
+        let mut config = fast();
+        tweak(i, &mut config);
         nodes.push(
             Node::start(
                 Transport {
@@ -88,7 +95,7 @@ async fn rig_of(devs: Vec<Dev>) -> Rig {
                 Arc::clone(&dev.keys),
                 Arc::clone(&dev.validator),
                 Arc::clone(&dev.store),
-                fast(),
+                config,
             )
             .await
             .expect("the node starts"),
@@ -181,6 +188,20 @@ fn signed_ask(node: &Node, to: &Node, ask: &ChanAsk) -> (Bytes, Interest) {
         .unwrap();
     let interest = Interest::decode(wire.clone()).unwrap();
     (wire, interest)
+}
+
+/// An ask Interest to `to` with the ApplicationParameters `params` (whatever they hold), whose
+/// KeyLocator names `locator` and whose signature is made by `signer`'s device key: what a
+/// misbehaving or hostile device writes by hand (`sign_interest` refuses anything but an ask).
+fn signed_as(signer: &Node, locator: &Name, to: &Node, params: &[u8]) -> Bytes {
+    let key = Arc::clone(&signer.inner.signer);
+    InterestBuilder::new(chan_prefix(to.name()))
+        .must_be_fresh()
+        .lifetime(Duration::from_secs(4))
+        .app_parameters(params.to_vec())
+        .sign_sync(key.sig_type(), Some(locator), |region| {
+            key.sign_sync(region).unwrap()
+        })
 }
 
 async fn fetch(node: &Node, wire: Bytes) -> Result<Data, AppError> {
@@ -321,13 +342,9 @@ async fn a_strangers_ask_is_nacked_and_costs_no_signature_verification() {
         "no signature was checked"
     );
     // An ask over 8 KiB, and one that is no ask, are Nacked before they are read.
-    let big = dave
-        .sign_interest(&chan_prefix(alice.name()), &vec![7u8; 9000])
-        .unwrap();
+    let big = signed_as(dave, dave.writer(), alice, &vec![7u8; 9000]);
     assert!(nacked(fetch(dave, big).await, NackReason::NoRoute));
-    let junk = dave
-        .sign_interest(&chan_prefix(alice.name()), b"not an ask")
-        .unwrap();
+    let junk = signed_as(dave, dave.writer(), alice, b"not an ask");
     assert!(nacked(fetch(dave, junk).await, NackReason::NoRoute));
     assert_eq!((stats.oversize.get(), stats.malformed.get()), (1, 1));
     assert_eq!(judge.interest_walks(), 0);
@@ -728,7 +745,7 @@ async fn a_removed_receiver_of_a_public_space_rekeys_the_channel_once_for_the_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_asker_over_its_rate_is_nacked_congestion_after_standing_and_before_any_signature() {
+async fn an_asker_over_its_rate_is_nacked_congestion_after_its_signature_verified() {
     let rig = rig(&["/alice/laptop", "/bob/phone", "/dave/pc"]).await;
     let (share, change) = public_with(&["/bob"], &[]);
     shared(&rig, share, change).await;
@@ -747,6 +764,8 @@ async fn an_asker_over_its_rate_is_nacked_congestion_after_standing_and_before_a
         "{nacks:?}"
     );
     assert_eq!(stats.throttled.get() as usize, nacks.len());
+    // The rate is the asker's, charged once the signature verified: every ask cost its walk.
+    assert_eq!(alice.inner.judge.interest_walks(), 30);
     // A stranger is told nothing of the rate: his Nack is the stranger's, and costs no walk.
     let walks = alice.inner.judge.interest_walks();
     let (_, interest) = signed_ask(dave, alice, &ask_of(dave, ChannelMode::Latest));
@@ -1296,6 +1315,94 @@ async fn a_session_of_lifetime_2_pow_63_does_not_panic_chan_tick() {
     assert!(
         bob.inner.chan.sessions.get(5).is_some(),
         "the session is kept, not lapsed"
+    );
+}
+
+/// Asks naming a member's key, unsigned by it, are charged to nobody's bucket: the member's own
+/// ask goes through after them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_asks_naming_a_member_do_not_throttle_that_members_real_ask() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/dave/pc"]).await;
+    let (share, change) = public_with(&["/bob"], &[]);
+    shared(&rig, share, change).await;
+    let (alice, bob, dave) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
+    let params = ask_of(bob, ChannelMode::Latest).encode().unwrap();
+    for i in 0..20 {
+        // Dave signs, naming bob's key in the KeyLocator: the signature cannot verify.
+        let forged = signed_as(dave, bob.writer(), alice, &params);
+        let interest = Interest::decode(forged).unwrap();
+        let answer = alice.inner.chan_answer(&interest).await;
+        assert!(
+            matches!(answer, ChanAnswer::Nack(NackReason::NoRoute)),
+            "forged ask {i} was answered {answer:?}: a forgery is judged, not charged to bob"
+        );
+    }
+    assert_eq!(alice.inner.chan.stats.unverified.get(), 20);
+    bob.ask_channel(&space(), alice.name())
+        .await
+        .expect("bob's own ask is answered after twenty forgeries naming his key");
+    let stats = &alice.inner.chan.stats;
+    assert_eq!(
+        (stats.throttled.get(), stats.shed.get()),
+        (0, 0),
+        "no rate was charged to bob, and the verification budget was not exhausted"
+    );
+}
+
+/// An ask signed long ago, or in the far future, by a member the sender never saw ask: the
+/// sender's clock (the one wall-clock reading of the setup) refuses it before any signature
+/// is checked. Within ±120 s it is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ask_signed_an_hour_ago_is_refused_by_a_sender_that_never_saw_it() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let skew = Arc::new(AtomicI64::new(0));
+    let rig = rig_with(world(&["/alice/laptop", "/bob/phone"]).await, {
+        let skew = Arc::clone(&skew);
+        move |i, config| {
+            if i == 0 {
+                // Alice's clock is the real one plus what the case says.
+                let base = Arc::clone(&config.clock);
+                let skew = Arc::clone(&skew);
+                config.clock = Arc::new(move || {
+                    let ms = base().0 as i64 + skew.load(Ordering::SeqCst);
+                    crate::error::Timestamp(ms as u64)
+                });
+            }
+        }
+    })
+    .await;
+    let (share, change) = public_with(&["/bob"], &[]);
+    shared(&rig, share, change).await;
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    let walks = alice.inner.judge.interest_walks();
+    for (skew_ms, answered) in [
+        (100_000, true),
+        (-100_000, true),
+        (150_000, false),
+        (-150_000, false),
+        (3_600_000, false),
+        (-3_600_000, false),
+    ] {
+        skew.store(skew_ms, Ordering::SeqCst);
+        let r = bob.ask_channel(&space(), alice.name()).await;
+        if answered {
+            r.unwrap_or_else(|e| panic!("an ask {skew_ms} ms from the sender's clock: {e}"));
+        } else {
+            assert!(
+                matches!(r, Err(ChanError::NotAnswered { .. })),
+                "an ask {skew_ms} ms from the sender's clock is refused: {r:?}"
+            );
+        }
+    }
+    assert_eq!(
+        alice.inner.judge.interest_walks(),
+        walks + 2,
+        "the stale asks cost no signature verification"
+    );
+    assert_eq!(
+        alice.inner.chan.stats.stale.get(),
+        4,
+        "four asks outside ±120 s"
     );
 }
 
