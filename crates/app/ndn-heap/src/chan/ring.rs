@@ -5,14 +5,14 @@
 //! frame's own `Bytes` (a reference, no copy). The hash `h` a checkpoint signs is the first 16
 //! octets of `H(frame octets)`: SHA-256 for a frame of at most 2,048 octets and BLAKE3 above (so
 //! nothing is negotiated: the frame's length selects the hash). **It is computed when the ring is
-//! drained** (what a checkpoint covers), not when the frame is recorded: nothing reads the hashes
-//! before a checkpoint is built (stage 5), and a hash on the writer's path cost a sixth of the
-//! writer thread at 1 KiB and 8 KiB (SHAPES-CHANNEL.md 18.x). The ring holds at most 4,096 frames
-//! **and** at most [`RING_BYTES`] octets of them (a recorded frame is kept alive by it until it is
-//! drained); a frame recorded past either bound pushes out the oldest, which is forgotten and
-//! **counted**, so a checkpoint can say how many frames it no longer covers. Nothing here verifies
-//! anything: writing the ring is the sender's part, and a checkpoint that signs it is a later
-//! stage's.
+//! drained** (what a checkpoint covers), not when the frame is recorded, and by the checkpoint
+//! writer with no lock held: nothing reads the hashes before a checkpoint is built, and a hash on
+//! the writer's path cost a sixth of the writer thread at 1 KiB and 8 KiB (SHAPES-CHANNEL.md
+//! 18.x). The ring holds at most 4,096 frames **and** at most [`RING_BYTES`] octets of them (a
+//! recorded frame is kept alive by it until it is drained); a frame recorded past either bound
+//! pushes out the oldest, which is forgotten and **counted**, and a checkpoint's range then
+//! begins past it ([`SentFrames::forgot_end`]) so a receiver never reads a forgotten frame as a
+//! mismatch. Nothing here verifies anything: [`super::checkpoint`] signs what the ring yields.
 
 use std::collections::VecDeque;
 
@@ -53,6 +53,9 @@ pub(crate) struct SentFrames {
     byte_budget: usize,
     bytes: usize,
     forgotten: u64,
+    /// One past the highest `seq0` of a frame the ring forgot.
+    forgot_end: u64,
+    #[cfg(test)]
     hashed: u64,
 }
 
@@ -71,6 +74,8 @@ impl SentFrames {
             byte_budget: byte_budget.clamp(1, RING_BYTES),
             bytes: 0,
             forgotten: 0,
+            forgot_end: 0,
+            #[cfg(test)]
             hashed: 0,
         }
     }
@@ -81,13 +86,23 @@ impl SentFrames {
     pub(crate) fn record(&mut self, seq0: u64, frame: &Bytes) {
         self.bytes += frame.len();
         self.frames.push_back((seq0, frame.clone()));
+        self.enforce();
+    }
+
+    fn enforce(&mut self) {
         while self.frames.len() > self.capacity || self.bytes > self.byte_budget {
-            let Some((_, old)) = self.frames.pop_front() else {
+            let Some((seq0, old)) = self.frames.pop_front() else {
                 break;
             };
             self.bytes -= old.len();
             self.forgotten += 1;
+            self.forgot_end = self.forgot_end.max(seq0.saturating_add(1));
         }
+    }
+
+    /// Whether any frame is held: a checkpoint has something to list.
+    pub(crate) fn has_frames(&self) -> bool {
+        !self.frames.is_empty()
     }
 
     /// Frames held.
@@ -122,23 +137,27 @@ impl SentFrames {
             .map(|(seq0, frame)| (*seq0, frame_hash(frame)))
     }
 
-    /// Frames pushed out unrecorded by a checkpoint since the last
-    /// [`take_forgotten`](Self::take_forgotten).
-    #[allow(dead_code)] // stage 5: a checkpoint says how many frames it no longer covers
+    /// Frames pushed out unrecorded since the last [`take_forgotten`](Self::take_forgotten).
+    #[cfg(test)]
     pub(crate) fn forgotten(&self) -> u64 {
         self.forgotten
     }
 
-    /// Reads and clears the forgotten count (a checkpoint reports it).
-    #[allow(dead_code)] // stage 5: a checkpoint reports the frames the ring forgot
+    /// Reads and clears the forgotten count (the sender counts what no checkpoint covers).
     pub(crate) fn take_forgotten(&mut self) -> u64 {
         std::mem::take(&mut self.forgotten)
+    }
+
+    /// One past the highest `seq0` of a frame this ring ever forgot, 0 if none: a checkpoint's
+    /// range begins at or above it, so no receiver reads a forgotten frame as unlisted.
+    pub(crate) fn forgot_end(&self) -> u64 {
+        self.forgot_end
     }
 
     /// Removes and yields the frames held, oldest first, as `(seq0, hash)`: what a checkpoint
     /// covers. **The hashes are computed here**, one per frame as the iterator is advanced (a frame
     /// the caller does not take is dropped unhashed). The ring keeps its storage.
-    #[allow(dead_code)] // stage 5: a checkpoint signs the frames the ring holds
+    #[cfg(test)]
     pub(crate) fn drain(&mut self) -> impl Iterator<Item = (u64, [u8; HASH_LEN])> + '_ {
         self.bytes = 0;
         let hashed = &mut self.hashed;
@@ -146,6 +165,37 @@ impl SentFrames {
             *hashed += 1;
             (seq0, frame_hash(&frame))
         })
+    }
+
+    /// Removes and yields the frames with `seq0 < hi`, in order of `seq0` (frames of the two lanes
+    /// are recorded in the order they left, which is not the order of their sequences): what a
+    /// checkpoint over `[.., hi)` covers. Nothing is hashed: the caller hashes the frames after it
+    /// let go of whatever lock guards the ring. A frame with `seq0 >= hi` stays for the next
+    /// checkpoint.
+    pub(crate) fn take_below(&mut self, hi: u64) -> Vec<(u64, Bytes)> {
+        let mut taken = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.frames.len());
+        for (seq0, frame) in self.frames.drain(..) {
+            if seq0 < hi {
+                self.bytes -= frame.len();
+                taken.push((seq0, frame));
+            } else {
+                kept.push_back((seq0, frame));
+            }
+        }
+        self.frames = kept;
+        taken.sort_by_key(|(seq0, _)| *seq0);
+        taken
+    }
+
+    /// Puts back frames [`take_below`](Self::take_below) yielded, before the ones held: a
+    /// checkpoint could not be signed, and what it would have covered is covered by the next.
+    pub(crate) fn restore(&mut self, frames: Vec<(u64, Bytes)>) {
+        for (seq0, frame) in frames.into_iter().rev() {
+            self.bytes += frame.len();
+            self.frames.push_front((seq0, frame));
+        }
+        self.enforce();
     }
 }
 
@@ -336,5 +386,114 @@ mod tests {
             live <= 2 * bound as i64 + 16 * 1024,
             "the ring counts {bound} octets of frames and keeps {live} octets of allocation alive"
         );
+    }
+
+    fn frame_of(len: usize, fill: u8) -> Bytes {
+        Bytes::from(vec![fill; len])
+    }
+
+    /// A checkpoint over `[.., hi)` takes the frames below `hi` in order of their sequences (the two
+    /// lanes record in the order frames left, not in the order of their sequences), leaves the
+    /// others for the next one, and keeps the octet count of what is left.
+    #[test]
+    fn take_below_yields_the_frames_under_hi_in_sequence_order_and_keeps_the_rest() {
+        let mut ring = SentFrames::new();
+        for (seq0, len) in [(5u64, 10usize), (3, 20), (9, 30), (7, 40), (8, 50)] {
+            ring.record(seq0, &frame_of(len, seq0 as u8));
+        }
+        let taken = ring.take_below(8);
+        let seqs: Vec<u64> = taken.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, [3, 5, 7], "below 8, rising");
+        assert_eq!(
+            taken[0].1.len(),
+            20,
+            "the frame itself, not a copy of another"
+        );
+        let held: Vec<u64> = ring.iter().map(|(s, _)| s).collect();
+        assert_eq!(
+            held,
+            [9, 8],
+            "what is at or above hi stays, in the order recorded"
+        );
+        assert_eq!(ring.bytes(), 30 + 50, "the octets of the frames left");
+        assert_eq!(ring.forgotten(), 0, "taking is not forgetting");
+        assert_eq!(ring.forgot_end(), 0);
+        assert!(ring.has_frames());
+        let rest = ring.take_below(100);
+        assert_eq!(rest.len(), 2);
+        assert!(!ring.has_frames());
+        assert_eq!(ring.bytes(), 0);
+        assert!(ring.take_below(100).is_empty());
+    }
+
+    /// A checkpoint that could not be signed gives its frames back: they come before the ones
+    /// recorded since, so the next checkpoint lists them all, and the octet count follows.
+    #[test]
+    fn restore_puts_the_frames_back_before_the_ones_held() {
+        let mut ring = SentFrames::new();
+        for seq0 in 0..4u64 {
+            ring.record(seq0, &frame_of(10, seq0 as u8));
+        }
+        let taken = ring.take_below(2);
+        ring.record(4, &frame_of(10, 4));
+        assert_eq!(ring.len(), 3);
+        ring.restore(taken);
+        let held: Vec<u64> = ring.iter().map(|(s, _)| s).collect();
+        assert_eq!(held, [0, 1, 2, 3, 4]);
+        assert_eq!(ring.bytes(), 50);
+        assert_eq!(ring.forgot_end(), 0);
+        // What came back is hashed as what was recorded: the same octets.
+        let again = ring.take_below(2);
+        assert_eq!(frame_hash(&again[0].1), frame_hash(&frame_of(10, 0)));
+    }
+
+    /// Restoring past the bounds forgets the oldest, counted, and the range moves past them.
+    #[test]
+    fn restore_past_the_bound_forgets_the_oldest_and_says_so() {
+        let mut ring = SentFrames::with_limits(3, RING_BYTES);
+        for seq0 in 10..13u64 {
+            ring.record(seq0, &frame_of(5, 1));
+        }
+        let taken = ring.take_below(12);
+        for seq0 in 13..15u64 {
+            ring.record(seq0, &frame_of(5, 2));
+        }
+        assert_eq!(ring.forgotten(), 0, "12, 13, 14 fit three");
+        ring.restore(taken);
+        assert_eq!(ring.len(), 3);
+        assert_eq!(
+            ring.forgotten(),
+            2,
+            "the two restored frames are the oldest"
+        );
+        assert_eq!(ring.forgot_end(), 12, "one past the highest forgotten (11)");
+        let held: Vec<u64> = ring.iter().map(|(s, _)| s).collect();
+        assert_eq!(held, [12, 13, 14]);
+    }
+
+    /// `forgot_end` is one past the highest sequence the ring ever forgot, whatever order they
+    /// went in, and never goes down; reading the forgotten count does not clear it.
+    #[test]
+    fn forgot_end_is_one_past_the_highest_forgotten_sequence_and_never_falls() {
+        let mut ring = SentFrames::with_limits(2, RING_BYTES);
+        assert_eq!(ring.forgot_end(), 0, "nothing forgotten yet");
+        ring.record(50, &frame_of(1, 0));
+        ring.record(20, &frame_of(1, 0));
+        assert_eq!(ring.forgot_end(), 0);
+        ring.record(30, &frame_of(1, 0));
+        assert_eq!(ring.forgot_end(), 51, "the oldest recorded (50) went first");
+        ring.record(40, &frame_of(1, 0));
+        assert_eq!(ring.forgot_end(), 51, "20 is lower: the end stays");
+        assert_eq!(ring.take_forgotten(), 2);
+        assert_eq!(
+            ring.forgot_end(),
+            51,
+            "counting what was forgotten does not move the end"
+        );
+        // A frame alone over the byte budget is forgotten at once and counted in the end too.
+        let mut small = SentFrames::with_limits(RING_FRAMES, 10);
+        small.record(77, &frame_of(11, 0));
+        assert!(small.is_empty());
+        assert_eq!(small.forgot_end(), 78);
     }
 }
