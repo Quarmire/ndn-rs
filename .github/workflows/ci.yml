@@ -147,6 +147,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 testbed/dep-direction-guard.py
+      - name: retired signal names stay gone
+        run: python3 testbed/retired-names-guard.py
 
   semver:
     name: semver-checks (cross-repo contract crates)
