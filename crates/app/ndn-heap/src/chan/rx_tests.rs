@@ -2167,7 +2167,9 @@ async fn a_session_installed_over_the_held_one_is_taken_up_by_the_next_frame() {
     ));
     let held = sessions.get(fx.info.channel).unwrap();
     let before = sessions.lookups();
-    sessions.insert(held);
+    sessions
+        .insert(held)
+        .expect("the id is held by nobody else");
     assert!(matches!(
         fx.deliver(fx.data(SideClass::Datagram, 2, &[msg(1, b"again")]))
             .await,

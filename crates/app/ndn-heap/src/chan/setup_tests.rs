@@ -1254,3 +1254,89 @@ async fn a_reliable_ask_without_a_stream_is_refused_no_stream() {
         .unwrap();
     assert_eq!(info.mode, ChannelMode::Reliable);
 }
+
+/// A listed writer signs a session of lifetime `2^63`. Whatever the wire says, the receiver's
+/// maintenance pass must survive it: a panic in `chan_tick` ends the task, and with it every
+/// lapse, re-judging and renewal of the node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_of_lifetime_2_pow_63_does_not_panic_chan_tick() {
+    let rig = rig(&["/alice/laptop", "/bob/phone"]).await;
+    let (share, change) = public_with(&["/bob"], &[]);
+    shared(&rig, share, change).await;
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    let fold = bob
+        .inner
+        .space_of(&space())
+        .unwrap()
+        .log
+        .lock()
+        .fold
+        .version();
+    let judged = (
+        bob.inner.judge.generation(),
+        fold.load(std::sync::atomic::Ordering::SeqCst),
+    );
+    let record = SessionRecord {
+        lifetime: 1 << 63,
+        ..record_of(alice.name(), None)
+    };
+    let session = Arc::new(super::sessions::RecvSession::new(
+        &record,
+        ChannelKey::random(),
+        alice.writer().clone(),
+        Arc::clone(&bob.inner.judge),
+        fold,
+        judged,
+        Instant::now(),
+    ));
+    bob.inner.chan.sessions.insert(session).unwrap();
+    bob.inner
+        .chan_tick(Instant::now() + Duration::from_secs(1000))
+        .await;
+    assert!(
+        bob.inner.chan.sessions.get(5).is_some(),
+        "the session is kept, not lapsed"
+    );
+}
+
+/// Writer B signs a session that carries writer A's channel id (it is in the clear in A's
+/// session and in every frame header): the receiver refuses it and keeps A's session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_reusing_another_senders_channel_id_is_refused() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
+    let (share, change) = public_with(&["/bob", "/carol"], &[]);
+    shared(&rig, share, change).await;
+    let (alice, bob, carol) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
+    let held = bob
+        .ask_channel(&space(), alice.name())
+        .await
+        .expect("alice's session");
+    let id = held.channel;
+
+    let (_, interest) = signed_ask(bob, carol, &ask_of(bob, ChannelMode::Latest));
+    let name = (*interest.name).clone();
+    let data = crafted(
+        carol,
+        bob,
+        &name,
+        SessionRecord {
+            id,
+            ..record_of(carol.name(), None)
+        },
+    );
+    match judge(bob, carol, &name, data).await {
+        Err(e @ ChanError::BadAnswer { .. }) => {
+            assert!(
+                e.to_string().contains("channel id"),
+                "the refusal says why: {e}"
+            );
+            assert_eq!(e.next(), NextStep::RetryLater);
+        }
+        other => panic!("a session reusing another sender's channel id is refused: {other:?}"),
+    }
+    let kept = bob.inner.chan.sessions.get(id).expect("alice's session");
+    assert_eq!(kept.sender(), alice.name(), "the id still maps to alice");
+    assert!(kept.ended().is_none());
+    assert_eq!(bob.inner.chan.sessions.all().len(), 1);
+}
+

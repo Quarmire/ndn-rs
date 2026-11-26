@@ -4,14 +4,15 @@
 //! A session is **usable** until its lifetime plus a 5 s grace has passed on the monotonic clock,
 //! counted from the receipt of the answer (no wall clock is read: a clock that steps changes
 //! nothing). It holds the key of the epoch it was last given and, for [`REKEY_GRACE`] after the
-//! receiver first saw the next key epoch, the key before it, so frames in flight under the old key
+//! answer that gave the next key epoch, the key before it, so frames in flight under the old key
 //! are not lost. The frame layer asks, per frame, [`RecvSession::is_current`] (two atomic loads:
 //! the trust generation and the space's fold version it was judged under) and, when either moved,
 //! [`RecvSession::recheck`], which judges the sender again from what the node holds, offline, and
 //! drops the session with its reason if the sender no longer stands.
 //!
 //! A frame under a key epoch the session does not hold calls [`RecvSessions::unknown_epoch`], which
-//! says whether to ask the sender again: at most once a second per sender.
+//! says whether to ask the sender again: at most once a second per sender. Such a frame is not
+//! authenticated, so it changes nothing of the session.
 
 use super::FastMap;
 use std::fmt;
@@ -31,8 +32,7 @@ use crate::rt::Instant;
 use crate::trust::Judge;
 use crate::wire::EpochId;
 
-/// How long the key before the current one is accepted after the receiver first saw the new key
-/// epoch.
+/// How long the key before the current one is accepted after the answer that gave the new one.
 pub(crate) const REKEY_GRACE: Duration = Duration::from_secs(5);
 
 /// How long past its lifetime a session is still used.
@@ -129,8 +129,6 @@ impl Terms {
 struct State {
     current: Held,
     previous: Option<(Held, Instant)>,
-    /// The low octet of the first key epoch seen that was not held, and when.
-    first_seen: Option<(u8, Instant)>,
     installed: Instant,
     lifetime: Duration,
     terms: Terms,
@@ -213,7 +211,6 @@ impl RecvSession {
                     frame,
                 },
                 previous: None,
-                first_seen: None,
                 installed: now,
                 lifetime: Duration::from_secs(record.lifetime),
                 terms: Terms::of(record),
@@ -253,6 +250,13 @@ impl RecvSession {
         self.state.lock().terms.clone()
     }
 
+    /// The sequence the sender's last answer said its next message takes (`S_SEQ`): where this
+    /// receiver's frames begin, and the floor a frame's `seq0` is measured from when the
+    /// receiver has seen none above it (the receiver's `too_far` rule).
+    pub(crate) fn seq(&self) -> u64 {
+        self.state.lock().terms.seq
+    }
+
     /// The key epoch of the key held now.
     #[cfg(test)]
     pub(crate) fn key_epoch(&self) -> u32 {
@@ -287,7 +291,8 @@ impl RecvSession {
     pub(crate) fn usable(&self, now: Instant) -> bool {
         let state = self.state.lock();
         state.ended.is_none()
-            && now.saturating_duration_since(state.installed) < state.lifetime + LIFETIME_GRACE
+            && now.saturating_duration_since(state.installed)
+                < state.lifetime.saturating_add(LIFETIME_GRACE)
     }
 
     /// Whether the session is due its renewal at `now`: 75 % of its lifetime has passed since it
@@ -295,7 +300,8 @@ impl RecvSession {
     pub(crate) fn renewal_due(&self, now: Instant) -> bool {
         let state = self.state.lock();
         state.ended.is_none()
-            && now.saturating_duration_since(state.installed) >= state.lifetime * 3 / 4
+            && now.saturating_duration_since(state.installed)
+                >= state.lifetime.saturating_mul(3) / 4
             && state.retry_at.is_none_or(|at| now >= at)
     }
 
@@ -311,7 +317,8 @@ impl RecvSession {
     pub(crate) fn frame_key(&self, low: u8, now: Instant) -> Option<FrameKey> {
         let state = self.state.lock();
         if state.ended.is_some()
-            || now.saturating_duration_since(state.installed) >= state.lifetime + LIFETIME_GRACE
+            || now.saturating_duration_since(state.installed)
+                >= state.lifetime.saturating_add(LIFETIME_GRACE)
         {
             return None;
         }
@@ -328,8 +335,7 @@ impl RecvSession {
 
     /// The session took a new answer of the same channel at `now`: a renewal, or a key pulled
     /// after a re-key. A key epoch not newer than the one held changes only the lifetime. The key
-    /// before stays acceptable until [`REKEY_GRACE`] after the first time the new epoch was seen
-    /// (in a frame, or here).
+    /// before stays acceptable until [`REKEY_GRACE`] after this answer.
     pub(crate) fn renewed(
         &self,
         record: &SessionRecord,
@@ -340,10 +346,8 @@ impl RecvSession {
     ) {
         let mut state = self.state.lock();
         if newer(record.key_epoch, state.current.epoch) {
-            let seen = match state.first_seen {
-                Some((low, at)) if low == record.key_epoch as u8 => at,
-                _ => now,
-            };
+            // Counted from this answer: a frame under a key this device does not hold is not
+            // authenticated, so nothing it says is a time to count from.
             let frame = key.frame_key(record.id, record.key_epoch);
             let old = std::mem::replace(
                 &mut state.current,
@@ -353,8 +357,7 @@ impl RecvSession {
                     frame,
                 },
             );
-            state.previous = Some((old, seen + REKEY_GRACE));
-            state.first_seen = None;
+            state.previous = Some((old, now + REKEY_GRACE));
         }
         state.installed = now;
         state.lifetime = Duration::from_secs(record.lifetime);
@@ -439,6 +442,18 @@ pub(crate) enum Unknown {
     },
 }
 
+/// The channel another sender, space or mode holds: what a session that names an id already held
+/// is refused for ([`RecvSessions::insert`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IdHeld {
+    /// The space of the channel that holds the id.
+    pub(crate) space: Name,
+    /// Its sender's device.
+    pub(crate) sender: Name,
+    /// Its mode.
+    pub(crate) mode: ChannelMode,
+}
+
 #[derive(Default)]
 struct Store {
     by_id: FastMap<u64, Arc<RecvSession>>,
@@ -502,8 +517,24 @@ impl RecvSessions {
 
     /// Hold `session`, ending (as replaced) any other of the same space, sender and mode: the
     /// sender began a new channel.
-    pub(crate) fn insert(&self, session: Arc<RecvSession>) {
+    ///
+    /// A channel id belongs to the (space, sender, mode) that holds it. It is in the clear in every
+    /// frame header, so a session that names an id another channel holds is refused with
+    /// [`IdHeld`] and nothing changes: otherwise a second writer could take the frames of the
+    /// first.
+    pub(crate) fn insert(&self, session: Arc<RecvSession>) -> Result<(), IdHeld> {
         let mut store = self.store.lock();
+        if let Some(holder) = store.by_id.get(&session.id)
+            && (holder.space != session.space
+                || holder.sender != session.sender
+                || holder.mode != session.mode)
+        {
+            return Err(IdHeld {
+                space: holder.space.clone(),
+                sender: holder.sender.clone(),
+                mode: holder.mode,
+            });
+        }
         let replaced: Vec<u64> = store
             .by_id
             .values()
@@ -522,6 +553,7 @@ impl RecvSessions {
         }
         store.by_id.insert(session.id, session);
         self.generation.fetch_add(1, Ordering::Release);
+        Ok(())
     }
 
     /// Drop the session of channel `id`.
@@ -556,20 +588,14 @@ impl RecvSessions {
             .collect()
     }
 
-    /// A frame of channel `id` came under a key epoch (low octet `low`) this device does not
-    /// hold, at `now`. The first time a new epoch is seen is noted (the grace of the key before it
-    /// counts from there). The sender is to be asked again at most once a second.
-    pub(crate) fn unknown_epoch(&self, id: u64, low: u8, now: Instant) -> Unknown {
+    /// A frame of channel `id` came under a key epoch this device does not hold, at `now`. The
+    /// frame is not authenticated (its key is not held), so it changes nothing of the session:
+    /// all it can do is make the sender be asked again, at most once a second per sender.
+    pub(crate) fn unknown_epoch(&self, id: u64, now: Instant) -> Unknown {
         let mut store = self.store.lock();
         let Some(session) = store.by_id.get(&id).cloned() else {
             return Unknown::NoSession;
         };
-        {
-            let mut state = session.state.lock();
-            if state.first_seen.is_none_or(|(l, _)| l != low) {
-                state.first_seen = Some((low, now));
-            }
-        }
         if store
             .asked_for_epoch
             .get(&session.sender)

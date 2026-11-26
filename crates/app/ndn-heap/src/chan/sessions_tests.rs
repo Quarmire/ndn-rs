@@ -66,7 +66,9 @@ impl Fixture {
             (self.judge.generation(), self.fold.load(Ordering::SeqCst)),
             now,
         ));
-        self.store.insert(Arc::clone(&session));
+        self.store
+            .insert(Arc::clone(&session))
+            .expect("a fixture session's id is held by nobody else");
         session
     }
 }
@@ -130,7 +132,7 @@ async fn renewal_is_due_at_75_percent_and_a_failed_one_is_tried_again_after_ten_
 }
 
 #[tokio::test]
-async fn the_old_key_is_accepted_only_for_the_grace_after_the_new_epoch_was_first_seen() {
+async fn a_junk_frame_under_a_future_epoch_does_not_shorten_the_old_keys_grace() {
     let f = fixture().await;
     let t0 = Instant::now();
     let old = ChannelKey::from_bytes([1; 32]);
@@ -141,31 +143,55 @@ async fn the_old_key_is_accepted_only_for_the_grace_after_the_new_epoch_was_firs
         "an epoch not held opens nothing"
     );
 
-    // A frame under epoch 1 arrives at t1; the answer with its key at t1 + 50 ms.
+    // Anyone who can reach the device sends a frame of channel 7 under epoch octet 1 at t1: it
+    // is not authenticated (its key is not held), so it says nothing of when the sender
+    // re-keyed. The sender's answer with the new key comes 100 s later.
     let t1 = t0 + Duration::from_secs(100);
-    assert!(matches!(
-        f.store.unknown_epoch(7, 1, t1),
-        Unknown::Ask { .. }
-    ));
+    assert!(matches!(f.store.unknown_epoch(7, t1), Unknown::Ask { .. }));
+    let t2 = t1 + Duration::from_secs(100);
     s.renewed(
         &record(7, 1, 3600),
         ChannelKey::from_bytes([2; 32]),
         n("/bob/phone/KEY/1"),
         (0, 0),
-        t1 + Duration::from_millis(50),
+        t2,
     );
     let seen = |at| (s.frame_key(0, at), s.frame_key(1, at));
-    let (o, nw) = seen(t1 + Duration::from_millis(4900));
+    let (o, nw) = seen(t2 + Duration::from_millis(4900));
     assert!(
         eq(&o, &old, 7, 0) && eq(&nw, &new, 7, 1),
-        "both keys for the grace: {o:?} {nw:?}"
+        "both keys for the grace, counted from the answer: {o:?} {nw:?}"
     );
-    let (o, nw) = seen(t1 + Duration::from_millis(5001));
-    assert!(
-        o.is_none(),
-        "the old key is refused 5 s after the new epoch was first seen"
-    );
+    let (o, nw) = seen(t2 + Duration::from_millis(5001));
+    assert!(o.is_none(), "the old key is refused 5 s after the answer");
     assert!(eq(&nw, &new, 7, 1));
+}
+
+/// A hostile writer signs a session of lifetime `2^63`; the maintenance task runs `lapse` and
+/// `due`, the frame layer `usable` and `frame_key`, over it: none may panic (a panic in
+/// `chan_tick` ends the task for good).
+#[tokio::test]
+async fn a_session_of_lifetime_2_pow_63_does_not_panic_the_store() {
+    let f = fixture().await;
+    let t0 = Instant::now();
+    for lifetime in [1u64 << 63, u64::MAX - 4, u64::MAX] {
+        let s = f.session(&record(7, 0, lifetime), [1; 32], t0);
+        let later = t0 + Duration::from_secs(1000);
+        assert!(s.usable(later), "a session that long is usable");
+        assert!(s.frame_key(0, later).is_some());
+        assert!(!s.renewal_due(later), "and is not due its renewal");
+        assert!(f.store.lapse(later).is_empty());
+        assert!(f.store.due(later).is_empty());
+        // A renewal that carries the same lifetime does not panic either.
+        s.renewed(
+            &record(7, 1, lifetime),
+            ChannelKey::from_bytes([2; 32]),
+            n("/bob/phone/KEY/1"),
+            (0, 0),
+            later,
+        );
+        assert!(s.usable(later));
+    }
 }
 
 #[tokio::test]
@@ -205,7 +231,7 @@ async fn a_frame_under_an_unknown_key_epoch_asks_the_sender_at_most_once_a_secon
     let t0 = Instant::now();
     f.session(&record(7, 0, 3600), [1; 32], t0);
     assert_eq!(
-        f.store.unknown_epoch(8, 1, t0),
+        f.store.unknown_epoch(8, t0),
         Unknown::NoSession,
         "not this device's channel"
     );
@@ -214,22 +240,20 @@ async fn a_frame_under_an_unknown_key_epoch_asks_the_sender_at_most_once_a_secon
         sender: n("/bob/phone"),
         mode: ChannelMode::Latest,
     };
-    assert_eq!(f.store.unknown_epoch(7, 1, t0), ask);
+    assert_eq!(f.store.unknown_epoch(7, t0), ask);
     for ms in [1u64, 500, 999] {
         assert_eq!(
-            f.store.unknown_epoch(7, 1, t0 + Duration::from_millis(ms)),
+            f.store.unknown_epoch(7, t0 + Duration::from_millis(ms)),
             Unknown::Limited,
             "{ms} ms"
         );
     }
     assert_eq!(
-        f.store
-            .unknown_epoch(7, 1, t0 + Duration::from_millis(1000)),
+        f.store.unknown_epoch(7, t0 + Duration::from_millis(1000)),
         ask
     );
     assert_eq!(
-        f.store
-            .unknown_epoch(7, 1, t0 + Duration::from_millis(1500)),
+        f.store.unknown_epoch(7, t0 + Duration::from_millis(1500)),
         Unknown::Limited
     );
 }
@@ -253,6 +277,62 @@ async fn a_new_channel_of_the_same_sender_replaces_the_old_one() {
         Some(9)
     );
     assert!(new.ended().is_none());
+}
+
+#[tokio::test]
+async fn a_session_never_overwrites_the_id_another_channel_holds() {
+    let f = fixture().await;
+    let t0 = Instant::now();
+    let bobs = f.session(&record(7, 0, 3600), [1; 32], t0);
+    let make = |record: &SessionRecord| {
+        Arc::new(RecvSession::new(
+            record,
+            ChannelKey::from_bytes([9; 32]),
+            n("/carol/tablet/KEY/1"),
+            Arc::clone(&f.judge),
+            Arc::clone(&f.fold),
+            (f.judge.generation(), f.fold.load(Ordering::SeqCst)),
+            t0,
+        ))
+    };
+    // Another sender, the same space and mode, the same id.
+    let carols = SessionRecord {
+        sender: n("/carol/tablet"),
+        ..record(7, 0, 3600)
+    };
+    let held = f.store.insert(make(&carols)).expect_err("the id is bob's");
+    assert_eq!(
+        (held.sender, held.space, held.mode),
+        (
+            n("/bob/phone"),
+            n("/alice/32=data/notes"),
+            ChannelMode::Latest
+        )
+    );
+    // The same sender and space in another mode, and another space, are other channels too.
+    for other in [
+        SessionRecord {
+            mode: ChannelMode::Reliable,
+            ..record(7, 0, 3600)
+        },
+        SessionRecord {
+            space: n("/alice/32=data/other"),
+            ..record(7, 0, 3600)
+        },
+    ] {
+        assert!(f.store.insert(make(&other)).is_err());
+    }
+    // Nothing changed: bob's session is the one held, not ended, and the generation did not move.
+    let generation = f.store.generation();
+    assert!(f.store.insert(make(&carols)).is_err());
+    assert_eq!(f.store.generation(), generation);
+    let kept = f.store.get(7).unwrap();
+    assert!(Arc::ptr_eq(&kept, &bobs) && kept.ended().is_none());
+    assert_eq!(f.store.all().len(), 1);
+    // The channel itself may be put again (the same space, sender and mode).
+    f.store
+        .insert(make(&record(7, 1, 3600)))
+        .expect("the holder of an id may take it again");
 }
 
 #[tokio::test]

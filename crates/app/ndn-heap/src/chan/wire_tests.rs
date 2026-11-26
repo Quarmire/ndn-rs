@@ -300,3 +300,37 @@ fn a_record_missing_a_field_or_naming_an_unknown_code_is_refused() {
         Err(WireError::Duplicate(_))
     ));
 }
+
+/// A session's lifetime is what a receiver counts on its clock: a hostile writer's `2^63` must not
+/// reach the arithmetic of the session store. The sender gives its asker's lifetime clamped to
+/// a minute and a day, so the receiver refuses what the sender would never write.
+#[test]
+fn a_session_with_a_lifetime_over_a_day_is_refused() {
+    let with = |lifetime: u64| {
+        SessionRecord {
+            lifetime,
+            ..session()
+        }
+        .encode()
+        .unwrap()
+    };
+    for ok in [LIFETIME_MIN, 3600, LIFETIME_MAX] {
+        assert_eq!(SessionRecord::decode(with(ok)).unwrap().lifetime, ok);
+    }
+    for refused in [
+        LIFETIME_MAX + 1,
+        1 << 40,
+        1 << 63,
+        u64::MAX,
+        LIFETIME_MIN - 1,
+        0,
+    ] {
+        assert!(
+            matches!(
+                SessionRecord::decode(with(refused)),
+                Err(WireError::Malformed(_))
+            ),
+            "a lifetime of {refused} s is refused"
+        );
+    }
+}

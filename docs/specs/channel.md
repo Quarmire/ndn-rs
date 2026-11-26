@@ -94,7 +94,7 @@ A channel's life is bounded by five things, each a signed record or a local fact
 
 **Re-keying is pulled.** The sender re-keys at every renewal, at once when a receiver is removed or the trust generation moved, when the sealed space's epoch changed, when a receiver's lease ran out, and before the sequence passes 2^63. It seals under the new key from the next frame and answers asks with it. A receiver that sees a frame under a key epoch it does not hold asks again, **at most once a second per sender**; the sender answers every asker it still judges in and Nacks the removed. **Nothing is pushed to a receiver**: nothing a removed member could be sent, nothing to forge.
 
-**The key before.** A receiver accepts the key before the current one for `REKEY_GRACE` (5 s) after it first saw the new key epoch (in a frame, or in the answer, whichever came first), so frames in flight are not lost. A removed member's forgeries under the old key are bounded to that grace and then to the checkpoint window of stage 5.
+**The key before.** A receiver accepts the key before the current one for `REKEY_GRACE` (5 s) after the answer that gave it the new key epoch, so frames in flight are not lost. (A frame under a key the receiver does not hold is not authenticated, so it starts no grace: it would be a time anyone who can reach the device could choose.) A removed member's forgeries under the old key are bounded to that grace and then to the checkpoint window of stage 5.
 
 **After a removal** the removed member holds the old key and can read what was sealed under it; it cannot open anything sealed after the re-key.
 
@@ -171,7 +171,7 @@ The setup's TLV-TYPEs are the block **0x0660–0x06BF**, registered to this file
 | 0x0689 | `S_BIND` | `B_ID`, `B_NAME` |
 | 0x068B | `S_CKPT_MS` | checkpoint period in ms |
 | 0x068D | `S_WINDOW` | `Window` mode: `W_MESSAGES`, `W_BYTES`, `W_MS` |
-| 0x068F | `S_LIFETIME` | seconds, from receipt, on the receiver's monotonic clock |
+| 0x068F | `S_LIFETIME` | seconds, from receipt, on the receiver's monotonic clock; 60 to 86,400 (a session that names another is refused) |
 | 0x0691 | `S_AUDIENCE_EPOCH` | an EpochId (sealed spaces) |
 | 0x0693 | `S_FRAME_MAX` | the largest frame the sender will send on a datagram carrier |
 | 0x0695 | `S_SEQ` | the next sequence the sender will use |
@@ -465,7 +465,7 @@ Each channel has a window of the last **4,096 frame sequences** and a bitmap bes
 ### 12.3 The generation check and the key epoch
 
 - **Generation.** A session holds the pair `(trust generation, the space's fold version)` it was judged under, and every frame compares it with the node's by two atomic loads (`is_current`). When either moved, the receiver judges the sender again **before** the frame is looked at further, offline and synchronously: the sender must still be a writer by the entries held and this device a member (§3.6). If it fails, the session ends with `NotMember` and is dropped, the `Items` are told (§12.7), and **the frame is refused**. So the first frame after the node holds the record that removes the sender is refused; frames the sender sent before the record arrived were delivered. The node's maintenance pass makes the same judgement when it runs; whichever notices first ends the session, and later frames find no session (`unknown_channel`).
-- **Key epoch.** The header carries the low octet of the key epoch. The session holds the key of the epoch last given and, for 5 s after the receiver first saw the next epoch, the key before it (§3.6). A frame under an octet the session does not hold is **not tried**: it costs a lookup. The sender is asked again for the session (§3.6), **at most once a second per sender**; frames that arrive meanwhile are dropped (`unknown_epoch`, of which `epoch_limited` did not ask). Nothing is guessed.
+- **Key epoch.** The header carries the low octet of the key epoch. The session holds the key of the epoch last given and, for 5 s after the answer that gave it, the key before it (§3.6). A frame under an octet the session does not hold is **not tried**: it costs a lookup, and as it is not authenticated it changes nothing of the session. The sender is asked again for the session (§3.6), **at most once a second per sender**; frames that arrive meanwhile are dropped (`unknown_epoch`, of which `epoch_limited` did not ask). Nothing is guessed.
 - **Frame limits** and the AEAD are those the session's last answer set.
 
 ### 12.4 The name table at the receiver

@@ -413,7 +413,7 @@ impl ChannelRx {
             return Delivery::Ended(why);
         }
         let Some(key) = self.session.frame_key(header.key_epoch, now) else {
-            return self.unknown_epoch(node, &header, now);
+            return self.unknown_epoch(node, now);
         };
         let mut post = Post::default();
         let delivery = {
@@ -436,14 +436,10 @@ impl ChannelRx {
 
     /// A frame under a key epoch the session does not hold: no AEAD attempt. The sender is asked
     /// again, at most once a second per sender.
-    fn unknown_epoch(&self, node: &NodeInner, header: &Header, now: Instant) -> Delivery {
+    fn unknown_epoch(&self, node: &NodeInner, now: Instant) -> Delivery {
         let stats = &node.chan.stats.rx;
         stats.unknown_epoch.bump();
-        match node
-            .chan
-            .sessions
-            .unknown_epoch(self.channel, header.key_epoch, now)
-        {
+        match node.chan.sessions.unknown_epoch(self.channel, now) {
             Unknown::Ask {
                 space,
                 sender,

@@ -346,7 +346,17 @@ impl NodeInner {
                     // held; from here they are taken in first, in the order they arrived, and a frame
                     // that arrives meanwhile queues behind them.
                     let replay = self.chan.rx.begin_replay(record.id);
-                    self.chan.sessions.insert(Arc::clone(&session));
+                    if let Err(held) = self.chan.sessions.insert(Arc::clone(&session)) {
+                        return Err(bad_answer(
+                            sender,
+                            format!(
+                                "its session names the channel id {:016x}, which this device \
+                                 holds for {}'s {:?} channel over {}: an id belongs to one \
+                                 channel, so nothing was installed",
+                                record.id, held.sender, held.mode, held.space
+                            ),
+                        ));
+                    }
                     (session, Some(replay))
                 }
             };

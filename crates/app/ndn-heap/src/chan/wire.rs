@@ -100,8 +100,11 @@ pub(crate) const W_MS: u64 = 0x06AB;
 pub(crate) const ASK_MAX: usize = 8 * 1024;
 /// The most octets of a session's Content.
 pub(crate) const SESSION_MAX: usize = 8000;
-/// The most seconds a session may be asked to last.
+/// The most seconds a session may be asked to last, and the most one names.
 pub(crate) const LIFETIME_MAX: u64 = 86_400;
+/// The fewest seconds a session lasts when its asker names one: a shorter ask is raised to it, so
+/// no asker makes the others' keys renew more often than every half minute.
+pub(crate) const LIFETIME_MIN: u64 = 60;
 /// The most binds a session carries.
 pub(crate) const TABLE_BINDS_MAX: usize = 64;
 /// The most octets of the binds a session carries.
@@ -242,6 +245,21 @@ fn need<T>(slot: Option<T>, what: &'static str) -> Result<T, WireError> {
 
 fn nni_u32(v: &[u8], what: &'static str) -> Result<u32, WireError> {
     u32::try_from(read_nni(v)?).map_err(|_| WireError::Malformed(what))
+}
+
+/// A session's lifetime in seconds: what the sender gives is the ask's, clamped to
+/// [`LIFETIME_MIN`] to [`LIFETIME_MAX`], so a receiver refuses any other as the word of a faulty
+/// or hostile sender (the receiver counts it on its clock: an unbounded one is arithmetic that
+/// overflows).
+fn read_lifetime(v: &[u8]) -> Result<u64, WireError> {
+    let seconds = read_nni(v)?;
+    if !(LIFETIME_MIN..=LIFETIME_MAX).contains(&seconds) {
+        return Err(WireError::Malformed(
+            "a session's lifetime is 60 to 86,400 seconds: a sender gives its asker's lifetime \
+             clamped to that, so any other is a faulty or hostile sender's",
+        ));
+    }
+    Ok(seconds)
 }
 
 /// Take certificate `cert` into `chain` under the limits of a grant ask's chain.
@@ -577,7 +595,7 @@ impl SessionRecord {
             },
             S_CKPT_MS => once(&mut ckpt_ms, read_nni(&v)?, "a session's checkpoint period")?,
             S_WINDOW => once(&mut window, read_window(v)?, "a session's window")?,
-            S_LIFETIME => once(&mut lifetime, read_nni(&v)?, "a session's lifetime")?,
+            S_LIFETIME => once(&mut lifetime, read_lifetime(&v)?, "a session's lifetime")?,
             S_AUDIENCE_EPOCH => once(&mut audience, read_epoch_id(v)?, "a session's audience epoch")?,
             S_FRAME_MAX => once(&mut frame_max, read_nni(&v)?, "a session's frame limit")?,
             S_SEQ => once(&mut seq, read_nni(&v)?, "a session's sequence")?,
