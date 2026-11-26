@@ -8,7 +8,11 @@
 //! a person, or the context that revokes a key, is held. [`gate`] asks the same of this device
 //! itself.
 
+use std::sync::Arc;
+
 use ndn_foundation_types::Name;
+use ndn_security::cert_name::key_name_of;
+use ndn_security::{SignedTrustContext, Validator};
 
 use crate::error::HeapError;
 use crate::log::Log;
@@ -67,13 +71,47 @@ pub(crate) fn standing(log: &Log, judge: &Judge, key: &Name, who: Who) -> Result
     if !owner_capable(&context, key) {
         return Err(Unstanding::NotMember);
     }
-    if context.is_revoked(key) {
+    if context.is_revoked(key) || issuer_revoked(&view, &context, key) {
         return Err(Unstanding::Revoked);
     }
     if log.suspected(key) {
         return Err(Unstanding::Suspected);
     }
     Ok(person.clone())
+}
+
+/// The most issuers above a key [`issuer_revoked`] follows: a chain of certificates is a few
+/// hops (a device, its person's issuer, an anchor).
+const CHAIN_HOPS: usize = 8;
+
+/// Whether `context` revokes an issuer of the certificate `view` holds for `key`, or of that
+/// issuer's own, as far as `view` holds them: revoking the key that certified a key revokes
+/// what it certified, as a chain walk of one of the key's packets would find. Offline: it reads
+/// the certificates held (the newest valid one of a key, a vouched one before an unverified
+/// one) and fetches nothing, and a chain it cannot follow is not read as revoked: the key's own
+/// revocation is [`context`'s](ndn_security::SignedTrustContext::is_revoked) to say.
+fn issuer_revoked(view: &Validator, context: &SignedTrustContext, key: &Name) -> bool {
+    let cache = view.cert_cache();
+    let mut want = key.clone();
+    for _ in 0..CHAIN_HOPS {
+        let Some(cert) = cache
+            .get_valid(&want)
+            .or_else(|| cache.get(&Arc::new(want.clone())))
+        else {
+            return false;
+        };
+        let Some(issuer) = cert.issuer else {
+            return false;
+        };
+        if context.is_revoked(&issuer) {
+            return true;
+        }
+        if key_name_of(&issuer) == key_name_of(&want) {
+            return false;
+        }
+        want = (*issuer).clone();
+    }
+    false
 }
 
 /// This device may take part: the creation of the space is held and this device's key stands as

@@ -359,6 +359,47 @@ async fn a_suspected_key_does_not_stand_until_unsuspected() {
     );
 }
 
+/// A context that revokes the key that certified a device's key revokes that device's key too, as
+/// a chain walk of a packet it signed would find; another person's keys are not touched. Nothing
+/// is fetched: the certificates are the ones held.
+#[tokio::test]
+async fn a_key_certified_by_a_revoked_issuer_does_not_stand() {
+    let world = World::new(false).await;
+    let alice = world.seat("/alice/laptop").await;
+    let bob = world.seat("/bob/phone").await;
+    let carol = world.seat("/carol/phone").await;
+    let one = alice
+        .members(
+            Some(true),
+            vec![add(1, "/bob", Role::Writer), add(2, "/carol", Role::Writer)],
+        )
+        .await;
+    alice.relay(one, &bob);
+    let (phone, carols) = (bob.dev.key.clone(), carol.dev.key.clone());
+    let tablet = world.dev("/bob/tablet").await.key;
+    for key in [&phone, &tablet, &carols] {
+        assert!(alice.stands(key, Who::Writer).is_ok(), "{key} before");
+    }
+
+    let bobs_issuer = world.people[1].issuer.clone();
+    world
+        .validator
+        .keyring()
+        .adopt_update(world.people[1].context(2, Some(&bobs_issuer)))
+        .unwrap();
+    for key in [&phone, &tablet] {
+        assert_eq!(
+            alice.stands(key, Who::Writer),
+            Err(Unstanding::Revoked),
+            "{key}: the key that certified it is revoked"
+        );
+    }
+    assert!(
+        alice.stands(&carols, Who::Writer).is_ok(),
+        "another person's key is not touched"
+    );
+}
+
 /// A reader the record lists stands as **listed** and never as a writer; a person a public
 /// space does not list at all stands in neither role (everybody may read a public space's kept
 /// data, but a channel's key is wrapped only to a listed person's key), and the owner always

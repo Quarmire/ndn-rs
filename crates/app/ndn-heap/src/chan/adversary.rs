@@ -125,6 +125,8 @@ impl NodeHandle {
             ("accepted", rx.accepted.get()),
             ("replayed", rx.replayed.get()),
             ("too_old", rx.too_old.get()),
+            ("sequence", rx.sequence.get()),
+            ("too_far", rx.too_far.get()),
             ("unauthentic", rx.unauthentic.get()),
             ("unknown_epoch", rx.unknown_epoch.get()),
             ("unknown_channel", rx.unknown_channel.get()),
