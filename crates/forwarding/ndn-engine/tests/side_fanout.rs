@@ -11,7 +11,7 @@ use ndn_engine::side::{SideConfig, SideId, SideLimits};
 use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::lp::{LpHeaders, LpPacket, SideRoute, encode_lp_with_headers, is_lp_packet};
-use ndn_packet::{Data, Name};
+use ndn_packet::{CachePolicyType, Data, Name};
 use ndn_transport::side_header::UpOp;
 use ndn_transport::{FaceId, FaceKind};
 use tokio_util::sync::CancellationToken;
@@ -179,6 +179,77 @@ async fn a_data_with_a_side_route_installs_a_route_at_each_hop_of_its_reverse_pa
     let keeps = hs.wait_side(1).await;
     assert_eq!(&keeps[0].frame[..], &up(ID, UpOp::Keep)[..]);
     assert_eq!(keeps[0].ingress, Some(FaceId(2)));
+}
+
+/// The session Data as its sender answers when it wants nothing of a setup cached:
+/// `CachePolicy = NoCache` beside the header.
+fn uncached_data(id: u64, ttl_secs: u16) -> Bytes {
+    encode_lp_with_headers(
+        &data(),
+        &LpHeaders {
+            side_route: Some(SideRoute { id, ttl_secs }),
+            cache_policy: Some(CachePolicyType::NoCache),
+            ..LpHeaders::default()
+        },
+    )
+}
+
+/// The names `engine`'s content store holds.
+async fn cached_names(engine: &ForwarderEngine) -> Vec<Name> {
+    engine
+        .cs()
+        .list_erased(&Name::root(), None, 64, 0)
+        .await
+        .entries
+        .iter()
+        .map(|e| (*e.name).clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_nocache_data_is_cached_at_no_hop_of_its_path() {
+    // Sender app S -- E1 -- E2 -- E3 -- receiver app R: the header that says "do not cache" is
+    // hop by hop, so each forwarder passes it on, or the next one caches what the sender asked
+    // to be kept nowhere.
+    let (s, hs) = face(1, FaceKind::App);
+    let ((l12, _h12), (l21, _h21)) = pair(2, 11, FaceKind::App);
+    let ((l23, _h23), (l32, _h32)) = pair(12, 21, FaceKind::App);
+    let (r, hr) = face(22, FaceKind::App);
+    let (e1, _s1) = engine(vec![s, l12], 1).await;
+    let (e2, _s2) = engine(vec![l21, l23], 11).await;
+    let (e3, _s3) = engine(vec![l32, r], 21).await;
+
+    let got = session(&hr, &hs, uncached_data(ID, 30)).await;
+
+    let lp = LpPacket::decode(got).unwrap();
+    assert_eq!(
+        lp.cache_policy,
+        Some(CachePolicyType::NoCache),
+        "the receiver's face was given the Data without the NoCache the sender set"
+    );
+    for (hop, e) in [("E1", &e1), ("E2", &e2), ("E3", &e3)] {
+        assert_eq!(
+            cached_names(e).await,
+            Vec::<Name>::new(),
+            "{hop} cached a Data its sender marked NoCache"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_data_that_is_not_nocache_is_cached_by_the_forwarders_past_the_first_hop() {
+    // The control of the test above: without the header the same Data is kept, so an empty
+    // store there says the header did it.
+    let (s, hs) = face(1, FaceKind::App);
+    let ((l12, _h12), (l21, _h21)) = pair(2, 11, FaceKind::App);
+    let (r, hr) = face(22, FaceKind::App);
+    let (e1, _s1) = engine(vec![s, l12], 1).await;
+    let (e2, _s2) = engine(vec![l21, r], 11).await;
+
+    session(&hr, &hs, labelled_data(ID, 30)).await;
+
+    assert_eq!(cached_names(&e1).await, vec![name()], "E1 kept no copy");
+    assert_eq!(cached_names(&e2).await, vec![name()], "E2 kept no copy");
 }
 
 #[tokio::test]

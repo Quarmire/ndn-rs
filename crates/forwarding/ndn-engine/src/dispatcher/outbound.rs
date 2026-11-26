@@ -9,7 +9,7 @@ use crate::engine::EgressIntent;
 use crate::observability::targets as t;
 use crate::pipeline::{Action, NackReason, PacketContext};
 use crate::side::{SideId, SideRefusal};
-use crate::stages::decode::SideRouteTag;
+use crate::stages::decode::{LpCachePolicy, SideRouteTag};
 use crate::stages::pit::DataFromUnaskedFace;
 use ndn_packet::Name;
 use ndn_packet::SideRoute;
@@ -375,6 +375,18 @@ impl PacketDispatcher {
         } else {
             ctx.tags.get::<SideRouteTag>().map(|t| t.0)
         };
+        // A sender that marks its Data `NoCache` means no forwarder keeps it: the header is hop by
+        // hop, so each forwarder says it again to the next, or the second hop would cache what
+        // the first was told not to (a session Data, whose setup nothing may keep). Never for a
+        // cache hit, which carries no header of the packet's own.
+        let cache_policy = if ctx.cs_hit {
+            None
+        } else {
+            ctx.tags
+                .get::<LpCachePolicy>()
+                .map(|p| p.0)
+                .filter(|p| matches!(p, ndn_packet::CachePolicyType::NoCache))
+        };
         // The PIT stage marks a Data that no out-record of the arrival face accounts for.
         let asked = ctx.tags.get::<DataFromUnaskedFace>().is_none();
         for (i, face_id) in ctx.out_faces.iter().enumerate() {
@@ -445,6 +457,7 @@ impl PacketDispatcher {
                     pit_token: ctx.out_pit_tokens.get(i).and_then(|t| t.clone()),
                     incoming_face_id,
                     side_route,
+                    cache_policy,
                     ..Default::default()
                 },
                 nack: None,

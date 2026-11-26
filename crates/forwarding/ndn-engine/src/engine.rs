@@ -117,9 +117,9 @@ pub type EgressItem = (bytes::Bytes, FaceId, EgressIntent);
 /// dispatcher used to encode inline:
 /// - a Nack wraps the Interest (`encode_lp_nack_with_pit_token` / `encode_nack`);
 /// - an LP-framed face wraps the payload, attaching any headers;
-/// - an IPC (bare-TLV) face stays bare unless a PitToken or a `SideRoute`
-///   forces an LP frame (a session Data's side header must reach the next
-///   forwarder or the receiving heap, wherever the face is);
+/// - an IPC (bare-TLV) face stays bare unless a PitToken, a `SideRoute` or a `NoCache` forces an
+///   LP frame (a session Data's side header and its `NoCache` must reach the next forwarder or
+///   the receiving heap, wherever the face is);
 /// - already-LP input (a retransmission) passes through untouched.
 pub fn frame_with_intent(payload: &[u8], intent: &EgressIntent, uses_lp: bool) -> bytes::Bytes {
     use ndn_packet::lp::{
@@ -139,7 +139,10 @@ pub fn frame_with_intent(payload: &[u8], intent: &EgressIntent, uses_lp: bool) -
     if uses_lp {
         // All-`None` headers make this identical to `encode_lp_packet`.
         encode_lp_with_headers(payload, &intent.headers)
-    } else if intent.headers.pit_token.is_some() || intent.headers.side_route.is_some() {
+    } else if intent.headers.pit_token.is_some()
+        || intent.headers.side_route.is_some()
+        || intent.headers.cache_policy.is_some()
+    {
         encode_lp_with_headers(payload, &intent.headers)
     } else {
         bytes::Bytes::copy_from_slice(payload)
