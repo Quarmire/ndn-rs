@@ -21,7 +21,7 @@ use super::channels::{Live, SendKey};
 use super::control::Control;
 use super::frame;
 use super::key::ChannelKey;
-use super::limits::{MESSAGE_MAX, STREAM_FRAME_MAX};
+use super::limits::{MESSAGE_DEFAULT, MESSAGE_MAX, STREAM_FRAME_MAX};
 use super::message::{Message, Origin};
 use super::table::name_octets;
 use super::tx::{BURST_GAP, KeySource, Refused, SEQ_END, TxChannel, TxStats};
@@ -511,7 +511,7 @@ async fn reliable_with_drop_leaves_a_gap_and_says_congested_when_nothing_can_be_
         },
     );
     rig.tx
-        .emit(&path, &Bytes::from(vec![1u8; 1 << 20]), &opts, rig.t0)
+        .emit(&path, &Bytes::from(vec![1u8; MESSAGE_DEFAULT]), &opts, rig.t0)
         .await
         .unwrap();
     for _ in 0..10 {
@@ -519,7 +519,7 @@ async fn reliable_with_drop_leaves_a_gap_and_says_congested_when_nothing_can_be_
     }
     let refused = error_of(
         rig.tx
-            .emit(&path, &Bytes::from_static(b"x"), &opts, rig.t0)
+            .emit(&path, &Bytes::from(vec![0u8; 2_048]), &opts, rig.t0)
             .await,
     );
     assert!(
@@ -1479,14 +1479,14 @@ async fn a_message_over_the_limit_or_a_name_over_255_octets_is_refused_before_an
     assert_eq!(rig.tx.names(), 0);
 }
 
-/// A stream that takes less than the channel's default frame (a face granting 1 MiB where the
-/// channel's default is 1 MiB + 1 KiB): the writer packs to what the carrier says it takes. A
-/// flood of 8 KiB messages over 256 names makes frames of as many as fit; a frame over the limit
-/// was refused whole, and every later emission rebuilt one, so nothing ever left.
+/// A stream that takes less than the channel's default frame: the writer packs to what the
+/// carrier says it takes. A flood of 8 KiB messages over 256 names makes frames of as many as
+/// fit; a frame over the limit was refused whole, and every later emission rebuilt one, so
+/// nothing ever left.
 #[tokio::test]
 async fn a_stream_frame_is_never_built_over_what_the_carrier_takes() {
     const NAMES: usize = 256;
-    const TAKES: usize = 1 << 20;
+    const TAKES: usize = 1 << 19;
     let mut rig = rig(
         ChannelMode::Latest,
         LinkConfig {
@@ -1516,7 +1516,7 @@ async fn a_stream_frame_is_never_built_over_what_the_carrier_takes() {
         }
     }
     assert!(
-        delivered >= 40 * 120,
+        delivered >= 40 * 60,
         "the stream wrote {delivered} messages in 40 passes (lost {})",
         rig.stats.lost_closed.get()
     );
@@ -1561,6 +1561,44 @@ async fn a_message_that_fits_no_frame_the_stream_takes_is_refused_before_anythin
         "{refused:?}"
     );
     assert_eq!(rig.tx.next_seq(), 1, "no sequence was taken");
+}
+
+/// The channel's default message limit is what the face's stream grant carries: a message of
+/// exactly the default maximum is taken at `emit` and its frame is within what the stream takes
+/// (the face grants 1,048,576 octets a frame; the channel's default once allowed a payload of
+/// 1 MiB, whose frame was refused by the face, an `emit` error for a size the channel itself
+/// advertised).
+#[tokio::test]
+async fn a_message_of_the_default_limit_fits_a_frame_the_face_grants() {
+    const FACE_GRANT: usize = 1_048_576;
+    let mut rig = rig(
+        ChannelMode::Latest,
+        LinkConfig {
+            datagram_max: 1_414,
+            stream_window: 4 << 20,
+            stream_frame_max: FACE_GRANT,
+            ..LinkConfig::default()
+        },
+    );
+    let payload = Bytes::from(vec![0x5Au8; MESSAGE_DEFAULT]);
+    rig.tx
+        .emit(&name(1), &payload, &EmitOptions::latest(), rig.t0)
+        .await
+        .expect("a message at the default limit is taken");
+    tokio::task::yield_now().await;
+    let frames = rig.link.take_stream();
+    assert!(!frames.is_empty(), "the frame left on the stream");
+    for frame in frames {
+        assert!(
+            frame.len() <= FACE_GRANT,
+            "a frame of {} octets",
+            frame.len()
+        );
+        if let Seen::Data { messages, .. } = rig.dec.read(frame) {
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].payload.len(), MESSAGE_DEFAULT);
+        }
+    }
 }
 
 /// An isolated message leaves inline and asks the carrier for nothing (a call back is a wake of

@@ -56,6 +56,13 @@ pub const UP: u8 = 0x24;
 /// padded by the NIC, so no frame is allowed to be shorter.
 pub const MIN_FRAME_LEN: usize = 46;
 
+/// The longest frame a face grants its peer on a side stream by default: 1 MiB.
+/// A carrier that grants this much names it in its `stream_frame_max`, and a
+/// protocol that rides the stream (the channel, docs/specs/channel.md) derives
+/// its default stream frame limit and message limit from it, so a message at
+/// the protocol's limit is never refused by the face.
+pub const STREAM_FRAME_GRANT: usize = 1024 * 1024;
+
 /// Octets of an `UP` record that mean something (the rest, to
 /// [`MIN_FRAME_LEN`], is zero).
 pub const UP_LEN: usize = HEADER_LEN + 1;

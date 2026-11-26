@@ -5,6 +5,7 @@
 //! never build.
 
 pub(crate) use ndn_transport::side_header::MIN_FRAME_LEN;
+use ndn_transport::side_header::STREAM_FRAME_GRANT;
 
 /// Octets of a sealed frame's header: marker, version/class/kind, channel id
 /// (8), key epoch (1), `seq0` (8), `count` (1).
@@ -32,8 +33,12 @@ pub(crate) const SEQUENCE_LIMIT: u64 = 1 << 63;
 /// The largest message payload a session may allow: 16 MiB.
 pub(crate) const MESSAGE_MAX: usize = 16 << 20;
 
-/// The largest message payload when a session says nothing: 1 MiB.
-pub(crate) const MESSAGE_DEFAULT: usize = 1 << 20;
+/// The largest message payload when a session says nothing: what fits one
+/// stream frame of [`STREAM_FRAME_DEFAULT`] (the grant of the faces,
+/// [`STREAM_FRAME_GRANT`]) once the frame's and the message's headers are
+/// taken off ([`MESSAGE_FRAME_SLACK`]): 1 MiB − 1 KiB. Derived, not a second
+/// number, so a message at the limit is never refused by a face.
+pub(crate) const MESSAGE_DEFAULT: usize = message_limit_for(STREAM_FRAME_DEFAULT);
 
 /// The octets the longest message header takes: flags (1), original sequence
 /// (8), name id (2: ids are at most 4,096), name length (2), name (255), stand
@@ -51,9 +56,9 @@ const _: () = assert!(MESSAGE_FRAME_SLACK >= FRAME_OVERHEAD + MESSAGE_OVERHEAD_M
 /// [`MESSAGE_FRAME_SLACK`]. A frame is measured whole (header, body, tag).
 pub(crate) const STREAM_FRAME_MAX: usize = MESSAGE_MAX + MESSAGE_FRAME_SLACK;
 
-/// The stream frame limit when a session says nothing: 1 MiB of payload plus
-/// [`MESSAGE_FRAME_SLACK`].
-pub(crate) const STREAM_FRAME_DEFAULT: usize = MESSAGE_DEFAULT + MESSAGE_FRAME_SLACK;
+/// The stream frame limit when a session says nothing: the stream frame a
+/// face grants by default, 1 MiB ([`STREAM_FRAME_GRANT`]).
+pub(crate) const STREAM_FRAME_DEFAULT: usize = STREAM_FRAME_GRANT;
 
 /// The message payload limit that fits a frame limit: a message must fit one
 /// stream frame, so the payload is at most the frame's room less the longest
