@@ -16,6 +16,19 @@ use ndn_transport::{FaceId, FaceScope, FaceTrust};
 
 use super::{InboundPacket, PacketDispatcher};
 
+/// How final a Nack reason is, least first: what is told when every upstream of an Interest has
+/// Nacked is the one that says "ask again" before the ones that say "nothing here" (NFD orders
+/// `Congestion` < `Duplicate` < `NoRoute`; `NotYet` is "ask again with more" and goes between).
+fn nack_severity(reason: &ndn_packet::NackReason) -> u8 {
+    match reason {
+        ndn_packet::NackReason::Congestion => 0,
+        ndn_packet::NackReason::NotYet => 1,
+        ndn_packet::NackReason::Duplicate => 2,
+        ndn_packet::NackReason::NoRoute => 3,
+        ndn_packet::NackReason::Refused(_) | ndn_packet::NackReason::Other(_) => 4,
+    }
+}
+
 impl PacketDispatcher {
     pub(super) const BATCH_SIZE: usize = 64;
 
@@ -403,6 +416,25 @@ impl PacketDispatcher {
             Some(Ok(nonce)) => nonce,
         };
 
+        // Only a program face (a forwarder on this host reached over its Unix socket, an
+        // in-process peer) may say it refused the Data; from anyone else, a loopback TCP face
+        // included, a refusal is an unverified claim, passed on as NoRoute.
+        let upstream_reason = match nack.reason {
+            Some(r) if r.refusal().is_none() || self.is_program_face(ctx.face_id) => r,
+            _ => ndn_packet::NackReason::NoRoute,
+        };
+        // The upstream has answered: its out-record says so, for the strategy that waits on
+        // the others and for the fallback below.
+        self.strategy.pit.with_entry_mut(&token, |e| {
+            if let Some(r) = e
+                .out_records
+                .iter_mut()
+                .find(|r| r.face_id == ctx.face_id.0)
+            {
+                r.nacked = Some(upstream_reason);
+            }
+        });
+
         let fib_entry_arc = self.strategy.fib.lpm(&name);
         let fib_entry_ref = fib_entry_arc.as_deref();
         let strategy_fib: Option<ndn_strategy::FibEntry> =
@@ -433,13 +465,19 @@ impl PacketDispatcher {
             &built_extensions
         };
 
-        // Upstreams already tried for this PIT entry — excluded from Nack
-        // failover so two mutually-nacking nexthops don't ping-pong (D.09).
+        // Faces this PIT entry must not fail over to: the upstreams already tried, so two
+        // mutually-nacking nexthops don't ping-pong (D.09), and the downstreams the Interest
+        // came in over (split horizon: a route back through one is no upstream, and the
+        // Interest sent there would be dropped as a loop by the router that sent it).
         let tried_faces: smallvec::SmallVec<[FaceId; 4]> = self
             .strategy
             .pit
             .with_entry(&token, |e| {
-                e.out_records.iter().map(|r| FaceId(r.face_id)).collect()
+                e.out_records
+                    .iter()
+                    .map(|r| FaceId(r.face_id))
+                    .chain(e.in_records.iter().map(|r| FaceId(r.face_id)))
+                    .collect()
             })
             .unwrap_or_default();
 
@@ -562,57 +600,68 @@ impl PacketDispatcher {
                 }
             }
             ForwardingAction::Nack(_reason) => {
-                if let Some((_, entry)) = self.strategy.pit.remove(&token) {
-                    // Only a program face (a forwarder on this host reached
-                    // over its Unix socket, an in-process peer) may say it
-                    // refused the Data; from anyone else, a loopback TCP
-                    // face included, a refusal is an unverified claim,
-                    // passed on as NoRoute.
-                    let from_program = self.is_program_face(ctx.face_id);
-                    let upstream_reason = match nack.reason {
-                        Some(r) if r.refusal().is_none() || from_program => r,
-                        _ => ndn_packet::NackReason::NoRoute,
-                    };
-                    let mut told: smallvec::SmallVec<[u64; 4]> = smallvec::SmallVec::new();
-                    for r in &entry.in_records {
-                        let face_id = FaceId(r.face_id);
-                        if told.contains(&r.face_id) {
-                            continue;
-                        }
-                        told.push(r.face_id);
-                        if !self.nacks_allowed_on_face(face_id) {
-                            debug!(target: t::FWD_STRATEGY, face=%face_id, "nack propagation suppressed on multi-access/ad-hoc in-record face");
-                            continue;
-                        }
-                        // A refusal is told to local downstreams only (see
-                        // `refuse`); a non-local one learns that this path
-                        // has nothing usable, as from any other upstream.
-                        let reason = if upstream_reason.refusal().is_some()
-                            && !self.is_local_face(face_id)
-                        {
-                            ndn_packet::NackReason::NoRoute
-                        } else {
-                            upstream_reason
-                        };
-                        // Each downstream gets its own Interest (its nonce,
-                        // selectors and parameters) and its PitToken back,
-                        // as a refusal this node makes does.
-                        let interest = ndn_packet::Nack::interest_wire(
-                            &entry.name,
-                            &r.selector,
-                            r.nonce,
-                            r.parameters.as_ref(),
-                        );
-                        self.nack_downstream(face_id, interest, r.lp_pit_token.clone(), reason)
-                            .await;
+                self.nack_downstreams(&token, upstream_reason).await;
+            }
+            // The strategy has nothing more to send (multicast sent to every upstream
+            // already). While an upstream that has not Nacked may still answer the entry waits
+            // for it; once every upstream has Nacked nobody can, and the downstreams are told
+            // the least severe reason among them (NFD `ProcessNackTraditional`) instead of
+            // timing out.
+            ForwardingAction::Suppress => {
+                let all_nacked = self.strategy.pit.with_entry(&token, |e| {
+                    e.out_records
+                        .iter()
+                        .map(|r| r.nacked)
+                        .collect::<Option<smallvec::SmallVec<[ndn_packet::NackReason; 4]>>>()
+                        .and_then(|all| all.into_iter().min_by_key(nack_severity))
+                });
+                match all_nacked.flatten() {
+                    Some(reason) => self.nack_downstreams(&token, reason).await,
+                    None => {
+                        debug!(target: t::FWD_STRATEGY, "nack suppressed by strategy: an upstream may still answer")
                     }
                 }
             }
-            ForwardingAction::Suppress
-            | ForwardingAction::ForwardAfter { .. }
-            | ForwardingAction::Broadcast => {
+            ForwardingAction::ForwardAfter { .. } | ForwardingAction::Broadcast => {
                 debug!(target: t::FWD_STRATEGY, "nack suppressed by strategy");
             }
+        }
+    }
+
+    /// Take the PIT entry `token` and tell every downstream that waited on it the Nack
+    /// `upstream_reason`, each with its own Interest and PitToken back.
+    async fn nack_downstreams(&self, token: &PitToken, upstream_reason: ndn_packet::NackReason) {
+        let Some((_, entry)) = self.strategy.pit.remove(token) else {
+            return;
+        };
+        let mut told: smallvec::SmallVec<[u64; 4]> = smallvec::SmallVec::new();
+        for r in &entry.in_records {
+            let face_id = FaceId(r.face_id);
+            if told.contains(&r.face_id) {
+                continue;
+            }
+            told.push(r.face_id);
+            if !self.nacks_allowed_on_face(face_id) {
+                debug!(target: t::FWD_STRATEGY, face=%face_id, "nack propagation suppressed on multi-access/ad-hoc in-record face");
+                continue;
+            }
+            // A refusal is told to local downstreams only (see `refuse`); a non-local one
+            // learns that this path has nothing usable, as from any other upstream.
+            let reason = if upstream_reason.refusal().is_some() && !self.is_local_face(face_id) {
+                ndn_packet::NackReason::NoRoute
+            } else {
+                upstream_reason
+            };
+            // Each downstream gets its own Interest (its nonce, selectors and parameters) and
+            // its PitToken back, as a refusal this node makes does.
+            let interest = ndn_packet::Nack::interest_wire(
+                &entry.name,
+                &r.selector,
+                r.nonce,
+                r.parameters.as_ref(),
+            );
+            self.nack_downstream(face_id, interest, r.lp_pit_token.clone(), reason)
+                .await;
         }
     }
 

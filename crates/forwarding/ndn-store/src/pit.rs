@@ -204,6 +204,9 @@ pub struct OutRecord {
     pub face_id: u64,
     pub last_nonce: u32,
     pub sent_at: u64,
+    /// The reason this upstream's Nack for the Interest gave (NFD `OutRecord::setIncomingNack`);
+    /// `None` while it has not Nacked. Sending the Interest to the upstream again clears it.
+    pub nacked: Option<ndn_packet::NackReason>,
 }
 
 pub struct PitEntry {
@@ -379,11 +382,13 @@ impl PitEntry {
             Some(existing) => {
                 existing.last_nonce = nonce;
                 existing.sent_at = sent_at;
+                existing.nacked = None;
             }
             None => self.out_records.push(OutRecord {
                 face_id,
                 last_nonce: nonce,
                 sent_at,
+                nacked: None,
             }),
         }
     }
@@ -1424,6 +1429,18 @@ mod retx_suppression_tests {
         assert_eq!(e.out_records.len(), 2, "one record per upstream, renewed");
         let r3 = e.out_records.iter().find(|r| r.face_id == 3).unwrap();
         assert_eq!((r3.last_nonce, r3.sent_at), (11, 500), "renewed, not stale");
+    }
+
+    /// An upstream that Nacked and is sent the Interest again has not Nacked this one: were its
+    /// old Nack kept, a Nack from another upstream would find "every upstream Nacked" true and
+    /// end the entry while the one asked again could still answer.
+    #[test]
+    fn sending_again_to_a_nacking_upstream_clears_its_nack() {
+        let mut e = entry();
+        e.add_out_record(3, 10, 100);
+        e.out_records[0].nacked = Some(ndn_packet::NackReason::Congestion);
+        e.add_out_record(3, 11, 500);
+        assert_eq!(e.out_records[0].nacked, None, "a new send is not a Nack");
     }
 
     /// The lifetime is the sender's: an entry made for an enormous one has a

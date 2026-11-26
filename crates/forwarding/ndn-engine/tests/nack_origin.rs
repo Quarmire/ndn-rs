@@ -226,6 +226,29 @@ async fn the_upstreams_own_nack_reaches_the_consumer() {
     rig.shutdown.shutdown().await;
 }
 
+/// A route back through the face the Interest came in over is no one to fail over to: the
+/// Nack of the only real upstream is the consumer's answer, with its reason, not the Interest
+/// sent back to the consumer (which a router upstream of the consumer then drops as a loop,
+/// leaving the consumer to time out).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nack_does_not_fail_over_to_the_face_the_interest_came_in_on() {
+    let rig = rig(false).await;
+    rig.engine.fib().add_nexthop(&n("/t"), FaceId(CONSUMER), 10);
+    rig.upstream
+        .send(encode_lp_nack(NackReason::Congestion, rig.forwarded.raw()))
+        .await
+        .expect("send Nack");
+    let got = recv_timeout(&rig.consumer, 1000)
+        .await
+        .expect("the consumer hears back");
+    assert_eq!(
+        nack_reason(&got),
+        Some(NackReason::Congestion),
+        "the consumer was sent its own Interest back, not the Nack"
+    );
+    rig.shutdown.shutdown().await;
+}
+
 /// On failover the forwarder sends its own PIT Interest — its name, nonce and
 /// selectors as the downstream asked — never the bytes the Nack enclosed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
