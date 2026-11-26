@@ -24,6 +24,7 @@ use super::aead::FrameCipher;
 use super::frame::{FrameBuf, FrameError};
 use super::limits::{MESSAGE_MAX, MESSAGES_PER_FRAME, NAME_MAX, NAMES_PER_CHANNEL};
 use super::varint;
+use super::verbs::STAND_MAX;
 use ndn_transport::SideClass;
 
 /// Flag: the message carries its name (a bind, or a datagram that may overtake
@@ -40,6 +41,10 @@ pub(crate) const REPLAYED: u8 = 0x08;
 pub(crate) const PAD: u8 = 0x80;
 
 const RESERVED: u8 = 0x70;
+
+/// The most seconds a message may stand for: the sender's own limit (one hour). A reader refuses
+/// more, since the value goes to consumers that add it to a clock.
+const STAND_SECS_MAX: u64 = STAND_MAX.as_secs();
 
 /// The largest frame whose messages are handed out as slices of it: 9,000 octets, the most a
 /// datagram frame carries (`tx::FRAME_CAP`), so the datagram lane costs no allocation per
@@ -108,6 +113,11 @@ pub(crate) enum MessageError {
     /// After the messages, octets that are not padding.
     #[error("{octets} octets follow the last message and are not padding: drop the frame")]
     Trailing { octets: usize },
+    /// Stand seconds over what a sender may stand an emission for.
+    #[error(
+        "a message stands for {secs} s, over the {max} s a sender may stand an emission for: drop the frame (a writer: stand for less)"
+    )]
+    StandSeconds { secs: u64, max: u64 },
     /// A PAD flag followed by a non-zero octet.
     #[error("padding has a non-zero octet at {at}: drop the frame")]
     Padding { at: usize },
@@ -163,6 +173,12 @@ impl<'a> OutMessage<'a> {
             n += varint::len(secs).ok_or(MessageError::Overflow {
                 what: "stand seconds",
             })?;
+            if secs > STAND_SECS_MAX {
+                return Err(MessageError::StandSeconds {
+                    secs,
+                    max: STAND_SECS_MAX,
+                });
+            }
         }
         let max = max_message.min(MESSAGE_MAX);
         if self.payload.len() > max {
@@ -445,7 +461,14 @@ impl Messages {
             None
         };
         let stand_secs = if flags & STAND != 0 {
-            Some(self.varint("stand seconds")?)
+            let secs = self.varint("stand seconds")?;
+            if secs > STAND_SECS_MAX {
+                return Err(MessageError::StandSeconds {
+                    secs,
+                    max: STAND_SECS_MAX,
+                });
+            }
+            Some(secs)
         } else {
             None
         };
@@ -661,7 +684,7 @@ mod tests {
         fn a_message_round_trips(
             id in 1u64..=4_096,
             name in proptest::option::of(proptest::collection::vec(any::<u8>(), 0..=255)),
-            stand in proptest::option::of(0u64..=varint::MAX),
+            stand in proptest::option::of(0u64..=STAND_SECS_MAX),
             origin in proptest::option::of((any::<bool>(), 0u64..=varint::MAX)),
             payload in proptest::collection::vec(any::<u8>(), 0..300),
             seq0 in 0u64..(SEQUENCE_LIMIT - 1),
@@ -877,6 +900,35 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A sender stands an emission for at most an hour; a reader refuses more instead of passing
+    /// 2^62 seconds to a consumer that adds it to an `Instant` (security review L8).
+    #[test]
+    fn stand_seconds_over_the_senders_limit_are_refused_by_the_reader_and_the_writer() {
+        let max = 3_600;
+        for secs in [3_601u64, 1 << 40, varint::MAX] {
+            let mut plain = vec![STAND, 1];
+            varint::write(&mut plain, secs).unwrap();
+            plain.push(0);
+            assert_eq!(
+                read_all(plain, 0, 1).err(),
+                Some(MessageError::StandSeconds { secs, max }),
+                "reading {secs} s"
+            );
+            let mut m = OutMessage::new(1, b"");
+            m.stand_secs = Some(secs);
+            assert_eq!(
+                m.encoded_len(MESSAGE_DEFAULT),
+                Err(MessageError::StandSeconds { secs, max }),
+                "writing {secs} s"
+            );
+        }
+        // The limit itself is read and written.
+        let mut m = OutMessage::new(1, b"");
+        m.stand_secs = Some(max);
+        let got = read_all(plaintext_of(&[m]), 0, 1).unwrap();
+        assert_eq!(got[0].stand_secs, Some(max));
     }
 
     #[test]

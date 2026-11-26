@@ -1324,6 +1324,55 @@ async fn padded_frames_with_tiny_messages_are_bounded_by_pinned_bytes_in_reliabl
     );
 }
 
+/// A data frame of one message that stands for `secs`, sealed by hand (a writer would refuse to
+/// build it).
+fn standing_frame(fx: &Fx, seq0: u64, secs: u64) -> Bytes {
+    let mut plain = vec![0x01 | 0x02, 1, 3, 0x08, 0x01, b'a'];
+    super::varint::write(&mut plain, secs).unwrap();
+    plain.extend_from_slice(&[1, b'x']);
+    let header = Header::new(
+        SideClass::Datagram,
+        SideKind::Data,
+        fx.info.channel,
+        fx.epoch(),
+        seq0,
+        1,
+    )
+    .unwrap();
+    seal(&fx.cipher, &header, &plain).unwrap()
+}
+
+/// A message that stands for more than the hour a sender may stand one for is refused with its
+/// frame, counted, and nothing of it is queued; an hour is taken (security review L8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_that_stands_for_more_than_an_hour_is_refused_with_its_frame() {
+    let mut fx = latest().await;
+    let start = fx.start();
+    for (i, secs) in [3_601u64, 1 << 40, super::varint::MAX]
+        .into_iter()
+        .enumerate()
+    {
+        let frame = standing_frame(&fx, start + i as u64, secs);
+        assert_eq!(
+            fx.deliver(frame).await,
+            Delivery::Dropped(Dropped::Malformed),
+            "{secs} s"
+        );
+    }
+    assert_eq!(fx.stats().malformed.get(), 3);
+    assert!(
+        nothing(&mut fx.items),
+        "nothing of the refused frames was queued"
+    );
+    let frame = standing_frame(&fx, start + 3, 3_600);
+    assert_eq!(fx.deliver(frame).await, Delivery::Delivered { messages: 1 });
+    let got = queued(&mut fx.items);
+    match &got[0].kind {
+        Kind::Emitted(e) => assert_eq!(e.stands, Some(Duration::from_secs(3_600))),
+        other => panic!("not an emission: {other:?}"),
+    }
+}
+
 // -- End to end: the real sender over a carrier that loses, duplicates and reorders -------------
 
 /// Bob's node sends over a [`Link`]; Carol's receives what the test hands over from it.
