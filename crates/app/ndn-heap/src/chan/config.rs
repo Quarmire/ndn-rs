@@ -22,7 +22,7 @@ pub const VERIFY_EPSILON: Duration = Duration::from_millis(1);
 ///
 /// A frame a key holder forged is delivered, as the sender's, to a receiver that trusts frames as
 /// they arrive ([`crate::Trust::Prompt`]). The next checkpoint that covers it exposes it, with
-/// evidence ([`crate::NodeHandle::channel_evidence`]), a [`crate::GetNotice::Retracted`] and an
+/// evidence ([`crate::host::NodeHandle::channel_evidence`]), a [`crate::GetNotice::Retracted`] and an
 /// [`crate::Alert::ChannelForgery`]. The stated window is
 /// `W = P + d + ε`: the checkpoint period `P` ([`Self::checkpoint`], 20 ms by default), the
 /// one-way delay `d` of the stream to the receiver, and `ε` ([`VERIFY_EPSILON`], 1 ms) of

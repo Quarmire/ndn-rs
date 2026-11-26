@@ -71,8 +71,8 @@ pub(crate) const NO_PATH_AFTER: Duration = Duration::from_secs(2);
 /// (below [`NO_PATH_AFTER`], so a receiver that waited is not yet told it has no path).
 pub(crate) const ROUTE_WAIT: Duration = Duration::from_secs(1);
 
-/// The largest datagram frame a [`ConnectionCarrier`] reports by default: what one QUIC
-/// datagram carries at the smallest path MTU (the figure a session names, [`super::answer`]),
+/// The largest datagram frame a `ConnectionCarrier` reports by default: what one QUIC
+/// datagram carries at the smallest path MTU (the figure a session names in its answer),
 /// because the sinks of a route may be links. A frame over what a sink takes is refused there
 /// and counted, and a larger message goes on the stream instead. A host whose sinks are all
 /// local may raise it ([`NodeHandle::attach_forwarder_with`]).
@@ -528,7 +528,7 @@ impl LiveEnd {
 impl NodeHandle {
     /// Run this node's channels through its connection's forwarder: the session Data carries the
     /// route label, frames leave through the forwarder's side table and the ones routed to the
-    /// node come back through the app face (see the [module](self) docs). Needs a connection
+    /// node come back through the app face (see the module docs of the channel routes). Needs a connection
     /// that carries side frames (an embedded engine's `app_face`); with `datagram_max`
     /// [`DATAGRAM_FRAME_MAX`]. Calling it again changes nothing.
     ///

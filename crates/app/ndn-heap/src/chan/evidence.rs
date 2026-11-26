@@ -1,6 +1,6 @@
 //! What a receiver keeps when a frame is shown not to be the sender's (docs/specs/channel.md,
 //! Checkpoints): [`ChannelEvidence`], the last 64 in memory, readable with
-//! [`crate::NodeHandle::channel_evidence`] and serializable with [`ChannelEvidence::encode`].
+//! [`crate::host::NodeHandle::channel_evidence`] and serializable with [`ChannelEvidence::encode`].
 //!
 //! Evidence proves that **a holder of the channel key** made a frame the sender's signature
 //! contradicts. It does not say which holder (the sender equivocating, a receiver, a member

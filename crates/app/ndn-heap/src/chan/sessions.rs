@@ -66,7 +66,7 @@ pub enum EndReason {
     /// A checkpoint of the channel did not verify under the sender's key: some holder of the
     /// channel key made it (the sender signs with a key no receiver holds), so the frames of this
     /// session are not to be trusted. The session was dropped, evidence kept
-    /// ([`crate::NodeHandle::channel_evidence`]) and [`crate::Alert::ChannelCheckpoint`] raised.
+    /// ([`crate::host::NodeHandle::channel_evidence`]) and [`crate::Alert::ChannelCheckpoint`] raised.
     /// Ask the sender again for a new session once the face that carried it is dealt with.
     BadCheckpoint {
         /// What was wrong, and what to do.

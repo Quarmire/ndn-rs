@@ -329,7 +329,7 @@ pub enum Alert {
     /// the link to look at. Two authentic frames at a sequence **no** checkpoint has settled are
     /// a conflict: evidence only, no alert and no bar, since either face may be the honest one;
     /// the next checkpoint that covers the sequence raises this alert for the face of the frame
-    /// it contradicts. Evidence is kept ([`crate::NodeHandle::channel_evidence`]); the host maps
+    /// it contradicts. Evidence is kept ([`crate::host::NodeHandle::channel_evidence`]); the host maps
     /// `via` to a link and a key.
     ChannelForgery {
         /// The sender's device, whose channel it is.

@@ -46,7 +46,7 @@ impl Responder {
     }
 
     /// [`respond_bytes`](Self::respond_bytes) with NDNLPv2 headers on the reply
-    /// ([`Connection::send_with`](crate::Connection::send_with)): `wire` is a bare Data, which
+    /// ([`Connection::send_with`]): `wire` is a bare Data, which
     /// goes out in an LpPacket that carries `headers` (a `CachePolicy`, a `SideRoute`).
     pub async fn respond_bytes_with(
         self,
