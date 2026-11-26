@@ -108,11 +108,15 @@ impl<T> Names<T> {
         let slot = &mut self.slots[at];
         let same = slot.binding.as_ref().is_some_and(|b| b.octets == *octets);
         if !same {
+            // A copy: the octets of a frame are a slice of its whole buffer, and a binding lives
+            // as long as the channel does, so it must not keep the frame (up to a megabyte,
+            // however small the name) alive.
+            let octets = Bytes::copy_from_slice(octets);
             let name = Name::decode(octets.clone()).map_err(|_| BindError::NotAName { id })?;
             slot.binds += 1;
             slot.binding = Some(Binding {
                 name,
-                octets: octets.clone(),
+                octets,
                 bound: slot.binds,
             });
         }

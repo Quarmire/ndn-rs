@@ -13,15 +13,15 @@ use ndn_transport::{SideClass, SideKind};
 use tokio_util::sync::CancellationToken;
 
 use super::aead::FrameCipher;
-use super::alloc_probe::count_allocations;
+use super::alloc_probe::{count_allocations, live_bytes};
 use super::carrier_kit::{Link, LinkConfig};
 use super::channels::SendKey;
 use super::control::Control;
 use super::frame::open;
 use super::frame::{Header, seal};
 use super::items::Items;
-use super::limits::{MESSAGE_DEFAULT, STREAM_FRAME_DEFAULT, STREAM_FRAME_MAX};
-use super::message::{MessageWriter, Origin, OutMessage};
+use super::limits::{FRAME_OVERHEAD, MESSAGE_DEFAULT, STREAM_FRAME_DEFAULT, STREAM_FRAME_MAX};
+use super::message::{MessageWriter, Origin, OutMessage, PAD};
 use super::rx::{Delivery, Dropped, RxStats};
 use super::sessions::{ChannelInfo, EndReason};
 use super::standing::{Who, gate};
@@ -1252,6 +1252,76 @@ async fn a_message_costs_no_allocation_and_a_frame_a_fixed_few() {
     let (taken, allocations) = count_allocations(|| fx.items.next_batch(&mut buf));
     assert_eq!(taken, 14);
     assert_eq!(allocations, 0, "next_batch allocates nothing");
+}
+
+// -- What a queued message pins ---------------------------------------------------------------
+
+/// A stream frame of `total` octets whose one message is named by `id` and has a one-octet
+/// payload: everything else is zero padding, which a receiver accepts after the messages.
+fn padded_frame(fx: &Fx, seq0: u64, id: u64, total: usize) -> Bytes {
+    let name = [0x08, 0x02, b'p', b'a' + id as u8];
+    let mut plain = vec![0x01, id as u8, name.len() as u8];
+    plain.extend_from_slice(&name);
+    plain.extend_from_slice(&[1, b'x', PAD]);
+    plain.resize(total - FRAME_OVERHEAD, 0);
+    let header = Header::new(
+        SideClass::Stream,
+        SideKind::Data,
+        fx.info.channel,
+        fx.epoch(),
+        seq0,
+        1,
+    )
+    .unwrap();
+    seal(&fx.cipher, &header, &plain).unwrap()
+}
+
+/// Hand `frames` frames of 1 MiB with a one-octet message each to the receiver and return the
+/// octets of allocation the receiver and its `Items` hold afterwards.
+fn pinned_by_padded_frames(fx: &Fx, frames: u64) -> i64 {
+    let carol = handle(fx.carol());
+    let start = fx.start();
+    let ((), live) = live_bytes(|| {
+        for i in 0..frames {
+            let frame = padded_frame(fx, start + i, i + 1, 1 << 20);
+            let delivery = carol
+                .deliver_frame(frame, 7)
+                .now_or_never()
+                .expect("no waiting");
+            assert_eq!(delivery, Delivery::Delivered { messages: 1 });
+        }
+    });
+    live
+}
+
+/// A message sealed in a frame padded to 1 MiB weighs one octet and its payload must not keep
+/// the frame alive: what the queues hold is what they are charged for (H3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn padded_frames_with_tiny_messages_are_bounded_by_pinned_bytes_in_latest() {
+    let mut fx = latest().await;
+    let live = pinned_by_padded_frames(&fx, 24);
+    assert_eq!(
+        queued(&mut fx.items).len(),
+        24,
+        "every name's message queued"
+    );
+    assert!(
+        live < 256 * 1024,
+        "24 one-octet messages in frames of 1 MiB hold {live} octets of allocation"
+    );
+}
+
+/// The same in a `Reliable` channel, where a queue charged 65 octets a message would take
+/// 16,000 such frames before it blocked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn padded_frames_with_tiny_messages_are_bounded_by_pinned_bytes_in_reliable() {
+    let mut fx = reliable(Congestion::Block).await;
+    let live = pinned_by_padded_frames(&fx, 24);
+    assert_eq!(queued(&mut fx.items).len(), 24, "every message queued");
+    assert!(
+        live < 256 * 1024,
+        "24 one-octet messages in frames of 1 MiB hold {live} octets of allocation"
+    );
 }
 
 // -- End to end: the real sender over a carrier that loses, duplicates and reorders -------------

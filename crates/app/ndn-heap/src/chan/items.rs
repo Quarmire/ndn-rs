@@ -25,20 +25,20 @@ use tokio::sync::Notify;
 
 use super::fifo::{Entry, Fifo, QUEUE_BYTES};
 use super::hub::Listen;
-use super::latest::{Coalescing, PAIRS_MAX, Pair};
+use super::latest::{Coalescing, LATEST_BYTES, PAIRS_MAX, Pair};
 use super::verbs::{Congestion, GetNotice, GetOptions, Got, Live, LiveEnd, Modes, Select, Trust};
 use super::wire::ChannelMode;
 use crate::error::HeapError;
 use crate::node::NodeInner;
 use crate::space::Heap;
 
-/// A message on its way to the sinks: the key of its pair, its sequence, its payload length and
-/// the item.
+/// A message on its way to the sinks: the key of its pair, its sequence, the octets it is
+/// charged for (what it pins, [`super::message::Message::pinned`]) and the item.
 #[derive(Clone, Debug)]
 pub(crate) struct Out {
     pub(crate) pair: Pair,
     pub(crate) seq: u64,
-    pub(crate) len: usize,
+    pub(crate) weight: usize,
     pub(crate) got: Got,
 }
 
@@ -112,7 +112,7 @@ impl Sink {
             overflow,
             hello: AtomicBool::new(false),
             state: Mutex::new(SinkState {
-                latest: Coalescing::new(PAIRS_MAX),
+                latest: Coalescing::new(PAIRS_MAX, LATEST_BYTES),
                 fifo: Fifo::new(QUEUE_BYTES),
                 ends: VecDeque::new(),
                 closed: false,
@@ -140,12 +140,12 @@ impl Sink {
                 pushed = true;
                 match mode {
                     ChannelMode::Latest => {
-                        st.latest.offer(out.pair, out.seq, out.got);
+                        st.latest.offer(out.pair, out.seq, out.weight, out.got);
                     }
                     ChannelMode::Reliable | ChannelMode::Window => match self.overflow {
-                        Congestion::Block => st.fifo.push(out.got, out.len),
+                        Congestion::Block => st.fifo.push(out.got, out.weight),
                         Congestion::Drop => {
-                            st.fifo.push_dropping_oldest(out.got, out.len);
+                            st.fifo.push_dropping_oldest(out.got, out.weight);
                         }
                     },
                 }

@@ -767,7 +767,7 @@ impl ChannelRx {
                 message.seq
             }
         };
-        let len = message.payload.len();
+        let weight = message.pinned;
         st.out.push(Out {
             pair: Pair {
                 channel: self.channel,
@@ -775,7 +775,7 @@ impl ChannelRx {
                 bound,
             },
             seq,
-            len,
+            weight,
             got: Got {
                 path: name,
                 bytes: message.payload,

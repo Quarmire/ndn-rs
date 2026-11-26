@@ -2,8 +2,10 @@
 //! queues): every message in the channel's order, at most `queue_bytes` queued, and a `Lagged`
 //! entry in the place where messages are known to be missing.
 //!
-//! A queued message weighs its payload plus [`ENTRY_OVERHEAD`], so a flood of empty messages is
-//! bounded too. What a full queue does is the caller's policy (`Congestion`): [`Fifo::is_full`]
+//! A queued message weighs what it pins plus [`ENTRY_OVERHEAD`] (the receiver passes the octets of
+//! the frame a message shares, or its own payload when it was copied out of a large frame), so a
+//! flood of empty messages, or of tiny ones in padded frames, is bounded too. What a full queue
+//! does is the caller's policy (`Congestion`): [`Fifo::is_full`]
 //! says it is, and the caller either stops taking frames from the stream (back pressure) or calls
 //! [`Fifo::push_dropping_oldest`], which discards from the front and leaves a `Lagged` entry in
 //! the place of what it discarded.

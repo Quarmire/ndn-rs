@@ -41,6 +41,16 @@ pub(crate) const PAD: u8 = 0x80;
 
 const RESERVED: u8 = 0x70;
 
+/// The largest frame whose messages are handed out as slices of it: 9,000 octets, the most a
+/// datagram frame carries (`tx::FRAME_CAP`), so the datagram lane costs no allocation per
+/// message. A payload of a larger frame (only the stream carries them) is **copied out** unless
+/// it is at least half of the frame. So a queued message never pins more than the larger of
+/// this and twice its own size, however the sender padded or packed its frame
+/// (channel.md §12.6).
+pub(crate) const SHARE_FRAME_MAX: usize = 9_000;
+
+const _: () = assert!(SHARE_FRAME_MAX >= super::tx::FRAME_CAP);
+
 /// Where a replayed message first went out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Origin {
@@ -322,8 +332,14 @@ pub(crate) struct Message {
     pub stand_secs: Option<u64>,
     /// Set when the message replays an earlier one.
     pub origin: Option<Origin>,
-    /// The payload, a slice of the opened frame.
+    /// The payload: a slice of the opened frame when the frame is small or the payload is at
+    /// least half of it, a copy otherwise ([`SHARE_FRAME_MAX`]).
     pub payload: Bytes,
+    /// The octets a queued message is charged for: its payload when copied; when it shares the
+    /// frame, the larger of the payload and the frame's share per message (the frame's octets
+    /// over its message count), so the messages of a frame together are charged what the frame
+    /// is.
+    pub pinned: usize,
 }
 
 /// The messages of an opened `DATA` frame, in order. After the last, the
@@ -370,6 +386,20 @@ impl Messages {
         let out = self.data.slice(self.pos..end);
         self.pos = end;
         Ok(out)
+    }
+
+    /// The payload of `len` octets at the cursor and what it is charged: shared with the frame
+    /// when the frame is small or the payload is most of it, a copy of its own otherwise.
+    fn take_payload(&mut self, len: usize) -> Result<(Bytes, usize), MessageError> {
+        let whole = self.data.len();
+        let shared = whole <= SHARE_FRAME_MAX || len.saturating_mul(2) >= whole;
+        let slice = self.take(len, "payload")?;
+        if shared {
+            let share = whole.div_ceil(self.count.max(1));
+            Ok((slice, len.max(share)))
+        } else {
+            Ok((Bytes::copy_from_slice(&slice), len))
+        }
     }
 
     fn message(&mut self) -> Result<Message, MessageError> {
@@ -422,7 +452,7 @@ impl Messages {
                 max: self.max_message,
             });
         }
-        let payload = self.take(len as usize, "payload")?;
+        let (payload, pinned) = self.take_payload(len as usize)?;
         Ok(Message {
             seq: self.seq,
             name_id,
@@ -430,6 +460,7 @@ impl Messages {
             stand_secs,
             origin,
             payload,
+            pinned,
         })
     }
 
@@ -505,6 +536,68 @@ mod tests {
 
     fn read_all(plain: Vec<u8>, seq0: u64, count: usize) -> Result<Vec<Message>, MessageError> {
         Messages::new(Bytes::from(plain), seq0, count, MESSAGE_DEFAULT).collect()
+    }
+
+    fn shares_the_frame(data: &Bytes, payload: &Bytes) -> bool {
+        data.as_ptr_range().contains(&payload.as_ptr())
+    }
+
+    /// Every payload of a small frame is a slice of it (the 64 octet path allocates nothing per
+    /// message), and what each is charged adds up to the frame; in a frame over
+    /// [`SHARE_FRAME_MAX`] a payload that is less than half of it is a copy charged its own
+    /// length, so it never keeps the frame alive; one that is most of the frame is shared.
+    #[test]
+    fn a_payload_shares_a_small_frame_and_is_copied_out_of_a_large_one_unless_it_is_most_of_it() {
+        let small = [0x11u8; 64];
+        let msgs: Vec<OutMessage<'_>> = (0..14).map(|_| OutMessage::new(1, &small)).collect();
+        let plain = Bytes::from(plaintext_of(&msgs));
+        assert!(plain.len() <= SHARE_FRAME_MAX);
+        let got: Vec<Message> = Messages::new(plain.clone(), 0, 14, MESSAGE_DEFAULT)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(got.iter().all(|m| shares_the_frame(&plain, &m.payload)));
+        let charged: usize = got.iter().map(|m| m.pinned).sum();
+        assert!(
+            (plain.len()..plain.len() + 14).contains(&charged),
+            "{charged} charged for a frame of {}",
+            plain.len()
+        );
+
+        // 120 messages of 100 octets: a frame of 12 KiB.
+        let hundred = [0x22u8; 100];
+        let msgs: Vec<OutMessage<'_>> = (0..120).map(|_| OutMessage::new(1, &hundred)).collect();
+        let plain = Bytes::from(plaintext_of(&msgs));
+        assert!(plain.len() > SHARE_FRAME_MAX);
+        let got: Vec<Message> = Messages::new(plain.clone(), 0, 120, MESSAGE_DEFAULT)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(got.iter().all(|m| !shares_the_frame(&plain, &m.payload)));
+        assert!(
+            got.iter()
+                .all(|m| m.pinned == 100 && m.payload[..] == hundred)
+        );
+
+        // One message of 20,000 octets and a small one: the big is most of the frame.
+        let big = vec![0x33u8; 20_000];
+        let msgs = [OutMessage::new(1, &big), OutMessage::new(2, &small)];
+        let plain = Bytes::from(plaintext_of(&msgs));
+        let got: Vec<Message> = Messages::new(plain.clone(), 0, 2, MESSAGE_DEFAULT)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(shares_the_frame(&plain, &got[0].payload));
+        assert!(!shares_the_frame(&plain, &got[1].payload));
+        assert_eq!(got[1].pinned, 64);
+
+        // A tiny message in a frame padded to 1 MiB.
+        let mut padded = plaintext_of(&[OutMessage::new(1, b"x")]);
+        padded.push(PAD);
+        padded.resize(1 << 20, 0);
+        let plain = Bytes::from(padded);
+        let got: Vec<Message> = Messages::new(plain.clone(), 0, 1, MESSAGE_DEFAULT)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!shares_the_frame(&plain, &got[0].payload));
+        assert_eq!(got[0].pinned, 1);
     }
 
     /// The bytes a 3-octet-overhead message has, written out.
