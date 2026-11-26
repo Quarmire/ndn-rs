@@ -34,12 +34,13 @@
 //!   [`Face::forward_side_from`](ndn_transport::Face::forward_side_from), which
 //!   must not wait. A sink that cannot take it costs that sink the frame and is
 //!   counted `sink_full`: relays are lossy under congestion, visibly.
-//! - `UP` `Keep` refreshes that sink's expiry (its TTL after the Keep) and, when
-//!   that sink's last forwarded Keep was at least
-//!   [`keep_forward_min`](SideLimits::keep_forward_min) ago (a sink's first
-//!   Keep: at once, so the source learns the route to that receiver is up),
-//!   forwards one Keep to the route's source: at most one frame per 5 s per
-//!   sink per hop keeps a path alive. `Unsub`
+//! - `UP` `Keep` refreshes that sink's expiry (its TTL after the Keep) and forwards one Keep to
+//!   the route's source while the sink is within its burst
+//!   ([`keep_forward_burst`](SideLimits::keep_forward_burst): a sink's first Keeps go at once,
+//!   so the source learns the route to each receiver is up, and a relay's one link toward the
+//!   source carries the first Keep of every receiver behind it), then at most one per
+//!   [`keep_forward_min`](SideLimits::keep_forward_min): at most one frame per 5 s per sink per
+//!   hop keeps a path alive. `Unsub`
 //!   removes that face's sink; when none is left the route is removed and the
 //!   `Unsub` is forwarded to the source.
 //! - Bounds ([`SideLimits`]): routes, routes per source face, sinks per route,
@@ -103,9 +104,16 @@ pub struct SideLimits {
     pub ttl_default: Duration,
     /// The longest TTL a header may ask for (default 300 s); longer is clamped.
     pub ttl_max: Duration,
-    /// The least time between two `Keep`s one route forwards to its source
-    /// (default 5 s).
+    /// The least time between two `Keep`s one sink passes to its route's source, once the
+    /// sink's burst ([`keep_forward_burst`](Self::keep_forward_burst)) is used (default 5 s).
     pub keep_forward_min: Duration,
+    /// How many `Keep`s one sink may pass to the source in quick succession (default 8). A
+    /// receiver's first `Keep` must reach the sender, which waits for it before it sends its
+    /// stream frames; behind a relay, the receivers of one channel share the sender's hop as
+    /// one sink, so the second receiver's first `Keep` is no sink's first at that hop. The
+    /// burst lets one `Keep` per receiver through at once up to this many; the rate over a
+    /// longer time is still one per [`keep_forward_min`](Self::keep_forward_min).
+    pub keep_forward_burst: u32,
 }
 
 impl Default for SideLimits {
@@ -118,6 +126,7 @@ impl Default for SideLimits {
             ttl_default: Duration::from_secs(30),
             ttl_max: Duration::from_secs(300),
             keep_forward_min: Duration::from_secs(5),
+            keep_forward_burst: 8,
         }
     }
 }
@@ -381,9 +390,6 @@ fn bump(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
 
-/// A sink's last forwarded `Keep`, before there was one.
-const NEVER: u64 = u64::MAX;
-
 /// The first bar of a face, doubling per repeat.
 const BAR_BASE: Duration = Duration::from_secs(60);
 /// The longest bar.
@@ -473,9 +479,9 @@ struct Sink {
     ttl_ns: AtomicU64,
     /// Lapses at this time (ns).
     expires: AtomicU64,
-    /// When this sink's last `Keep` was forwarded to the route's source
-    /// ([`NEVER`] before the first): a sink's first Keep goes upstream at
-    /// once, later ones at most every `keep_forward_min`.
+    /// Until when the `Keep`s this sink passed to the route's source are paid for (ns): each
+    /// one adds `keep_forward_min`, and one is passed while what is owed is within the burst
+    /// (`keep_forward_burst`). 0 before the first.
     kept: AtomicU64,
 }
 
@@ -702,7 +708,7 @@ impl SideTable {
                 entry: Arc::clone(&sink_entry),
                 ttl_ns: AtomicU64::new(ttl_ns),
                 expires: AtomicU64::new(now.saturating_add(ttl_ns)),
-                kept: AtomicU64::new(NEVER),
+                kept: AtomicU64::new(0),
             })
         };
         let existing = self.routes.get(&id.0).map(|r| Arc::clone(&r));
@@ -888,12 +894,18 @@ impl SideTable {
             UpOp::Keep => {
                 bump(&self.counters.keeps);
                 sink.refresh(now);
-                let last = sink.kept.load(Ordering::Relaxed);
-                let due = last == NEVER
-                    || now.saturating_sub(last) >= ns(self.config.limits.keep_forward_min);
+                // A sink passes `keep_forward_burst` Keeps in quick succession and then one per
+                // `keep_forward_min` (the generic cell rate algorithm over `kept`).
+                let limits = &self.config.limits;
+                let every = ns(limits.keep_forward_min);
+                let allowance =
+                    every.saturating_mul(u64::from(limits.keep_forward_burst.max(1)) - 1);
+                let owed_until = sink.kept.load(Ordering::Relaxed);
+                let due = owed_until.saturating_sub(now) <= allowance;
                 let forwarded = due && self.up_to_source(route, frame, from, faces);
                 if forwarded {
-                    sink.kept.store(now, Ordering::Relaxed);
+                    sink.kept
+                        .store(owed_until.max(now).saturating_add(every), Ordering::Relaxed);
                     bump(&self.counters.keeps_forwarded);
                 }
                 SideOutcome::Kept { forwarded }

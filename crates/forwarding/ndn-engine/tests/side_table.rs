@@ -86,6 +86,15 @@ fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
 
+/// The limits of a table whose sinks pass one `Keep` per 5 s and no burst: what a hop with one
+/// receiver per sink needs, to read the spacing in isolation.
+fn one_keep_at_a_time() -> SideLimits {
+    SideLimits {
+        keep_forward_burst: 1,
+        ..SideLimits::default()
+    }
+}
+
 #[test]
 fn table_full_refuses_a_new_route_beyond_the_table_limit() {
     let fx = Fx::limits(SideLimits {
@@ -367,8 +376,8 @@ fn a_sink_that_does_not_carry_the_class_counts_class_unsupported() {
 #[test]
 fn a_sink_lapses_after_its_ttl_and_keep_refreshes_it_through_each_hop_once_per_5_s() {
     // Sender app a1 -- T1 -- l1 | l2 -- T2 -- receiver app r2.
-    let t1 = Fx::new();
-    let t2 = Fx::new();
+    let t1 = Fx::limits(one_keep_at_a_time());
+    let t2 = Fx::limits(one_keep_at_a_time());
     let a1 = t1.app(1);
     let _l1 = t1.face(2, FaceKind::Udp);
     let l2 = t2.face(3, FaceKind::Udp);
@@ -447,7 +456,7 @@ fn a_sink_lapses_after_its_ttl_and_keep_refreshes_it_through_each_hop_once_per_5
 
 #[test]
 fn a_sinks_first_keep_goes_upstream_at_once_even_when_another_sink_just_kept() {
-    let fx = Fx::new();
+    let fx = Fx::limits(one_keep_at_a_time());
     let src = fx.app(10);
     let _a = fx.app(20);
     let _b = fx.app(21);
@@ -483,6 +492,45 @@ fn a_sinks_first_keep_goes_upstream_at_once_even_when_another_sink_just_kept() {
         "4 s after its own forwarded Keep"
     );
     assert_eq!(src.side().len(), 3);
+}
+
+/// A relay's one link toward the sender is one sink at the sender's hop for every receiver
+/// behind the relay, so the second receiver's first `Keep` follows the first's within a moment:
+/// it goes up too (the sender holds its stream frames for it), up to the sink's burst, and the
+/// rate over a longer time stays one per `keep_forward_min`.
+#[test]
+fn the_first_keeps_of_receivers_behind_one_sink_all_go_upstream_then_one_per_5_s() {
+    let fx = Fx::new();
+    let src = fx.app(10);
+    let _relay = fx.app(20);
+    fx.install(1, 10, 20).unwrap();
+    // At least two receivers' first Keeps pass, whatever the default burst.
+    let burst = SideLimits::default().keep_forward_burst.max(2) as usize;
+    for n in 0..burst {
+        assert_eq!(
+            fx.on_frame(20, up(1, UpOp::Keep)),
+            SideOutcome::Kept { forwarded: true },
+            "the first Keep of receiver {n} behind the sink"
+        );
+        fx.advance(0);
+    }
+    assert_eq!(src.side().len(), burst);
+    assert_eq!(
+        fx.on_frame(20, up(1, UpOp::Keep)),
+        SideOutcome::Kept { forwarded: false },
+        "past the burst"
+    );
+    // One more is paid for every 5 s.
+    fx.advance(5);
+    assert_eq!(
+        fx.on_frame(20, up(1, UpOp::Keep)),
+        SideOutcome::Kept { forwarded: true }
+    );
+    assert_eq!(
+        fx.on_frame(20, up(1, UpOp::Keep)),
+        SideOutcome::Kept { forwarded: false }
+    );
+    assert_eq!(src.side().len(), burst + 1);
 }
 
 #[test]
