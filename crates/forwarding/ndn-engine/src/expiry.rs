@@ -95,6 +95,8 @@ pub async fn run_rib_expiry_task(
     rib: Arc<Rib>,
     fib: Arc<Fib>,
     reflexive: Arc<crate::reflexive::ReflexiveTable>,
+    side: Arc<crate::side::SideTable>,
+    face_table: Arc<FaceTable>,
     cancel: CancellationToken,
     runtime: Arc<dyn Runtime>,
 ) {
@@ -117,6 +119,13 @@ pub async fn run_rib_expiry_task(
                 if swept > 0 {
                     tracing::debug!(target: t::ENGINE, count = swept, "reflexive routes expired");
                 }
+                // Channel routes: sinks that got no `Keep` within their TTL
+                // lapse, and the routes of faces that left the table go.
+                let lapsed = side.sweep(runtime.unix_nanos());
+                if lapsed > 0 {
+                    tracing::debug!(target: t::ENGINE, count = lapsed, "side-route sinks lapsed");
+                }
+                side.drop_gone_faces(&face_table);
             }
         }
     }
@@ -162,6 +171,7 @@ pub async fn run_idle_face_task(
     face_table: Arc<FaceTable>,
     fib: Arc<Fib>,
     rib: Arc<Rib>,
+    side: Arc<crate::side::SideTable>,
     cancel: CancellationToken,
     discovery: Arc<dyn DiscoveryProtocol>,
     discovery_ctx: Arc<EngineDiscoveryContext>,
@@ -199,6 +209,7 @@ pub async fn run_idle_face_task(
                     }
                     rib.handle_face_down(face_id, &fib);
                     fib.remove_face(face_id);
+                    side.remove_face(face_id);
                     face_table.remove(face_id);
                     tracing::debug!(target: t::FACE_SYSTEM, face=%face_id, "idle on-demand face removed");
                 }

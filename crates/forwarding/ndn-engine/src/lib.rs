@@ -39,6 +39,7 @@ pub mod replay_guard_config;
 mod revocation_purge;
 pub mod rib;
 pub mod routing;
+pub mod side;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod signals_driver;
 pub mod stages;

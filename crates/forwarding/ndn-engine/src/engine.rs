@@ -117,7 +117,9 @@ pub type EgressItem = (bytes::Bytes, FaceId, EgressIntent);
 /// dispatcher used to encode inline:
 /// - a Nack wraps the Interest (`encode_lp_nack_with_pit_token` / `encode_nack`);
 /// - an LP-framed face wraps the payload, attaching any headers;
-/// - an IPC (bare-TLV) face stays bare unless a PitToken forces an LP frame;
+/// - an IPC (bare-TLV) face stays bare unless a PitToken or a `SideRoute`
+///   forces an LP frame (a session Data's side header must reach the next
+///   forwarder or the receiving heap, wherever the face is);
 /// - already-LP input (a retransmission) passes through untouched.
 pub fn frame_with_intent(payload: &[u8], intent: &EgressIntent, uses_lp: bool) -> bytes::Bytes {
     use ndn_packet::lp::{
@@ -137,7 +139,7 @@ pub fn frame_with_intent(payload: &[u8], intent: &EgressIntent, uses_lp: bool) -
     if uses_lp {
         // All-`None` headers make this identical to `encode_lp_packet`.
         encode_lp_with_headers(payload, &intent.headers)
-    } else if intent.headers.pit_token.is_some() {
+    } else if intent.headers.pit_token.is_some() || intent.headers.side_route.is_some() {
         encode_lp_with_headers(payload, &intent.headers)
     } else {
         bytes::Bytes::copy_from_slice(payload)
@@ -316,6 +318,8 @@ pub struct EngineInner {
     /// Namespaces whose Data is forwarded without validation (served for
     /// devices of a namespace this forwarder does not hold).
     pub transit: Arc<crate::transit::TransitPrefixes>,
+    /// Fan-out table for side (channel) frames.
+    pub side: Arc<crate::side::SideTable>,
     /// `OnceLock` breaks the `EngineInner -> Arc<ctx> -> Weak<EngineInner>` cycle.
     pub(crate) discovery_ctx: OnceLock<Arc<EngineDiscoveryContext>>,
     pub(crate) runtime: Arc<dyn Runtime>,
@@ -442,6 +446,13 @@ impl ForwarderEngine {
         Arc::clone(&self.inner.transit)
     }
 
+    /// The fan-out table for side (channel) frames: routes installed by a
+    /// Data's `SideRoute` header, `UP` keep-alives, quarantine, counters. See
+    /// [`crate::side`].
+    pub fn side(&self) -> Arc<crate::side::SideTable> {
+        Arc::clone(&self.inner.side)
+    }
+
     /// Pre-PIT replay guard. `Some` for production-shaped engines; `None`
     /// only when explicitly disabled via the builder escape hatch.
     pub fn replay_guard(&self) -> Option<Arc<ndn_security::ReplayGuard>> {
@@ -552,6 +563,7 @@ impl ForwarderEngine {
         }
         self.inner.rib.handle_face_down(face_id, &self.inner.fib);
         self.inner.fib.remove_face(face_id);
+        self.inner.side.remove_face(face_id);
         self.inner.face_table.remove(face_id);
     }
 
@@ -696,6 +708,7 @@ impl ForwarderEngine {
         require_data_validation: bool,
     ) {
         let face_id = erased.id();
+        self.inner.side.configure_face(face_id, erased.kind());
         // The face's own token, a child of the caller's: removing the face
         // (its connection closed, `remove_face`, `faces/destroy`) cancels this
         // face's tasks only, never a token the caller shares with other faces
@@ -766,6 +779,7 @@ impl ForwarderEngine {
                     discovery_ctx: Arc::clone(&discovery_ctx),
                     runtime: Arc::clone(&self.inner.runtime),
                     face_lifecycle_sink: self.face_lifecycle_sink(),
+                    side: Arc::clone(&self.inner.side),
                 },
             )
             .instrument(tracing::info_span!(
@@ -795,6 +809,7 @@ impl ForwarderEngine {
                     discovery_ctx,
                     runtime: Arc::clone(&self.inner.runtime),
                     face_lifecycle_sink: self.face_lifecycle_sink(),
+                    side: Arc::clone(&self.inner.side),
                 },
             )
             .instrument(tracing::info_span!(
@@ -822,6 +837,7 @@ impl ForwarderEngine {
         cancel: CancellationToken,
     ) {
         let face_id = face.id();
+        let kind = face.kind();
         // Its own token, a child of the caller's (see `wire_face`).
         let cancel = cancel.child_token();
         let congestion_policy = CongestionPolicy::default_for_scope(face.scope());
@@ -835,6 +851,7 @@ impl ForwarderEngine {
         );
         self.inner.face_states.insert(face_id, state);
         self.inner.face_table.insert(face);
+        self.inner.side.configure_face(face_id, kind);
 
         let erased = self
             .inner
@@ -859,6 +876,7 @@ impl ForwarderEngine {
                     discovery_ctx: Arc::clone(&discovery_ctx),
                     runtime: Arc::clone(&self.inner.runtime),
                     face_lifecycle_sink: self.face_lifecycle_sink(),
+                    side: Arc::clone(&self.inner.side),
                 },
             )
             .instrument(tracing::info_span!(
@@ -1087,6 +1105,7 @@ pub(crate) async fn run_face_sender(
         discovery_ctx,
         runtime,
         face_lifecycle_sink,
+        side,
     } = ctx;
     // G4: if this face has an egress scheduler installed, the send loop drains *it* (in
     // priority order) instead of the raw `rx`. `None` ⇒ the FIFO default (drain `rx`).
@@ -1223,6 +1242,7 @@ pub(crate) async fn run_face_sender(
                     }
                     rib.handle_face_down(face_id, &fib);
                     fib.remove_face(face_id);
+                    side.remove_face(face_id);
                     face_table.remove(face_id);
                 }
                 true
@@ -1285,7 +1305,8 @@ pub(crate) async fn run_face_sender(
                         && h.congestion_mark.is_none()
                         && h.incoming_face_id.is_none()
                         && h.next_hop_face_id.is_none()
-                        && h.cache_policy.is_none();
+                        && h.cache_policy.is_none()
+                        && h.side_route.is_none();
                     let wires = if plain {
                         lp_reliability_feature
                             .as_ref()

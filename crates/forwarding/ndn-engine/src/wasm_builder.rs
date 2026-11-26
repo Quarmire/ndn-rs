@@ -206,11 +206,17 @@ impl WasmEngineBuilder {
             crate::reflexive::ReflexiveConfig::default(),
         ));
         let transit = Arc::new(crate::transit::TransitPrefixes::default());
+        let side = Arc::new(crate::side::SideTable::new(
+            crate::side::SideConfig::default(),
+            Arc::clone(&runtime),
+        ));
 
         {
             let rib_clone = Arc::clone(&rib);
             let fib_clone = Arc::clone(&fib);
             let reflexive_clone = Arc::clone(&reflexive);
+            let side_clone = Arc::clone(&side);
+            let face_table_clone = Arc::clone(&face_table);
             let cancel_clone = cancel.clone();
             let runtime_clone = Arc::clone(&runtime);
             tasks.spawn(async move {
@@ -218,6 +224,8 @@ impl WasmEngineBuilder {
                     rib_clone,
                     fib_clone,
                     reflexive_clone,
+                    side_clone,
+                    face_table_clone,
                     cancel_clone,
                     runtime_clone,
                 )
@@ -298,6 +306,7 @@ impl WasmEngineBuilder {
             neighbors: Arc::clone(&neighbors),
             reflexive: Arc::clone(&reflexive),
             transit: Arc::clone(&transit),
+            side: Arc::clone(&side),
             discovery_ctx: OnceLock::new(),
             runtime: Arc::clone(&runtime),
             face_lifecycle_sink: OnceLock::new(),
@@ -374,6 +383,7 @@ impl WasmEngineBuilder {
             discovery: Arc::clone(&discovery),
             discovery_ctx: Arc::clone(&discovery_ctx),
             reflexive: Arc::clone(&reflexive),
+            side: Arc::clone(&side),
             rate_limit: self.rate_limit_hook.clone(),
             // wasm drives no signal sources, so the congestion-feedback bridge (which
             // decays via a polled source) has nothing to run it — not wired here.
@@ -399,6 +409,7 @@ impl WasmEngineBuilder {
             let face_table_clone = Arc::clone(&face_table);
             let fib_clone = Arc::clone(&fib);
             let rib_clone = Arc::clone(&rib);
+            let side_clone = Arc::clone(&side);
             let cancel_clone = cancel.clone();
             let d = Arc::clone(&discovery);
             let ctx = Arc::clone(&discovery_ctx);
@@ -409,6 +420,7 @@ impl WasmEngineBuilder {
                     face_table_clone,
                     fib_clone,
                     rib_clone,
+                    side_clone,
                     cancel_clone,
                     d,
                     ctx,

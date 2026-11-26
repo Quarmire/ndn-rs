@@ -45,6 +45,14 @@ pub struct LpCachePolicy(pub ndn_packet::CachePolicyType);
 #[derive(Clone, Debug)]
 pub struct PrefixAnnouncement(pub Bytes);
 
+/// The NDNLPv2 `SideRoute` header (TLV 0x0370) a Data arrived with, surfaced
+/// into `ctx.tags`: the Data pipeline installs a side route from it after the
+/// PIT matched (see [`crate::side`]). A header split over fragments counts only
+/// if it is on the final fragment, the one the reassembled packet continues
+/// as; a session Data fits one LP packet.
+#[derive(Clone, Copy, Debug)]
+pub struct SideRouteTag(pub ndn_packet::SideRoute);
+
 /// Decodes raw bytes into Interest, Data, or Nack. Handles bare TLV and
 /// NDNLPv2 LpPacket wrappers (LpPackets with a Nack header produce
 /// `DecodedPacket::Nack`). Enforces `/localhost` scope at ingress.
@@ -362,6 +370,9 @@ impl TlvDecodeStage {
         }
         if let Some(ref pa) = lp.prefix_announcement {
             ctx.tags.insert(PrefixAnnouncement(pa.clone()));
+        }
+        if let Some(route) = lp.side_route {
+            ctx.tags.insert(SideRouteTag(route));
         }
         // A-LAL geographic headers (CCLF Location Score). Surfaced as typed
         // tags; the strategy stage forwards them into `StrategyContext::extensions`.

@@ -8,7 +8,10 @@ use tracing::{debug, trace};
 use crate::engine::EgressIntent;
 use crate::observability::targets as t;
 use crate::pipeline::{Action, NackReason, PacketContext};
+use crate::side::{SideId, SideRefusal};
+use crate::stages::decode::SideRouteTag;
 use ndn_packet::Name;
+use ndn_packet::SideRoute;
 use ndn_packet::lp::LpHeaders;
 use ndn_store::CsEntry;
 use ndn_transport::{CongestionPolicy, FaceId, FaceScope, FaceTrust, LinkType};
@@ -311,6 +314,41 @@ impl PacketDispatcher {
         }
     }
 
+    /// Install the route a session Data's `SideRoute` header asks for with
+    /// `sink` (a face that asked for the Data) as a sink and `source` (the face
+    /// the Data arrived on) as the source; returns the header to send on to
+    /// `sink`, with the TTL the table kept. A refusal is counted by the table
+    /// and logged here with its reason; `None` then, and the face gets the Data
+    /// without the header: its receiver reports no path rather than waiting.
+    fn install_side_route(
+        &self,
+        label: SideRoute,
+        source: FaceId,
+        sink: FaceId,
+    ) -> Option<SideRoute> {
+        if self.face_table.get(sink).is_none() {
+            self.side.note_refusal(SideRefusal::FaceGone);
+            return None;
+        }
+        let ttl = self
+            .side
+            .clamp_ttl(std::time::Duration::from_secs(u64::from(label.ttl_secs)));
+        match self.side.install(SideId(label.id), source, sink, ttl) {
+            Ok(()) => Some(SideRoute {
+                id: label.id,
+                ttl_secs: u16::try_from(ttl.as_secs()).unwrap_or(u16::MAX),
+            }),
+            Err(refusal) => {
+                tracing::warn!(
+                    target: t::FWD_PIPELINE,
+                    route = label.id, %source, %sink, reason = refusal.label(),
+                    "side route not installed ({refusal}); the Data goes to the face without its header"
+                );
+                None
+            }
+        }
+    }
+
     pub(super) async fn satisfy(&self, ctx: PacketContext) {
         let data_bytes = if ctx.cs_hit {
             ctx.tags
@@ -323,6 +361,11 @@ impl PacketDispatcher {
 
         let is_localhost = ctx.name.as_ref().is_some_and(|n| is_localhost_name(n));
         let name_for_rl = ctx.name.as_deref();
+        let side_label = if ctx.cs_hit {
+            None
+        } else {
+            ctx.tags.get::<SideRouteTag>().map(|t| t.0)
+        };
         for (i, face_id) in ctx.out_faces.iter().enumerate() {
             // Don't echo forwarded Data back out the face it arrived on —
             // EXCEPT on ad-hoc links, where re-radiating onto the shared
@@ -357,6 +400,19 @@ impl PacketDispatcher {
                 debug!(target: t::FWD_PIPELINE, face=%face_id, name=?ctx.name, "rate-limit: outbound Data dropped");
                 continue;
             }
+            // A session Data's `SideRoute` header: this face asked for the
+            // Data (its Interest is the in-record), so it becomes a sink of the
+            // route whose source is the face the Data arrived on, and the Data
+            // goes on with the header for the next forwarder to do the same.
+            // Never from a cache hit (no header), for an unsolicited Data (no
+            // out faces), or back out the arrival face. A refusal leaves this
+            // face the Data without the header.
+            let side_route = match side_label {
+                Some(label) if *face_id != ctx.face_id => {
+                    self.install_side_route(label, ctx.face_id, *face_id)
+                }
+                _ => None,
+            };
             // Returned Data echoes the consumer's PitToken (so it can correlate
             // the response) and, on a LocalFields face, the IncomingFaceId — the
             // face the Data arrived on (producer face, or the reserved
@@ -377,6 +433,7 @@ impl PacketDispatcher {
                 headers: LpHeaders {
                     pit_token: ctx.out_pit_tokens.get(i).and_then(|t| t.clone()),
                     incoming_face_id,
+                    side_route,
                     ..Default::default()
                 },
                 nack: None,

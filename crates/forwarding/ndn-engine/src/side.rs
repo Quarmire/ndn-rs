@@ -1,0 +1,1103 @@
+//! [`SideTable`]: the forwarder's generic fan-out table for side frames.
+//!
+//! A *side frame* (first octet [`SIDE_MARKER`](ndn_transport::SIDE_MARKER), see
+//! [`ndn_transport::side`]) is not an NDN packet. The face reader peels it
+//! before the NDN pipeline and hands it to [`SideTable::on_frame`], which routes
+//! it on the 10 octets of its [`SideHeader`]: the id it carries finds a route, a
+//! route has **one source face** and any number of **sink faces**, and the frame
+//! goes to every sink, once per face, as a reference-counted clone of the same
+//! bytes. The table is a lighter cousin of the PIT and holds nothing but opaque
+//! 64-bit ids, [`FaceId`]s, times and counters: it never sees a name, a key, a
+//! space, a person or a mode, decrypts and verifies nothing, and reads only one
+//! frame kind, `UP`, its own keep-alive.
+//!
+//! # How a route comes to be
+//!
+//! The interface is an NDNLPv2 header on a Data ([`ndn_packet::lp::SideRoute`],
+//! TLV 0x0370: id and TTL). In the Data pipeline, after the PIT matched and after
+//! validation, for each in-record face `f` other than the arrival face `a` the
+//! engine calls [`SideTable::install`]`(id, a, f, ttl)` and sends the Data to
+//! `f` with the header again, so the next forwarder does the same. A Data that
+//! matched no PIT entry installs nothing; a refusal is counted, logged with its
+//! reason, and that face gets the Data **without** the header (the receiver then
+//! sees no frames and reports `NoPath`).
+//!
+//! # Rules the table keeps
+//!
+//! - A frame of an id from any face but the route's source is dropped
+//!   (`wrong_source`); a face that is not a sink of the route cannot refresh or
+//!   remove anything with `UP`.
+//! - **Never blocks.** A sink is handed the frame with
+//!   [`Face::forward_side_from`](ndn_transport::Face::forward_side_from), which
+//!   must not wait. A sink that cannot take it costs that sink the frame and is
+//!   counted `sink_full`: relays are lossy under congestion, visibly.
+//! - `UP` `Keep` refreshes that sink's expiry (its TTL after the Keep) and, when
+//!   this route's last forwarded Keep was at least
+//!   [`keep_forward_min`](SideLimits::keep_forward_min) ago (the first one of a
+//!   route: at once), forwards one Keep to the route's source: one frame per
+//!   5 s per hop keeps a path alive however many receivers there are. `Unsub`
+//!   removes that face's sink; when none is left the route is removed and the
+//!   `Unsub` is forwarded to the source.
+//! - Bounds ([`SideLimits`]): routes, routes per source face, sinks per route,
+//!   routes per sink face. A refusal names which ([`SideRefusal`]).
+//! - Time is the engine's clock (nanoseconds, `Runtime::unix_nanos`), read
+//!   through the table's clock; `sweep(now)`, `quarantine(face, until)` and
+//!   `bar(face, now)` take it explicitly so a caller or a test can supply it.
+//! - A face that goes down takes its routes with it
+//!   ([`remove_face`](SideTable::remove_face), called at every site where the
+//!   engine drops a face; [`drop_gone_faces`](SideTable::drop_gone_faces) in the
+//!   1 s sweep catches any other).
+//! - **Quarantine.** A barred face has the frames it sends dropped
+//!   (`quarantined`), its `Keep`s ignored and no route installed from it; the
+//!   NDN traffic over it is not the table's and goes on. [`bar`](SideTable::bar)
+//!   is 60 s, doubling for each repeat on the same face up to 1 h, back to 60 s
+//!   after an hour clean.
+//! - **Rate.** [`SideRate`] is a bytes-per-second token bucket on what the table
+//!   hands one sink face; over it a frame is dropped and counted `quota`.
+//!   Default off on the Ethernet kinds, 1 MB/s on the radio kinds
+//!   ([`FaceKind::Wfb`], `WifiAware`, `WifiDirect`), per face via
+//!   [`set_rate`](SideTable::set_rate) and per kind in [`SideConfig`].
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use arc_swap::ArcSwap;
+use bytes::Bytes;
+use dashmap::DashMap;
+use ndn_runtime::Runtime;
+use ndn_transport::side_header::{SideHeader, SideKind, UpOp, UpRecord};
+use ndn_transport::{FaceId, FaceKind, FaceTable, SideClass, SideRefused};
+
+/// The clock a [`SideTable`] reads: nanoseconds, the engine's
+/// `Runtime::unix_nanos`.
+pub type SideClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// A route's id: the 8 octets after the marker and the kind of every frame, and
+/// the id in a Data's `SideRoute` header. Opaque to the forwarder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SideId(pub u64);
+
+/// The bounds of the table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SideLimits {
+    /// Routes in the table (default 4,096).
+    pub routes: usize,
+    /// Routes one source face may feed (default 256).
+    pub per_source_face: usize,
+    /// Sink faces on one route (default 64).
+    pub sinks_per_route: usize,
+    /// Routes one face may be a sink of (default 1,024).
+    pub per_sink_face: usize,
+    /// The TTL of a sink installed with a TTL of zero (default 30 s).
+    pub ttl_default: Duration,
+    /// The longest TTL a header may ask for (default 300 s); longer is clamped.
+    pub ttl_max: Duration,
+    /// The least time between two `Keep`s one route forwards to its source
+    /// (default 5 s).
+    pub keep_forward_min: Duration,
+}
+
+impl Default for SideLimits {
+    fn default() -> Self {
+        Self {
+            routes: 4096,
+            per_source_face: 256,
+            sinks_per_route: 64,
+            per_sink_face: 1024,
+            ttl_default: Duration::from_secs(30),
+            ttl_max: Duration::from_secs(300),
+            keep_forward_min: Duration::from_secs(5),
+        }
+    }
+}
+
+/// A per-face limit on the octets a sink face is handed per second (a token
+/// bucket with one second's burst). A frame that finds the bucket empty is
+/// dropped and counted `quota`; any size of frame passes while the bucket holds
+/// something, so a large frame is not refused for ever at a low rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SideRate {
+    /// Octets per second.
+    pub bytes_per_sec: u64,
+}
+
+impl SideRate {
+    /// 1 MB/s: the default on the radio kinds.
+    pub const RADIO_DEFAULT: SideRate = SideRate {
+        bytes_per_sec: 1_000_000,
+    };
+}
+
+/// What the engine builds a [`SideTable`] from (`EngineConfig::side`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SideConfig {
+    /// The bounds.
+    pub limits: SideLimits,
+    /// The rate of a radio face ([`FaceKind::Wfb`], `WifiAware`, `WifiDirect`);
+    /// `None` is off. Default 1 MB/s.
+    pub radio_rate: Option<SideRate>,
+    /// The rate of an Ethernet face (`Ethernet`, `EtherMulticast`); `None` is
+    /// off. Default off.
+    pub ethernet_rate: Option<SideRate>,
+}
+
+impl Default for SideConfig {
+    fn default() -> Self {
+        Self {
+            limits: SideLimits::default(),
+            radio_rate: Some(SideRate::RADIO_DEFAULT),
+            ethernet_rate: None,
+        }
+    }
+}
+
+impl SideConfig {
+    /// The rate a face of `kind` starts with.
+    pub fn rate_for(&self, kind: FaceKind) -> Option<SideRate> {
+        match kind {
+            FaceKind::Wfb | FaceKind::WifiAware | FaceKind::WifiDirect => self.radio_rate,
+            FaceKind::Ethernet | FaceKind::EtherMulticast => self.ethernet_rate,
+            _ => None,
+        }
+    }
+}
+
+/// Why [`SideTable::install`] refused. Each says what to look at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SideRefusal {
+    /// The table holds its most routes.
+    #[error(
+        "this forwarder's channel route table is full: end a channel, or raise the route limit (`routes`) in its side configuration"
+    )]
+    TableFull,
+    /// The upstream face already feeds its most routes.
+    #[error(
+        "too many channel routes already come from this upstream face: end one, or raise `per_source_face`"
+    )]
+    SourceFull,
+    /// The route already fans out to its most faces.
+    #[error(
+        "this channel route already fans out to the most faces it may: raise `sinks_per_route`, or put the receivers behind a relay"
+    )]
+    SinkCap,
+    /// The receiver's face is already a sink of its most routes.
+    #[error(
+        "too many channel routes already go to this receiver face: end one, or raise `per_sink_face`"
+    )]
+    SinkFaceFull,
+    /// The route exists with another source.
+    #[error(
+        "a channel route with this id already comes from another face: the id is in use or the path changed; wait for the old route to lapse"
+    )]
+    SourceMismatch,
+    /// The receiver's face is the face the Data arrived on.
+    #[error("the receiver's face is the face the Data arrived on: a route cannot loop back")]
+    SinkIsSource,
+    /// The upstream face is barred.
+    #[error(
+        "the upstream face is quarantined for channel frames it forged: wait for the bar to end, or lift it with the `side/quarantine` command"
+    )]
+    Quarantined,
+    /// A face of the route is not on this forwarder.
+    #[error("a face of the route is no longer on this forwarder")]
+    FaceGone,
+}
+
+impl SideRefusal {
+    /// A short stable name, for logs and management output.
+    pub const fn label(self) -> &'static str {
+        match self {
+            SideRefusal::TableFull => "table_full",
+            SideRefusal::SourceFull => "source_full",
+            SideRefusal::SinkCap => "sink_cap",
+            SideRefusal::SinkFaceFull => "sink_face_full",
+            SideRefusal::SourceMismatch => "source_mismatch",
+            SideRefusal::SinkIsSource => "sink_is_source",
+            SideRefusal::Quarantined => "quarantined",
+            SideRefusal::FaceGone => "face_gone",
+        }
+    }
+
+    const COUNT: usize = 8;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Why a frame was dropped before any sink saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SideDrop {
+    /// Not a valid routing header or `UP` record.
+    Malformed,
+    /// From a barred face.
+    Quarantined,
+    /// No route has the id.
+    Unrouted,
+    /// A frame of the id from a face that is not the route's source, or an
+    /// `UP` from a face that is not a sink of it.
+    WrongSource,
+}
+
+/// What [`SideTable::on_frame`] did with a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SideOutcome {
+    /// Dropped before any sink.
+    Dropped(SideDrop),
+    /// Fanned out: `sinks` live sinks, `delivered` took it, `dropped` did not
+    /// (full, over rate, not carrying the class, gone).
+    Routed {
+        sinks: usize,
+        delivered: usize,
+        dropped: usize,
+    },
+    /// An `UP` `Keep`: the sink was refreshed; `forwarded` says whether one was
+    /// passed to the route's source.
+    Kept { forwarded: bool },
+    /// An `UP` `Unsub`: the face's sink was removed; the route went with it if
+    /// it was the last (`route_removed`), and only then is the `Unsub` passed
+    /// to the source (`forwarded`).
+    Unsubscribed {
+        route_removed: bool,
+        forwarded: bool,
+    },
+}
+
+/// One sink of a route, for [`RouteInfo`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SinkInfo {
+    pub face: FaceId,
+    /// Time left until the sink lapses without a `Keep` (zero when overdue).
+    pub expires_in: Duration,
+}
+
+/// One route, read-only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteInfo {
+    /// The route id.
+    pub id: u64,
+    /// The one face frames of this id may arrive from.
+    pub source: FaceId,
+    pub sinks: Vec<SinkInfo>,
+    /// Frames and octets routed on it since it was made.
+    pub frames: u64,
+    pub bytes: u64,
+    /// Time since it was made.
+    pub age: Duration,
+}
+
+/// A snapshot of the table's counters: gauges (`routes`, `sinks`) and totals
+/// since start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SideStats {
+    pub routes: u64,
+    pub sinks: u64,
+    /// Frames offered to [`SideTable::on_frame`] and their octets.
+    pub frames_in: u64,
+    pub bytes_in: u64,
+    /// Frames (and octets) handed to sinks: one per sink that took one.
+    pub frames_out: u64,
+    pub bytes_out: u64,
+    /// Drops, by reason.
+    pub unrouted: u64,
+    pub wrong_source: u64,
+    pub malformed: u64,
+    /// A sink does not carry the frame's class.
+    pub class_unsupported: u64,
+    /// A sink over its [`SideRate`].
+    pub quota: u64,
+    pub quarantined: u64,
+    /// A sink's queue or send buffer had no room (also a sink face that was
+    /// gone from the face table).
+    pub sink_full: u64,
+    /// A sink refused for another reason (too large for it, closed, I/O).
+    pub sink_error: u64,
+    /// `UP` records accepted from a sink, and `Keep`s passed on, `Unsub`s.
+    pub keeps: u64,
+    pub keeps_forwarded: u64,
+    pub unsubs: u64,
+    /// Sinks that lapsed for want of a `Keep`.
+    pub sinks_lapsed: u64,
+    /// Installs refused, by reason.
+    pub refused_table_full: u64,
+    pub refused_source_full: u64,
+    pub refused_sink_cap: u64,
+    pub refused_sink_face_full: u64,
+    pub refused_source_mismatch: u64,
+    pub refused_sink_is_source: u64,
+    pub refused_quarantined: u64,
+    pub refused_face_gone: u64,
+}
+
+#[derive(Default)]
+struct Counters {
+    frames_in: AtomicU64,
+    bytes_in: AtomicU64,
+    frames_out: AtomicU64,
+    bytes_out: AtomicU64,
+    unrouted: AtomicU64,
+    wrong_source: AtomicU64,
+    malformed: AtomicU64,
+    class_unsupported: AtomicU64,
+    quota: AtomicU64,
+    quarantined: AtomicU64,
+    sink_full: AtomicU64,
+    sink_error: AtomicU64,
+    keeps: AtomicU64,
+    keeps_forwarded: AtomicU64,
+    unsubs: AtomicU64,
+    sinks_lapsed: AtomicU64,
+    refused: [AtomicU64; SideRefusal::COUNT],
+}
+
+fn bump(c: &AtomicU64) {
+    c.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A route's last forwarded `Keep`, before there was one.
+const NEVER: u64 = u64::MAX;
+
+/// The first bar of a face, doubling per repeat.
+const BAR_BASE: Duration = Duration::from_secs(60);
+/// The longest bar.
+const BAR_MAX: Duration = Duration::from_secs(3600);
+/// A face that stays unbarred this long after a bar ended starts again at
+/// [`BAR_BASE`].
+const BAR_CLEAN: Duration = Duration::from_secs(3600);
+
+fn ns(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Per-face state: the rate bucket and the bar history. Shared with the sinks
+/// that name the face, so the hot path takes no lookup for the rate.
+struct FaceEntry {
+    rate_on: AtomicBool,
+    bucket: Mutex<Option<Bucket>>,
+    /// The face is barred until this time (ns); 0: never was.
+    barred_until: AtomicU64,
+    strikes: Mutex<Strikes>,
+}
+
+struct Bucket {
+    rate: u64,
+    tokens: i64,
+    last: u64,
+}
+
+#[derive(Default)]
+struct Strikes {
+    count: u32,
+    /// When the last bar ended.
+    last_end: u64,
+}
+
+impl FaceEntry {
+    fn new() -> Self {
+        Self {
+            rate_on: AtomicBool::new(false),
+            bucket: Mutex::new(None),
+            barred_until: AtomicU64::new(0),
+            strikes: Mutex::new(Strikes::default()),
+        }
+    }
+
+    fn set_rate(&self, rate: Option<SideRate>, now: u64) {
+        let mut bucket = self.bucket.lock().unwrap();
+        *bucket = rate.map(|r| Bucket {
+            rate: r.bytes_per_sec,
+            tokens: i64::try_from(r.bytes_per_sec).unwrap_or(i64::MAX),
+            last: now,
+        });
+        self.rate_on.store(rate.is_some(), Ordering::Relaxed);
+    }
+
+    /// Whether a frame of `len` octets may go to the face now; charges it.
+    fn admit(&self, now: u64, len: usize) -> bool {
+        let mut bucket = self.bucket.lock().unwrap();
+        let Some(b) = bucket.as_mut() else {
+            return true;
+        };
+        let elapsed = now.saturating_sub(b.last);
+        b.last = now;
+        let add = (u128::from(elapsed) * u128::from(b.rate) / 1_000_000_000) as i64;
+        let burst = i64::try_from(b.rate).unwrap_or(i64::MAX);
+        b.tokens = b.tokens.saturating_add(add).min(burst);
+        if b.tokens > 0 {
+            b.tokens = b
+                .tokens
+                .saturating_sub(i64::try_from(len).unwrap_or(i64::MAX));
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct Sink {
+    face: FaceId,
+    entry: Arc<FaceEntry>,
+    ttl_ns: AtomicU64,
+    /// Lapses at this time (ns).
+    expires: AtomicU64,
+}
+
+impl Sink {
+    fn refresh(&self, now: u64) {
+        self.expires.store(
+            now.saturating_add(self.ttl_ns.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+struct Route {
+    source: FaceId,
+    sinks: ArcSwap<Vec<Arc<Sink>>>,
+    frames: AtomicU64,
+    bytes: AtomicU64,
+    created: u64,
+    /// When this route last forwarded a `Keep` to its source ([`NEVER`]).
+    kept: AtomicU64,
+}
+
+#[derive(Default)]
+struct Quota {
+    per_source: HashMap<FaceId, usize>,
+    per_sink: HashMap<FaceId, usize>,
+    routes: usize,
+    sinks: usize,
+}
+
+impl Quota {
+    fn dec(map: &mut HashMap<FaceId, usize>, face: FaceId) {
+        if let Some(n) = map.get_mut(&face) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&face);
+            }
+        }
+    }
+}
+
+/// The forwarder's fan-out table for side frames; see the [module](self).
+pub struct SideTable {
+    config: SideConfig,
+    clock: SideClock,
+    routes: DashMap<u64, Arc<Route>>,
+    /// Every change to routes, sinks and their per-face counts is made under
+    /// this lock, so the counts and the table never disagree; the data path
+    /// reads without it.
+    quota: Mutex<Quota>,
+    faces: DashMap<FaceId, Arc<FaceEntry>>,
+    /// The latest time any face is barred until: the data path skips the bar
+    /// lookup while it is in the past.
+    latest_bar_end: AtomicU64,
+    counters: Counters,
+}
+
+impl SideTable {
+    /// A table on the engine's clock.
+    pub fn new(config: SideConfig, runtime: Arc<dyn Runtime>) -> Self {
+        Self::with_clock(config, Arc::new(move || runtime.unix_nanos()))
+    }
+
+    /// A table on `clock` (nanoseconds).
+    pub fn with_clock(config: SideConfig, clock: SideClock) -> Self {
+        Self {
+            config,
+            clock,
+            routes: DashMap::new(),
+            quota: Mutex::new(Quota::default()),
+            faces: DashMap::new(),
+            latest_bar_end: AtomicU64::new(0),
+            counters: Counters::default(),
+        }
+    }
+
+    /// The table's bounds.
+    pub fn limits(&self) -> SideLimits {
+        self.config.limits
+    }
+
+    /// The TTL a sink installed with `ttl` gets: zero is
+    /// [`ttl_default`](SideLimits::ttl_default), anything longer than
+    /// [`ttl_max`](SideLimits::ttl_max) is clamped to it.
+    pub fn clamp_ttl(&self, ttl: Duration) -> Duration {
+        if ttl.is_zero() {
+            self.config.limits.ttl_default
+        } else {
+            ttl.min(self.config.limits.ttl_max)
+        }
+    }
+
+    /// The table's clock now (ns): what to pass to [`bar`](Self::bar),
+    /// [`sweep`](Self::sweep) and [`quarantine`](Self::quarantine) in a caller
+    /// that has no clock of its own.
+    pub fn now(&self) -> u64 {
+        (self.clock)()
+    }
+
+    fn entry(&self, face: FaceId) -> Arc<FaceEntry> {
+        if let Some(e) = self.faces.get(&face) {
+            return Arc::clone(&e);
+        }
+        Arc::clone(
+            &self
+                .faces
+                .entry(face)
+                .or_insert_with(|| Arc::new(FaceEntry::new())),
+        )
+    }
+
+    /// Give a face that was just added the rate its kind starts with
+    /// ([`SideConfig::rate_for`]).
+    pub fn configure_face(&self, face: FaceId, kind: FaceKind) {
+        self.set_rate(face, self.config.rate_for(kind));
+    }
+
+    /// Set (or, with `None`, clear) the rate limit of sink face `face`.
+    pub fn set_rate(&self, face: FaceId, rate: Option<SideRate>) {
+        if rate.is_none() && !self.faces.contains_key(&face) {
+            return;
+        }
+        self.entry(face).set_rate(rate, self.now());
+    }
+
+    // ---- install ----
+
+    /// Add `sink` to route `id`, creating the route with `source` if it does
+    /// not exist; refresh the sink's expiry if it is already one. `ttl` is
+    /// clamped to [`SideLimits::ttl_max`]; zero means
+    /// [`SideLimits::ttl_default`]. Refused, with the table unchanged, when the
+    /// route exists with another source, a bound would be exceeded, the sink is
+    /// the source, or the source is barred.
+    pub fn install(
+        &self,
+        id: SideId,
+        source: FaceId,
+        sink: FaceId,
+        ttl: Duration,
+    ) -> Result<(), SideRefusal> {
+        let result = self.install_inner(id, source, sink, ttl);
+        if let Err(refusal) = result {
+            self.note_refusal(refusal);
+        }
+        result
+    }
+
+    /// Count an install refusal the caller decided (a face the table cannot
+    /// see is gone).
+    pub fn note_refusal(&self, refusal: SideRefusal) {
+        bump(&self.counters.refused[refusal.index()]);
+    }
+
+    fn install_inner(
+        &self,
+        id: SideId,
+        source: FaceId,
+        sink: FaceId,
+        ttl: Duration,
+    ) -> Result<(), SideRefusal> {
+        let limits = &self.config.limits;
+        if source == sink {
+            return Err(SideRefusal::SinkIsSource);
+        }
+        let now = self.now();
+        if self.is_quarantined(source, now) {
+            return Err(SideRefusal::Quarantined);
+        }
+        let ttl = self.clamp_ttl(ttl);
+        let ttl_ns = ns(ttl);
+        let sink_entry = self.entry(sink);
+        let new_sink = || {
+            Arc::new(Sink {
+                face: sink,
+                entry: Arc::clone(&sink_entry),
+                ttl_ns: AtomicU64::new(ttl_ns),
+                expires: AtomicU64::new(now.saturating_add(ttl_ns)),
+            })
+        };
+
+        let mut q = self.quota.lock().unwrap();
+        let existing = self.routes.get(&id.0).map(|r| Arc::clone(&r));
+        match existing {
+            Some(route) => {
+                if route.source != source {
+                    return Err(SideRefusal::SourceMismatch);
+                }
+                let sinks = route.sinks.load_full();
+                if let Some(s) = sinks.iter().find(|s| s.face == sink) {
+                    s.ttl_ns.store(ttl_ns, Ordering::Relaxed);
+                    s.refresh(now);
+                    return Ok(());
+                }
+                if sinks.len() >= limits.sinks_per_route {
+                    return Err(SideRefusal::SinkCap);
+                }
+                if q.per_sink.get(&sink).copied().unwrap_or(0) >= limits.per_sink_face {
+                    return Err(SideRefusal::SinkFaceFull);
+                }
+                let mut v = Vec::with_capacity(sinks.len() + 1);
+                v.extend(sinks.iter().cloned());
+                v.push(new_sink());
+                route.sinks.store(Arc::new(v));
+                *q.per_sink.entry(sink).or_insert(0) += 1;
+                q.sinks += 1;
+            }
+            None => {
+                if q.routes >= limits.routes {
+                    return Err(SideRefusal::TableFull);
+                }
+                if q.per_source.get(&source).copied().unwrap_or(0) >= limits.per_source_face {
+                    return Err(SideRefusal::SourceFull);
+                }
+                if q.per_sink.get(&sink).copied().unwrap_or(0) >= limits.per_sink_face {
+                    return Err(SideRefusal::SinkFaceFull);
+                }
+                self.routes.insert(
+                    id.0,
+                    Arc::new(Route {
+                        source,
+                        sinks: ArcSwap::from_pointee(vec![new_sink()]),
+                        frames: AtomicU64::new(0),
+                        bytes: AtomicU64::new(0),
+                        created: now,
+                        kept: AtomicU64::new(NEVER),
+                    }),
+                );
+                *q.per_source.entry(source).or_insert(0) += 1;
+                *q.per_sink.entry(sink).or_insert(0) += 1;
+                q.routes += 1;
+                q.sinks += 1;
+            }
+        }
+        Ok(())
+    }
+
+    // ---- the data path ----
+
+    /// Route one frame that arrived on `from`; `faces` is the engine's face
+    /// table. **Never blocks.** `from` is the face the frame came over: the
+    /// reader's face, or the app face of a locally originated frame.
+    pub fn on_frame(&self, from: FaceId, frame: Bytes, faces: &FaceTable) -> SideOutcome {
+        let c = &self.counters;
+        bump(&c.frames_in);
+        c.bytes_in.fetch_add(frame.len() as u64, Ordering::Relaxed);
+        let Ok(header) = SideHeader::parse(&frame) else {
+            return self.dropped(SideDrop::Malformed);
+        };
+        let op = if header.kind() == SideKind::Up {
+            match UpRecord::parse(&frame) {
+                Ok(r) => Some(r.op),
+                Err(_) => return self.dropped(SideDrop::Malformed),
+            }
+        } else {
+            None
+        };
+        let now = self.now();
+        if self.is_quarantined(from, now) {
+            return self.dropped(SideDrop::Quarantined);
+        }
+        let Some(route) = self.routes.get(&header.id()).map(|r| Arc::clone(&r)) else {
+            return self.dropped(SideDrop::Unrouted);
+        };
+        match op {
+            Some(op) => self.on_up(header.id(), &route, op, from, frame, faces, now),
+            None => {
+                if route.source != from {
+                    return self.dropped(SideDrop::WrongSource);
+                }
+                route.frames.fetch_add(1, Ordering::Relaxed);
+                route.bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                self.fan_out(&route, frame, header.class(), from, faces, now)
+            }
+        }
+    }
+
+    fn dropped(&self, why: SideDrop) -> SideOutcome {
+        let c = &self.counters;
+        bump(match why {
+            SideDrop::Malformed => &c.malformed,
+            SideDrop::Quarantined => &c.quarantined,
+            SideDrop::Unrouted => &c.unrouted,
+            SideDrop::WrongSource => &c.wrong_source,
+        });
+        SideOutcome::Dropped(why)
+    }
+
+    fn fan_out(
+        &self,
+        route: &Route,
+        frame: Bytes,
+        class: SideClass,
+        from: FaceId,
+        faces: &FaceTable,
+        now: u64,
+    ) -> SideOutcome {
+        let c = &self.counters;
+        let sinks = route.sinks.load();
+        let (mut live, mut delivered) = (0, 0);
+        for sink in sinks.iter() {
+            if sink.expires.load(Ordering::Relaxed) <= now {
+                continue; // lapsed; the sweep removes it
+            }
+            live += 1;
+            if sink.entry.rate_on.load(Ordering::Relaxed) && !sink.entry.admit(now, frame.len()) {
+                bump(&c.quota);
+                continue;
+            }
+            let Some(face) = faces.get(sink.face) else {
+                bump(&c.sink_full);
+                continue;
+            };
+            match face.forward_side_from(frame.clone(), class, from) {
+                Ok(()) => {
+                    delivered += 1;
+                    bump(&c.frames_out);
+                    c.bytes_out.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                }
+                Err(refused) => self.refused_by_sink(&refused),
+            }
+        }
+        SideOutcome::Routed {
+            sinks: live,
+            delivered,
+            dropped: live - delivered,
+        }
+    }
+
+    fn refused_by_sink(&self, refused: &SideRefused) {
+        let c = &self.counters;
+        bump(match refused {
+            SideRefused::Full => &c.sink_full,
+            SideRefused::Unsupported | SideRefused::PeerLacksChannels | SideRefused::NotCarried => {
+                &c.class_unsupported
+            }
+            _ => &c.sink_error,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_up(
+        &self,
+        id: u64,
+        route: &Arc<Route>,
+        op: UpOp,
+        from: FaceId,
+        frame: Bytes,
+        faces: &FaceTable,
+        now: u64,
+    ) -> SideOutcome {
+        let sinks = route.sinks.load();
+        let Some(sink) = sinks.iter().find(|s| s.face == from) else {
+            return self.dropped(SideDrop::WrongSource);
+        };
+        match op {
+            UpOp::Keep => {
+                bump(&self.counters.keeps);
+                sink.refresh(now);
+                let last = route.kept.load(Ordering::Relaxed);
+                let due = last == NEVER
+                    || now.saturating_sub(last) >= ns(self.config.limits.keep_forward_min);
+                let forwarded = due && self.up_to_source(route, frame, from, faces);
+                if forwarded {
+                    route.kept.store(now, Ordering::Relaxed);
+                    bump(&self.counters.keeps_forwarded);
+                }
+                SideOutcome::Kept { forwarded }
+            }
+            UpOp::Unsub => {
+                bump(&self.counters.unsubs);
+                let route_removed = {
+                    let mut q = self.quota.lock().unwrap();
+                    self.retain_sinks(&mut q, id, route, |s| s.face != from).1
+                };
+                let forwarded = route_removed && self.up_to_source(route, frame, from, faces);
+                SideOutcome::Unsubscribed {
+                    route_removed,
+                    forwarded,
+                }
+            }
+        }
+    }
+
+    /// Pass an `UP` record to the route's source, as a datagram, telling it
+    /// which face it came over.
+    fn up_to_source(&self, route: &Route, frame: Bytes, from: FaceId, faces: &FaceTable) -> bool {
+        let Some(source) = faces.get(route.source) else {
+            return false;
+        };
+        match source.forward_side_from(frame, SideClass::Datagram, from) {
+            Ok(()) => true,
+            Err(refused) => {
+                self.refused_by_sink(&refused);
+                false
+            }
+        }
+    }
+
+    // ---- removal ----
+
+    /// Remove the sinks of `route` that fail `keep`; the route goes with its
+    /// last sink. Returns the number of sinks removed and whether the route
+    /// was removed. The caller holds the quota lock.
+    fn retain_sinks(
+        &self,
+        q: &mut Quota,
+        id: u64,
+        route: &Arc<Route>,
+        keep: impl Fn(&Sink) -> bool,
+    ) -> (usize, bool) {
+        let current = route.sinks.load_full();
+        let kept: Vec<Arc<Sink>> = current.iter().filter(|s| keep(s)).cloned().collect();
+        let removed = current.len() - kept.len();
+        if removed == 0 {
+            return (0, false);
+        }
+        for s in current.iter().filter(|s| !keep(s)) {
+            Quota::dec(&mut q.per_sink, s.face);
+        }
+        q.sinks -= removed;
+        if kept.is_empty() {
+            let gone = self
+                .routes
+                .remove_if(&id, |_, r| Arc::ptr_eq(r, route))
+                .is_some();
+            if gone {
+                Quota::dec(&mut q.per_source, route.source);
+                q.routes -= 1;
+            }
+            (removed, gone)
+        } else {
+            route.sinks.store(Arc::new(kept));
+            (removed, false)
+        }
+    }
+
+    /// Remove `route` and every sink of it. The caller holds the quota lock.
+    fn remove_route(&self, q: &mut Quota, id: u64, route: &Arc<Route>) {
+        self.retain_sinks(q, id, route, |_| false);
+    }
+
+    fn snapshot(&self) -> Vec<(u64, Arc<Route>)> {
+        self.routes
+            .iter()
+            .map(|r| (*r.key(), Arc::clone(r.value())))
+            .collect()
+    }
+
+    /// Drop every route `face` is the source of and every sink on `face`; a
+    /// route left without sinks goes. Call when a face goes down. Keeps the
+    /// face's bar history (a barred link that is dialed again at the same id
+    /// is still barred) and drops its rate.
+    pub fn remove_face(&self, face: FaceId) {
+        {
+            let mut q = self.quota.lock().unwrap();
+            for (id, route) in self.snapshot() {
+                if route.source == face {
+                    self.remove_route(&mut q, id, &route);
+                } else {
+                    self.retain_sinks(&mut q, id, &route, |s| s.face != face);
+                }
+            }
+        }
+        if let Some(e) = self.faces.get(&face) {
+            e.set_rate(None, 0);
+        }
+    }
+
+    /// Drop the sinks that lapsed (no `Keep` within their TTL) as of `now`
+    /// (ns), and the routes left without any; also forget bar history that is
+    /// an hour old. Returns the number of sinks removed. The engine calls it
+    /// every second.
+    pub fn sweep(&self, now: u64) -> usize {
+        let mut removed = 0;
+        {
+            let mut q = self.quota.lock().unwrap();
+            for (id, route) in self.snapshot() {
+                removed += self
+                    .retain_sinks(&mut q, id, &route, |s| {
+                        s.expires.load(Ordering::Relaxed) > now
+                    })
+                    .0;
+            }
+        }
+        self.counters
+            .sinks_lapsed
+            .fetch_add(removed as u64, Ordering::Relaxed);
+        let clean = ns(BAR_CLEAN);
+        self.faces.retain(|_, e| {
+            let strikes = e.strikes.lock().unwrap();
+            let recent = strikes.count > 0 && now < strikes.last_end.saturating_add(clean);
+            e.rate_on.load(Ordering::Relaxed)
+                || e.barred_until.load(Ordering::Relaxed) > now
+                || recent
+                || Arc::strong_count(e) > 1
+        });
+        removed
+    }
+
+    /// Drop the routes and sinks whose face is no longer in `faces`: the 1 s
+    /// sweep's catch for any face that left without a `remove_face`.
+    pub fn drop_gone_faces(&self, faces: &FaceTable) {
+        let mut q = self.quota.lock().unwrap();
+        for (id, route) in self.snapshot() {
+            if faces.get(route.source).is_none() {
+                self.remove_route(&mut q, id, &route);
+            } else {
+                self.retain_sinks(&mut q, id, &route, |s| faces.get(s.face).is_some());
+            }
+        }
+    }
+
+    // ---- quarantine ----
+
+    /// Whether `face` is barred at `now` (ns).
+    pub fn is_quarantined(&self, face: FaceId, now: u64) -> bool {
+        self.latest_bar_end.load(Ordering::Relaxed) > now
+            && self
+                .faces
+                .get(&face)
+                .is_some_and(|e| e.barred_until.load(Ordering::Relaxed) > now)
+    }
+
+    /// Bar `face` until `until` (ns): frames it sends are dropped
+    /// (`quarantined`), its `Keep`s ignored, no route installed from it. An
+    /// existing longer bar is kept. NDN traffic over the face is not affected.
+    pub fn quarantine(&self, face: FaceId, until: u64) {
+        self.entry(face)
+            .barred_until
+            .fetch_max(until, Ordering::Relaxed);
+        self.latest_bar_end.fetch_max(until, Ordering::Relaxed);
+    }
+
+    /// End `face`'s bar now. Its history stays, so the next [`bar`](Self::bar)
+    /// still doubles.
+    pub fn lift(&self, face: FaceId) {
+        if let Some(e) = self.faces.get(&face) {
+            e.barred_until.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Bar `face` for the next length of its history: 60 s, doubling for each
+    /// repeat on the same face up to 1 h, and back to 60 s once the face has
+    /// been clean for an hour since its last bar ended. Returns the length
+    /// applied.
+    pub fn bar(&self, face: FaceId, now: u64) -> Duration {
+        let entry = self.entry(face);
+        let length = {
+            let mut strikes = entry.strikes.lock().unwrap();
+            if strikes.count > 0 && now >= strikes.last_end.saturating_add(ns(BAR_CLEAN)) {
+                strikes.count = 0;
+            }
+            let doubled = BAR_BASE
+                .checked_mul(1u32 << strikes.count.min(16))
+                .unwrap_or(BAR_MAX);
+            let length = doubled.min(BAR_MAX);
+            strikes.count = strikes.count.saturating_add(1);
+            strikes.last_end = strikes.last_end.max(now.saturating_add(ns(length)));
+            length
+        };
+        self.quarantine(face, now.saturating_add(ns(length)));
+        length
+    }
+
+    // ---- read ----
+
+    /// Live sinks of route `id`; a sender with none sends nothing.
+    pub fn sinks(&self, id: SideId) -> usize {
+        self.routes.get(&id.0).map_or(0, |r| r.sinks.load().len())
+    }
+
+    /// Routes that have `face` as their source or as a sink.
+    pub fn routes_to(&self, face: FaceId) -> usize {
+        let q = self.quota.lock().unwrap();
+        q.per_source.get(&face).copied().unwrap_or(0) + q.per_sink.get(&face).copied().unwrap_or(0)
+    }
+
+    /// Every route, ordered by id. Read-only.
+    pub fn list(&self) -> Vec<RouteInfo> {
+        let now = self.now();
+        let mut out: Vec<RouteInfo> = self
+            .snapshot()
+            .into_iter()
+            .map(|(id, route)| RouteInfo {
+                id,
+                source: route.source,
+                sinks: route
+                    .sinks
+                    .load()
+                    .iter()
+                    .map(|s| SinkInfo {
+                        face: s.face,
+                        expires_in: Duration::from_nanos(
+                            s.expires.load(Ordering::Relaxed).saturating_sub(now),
+                        ),
+                    })
+                    .collect(),
+                frames: route.frames.load(Ordering::Relaxed),
+                bytes: route.bytes.load(Ordering::Relaxed),
+                age: Duration::from_nanos(now.saturating_sub(route.created)),
+            })
+            .collect();
+        out.sort_by_key(|r| r.id);
+        out
+    }
+
+    /// The faces currently barred, with when each bar ends (ns).
+    pub fn quarantined(&self) -> Vec<(FaceId, u64)> {
+        let now = self.now();
+        let mut out: Vec<(FaceId, u64)> = self
+            .faces
+            .iter()
+            .filter_map(|e| {
+                let until = e.barred_until.load(Ordering::Relaxed);
+                (until > now).then_some((*e.key(), until))
+            })
+            .collect();
+        out.sort_by_key(|(f, _)| f.0);
+        out
+    }
+
+    /// The counters.
+    pub fn stats(&self) -> SideStats {
+        let (routes, sinks) = {
+            let q = self.quota.lock().unwrap();
+            (q.routes as u64, q.sinks as u64)
+        };
+        let c = &self.counters;
+        let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let refused = |r: SideRefusal| get(&c.refused[r.index()]);
+        SideStats {
+            routes,
+            sinks,
+            frames_in: get(&c.frames_in),
+            bytes_in: get(&c.bytes_in),
+            frames_out: get(&c.frames_out),
+            bytes_out: get(&c.bytes_out),
+            unrouted: get(&c.unrouted),
+            wrong_source: get(&c.wrong_source),
+            malformed: get(&c.malformed),
+            class_unsupported: get(&c.class_unsupported),
+            quota: get(&c.quota),
+            quarantined: get(&c.quarantined),
+            sink_full: get(&c.sink_full),
+            sink_error: get(&c.sink_error),
+            keeps: get(&c.keeps),
+            keeps_forwarded: get(&c.keeps_forwarded),
+            unsubs: get(&c.unsubs),
+            sinks_lapsed: get(&c.sinks_lapsed),
+            refused_table_full: refused(SideRefusal::TableFull),
+            refused_source_full: refused(SideRefusal::SourceFull),
+            refused_sink_cap: refused(SideRefusal::SinkCap),
+            refused_sink_face_full: refused(SideRefusal::SinkFaceFull),
+            refused_source_mismatch: refused(SideRefusal::SourceMismatch),
+            refused_sink_is_source: refused(SideRefusal::SinkIsSource),
+            refused_quarantined: refused(SideRefusal::Quarantined),
+            refused_face_gone: refused(SideRefusal::FaceGone),
+        }
+    }
+}

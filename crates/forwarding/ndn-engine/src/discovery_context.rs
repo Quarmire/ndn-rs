@@ -109,6 +109,7 @@ impl FaceLifecycleContext for EngineDiscoveryContext {
         }
         inner.face_states.insert(face_id, state);
         inner.face_table.insert_arc(Arc::clone(&face));
+        inner.side.configure_face(face_id, kind);
 
         let discovery = Arc::clone(&inner.discovery);
         let discovery_ctx = inner
@@ -135,6 +136,7 @@ impl FaceLifecycleContext for EngineDiscoveryContext {
                     discovery_ctx: ctx,
                     runtime: Arc::clone(&inner.runtime),
                     face_lifecycle_sink: inner.face_lifecycle_sink.get().cloned(),
+                    side: Arc::clone(&inner.side),
                 },
             )));
         }
@@ -163,6 +165,7 @@ impl FaceLifecycleContext for EngineDiscoveryContext {
                     discovery_ctx,
                     runtime: Arc::clone(&inner.runtime),
                     face_lifecycle_sink: inner.face_lifecycle_sink.get().cloned(),
+                    side: Arc::clone(&inner.side),
                 },
             )));
 
@@ -179,6 +182,7 @@ impl FaceLifecycleContext for EngineDiscoveryContext {
         }
         inner.rib.handle_face_down(face_id, &inner.fib);
         inner.fib.remove_face(face_id);
+        inner.side.remove_face(face_id);
         inner.face_table.remove(face_id);
     }
 }

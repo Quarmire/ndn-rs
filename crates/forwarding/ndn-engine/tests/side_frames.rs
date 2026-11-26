@@ -1,6 +1,7 @@
 //! A side frame (first octet `SIDE_MARKER`) is peeled by the face reader before
-//! the NDN pipeline: it is counted per face and dropped, never decoded, never
-//! a PIT entry, never a malformed packet, never an inbound-queue drop, and it
+//! the NDN pipeline and handed to the engine's side table: with no route for its
+//! id it is dropped and counted `unrouted`, never decoded, never a PIT entry,
+//! never a malformed packet, never an inbound-queue drop, never a Nack, and it
 //! changes nothing about the NDN packet that follows it on the same face.
 
 use std::sync::atomic::Ordering;
@@ -65,6 +66,13 @@ async fn a_marked_frame_never_enters_the_ndn_pipeline() {
         let a = states.get(&FaceId(FACE_A)).expect("face A state");
         let c = &a.counters;
         assert_eq!(c.in_side_frames.load(Ordering::Relaxed), 1);
+        let side = engine.side().stats();
+        assert_eq!(
+            (side.frames_in, side.unrouted),
+            (1, 1),
+            "the side table saw the frame and dropped it: no route has its id"
+        );
+        assert_eq!(side.frames_out, 0);
         assert_eq!(c.in_side_bytes.load(Ordering::Relaxed), marked.len() as u64);
         assert_eq!(c.in_drops.load(Ordering::Relaxed), 0, "not an inbound drop");
         assert_eq!(

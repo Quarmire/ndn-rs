@@ -52,6 +52,7 @@ pub(crate) async fn run_face_reader(
         discovery_ctx,
         runtime,
         face_lifecycle_sink,
+        side,
     } = ctx;
     let kind = face.kind();
     let persistency = face_states
@@ -87,9 +88,10 @@ pub(crate) async fn run_face_reader(
                 // A side frame (`ndn_transport::side`) is not an NDN packet: peel it
                 // here, with one comparison, before LP detection and before the
                 // bounded pipeline channel, so it never costs a PIT entry, a spawned
-                // task, an `in_drops` count or a malformed-packet verdict. The engine
-                // has no side route table yet, so the frame is counted per face and
-                // dropped; the place a route table's `on_frame` goes is here.
+                // task, an `in_drops` count or a malformed-packet verdict. The side
+                // table routes it (or drops it, counted, when no route matches); the
+                // call never blocks, so this reader keeps reading the face's NDN
+                // packets whatever a sink does with the frame.
                 if raw.first() == Some(&SIDE_MARKER) {
                     if let Some(state) = face_states.get(&face_id) {
                         state
@@ -101,7 +103,8 @@ pub(crate) async fn run_face_reader(
                             .in_side_bytes
                             .fetch_add(raw.len() as u64, Ordering::Relaxed);
                     }
-                    debug!(target: t::FACE_SYSTEM, face=%face_id, len=raw.len(), "face-reader: side frame has no route, dropped");
+                    let outcome = side.on_frame(face_id, raw, &face_table);
+                    trace!(target: t::FACE_SYSTEM, face=%face_id, ?outcome, "face-reader: side frame");
                     continue;
                 }
                 trace!(target: t::FACE_SYSTEM, face=%face_id, len=raw.len(), "face-reader: recv");
@@ -187,6 +190,7 @@ pub(crate) async fn run_face_reader(
         FaceKind::App => {
             rib.handle_face_down(face_id, &fib);
             fib.remove_face(face_id);
+            side.remove_face(face_id);
             debug!(target: t::FACE_SYSTEM, face=%face_id, "app face stopped sending: its routes removed");
             if errored {
                 drop(tx);
@@ -206,6 +210,7 @@ pub(crate) async fn run_face_reader(
             }
             rib.handle_face_down(face_id, &fib);
             fib.remove_face(face_id);
+            side.remove_face(face_id);
             face_table.remove(face_id);
             pit.remove_face(face_id.0);
             debug!(target: t::FACE_SYSTEM, face=%face_id, "app face removed");
@@ -232,6 +237,7 @@ pub(crate) async fn run_face_reader(
                     state.cancel.cancel();
                 }
                 face_table.remove(face_id);
+                side.remove_face(face_id);
                 debug!(target: t::FACE_SYSTEM, face=%face_id, "persistent face dropped on connection loss (routes kept for re-dial)");
             }
             FacePersistency::OnDemand => {
@@ -246,6 +252,7 @@ pub(crate) async fn run_face_reader(
                 }
                 rib.handle_face_down(face_id, &fib);
                 fib.remove_face(face_id);
+                side.remove_face(face_id);
                 face_table.remove(face_id);
                 debug!(target: t::FACE_SYSTEM, face=%face_id, "on-demand face removed from table (FIB routes cleaned)");
             }

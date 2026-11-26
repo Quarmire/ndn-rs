@@ -90,6 +90,9 @@ pub struct EngineConfig {
     /// `true` on a multi-tenant host so a local app cannot poison the CS or spoof
     /// another namespace; applied to every program face as it is added.
     pub require_local_validation: bool,
+    /// The fan-out table for side (channel) frames: its bounds and the
+    /// per-face rate defaults by face kind. See [`crate::side`].
+    pub side: crate::side::SideConfig,
 }
 
 pub use crate::replay_guard_config::ReplayGuardConfig;
@@ -107,6 +110,7 @@ impl Default for EngineConfig {
             network_region: Vec::new(),
             unsolicited_data: crate::unsolicited::UnsolicitedDataPolicy::default(),
             data_plane: crate::dispatcher::DataPlane::default(),
+            side: crate::side::SideConfig::default(),
         }
     }
 }
@@ -532,6 +536,10 @@ impl EngineBuilder {
 
         let reflexive = Arc::new(crate::reflexive::ReflexiveTable::new(self.config.reflexive));
         let transit = Arc::new(crate::transit::TransitPrefixes::default());
+        let side = Arc::new(crate::side::SideTable::new(
+            self.config.side,
+            Arc::clone(&runtime),
+        ));
 
         // Must outlive the expiry task, which credits `NUnsatisfiedInterests`
         // on the in-faces of timed-out PIT entries.
@@ -560,6 +568,8 @@ impl EngineBuilder {
             let rib_clone = Arc::clone(&rib);
             let fib_clone = Arc::clone(&fib);
             let reflexive_clone = Arc::clone(&reflexive);
+            let side_clone = Arc::clone(&side);
+            let face_table_clone = Arc::clone(&face_table);
             let cancel_clone = cancel.clone();
             let runtime_clone = Arc::clone(&runtime);
             tasks.spawn(async move {
@@ -567,6 +577,8 @@ impl EngineBuilder {
                     rib_clone,
                     fib_clone,
                     reflexive_clone,
+                    side_clone,
+                    face_table_clone,
                     cancel_clone,
                     runtime_clone,
                 )
@@ -700,6 +712,7 @@ impl EngineBuilder {
             neighbors: Arc::clone(&neighbors),
             reflexive: Arc::clone(&reflexive),
             transit: Arc::clone(&transit),
+            side: Arc::clone(&side),
             discovery_ctx: OnceLock::new(),
             runtime: Arc::clone(&runtime),
             face_lifecycle_sink: OnceLock::new(),
@@ -818,6 +831,7 @@ impl EngineBuilder {
             discovery: Arc::clone(&discovery),
             discovery_ctx: Arc::clone(&discovery_ctx),
             reflexive: Arc::clone(&reflexive),
+            side: Arc::clone(&side),
             rate_limit: self.rate_limit_hook.clone(),
             congestion_feedback: congestion_fb,
             name_activity: self.name_activity,
@@ -864,6 +878,7 @@ impl EngineBuilder {
             let face_table_clone = Arc::clone(&face_table);
             let fib_clone = Arc::clone(&fib);
             let rib_clone = Arc::clone(&rib);
+            let side_clone = Arc::clone(&side);
             let cancel_clone = cancel.clone();
             let d = Arc::clone(&discovery);
             let ctx = Arc::clone(&discovery_ctx);
@@ -874,6 +889,7 @@ impl EngineBuilder {
                     face_table_clone,
                     fib_clone,
                     rib_clone,
+                    side_clone,
                     cancel_clone,
                     d,
                     ctx,

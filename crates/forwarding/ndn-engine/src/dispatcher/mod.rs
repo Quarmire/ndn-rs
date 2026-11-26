@@ -39,6 +39,9 @@ pub(crate) struct FaceRunnerCtx {
     /// Optional sink observing `Up` / `Down` transitions; face tasks
     /// short-circuit the publish path when `None`.
     pub(crate) face_lifecycle_sink: Option<Arc<dyn ndn_transport::FaceLifecycleSink>>,
+    /// The fan-out table: the reader peels side frames into it; a face going
+    /// down takes its routes with it.
+    pub(crate) side: Arc<crate::side::SideTable>,
 }
 
 pub(crate) struct InboundPacket {
@@ -82,6 +85,9 @@ pub struct PacketDispatcher {
     pub discovery: Arc<dyn DiscoveryProtocol>,
     pub discovery_ctx: Arc<EngineDiscoveryContext>,
     pub reflexive: Arc<crate::reflexive::ReflexiveTable>,
+    /// Fan-out table for side frames: the data path installs routes from a
+    /// Data's `SideRoute` header; the face reader peels side frames into it.
+    pub side: Arc<crate::side::SideTable>,
     pub runtime: Arc<dyn ndn_runtime::Runtime>,
     /// `None` is the zero-cost path: every probe site short-circuits on
     /// `Option::is_none`, so the per-packet cost is one untaken branch.
@@ -121,6 +127,7 @@ impl PacketDispatcher {
 
         for face_id in dispatcher.face_table.face_ids() {
             if let Some(face) = dispatcher.face_table.get(face_id) {
+                dispatcher.side.configure_face(face_id, face.kind());
                 // The face's own token, a child of the engine's: removing the
                 // face stops its sender and reader, not the engine.
                 let face_cancel = match dispatcher.face_states.get(&face_id) {
@@ -168,6 +175,7 @@ impl PacketDispatcher {
                                 // sink is installed by `mount_management`
                                 // after build, so no subscriber exists yet.
                                 face_lifecycle_sink: None,
+                                side: Arc::clone(&dispatcher.side),
                             },
                         )
                         .instrument(tracing::info_span!(
@@ -191,6 +199,7 @@ impl PacketDispatcher {
                     discovery_ctx: Arc::clone(&dispatcher.discovery_ctx),
                     runtime: Arc::clone(&dispatcher.runtime),
                     face_lifecycle_sink: None,
+                    side: Arc::clone(&dispatcher.side),
                 };
                 tasks.spawn(
                     async move {
