@@ -24,7 +24,9 @@ use super::key::ChannelKey;
 use super::limits::{MESSAGE_DEFAULT, MESSAGE_MAX, STREAM_FRAME_MAX};
 use super::message::{Message, Origin};
 use super::table::name_octets;
-use super::tx::{BURST_GAP, KeySource, Refused, SEQ_END, TxChannel, TxStats};
+use super::tx::{
+    BURST_GAP, KeySource, QUEUE_BYTES, Refused, SEQ_END, SINCE_REPLAY_EVERY, TxChannel, TxStats,
+};
 use super::verbs::{Congestion, EmitError, EmitOptions, Window};
 use super::wire::ChannelMode;
 use crate::rt::{Instant, Tasks};
@@ -839,6 +841,100 @@ async fn window_keeps_at_most_its_limits_and_replays_them_to_a_joiner() {
         (window.messages, window.bytes, window.ms),
         (4096, 16 << 20, 300_000)
     );
+}
+
+/// A `Window` channel that sent `messages` messages of `size` octets under one name, a joiner
+/// not yet welcomed, and a stream that takes one small frame and then stalls.
+async fn stalled_window(messages: usize, size: usize) -> Rig {
+    let rig = rig(
+        ChannelMode::Window,
+        LinkConfig {
+            stream_window: 16 * 1024,
+            ..LinkConfig::default()
+        },
+    );
+    let window = EmitOptions::window(Window {
+        messages,
+        bytes: QUEUE_BYTES,
+        age: Duration::from_secs(3_600),
+    });
+    for i in 0..messages {
+        send(&rig, &name(1), &vec![i as u8; size], &window, rig.t0).await;
+        settle(&rig.tx).await;
+        let _ = rig.link.take_stream();
+    }
+    // The first welcome binds the name and fills the stalled stream.
+    rig.tx.welcome(true, None, rig.t0);
+    rig
+}
+
+/// A receiver that asks again and again with `ASK_SINCE` must not grow the sender's FIFO past
+/// `queue_bytes`, whatever the pace of its asks and however long the stream is stalled (M4).
+#[tokio::test]
+async fn repeated_since_asks_do_not_grow_the_fifo_past_queue_bytes() {
+    let rig = stalled_window(256, 4_000).await;
+    for second in 1..=100u64 {
+        rig.tx.welcome(false, Some(0), at(&rig, 2 * second));
+        tokio::task::yield_now().await;
+    }
+    let queued = rig.tx.queued_bytes();
+    assert!(
+        queued <= QUEUE_BYTES,
+        "100 asks for a window of {} octets (a stalled stream) left {queued} octets in a queue \
+         of {QUEUE_BYTES}",
+        256 * 4_000
+    );
+    assert!(
+        rig.stats.replay_refused.get() > 0,
+        "and the refusals are counted"
+    );
+}
+
+/// At most one `since` replay a second per channel: the second ask within the second is given
+/// the session and no replay, counted, and the next second's is replayed again.
+#[tokio::test]
+async fn a_since_replay_is_given_once_a_second_per_channel() {
+    let mut rig = rig(ChannelMode::Window, LinkConfig::default());
+    for i in 0..20u8 {
+        send(
+            &rig,
+            &name(1),
+            &[i; 10],
+            &EmitOptions::window(Window::DEFAULT),
+            rig.t0,
+        )
+        .await;
+        settle(&rig.tx).await;
+        let _ = rig.link.take_stream();
+    }
+    let replayed = |rig: &mut Rig| messages(&stream(rig)).len();
+    let asked = |rig: &mut Rig, at: Instant| {
+        rig.tx.welcome(false, Some(0), at);
+        replayed(rig)
+    };
+    let t = rig.t0 + Duration::from_secs(5);
+    rig.tx.welcome(false, Some(0), t);
+    settle(&rig.tx).await;
+    assert_eq!(replayed(&mut rig), 20, "the first ask is replayed");
+    let again = asked(&mut rig, t + SINCE_REPLAY_EVERY / 2);
+    settle(&rig.tx).await;
+    assert_eq!(
+        again + replayed(&mut rig),
+        0,
+        "a second ask within the second is not"
+    );
+    assert_eq!(rig.stats.replay_refused.get(), 1);
+    rig.tx.welcome(false, Some(0), t + SINCE_REPLAY_EVERY);
+    settle(&rig.tx).await;
+    assert_eq!(
+        replayed(&mut rig),
+        20,
+        "a second later it is replayed again"
+    );
+    // A joiner that was not a receiver before is given its replay whenever it comes.
+    rig.tx.welcome(true, None, t + SINCE_REPLAY_EVERY);
+    settle(&rig.tx).await;
+    assert_eq!(replayed(&mut rig), 20);
 }
 
 #[tokio::test]

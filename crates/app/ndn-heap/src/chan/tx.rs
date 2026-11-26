@@ -73,6 +73,10 @@ pub(crate) const FRAME_CAP: usize = 9_000;
 /// When a `Drop` emission that found the queue full of what cannot be dropped may try again.
 pub(crate) const CONGESTED_RETRY: Duration = Duration::from_millis(100);
 
+/// The shortest time between two replays of the window to a receiver that is not new (an ask with
+/// `ASK_SINCE`), per channel.
+pub(crate) const SINCE_REPLAY_EVERY: Duration = Duration::from_secs(1);
+
 /// Sequences are below this: 2^62 − 1, the largest value of the varint in which `HELLO` and a
 /// replayed message carry a sequence (and so below the frame's own limit of 2^63).
 pub(crate) const SEQ_END: u64 = varint::MAX;
@@ -120,6 +124,9 @@ pub(crate) struct TxStats {
     pub(crate) seal_failed: Counter,
     /// Replayed messages (standing and window) queued for a new session.
     pub(crate) replayed: Counter,
+    /// Window replays asked for with `ASK_SINCE` and not queued: within a second of the last, or
+    /// more than the queue holds.
+    pub(crate) replay_refused: Counter,
     /// Frames by the messages they carry: 1, 2, 3-4, 5-8, 9-16, 17-32, 33-64, 65-128, 129-255.
     pub(crate) by_count: [Counter; 9],
 }
@@ -212,6 +219,8 @@ struct State {
     /// `ending` was set where the stream's writer could not be spawned (the state's lock is held
     /// by the emission): the emission spawns it once the lock is released.
     end_kick: bool,
+    /// When the window was last replayed to a receiver that is not new (an `ASK_SINCE`).
+    since_replayed: Option<Instant>,
 }
 
 impl State {
@@ -406,6 +415,7 @@ impl TxChannel {
                 ended: false,
                 ending: false,
                 end_kick: false,
+                since_replayed: None,
             }),
             room: Notify::new(),
             drain_requested: AtomicU64::new(0),
@@ -1535,9 +1545,12 @@ impl TxChannel {
         let mut replay = Vec::new();
         if replay_window {
             let window = st.window;
-            for held in st.history.since(since, &window, now) {
-                if let Some(used) = self.replay_binding(&mut st, &held.name, now) {
-                    replay.push((held, used));
+            let held = st.history.since(since, &window, now);
+            if fresh || self.since_replay_allowed(&mut st, &held, now) {
+                for held in held {
+                    if let Some(used) = self.replay_binding(&mut st, &held.name, now) {
+                        replay.push((held, used));
+                    }
                 }
             }
         }
@@ -1587,6 +1600,37 @@ impl TxChannel {
         terms
     }
 
+    /// Whether a receiver that is not new may be replayed `held` (what its `ASK_SINCE` asked
+    /// for): at most once per [`SINCE_REPLAY_EVERY`] per channel, and only while the stream's
+    /// FIFO has room for it under `queue_bytes`. A receiver asks as often as its signature
+    /// allows, and each replay goes to every receiver on the route and waits in the FIFO behind a
+    /// stream that may be stalled; what is refused is counted (`replay_refused`) and the
+    /// receiver's gap stands as `Lagged` until its next ask (the session's `S_SEQ` tells it the
+    /// window was not replayed).
+    fn since_replay_allowed(&self, st: &mut State, held: &[Held], now: Instant) -> bool {
+        if held.is_empty() {
+            return true;
+        }
+        let wanted: usize = held.iter().map(|h| h.payload.len()).sum();
+        let soon = st
+            .since_replayed
+            .is_some_and(|at| now.saturating_duration_since(at) < SINCE_REPLAY_EVERY);
+        let fits = st.fifo.data_bytes().saturating_add(wanted) <= self.queue_bytes;
+        if soon || !fits {
+            self.stats.replay_refused.bump();
+            tracing::debug!(
+                channel = self.id,
+                soon,
+                fits,
+                wanted,
+                "a window replay asked for with ASK_SINCE was not queued"
+            );
+            return false;
+        }
+        st.since_replayed = Some(now);
+        true
+    }
+
     /// The id a replayed message of the name with these octets carries (it names itself, so the
     /// id only has to be unique): the bound one, or a new bind.
     fn replay_binding(&self, st: &mut State, octets: &Bytes, now: Instant) -> Option<Use> {
@@ -1629,6 +1673,12 @@ impl TxChannel {
     pub(crate) fn pending(&self) -> usize {
         let st = self.state.lock();
         st.latest.len() + st.big.len() + st.fifo.len()
+    }
+
+    /// Payload octets waiting in the stream's FIFO (a test asks).
+    #[cfg(test)]
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.state.lock().fifo.data_bytes()
     }
 
     /// Hashes in the ring of sent frames (a test asks).
