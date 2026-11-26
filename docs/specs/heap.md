@@ -1381,7 +1381,7 @@ blob's root are inside the ciphertext. The entry is
 is cut, so holders of the pieces see only its size.
 
 A reader opens a sealed entry with the key of the epoch it names; without the
-key the entry is **held closed**: kept, chained, its path unknown. `get` on a
+key the entry is **held closed**: kept, chained, its path unknown. `kept` on a
 space with any entry held closed answers `NotReady` (`RetryLater`) to a reader
 whose key is on its way by grant, and `Sealed` otherwise (the path of a closed
 entry is unknown, so no answer would be complete; §10.3).
@@ -2114,7 +2114,7 @@ Pieces still owed are asked for again while the node lists the value as owed
 
 ### 8.6 Reading a blob head
 
-`get` of a path whose head is a blob answers the item only when the value is
+`kept` of a path whose head is a blob answers the item only when the value is
 recorded whole (`assembled/<entry name>`, §4.3) and the root, every node and
 every chunk verify as it is read and, if sealed, the value opens; otherwise
 `Unavailable` (`RetryLater`) and a background fetch of the missing pieces. A
@@ -2764,7 +2764,10 @@ impl Heap {
     pub fn name(&self) -> &Name;
     pub async fn put(&self, path: &Name, bytes: Bytes, opts: PutOptions)
                      -> Result<EntryId, HeapError>;
-    pub async fn get(&self, path: &Name) -> Result<Option<Item>, HeapError>;
+    pub async fn kept(&self, path: &Name) -> Result<Option<Item>, HeapError>;
+    pub fn get(&self, what: Select, opts: GetOptions) -> Result<Items, HeapError>;
+    pub async fn emit(&self, path: &Name, bytes: Bytes, opts: EmitOptions)
+                      -> Result<(), EmitError>;
     pub async fn watch(&self, since: &Frontier) -> Result<Changes, HeapError>;
     // `Frontier::everything()`: everything held now is seen, so no head is replayed and no value read; only what follows is told.
     pub fn members(&self) -> Members;
@@ -2782,6 +2785,15 @@ pub enum Readers { Anyone, Persons(Vec<Name>) }
 pub struct MembersChange { pub add_writers: Vec<Name>, pub add_readers: Vec<Name>,
                            pub remove: Vec<Name> }
 pub struct Members { pub owner: Name, pub writers: Vec<Name>, pub readers: Readers }
+pub enum Select { Path(Name), Prefix(Name) }
+pub struct GetOptions { pub kept: bool, pub live: Live, pub modes: Modes,
+                        pub trust: Trust, pub congestion: Congestion }   // kept: true, Live::Emitted by default
+pub struct Items;   // Stream<Item = Result<Got, GetNotice>>; next, next_batch, caught_up, hello_seen
+pub struct Got { pub path: Name, pub bytes: Bytes, pub by: Name, pub writer: Name, pub kind: Kind }
+pub enum Kind { Kept(Kept), Emitted(Emitted) }
+pub struct Kept { pub id: EntryId, pub as_of: Option<Duration>, pub removed: bool }
+pub enum GetNotice { Lagged { missed: u64 }, Withdrawn { id: EntryId, why: Refusal },
+                     LiveEnded(LiveEnd), Retracted { writer: Name, from: u64, to: u64 } }
 ```
 
 A `Heap` is a cheap handle, `Clone`, on one space of one node. `Item.by` is the
@@ -2796,7 +2808,7 @@ the owner first and the rest in NDN canonical order.
 1. *What `Ok` says.* The entry is signed by this device's key, chained to the
    one before (§3.6), stored in **one** batch with its records and, for a value
    in pieces, its pieces (§4.4), applied to the register, and handed to the
-   in-order publisher: `get` on this node answers the value and every watcher
+   in-order publisher: `kept` on this node answers the value and every watcher
    of this node has been told (a value in pieces: once its pieces are whole
    here), before `put` returns, and the entry is served and announced as
    soon as the publisher releases it (§4.6, §7.6). The `EntryId` names the
@@ -2835,7 +2847,7 @@ device's own key is revoked by a context held here, `Untrusted`, or marked
 suspected, `Suspected`, §9.8: it signs nothing), `Local` (the disk, the keys, or
 a closing node). It never refuses for what a peer holds.
 
-**`get(path)`** reads what this node holds and never waits for the network:
+**`kept(path)`** reads what this node holds and never waits for the network:
 `Some(item)` the value, `None` for a path that has none or was removed. Stale,
 never wrong (§1.3 invariant 5): a path the node has not caught up on answers
 what it holds. `Unavailable` (`RetryLater`) answers for a value in pieces that is
@@ -2843,9 +2855,54 @@ not whole here yet (§8.6); it is being fetched. `Sealed` (`AskOwner`) answers
 when the space is sealed and this node's person is neither the owner nor a
 listed reader. While any entry of a sealed space is held closed (its epoch key
 has not arrived, so its path is unknown and no answer would be complete, §6.4)
-`get` answers `NotReady` (`RetryLater`) to a reader that is entitled to every
+`kept` answers `NotReady` (`RetryLater`) to a reader that is entitled to every
 key it lacks, the keys being on their way by the grant pull (§7.8), and `Sealed`
 otherwise.
+
+**`get(what, opts)`** is the one stream of the space: its kept values and their
+changes merged with the emissions of its channels ([channel.md](channel.md)
+§17 states every rule exactly). It is synchronous and does no network I/O;
+when it returns the kept watcher and, with `Live::Emitted`, the emission sink
+are registered, so nothing after the call is lost. Each item says what it is
+(`Got.kind`): **`Kept`** is the register's head of a path (`Kept.id`, durable,
+signed, `removed: true` with empty `bytes` for a removal), **`Emitted`** is an
+ephemeral message of a channel and is never the current value of a path.
+
+1. *Order.* The kept listing first, always: every path under `what` with a
+   value, in path order, as `Put` of `watch` lists them (§10.4); `Items::caught_up`
+   resolves once it was yielded. Emissions that arrive during the listing come
+   after it. Then the kept changes and the emissions alternate fairly, neither
+   starving the other, with no order promised between the two. Kept items are in
+   the order the register applied the changes, never an older value of a path
+   after a newer; emitted items are in the mode's order.
+2. *Duplicates.* A path both put and emitted gives two items, one `Kept` and one
+   `Emitted`, never merged or deduplicated; no emission is suppressed by a put. A
+   kept entry is given once per `Items`, also after a lag. A `stand` replay is
+   `Emitted` with `stands`. An application takes `kind` as the authority: `Kept`
+   is durable and signed, `Emitted` is not.
+3. *A slow reader never loses a kept value.* The kept queue is `watch`'s
+   (`Config.watch_queue`), but it is not told `Lagged`: when it overflowed, the
+   stream reads the heads again under the space's lock, in the step that
+   forgets what was dropped, and gives every path's current value it did not
+   give (and a removal for a path it gave that has none now). A path that changed
+   several times meanwhile is given its latest value; the intermediate ones are
+   skipped by state, and the log and `watch` have the history. An emitted queue
+   follows the mode (channel.md §17.5): `Latest` keeps the newest per name and tells
+   `Lagged` past its bound, `Reliable` and `Window` stall the sender (`Block`) or
+   drop the oldest and tell `Lagged` (`Drop`).
+4. *`by` and `writer`.* For `Kept`, the writing device and the person of the
+   trust context that validated its key; for `Emitted`, the sender's device and
+   its person as judged when the session was set up.
+5. *Entries refused after the fact* are told `GetNotice::Withdrawn { id, why }` if
+   this stream gave `id` as the value of its path; the entry it superseded
+   returns as the next `Kept`. `Members` and `Alert` changes are not data and
+   are not given (`watch` has them).
+
+`get` refuses with `BadRequest` for `kept: false` with `Live::Off` (it asks for
+nothing), `NotAllowed` for `Live::Emitted` on a space this device only follows
+(it may read kept values with `Live::Off`), and `Sealed` for kept values of a
+sealed space whose audience does not list this device's person (also a member
+removed since). `put` and `emit` need a writer, `get` a reader or a writer.
 
 **`watch(since)`** is §10.4. **`members()`** answers who the space lists now,
 from the fold (§5.4), the owner first; it never waits. **`ready()`** says the
@@ -2873,7 +2930,7 @@ member, inside the cut if removed, and the entry was neither refused, waiting
 on a removal cut, held closed for want of its epoch's key, unreadable, nor
 withdrawn since (§3.8, re-check). An entry never held, or held as other bytes
 at its name, is not applied. Every applied entry counts, one a later write
-superseded too: `get` shows only the heads, `applied` is how a host (or the
+superseded too: `kept` shows only the heads, `applied` is how a host (or the
 suite's "device D holds entry E") sees the entries below them. It reads the
 space's records under the space's lock, never waits for the network or the
 disk's flush, and is not a durability statement (§4.9).
@@ -2908,7 +2965,7 @@ pub struct Frontier(/* device → seq */);   // new(), everything(), get(&Name) 
 pub struct Changes;  // async fn next(&mut self) -> Option<Result<Change, HeapError>>; a Stream
 ```
 
-`watch(since)` answers `Sealed` as `get` does for a person outside the
+`watch(since)` answers `Sealed` as `kept` does for a person outside the
 audience, then registers a queue **and** takes its first listing under one lock,
 so no change falls between them and none is told twice. A watcher is told, in
 this order:
@@ -2942,13 +2999,20 @@ and the node stopped or the space left.
 change that does not fit is dropped and counted, and so is every later one until
 the watcher has read what was queued; it is then told `Lagged { missed }`, and
 the changes after that arrive again. A host that is told `Lagged` MUST discard
-what it derived from the stream and `watch(&Frontier::new())` again (or `get`
+what it derived from the stream and `watch(&Frontier::new())` again (or `kept`
 what it shows): the dropped changes are not recoverable one by one, and alerts
 may be among them (a new watch is told the standing ones again, §10.6). A slow
 watcher never slows a put, a fetch or another watcher.
 
 The item of `Changes::next` is a `Result` so that the stream and the calls share
 one error type; the stream defines no failure of its own and yields only `Ok`.
+
+**`get` is built on the same register** and the same first-listing-then-live
+order, filtered to its selector: it is not a second source of truth for kept
+data. Unlike `watch` it is never told `Lagged` (the host is told nothing it has
+to repair: §10.3 `get`), it lists in path order only the heads with a value (no
+alerts, no standing alerts, no `Members`), and it is not resumable (`watch` with
+a `Frontier` is).
 
 ### 10.5 Errors
 
@@ -3003,10 +3067,10 @@ decided show what they decided before.
 
 ### 10.7 Sealed spaces
 
-- **A reader is an audience member.** `get` and `watch` of a sealed space answer
+- **A reader is an audience member.** `kept`, `get` and `watch` of a sealed space answer
   `Sealed` to a node whose person is neither the owner nor a standing reader.
   Opening what the audience may read needs the key of the epoch an entry
-  names, which arrives by grant (§6.5); until it has, `get` answers `NotReady`
+  names, which arrives by grant (§6.5); until it has, `kept` answers `NotReady`
   (`RetryLater`) to a reader entitled to the key and `Sealed` to one that is not
   (§10.3).
 - **A writer that is not a reader cannot seal.** Writing needs the key of the
@@ -3023,7 +3087,7 @@ decided show what they decided before.
   epoch.
 - **A reader added later** names the epoch in force and reads its history; an
   epoch that ended before it was added stays closed to it (§6.6).
-- **A public space** seals nothing: `Readers::Anyone`, no epochs, `get` and
+- **A public space** seals nothing: `Readers::Anyone`, no epochs, `kept`, `get` and
   `watch` answer everybody.
 - **Channels.** A reader of a sealed space that is in the audience of the epoch in
   force may receive a channel of it (§11.3); sending stays with writers.
@@ -3552,12 +3616,12 @@ measured 0.64, 1.17 and 28.9 ms, two worker threads 0.43, 0.81 and 19.3.
 **Cold open of 100,000 entries** (fjall, 120 MiB on disk, 100,000 paths, 15,300
 puts a second to build): the store opens in 0.83 to 0.91 s, `Node::start` takes
 2.1 to 2.4 s after a clean close and 2.5 to 3.1 s after `shutdown` (an unclean
-start), the first `get` answers in 0.04 to 1.2 ms, and a watcher's first
-listing takes 0.63 to 0.69 s. Start plus first `get` (0.9 s of store open
+start), the first `kept` answers in 0.04 to 1.2 ms, and a watcher's first
+listing takes 0.63 to 0.69 s. Start plus first `kept` (0.9 s of store open
 included) is under 5 s; the layer has no checkpoint, and a start over 5 s is to
 be reported to the owner of the layer, checkpoints being a later work. With
 1,000 paths of 100 versions each: store open 57 ms, `Node::start` 0.28
-to 0.40 s, first `get` 0.014 ms, listing 5.4 ms.
+to 0.40 s, first `kept` 0.014 ms, listing 5.4 ms.
 
 ### 13.9 The sibling surface (this layer only)
 

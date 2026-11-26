@@ -112,7 +112,7 @@ A channel's life is bounded by five things, each a signed record or a local fact
 
 ### 4.2 Who may call what
 
-A device **sends** only as a writer; it **receives** as a reader or a writer the record lists. A follower (a node that follows the space's group but is no member) takes no part. A `guest` or `node` device never sends or receives.
+A device **sends** only as a writer; it **receives** as a reader or a writer the record lists. A follower (a node that follows the space's group but is no member) takes no part in channels: `get` refuses it `Live::Emitted`, and it may read kept values with `Live::Off` (§17.7). A `guest` or `node` device never sends or receives.
 
 ## 5. Surface
 
@@ -435,7 +435,7 @@ Nonce `02000000 1122334455667788`. Frame, 57 octets:
 
 ## 12. The receiver
 
-What a device does with the frames of the sessions it holds as a receiver (§3.4), from the octets the host read to the `Items` of a `live` call (§12.7). Implementation: `ndn-heap`, `chan` (`rx.rs` the frame path, `replay.rs`, `rx_names.rs`, `latest.rs` and `fifo.rs` the queues, `items.rs`).
+What a device does with the frames of the sessions it holds as a receiver (§3.4), from the octets the host read to the `Items` of a `get` call (§12.7, §17). Implementation: `ndn-heap`, `chan` (`rx.rs` the frame path, `replay.rs`, `rx_names.rs`, `latest.rs` and `fifo.rs` the queues, `items.rs`).
 
 The host hands the node one whole frame at a time (a datagram, or one frame of the stream) with an opaque id of the face it came over (`NodeHandle::deliver_frame(frame, ingress)`; with a forwarder (§14.10) it is the forwarder's own id of the face, which decides what the early-frame hold shares between (§12.8) and is the face the evidence of a checkpoint names and the node bars (§15.5)). Frames of one channel are taken one at a time and in the order they were handed over; frames of different channels do not wait for each other. No timer task runs for the receiver: what must expire is swept by the next frame of the channel, by a poll of an `Items`, and by the node's maintenance pass.
 
@@ -516,15 +516,15 @@ Each channel has a table from name id to name, filled by the session's table (§
 
 ### 12.7 `Items`
 
-`Heap::live(Select, GetOptions)` returns an `Items`, a `Stream` of `Result<Got, GetNotice>` (`GetOptions::kept` and the kept values are stage 6; `trust` is `Trust::Prompt` or `Trust::Verified` (§15.8); `live` refuses `Live::Off` and a follower).
+`Heap::get(Select, GetOptions)` returns an `Items`, a `Stream` of `Result<Got, GetNotice>`: the kept values of the space and the emissions of its channels as one stream (§17). This section is the emission side of it: the sink the receiver pushes into. `trust` is `Trust::Prompt` or `Trust::Verified` (§15.8); `GetOptions::live` is `Live::Emitted` (the default) or `Live::Off`, which installs no sink; a follower is refused `Live::Emitted`.
 
-- **Creating it does no I/O.** It takes every message of every session of the space this device holds, in the modes it joined (`Modes`), whose path matches `Select::Path` (exactly) or `Select::Prefix`. While it exists, this device is *listening* to the space (§9): announces of writers' channels make it ask. Asking a sender for a session is the caller's (`NodeHandle::ask_channel_in`) until the verbs of stage 6 do it.
-- **`Got`** carries the path (relative to the space), the payload (a slice of the opened frame when the frame is at most 9,000 octets or the payload is most of it, a copy of its own otherwise: §12.6), the writer's person and device, and `Kind::Emitted { seq, stands }`.
-- **Order.** Within a channel as §12.6. Across channels, the order messages were queued in.
+- **Creating it does no I/O.** It takes every message of every session of the space this device holds, in the modes it joined (`Modes`), whose path matches `Select::Path` (exactly) or `Select::Prefix`. The sink is installed when `get` returns, so a message that arrives before the first poll is queued, not lost. While it exists, this device is *listening* to the space (§9): announces of writers' channels make it ask. Asking a sender for a session is otherwise the caller's (`NodeHandle::ask_channel_in`); `get` sets up no session itself.
+- **`Got`** carries the path (relative to the space), the payload (a slice of the opened frame when the frame is at most 9,000 octets or the payload is most of it, a copy of its own otherwise: §12.6), the writer's person and device, and `Kind::Emitted { seq, stands }`. The person is the one of the sender's device as judged when the session was set up (§3.4), not read from the frame (§17.6).
+- **Order.** Within a channel as §12.6. Across channels, the order messages were queued in. How the emissions interleave with the kept values: §17.3.
 - **Notices.** `Lagged { missed }` as above. `LiveEnded(Ended { writer, reason })` when a session ends (`NotMember` when the sender no longer stands, `Closed` for an `END` (once a checkpoint lists it, §15.6), `Lapsed`, `Left`, `BadCheckpoint` and `Unverifiable` (§15.6, §15.7)), told **after** the messages queued before it; a session replaced by a newer one of the same sender and mode is not told, since the `Items` simply goes on with the new one. `LiveEnded(NoPath { why })` when no `HELLO` came within 2 s of the session's install (§14.10). `Retracted { writer, from, to }` is raised by checkpoints (§15.5).
-- **`next_batch(&mut Vec<Got>) -> usize`** moves everything queued that is an item into the buffer, under one lock, with no wake per item and no allocation when the buffer has room; it stops before a notice (the next `next()` yields it) and never waits.
+- **`next_batch(&mut Vec<Got>) -> usize`** moves everything queued that is an item into the buffer (the kept listing first, then the kept changes, then the emissions), under one lock per source, with no wake per item and no allocation when the buffer has room; it stops before a notice (the next `next()` yields it) and never waits.
 - **Back pressure** (§12.6) is applied by the receiver before it takes a stream frame, so it reaches the sender through the stream's flow control. An `Items` that is never read stalls the stream of a `Reliable` or `Window` channel with `Block`; dropping it frees the stream.
-- **Dropping an `Items`** cancels its sink: nothing more is queued for it. The stream ends when the node stops.
+- **Dropping an `Items`** cancels its sink and closes its kept watcher: nothing more is queued for it. The stream ends when the node stops.
 
 ### 12.8 Limits and counters of the receiver
 
@@ -565,7 +565,7 @@ The counters of checkpoints (stage 5) are `checkpoints` (every `CHECKPOINT` fram
 
 ## 13. The sender
 
-Implementation: `ndn-heap` `chan/emit.rs` (`Heap::emit`, the writer gate), `tx.rs` (the combining writer), `queues.rs` (the pending sets), `table.rs` (the name-id table), `history.rs` (the window and the standing values), `control.rs` (the `CONTROL` bodies), `carrier.rs` (the carrier a host gives the node), `verbs.rs` (the public types of `emit` and `live`).
+Implementation: `ndn-heap` `chan/emit.rs` (`Heap::emit`, the writer gate), `tx.rs` (the combining writer), `queues.rs` (the pending sets), `table.rs` (the name-id table), `history.rs` (the window and the standing values), `control.rs` (the `CONTROL` bodies), `carrier.rs` (the carrier a host gives the node), `verbs.rs` (the public types of `emit` and `get`).
 
 ### 13.1 `Heap::emit`
 
@@ -903,7 +903,7 @@ Not built: IPC connections carry no channel frames (§14.10), and no node uses t
 **The receiver.**
 
 - One task of the node reads `recv_side` and gives each frame to `deliver_frame` with the forwarder's face id as the `ingress` (§12). A `Keep` that arrives at a sender is not delivered to the receiver path: it releases the sender's gate. The engine's reader never calls `deliver_frame`, so a blocked `Reliable` queue (§12.6) stalls this task and not the forwarder (§13.12 item 15).
-- **Keep and Unsub.** When a session is installed the node sends one `Keep` for it at once (the gate above waits for it); the maintenance pass sends one every 10 s for each session it holds. When a session ends, is replaced or is removed, and when the last `Items` that takes it is dropped, the node sends one `Unsub` and no `Keep` follows. The last case ends the session as `Left` and **drops the channel's receiving state at once**: nobody is told (an `Items` made later has not seen the session it would be told of, so it gets no `LiveEnded(Left)`), and a later `live` over the same sender needs a new ask, which says `ASK_NEW` (§3.1) and makes a new route. An `UP` the connection had no room for is tried again at the next pass. `UP` frames go as datagrams.
+- **Keep and Unsub.** When a session is installed the node sends one `Keep` for it at once (the gate above waits for it); the maintenance pass sends one every 10 s for each session it holds. When a session ends, is replaced or is removed, and when the last `Items` that takes it is dropped, the node sends one `Unsub` and no `Keep` follows. The last case ends the session as `Left` and **drops the channel's receiving state at once**: nobody is told (an `Items` made later has not seen the session it would be told of, so it gets no `LiveEnded(Left)`), and a later `get` over the same sender needs a new ask, which says `ASK_NEW` (§3.1) and makes a new route. An `UP` the connection had no room for is tried again at the next pass. `UP` frames go as datagrams.
 - **Ask against release.** An ask whose answer arrives after a release of its (space, mode) installs no session and is told `Superseded` (§3.4): the route its Data laid is given up by one best-effort `Unsub` when no other ask of the channel is in flight and no session holds it, and the next ask is new.
 - **`NoPath`.** A session that offers a stream and has no `HELLO` 2 s after it was installed (`NO_PATH_AFTER`), that an `Items` wants, tells that `Items` `LiveEnded(NoPath { why })`, once. The text says that no frame of the sender's channel reached this device in 2 s and gives the two causes the device cannot tell apart, each with its remedy: a forwarder between the two does not carry channel frames (update it), or this device's first `Keep` or the session was lost or held up on the way, so the sender dropped its first frame (ask again; §13.12 item 27). It does not say which hop. `LiveEnd::next()` is `FixLocal` for it (and `RetryLater` for an `Ended`). The causes are a forwarder that predates the label (§14.3), an install a hop refused (that hop's `side/list` counts and its log says why), a hop beyond the sender's own forwarder with no stream (§14.9), a sender that sends nothing, and a first `Keep` lost or a session held longer than `ROUTE_WAIT` on a lossy or slow network. A session that offers no stream (the first hop toward this device has none, §14.9) is sent no `HELLO`: nothing is waited for, and it is never told `NoPath`.
 - **The bar.** `ConnectionBar` over `Connection::side_quarantine` is attached by `attach_forwarder`; a node with another `IngressBar` (`attach_bar`) bars through that. Without one a node still alerts and bars nothing.
@@ -1142,7 +1142,7 @@ Informative. This section records what was measured of the stage-3 implementatio
 
 ### 16.1 Method
 
-- **The rung.** `examples/chan_ping.rs` of `ndn-face-quic` runs `Heap::emit` (`Latest`) into `Heap::live` between two nodes (`/bob/phone` writes, `/carol/tablet` reads). The space and the channel are made by the signed setup of §3. The frames cross **one** QUIC link on loopback. The `Carrier` is an adapter over `LinkFace::forward_side` (the datagram lane), `send_side` (the stream lane) and `side_limits`. The two nodes share one forwarder, so the setup's Interests do not cross the link; the frames do.
+- **The rung.** `examples/chan_ping.rs` of `ndn-face-quic` runs `Heap::emit` (`Latest`) into `Heap::get` (`kept: false`) between two nodes (`/bob/phone` writes, `/carol/tablet` reads). The space and the channel are made by the signed setup of §3. The frames cross **one** QUIC link on loopback. The `Carrier` is an adapter over `LinkFace::forward_side` (the datagram lane), `send_side` (the stream lane) and `side_limits`. The two nodes share one forwarder, so the setup's Interests do not cross the link; the frames do.
 - **Cores.** Pinned to four cores (`taskset -c 10-13`) of a shared 64-core AMD EPYC 7532 host, with two runtimes of one worker each: the sender's writer task and the QUIC driver share a worker.
 - **Throughput.** 0.5 s of warm-up, then 3 s a size. Each figure is the median of 3 pairs run back to back and interleaved (a channel run, then the raw run, alternating the order). The raw rows are the QUIC datagram and stream rows of `carrier_bench` at the same `path_mtu_max`, with the socket buffer and the bounded GSO batch a link has. The count is what `Items` yields; the emitter rotates 256 paths.
 - **Latency.** The half round trip of a 64-octet message: 14 pairs, each the p50 of 10,000 timed round trips after 1,000 warm-up ones, the outer 1 % dropped, against the raw QUIC datagram. *Cold* is the host as it is; *hot* adds four busy loops on other cores.
@@ -1291,3 +1291,96 @@ Against the targets of the design note every performance gate **except 8 B is mi
 - Zenoh was not rerun on this host; comparisons to it use the figures of the design note's baseline (§1.2), taken at another load. Zenoh was not measured at 128 B to 512 B.
 - A full table after the changes made since the tuning pass (§16.2), and the latency with and without an offload.
 - A quiet host: the figures were taken at load 5–6 on a shared host, and single latency pairs vary by ±5 µs.
+
+## 17. The verbs: put, emit, get
+
+A space has three verbs and a point read. This section states what `get` does with the first two, exactly; [heap.md](heap.md) §10.3 and §10.4 state the kept side (the register, `watch`).
+
+| Verb | What it is | Who may call it |
+|---|---|---|
+| `put(path, bytes, opts)` | **kept**: signed by the writer's device key, chained, stored, synced; the register's head of `path` ([heap.md](heap.md) §10.1) | a writer (§4.2, [heap.md](heap.md) §10.3) |
+| `emit(path, bytes, opts)` | **ephemeral**: sent over the space's channel (§13.1), never an entry, stored and served by nobody | a writer (§13.1) |
+| `get(what, opts)` | **one stream**: the kept values of the space, then their changes, merged with the emissions of its channels, filtered by `what` | a reader or a writer; a follower for kept values only |
+| `kept(path)` | the head's value now, from what this node holds; never waits, never touches the network | a reader or a writer |
+
+```rust
+pub fn get(&self, what: Select, opts: GetOptions) -> Result<Items, HeapError>;
+pub async fn kept(&self, path: &Name) -> Result<Option<Item>, HeapError>;
+
+pub enum Select { Path(Name), Prefix(Name) }
+pub struct GetOptions {
+    pub kept: bool,              // kept values and their changes (default true)
+    pub live: Live,              // Live::Emitted (default): also emissions; Live::Off
+    pub modes: Modes,            // which channel modes to join (default: all the senders offer)
+    pub trust: Trust,            // Trust::Prompt (default) | Trust::Verified (§15.8); emissions only
+    pub congestion: Congestion,  // Block (default) | Drop; Reliable and Window emissions only
+}
+pub struct Items;                // Stream<Item = Result<Got, GetNotice>>
+impl Items {
+    pub async fn next(&mut self) -> Option<Result<Got, GetNotice>>;
+    pub fn next_batch(&mut self, buf: &mut Vec<Got>) -> usize;
+    pub async fn caught_up(&mut self);
+    pub fn hello_seen(&self) -> bool;
+}
+pub struct Got { pub path: Name, pub bytes: Bytes, pub by: Name, pub writer: Name, pub kind: Kind }
+pub enum Kind { Kept(Kept), Emitted(Emitted) }
+pub struct Kept { pub id: EntryId, pub as_of: Option<Duration>, pub removed: bool }
+pub struct Emitted { pub seq: u64, pub stands: Option<Duration> }
+pub enum GetNotice {
+    Lagged { missed: u64 },                          // emissions the mode dropped (§17.5)
+    Withdrawn { id: EntryId, why: Refusal },         // a kept entry this stream gave was refused after the fact
+    LiveEnded(LiveEnd),                              // the emission part ended (§12.7); kept values go on
+    Retracted { writer: Name, from: u64, to: u64 },  // a checkpoint contradicted emissions (§15.5)
+}
+```
+
+### 17.1 What `get` creates
+
+`get` is synchronous and does no network I/O. When it returns, **both feeds are registered**: the kept watcher (the register's heads under `what` are listed and the watcher registered in one step under the space's lock, so no change falls between them) and, with `Live::Emitted`, the emission sink (§12.7). Nothing that happens after the call is lost for want of a first poll. `get` asks no sender for a session: that is `ask_channel_in`, or the announce-driven ask of a device that is listening (§9). Dropping the `Items` closes both feeds and releases the sink's sessions (§14.10).
+
+### 17.2 `kind` is the authority
+
+Every item says what it is. **`Kind::Kept`** is durable and signed: the head of its path in the register, an entry the writer's device signed, chained, and that this node judged ([heap.md](heap.md) §3.8, §9). **`Kind::Emitted`** is neither: it was authenticated as the sender's by the channel's AEAD and, after the sender's signed checkpoint, as the sender's alone (§15), it is not an entry, and **it is never the current value of a path**: no emission replaces, hides or confirms a kept value. An application that needs "the value" reads `Kept`; one that wants "what is being done now" (a cursor, a drag) reads `Emitted`. A `stand` replay (§13.6) is an `Emitted` with `stands` set to what is left of the stated lifetime; it is not kept either.
+
+### 17.3 The order
+
+1. **The kept listing comes first, always**: every path under `what` that has a value, as the register's head, in path order (canonical NDN order of the path), each as `Kind::Kept` with `removed: false`. A path with no value (never written, or removed) has no item. A value in pieces that is not whole here is not listed; it is given as a kept change when its last piece is held.
+2. **`caught_up()` resolves after the listing was yielded**: when every path that had a value when `get` returned has been given by `next` or `next_batch`. Called before the listing was read, it reads the rest of it into the `Items`' own buffer (the next `next` gives it, before anything else): it never waits for the caller. At once when `kept` is `false`.
+3. **Emissions that arrive during the listing are held** (queued in the sink under the bounds of §17.5) **and come after it**: nothing emitted is yielded before the last item of the listing.
+4. **After the listing, the two sources alternate fairly**: when both have something queued, the one that was not taken last is taken first, so neither starves the other. **No order is promised between a kept item and an emitted one**: an emission made after a `put` can reach a receiver before the `put` does (kept data travels by sync, emissions by the channel), and the reverse.
+5. **Within a source**: kept items are in the order the register applied the changes of this node, and **never an older value of a path after a newer one**; emitted items are in the mode's order (§12.6): `Reliable` and `Window` in sequence order, `Latest` the newest per sender and name, never an older after a newer; across channels, arrival order.
+6. **A notice comes after the items queued before it in its own source**: `Lagged`, `LiveEnded` and `Retracted` after the emissions (§12.7), `Withdrawn` after the kept items.
+
+A joiner therefore gets the **current kept state** (the listing), then what changes, and with it what is being emitted, without a connect step and without a gap between the listing and the changes.
+
+### 17.4 Duplicates
+
+- **A path both put and emitted** gives **two items**: one `Kept` and one `Emitted`. They are never merged and never deduplicated, even when their bytes are equal. An emission is never suppressed by a `put` (there is no mark between the two): a stale emission after a later `put` of the same writer is delivered, and `kind` tells the application which one is the value.
+- **A kept entry is yielded once per `Items`.** The `Items` remembers the entry it gave at each path, and never gives the same entry again, also not after a lag (§17.5). An application that is told an entry twice (the same `Kept::id`) by an implementation that repeats the current value after a lag may treat it as the same value; it is never told an **older** value of a path after a newer one.
+- A `stand` replay is `Emitted` with `stands`, as §17.2; it never becomes `Kept`.
+- **A removal** is `Kind::Kept` with `removed: true`, empty `bytes` and `id` the removing entry. It is given only for a path this `Items` gave a value of; a path that never had a value in this stream gives none.
+- **`Withdrawn { id, why }`** is given for an entry this `Items` gave and that was the value it had given at its path when it was refused ([heap.md](heap.md) §3.8, §10.4): drop what was derived from `id`. The entry the refused one superseded returns as the next `Kept` (or, with none left, a removal).
+
+### 17.5 A slow reader
+
+**Kept: never lost.** The kept queue holds at most `Config::watch_queue` changes (4,096 by default), as a `watch`'s does. When a change does not fit, the stream is **not told a loss**: when it has read what was queued, it takes the space's lock, forgets what was dropped, and in the same step reads from the store the heads under `what`. It then gives, in path order and before any later change, every head that is not the entry it already gave at its path, and a removal for every path it gave a value of that has none now. So **every path's current value is delivered**, and a path that changed several times while the reader was behind is given its **latest** value and never an older one after a newer. The intermediate values are skipped **by state**, not lost data: the log and `watch` ([heap.md](heap.md) §10.4) have the history. A slow reader never slows a `put`, a fetch or another reader.
+
+**Emitted: as the mode says** (§12.6): `Latest` keeps the newest per sender and name (coalescing is not a loss and is not told) in at most 4,096 pairs and 1 MiB charged, evicts the oldest pair past the bound and tells `Lagged { missed }`; `Reliable` and `Window` queue at most 1 MiB, and `Congestion::Block` (the default) **stalls the stream** so that the back pressure reaches the sender and nothing is lost, `Congestion::Drop` discards the oldest and tells `Lagged { missed }` in its place. **Kept items are unaffected**: the two sources have separate queues; a stalled or overflowing emission queue delays no kept item, and the other way round.
+
+### 17.6 `by` and `writer`
+
+`writer` is the device that signed the entry (kept) or sent the channel (emitted). `by` is the **authenticated** person of that device and nothing the sender or the frame says: for `Kept`, the namespace of the trust context that validated the signing key of the entry ([heap.md](heap.md) §9.1), which the node derived when it admitted the entry; for `Emitted`, the person of the sender's device **as this node judged it when the session was set up** (§3.4), kept with the session. A `Got` of either kind for the same writer has the same `by` unless the trust contexts changed in between.
+
+### 17.7 Refusals: who may call what
+
+`get` refuses at creation, each with a reason and a next step ([heap.md](heap.md) §10.5):
+
+- **`BadRequest`** for `kept: false` with `Live::Off`: it asks for nothing; ask for kept values, emissions, or both.
+- **`NotAllowed`** for `Live::Emitted` on a space this device only follows: a follower takes no part in channels; open the space as a member, or read the kept values with `Live::Off`. A follower **may** read kept values with `Live::Off`.
+- **`Sealed`** (`AskOwner`) for kept values of a sealed space whose audience does not list this device's person: a **non-member**, or a member that was **removed** (as soon as this node holds the record that removes her), gets no kept value. With `kept: false` the call succeeds (it does no I/O), and a non-member gets **no emission** either: no sender answers her ask (§3.4, §4.1), so she holds no session. A kept feed whose queue overflowed after its reader was removed ends instead of re-reading the register (it gives nothing more).
+
+`put` and `emit` need a writer (`NotAllowed` and `NotWriter` otherwise). `get` needs a reader or a writer. `kept` answers as before ([heap.md](heap.md) §10.3).
+
+### 17.8 What `get` does not do
+
+It does not resume (`watch` with a `Frontier` does, [heap.md](heap.md) §10.4); it does not give history, only the current value of each path and what changes after; it does not make a session (§17.1); it does not order an emission against a `put` (§17.3 item 4); and it adds nothing to the wire: no field of an entry or of a frame is new for it.
