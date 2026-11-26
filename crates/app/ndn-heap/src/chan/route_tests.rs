@@ -517,10 +517,14 @@ async fn a_forwarder_without_the_header_leaves_no_path_and_the_receiver_says_whi
         panic!("{end:?}");
     };
     assert!(
-        why.contains(
-            "a forwarder between you and the sender does not carry channel frames: update it"
-        ),
-        "{why}"
+        why.contains("a forwarder between you and the sender does not carry channel frames")
+            && why.contains("update it"),
+        "the text must name the forwarder that predates the label and say to update it: {why}"
+    );
+    assert!(
+        why.contains("first Keep") && why.contains("lost or held up") && why.contains("ask again"),
+        "a lost or delayed first Keep also ends in NoPath: the text must say so and to ask \
+         again: {why}"
     );
     assert_eq!(end.next(), NextStep::FixLocal);
     assert!(!items.hello_seen());

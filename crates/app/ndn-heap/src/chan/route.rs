@@ -29,8 +29,10 @@
 //!   `Keep` follows.
 //! * **No path.** A session that offers a stream and whose `HELLO` has not come [`NO_PATH_AFTER`]
 //!   (2 s) after it was installed tells every `Items` that takes it `LiveEnded(NoPath)`: a
-//!   forwarder between the two does not carry channel frames. A session that offers none (the
-//!   first hop toward this node, judged by the sender, has no stream) is sent no `HELLO` and
+//!   forwarder between the two does not carry channel frames, or the first `Keep` or the session
+//!   was lost or held up and the sender dropped its `HELLO` (the text says both: update, or ask
+//!   again). A session that offers none (the first hop toward this node, judged by the sender,
+//!   has no stream) is sent no `HELLO` and
 //!   is told nothing.
 //! * **The bar.** [`ConnectionBar`] asks the forwarder to bar a face
 //!   (`Connection::side_quarantine`) when a frame that came over it was shown to be forged.
@@ -571,11 +573,16 @@ impl NodeInner {
     }
 }
 
-/// What `LiveEnded(NoPath)` says: why, and what to do (`NextStep::FixLocal`).
+/// What `LiveEnded(NoPath)` says: why, and what to do. Two causes end here and the device cannot
+/// tell them apart: a forwarder that does not carry channel frames (update it), and a first
+/// `Keep` of this device, or the session itself, lost or held up past the sender's wait for it
+/// (the sender then dropped its `HELLO`: ask again).
 fn no_path(sender: &Name, id: u64) -> String {
     format!(
         "no frame of {sender}'s channel {id:016x} reached this device within {} s of its session: \
-         a forwarder between you and the sender does not carry channel frames: update it",
+         either a forwarder between you and the sender does not carry channel frames: update it; \
+         or this device's first Keep or the session was lost or held up on the way (loss or \
+         delay), so the sender dropped its first frame: ask again",
         NO_PATH_AFTER.as_secs()
     )
 }
