@@ -42,6 +42,7 @@ fn ask() -> ChanAsk {
         lifetime: 3600,
         epoch: Some(epoch()),
         since: Some(9),
+        new: false,
         chain: vec![Bytes::from_static(&[0xC0, 0xDE, 0x01])],
     }
 }
@@ -333,4 +334,28 @@ fn a_session_with_a_lifetime_over_a_day_is_refused() {
             "a lifetime of {refused} s is refused"
         );
     }
+}
+
+#[test]
+fn an_ask_that_holds_no_session_says_so_in_one_empty_even_field() {
+    // The golden ask names none: it is the ask of a receiver that holds its session (a renewal).
+    assert!(!ChanAsk::decode(unhex(GOLDEN_ASK)).unwrap().new);
+    let mut said = ask();
+    said.new = true;
+    let wire = said.encode().unwrap();
+    assert_eq!(ChanAsk::decode(wire.clone()).unwrap(), said);
+    // Even, so a reader that predates it skips it and reads a renewal.
+    assert_eq!(ASK_NEW % 2, 0);
+    // It has no value.
+    let valued = with_extra(&ask().encode().unwrap(), &[(ASK_NEW, &[1])]);
+    assert!(matches!(
+        ChanAsk::decode(valued),
+        Err(WireError::Malformed(_))
+    ));
+    // Twice is ambiguous, as any field.
+    let twice = with_extra(&wire, &[(ASK_NEW, &[])]);
+    assert!(matches!(
+        ChanAsk::decode(twice),
+        Err(WireError::Duplicate(_))
+    ));
 }

@@ -19,7 +19,7 @@ use crate::wire::{
 };
 
 /// `{ ASK_SPACE, ASK_PREFIX, ASK_MODE, ASK_RECIPIENT, ASK_CARRIERS, ASK_LIFETIME, ASK_EPOCH?,
-/// ASK_SINCE?, ASKER_CERT* }`: the ApplicationParameters of an ask.
+/// ASK_SINCE?, ASK_NEW?, ASKER_CERT* }`: the ApplicationParameters of an ask.
 pub(crate) const CHAN_ASK: u64 = 0x0661;
 /// Name: the space.
 pub(crate) const ASK_SPACE: u64 = 0x0663;
@@ -37,6 +37,9 @@ pub(crate) const ASK_LIFETIME: u64 = 0x066D;
 pub(crate) const ASK_EPOCH: u64 = 0x066F;
 /// `Window` only: the first sequence the asker still needs replayed.
 pub(crate) const ASK_SINCE: u64 = 0x0671;
+/// Empty: the asker holds no session of the channel it asks for (see [`ChanAsk::new`]). Even, so a
+/// sender that predates it skips it and reads a renewal.
+pub(crate) const ASK_NEW: u64 = 0x0672;
 /// The Content of the answering Data.
 pub(crate) const CHAN_SESSION: u64 = 0x0673;
 /// 8 octets: the channel id.
@@ -303,6 +306,10 @@ pub(crate) struct ChanAsk {
     pub epoch: Option<EpochId>,
     /// `Window` only: the first sequence still needed.
     pub since: Option<u64>,
+    /// The asker holds no session of this channel (a first ask, or it let the session go): it is
+    /// new to the sender's `HELLO`, names and replay, whatever the sender remembers of its
+    /// device. A receiver that holds its session asks without it (a renewal).
+    pub new: bool,
     /// The certificates of the asker's signer chain, leaf first, each a whole Data.
     pub chain: Vec<Bytes>,
 }
@@ -334,6 +341,9 @@ impl ChanAsk {
             if let Some(since) = self.since {
                 write_nni(w, ASK_SINCE, since);
             }
+            if self.new {
+                w.write_tlv(ASK_NEW, &[]);
+            }
             for cert in &self.chain {
                 w.write_tlv(tlv::ASKER_CERT, cert);
             }
@@ -362,6 +372,7 @@ impl ChanAsk {
         let value = only(content, CHAN_ASK, "an ask is one CHAN_ASK TLV")?;
         let (mut space, mut prefix, mut mode, mut recipient) = (None, None, None, None);
         let (mut carriers, mut lifetime, mut epoch, mut since) = (None, None, None, None);
+        let mut new = None;
         let (mut chain, mut octets) = (Vec::new(), 0);
         fields!(value, |v| {
             ASK_SPACE => once(&mut space, read_name(v)?, "an ask's space")?,
@@ -385,6 +396,12 @@ impl ChanAsk {
             ASK_LIFETIME => once(&mut lifetime, read_nni(&v)?, "an ask's lifetime")?,
             ASK_EPOCH => once(&mut epoch, read_epoch_id(v)?, "an ask's epoch")?,
             ASK_SINCE => once(&mut since, read_nni(&v)?, "an ask's since")?,
+            ASK_NEW => {
+                if !v.is_empty() {
+                    return Err(WireError::Malformed("an ask's no-session flag has no value"));
+                }
+                once(&mut new, true, "an ask's no-session flag")?;
+            },
             tlv::ASKER_CERT => take_cert(&mut chain, &mut octets, v, "the certificates an ask carries")?,
         });
         Ok(ChanAsk {
@@ -396,6 +413,7 @@ impl ChanAsk {
             lifetime: need(lifetime, "an ask's lifetime")?,
             epoch,
             since,
+            new: new.is_some(),
             chain,
         })
     }

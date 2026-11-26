@@ -2074,6 +2074,7 @@ async fn stream_frames_that_overtake_the_session_are_not_lost_to_a_window_joiner
         lifetime: 3600,
         epoch: None,
         since: None,
+        new: false,
         chain: carol.inner.signer_chain(),
     };
     let wire_ask = carol

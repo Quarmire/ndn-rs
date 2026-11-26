@@ -403,6 +403,9 @@ impl NodeInner {
             if sink.takes(space, mode) && !self.chan.rx.wanted(space, mode) {
                 session.end(EndReason::Left);
                 self.chan.sessions.remove(session.id());
+                // Nobody takes the channel now, so nobody is told it ended: an `Items` made
+                // later has not seen the session it would be told of.
+                self.chan.rx.release_channel(session.id());
             }
         }
         self.chan_route_tick(Instant::now());

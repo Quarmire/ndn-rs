@@ -765,3 +765,35 @@ async fn an_extension_answer_can_carry_a_route_label() {
     );
     assert_eq!(rig.engine.side().list().len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_items_made_after_the_last_one_let_go_is_not_told_that_the_session_ended() {
+    let rig = rig(true).await;
+    let items = live(rig.carol());
+    let info = rig
+        .carol()
+        .ask_channel(&space(), rig.bob().name())
+        .await
+        .unwrap();
+    eventually("HELLO", || items.hello_seen()).await;
+    drop(items);
+    eventually("the route is gone", || rig.sinks(info.channel) == 0).await;
+
+    // A new `Items` over the same sender: the session it never had ended before it existed, and
+    // the maintenance passes that follow (every 250 ms) tell it nothing.
+    let mut again = live(rig.carol());
+    let told = tokio::time::timeout(Duration::from_millis(900), again.next()).await;
+    assert!(
+        told.is_err(),
+        "a new Items is told of the end of a session it never took: {told:?}"
+    );
+    // It takes the channel again with a new ask: the sender's HELLO and a frame reach it.
+    rig.carol()
+        .ask_channel(&space(), rig.bob().name())
+        .await
+        .unwrap();
+    eventually("HELLO again", || again.hello_seen()).await;
+    emit(rig.bob(), "/b", b"y").await;
+    let got = next(&mut again).await.expect("an item");
+    assert_eq!(&got.bytes[..], b"y");
+}

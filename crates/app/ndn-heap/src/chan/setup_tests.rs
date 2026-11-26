@@ -177,6 +177,7 @@ fn ask_of(node: &Node, mode: ChannelMode) -> ChanAsk {
         lifetime: 3600,
         epoch: None,
         since: None,
+        new: false,
         chain: node.inner.signer_chain(),
     }
 }
@@ -1228,6 +1229,7 @@ async fn a_sender_over_its_receiver_cap_gives_a_signed_refusal_that_says_to_retr
             device: &device,
             key: &key,
             wanted: 0,
+            new: false,
         };
         alice
             .inner

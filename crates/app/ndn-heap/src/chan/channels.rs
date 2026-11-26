@@ -170,6 +170,10 @@ pub(crate) struct Asker<'a> {
     pub(crate) key: &'a Name,
     /// The lifetime the ask wants, in seconds (0: none named).
     pub(crate) wanted: u64,
+    /// The ask says the asker holds no session of the channel (`ASK_NEW`): a receiver the sender
+    /// remembers, which let the session go and asks again, is new again (the sender is not told
+    /// when a receiver lets go, unless it was the last one behind the forwarder).
+    pub(crate) new: bool,
 }
 
 /// What a channel gives the frame layer: the id and the key frames are sealed under now.
@@ -435,7 +439,7 @@ impl Channels {
             .live
             .receivers
             .store(channel.receivers.len(), Ordering::Release);
-        Ok(channel.admitted(&receiver, rekeyed, known.is_none()))
+        Ok(channel.admitted(&receiver, rekeyed, known.is_none() || asker.new))
     }
 
     /// Make the channel of `(space, mode)` if there is none (the sender's own start, before

@@ -429,6 +429,7 @@ impl NodeInner {
             device: &asker_device,
             key: &key,
             wanted: ask.lifetime,
+            new: ask.new,
         };
         match self
             .chan

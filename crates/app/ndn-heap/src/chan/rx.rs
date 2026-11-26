@@ -1964,6 +1964,15 @@ impl Receivers {
         self.channels.lock().get(&id).cloned()
     }
 
+    /// The channel of `id` was let go because no `Items` takes it any more: its receiving state
+    /// goes and nobody is told (a sink made later has not seen the session it would be told of).
+    pub(crate) fn release_channel(&self, id: u64) {
+        *self.fast.write() = None;
+        if let Some(ch) = self.channels.lock().remove(&id) {
+            ch.state.lock().ended = true;
+        }
+    }
+
     /// The channel of `id` ended with `why`: every sink of its space and mode is told, after what
     /// it has queued. A channel replaced by a newer one of the same sender and mode is not told:
     /// the sink goes on with the new one.

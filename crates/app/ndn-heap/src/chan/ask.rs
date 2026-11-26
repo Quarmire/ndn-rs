@@ -191,6 +191,12 @@ impl NodeInner {
             })?;
             log.sealed().then(|| log.fold.in_force()).flatten()
         };
+        // A session held is renewed; with none (a first ask, or the last `Items` let it go) the
+        // sender must treat this device as new whatever it remembers of it: its `HELLO`, its
+        // names, its replay.
+        let new = !self.chan.sessions.all().iter().any(|s| {
+            s.ended().is_none() && s.sender() == sender && s.space() == space && s.mode() == mode
+        });
         let ask = ChanAsk {
             space: space.clone(),
             prefix: Name::root(),
@@ -200,6 +206,7 @@ impl NodeInner {
             lifetime: LIFETIME_DEFAULT,
             epoch,
             since,
+            new,
             chain: self.signer_chain(),
         };
         let params = ask.encode().map_err(|e| ChanError::Local {

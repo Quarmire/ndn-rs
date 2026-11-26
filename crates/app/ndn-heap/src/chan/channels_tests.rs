@@ -21,6 +21,7 @@ fn ask<'a>(device: &'a Name, key: &'a Name, wanted: u64) -> Asker<'a> {
         device,
         key,
         wanted,
+        new: false,
     }
 }
 
@@ -518,4 +519,44 @@ fn a_session_names_the_next_sequence_and_the_audience_epoch_the_receiver_was_jud
     let given = admit(&table, &carol, &carol_key, 0, now).unwrap();
     assert_eq!(given.seq, 77);
     assert_eq!(given.audience, Some(epoch));
+}
+
+#[test]
+fn a_receiver_that_says_it_holds_no_session_is_new_again_and_one_that_says_nothing_is_not() {
+    let table = Channels::default();
+    let t0 = Instant::now();
+    let (bob, key) = (n("/bob/phone"), n("/bob/phone/KEY/1"));
+    assert!(
+        admit(&table, &bob, &key, 3600, t0).unwrap().fresh,
+        "the first ask"
+    );
+    assert!(
+        !admit(&table, &bob, &key, 3600, t0 + Duration::from_secs(1))
+            .unwrap()
+            .fresh,
+        "an ask that holds its session is a renewal"
+    );
+    // The receiver let the channel go and asks again: the sender does not know it left, the
+    // ask says so.
+    let asker = Asker {
+        device: &bob,
+        key: &key,
+        wanted: 3600,
+        new: true,
+    };
+    let again = table
+        .admit(
+            &space(),
+            ChannelMode::Latest,
+            &asker,
+            None,
+            (1, 1),
+            t0 + Duration::from_secs(2),
+        )
+        .unwrap();
+    assert!(
+        again.fresh,
+        "a receiver with no session is new to the sender's HELLO and names"
+    );
+    assert_eq!(table.receiver_count(&space(), ChannelMode::Latest), 1);
 }
