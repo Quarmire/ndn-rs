@@ -320,6 +320,17 @@ impl RecvSession {
             .then(|| (state.current.frame.clone(), state.current.epoch))
     }
 
+    /// The channel key of the epoch this session holds now, and that epoch: what the
+    /// `adversary` feature's holder wraps to a receiver it answers as the sender.
+    #[cfg(feature = "adversary")]
+    pub(crate) fn current_key(&self) -> Option<(ChannelKey, u32)> {
+        let state = self.state.lock();
+        state
+            .ended
+            .is_none()
+            .then(|| (state.current._key.clone(), state.current.epoch))
+    }
+
     /// The 32 octets of the Ed25519 public key checkpoints of this channel are verified under
     /// (see [`Self::set_signer_public`]).
     pub(crate) fn signer_public(&self) -> Option<[u8; 32]> {

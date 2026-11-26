@@ -4,26 +4,29 @@
 //! checkpoints are what tell a frame a holder made from one the sender sent (channel.md,
 //! Checkpoints). The in-crate tests seal frames by hand to show that; a test outside this crate
 //! (an end-to-end run on real processes) has no way to, because the key, the frame codec and the
-//! seal are crate-private. These three methods are that one seam: a node that holds a session of a
+//! seal are crate-private. These methods are that one seam: a node that holds a session of a
 //! channel (it asked, and was answered) can seal a frame under that channel's key as any holder
-//! could, and sign a checkpoint with **its own** device key (a holder's, not the sender's, which
-//! the receivers refuse). They hand the frame back; sending it, and where, is the caller's.
+//! could, sign a checkpoint with **its own** device key (a holder's, not the sender's, which
+//! the receivers refuse), and answer an ask as the sender with a session signed by its own key
+//! (which the asker refuses). They hand the bytes back; sending them, and where, is the caller's.
 //!
 //! The feature is off by default; `ndn-fwd` and `ndn-ext` never enable it. It adds no behaviour
 //! to a node that does not call these methods.
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
+use ndn_packet::Interest;
 use ndn_transport::{SideClass, SideKind};
 
 use super::aead::FrameCipher;
+use super::answer::session_data;
 use super::checkpoint;
 use super::frame::{Header, seal};
 use super::limits::MESSAGE_DEFAULT;
 use super::message::{MessageWriter, OutMessage};
 use super::ring::frame_hash;
 use super::table::name_octets;
-use super::wire::ChannelMode;
+use super::wire::{ChanAsk, ChannelMode, SessionRecord};
 use crate::host::NodeHandle;
 
 /// The largest frame the forged `DATA` frames are written to: a datagram a link takes at once.
@@ -35,6 +38,47 @@ impl NodeHandle {
     /// holds no session of `channel`.
     pub fn adversary_next_seq(&self, channel: u64) -> Option<u64> {
         self.inner.chan.sessions.get(channel).map(|s| s.seq())
+    }
+
+    /// The answer a hostile holder of `channel`'s key gives to `ask` (a signed ask Interest, as
+    /// it crossed the network) as if it were the sender: the session this node holds, its key
+    /// wrapped to the recipient the ask names, named by the ask, and signed with **this node's**
+    /// device key, which is not the sender's. A receiver must refuse it as not the sender's.
+    /// `None` when this node holds no usable session of `channel`, `ask` is no ask, or the
+    /// answer cannot be written.
+    pub fn adversary_session_data(&self, channel: u64, ask: Bytes) -> Option<Bytes> {
+        let session = self.inner.chan.sessions.get(channel)?;
+        let (key, key_epoch) = session.current_key()?;
+        let interest = Interest::decode(ask).ok()?;
+        let ask = ChanAsk::decode(interest.app_parameters()?.clone()).ok()?;
+        let terms = session.terms();
+        let record = SessionRecord {
+            id: channel,
+            sender: session.sender().clone(),
+            space: session.space().clone(),
+            mode: session.mode(),
+            key_epoch,
+            key_id: key.id(),
+            wrap: Bytes::new(),
+            aead: terms.aead,
+            carriers: terms.carriers,
+            table: terms.table,
+            ckpt_ms: terms.ckpt_ms,
+            window: terms.window,
+            lifetime: session.info().lifetime.as_secs(),
+            audience_epoch: terms.audience,
+            frame_max: terms.frame_max,
+            seq: terms.seq,
+            certs: self.inner.signer_chain(),
+        };
+        session_data(
+            &*self.inner.signer,
+            &interest.name,
+            record,
+            &key,
+            &ask.recipient,
+        )
+        .ok()
     }
 
     /// A `DATA` frame of one message — `payload` at `path`, bound to name id `name_id` in the
