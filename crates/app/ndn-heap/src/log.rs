@@ -321,12 +321,16 @@ pub enum Alert {
         /// The disk's reason.
         why: String,
     },
-    /// A frame of a channel was shown not to be the channel's sender's: a signed checkpoint of the
-    /// sender does not list it (or lists another frame at its sequence), or two authentic frames
-    /// came at one sequence. Only a holder of the channel key can make such a frame (the sender
-    /// itself, equivocating, or a receiver or member relaying under the key); `via` is the face
-    /// the frame came over, which is the link to bar or to look at. Evidence is kept
-    /// ([`crate::NodeHandle::channel_evidence`]); the host maps `via` to a link and a key.
+    /// A frame of a channel was shown not to be the channel's sender's: a verified checkpoint of
+    /// the sender does not list it (or lists another frame at its sequence), or a second authentic
+    /// frame came at a sequence a verified checkpoint already listed. Only a holder of the channel
+    /// key can make such a frame (the sender itself, equivocating, or a receiver or member
+    /// relaying under the key); `via` is the face that frame came over, which is barred and is
+    /// the link to look at. Two authentic frames at a sequence **no** checkpoint has settled are
+    /// a conflict: evidence only, no alert and no bar, since either face may be the honest one;
+    /// the next checkpoint that covers the sequence raises this alert for the face of the frame
+    /// it contradicts. Evidence is kept ([`crate::NodeHandle::channel_evidence`]); the host maps
+    /// `via` to a link and a key.
     ChannelForgery {
         /// The sender's device, whose channel it is.
         writer: Name,
@@ -340,8 +344,9 @@ pub enum Alert {
         via: ndn_transport::FaceId,
     },
     /// A checkpoint of a channel did not verify under the sender's key, though it opened under
-    /// the channel key: a holder of the key made it. The session was dropped
-    /// ([`crate::EndReason::BadCheckpoint`]); `via` is the face it came over.
+    /// the channel key (a holder made it, or one for another channel, key epoch or range was
+    /// sealed again). The session was dropped ([`crate::EndReason::BadCheckpoint`]), the face it
+    /// came over (`via`) is barred and evidence is kept.
     ChannelCheckpoint {
         /// The sender's device, whose channel it is.
         writer: Name,

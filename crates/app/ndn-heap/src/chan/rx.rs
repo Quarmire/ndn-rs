@@ -1058,6 +1058,14 @@ impl ChannelRx {
                 post,
             );
         }
+        // The `Prompt` lane has no sink: nothing was delivered to anyone, and the frame waits for
+        // the checkpoint that lists it.
+        if lanes.prompt.is_empty()
+            && verified_wanted
+            && matches!(delivery, Delivery::Delivered { .. })
+        {
+            delivery = Delivery::Deferred;
+        }
         // The buffer the messages were parsed into is kept for the next frame.
         if let Body::Data(buffer) = body {
             st.parsed = buffer;

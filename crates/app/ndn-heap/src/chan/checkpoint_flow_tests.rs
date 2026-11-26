@@ -1759,3 +1759,18 @@ async fn an_idle_channel_sends_one_empty_checkpoint_every_five_seconds() {
         at.len() as u64 - non_empty
     );
 }
+
+/// A receiver whose only reader is `Verified` delivers nothing as a frame is taken: the frame is
+/// reported `Deferred`, and reaches the reader when a checkpoint lists it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_taken_for_a_verified_only_reader_is_deferred_until_a_checkpoint_lists_it() {
+    let mut ck = ck(ChannelMode::Latest, verified(), LinkConfig::default()).await;
+    ck.pause_tick();
+    let s = ck.start();
+    let g0 = ck.data(s, 0, b"one");
+    assert_eq!(ck.deliver(&g0, HONEST, ck.at(1)).await, Delivery::Deferred);
+    assert!(ck.got().is_empty());
+    let cp = ck.checkpoint(s + 1, s, s + 1, &[&g0]);
+    ck.checkpoint_in(&cp, HONEST, 22).await;
+    assert_eq!(ck.got(), vec![(path(0), b"one".to_vec())]);
+}
