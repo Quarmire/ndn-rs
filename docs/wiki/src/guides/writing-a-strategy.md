@@ -148,8 +148,8 @@ shared store), so reading them never blocks: register a source with
 `EngineBuilder::signal_source(...)` from `ndn-signal-sources` (radio
 metrics, GPS; pluggable hardware/mock backends). A measured strategy can
 share one decision kernel across native and embedded sans-IO targets;
-`ndn-strategy-cclf` is the worked example, with taxonomy and units in
-[`docs/signals.md`](https://github.com/Quarmire/ndn-rs/blob/main/docs/signals.md).
+`ndn-strategy-cclf` is the worked example, with taxonomy and units in the
+[`ndn-signals-core` crate docs](https://github.com/Quarmire/ndn-rs/blob/main/crates/core/ndn-signals-core/src/lib.rs).
 
 ## Testing
 

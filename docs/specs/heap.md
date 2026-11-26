@@ -18,8 +18,8 @@
 - **Out of scope:** views and lenses above the layer; trust-context encoding
   ([trust-context.md](trust-context.md)); link admission
   ([ndn-link.md](ndn-link.md)); State Vector Sync itself (ndn-svs v2, as
-  `ndn-sync` implements it); invitations (`ndn-invite`); the clock of live
-  signals (`ndn-surface`).
+  `ndn-sync` implements it); invitations (`ndn-invite`); the setup, frames and
+  carriers of live data ([channel.md](channel.md)).
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
 "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
@@ -229,7 +229,7 @@ of a space of `/home`. **The role layout** is declared by a marker the root
 signs into the context: its schema is *authoritative* (the generated namespace
 schema of every `ndn-cert` namespace). Where it is declared, a `guest`, a `node`,
 any other role and a device with no role are not owner devices **and hold no epoch
-key and no standing for signals in any person's name, a reader's included**
+key and no standing for channels in any person's name, a reader's included**
 (§6.5 condition 2, §11.1; the entries of a person's guest device are judged by
 the members entries alone, so guest *writes* stay as the record admits them);
 where it is not
@@ -251,7 +251,6 @@ device.
 | grant | `<G>/32=grant/<GrantAsk TLV>`, the last component one GenericNameComponent holding the `GRANT_ASK` TLV, which carries the asker's seal key packet and the certificates of its signer chain | one `GRANT` TLV (§6.5) | a key of the granter `G` |
 | held copy | `<H>/32=held/<Name TLV of the original>`, the last component one GenericNameComponent | the complete wire of the original packet | DigestSha256 |
 | channel ask and session (never stored; [channel.md](channel.md)) | `<D>/32=chan/<ParametersSha256Digest>`, exactly one component after the keyword, a ParametersSha256DigestComponent of 32 octets | the ask's ApplicationParameters (a `CHAN_ASK`) go in the Interest; the Data's Content is a `CHAN_SESSION` or a `CHAN_REFUSAL` | the Interest by a key of the asker's device, the Data by a key of device `D` |
-| signal run header (§11; never stored, served or fetched) | `<D>/32=signal/<S>/32=run/<run id>`, the run id one GenericNameComponent of 16 octets | the run's body | a key of device `D` |
 | sync group | `<O>/32=sync/<c1>[/<c2>…]` | State Vector Sync Interests and Data (§7) | as `ndn-sync` |
 
 A space is not a packet: it exists as the entries under its name. Entries are
@@ -304,9 +303,6 @@ Every name parses one way, and a node MUST refuse a name that does not parse.
 - **Held copy.** `H` is the components before the first `32=held` (a device
   name); exactly one GenericNameComponent follows whose value is the Name TLV
   of the original.
-- **Signal run header.** `D` is the components before the first `32=signal` (a
-  device name); the last component is a GenericNameComponent of exactly 16
-  octets, the next-to-last `32=run`; what lies between is a space name (§11).
 - **Channel ask.** `D` is the components before the first `32=chan` (a device name); exactly one
   component follows, a ParametersSha256DigestComponent of 32 octets. Nothing else parses (no
   component, two, a generic one, a digest of another length). The announce of a channel has the
@@ -336,7 +332,7 @@ parser to run. A node MUST NOT serve any other name, except its **own key** `<D>
 and the certificates of that key (§7.6), which it answers whatever the keyword rule says (a
 device name holds `KEY` as a plain component: such a name has no keyword), and MUST NOT serve a
 name under `/localhost`. The keywords above, and `data`, `piece`, `manifest`,
-`sync`, `signal` and `run` (the other keywords this layer's names carry), are
+`sync` (the other keyword this layer's names carry), are
 **core**: an extension MUST NOT be given an Interest under one (§10.9).
 
 ### 2.5 The sync group of a space
@@ -728,7 +724,7 @@ offered again and verifies.
 The crate exports its wire format as `ndn_heap::wire`, so that a program that is
 not a node (the conformance suite, §13) can build, name, read and digest
 entries exactly as a node does. Nothing else of the module is public (the
-names of grants, held copies, seal keys and signal runs, the pieces, the record
+names of grants, held copies and seal keys, the pieces, the record
 codecs, the TLV registry, the function that signs an entry are the layer's own).
 There is no switch and no feature behind it: it is the format this section and §2
 specify.
@@ -2421,12 +2417,12 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   (§9.5) and the mark would only refuse what the cut keeps.
 - **A removed person is not suspected out of the cut:** her entries are judged by
   the removal cut alone (§3.7).
-- **A suspected key has no signal standing (stage-7 I8).** A key marked suspected
-  here is no signal member (`signal_member` false, `signal_sender` refuses
-  `Suspected`, its own device's signal calls `NotAllowed`), as one revoked is:
-  its run headers and its sends stop at the mark, not at the revocation. The mark
-  is this node's, so other nodes admit the key until they hold it or the
-  revocation.
+- **A suspected key has no standing in a channel (stage-7 I8).** A key marked
+  suspected here does not stand (§11.1), as one revoked does not: it is refused as
+  a sender and as a receiver, and its own device's `emit` and ask are refused
+  (`NotWriter`, `NotAllowed`): its asks and its frames stop at the mark, not at
+  the revocation. The mark is this node's, so other nodes admit the key until they
+  hold it or the revocation.
 - **A suspected key is granted no epoch key, and rotates the epoch.** A suspected
   key is refused every grant (`AskerKeySuspected`, §6.5 condition 8). A suspected
   key of a device of a person a sealed space reads for may already hold the key in
@@ -2534,7 +2530,7 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   admission step 6, the owner's implicit write (a refused entry says
   `NotOwnerDevice` and what to do), a device's own signing (`NotOwner`; a put
   says `NotAllowed`), the owner-log hole check, epoch repair, `change`, the
-  grant (`GrantRefusal::NotOwnerDevice`) and the signal scope. A device with no
+  grant (`GrantRefusal::NotOwnerDevice`) and a channel's standing. A device with no
   role at all in a role-layout namespace is no owner device either (fail
   closed). **The role layout is read from a signed marker, not inferred:** the
   governing trust context's schema is *authoritative* — the generated namespace
@@ -2544,13 +2540,13 @@ it is taken while its person is a writer (`Suspected`); what is held stays.
   back into owner devices. A namespace without the marker (a flat namespace of
   devices, as small hosts and tests make) has no roles to tell devices apart by,
   and all its devices are owner devices, as before.
-- **A member's guest or node device holds no epoch key and no signal standing
+- **A member's guest or node device holds no epoch key and no channel standing
   (stage-7 M2).** The exclusion of H1 protected only the owner's own devices: a
   member's `guest` (a friend's phone for a weekend) or `node` relay that opened a
   private space was granted the key in force, kept reading every later entry after
   its certificate lapsed (nothing rotated), and the owner never admitted it and
   cannot see it. Where a person's namespace declares the role layout, epoch keys
-  are now granted to her `admin` and `member` devices only, and so are signals
+  are now granted to her `admin` and `member` devices only, and so is standing in a channel
   (§6.5 condition 2, §11.1). Her guest and node devices still **write** where the
   record admits her (the entries are the person's, §3.8) and are told, by the
   refusal, to read from an `admin` or `member` device. Every key given in such a
@@ -2665,15 +2661,6 @@ impl Node {
     pub fn unsuspect(&self, key: &Name) -> bool;
     pub fn suspected(&self, key: &Name) -> Option<Timestamp>;
     pub fn refused_by_revocation(&self, key: &Name) -> Vec<Name>;
-    pub fn signal_scope(&self, space: &Name) -> Result<SignalScope, HeapError>;
-    pub fn signal_header(&self, scope: &Name, run_id: &[u8; RUN_ID_LEN], body: &[u8])
-                         -> Result<Bytes, HeapError>;
-    pub fn signal_sender(&self, scope: &Name, data: &Data)
-                         -> Result<SignalSender, SignalRefusal>;
-    pub fn signal_view(&self, scope: &Name, data: &Data)
-                       -> Result<Arc<Validator>, SignalRefusal>;
-    pub fn signal_member(&self, scope: &Name, key: &Name) -> bool;
-    pub fn revocations(&self) -> u64;
 }
 ```
 
@@ -2681,17 +2668,13 @@ The crate exports exactly these, the types they use (`Transport`, `Config`,
 `Clock`, `Share`, `Readers`, `MembersChange`, `Members`, `PutOptions`,
 `Frontier`, `Item`, `EntryId`, `Change`, `Changes`, `Alert`, `Follower`,
 `HeapError`, `NextStep`, `Refusal`, `Cut`, `Timestamp`, `CutBound`,
-`CutProposal`, `RUN_ID_LEN`, `SignalScope`, `SignalKey`, `SignalSender`,
-`SignalRefusal`) and the host's trust seam (`Adopter`, `Scoping`, §9.4), and,
-for `ndn-invite` and `ndn-surface` alone, the sibling surface of §10.9. The
-signal methods are the gate of §11 (`revocations` is its count of revocations;
-each answers `NotReady` for a space not open here as a member). They are
-methods of the node's `NodeHandle` (§10.9), which a `Node` dereferences to: a
-transport holds a handle and the host keeps the node. The node
-offers no raw signing: nothing signs octets a caller names with the device key
-(a signature over bytes of the host's choosing would be an oracle for any
-protocol that frames them like an entry); a run header is signed by
-`signal_header` under a name this gate defines. The one exception is the
+`CutProposal`) and the host's trust seam (`Adopter`, `Scoping`, §9.4), and,
+for `ndn-invite` alone, the sibling surface of §10.9: the node's `NodeHandle`,
+which a `Node` dereferences to (a sibling crate holds a handle and the host keeps
+the node). The node offers no raw signing: nothing signs octets a caller names
+with the device key (a signature over bytes of the host's choosing would be an
+oracle for any protocol that frames them like an entry); a channel's ask is signed
+under the name channel.md defines (§5 there). The one exception is the
 sibling surface (§10.9), which signs a packet only under a keyword an extension
 registered and never under one of the core keywords above.
 
@@ -2978,7 +2961,7 @@ Every error says why in its message and what to do in `HeapError::next()`, and
 | `NotReady { name, why }` | the creation is not held; no epoch in force or its key not held; `why` says what it waits for | `RetryLater` |
 | `BadName { name, why }` | a space or a path that does not parse (§2.3) | `FixName` |
 | `TooLarge { name, limit }` | a value over `PAYLOAD_MAX`, an entry over its limit | `FixName` |
-| `NotAllowed { space, why }` | this device's person is no writer; or a writer that is no reader of a sealed space (`why` says which and what to ask); or, for signals, neither writer nor reader, or its key revoked (§11) | `AskOwner` |
+| `NotAllowed { space, why }` | this device's person is no writer; or a writer that is no reader of a sealed space (`why` says which and what to ask); or, for a channel, neither a writer (to `emit`) nor a writer or reader (to receive), or its key revoked or marked suspected (§11) | `AskOwner` |
 | `Sealed { space }` | a read of a sealed space by a person outside its audience, or while an entry is held closed in an epoch the person is not entitled to (§10.3) | `AskOwner` |
 | `NotOwner { space }` | a structural call from a device that is not an owner device (§9.9) | `UseOwnerDevice` |
 | `Refused { name, why }` | `put`, `change` or an epoch by a device whose own key is revoked by a context held here (`Untrusted`) or marked suspected (`Suspected`) (§9.8) | that of `why` (`AskOwner`) |
@@ -3042,9 +3025,8 @@ decided show what they decided before.
   epoch that ended before it was added stays closed to it (§6.6).
 - **A public space** seals nothing: `Readers::Anyone`, no epochs, `get` and
   `watch` answer everybody.
-- **Signals.** `signal_scope` (the signal keys and the groups, §11.2) is
-  available to writers **and readers** of the space; sending a header and being
-  admitted as a sender stay with writers.
+- **Channels.** A reader of a sealed space that is in the audience of the epoch in
+  force may receive a channel of it (§11.3); sending stays with writers.
 
 ### 10.8 Threat notes
 
@@ -3071,8 +3053,8 @@ decided show what they decided before.
 
 ### 10.9 The sibling surface
 
-`ndn_heap::host` is the interface for `ndn-invite` and `ndn-surface` and for
-no other program; a host that reads and writes spaces never uses it. It lets a
+`ndn_heap::host` is the interface for `ndn-invite` and for no other program; a
+host that reads and writes spaces never uses it. It lets a
 sibling crate add a protocol of its own to a device (introductions, invite.md)
 that rides the device's key, trust, store and serving, without this layer
 growing a case for it. `Node` dereferences to a `NodeHandle`, the same
@@ -3123,7 +3105,7 @@ impl Heap { pub fn removed_by(&self, person: &Name) -> Option<EntryId>; }
 none, and answers `HeapError::BadRequest` (next step `FixRequest`) when it
 claims no keyword; a word that is not a keyword (lowercase ASCII letters,
 digits and `-`, at least one); a core keyword (§2.4: `data`, `log`, `seal`,
-`grant`, `held`, `piece`, `manifest`, `sync`, `chan`, `signal`, `run`); or a keyword
+`grant`, `held`, `piece`, `manifest`, `sync`, `chan`); or a keyword
 claimed already, by another extension or twice by itself. An Interest whose
 name is under this device's own name and whose keyword right after it is
 registered is **given to that extension, and to no other code**: it answers
@@ -3150,7 +3132,7 @@ named `<D>/32=<keyword>/…` where `D` is this device, the keyword is the
 component right after it, and an extension has registered it. The name is read
 from the very bytes about to be signed, before the key is used, so nothing
 signs a name the caller builds around it. Every other name (an entry
-`32=log`, a seal key, a grant, a signal run, a certificate or key name
+`32=log`, a seal key, a grant, a certificate or key name
 `<D>/KEY/…`, another device's, one with no keyword or the keyword not right
 after the device, an unregistered keyword) is `HeapError::BadRequest` naming why
 and what to register, signs nothing and counts no signature. A name with a
@@ -3246,143 +3228,76 @@ Threat notes:
   by the rules of §3.8 and §9; a name of a space not open here is refused
   before anything is asked.
 
-## 11. Signals: the gate
+## 11. Channels: the gate
 
-A **signal** is ephemeral live data — presence, cursors, a drag — pushed to the
-members of a space and never an entry: nothing of it is stored, served or counted
-by this layer. The transport that carries signals (`ndn-surface`, signals.md)
-asks the node six things, and nothing else leaves this layer. The scope of a
-signal is **one space**. The clock and sequence reservation of signals, and the
-admission of a run header (the certificate fetches it may cost), belong to the
-transport, not to this layer.
+A **channel** is ephemeral live data of a space (presence, a cursor, a drag): `emit`
+sends it, `get` receives it beside the kept values, and nothing of it is an entry:
+this layer stores, serves and counts none of it. Its setup by signed NDN, its
+frames, its receiver and sender, the forwarder's side table and its checkpoints are
+specified in [channel.md](channel.md) and built in `ndn-heap`'s `chan` module. This
+section states the one thing the layer decides for it: **who may take part**, the
+gate, which is a function of what is held (the members record, §5, and the trust
+contexts, §9), and so changes the moment a record or a context is held, never by
+time. The signals of earlier rounds, which had a gate of their own, are replaced by
+channels; their specification is kept in [history/signals.md](history/signals.md).
 
-**The channel, which replaces signals, is specified in [channel.md](channel.md)** and is
-built beside them: its setup by signed NDN (`<device>/32=chan/<digest>`), its frames and its
-receiver and sender are in `ndn-heap`'s `chan` module, and the same membership rule
-(§11.1: `standing`, shared with this section's gate) judges who may send and receive. Signals
-and their gate stay until the verbs of the channel replace them; this section is kept as it
-is until then.
+### 11.1 Standing
 
-### 11.1 Members
+A key **stands** for a space, in the role asked, when all of these hold:
 
-A **member** of a space, for signals, is a key of a device whose **person** is a
-writer of the space (the owner always is), which is an `admin` or `member` device
-of that person where her namespace declares the role layout (a `guest` or `node`
-device of any member is **no** signal member, §9.9), and which the trust context
-governing that key does not revoke and this node does not mark suspected (§9.8: a
-suspected key's entries are refused, so are its run headers). The person is the namespace of the context that
-governs the key, taken from the view the node judges the key's packets about the
-space by (§9.4): the node's own for a person it holds, else the view adopted for
-her while a listing of the space names her as a writer or a reader. The answer is
-read **offline, from what is held at the call**: the fold of the `Members` entries
-held and the contexts held, so it flips on the first call after the entry that
-removes a person, or the context that revokes a key, is held. Readers of a
-space that are not writers are **not** members: they cannot send and their
-headers are not admitted, but they are given the scope and, in a sealed space,
-the signal keys (§11.2), since they hold the epoch key and must be able to
-receive what members send.
+- the key names a device (`<device>/KEY/<id>`) whose **person** the members record
+  lists in that role: as a **writer** (the owner always is), or as **listed**, a
+  writer or a reader the record lists (a public space makes no reader of an unlisted
+  person: a channel's key is wrapped to a judged key);
+- the key's role is `owner_capable` (§9.9): an `admin` or `member` device where the
+  person's namespace declares the role layout, so a `guest` or a `node` device of
+  any person, a member's included, never stands;
+- the trust context that governs the key does not revoke it;
+- this node does not mark it suspected (§9.8: a suspected key's entries are
+  refused, so is its standing).
 
-### 11.2 The six calls
+The person is the namespace of the context that governs the key, taken from the
+view the node judges the key's packets about the space by (§9.4): the node's own for
+a person it holds, else the view adopted for her while a listing of the space names
+her as a writer or a reader. The answer is read **offline, from what is held at the
+call**: the fold of the `Members` entries held and the contexts held, so it flips on
+the first call after the entry that removes a person, or the context that revokes a
+key, is held.
 
-| Call | What it says |
-|---|---|
-| `signal_scope(space)` | this device's `SignalScope { space, keys, groups, listen }`, to a writer **or a reader** of the space: its signal keys when the space is sealed, the group to push into (`sync_group_of(space)`) and the group to listen on (the same one) |
-| `signal_header(scope, run id, body)` | a run header signed by this device's key |
-| `signal_sender(scope, header)` | the header's signer if it is a member, before anything is verified, and again once the transport verified it |
-| `signal_view(scope, header)` | the validator that judges the header's signer (the node's own, or the view adopted for her): what the transport verifies the header by |
-| `signal_member(scope, key)` | whether a key is a member now; asked for every packet |
-| `revocations()` | a count that moves when a trust context that revokes keys is adopted (the judge's generation, §9.1), so a transport walks the chains of the runs it admitted again |
+### 11.2 Who is judged as what
 
-**This device may take the scope** when the space's creation is held and this
-device's key is a writer's or a reader's and not revoked; it may **send** (sign
-a header, `signal_header`) only as a writer, that is, as a member. Otherwise
-`signal_scope` and `signal_header` answer `NotReady` (the space is not open here
-as a member, or its creation is not held;
-or, sealed, no epoch is in force, or the key of the epoch in force is not held
-yet and this device is in the audience: ask again after the grant; the gate
-starts no ask), `BadName` (the name is no space name: no node can open one of
-that name, fix the name), `NotAllowed` (neither writer nor reader, or, for
-`signal_header`, not a writer; or its own key is revoked or marked suspected) or `Sealed` (a person
-outside the sealed space's audience, which may not hold its key; the owner
-counts as inside). A header can be signed without the epoch's key. The checks
-that judge another device's key (`signal_member`, `signal_sender`) count writers
-only, whoever asks.
+| Party | Judged as | Where |
+|---|---|---|
+| the sender, by itself | a writer, and the creation of the space held | before every `emit`: `NotReady` while the creation is not held, `NotWriter` when its own key does not stand as a writer (the refusal says why and what to ask the owner) |
+| the sender, by a receiver | a writer | on the session's Data, and for every frame once the judge's generation or the space's record has moved (channel.md §3.4, §12.3); a reader's device is `SenderNotWriter` whatever it holds |
+| the receiver, by itself | listed (a writer or a reader) | before it asks: `NotAllowed` otherwise |
+| the receiver, by the sender | listed | at the ask, before any signature is checked for a stranger, and again once the signature verified (channel.md §3.3); and for every receiver whenever the record changes or a context that revokes keys is adopted (channel.md §3.6) |
 
-### 11.3 Run headers
+A `guest` or `node` device is judged as no one (§11.1). A node holding the creation of
+a space only as a follower, not as a member, takes no part.
 
-A run header is the Data `<D>/32=signal/<S>/32=run/<run id>` (§2.2): the run id
-one GenericNameComponent of 16 octets, no FreshnessPeriod, Content the body,
-signed by a key of `D`. It is never stored, served or fetched here.
+### 11.3 Sealed spaces
 
-`signal_sender` refuses with: `Malformed` (a scope other than the space, a name
-that is not a run header of it, no key locator, a key of another device than the
-name's), `NotReady` (the creation is not held), `NotMember`, `BadSignature`
-(for a key the context governing it revokes) or `Suspected` (for a key this node
-marks suspected, §9.8). Its answer is
-`SignalSender { key, device, namespace }`, the **namespace being the person**: a
-transport bounds a sender's admissions and runs by it, since a person can make as
-many keys and devices as it likes and never more persons.
+A sealed space adds its **audience**: the persons the epoch in force is sealed to (§6.3).
+The sender answers an ask only if the asker's person is in the audience of the epoch
+in force (a signed `NotAudience` refusal says what a plain read of a sealed path
+would), and a receiver takes a session only if the audience epoch it names is the epoch
+in force at the receiver (`StaleEpoch` and `NotReady` say which side is behind,
+channel.md §3.3 step 8, §3.4 step 6). A channel's key is random for each session, never
+derived from an epoch's content key, and wrapped to the receiver's recipient key, so
+a person outside the audience holds none. `emit` in a sealed space with no epoch in
+force is `NotReady`.
 
-The transport admits a header in three steps: `signal_sender` first (a stranger's
-header costs nothing more); then it verifies the header by the validator
-`signal_view` gives, the one that judges the signer's person (the node's own,
-or the view adopted for her), by the **live** rule: its certificates valid now,
-a revoked or suspected key refused; and then `signal_sender` again, so a removal,
-revocation or mark held while the chain was fetched ends it (`NotMember`,
-`BadSignature`, `Suspected`). `signal_view` decides nothing about membership and answers
-`NotReady` for a space not open here as a member. The chain is walked from the
-certificates held first; one not held is fetched, and the transport bounds those
-fetches: only while fewer than **2** headers of the signer's person wait for
-certificates, not for a device whose last fetch brought none within **30 s**,
-and at most **4** certificates for one header; otherwise `Unverified` (ask again
-when the header rides again). The layer enforces none of these: they are the
-transport's policy over the view (`ndn_surface::signal`). A refused header is
-dropped with its run; none is kept.
+### 11.4 Threat notes
 
-### 11.4 Signal keys
-
-A sealed space's **signal key** for an epoch is `HKDF-SHA256(IKM = the epoch's
-content key, salt = none, info = "ndn-heap/signal/1" ‖ the Name TLV of S ‖ the
-Name TLV of the epoch's creator ‖ the epoch's seq, 8 octets big-endian)`, 32
-octets (an XChaCha20-Poly1305 key, signals.md). Its **id** is the first 8 octets
-of `HKDF-SHA256(IKM = the signal key, salt = none, info =
-"ndn-heap/signal/id/1")`, carried beside what it seals so a receiver knows which
-key opens it. `SignalScope.keys` lists the epoch in force's key **first** (the
-one to seal with), then the keys of the other epochs whose content keys are held,
-by epoch seq highest first (to open what members still seal in them). The keys
-are zeroed when dropped and never shown by `Debug`.
-
-### 11.5 Differences from the previous gate
-
-- The scope is a space; the previous gate's scope was a collection or folder with
-  per-namespace groups for every writer and reader namespace, and a share. The
-  groups to push into and to listen on are the space's one group.
-- Members are the space's **writers** (and the owner), by person; the previous
-  gate also admitted the readers of the record's audience. The decision is that
-  `signal_scope` (the keys and the groups) is available to writers **and
-  readers**, so a reader of a sealed space can receive what members send,
-  while sending and admitting a sender remain writers' only.
-- The gate asks the node's judge for persons and revocations; `revocations()`
-  is the judge's generation, with no counter of its own.
-- The clock, the sequence floor and their store keys are not in this layer.
-- **Admission is the transport's.** The previous gate's `signal_admit` (the walk
-  of the header's certificate chain, the fetch budget, the 30 s back-off) is not in
-  this layer: the transport verifies the header itself by the view the node gives
-  (`signal_view`, §11.2), and asks `signal_sender` before and after. The layer
-  keeps the membership, which is a function of what is held; the network cost of
-  a header is the transport's to bound, by the rules of §11.3, kept in
-  `ndn-surface` and tested there.
-
-### 11.6 Threat notes
-
-- **A removed member** keeps sending until the removal is held here: the answer
-  is exact by what is held, never by time.
-- **A stranger's headers** cost no certificate fetch (`signal_sender` refuses them
-  offline before the transport spends anything), and a member's cost what the
-  transport's budget allows: at most 2 waiting per person and one fetch run per
-  device per 30 s (signals.md §10).
-- **A revoked issuer** ends the runs it certified: the count of §11.2 moves and a
-  transport walks the chains again.
+- **A removed member** keeps sending until the removal is held here: the answer is
+  exact by what is held, never by time. The first frame after the node holds the
+  removing record is refused and its session ends (channel.md §12.3).
+- **A stranger's ask** costs a lookup and no signature check (channel.md §3.3).
+- **A revoked issuer** ends the sessions of the keys it certified: the judge's
+  generation (§9.1) moves, and every receiver and sender is judged again.
+- **A key holder that is no writer** can seal frames a receiver accepts; what the
+  gate does not decide, the checkpoints of the sender tell (channel.md §15).
 
 ## 12. Failure model
 
@@ -3429,7 +3344,7 @@ are zeroed when dropped and never shown by `Debug`.
 | After a restart a path serves only an older version of a member's context | The newest version adopted is kept signed, held again at start and refreshed from by continuity; an older version, that number with other content, or a branch not descending from it is refused. | §9.4 |
 | Value in pieces, a piece forged or missing | A piece verifies by the digest its parent lists or is dropped; the value is `Unavailable` until whole; nothing is stored of a partial value. | §8 |
 | Space created by an outsider under an owner's name | Its `Members` entries are refused (`NotMember`): only keys of devices of the owner's person, under its namespace by name, carry them. | §3.8, §9.9 |
-| Signal sender removed or revoked | The gate flips on the first packet after the removal or revocation is held. | §11 |
+| Channel sender or receiver removed or revoked | The gate flips on the first frame after the removal or revocation is held. | §11 |
 
 The durability cases — a crash at each point, with and without a peer, with and
 without `durable`, a restored image, a failing disk — are the matrix of §4.9.
@@ -3522,34 +3437,19 @@ dropped, a start from the image), `image`, `restore` and `block_flush`.
 | q8 | An epoch a held epoch replaces is never in force, whatever the order of the creators' names, and returns when the replacing entry is withdrawn | `an_epoch_a_held_epoch_replaces_is_never_in_force_whatever_their_order`, `withdrawing_an_epoch_equals_never_having_seen_it`, `only_a_put_or_an_epoch_names_what_it_supersedes` |
 | q9 | A reader's device whose key is revoked is granted no key and the epoch it held goes out of force: an owner device signs one new epoch that replaces it, a restart none more; a granter's kept seal key and grant never outlive a revocation | `may_grant_refuses_each_condition_and_names_which`, `an_asker_with_a_revoked_key_gets_no_grant`, `a_reader_device_with_a_revoked_key_is_refused_every_grant`, `a_kept_seal_key_and_grant_are_not_served_after_the_judge_moves`, `revoking_a_reader_devices_key_makes_an_owner_device_sign_a_new_epoch_once` |
 
-### 13.4 Signals (with the signal transport)
+### 13.4 Channels (with the channel suite)
 
-The transport that carries signals (`ndn-surface`) owns most of these; this layer
-owns the gate (§11): who is a member, the signal keys, admission of a header,
-and the count that walks admitted runs again. The suite runs them on this layer
-only.
+The channel is specified and tested in [channel.md](channel.md). The cases of the signals
+it replaced (e1–e19) are the conformance suite's channel cases c23–c41, ported or
+deleted one by one in its case table; the suite carries the delivery cases. This layer
+owns the gate (§11), and its crate tests are these:
 
 | Case | Property | Crate tests |
 |---|---|---|
-| e1 | A member's signals reach every other member, attributed to the device whose key vouched for the run, each delivered once and never older than one before it; a reader of a sealed space holds the scope and keys to receive them and cannot send | `a_members_header_is_admitted_at_a_peer_node_and_a_removed_writers_is_not`, `a_reader_of_a_sealed_space_gets_scope_and_keys_but_cannot_send_and_its_headers_are_not_admitted` (delivery: suite only) |
-| e2 | A device no entry in force names is refused `NotMember` when it opens a run, and its hand-made packets are refused by every member | `a_header_signed_by_a_non_member_is_refused_with_the_reason`, `a_device_that_is_no_member_uses_no_signals`, `a_spaces_members_are_its_writers_by_person_and_no_stranger` |
-| e3 | A member cannot pass signals off as another's: a run is another's only if its run key signed | suite only (the run key is the transport's) |
-| e4 | A replayed packet is refused as a sequence its run already delivered | suite only |
-| e5 | From the moment a device holds the entry that removes a member, or the revocation of a key, every packet of that member or key is refused, signals of the new epoch cannot be opened by the removed member, and its own send answers `NotMember` | `signal_member_flips_after_a_removal`, `a_revoked_key_is_no_member_once_its_revocation_is_held`, `a_sealed_space_gives_its_audience_the_keys_of_its_epochs`, `a_members_header_is_admitted_at_a_peer_node_and_a_removed_writers_is_not` |
-| e6 | A relay of a sealed space's signals sees only ciphertext, a key id, a size and timing | `a_signal_key_is_the_hkdf_the_spec_fixes`, `signal_keys_are_per_epoch_and_zeroized` (the packets: suite only) |
-| e7 | No store keeps a signal: nothing under `32=signal` is stored, served or fetched | `signal_run_names_round_trip_and_refuse_what_they_are_not`, `the_keyword_router_names_each_served_kind_in_one_look`, `localhost_and_other_devices_names_are_never_served` |
-| e8 | The newest signal per address survives loss, duplication and reordering | suite only (the transport's) |
-| e9 | Live edits never become entries: a stream of signals ending in one put adds exactly one entry | suite only (this layer never stores a signal, §11) |
-| e10 | Four senders at 60 Hz in one sealed space: every receiver gets each sender's last signal per address, once, in order | suite only |
-| e11 | A run header is taken only with proof that its signer holds the run key | suite only; the signer's membership and signature: `a_header_signed_by_a_non_member_is_refused_with_the_reason` |
-| e12 | A flood of unfetchable run headers never shuts out a member's run | `the_fetch_budget_bounds_waiting_headers`, `a_device_whose_certificate_could_not_be_had_is_not_asked_again_for_30_seconds`, `a_member_header_admitted_after_the_chain_fetch` |
-| e13 | Forged packets of a held run do not starve its genuine ones | suite only |
-| e14 | One member cannot take a space's run slots, and a removal frees them at once | `signal_member_flips_after_a_removal` (the slots: suite only) |
-| e15 | A packet at the largest sequence is taken or refused like any other | suite only |
-| e16 | Revoking a sender's issuer ends its held run without waiting for its next header | `a_revoked_key_is_no_member_once_its_revocation_is_held` (the count `revocations()` moves), `a_header_under_an_expired_certificate_is_refused` |
-| e17 | A signal of 512 octets is delivered whole under the longest space names, and a name over the limit is refused with the limit stated | `space_names_of_one_to_four_components_parse_and_five_do_not` (the signal's size: suite only) |
-| e18 | A member whose clock stepped back across a restart is heard again | suite only; the clock is not in this layer (§11) |
-| e19 | A crash loop and a corrected clock leave a member's signal clock at real time | suite only; the clock is not in this layer (§11) |
+| g1 | A stranger's ask is refused without a signature check; a reader never sends and a Data signed by one is refused | `a_strangers_ask_is_nacked_and_costs_no_signature_verification`, `a_reader_cannot_be_a_sender_and_a_data_from_one_is_refused` |
+| g2 | From the moment a device holds the entry that removes a member, or the revocation of a key, it is not answered, its session ends and the channel is re-keyed | `a_removed_receiver_is_not_answered_and_the_channel_rekeys`, `a_removed_sender_is_dropped_at_the_generation_move`, `a_revoked_senders_session_is_dropped_when_the_trust_generation_moves`, `a_revoked_receivers_key_rekeys_the_channel_and_drops_it_with_no_change_of_members` |
+| g3 | A sealed space's channel is for the audience of the epoch in force | `a_sealed_space_ask_outside_the_audience_gets_a_signed_refusal_that_says_what_to_do`, `an_ask_naming_an_epoch_the_sender_does_not_have_in_force_is_refused_stale_or_not_ready` |
+| g4 | A `guest` or a `node` device of the owner or of a member stands in no role; a suspected key does not stand until it is unsuspected; a reader stands as listed and not as a writer | `a_guest_or_node_device_does_not_stand_in_any_role`, `a_suspected_key_does_not_stand_until_unsuspected`, `a_reader_stands_as_listed_and_not_as_a_writer` |
 
 ### 13.5 Invitations (with `ndn-invite`)
 
@@ -3707,7 +3607,7 @@ to 0.40 s, first `get` 0.014 ms, listing 5.4 ms.
   owner's name whose key a deeper context validates cannot carry them) **and**
   an `admin` or `member` device where the owner declares the role layout (a
   `guest`, a `node` relay and a role-less device cannot), at admission, when
-  signing, when granting a key and for signals (§2.1, §3.8 step 6, §9.9).
+  signing, when granting a key and for a channel's standing (§2.1, §3.8 step 6, §9.9, §11.1).
 - **Writers that are not readers** of a sealed space cannot hold a key and cannot
   seal (§5.7, §10.7): their `put` answers `NotAllowed`. A sealed space listing
   more than 256 readers is refused before anything is signed (§10.7).
@@ -3778,7 +3678,7 @@ and every even number of the block are free.
 | 0x063D | `ASKER_CERT` | the wire of one certificate of the asker's signer chain (a whole Data), at most 4 in a `GRANT_ASK`, each at most 4,096 octets, 6,144 in all | 2.3, 3.3, 6.5 |
 
 Name keywords this specification owns (KeywordNameComponent, TLV-TYPE 0x20): `data`,
-`log`, `piece`, `manifest`, `seal`, `grant`, `held`, `sync`, `signal`, `run` (§2, §11). The numbers
+`log`, `piece`, `manifest`, `seal`, `grant`, `held`, `sync` (§2); `chan` is channel.md's. The numbers
 that the deletions of the former data layer freed (inside 0x0520–0x057F, except the numbers
 `invite.md` lists, and 0x05C0–0x05FE) stay quarantined, so no stale `ndn-data` packet ever decodes as
 new content; the block 0x0640–0x0653 belongs to the custodian remote signer of

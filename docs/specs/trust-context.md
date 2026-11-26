@@ -1727,9 +1727,9 @@ outside its ValidityPeriod by the node's clock: signed Interests and command
 Interests, management authorization, adopting a context (§4.4, §5.2: the
 signer anchor valid now), enrollment, renewal and NDNCERT, link admission
 and peer authentication, certificate issuance and serving, the prefix
-announcements a forwarder installs routes from, and signal run headers
-([signals.md](signals.md) §7: Data, but never kept, served or answered for,
-admitted only to open a live run). These are
+announcements a forwarder installs routes from, and the signed asks of a channel
+([channel.md](channel.md) §3.3: an Interest, never kept or served, admitted only to
+open a session). These are
 exchanges whose freshness is the point; a refusal is retried, never stored,
 so a wrong clock there denies service, loudly, and decides nothing about
 stored data.

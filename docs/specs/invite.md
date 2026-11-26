@@ -184,8 +184,7 @@ else under `32=intro` is served.
 ### 2.3 The two prefixes, and silence
 
 The crate registers one `Extension` with `Node::extend` (the sibling surface of
-heap.md, documented there as the interface for `ndn-invite` and `ndn-surface`
-only). The extension is held weakly by the node: once the `Invites` handle and its
+heap.md, documented there as the interface for `ndn-invite` only). The extension is held weakly by the node: once the `Invites` handle and its
 clones are gone, it answers nothing. Its keywords are `intro` and `hint`, which
 carry the exchange, and `ask`, which only lets the node sign the proof packets
 `<X>/32=ask/<binding>` an ask and an answer carry (the node signs only under a
@@ -1621,7 +1620,6 @@ two names by the grammar of heap.md §2.3: nothing is looked up and nothing is c
 
 - an entry `<D>/32=log/<space>/seq=<n>` **of this space** (any device, whatever device wrote it), and a piece or manifest node
   `<E>/32=piece/…` of such an entry (heap.md §2.2); never an entry of another space, even one whose name extends this space's;
-- a signal run header `<D>/32=signal/<space>/32=run/<id>` of this space;
 - a seal key `<W>/<role>/<device>/32=seal/<public key>` of a device of the space's **own owner namespace** (exactly two components below
   the owner, the first a role of the layout), and a grant ask `<G>/32=grant/<GrantAsk>` of this space **to a device of the owner's
   namespace** (the epoch's creator, or another owner device that holds the key: heap.md §6.5); no other seal key, no other granter;
@@ -1656,7 +1654,7 @@ writers' devices and keys:
   grant asks of its choosing to devices that never held the key;
 - a held copy about a name carried by these rules, nested to the depth `folder_carries` unwraps held names to, and not deeper.
 
-Nothing of a writer outside the space is added: the other writers' entries, pieces and signal headers of the space are carried
+Nothing of a writer outside the space is added: the other writers' entries and pieces of the space are carried
 already, whatever device wrote them. A reader-role grant gains nothing by it: the link layer's push scope stays the person's own devices'.
 
 **The space's sync group is the link layer's, in two halves** (ndn-link.md §8.7 rules 10 and 20; the hook is ndn-link's
