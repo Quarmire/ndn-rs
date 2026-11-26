@@ -830,6 +830,32 @@ async fn an_items_made_after_the_last_one_let_go_is_not_told_that_the_session_en
     assert_eq!(&got.bytes[..], b"y");
 }
 
+/// A receiver whose explicit ask and an announce-driven ask are in flight together makes both
+/// as new (neither session is installed when the second decides), and the sender welcomes the
+/// first as a fresh device and the second as a claim: each arms the stream's gate, which opens on
+/// a `Keep` per welcome. The route is laid by the first answer, so the second finds the session
+/// installed and its `Keep` entry standing: it still sends a `Keep` at once, or the sender's
+/// stream frames (HELLO again, binds, checkpoints) wait the whole `ROUTE_WAIT` for one that
+/// comes only with the next maintenance pass (channel.md 13.12 item 28).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_to_a_second_new_ask_in_flight_sends_its_own_keep_at_once() {
+    let rig = rig(true).await;
+    let (carol, bob) = (rig.carol(), rig.bob());
+    let _items = live(carol);
+    let space = space();
+    let (first, second) = tokio::join!(
+        carol.ask_channel(&space, bob.name()),
+        carol.ask_channel(&space, bob.name())
+    );
+    first.expect("the first ask is answered");
+    second.expect("the second ask is answered");
+    assert_eq!(
+        carol.inner.chan.route.keeps.get(),
+        2,
+        "each new ask the sender welcomed is followed by a Keep at once"
+    );
+}
+
 /// An ask of a sender, signed and answered by it, whose answer is not handed to the asker yet: what
 /// an ask that is still on its way holds. Returns the ask's name, the answer, the judges'
 /// generation read before the ask went out and the ask's ticket.

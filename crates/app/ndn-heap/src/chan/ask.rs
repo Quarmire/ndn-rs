@@ -201,6 +201,7 @@ impl NodeInner {
         let new = !self.chan.sessions.all().iter().any(|s| {
             s.ended().is_none() && s.sender() == sender && s.space() == space && s.mode() == mode
         });
+        asking.made_new(new);
         let ask = ChanAsk {
             space: space.clone(),
             prefix: Name::root(),
@@ -431,8 +432,9 @@ impl NodeInner {
             self.chan.stats.installed.bump();
             (session, replay)
         };
-        // The route this session came over is kept from now: the first `Keep` goes out at once.
-        self.chan_route_installed(&session);
+        // The route this session came over is kept from now: the first `Keep` goes out at once,
+        // and one for every ask made as new, which the sender welcomed and waits a `Keep` for.
+        self.chan_route_installed(&session, asking.was_new());
         if let Some(replay) = replay {
             self.chan_replay_held(session.id(), replay).await;
         }

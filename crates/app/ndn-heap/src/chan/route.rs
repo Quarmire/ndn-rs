@@ -403,8 +403,13 @@ impl NodeInner {
     }
 
     /// The first `Keep` of a session just installed, at once (the sender holds its stream frames
-    /// until it arrives); the maintenance pass sends the rest.
-    pub(crate) fn chan_route_installed(&self, session: &RecvSession) {
+    /// until it arrives); the maintenance pass sends the rest. `new`: the ask this answer
+    /// belongs to was made as a new one. The sender welcomed it (a fresh device or a claim) and
+    /// its stream's gate waits for one `Keep` more, so one goes out at once even when another
+    /// ask's answer installed the session first and its `Keep` entry stands (an explicit ask
+    /// and an announce-driven ask in flight together): without it the sender's stream frames
+    /// wait the whole [`ROUTE_WAIT`] for the next maintenance pass's `Keep`.
+    pub(crate) fn chan_route_installed(&self, session: &RecvSession, new: bool) {
         let routes = &self.chan.route;
         let Some(conn) = routes.conn() else { return };
         let mut keeping = routes.keeping.lock();
@@ -412,7 +417,7 @@ impl NodeInner {
             last: None,
             path_settled: false,
         });
-        if entry.last.is_none()
+        if (entry.last.is_none() || new)
             && conn
                 .try_send_side(up_frame(session.id(), UpOp::Keep), SideClass::Datagram)
                 .is_ok()

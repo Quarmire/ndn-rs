@@ -17,7 +17,7 @@
 use super::FastMap;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use ndn_foundation_types::Name;
@@ -576,6 +576,7 @@ pub(crate) struct Asking<'a> {
     sessions: &'a RecvSessions,
     key: (Name, ChannelMode),
     began: u64,
+    new: AtomicBool,
 }
 
 impl Asking<'_> {
@@ -587,6 +588,18 @@ impl Asking<'_> {
             .lanes
             .get(&self.key)
             .is_none_or(|lane| lane.asking <= 1)
+    }
+
+    /// The ask is made as a new one (`ASK_NEW`: no session of the channel was held when it was
+    /// built). Said once, before the Interest leaves.
+    pub(crate) fn made_new(&self, new: bool) {
+        self.new.store(new, Ordering::Relaxed);
+    }
+
+    /// Whether the ask was made as a new one: the sender welcomes it (it arms its stream's gate
+    /// for a `Keep`), whether or not another ask's answer installed the session first.
+    pub(crate) fn was_new(&self) -> bool {
+        self.new.load(Ordering::Relaxed)
     }
 }
 
@@ -723,6 +736,7 @@ impl RecvSessions {
             sessions: self,
             key,
             began,
+            new: AtomicBool::new(false),
         }
     }
 
