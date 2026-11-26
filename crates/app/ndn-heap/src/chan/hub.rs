@@ -111,7 +111,8 @@ pub(crate) struct Stats {
     pub(crate) announces_heard: Counter,
     /// Announces of a device that is no writer of the space (a lookup and nothing else).
     pub(crate) announce_strangers: Counter,
-    /// Announces of a writer that were not acted on (not wanted, or over a limit).
+    /// Announces of a writer that were not acted on (not wanted, over a limit, or of a device the
+    /// record holds no admitted entry of).
     pub(crate) announce_ignored: Counter,
     /// Asks an announce made this device send.
     pub(crate) announce_asks: Counter,
@@ -296,9 +297,9 @@ impl NodeInner {
     }
 
     /// An announce was heard (`ChanPort::heard`): a hint, and nothing more. It costs a lookup of
-    /// the announcer's person in the record of the space; only a writer's, while this device
-    /// wants live data of the space, makes it ask, each device at most once in 10 s and at most
-    /// 32 asks in progress for a space.
+    /// the announcer's person in the record of the space; only a writer's device of which the
+    /// record holds an admitted entry, while this device wants live data of the space, makes it
+    /// ask, each device at most once in 10 s and at most 32 asks in progress for a space.
     pub(crate) fn chan_heard(&self, interest: &Interest) {
         let stats = &self.chan.stats;
         stats.announces_heard.bump();
@@ -327,12 +328,21 @@ impl NodeInner {
         else {
             return;
         };
-        let writer = self.space_of(&space).is_some_and(|held| {
+        let (writer, vouched) = self.space_of(&space).map_or((false, false), |held| {
             let person = self.person_of(&sender);
-            held.log.lock().fold.is_writer(&person)
+            let log = held.log.lock();
+            (log.fold.is_writer(&person), log.vouches(&sender))
         });
         if !writer {
             stats.announce_strangers.bump();
+            return;
+        }
+        // The announce is unsigned, so any name under a writer's namespace passes for one of
+        // that writer's devices. Only a device the record holds an admitted entry of (its key was
+        // judged for the space, its certificate is held) is worth an ask slot; any other is
+        // asked by name (`ask_channel`), not by hint.
+        if !vouched {
+            stats.announce_ignored.bump();
             return;
         }
         let now = Instant::now();

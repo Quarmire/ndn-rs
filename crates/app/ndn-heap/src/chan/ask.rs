@@ -63,12 +63,42 @@ fn bad_answer(sender: &Name, why: impl Into<String>) -> ChanError {
     }
 }
 
+/// Whether `device` lies under a reserved prefix, `/localhost` or `/localhop`: no device of the
+/// network is named so, and a command signed under such a name is what a forwarder takes from its
+/// own host or its neighbour.
+fn is_reserved(device: &Name) -> bool {
+    device
+        .components()
+        .first()
+        .is_some_and(|c| matches!(c.value.as_ref(), b"localhost" | b"localhop"))
+}
+
 impl NodeInner {
     /// Sign the ask `<device>/32=chan/<digest>` whose ApplicationParameters are `params`: an
     /// InterestSignatureInfo with this device's key as the KeyLocator, a SignatureNonce and a
     /// SignatureTime, MustBeFresh, an InterestLifetime of 4 s. The name is the only one this
-    /// signs: a signed Interest of this device's key is a command anywhere that trusts the key.
+    /// signs: a signed Interest of this device's key is a command anywhere that trusts the key,
+    /// so `params` must decode as a `CHAN_ASK` and `device` must be no reserved prefix
+    /// (`/localhost`, `/localhop`): whatever else a caller hands in is refused, never signed.
     pub(crate) fn sign_ask(&self, device: &Name, params: &[u8]) -> Result<Bytes, HeapError> {
+        if is_reserved(device) {
+            return Err(HeapError::BadRequest {
+                why: format!(
+                    "{device} lies under a reserved prefix (/localhost, /localhop): this node \
+                     signs an ask only for a device of the network"
+                ),
+            });
+        }
+        if let Err(e) = ChanAsk::decode(Bytes::copy_from_slice(params)) {
+            return Err(HeapError::BadRequest {
+                why: format!(
+                    "the {} octets given are no CHAN_ASK ({e}): this node signs the ask of a \
+                     channel and nothing else, since a signed Interest of the device's key is a \
+                     command wherever the key is trusted",
+                    params.len()
+                ),
+            });
+        }
         let key = self.signer.key_name();
         let mut failed = None;
         let wire = InterestBuilder::new(chan_prefix(device))
@@ -122,6 +152,14 @@ impl NodeInner {
             return Err(ChanError::BadName {
                 name: sender.clone(),
                 why: "it is no device name: no keyword or digest component".into(),
+            });
+        }
+        if is_reserved(sender) {
+            return Err(ChanError::BadName {
+                name: sender.clone(),
+                why: "it lies under a reserved prefix (/localhost, /localhop): no device of the \
+                      network is named so"
+                    .into(),
             });
         }
         if *sender == self.device {

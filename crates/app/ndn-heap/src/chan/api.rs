@@ -48,12 +48,14 @@ impl NodeHandle {
     /// Sign the ask `<device>/32=chan/<digest>` whose ApplicationParameters are `parameters` (a
     /// `CHAN_ASK`): an InterestSignatureInfo with this device's key as the KeyLocator, a
     /// SignatureNonce and a SignatureTime, MustBeFresh, an InterestLifetime of 4 s. `prefix` must be
-    /// `<device>/32=chan`: the node signs no other Interest, since a signed Interest of the
-    /// device's key is a command wherever the key is trusted.
+    /// `<device>/32=chan` and `parameters` must decode as a `CHAN_ASK`: the node signs no other
+    /// Interest, since a signed Interest of the device's key is a command wherever the key is
+    /// trusted. `device` may not lie under `/localhost` or `/localhop`.
     ///
     /// # Errors
     ///
-    /// [`HeapError::BadRequest`] when `prefix` is not `<device>/32=chan`;
+    /// [`HeapError::BadRequest`] when `prefix` is not `<device>/32=chan`, `device` is under a
+    /// reserved prefix, or `parameters` are no `CHAN_ASK`;
     /// [`HeapError::Local`] when the key does not sign synchronously.
     pub fn sign_interest(&self, prefix: &Name, parameters: &[u8]) -> Result<Bytes, HeapError> {
         let Some(device) = parse_chan_prefix(prefix) else {

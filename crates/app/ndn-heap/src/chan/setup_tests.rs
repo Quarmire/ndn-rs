@@ -20,7 +20,7 @@ use super::error::ChanError;
 use super::key::ChannelKey;
 use super::standing::{Who, gate};
 use super::wire::{Announce, Answer, ChanAsk, ChannelMode, RefusalCode, SessionRecord, carrier};
-use crate::error::NextStep;
+use crate::error::{HeapError, NextStep};
 use crate::fold::Readers;
 use crate::node::tests::{Dev, cfg, space, world, world_apart};
 use crate::node::{Config, Node, Transport};
@@ -1447,3 +1447,76 @@ async fn a_session_reusing_another_senders_channel_id_is_refused() {
     assert_eq!(bob.inner.chan.sessions.all().len(), 1);
 }
 
+/// The announce is unsigned: a name under a writer's namespace that is no device the record
+/// holds an entry of is no sender to ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_announce_of_a_device_the_record_holds_nothing_of_makes_no_ask() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
+    let (share, change) = public_with(&["/bob"], &["/carol"]);
+    shared(&rig, share, change).await;
+    let carol = &rig.nodes[2];
+    let group = sync_group_of(&space()).unwrap();
+    let _listening = carol.inner.chan_listen(&space());
+    let record = Announce {
+        sender: n("/bob/ghost"),
+        modes: vec![ChannelMode::Latest],
+    }
+    .encode();
+    let wire = InterestBuilder::new(chan_prefix(&group))
+        .lifetime(Duration::from_secs(1))
+        .hop_limit(8)
+        .app_parameters(record.to_vec())
+        .build();
+    rig.syncs[0].send(wire).await.unwrap();
+    let stats = &carol.inner.chan.stats;
+    eventually("carol heard the announce", || {
+        stats.announces_heard.get() >= 1
+    })
+    .await;
+    assert_eq!(
+        stats.announce_strangers.get(),
+        0,
+        "bob's person is a writer"
+    );
+    assert_eq!(
+        (stats.announce_asks.get(), stats.asked.get()),
+        (0, 0),
+        "and a name nobody holds an entry of makes no ask"
+    );
+    assert_eq!(stats.announce_ignored.get(), 1);
+}
+
+/// `sign_interest` signs the ask of a channel and nothing else: the parameters decode as a
+/// `CHAN_ASK`, and the device asked is no reserved prefix (`/localhost`, `/localhop`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_interest_signs_only_an_ask_for_a_device_that_may_be_asked() {
+    let rig = rig(&["/alice/laptop"]).await;
+    let alice = &rig.nodes[0];
+    let ask = ask_of(alice, ChannelMode::Latest).encode().unwrap();
+    alice
+        .sign_interest(&chan_prefix(&n("/bob/phone")), &ask)
+        .expect("an ask for a device is signed");
+    let signed = || {
+        alice
+            .inner
+            .signatures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let before = signed();
+    for params in [b"not an ask".as_slice(), &[], &[7u8; 9000]] {
+        let refused = alice.sign_interest(&chan_prefix(&n("/bob/phone")), params);
+        assert!(
+            matches!(refused, Err(HeapError::BadRequest { .. })),
+            "{} octets that are no ask: {refused:?}",
+            params.len()
+        );
+    }
+    for device in ["/localhost/ndn/x", "/localhop/ndn/x", "/localhost"] {
+        let refused = alice.sign_interest(&chan_prefix(&n(device)), &ask);
+        assert!(
+            matches!(refused, Err(HeapError::BadRequest { .. })),
+            "{device} is reserved: {refused:?}"
+        );
+    }
+    assert_eq!(signed(), before, "nothing was signed for a refusal");
+}
