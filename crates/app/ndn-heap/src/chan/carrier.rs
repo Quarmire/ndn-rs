@@ -15,6 +15,11 @@
 //!   queued ahead (docs/specs/ndn-link.md: the rate-aware headroom, `QUEUE_FLOOR` to `QUEUE_CAP`);
 //!   [`CarrierRefused::TooLarge`] when the path no longer takes a frame of this size (it names the
 //!   size that fits); [`CarrierRefused::Closed`] when the link is gone.
+//! * [`Carrier::stream_frame_max`] is the largest frame [`Carrier::send_stream`] takes. The sender
+//!   packs a stream frame to the smaller of it and the channel's own limit (1 MiB + 1 KiB), and
+//!   refuses at `emit` a message that fits no such frame; a frame over it is a carrier that
+//!   broke this contract (a refusal of it ends the stream's writing and counts what waited as
+//!   lost). A face that grants its peer less than the channel's default says so here.
 //! * [`Carrier::send_stream`] takes a whole frame onto the ordered, reliable stream, in the order it
 //!   is called, and completes when the stream accepted it: it waits for flow control. The sender
 //!   never calls it again before the previous call completed, and it **does not drop the future**
@@ -69,6 +74,10 @@ pub trait Carrier: Send + Sync {
 
     /// Whether the carrier has an ordered, reliable stream.
     fn has_stream(&self) -> bool;
+
+    /// The largest frame `send_stream` takes whole; the sender never builds a stream frame over
+    /// it. Meaningful only when `has_stream`.
+    fn stream_frame_max(&self) -> usize;
 
     /// Send `frame` as a datagram now, or say why not. Never blocks.
     fn try_send_datagram(&self, frame: Bytes) -> Result<(), CarrierRefused>;

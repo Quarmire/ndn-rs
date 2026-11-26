@@ -1319,6 +1319,9 @@ impl Carrier for Void {
     fn has_stream(&self) -> bool {
         true
     }
+    fn stream_frame_max(&self) -> usize {
+        super::limits::STREAM_FRAME_DEFAULT
+    }
     fn try_send_datagram(&self, _frame: Bytes) -> Result<(), CarrierRefused> {
         if self.full.load(Ordering::SeqCst) {
             Err(CarrierRefused::Full)
@@ -1473,4 +1476,88 @@ async fn a_message_over_the_limit_or_a_name_over_255_octets_is_refused_before_an
     );
     assert_eq!(rig.tx.next_seq(), 1, "no sequence was taken, no name bound");
     assert_eq!(rig.tx.names(), 0);
+}
+
+/// A stream that takes less than the channel's default frame (a face granting 1 MiB where the
+/// channel's default is 1 MiB + 1 KiB): the writer packs to what the carrier says it takes. A
+/// flood of 8 KiB messages over 256 names makes frames of as many as fit; a frame over the limit
+/// was refused whole, and every later emission rebuilt one, so nothing ever left.
+#[tokio::test]
+async fn a_stream_frame_is_never_built_over_what_the_carrier_takes() {
+    const NAMES: usize = 256;
+    const TAKES: usize = 1 << 20;
+    let mut rig = rig(
+        ChannelMode::Latest,
+        LinkConfig {
+            datagram_max: 1_414,
+            stream_window: 300_000,
+            stream_frame_max: TAKES,
+            ..LinkConfig::default()
+        },
+    );
+    let latest = EmitOptions::latest();
+    prebind(&mut rig, 0..NAMES).await;
+    let big = Bytes::from(vec![0xA5u8; 8_192]);
+    let mut delivered = 0usize;
+    for _ in 0..40 {
+        for i in 0..NAMES {
+            rig.tx
+                .emit(&name(i), &big, &latest, at(&rig, 10))
+                .await
+                .expect("the emission is taken");
+        }
+        tokio::task::yield_now().await;
+        for frame in rig.link.take_stream() {
+            assert!(frame.len() <= TAKES, "a frame of {} octets", frame.len());
+            if let Seen::Data { messages, .. } = rig.dec.read(frame) {
+                delivered += messages.len();
+            }
+        }
+    }
+    assert!(
+        delivered >= 40 * 120,
+        "the stream wrote {delivered} messages in 40 passes (lost {})",
+        rig.stats.lost_closed.get()
+    );
+    assert_eq!(
+        rig.stats.lost_closed.get(),
+        0,
+        "nothing was lost to a refusal"
+    );
+}
+
+/// A message whose frame fits no frame the stream takes is refused at `emit`, saying what the
+/// stream takes; no sequence is taken.
+#[tokio::test]
+async fn a_message_that_fits_no_frame_the_stream_takes_is_refused_before_anything_changes() {
+    let rig = rig(
+        ChannelMode::Latest,
+        LinkConfig {
+            datagram_max: 1_414,
+            stream_frame_max: 100_000,
+            ..LinkConfig::default()
+        },
+    );
+    let refused = error_of(
+        rig.tx
+            .emit(
+                &name(1),
+                &Bytes::from(vec![0u8; 100_000]),
+                &EmitOptions::latest(),
+                rig.t0,
+            )
+            .await,
+    );
+    assert!(
+        matches!(
+            refused,
+            EmitError::TooLarge {
+                what: "message that fits no frame of the stream",
+                max: 100_000,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(rig.tx.next_seq(), 1, "no sequence was taken");
 }

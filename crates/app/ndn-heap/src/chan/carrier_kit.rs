@@ -30,6 +30,9 @@ pub(crate) struct LinkConfig {
     /// How many octets may be queued on the stream before `send_stream` waits (a frame is taken
     /// whole when the stream is empty, however large).
     pub stream_window: usize,
+    /// The largest frame the stream takes (a larger one is refused `TooLarge`, as a face whose
+    /// stream grants less than the channel's default does).
+    pub stream_frame_max: usize,
     /// The seed of loss, duplication and reordering.
     pub seed: u64,
     /// Datagrams lost, in thousandths.
@@ -47,6 +50,7 @@ impl Default for LinkConfig {
             has_stream: true,
             datagram_capacity: 64,
             stream_window: 1 << 20,
+            stream_frame_max: super::limits::STREAM_FRAME_DEFAULT,
             seed: 1,
             loss: 0,
             duplicate: 0,
@@ -232,6 +236,10 @@ impl Carrier for Link {
         self.state.lock().cfg.has_stream
     }
 
+    fn stream_frame_max(&self) -> usize {
+        self.state.lock().cfg.stream_frame_max
+    }
+
     fn try_send_datagram(&self, frame: Bytes) -> Result<(), CarrierRefused> {
         let mut st = self.state.lock();
         if let Some(max) = st.shrinks.pop_front() {
@@ -278,6 +286,11 @@ impl Carrier for Link {
                     let mut st = self.state.lock();
                     if !st.cfg.has_stream {
                         return Err(CarrierRefused::Closed);
+                    }
+                    if frame.len() > st.cfg.stream_frame_max {
+                        return Err(CarrierRefused::TooLarge {
+                            max: st.cfg.stream_frame_max,
+                        });
                     }
                     if st.stream.is_empty() || st.stream_bytes + frame.len() <= st.cfg.stream_window
                     {

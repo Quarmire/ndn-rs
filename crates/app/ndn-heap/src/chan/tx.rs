@@ -715,6 +715,18 @@ impl TxChannel {
             }
             .into());
         }
+        // A message for the stream must fit a frame the carrier's stream takes.
+        if stream && (big || self.mode != ChannelMode::Latest) {
+            let max = limits::STREAM_FRAME_DEFAULT.min(carrier.stream_frame_max());
+            if need > max {
+                return Err(EmitError::TooLarge {
+                    what: "message that fits no frame of the stream",
+                    size: need,
+                    max,
+                }
+                .into());
+            }
+        }
         let name_for_standing = fresh_octets.clone();
         if opts.stand.is_some() {
             let octets = match &name_for_standing {
@@ -1255,7 +1267,7 @@ impl TxChannel {
 
     /// Pack the next frame of the stream lane, under the lock.
     fn pack_stream(self: &Arc<Self>, carrier: &Arc<dyn Carrier>) -> StreamPack {
-        let _ = carrier;
+        let limit = limits::STREAM_FRAME_DEFAULT.min(carrier.stream_frame_max());
         let mut st = self.state.lock();
         self.refresh_key(&mut st);
         if st.ended && !st.ending {
@@ -1266,7 +1278,6 @@ impl TxChannel {
             return StreamPack::Gone;
         }
         let epoch = st.key_epoch as u8;
-        let limit = limits::STREAM_FRAME_DEFAULT;
         enum Head {
             Control(u64, Bytes),
             Data(u64),
