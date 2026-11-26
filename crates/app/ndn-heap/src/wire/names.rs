@@ -44,9 +44,8 @@ const SYNC: &[u8] = ndn_security::trust_context::SYNC_GROUP_KEYWORD;
 /// (`seal`, `grant`, `held`), a sync group (`sync`) and a channel ask (`chan`). The sibling
 /// surface refuses an extension that claims one
 /// of them ([`crate::host`]).
-pub(crate) const CORE_KEYWORDS: &[&[u8]] = &[
-    DATA, LOG, SEAL, GRANT, HELD, PIECE, MANIFEST, SYNC, CHAN,
-];
+pub(crate) const CORE_KEYWORDS: &[&[u8]] =
+    &[DATA, LOG, SEAL, GRANT, HELD, PIECE, MANIFEST, SYNC, CHAN];
 
 /// The most components a space name has after its `32=data`.
 pub(crate) const SPACE_REST_MAX: usize = 4;
