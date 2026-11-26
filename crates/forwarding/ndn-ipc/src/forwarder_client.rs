@@ -305,7 +305,7 @@ impl ForwarderClient {
         }
     }
 
-    /// The longest side frame (a channel frame, [`SIDE_MARKER`] first) this client can carry to
+    /// The longest side frame (a channel frame, sent as a side record) this client can carry to
     /// the forwarder: what its control face grants on the Unix data plane. `0` over an external
     /// data plane (shared memory): a channel frame must reach the forwarder over the face its
     /// Data went out on, which is the data plane's, and no data plane here carries one. Connect
