@@ -202,6 +202,13 @@ pub trait Connection: Send + Sync {
         0
     }
 
+    /// Say to the forwarder that this connection reads side frames, before any is carried either
+    /// way: a connection to a daemon over a socket must (the daemon sends a record only to a
+    /// client that said it reads them, since one built before the record would be put out of step
+    /// by it), and an embedded engine's connection needs nothing (the default). A node calls
+    /// it in `attach_forwarder`, so it is in place before the node asks for or answers anything.
+    fn open_side(&self) {}
+
     /// Send one side frame into the forwarder, which routes it by its channel id
     /// (`ndn_engine::side::SideTable`); `class` is the carrier the frame asks for, which the
     /// sink faces honour. Waits for room in the connection's queue. A connection that carries
@@ -294,6 +301,13 @@ const NO_SIDE_SHM: &str = "this connection to an ndn-fwd daemon uses a shared-me
      Data went out on. Connect over the unix socket alone (`ForwarderClient::connect_unix_only`, \
      or do not install the shared-memory data plane in this process), or run the heap node over \
      an embedded engine (`EngineAppExt::app_face`)";
+
+/// Why an IPC connection that has not said it reads side records carries none, and what to do.
+#[cfg(not(target_arch = "wasm32"))]
+const NOT_OPEN: &str = "this connection has not told the daemon that it reads channel frames, and \
+     the daemon sends a frame only to a client that did (one built before the frame would be put \
+     out of step by it). Call `Connection::open_side` first (a heap node does in \
+     `attach_forwarder`)";
 
 /// Why a connection cannot bar a face, and what to do.
 const NO_QUARANTINE: &str = "this connection cannot ask its forwarder to bar a face: it has no \
@@ -446,11 +460,21 @@ impl Connection for IpcConnection {
         if self.side_frame_max() == 0 {
             return Err(AppError::Unsupported(NO_SIDE_SHM.into()));
         }
+        if !self.client.side_open() {
+            return Err(AppError::Unsupported(NOT_OPEN.into()));
+        }
         side_check(&frame, self.side_frame_max()).map_err(side_error)?;
         self.client
             .send_side(frame, class)
             .await
             .map_err(side_error)
+    }
+
+    /// Tell the daemon this connection reads side records (the hello is the first thing on the
+    /// socket from now on), which it must before a channel frame goes either way: the daemon
+    /// sends a record only to a connection that said so.
+    fn open_side(&self) {
+        self.client.open_side();
     }
 
     fn try_send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {

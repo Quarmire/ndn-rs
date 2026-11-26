@@ -437,6 +437,10 @@ impl Connection for DemuxConnection {
         self.inner.side_frame_max()
     }
 
+    fn open_side(&self) {
+        self.inner.open_side();
+    }
+
     async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), AppError> {
         self.inner.send_side(frame, class).await
     }

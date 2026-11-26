@@ -24,6 +24,8 @@ mod face_notification_semantic_events;
 mod faces_create_idempotent;
 #[path = "faces_update_tier2.rs"]
 mod faces_update_tier2;
+#[path = "heap_over_ipc.rs"]
+mod heap_over_ipc;
 #[path = "ipc_seam.rs"]
 mod ipc_seam;
 #[path = "local_operator_commands.rs"]

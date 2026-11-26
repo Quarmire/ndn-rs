@@ -86,6 +86,8 @@ libc             = { workspace = true }
 # over an IPC connection to an engine with management mounted.
 ndn-heap         = { workspace = true }
 ndn-sync         = { workspace = true }
+# Channel-over-IPC witness (tests/heap_over_ipc.rs): the namespace's sync group on the engine.
+ndn-namespace    = { workspace = true }
 
 [[test]]
 name = "suite"

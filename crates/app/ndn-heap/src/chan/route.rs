@@ -632,6 +632,8 @@ impl NodeHandle {
                  engine, or use `attach_carrier` for a link of your own",
             ));
         }
+        // A connection to a daemon says it reads side frames before it asks or answers anything.
+        conn.open_side();
         if !inner.chan.route.attach(Arc::clone(&conn)) {
             return Ok(());
         }

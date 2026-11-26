@@ -73,7 +73,12 @@ mod mesh_tests;
 pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 /// The two faces a node runs on: one for Interest and Data, one for the sync
-/// group's Sync Interests.
+/// group's Sync Interests. They MUST be two connections (two faces on the forwarder, two
+/// sockets to a daemon): each is read by its own task, and one connection read by two
+/// tasks hands every packet to one of them, so the node's session Interests and Data reach
+/// the sync driver and the other way round. The spaces may still sync over one, while a
+/// channel's session is never set up (`get` waits for ever); `ndn-heap` opens two
+/// (`Node::connect` and `ForwarderClient::connect`).
 pub struct Transport {
     /// The connection fetches and serving use.
     pub node: ndn_app::Node,

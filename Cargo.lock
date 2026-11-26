@@ -1955,6 +1955,7 @@ dependencies = [
  "ndn-heap",
  "ndn-ipc",
  "ndn-mgmt-wire",
+ "ndn-namespace",
  "ndn-packet",
  "ndn-security",
  "ndn-store",

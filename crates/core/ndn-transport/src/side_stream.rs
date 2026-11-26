@@ -15,9 +15,19 @@
 //! A TLV element never starts with `0x00` (TLV-TYPE 0 is not assigned, and a longer type number
 //! starts `0xFD`/`0xFE`/`0xFF`), so the decoder tells a record from an NDN packet by its first
 //! octet and a stream's ordinary traffic is byte-for-byte what [`TlvCodec`] carries. The decoder
-//! fails closed: a record whose length is zero or over [`RECORD_MAX`], or whose frame does not
+//! fails closed: a record whose length is over [`RECORD_MAX`], or whose frame does not
 //! start with the marker, is an error that closes the face with its reason; so is a stream that
 //! ends inside a record. Nothing is skipped or guessed at.
+//!
+//! **Hello.** A record whose length is zero ([`put_hello`]) carries no frame: it says its writer
+//! reads records. A peer built before the record reads its stream as TLV elements and a record
+//! would put it out of step for good, so a face writes a record only to a peer that said so:
+//! the app end writes the hello first when it opts in (`StreamFace::open_side`), the forwarder's
+//! end opens its lane when it reads it, and until then both ends refuse every frame
+//! [`NotCarried`](SideRefused::NotCarried) and report [`side_frame_max`](crate::Transport) 0. A
+//! record that arrives before the hello is an error that closes the face. A peer that predates
+//! the record answers the hello (a TLV element of type 0 with a length of `u64::MAX`) by closing
+//! the stream.
 //!
 //! A face's side frames go through a bounded [`SideLane`], one queue in order, written by a
 //! [`SidePump`] the owner of the face runs as a task (this crate spawns nothing): `send_side` waits
@@ -25,6 +35,7 @@
 //! each record whole under the face's writer lock, so a record is never split by an NDN packet.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -71,6 +82,22 @@ impl From<Bytes> for Inbound {
     }
 }
 
+impl Inbound {
+    /// What the hello record decodes to: no wire at all. A face that reads it opens its lane
+    /// and hands it on to nobody.
+    pub(crate) fn hello() -> Self {
+        Self {
+            wire: Bytes::new(),
+            ingress: None,
+        }
+    }
+
+    /// Whether this is the hello record ([`put_hello`]).
+    pub fn is_hello(&self) -> bool {
+        self.wire.is_empty()
+    }
+}
+
 /// [`TlvCodec`] that also reads and writes the side record (see the module docs). `Item` is
 /// [`Inbound`]; writing is as is, so a face frames a side frame with [`put_record`] (the
 /// [`SidePump`] does) and an NDN packet with nothing.
@@ -96,11 +123,15 @@ impl Decoder for SideTlvCodec {
         }
         let ingress = u64::from_be_bytes(src[1..9].try_into().expect("8 octets"));
         let len = u32::from_be_bytes(src[9..13].try_into().expect("4 octets")) as usize;
-        if len == 0 || len > RECORD_MAX {
+        if len > RECORD_MAX {
             return Err(invalid(format!(
                 "side record of {len} octets: a frame is 1 to {RECORD_MAX} octets; the peer is \
                  not speaking the side-record framing, so the stream is closed"
             )));
+        }
+        if len == 0 {
+            src.advance(RECORD_HEADER_LEN);
+            return Ok(Some(Inbound::hello()));
         }
         if src.len() > RECORD_HEADER_LEN && src[RECORD_HEADER_LEN] != SIDE_MARKER {
             return Err(invalid(format!(
@@ -143,6 +174,15 @@ pub fn put_record(dst: &mut BytesMut, frame: &[u8], ingress: Option<FaceId>) {
     dst.extend_from_slice(frame);
 }
 
+/// Append the hello record to `dst`: a record of no frame, which says its writer reads side
+/// records (and is the first thing its writer writes after it says so).
+pub fn put_hello(dst: &mut BytesMut) {
+    dst.reserve(RECORD_HEADER_LEN);
+    dst.put_u8(SIDE_MARKER);
+    dst.put_u64(NO_INGRESS);
+    dst.put_u32(0);
+}
+
 #[derive(Default)]
 struct LaneState {
     frames: VecDeque<(Bytes, Option<FaceId>)>,
@@ -154,10 +194,17 @@ struct LaneState {
 /// its records.
 pub(crate) struct SideLane {
     state: StdMutex<LaneState>,
-    /// Wakes the pump: a frame was queued, or the lane closed.
+    /// Wakes the pump: a frame was queued, the hello is due, or the lane closed.
     wake: Notify,
     /// Wakes the senders waiting for room: the pump took what was queued, or the lane closed.
     room: Notify,
+    /// The peer reads side records: it said so (a daemon's end reads the client's hello) or this
+    /// end did (a client's end writes it). A lane that is not open refuses every frame
+    /// [`NotCarried`](SideRefused::NotCarried): a peer built before the record reads its stream
+    /// as TLV elements and a record would put it out of step for good.
+    open: AtomicBool,
+    /// The hello is yet to be written.
+    hello_due: AtomicBool,
 }
 
 impl SideLane {
@@ -166,6 +213,8 @@ impl SideLane {
             state: StdMutex::new(LaneState::default()),
             wake: Notify::new(),
             room: Notify::new(),
+            open: AtomicBool::new(false),
+            hello_due: AtomicBool::new(false),
         }
     }
 
@@ -195,6 +244,9 @@ impl SideLane {
         ingress: Option<FaceId>,
     ) -> Result<(), SideRefused> {
         Self::check(frame)?;
+        if !self.is_open() {
+            return Err(SideRefused::NotCarried);
+        }
         let cost = frame.len() + RECORD_HEADER_LEN;
         let mut state = self.lock();
         if state.closed {
@@ -249,6 +301,30 @@ impl SideLane {
         self.wake.notify_one();
         self.room.notify_waiters();
     }
+
+    /// Whether side frames may go over this stream: the peer has said it reads them.
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
+    /// This end says it reads side records: the hello is written before anything else this end
+    /// writes from now on, and its frames may be queued.
+    pub(crate) fn open_here(&self) {
+        self.hello_due.store(true, Ordering::Release);
+        self.open.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    /// The peer said it reads side records (its hello was read): this end's frames may be queued.
+    pub(crate) fn open_for_peer(&self) {
+        self.open.store(true, Ordering::Release);
+    }
+
+    /// Whether the hello is still to be written; clears it. Called under the writer lock by
+    /// whoever writes next.
+    pub(crate) fn take_hello(&self) -> bool {
+        self.hello_due.load(Ordering::Acquire) && self.hello_due.swap(false, Ordering::AcqRel)
+    }
 }
 
 /// Writes a face's queued side records. [`StreamFace::with_side_lane`](crate::StreamFace) makes
@@ -282,7 +358,8 @@ impl<W: AsyncWrite + Unpin + Send + 'static> SidePump<W> {
                 state.octets = 0;
                 (std::mem::take(&mut state.frames), state.closed)
             };
-            if batch.is_empty() {
+            let hello = self.lane.hello_due.load(Ordering::Acquire);
+            if batch.is_empty() && !hello {
                 if closed {
                     return;
                 }
@@ -291,6 +368,11 @@ impl<W: AsyncWrite + Unpin + Send + 'static> SidePump<W> {
             }
             self.lane.room.notify_waiters();
             let mut writer = self.writer.lock().await;
+            // The hello goes before any record, and before any packet an NDN send writes after
+            // it (`StreamFace::send_bytes` takes the same flag under this lock).
+            if self.lane.take_hello() {
+                put_hello(writer.write_buffer_mut());
+            }
             for (frame, ingress) in &batch {
                 put_record(writer.write_buffer_mut(), frame, *ingress);
             }
@@ -408,10 +490,7 @@ mod tests {
     #[test]
     fn a_bad_record_fails_closed_with_a_reason() {
         let bad = |mut src: BytesMut| SideTlvCodec.decode(&mut src).unwrap_err();
-        // Length zero.
-        let mut zero = record(&frame(2), None);
-        zero[9..13].copy_from_slice(&0u32.to_be_bytes());
-        assert!(bad(zero).to_string().contains("side record of 0 octets"));
+        // (A record of length zero is the hello, not an error.)
         // Length over the limit, announced by the header alone.
         let mut over = BytesMut::new();
         over.put_u8(SIDE_MARKER);
@@ -455,9 +534,47 @@ mod tests {
         assert!(read.next().await.is_none());
     }
 
+    /// A lane takes no frame until its peer said it reads records, and then takes them: a peer
+    /// that predates the record would be put out of step by the first.
+    #[test]
+    fn a_lane_refuses_every_frame_until_it_is_open() {
+        let lane = SideLane::new();
+        assert!(!lane.is_open());
+        assert_eq!(
+            lane.try_push(&frame(46), None),
+            Err(SideRefused::NotCarried)
+        );
+        lane.open_for_peer();
+        assert_eq!(lane.try_push(&frame(46), None), Ok(()));
+        // Opening here is saying hello: it is written once, before anything else.
+        let here = SideLane::new();
+        here.open_here();
+        assert!(here.is_open());
+        assert!(here.take_hello());
+        assert!(!here.take_hello());
+    }
+
+    /// The hello is a record of no frame: 13 octets, marker, no ingress, length 0; it decodes to
+    /// an `Inbound` that is none, and what follows it decodes as before.
+    #[test]
+    fn the_hello_is_a_record_of_no_frame() {
+        let mut src = BytesMut::new();
+        put_hello(&mut src);
+        assert_eq!(src.len(), RECORD_HEADER_LEN);
+        assert_eq!(src[0], SIDE_MARKER);
+        assert_eq!(&src[1..9], &u64::MAX.to_be_bytes());
+        assert_eq!(&src[9..13], &0u32.to_be_bytes());
+        src.extend_from_slice(&[0x05, 0x01, 0xAB]);
+        let hello = SideTlvCodec.decode(&mut src).unwrap().unwrap();
+        assert!(hello.is_hello());
+        let next = SideTlvCodec.decode(&mut src).unwrap().unwrap();
+        assert!(!next.is_hello());
+        assert_eq!(&next.wire[..], &[0x05, 0x01, 0xAB]);
+    }
     #[test]
     fn a_lane_refuses_what_is_not_a_side_frame_and_what_does_not_fit() {
         let lane = SideLane::new();
+        lane.open_for_peer();
         assert_eq!(
             lane.try_push(&Bytes::from_static(&[0x05, 0x00]), None),
             Err(SideRefused::Malformed)
@@ -479,12 +596,14 @@ mod tests {
     #[test]
     fn a_lane_is_bounded_in_frames_and_in_octets() {
         let lane = SideLane::new();
+        lane.open_for_peer();
         for _ in 0..LANE_FRAMES {
             lane.try_push(&frame(46), None).unwrap();
         }
         assert_eq!(lane.try_push(&frame(46), None), Err(SideRefused::Full));
 
         let lane = SideLane::new();
+        lane.open_for_peer();
         let mut n = 0;
         while lane.try_push(&frame(RECORD_MAX), None).is_ok() {
             n += 1;

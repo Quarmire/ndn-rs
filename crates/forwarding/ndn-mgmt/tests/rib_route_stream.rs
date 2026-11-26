@@ -324,10 +324,11 @@ async fn an_ipc_connection_left_behind_is_told_it_missed_routes() {
     d.cancel.cancel();
 }
 
-/// A node of the heap layer over an IPC connection to the daemon: `device`'s
-/// key is made from `seed`.
+/// A node of the heap layer over two IPC connections to the daemon (one for the node, one for
+/// the sync group, as `Transport` requires): `device`'s key is made from `seed`.
 async fn node_over_ipc(d: &Daemon, device: &str, seed: u8) -> Node {
     let conn = d.ipc();
+    let sync = d.ipc();
     let device = n(device);
     let validator = Arc::new(Validator::new(TrustSchema::hierarchical()));
     validator
@@ -339,7 +340,7 @@ async fn node_over_ipc(d: &Daemon, device: &str, seed: u8) -> Node {
     Node::start(
         Transport {
             node: ndn_app::Node::from_connection(Arc::clone(&conn) as Arc<dyn Connection>),
-            sync: conn as Arc<dyn Connection>,
+            sync: sync as Arc<dyn Connection>,
         },
         device,
         keys,

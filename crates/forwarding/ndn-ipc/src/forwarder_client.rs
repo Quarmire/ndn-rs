@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use ndn_face::local::IpcFace;
 use ndn_packet::Name;
 use ndn_packet::lp::encode_lp_packet;
+use ndn_transport::side_stream::RECORD_MAX;
 use ndn_transport::{FaceId, SideClass, SideRefused, Transport};
 
 use crate::face_mux::FaceMux;
@@ -304,16 +305,35 @@ impl ForwarderClient {
         }
     }
 
-    /// The longest side frame (a channel frame, [`SIDE_MARKER`] first) this client carries to
+    /// The longest side frame (a channel frame, [`SIDE_MARKER`] first) this client can carry to
     /// the forwarder: what its control face grants on the Unix data plane. `0` over an external
     /// data plane (shared memory): a channel frame must reach the forwarder over the face its
     /// Data went out on, which is the data plane's, and no data plane here carries one. Connect
-    /// with [`connect_unix_only`](Self::connect_unix_only) to carry channel frames.
+    /// with [`connect_unix_only`](Self::connect_unix_only) to carry channel frames. This says
+    /// what the client *can* do; it carries none until [`open_side`](Self::open_side).
     pub fn side_frame_max(&self) -> usize {
         match &self.transport {
-            DataTransport::Unix => Transport::side_frame_max(&*self.control),
-            DataTransport::External(_) => 0,
+            DataTransport::Unix if self.control.has_side_lane() => RECORD_MAX,
+            _ => 0,
         }
+    }
+
+    /// Say to the forwarder that this client reads side records, which it must before it
+    /// carries a channel frame in either direction: a client built before the record reads its
+    /// socket as TLV elements, and the forwarder sends it no record (and installs no channel
+    /// route to it) unless it said so. The hello goes first on the socket, before anything this
+    /// client writes after the call, so it precedes every Interest and Data that follows. A
+    /// forwarder that predates the record closes the connection on reading it. No effect when
+    /// [`side_frame_max`](Self::side_frame_max) is 0.
+    pub fn open_side(&self) {
+        if self.side_frame_max() != 0 {
+            self.control.open_side();
+        }
+    }
+
+    /// Whether [`open_side`](Self::open_side) was called and the client carries frames.
+    pub fn side_open(&self) -> bool {
+        self.side_frame_max() != 0 && self.control.side_open()
     }
 
     /// Send one side frame to the forwarder, waiting for room in the face's queue. Refused

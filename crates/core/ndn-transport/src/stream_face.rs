@@ -6,10 +6,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
-use crate::side_stream::{Inbound, RECORD_MAX, SideLane, SidePump, SideTlvCodec, lane_and_pump};
+use crate::side_stream::{
+    Inbound, RECORD_MAX, SideLane, SidePump, SideTlvCodec, lane_and_pump, put_hello,
+};
 use crate::{
     FaceError, FaceId, FaceKind, FacePersistency, FaceTrust, MtuError, PeerCredentials,
-    PersistencyError, SideClass, SideRefused, Transport,
+    PersistencyError, SIDE_MARKER, SideClass, SideRefused, Transport,
 };
 
 /// Generic stream-based `Transport` over any async read/write pair with a
@@ -100,10 +102,29 @@ where
     /// the framing does not allow.
     pub async fn recv_inbound(&self) -> Result<Inbound, FaceError> {
         let mut reader = self.reader.lock().await;
-        match reader.next().await {
-            Some(Ok(item)) => Ok(item.into()),
-            Some(Err(e)) => Err(FaceError::Io(e)),
-            None => Err(FaceError::Closed),
+        loop {
+            let inbound: Inbound = match reader.next().await {
+                Some(Ok(item)) => item.into(),
+                Some(Err(e)) => return Err(FaceError::Io(e)),
+                None => return Err(FaceError::Closed),
+            };
+            if inbound.is_hello() {
+                // The peer reads side records: this end's frames may go to it.
+                if let Some(lane) = &self.lane {
+                    lane.open_for_peer();
+                }
+                continue;
+            }
+            if inbound.wire.first() == Some(&SIDE_MARKER)
+                && self.lane.as_ref().is_some_and(|lane| !lane.is_open())
+            {
+                return Err(FaceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "a side record arrived before the peer's hello: a peer that reads side \
+                     records says so first (`open_side`), so the stream is closed",
+                )));
+            }
+            return Ok(inbound);
         }
     }
 }
@@ -124,6 +145,27 @@ impl<R, W> StreamFace<R, W, SideTlvCodec> {
     pub async fn side_ready(&self) {
         if let Some(lane) = &self.lane {
             lane.ready().await;
+        }
+    }
+
+    /// Whether the face has a lane, so can carry side records once it is opened.
+    pub fn has_side_lane(&self) -> bool {
+        self.lane.is_some()
+    }
+
+    /// Whether the lane is open: the peer has said it reads side records (see
+    /// [`open_side`](Self::open_side)), or this end said it does.
+    pub fn side_open(&self) -> bool {
+        self.lane.as_ref().is_some_and(|lane| lane.is_open())
+    }
+
+    /// Say that this end reads side records, which a client does when it means to carry
+    /// channel frames. The hello record is written before anything else this end writes from
+    /// now on, and this end's frames are carried from now on. A forwarder that predates the
+    /// record closes the stream on reading it; a face with no lane does nothing.
+    pub fn open_side(&self) {
+        if let Some(lane) = &self.lane {
+            lane.open_here();
         }
     }
 }
@@ -169,6 +211,12 @@ where
 
     async fn send_bytes(&self, wire: Bytes) -> Result<(), FaceError> {
         let mut writer = self.writer.lock().await;
+        // The hello goes before this packet and everything written after it opened the lane.
+        if let Some(lane) = &self.lane
+            && lane.take_hello()
+        {
+            put_hello(writer.write_buffer_mut());
+        }
         writer.send(wire).await.map_err(FaceError::Io)
     }
 
@@ -211,8 +259,14 @@ where
         }
     }
 
+    /// What the peer has said it reads: [`RECORD_MAX`] once it opened the lane (a forwarder's
+    /// end read the client's hello; a client's end said hello), `0` before, and for a face with
+    /// no lane.
     fn side_frame_max(&self) -> usize {
-        if self.lane.is_some() { RECORD_MAX } else { 0 }
+        match &self.lane {
+            Some(lane) if lane.is_open() => RECORD_MAX,
+            _ => 0,
+        }
     }
 
     /// Persistency is a face-table hint only — destruction is driven by I/O
@@ -301,6 +355,21 @@ mod tests {
         let (app, fwd, _pumps) = pair();
         let pkt = |n: u8| Bytes::from(vec![0x05, 0x02, n, n]);
 
+        // Nothing is carried either way until the app has said it reads records.
+        for face in [&app, &fwd] {
+            assert_eq!(Transport::side_frame_max(face), 0);
+            assert!(!Transport::side_carries(face, SideClass::Datagram));
+            assert_eq!(
+                Transport::forward_side(face, side(1, 50), SideClass::Datagram),
+                Err(SideRefused::NotCarried)
+            );
+            assert_eq!(
+                Transport::send_side(face, side(1, 50), SideClass::Stream).await,
+                Err(SideRefused::NotCarried)
+            );
+        }
+        app.open_side();
+
         Transport::send_bytes(&app, pkt(1)).await.unwrap();
         Transport::send_side(&app, side(1, 50), SideClass::Datagram)
             .await
@@ -372,8 +441,16 @@ mod tests {
                 })
             );
         }
+        // Opening the lane puts the hello first on the stream, then the packet.
+        face.open_side();
         let pkt = Bytes::from_static(&[0x05, 0x01, 0xAB]);
         Transport::send_bytes(&face, pkt.clone()).await.unwrap();
+        let mut hello = [0u8; 13];
+        far.read_exact(&mut hello).await.unwrap();
+        let mut want_hello = vec![0u8];
+        want_hello.extend_from_slice(&u64::MAX.to_be_bytes());
+        want_hello.extend_from_slice(&0u32.to_be_bytes());
+        assert_eq!(&hello[..], &want_hello[..]);
         let mut got = [0u8; 3];
         far.read_exact(&mut got).await.unwrap();
         assert_eq!(&got[..], &pkt[..]);
@@ -399,6 +476,7 @@ mod tests {
         let (face, pump) =
             StreamFace::new(FaceId(1), FaceKind::Unix, None, None, r, w, SideTlvCodec)
                 .with_side_lane();
+        face.open_side();
         for _ in 0..crate::side_stream::LANE_FRAMES {
             Transport::forward_side(&face, side(1, 46), SideClass::Datagram).unwrap();
         }
@@ -461,6 +539,53 @@ mod tests {
                 );
             }
             other => panic!("expected a framing error, got {other:?}"),
+        }
+    }
+
+    /// An app that only says it reads records, and sends no packet, still opens the forwarder's
+    /// lane: the pump writes the hello by itself, and the reader takes it in and hands nothing on.
+    #[tokio::test]
+    async fn the_hello_opens_the_peers_lane_and_is_handed_on_to_nobody() {
+        let (app, fwd, _pumps) = pair();
+        let fwd = Arc::new(fwd);
+        let reading = tokio::spawn({
+            let fwd = Arc::clone(&fwd);
+            async move { fwd.recv_inbound().await }
+        });
+        assert!(!fwd.side_open());
+        app.open_side();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !fwd.side_open() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the hello reaches the forwarder's end and opens its lane");
+        assert!(!reading.is_finished(), "the hello is no packet");
+        Transport::forward_side(&*fwd, side(1, 46), SideClass::Datagram).unwrap();
+        assert_eq!(app.recv_inbound().await.unwrap().wire, side(1, 46));
+        reading.abort();
+    }
+
+    /// A record from a peer that never said it reads them closes the face with the reason: an
+    /// app that predates the record sends none, so this is a peer out of step.
+    #[tokio::test]
+    async fn a_record_before_the_hello_closes_the_face_with_a_reason() {
+        use tokio::io::AsyncWriteExt;
+        let (near, mut far) = tokio::io::duplex(1024);
+        let (r, w) = tokio::io::split(near);
+        let (face, _pump) =
+            StreamFace::new(FaceId(1), FaceKind::Unix, None, None, r, w, SideTlvCodec)
+                .with_side_lane();
+        let mut record = bytes::BytesMut::new();
+        crate::side_stream::put_record(&mut record, &side(1, 46), None);
+        far.write_all(&record).await.unwrap();
+        match face.recv_inbound().await {
+            Err(FaceError::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+                assert!(e.to_string().contains("before the peer's hello"), "{e}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 }
