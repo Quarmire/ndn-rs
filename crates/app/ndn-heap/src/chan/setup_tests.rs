@@ -1769,6 +1769,84 @@ async fn names_the_record_holds_nothing_of_are_asked_in_a_bounded_burst_and_neve
     .await;
 }
 
+/// The announce is unsigned, so a stranger can name a device the record vouches for, with a mode
+/// it has no channel in. That claim makes one ask, which is refused; it must not use up the
+/// window of the device's real announce (a mode it does have), or a stranger that repeats the
+/// claim inside the window would keep the device from being heard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stranger_naming_a_vouched_device_does_not_silence_its_real_announce() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
+    let (share, change) = public_with(&["/bob"], &["/carol"]);
+    shared(&rig, share, change).await;
+    let (alice, carol) = (&rig.nodes[0], &rig.nodes[2]);
+    assert!(
+        carol
+            .inner
+            .space_of(&space())
+            .unwrap()
+            .log
+            .lock()
+            .vouches(alice.name()),
+        "the case needs a device the record vouches for"
+    );
+    let _listening = carol.inner.chan_listen(&space());
+    rig.syncs[0]
+        .send(announce_wire("/alice/laptop", &[ChannelMode::Window]))
+        .await
+        .unwrap();
+    let s = &carol.inner.chan.stats;
+    eventually("carol asked for the claimed mode", || {
+        s.announce_asks.get() >= 1
+    })
+    .await;
+    // Her real announce, inside the window of the claim.
+    open_latest(alice);
+    alice.inner.chan_announce(&space()).await;
+    eventually("carol holds alice's session despite the claim", || {
+        carol
+            .inner
+            .chan
+            .sessions
+            .find(&space(), alice.name(), ChannelMode::Latest)
+            .is_some()
+    })
+    .await;
+}
+
+/// A device whose session is usable needs no ask, so its announce (every 30 s, and at each
+/// change of the members) spends nothing of the bucket of the names the record holds nothing
+/// of, and takes no slot: an announce with no ask is counted ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_announce_of_a_device_with_a_usable_session_makes_no_ask() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
+    let (share, change) = public_with(&["/bob"], &["/carol"]);
+    shared(&rig, share, change).await;
+    let (bob, carol) = (&rig.nodes[1], &rig.nodes[2]);
+    // Only the announce this test makes reaches carol.
+    bob.inner
+        .chan
+        .tick_paused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    open_latest(bob);
+    carol
+        .inner
+        .chan_ask(&space(), bob.name(), ChannelMode::Latest)
+        .await
+        .expect("carol holds bob's session");
+    let _listening = carol.inner.chan_listen(&space());
+    bob.inner.chan_announce(&space()).await;
+    let s = &carol.inner.chan.stats;
+    eventually("carol acted on the announce", || {
+        s.announce_ignored.get() + s.announce_asks.get() >= 1
+    })
+    .await;
+    assert_eq!(
+        (s.announce_asks.get(), s.announce_ignored.get()),
+        (0, 1),
+        "a mode a usable session covers makes no ask and takes no token"
+    );
+}
+
 /// What is no device's name is not worth an ask slot, and a reader is no sender: a reader's
 /// device never emits (channel.md §4.2), so her person is no writer and her announce is a
 /// stranger's.

@@ -10,11 +10,12 @@
 //!
 //! [`is_current`]: super::sessions::RecvSession::is_current
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
+use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::Interest;
 use ndn_packet::encode::InterestBuilder;
@@ -35,7 +36,7 @@ use super::sessions::{EndReason, RecvSessions};
 use super::standing::{Who, gate, standing};
 use super::tx::Tx;
 use super::verify::Bucket;
-use super::wire::Announce;
+use super::wire::{Announce, ChannelMode};
 use crate::node::NodeInner;
 use crate::rt::{self, Instant};
 use crate::wire::{chan_prefix, is_device_name, parse_chan_announce_name, sync_group_of};
@@ -43,17 +44,23 @@ use crate::wire::{chan_prefix, is_device_name, parse_chan_announce_name, sync_gr
 /// How often the maintenance task looks at the channels without being woken.
 pub(crate) const TICK: Duration = Duration::from_millis(250);
 
-/// The shortest time between two announce-driven asks of one device.
+/// The shortest time between two announce-driven asks of one device **for one mode**. The
+/// announce is unsigned, so the claim "this device has a channel in this mode" is anyone's to
+/// make; keying the limit by mode keeps a claim for a mode the device does not have from using
+/// up the window of the mode it does.
 pub(crate) const ANNOUNCE_ASK_EVERY: Duration = Duration::from_secs(10);
 
 /// The most announce-driven asks one space has in progress.
 pub(crate) const ANNOUNCE_PENDING_MAX: usize = 32;
 
-/// The announce-driven asks of devices **the record holds no admitted entry of** (a writer who
-/// has put nothing, or a name nobody holds) a space may begin in a burst, and then a second:
-/// the announce is unsigned, so any name under a writer's namespace passes for a device of hers,
-/// and the ask it makes costs this device one signature and an Interest. The pool is its own, so
-/// a stranger's names never take what the devices the record vouches for need.
+/// The announce-driven asks (one per mode) of devices **the record holds no admitted entry of**
+/// and that never answered one (a writer who has put nothing and was not heard from yet, or a
+/// name nobody holds) a space may begin in a burst, and then a second: the announce is unsigned,
+/// so any name under a writer's namespace passes for a device of hers, and the ask it makes
+/// costs this device one signature and an Interest. The pool is its own, so a stranger's names
+/// never take what the devices the record vouches for need. It is one pool for the space, not
+/// one per claimed person: the persons are the writers of the record, and a pool each would
+/// multiply what a stranger may make this device spend by their number.
 pub(crate) const ANNOUNCE_UNVOUCHED_BURST: f64 = 4.0;
 
 /// The rate, a second, at which [`ANNOUNCE_UNVOUCHED_BURST`] fills again.
@@ -61,6 +68,10 @@ pub(crate) const ANNOUNCE_UNVOUCHED_RATE: f64 = 1.0;
 
 /// The most octets of an announce's ApplicationParameters.
 const ANNOUNCE_MAX: usize = 1024;
+
+/// The devices that answered an announce-driven ask this node remembers as vouched for (those
+/// beyond it take the bucket, as a device never heard from does).
+const ANNOUNCE_ANSWERED_MAX: usize = 1024;
 
 /// The asks of one key the replay guard remembers: an ask is good for 240 s
 /// ([`ASK_CLOCK_WINDOW_MS`] either side of the sender's clock), and a key's asks are admitted at
@@ -138,54 +149,112 @@ pub(crate) struct Stats {
 
 /// What the announces heard are limited by.
 #[derive(Default)]
-struct Heard {
-    asked: HashMap<(Name, Name), Instant>,
+pub(crate) struct Heard {
+    /// When each `(space, device, mode)` was last let make an ask.
+    asked: HashMap<(Name, Name, ChannelMode), Instant>,
     pending: HashMap<Name, usize>,
-    /// Per space, what is left of the asks of devices the record holds no entry of.
+    /// Per space, what is left of the asks of devices the record holds no entry of and that
+    /// never answered one.
     unvouched: HashMap<Name, Bucket>,
+    /// The `(space, device)` pairs whose answer to an announce-driven ask was judged good: a
+    /// signed answer by a key that stands as a writer, so the device is no name a stranger made
+    /// up. At most [`ANNOUNCE_ANSWERED_MAX`].
+    answered: HashSet<(Name, Name)>,
 }
 
 impl Heard {
-    /// Whether an announce of `device` over `space` may make an ask at `now`: not one of that
-    /// device sooner than [`ANNOUNCE_ASK_EVERY`] ago, not past [`ANNOUNCE_PENDING_MAX`] in
-    /// progress for the space and, for a device the record holds no admitted entry of
-    /// (`vouched` false), a token of the space's own bucket ([`ANNOUNCE_UNVOUCHED_BURST`]). If it
-    /// may, it is counted in progress.
-    fn admit(&mut self, space: &Name, device: &Name, vouched: bool, now: Instant) -> bool {
-        let key = (space.clone(), device.clone());
-        if self
-            .asked
-            .get(&key)
-            .is_some_and(|at| now.saturating_duration_since(*at) < ANNOUNCE_ASK_EVERY)
-        {
-            return false;
+    /// The modes of an announce of `device` over `space` that may make an ask at `now`, and none
+    /// when it may make none: a mode is left out when it was asked of that device sooner than
+    /// [`ANNOUNCE_ASK_EVERY`] ago, all are when [`ANNOUNCE_PENDING_MAX`] announces are in
+    /// progress for the space, and, for a device the record holds no admitted entry of
+    /// (`vouched` false) that never answered, each mode takes a token of the space's own bucket
+    /// ([`ANNOUNCE_UNVOUCHED_BURST`]) and the modes beyond the tokens are left out. Nothing is
+    /// spent, stamped or counted for a mode that is left out, or when `modes` is empty. If any
+    /// is let through, the announce is counted in progress ([`Self::done`]).
+    pub(crate) fn admit(
+        &mut self,
+        space: &Name,
+        device: &Name,
+        modes: &[ChannelMode],
+        vouched: bool,
+        now: Instant,
+    ) -> Vec<ChannelMode> {
+        let key = |mode: ChannelMode| (space.clone(), device.clone(), mode);
+        let mut due: Vec<ChannelMode> = modes
+            .iter()
+            .copied()
+            .filter(|mode| {
+                self.asked
+                    .get(&key(*mode))
+                    .is_none_or(|at| now.saturating_duration_since(*at) >= ANNOUNCE_ASK_EVERY)
+            })
+            .collect();
+        if due.is_empty() || self.pending.get(space).copied().unwrap_or(0) >= ANNOUNCE_PENDING_MAX {
+            return Vec::new();
         }
-        if self.pending.get(space).copied().unwrap_or(0) >= ANNOUNCE_PENDING_MAX {
-            return false;
-        }
-        if !vouched
-            && !self
+        if !vouched && !self.answered.contains(&(space.clone(), device.clone())) {
+            let bucket = self
                 .unvouched
                 .entry(space.clone())
-                .or_insert_with(|| Bucket::new(ANNOUNCE_UNVOUCHED_RATE, ANNOUNCE_UNVOUCHED_BURST))
-                .take(now)
-        {
-            return false;
+                .or_insert_with(|| Bucket::new(ANNOUNCE_UNVOUCHED_RATE, ANNOUNCE_UNVOUCHED_BURST));
+            let granted = due.iter().take_while(|_| bucket.take(now)).count();
+            due.truncate(granted);
+            if due.is_empty() {
+                return due;
+            }
         }
         if self.asked.len() > 4096 {
             self.asked
                 .retain(|_, at| now.saturating_duration_since(*at) < ANNOUNCE_ASK_EVERY);
         }
-        self.asked.insert(key, now);
+        for mode in &due {
+            self.asked.insert(key(*mode), now);
+        }
         *self.pending.entry(space.clone()).or_default() += 1;
-        true
+        due
     }
 
+    /// The announce-driven asks of one announce over `space` are over.
     fn done(&mut self, space: &Name) {
         if let Some(n) = self.pending.get_mut(space) {
             *n = n.saturating_sub(1);
         }
     }
+
+    /// `device` answered an announce-driven ask over `space` with a session judged good: later
+    /// announces of it take no token of the bucket.
+    pub(crate) fn answered(&mut self, space: &Name, device: &Name) {
+        if self.answered.len() < ANNOUNCE_ANSWERED_MAX {
+            self.answered.insert((space.clone(), device.clone()));
+        }
+    }
+
+    /// Whether `device` answered an announce-driven ask over `space` (a test asks).
+    #[cfg(test)]
+    pub(crate) fn has_answered(&self, space: &Name, device: &Name) -> bool {
+        self.answered.contains(&(space.clone(), device.clone()))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The octets of ApplicationParameters [`announce_params`] hashed on this thread.
+    pub(crate) static ANNOUNCE_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The ApplicationParameters of an announce, if they are at most [`ANNOUNCE_MAX`] octets and
+/// hash to `digest` (the name's `ParametersSha256Digest`, made as the Interest's is). The length
+/// is checked first, so no more than 1 KiB (and the few octets of the TLV header) is ever
+/// hashed, whatever the Interest carries.
+pub(crate) fn announce_params(interest: &Interest, digest: &[u8]) -> Option<Bytes> {
+    let params = interest.app_parameters()?;
+    if params.len() > ANNOUNCE_MAX {
+        return None;
+    }
+    let portion = interest.parameters_portion()?;
+    #[cfg(test)]
+    ANNOUNCE_HASHED.with(|n| n.set(n.get() + portion.len()));
+    (Sha256::digest(&portion).as_slice() == digest).then(|| params.clone())
 }
 
 /// What a node keeps of channels.
@@ -347,30 +416,27 @@ impl NodeInner {
     }
 
     /// An announce was heard (`ChanPort::heard`): a hint, and nothing more. It costs, cheapest
-    /// first: a hash of at most 1 KiB, a lookup of the announcer's person in the record of the
-    /// space (the person its name lies in, which is no entry's to say), and a table lookup of
-    /// whether this device wants live data of the space; only an announce of a writer's device
-    /// that passes all of them can make an ask, each device at most once in 10 s, at most 32
-    /// asks in progress for a space, and, for a device the record holds no admitted entry of (a
-    /// writer who has put nothing is such a device), within a bucket of the space's own. The ask
-    /// is the check: the answer is judged by signature from the certificates it carries, so
-    /// nothing is fetched and a name no device answers costs one ask.
+    /// first: a hash of at most 1 KiB (the length is checked before it), a lookup of the
+    /// announcer's person in the record of the space (the person its name lies in, which is no
+    /// entry's to say), a table lookup of whether this device wants live data of the space and
+    /// one of whether it holds a usable session of each announced mode already; only an announce
+    /// of a writer's device with a mode no usable session covers can make an ask, each device
+    /// for each mode at most once in 10 s, at most 32 announces with asks in progress for a
+    /// space, and, for a device the record holds no admitted entry of that never answered one
+    /// (a writer who has put nothing is such a device), each ask within a bucket of the space's
+    /// own. Nothing is spent where no ask follows. The ask is the check: the answer is judged by
+    /// signature from the certificates it carries, so nothing is fetched and a name no device
+    /// answers costs one ask.
     pub(crate) fn chan_heard(&self, interest: &Interest) {
         let stats = &self.chan.stats;
         stats.announces_heard.bump();
         let Some((group, digest)) = parse_chan_announce_name(&interest.name) else {
             return;
         };
-        let Some(params) = interest.app_parameters().cloned() else {
+        let Some(params) = announce_params(interest, &digest) else {
             return;
         };
-        let digest_holds = interest
-            .parameters_portion()
-            .is_some_and(|portion| Sha256::digest(&portion).as_slice() == digest);
-        if params.len() > ANNOUNCE_MAX || !digest_holds {
-            return;
-        }
-        let Ok(Announce { sender, modes }) = Announce::decode(params) else {
+        let Ok(Announce { sender, modes, .. }) = Announce::decode(params) else {
             return;
         };
         if sender == self.device {
@@ -401,22 +467,39 @@ impl NodeInner {
             return;
         }
         let now = Instant::now();
-        if !self.chan.is_listening(&space)
-            || !self.chan.heard.lock().admit(&space, &sender, vouched, now)
-        {
+        if !self.chan.is_listening(&space) {
+            stats.announce_ignored.bump();
+            return;
+        }
+        // A mode a usable session covers needs no ask, so it takes no token and no slot.
+        let modes: Vec<ChannelMode> = modes
+            .into_iter()
+            .filter(|mode| {
+                !self
+                    .chan
+                    .sessions
+                    .find(&space, &sender, *mode)
+                    .is_some_and(|s| s.usable(now))
+            })
+            .collect();
+        let asks = self
+            .chan
+            .heard
+            .lock()
+            .admit(&space, &sender, &modes, vouched, now);
+        if asks.is_empty() {
             stats.announce_ignored.bump();
             return;
         }
         stats.announce_asks.bump();
         let node = self.arc();
         self.tasks.spawn(async move {
-            for mode in modes {
-                let held = node.chan.sessions.find(&space, &sender, mode);
-                if held.is_some_and(|s| s.usable(Instant::now())) {
-                    continue;
-                }
+            for mode in asks {
                 match node.chan_ask(&space, &sender, mode).await {
-                    Ok(session) => node.chan_release_unwanted(&session),
+                    Ok(session) => {
+                        node.chan.heard.lock().answered(&space, &sender);
+                        node.chan_release_unwanted(&session);
+                    }
                     Err(why) => {
                         tracing::debug!(%space, %sender, ?mode, "announce-driven ask failed: {why}");
                     }

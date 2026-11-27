@@ -89,3 +89,6 @@ mod get_tests;
 
 #[cfg(test)]
 mod honest_tests;
+
+#[cfg(test)]
+mod heard_tests;
