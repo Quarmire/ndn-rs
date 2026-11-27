@@ -4,7 +4,8 @@
 //!
 //! Verbs:
 //! - `list` — read-only status text: the counters (routes, sinks, frames and
-//!   octets in and out, every drop by reason, every refused install by
+//!   octets in and out, every drop by reason, the side PIT's `query:` line:
+//!   breadcrumbs held and every refusal of a `QUERY` or an `ANSWER`, every refused install by
 //!   reason), one line per route (id in hex, source face, each sink with the
 //!   time left before it lapses, frames, octets, age), and the faces barred
 //!   now. Changes nothing.
@@ -65,6 +66,21 @@ fn side_list(engine: &ForwarderEngine) -> ControlResponse {
         text,
         "up: keeps={} keeps_forwarded={} unsubs={} sinks_lapsed={}",
         s.keeps, s.keeps_forwarded, s.unsubs, s.sinks_lapsed
+    );
+    let _ = writeln!(
+        text,
+        "query: breadcrumbs={} queries={} answers={} rate_refused={} pit_dup={} pit_full={} \
+         pit_face_full={} pit_route_full={} unmatched={} late={}",
+        s.breadcrumbs,
+        s.queries,
+        s.answers,
+        s.query_rate_refused,
+        s.pit_dup,
+        s.pit_full,
+        s.pit_face_full,
+        s.pit_route_full,
+        s.unmatched,
+        s.late
     );
     let _ = writeln!(
         text,
@@ -308,6 +324,99 @@ mod tests {
         assert!(text.contains("sinks=[2("), "{text}");
         assert!(text.contains("unrouted=0"), "{text}");
         assert_eq!(engine.side().stats().routes, 1, "a read changes nothing");
+        shutdown.shutdown().await;
+    }
+
+    /// A face that takes every side frame and does nothing else.
+    struct Takes(FaceId);
+    impl Transport for Takes {
+        fn id(&self) -> FaceId {
+            self.0
+        }
+        fn kind(&self) -> FaceKind {
+            FaceKind::Internal
+        }
+        fn side_frame_max(&self) -> usize {
+            10_000
+        }
+        fn forward_side(
+            &self,
+            _frame: bytes::Bytes,
+            _class: ndn_transport::SideClass,
+        ) -> Result<(), ndn_transport::SideRefused> {
+            Ok(())
+        }
+        fn forward_side_from(
+            &self,
+            _frame: bytes::Bytes,
+            _class: ndn_transport::SideClass,
+            _ingress: FaceId,
+        ) -> Result<(), ndn_transport::SideRefused> {
+            Ok(())
+        }
+        async fn send_bytes(&self, _wire: bytes::Bytes) -> Result<(), ndn_transport::FaceError> {
+            Ok(())
+        }
+        async fn recv_bytes(&self) -> Result<bytes::Bytes, ndn_transport::FaceError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn list_shows_the_breadcrumbs_and_why_a_query_or_an_answer_was_refused() {
+        use ndn_transport::SideClass;
+        use ndn_transport::side_header::{AnswerPrefix, QueryPrefix};
+
+        let (engine, shutdown) = EngineBuilder::new(EngineConfig::default())
+            .face(Takes(FaceId(1)))
+            .face(Takes(FaceId(2)))
+            .build()
+            .await
+            .unwrap();
+        let side = engine.side();
+        side.install(
+            SideId(0xABCD),
+            FaceId(1),
+            FaceId(2),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let query = |token: u64| {
+            let mut v = QueryPrefix {
+                id: 0xABCD,
+                token,
+                ttl_ticks: 10,
+            }
+            .encode()
+            .to_vec();
+            v.resize(60, 0);
+            bytes::Bytes::from(v)
+        };
+        let answer = |token: u64| {
+            let mut v = AnswerPrefix {
+                class: SideClass::Datagram,
+                id: 0xABCD,
+                token,
+            }
+            .encode()
+            .to_vec();
+            v.resize(60, 0);
+            bytes::Bytes::from(v)
+        };
+        side.on_frame(FaceId(2), query(7), &engine.faces()); // a breadcrumb
+        side.on_frame(FaceId(2), query(7), &engine.faces()); // a duplicate
+        side.on_frame(FaceId(1), answer(8), &engine.faces()); // nobody asked 8
+
+        let resp = call(&engine, b"list", ControlParameters::default()).await;
+        assert!(resp.is_ok(), "{}", resp.status_text);
+        let text = &resp.status_text;
+        assert!(
+            text.contains(
+                "query: breadcrumbs=1 queries=1 answers=0 rate_refused=0 pit_dup=1 pit_full=0 \
+                 pit_face_full=0 pit_route_full=0 unmatched=1 late=0"
+            ),
+            "{text}"
+        );
         shutdown.shutdown().await;
     }
 
