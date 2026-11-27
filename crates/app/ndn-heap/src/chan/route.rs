@@ -368,6 +368,14 @@ impl Carrier for ConnectionCarrier {
         self.routes.receiver_added(channel);
     }
 
+    /// One task per carrier serves every channel that waits for room: it waits for the
+    /// connection ([`Connection::side_ready`]: room for any route the connection was refused
+    /// for, or the bound of that wait) and then calls **every** waiting drain, whichever route
+    /// woke it. A drain sends what its channel holds, and a channel whose route has no room
+    /// is refused again and asks again, so a route whose sink never drains holds back none of
+    /// the others (the waiter has no route of its own). A drain that panics costs that one
+    /// drain, not the lane: [`DrainTask`] puts the drains not yet called back and starts the
+    /// task again.
     fn on_ready(&self, drain: Box<dyn FnOnce() + Send>) {
         let mut ready = self.ready.lock();
         ready.waiting.push(drain);
@@ -376,21 +384,65 @@ impl Carrier for ConnectionCarrier {
         }
         ready.running = true;
         drop(ready);
-        let (conn, state) = (Arc::clone(&self.conn), Arc::clone(&self.ready));
+        DrainTask::spawn(Arc::clone(&self.conn), Arc::clone(&self.ready));
+    }
+}
+
+/// The task of a [`ConnectionCarrier`] that calls the drains waiting for room, and the guard that
+/// keeps `running` true only while a task runs: dropped before its task finished (a drain
+/// panicked, or the runtime ended it), it clears the flag and puts the drains it had not called
+/// back, so the next `on_ready` starts a task and none waits on one that is gone. After a panic
+/// it starts the task again itself: the channels whose drains wait ask no more (their emitters
+/// only queue while a drain is asked for), so nothing else would.
+struct DrainTask {
+    conn: Arc<dyn Connection>,
+    state: Arc<Mutex<Ready>>,
+    /// The drains taken from `waiting` that were not called yet.
+    batch: std::collections::VecDeque<Box<dyn FnOnce() + Send>>,
+    finished: bool,
+}
+
+impl DrainTask {
+    fn spawn(conn: Arc<dyn Connection>, state: Arc<Mutex<Ready>>) {
         rt::spawn(async move {
+            let mut task = DrainTask {
+                conn,
+                state,
+                batch: std::collections::VecDeque::new(),
+                finished: false,
+            };
             loop {
-                conn.side_ready().await;
-                let batch = std::mem::take(&mut state.lock().waiting);
-                for drain in batch {
+                task.conn.side_ready().await;
+                task.batch = std::mem::take(&mut task.state.lock().waiting).into();
+                while let Some(drain) = task.batch.pop_front() {
                     drain();
                 }
-                let mut ready = state.lock();
+                let mut ready = task.state.lock();
                 if ready.waiting.is_empty() {
                     ready.running = false;
+                    drop(ready);
+                    task.finished = true;
                     return;
                 }
             }
         });
+    }
+}
+
+impl Drop for DrainTask {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut ready = self.state.lock();
+        let unrun: Vec<_> = self.batch.drain(..).collect();
+        ready.waiting.splice(0..0, unrun);
+        if ready.waiting.is_empty() || !std::thread::panicking() {
+            ready.running = false;
+            return;
+        }
+        drop(ready);
+        DrainTask::spawn(Arc::clone(&self.conn), Arc::clone(&self.state));
     }
 }
 

@@ -1074,9 +1074,9 @@ impl SideTable {
     /// Route a frame the application of the face `from` hands over itself, and say so when the
     /// frame would be lost to a full sink: **`Err(Full)` with nothing counted but `held_back`**
     /// when `frame` is a datagram-class data frame of a route whose source is `from`, the
-    /// route has live sinks, and none of them has room now
-    /// ([`Face::side_room`](ndn_transport::Face::side_room)). The frame is the sender's again, to keep and offer
-    /// when there is room ([`SideTable::room`]); `on_frame` would have dropped it for each
+    /// route has live sinks, and none of them has room for this frame now
+    /// ([`Face::side_room_for`](ndn_transport::Face::side_room_for)). The frame is the sender's
+    /// again, to keep and offer when there is room ([`SideTable::room`]); `on_frame` would have dropped it for each
     /// full sink and the sender would never have known. Any other frame (a stream frame, an
     /// `UP`, a `QUERY`, an `ANSWER`, one for no route, from a barred face, from a face that is
     /// not the route's source) is `on_frame`'s, with its counts, and is `Ok`. A sink that has
@@ -1098,7 +1098,7 @@ impl SideTable {
             && let Some(route) = self.routes.get(&header.id()).map(|r| Arc::clone(&r))
             && route.source == from
             && !self.is_quarantined(from, self.now())
-            && !self.has_room(&route, SideClass::Datagram, faces, self.now())
+            && !self.has_room(&route, &frame, SideClass::Datagram, faces, self.now())
         {
             bump(&self.counters.held_back);
             return Err(SideRefused::Full);
@@ -1106,19 +1106,32 @@ impl SideTable {
         Ok(self.on_frame(from, frame, faces))
     }
 
-    /// Whether a frame of `class` for route `id` would find room at a sink now: at least one
-    /// live sink has it ([`Face::side_room`](ndn_transport::Face::side_room)), or the route has
-    /// no live sink (there is nothing to wait for: the frame goes nowhere, as `on_frame` would
-    /// have it). A hint, as the faces' answer is: room is not reserved. What a sender that
-    /// `send_local` told `Full` waits on.
-    pub fn room(&self, id: SideId, class: SideClass, faces: &FaceTable) -> bool {
-        let Some(route) = self.routes.get(&id.0).map(|r| Arc::clone(&r)) else {
+    /// Whether `frame`, a frame of its route, would find room at a sink now: at least one live
+    /// sink has it for this frame
+    /// ([`Face::side_room_for`](ndn_transport::Face::side_room_for): a face whose queues the frame
+    /// does not all go through, a radio that picks phys by frame, answers for the queues of this
+    /// frame), or the route has no live sink (there is nothing to wait for: the frame goes
+    /// nowhere, as `on_frame` would have it), or `frame` is no side frame or of no route. A hint,
+    /// as the faces' answer is: room is not reserved. What a sender that `send_local` told `Full`
+    /// for this frame waits on.
+    pub fn room(&self, frame: &Bytes, faces: &FaceTable) -> bool {
+        let Ok(header) = SideHeader::parse(frame) else {
             return true;
         };
-        self.has_room(&route, class, faces, self.now())
+        let Some(route) = self.routes.get(&header.id()).map(|r| Arc::clone(&r)) else {
+            return true;
+        };
+        self.has_room(&route, frame, header.class(), faces, self.now())
     }
 
-    fn has_room(&self, route: &Route, class: SideClass, faces: &FaceTable, now: u64) -> bool {
+    fn has_room(
+        &self,
+        route: &Route,
+        frame: &Bytes,
+        class: SideClass,
+        faces: &FaceTable,
+        now: u64,
+    ) -> bool {
         let sinks = route.sinks.load();
         let mut live = false;
         for sink in sinks.iter() {
@@ -1126,7 +1139,10 @@ impl SideTable {
                 continue;
             }
             live = true;
-            if faces.get(sink.face).is_some_and(|f| f.side_room(class)) {
+            if faces
+                .get(sink.face)
+                .is_some_and(|f| f.side_room_for(frame, class))
+            {
                 return true;
             }
         }

@@ -861,11 +861,11 @@ async fn a_frame_a_local_sender_hands_over_is_refused_to_it_while_no_sink_has_ro
     let (e, _sd) = engine(vec![s, r], 1).await;
     session(&hr, &hs, labelled_data(ID, 30)).await;
     eventually("the sink is installed", || sinks_of(&e, ID).len() == 1).await;
-    let datagram = ndn_transport::SideClass::Datagram;
-    assert!(e.side_room(ID, datagram), "an empty sink has room");
+    let frame = data_frame(ID, 1_200);
+    assert!(e.side_room(&frame), "an empty sink has room");
 
     hr.log.full.store(true, Ordering::Relaxed);
-    assert!(!e.side_room(ID, datagram), "a full sink has none");
+    assert!(!e.side_room(&frame), "a full sink has none");
     for _ in 0..50 {
         assert_eq!(
             e.side_send_local(FaceId(1), data_frame(ID, 1_200)),
@@ -882,7 +882,7 @@ async fn a_frame_a_local_sender_hands_over_is_refused_to_it_while_no_sink_has_ro
 
     // With room again the frames are taken, offered again.
     hr.log.full.store(false, Ordering::Relaxed);
-    assert!(e.side_room(ID, datagram));
+    assert!(e.side_room(&frame));
     for _ in 0..3 {
         assert_eq!(e.side_send_local(FaceId(1), data_frame(ID, 1_200)), Ok(()));
     }
@@ -906,5 +906,5 @@ async fn a_frame_a_local_sender_hands_over_is_refused_to_it_while_no_sink_has_ro
     let stats = e.side().stats();
     assert_eq!((stats.wrong_source, stats.held_back), (1, 50), "{stats:?}");
     // A route with no live sink has nothing to wait for.
-    assert!(e.side_room(ID + 1, datagram));
+    assert!(e.side_room(&data_frame(ID + 1, 1_200)));
 }

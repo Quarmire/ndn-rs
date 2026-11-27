@@ -869,6 +869,36 @@ async fn the_carrier_says_full_and_calls_back_once_the_face_took_a_frame() {
     carrier.try_send_datagram(marked(2)).unwrap();
 }
 
+/// A drain that panics costs that drain and not the lane: the drains behind it in the batch are
+/// still called, and one asked for after it is too (the task's flag is not left set for good,
+/// which froze every channel of the node whose drain was asked for: its emitters only queue
+/// while a drain is asked for).
+#[tokio::test]
+async fn a_drain_that_panics_does_not_freeze_the_drains_of_the_other_channels() {
+    use ndn_face_local::InProcFace;
+    let (_face, handle) = InProcFace::new(FaceId(9), 1);
+    let conn: Arc<dyn Connection> = Arc::new(ndn_app::InProcConnection::new(handle));
+    let carrier = ConnectionCarrier::new(conn, Arc::new(Routes::default()), DatagramSize::Live);
+    let flag = || {
+        let called = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&called);
+        (called, Box::new(move || set.store(true, Ordering::SeqCst)))
+    };
+    let (behind, behind_drain) = flag();
+    carrier.on_ready(Box::new(|| panic!("a channel's drain broke")));
+    carrier.on_ready(behind_drain);
+    eventually("the drain behind the one that panicked was called", || {
+        behind.load(Ordering::SeqCst)
+    })
+    .await;
+    let (after, after_drain) = flag();
+    carrier.on_ready(after_drain);
+    eventually("a drain asked for after the panic was called", || {
+        after.load(Ordering::SeqCst)
+    })
+    .await;
+}
+
 /// An extension that answers with a route label of its own.
 struct Routed {
     node: crate::host::NodeHandle,

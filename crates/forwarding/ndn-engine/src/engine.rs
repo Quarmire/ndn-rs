@@ -451,13 +451,14 @@ impl ForwarderEngine {
         Ok(())
     }
 
-    /// Whether a frame of `class` for side route `id` would find room at a sink now
-    /// ([`SideTable::room`](crate::side::SideTable::room)): what a sender told `Full` by
-    /// [`side_send_local`](Self::side_send_local) waits for. A hint, never a reservation.
-    pub fn side_room(&self, id: u64, class: ndn_transport::SideClass) -> bool {
-        self.inner
-            .side
-            .room(crate::side::SideId(id), class, &self.inner.face_table)
+    /// Whether `frame` (a side frame, offered again by a sender told `Full` for it) would find
+    /// room at a sink of its route now ([`SideTable::room`](crate::side::SideTable::room)): what
+    /// a sender told `Full` by [`side_send_local`](Self::side_send_local) waits for. It is the
+    /// answer for this frame, so a face that sends a frame on only some of its queues (a radio
+    /// whose policy picks the phys by frame) is not waited on for a queue the frame does not
+    /// use. A hint, never a reservation.
+    pub fn side_room(&self, frame: &bytes::Bytes) -> bool {
+        self.inner.side.room(frame, &self.inner.face_table)
     }
 
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]

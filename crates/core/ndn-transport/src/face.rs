@@ -572,6 +572,12 @@ impl Face {
         self.transport.side_room(class)
     }
 
+    /// [`side_room`](Self::side_room) for this `frame` (see [`Transport::side_room_for`]): what
+    /// a sender holding the frame back waits on.
+    pub fn side_room_for(&self, frame: &[u8], class: SideClass) -> bool {
+        self.transport.side_room_for(frame, class)
+    }
+
     /// Send tagged with its originating face id. Passthrough routes the tag
     /// through the in-process tag-bag; LpLinkService drops it for now.
     pub async fn send_bytes_with_source(

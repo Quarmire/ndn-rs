@@ -228,7 +228,12 @@ pub trait Connection: Send + Sync {
     }
 
     /// Completes when [`try_send_side`](Self::try_send_side) may take a frame again (at once
-    /// if it may now). Room is not reserved.
+    /// if it may now). Room is not reserved. It is **one wait for the whole connection**, not
+    /// for a route: a caller that waits on it re-offers everything it holds back when it
+    /// returns, and what is still refused stays held and is waited on again. So it completes
+    /// when *any* refused frame may be sent, and an implementation that is refused for routes
+    /// whose sinks may never drain bounds the wait (the embedded engine's connection: 1 s) so
+    /// that no route is waited on forever on behalf of the others.
     async fn side_ready(&self) {}
 
     /// The next side frame the forwarder routed to this connection, with the id of the face it

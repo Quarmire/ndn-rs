@@ -220,6 +220,17 @@ pub trait Transport: Send + Sync + 'static {
         true
     }
 
+    /// [`side_room`](Transport::side_room) for this `frame`, for a face whose queue the frame
+    /// may not go through whole (a radio sends a frame on the phys its policy picks for it, and
+    /// the queue of a phy it does not pick is no concern of this frame). A sender that is
+    /// holding a frame back asks it with the frame it holds, so that a queue the frame does
+    /// not use does not hold it. The default is `side_room(class)`, the answer for a face whose
+    /// one queue every frame goes through. A hint, as `side_room` is; it never blocks.
+    fn side_room_for(&self, frame: &[u8], class: SideClass) -> bool {
+        let _ = frame;
+        self.side_room(class)
+    }
+
     fn send_bytes(&self, wire: Bytes) -> impl Future<Output = Result<(), FaceError>> + Send;
 
     /// Send a burst of already-framed datagrams to the same peer in one shot.
@@ -328,6 +339,7 @@ pub trait ErasedTransport: Send + Sync + 'static {
     fn side_frame_max(&self) -> usize;
     fn side_carries(&self, class: SideClass) -> bool;
     fn side_room(&self, class: SideClass) -> bool;
+    fn side_room_for(&self, frame: &[u8], class: SideClass) -> bool;
 
     fn send_bytes(
         &self,
@@ -421,6 +433,9 @@ impl<T: Transport> ErasedTransport for T {
     }
     fn side_room(&self, class: SideClass) -> bool {
         Transport::side_room(self, class)
+    }
+    fn side_room_for(&self, frame: &[u8], class: SideClass) -> bool {
+        Transport::side_room_for(self, frame, class)
     }
 
     fn send_bytes(
