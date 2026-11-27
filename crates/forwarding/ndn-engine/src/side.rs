@@ -722,12 +722,7 @@ impl Pit {
         if held >= limits.pit_per_route {
             return false;
         }
-        let share = |face: FaceId| {
-            self.per_route_face
-                .get(&(route, face))
-                .copied()
-                .unwrap_or(0)
-        };
+        let share = |face: FaceId| self.per_route_face.get(&(route, face)).copied().unwrap_or(0);
         if share(from) < limits.pit_route_reserve {
             return true;
         }
