@@ -8,8 +8,8 @@
 //! goes to every sink, once per face, as a reference-counted clone of the same
 //! bytes. The table is a lighter cousin of the PIT and holds nothing but opaque
 //! 64-bit ids, [`FaceId`]s, times and counters: it never sees a name, a key, a
-//! space, a person or a mode, decrypts and verifies nothing, and reads only one
-//! frame kind, `UP`, its own keep-alive.
+//! space, a person or a mode, decrypts and verifies nothing, and reads only the keep-alive
+//! `UP` and the token of a `QUERY` or an `ANSWER` (the breadcrumb table, below).
 //!
 //! # How a route comes to be
 //!
@@ -43,6 +43,16 @@
 //!   hop keeps a path alive. `Unsub`
 //!   removes that face's sink; when none is left the route is removed and the
 //!   `Unsub` is forwarded to the source.
+//! - **Breadcrumbs (the side PIT).** A `QUERY` ([`ndn_transport::side_header::QueryPrefix`])
+//!   from a *live sink* of a route leaves `(route id, token) -> (ingress face, expiry)` and goes
+//!   up to the route's source as a datagram, with the sink as ingress; the `ANSWER`
+//!   ([`AnswerPrefix`]) from the source *removes* the breadcrumb and goes to that one face only.
+//!   Bounds [`pit_total`](SideLimits::pit_total), [`pit_per_face`](SideLimits::pit_per_face),
+//!   [`pit_per_route`](SideLimits::pit_per_route), a per-face
+//!   [`query_rate`](SideLimits::query_rate); a ttl of 100 ms to
+//!   [`pit_ttl_max`](SideLimits::pit_ttl_max). Every refusal drops the frame and counts it
+//!   (`pit_dup`, `pit_full`, `unmatched`, `late`, ...): no Nack frame is built. A barred sink's
+//!   `QUERY` passes, a barred source's `ANSWER` is dropped. docs/specs/channel.md §14.13.
 //! - Bounds ([`SideLimits`]): routes, routes per source face, sinks per route,
 //!   routes per sink face. A refusal names which ([`SideRefusal`]).
 //! - Time is the engine's **monotonic** clock (nanoseconds since the table was made,

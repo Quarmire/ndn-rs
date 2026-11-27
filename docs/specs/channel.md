@@ -268,7 +268,7 @@ Cleartext, and authenticated as the AEAD's additional data (§11.2).
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 1 | `0x00`, the **marker** |
-| 1 | 1 | `ver:3 \| class:1 \| kind:4`, high bit first. `ver` is 1. `class` is 0 for a datagram and 1 for a stream. `kind` is 0 `DATA`, 1 `CHECKPOINT`, 2 `CONTROL`, 4 `UP`. |
+| 1 | 1 | `ver:3 \| class:1 \| kind:4`, high bit first. `ver` is 1. `class` is 0 for a datagram and 1 for a stream. `kind` is 0 `DATA`, 1 `CHECKPOINT`, 2 `CONTROL`, 4 `UP`, 5 `QUERY`, 6 `ANSWER`. |
 | 2 | 8 | the **channel id**, big-endian (for an `UP`, the route id) |
 | 10 | 1 | the **key epoch**, low 8 bits |
 | 11 | 8 | `seq0`, big-endian: the sequence of the frame's first message |
@@ -277,9 +277,9 @@ Cleartext, and authenticated as the AEAD's additional data (§11.2).
 
 A sealed frame has 36 octets of overhead (20 header, 16 tag), spread over every message in it.
 
-The first octets that exist are exactly five: `0x20` `DATA` on a datagram, `0x30` `DATA` on a stream, `0x31` `CHECKPOINT`, `0x32` `CONTROL`, `0x24` `UP`. `CHECKPOINT` and `CONTROL` are always streams and `UP` is always a datagram; a kind on another class is malformed, and so is a kind that is not assigned, a version other than 1 and a marker other than `0x00`.
+The first octets that exist are exactly eight: `0x20` `DATA` on a datagram, `0x30` `DATA` on a stream, `0x31` `CHECKPOINT`, `0x32` `CONTROL`, `0x24` `UP`, `0x25` `QUERY`, `0x26` `ANSWER` on a datagram and `0x36` `ANSWER` on a stream. `CHECKPOINT` and `CONTROL` are always streams, `UP` and `QUERY` are always datagrams; a kind on another class is malformed, and so is a kind that is not assigned (kind 3 stays unassigned), a version other than 1 and a marker other than `0x00`.
 
-**What a relay reads.** The first ten octets, and nothing else: marker, `ver|class|kind`, id. A relay forwards a frame on the class it arrived on, routes it by the id, and never opens, re-packs or re-seals it. A relay refuses (drops, counted) a frame that is shorter than ten octets, whose marker is not `0x00`, whose version is not 1, whose kind is not assigned or is on a class it never uses.
+**What a relay reads.** The first ten octets, and nothing else: marker, `ver|class|kind`, id; a `QUERY` and an `ANSWER` also have a token (and a `QUERY` a ttl) at octets 10 to 18 that the side PIT reads (§14.13). A relay forwards a frame on the class it arrived on, routes it by the id, and never opens, re-packs or re-seals it. A relay refuses (drops, counted) a frame that is shorter than ten octets, whose marker is not `0x00`, whose version is not 1, whose kind is not assigned or is on a class it never uses, or a `QUERY` or `ANSWER` shorter than its prefix.
 
 **What a receiver of a sealed frame checks, in this order:**
 
@@ -348,6 +348,7 @@ flags:  bit 0 NAMED    the full name rides here (the id is bound by this message
 - **`CHECKPOINT` (1):** a signed checkpoint of the frames sent (§15). Always on the stream. Its record is §15.2. The sender records every frame it sends except a `CHECKPOINT` frame (`ring.rs`: the frame's own `Bytes`, a reference and no copy, kept for at most 4,096 frames **and 4 MiB** per channel, the oldest forgotten and counted) and the hash a checkpoint lists, the first 16 octets of SHA-256 for a frame of at most 2,048 octets and of BLAKE3 above, is **computed when the ring is drained** for a checkpoint, not when the frame is sent.
 - **`CONTROL` (2):** always on the stream. The plaintext is `op (1) | …`: 1 `BIND` (id, name), 2 `UNBIND` (id), 3 `HELLO` (the first frame after a session starts: the sender's current sequence), 4 `END`, 5 `STANDING_BEGIN`, 6 `STANDING_END`. It takes one sequence.
 - **`UP` (4):** the unsealed 11-octet record `0x00 | 0x24 | id (8) | op (1)`, `op` 1 `Keep` or 2 `Unsub`, then zero octets to 46 (§11.3). It is accepted only from a face that is a sink of the route and changes nothing but that face's own entry (§14.5).
+- **`QUERY` (5), `ANSWER` (6):** a request sent up by a sink of the route and the reply that comes back to that one face. A forwarder matches them by a token in the clear at octets 10–17 and leaves a breadcrumb for it (§14.13); the rest of each frame is the query layer's, not this section's layout. `QUERY` is always a datagram, `ANSWER` is either class; first octets `0x25`, `0x26` and `0x36`. Kind 3 stays unassigned.
 
 ### 11.6 Limits
 
@@ -754,13 +755,13 @@ Before stages 4 and 5 a frame that opened under a channel's key was not known to
 
 ## 14. The forwarder's side table
 
-A forwarder that carries channels holds one table for their frames, the **side table**. It copies each frame to the faces that asked for it, once per face, and knows nothing of what a frame is. This section says what the table keeps (§14.1, §14.2), how a route comes to be (§14.3), how a frame and a keep-alive go through it (§14.4, §14.5), how a route is kept and ends (§14.6), how a face is barred (§14.7) and paced (§14.8), what a face has to carry (§14.9), what a node does to use the table (§14.10), the management commands and counters (§14.11) and the threat notes (§14.12).
+A forwarder that carries channels holds one table for their frames, the **side table**. It copies each frame to the faces that asked for it, once per face, and knows nothing of what a frame is. This section says what the table keeps (§14.1, §14.2), how a route comes to be (§14.3), how a frame and a keep-alive go through it (§14.4, §14.5), how a route is kept and ends (§14.6), how a face is barred (§14.7) and paced (§14.8), what a face has to carry (§14.9), what a node does to use the table (§14.10), the management commands and counters (§14.11), the threat notes (§14.12) and how a request goes up and its reply comes back to one face (the side PIT, §14.13).
 
 Implementation: `ndn-packet` (`lp/`: the `SideRoute` header), `ndn-transport` (`Transport::forward_side_from`, `side_header.rs`), `ndn-engine` (`side.rs`: the table; `dispatcher/inbound.rs`: the peel; `dispatcher/outbound.rs`: the install), `ndn-mgmt` (`modules/side.rs`), `ndn-face-local` (the app face's side inbox), `ndn-app` (`Connection`), `ndn-face` (`l2/`: the Ethernet faces), `ndn-heap` (`chan/route.rs`, `chan/bar.rs`: the node's part) and, in ndn-ext, `ndn-link` (`FaceSink`, [ndn-link.md](ndn-link.md) §9).
 
 ### 14.1 The table
 
-`SideTable` is owned by the `ForwarderEngine` (`ForwarderEngine::side()`; `EngineConfig::side` sets it). It is **generic**: it holds opaque 64-bit ids, `FaceId`s, times and counters, and nothing else. It never sees a name, a key, a space, a person or a mode; it decrypts and verifies nothing; the one kind of frame it reads is `UP` (§11.5), its own keep-alive. It is not the FIB and not the PIT: routes come and go with sessions, and nothing in the table is a name.
+`SideTable` is owned by the `ForwarderEngine` (`ForwarderEngine::side()`; `EngineConfig::side` sets it). It is **generic**: it holds opaque 64-bit ids, `FaceId`s, times and counters, and nothing else. It never sees a name, a key, a space, a person or a mode; it decrypts and verifies nothing; the frames it reads beyond the routing header are `UP` (§11.5), its own keep-alive, and the tokens of `QUERY` and `ANSWER` (§14.13). It is not the FIB and not the PIT: routes come and go with sessions, and nothing in the table is a name.
 
 A **route** has an id (the channel id, which the table treats as 64 opaque bits), **one source face**, one to 64 **sink faces**, and counters of the frames and octets it routed. A **sink** is a face, an expiry and the time its last `Keep` was passed upstream. A face may be the source of some routes and a sink of others. The source is the face the setup Data arrived on, the next hop toward the sender; a sink is a face whose Interest that Data answered, a hop toward a receiver.
 
@@ -780,6 +781,7 @@ The bounds are `SideLimits`, set by a host in `EngineConfig::side` (`SideConfig`
 | Bar | 60 s, doubling to 1 h (§14.7) | |
 | Rate of a sink face | 1 MB/s on radio kinds, off on Ethernet kinds (§14.8) | the frame is dropped for that sink, `quota` |
 | The app face's side inbox | 256 frames and 8 MiB | `Full`, counted |
+| Breadcrumbs of the side PIT, `QUERY` rate, life of a breadcrumb | 16,384 in all, 256 a face, 1,024 a route; 512 a second, burst 128; 10 s (`pit_total`, `pit_per_face`, `pit_per_route`, `query_rate`, `query_burst`, `pit_ttl_max`) | the `QUERY` is dropped and counted (§14.13) |
 
 `SideTable::install` refuses with a `SideRefusal`, leaves the table as it was, and each refusal is counted (`refused_*`, §14.11):
 
@@ -934,7 +936,7 @@ Not built: no node uses the ring carrier: `CarrierHost` (`offer_ring`, `attach_r
 
 `/localhost/nfd/side/list` and `/localhost/nfd/side/quarantine` (`ndn-mgmt` `modules/side.rs`; module `SIDE`, verbs `LIST` and `QUARANTINE` in `ndn-mgmt-wire`). As every ndn-rs module that is not an NFD one, each requires a **signed** command Interest.
 
-- **`side/list`** is read-only and answers status text: a line of counters (`routes`, `sinks`, `frames_in`, `bytes_in`, `frames_out`, `bytes_out`), the drops by reason (`unrouted`, `wrong_source`, `malformed`, `class_unsupported`, `quota`, `quarantined`, `sink_full`, `sink_error`), the `UP` counters (`keeps`, `keeps_forwarded`, `unsubs`, `sinks_lapsed`), the refused installs by reason (§14.2), one line per route (the id in hex, the source face, each sink with the time left before it lapses, frames, octets, age) and one per barred face (the face, the time left). It is text, not a TLV dataset.
+- **`side/list`** is read-only and answers status text: a line of counters (`routes`, `sinks`, `frames_in`, `bytes_in`, `frames_out`, `bytes_out`), the drops by reason (`unrouted`, `wrong_source`, `malformed`, `class_unsupported`, `quota`, `quarantined`, `sink_full`, `sink_error`), the `UP` counters (`keeps`, `keeps_forwarded`, `unsubs`, `sinks_lapsed`), the side PIT's line `query:` (`breadcrumbs`, `queries`, `answers`, `rate_refused`, `pit_dup`, `pit_full`, `pit_face_full`, `pit_route_full`, `unmatched`, `late`; §14.13), the refused installs by reason (§14.2), one line per route (the id in hex, the source face, each sink with the time left before it lapses, frames, octets, age) and one per barred face (the face, the time left). It is text, not a TLV dataset.
 - **`side/quarantine`** takes `FaceId` (required: it does not default to the requesting face) and, optionally, `ExpirationPeriod` in **milliseconds**. Without it the bar is the face's next one by its history (60 s, doubling, §14.7); a call while a bar is live changes nothing and names what is left of it; with a value, that long, **at most 1 h** (a longer value is clamped and the answer names the length applied); `0` lifts the bar. The answer says `face barred` or `bar lifted` and names the length applied in `ExpirationPeriod`. It refuses with status 400 and a sentence when `FaceId` is missing or names no face on the forwarder (a lift is not refused), answers 404 to any other verb of the module, and answers **403 over `/localhop`** whoever signed it: `/localhop/nfd` is a neighbour's route registration (`rib/register`, `rib/unregister`) and nothing else, so a key the localhop anchors accept cannot bar a link or read the routes ([mgmt-trust.md](mgmt-trust.md), Side routes). The commands are logged at `warn`.
 
 The per-face counters `in_side_frames` and `in_side_bytes` are in the engine's face state; `status` does not show them. [mgmt-trust.md](mgmt-trust.md) lists the module among the management commands.
@@ -950,6 +952,67 @@ The per-face counters `in_side_frames` and `in_side_bytes` are in the engine's f
 - **A removed member that keeps its sink.** It keeps sending `Keep` and is sent ciphertext: it holds the old key only until the re-key (§3.6) and the forwarder judges no membership. Its sink costs the forwarder one fan-out per frame, within the limits above.
 - **Barring an honest relay.** The bar is made by a receiver's node on the face the contradicted frame **arrived on at that node's forwarder**: the link to the nearest hop upstream (§14.7). A member (a key holder) can inject frames only through a face that is the source of the route at its own forwarder, as any hop can, and a frame goes on from hop to hop with nothing added. So if the member's device is that nearest hop, its own link is barred; if it is further upstream and the hop between is honest, **the honest relay's link is barred** at the receivers' forwarders, because nothing carries attribution upstream. What the bar costs the relay: the channel frames it sends to that forwarder (of every channel) are dropped for 60 s, then 120 s and so on to an hour for each repeat, and routes with the relay as source are not installed; its NDN traffic is untouched and the other forwarders are not told. What the member needs for it: a frame a signed checkpoint contradicts, or a checkpoint that does not verify (§15.6), which a key holder can make at will. A conflict alone (§15.6) bars nobody. The evidence (§15.5) names the face; an operator lifts a bar with `side/quarantine` (length 0). The bar is a response to a **link**, not a verdict on a person.
 - **Clocks.** No decision about who may send rests on a clock. TTLs, bars and the sweep are on the forwarder's **monotonic** engine clock: the table counts nanoseconds since it was made (`Runtime::now`, an `Instant`, never `unix_nanos`), so a step of the host's wall clock (NTP, a VM that resumed, an operator setting the date) neither lapses every sink nor lifts every bar; a step of +301 s changes nothing, time that passes still lapses a sink. The table's stamps are read as ages (the idle reaper compares the table's idle time, not a stamp of the other clock). They decide how long a route or a bar lives.
+
+### 14.13 The side PIT: `QUERY` and `ANSWER`
+
+A route carries frames **down**, from its one source to its sinks. A request has to go **up**, from one sink to the source, and its reply has to come back to **that one face** and to no other sink of the route. The table does it with a second, equally generic table of **breadcrumbs**: a `QUERY` leaves `(route id, token) → (ingress face, expiry)` at each hop it crosses, and the `ANSWER` consumes it. It is a PIT in the sense that one outstanding request leaves a one-shot entry that the reply removes, and unlike the NDN PIT nothing in it is a name. The table never sees a name, a key, a space, a person or a mode; it opens, verifies and authenticates nothing; a token is 64 opaque bits chosen by the asker (`ndn-transport` `side_header.rs`: `QueryPrefix`, `AnswerPrefix`; `ndn-engine` `side.rs`: `SideTable`).
+
+**The two frames** (kinds 5 and 6; kind 3 stays unassigned). Both start with the routing header of §11.1 (marker, `ver|class|kind`, the route id), then a token; the rest is sealed by the query layer and is not read here:
+
+| Frame | First octet | Class | Octets a relay reads |
+|---|---|---|---|
+| `QUERY` (5) | `0x25` | datagram only (a `QUERY` on a stream is malformed) | 0 marker; 1 `0x25`; 2–9 route id; **10–17 token**; **18 ttl** in units of 100 ms. **19 octets** |
+| `ANSWER` (6) | `0x26` on a datagram, `0x36` on a stream | either; an `ANSWER` leaves on the class it arrived on | 0 marker; 1 `0x26`/`0x36`; 2–9 route id; **10–17 token**. **18 octets** |
+
+A frame shorter than its prefix (19, 18) is `malformed`: dropped and counted, with nothing else done. The first octets that exist are now `0x20 0x30 0x31 0x32 0x24 0x25 0x26 0x36`. The token is chosen by the asker, random per query per server; it is in the clear so a forwarder can match an answer to its breadcrumb, and it is not a counter an attacker could guess and squat. The octets after the prefix are not the §11.1 header of a `DATA` frame: they are the query layer's, and a relay does not read them.
+
+**`QUERY`, from a face.** The checks, cheapest first, each dropping the frame and counting:
+
+1. the route exists (`unrouted`) and the face is a **live sink** of it, one that has not lapsed (else `wrong_source`: the source itself, a stranger and a lapsed sink all land here; it is the check an `UP` makes);
+2. the face's **query rate** (`query_rate`, a refusal counted `rate_refused`): the face's own allowance, as a generic cell rate: 512 a second, a burst of 128;
+3. the `(route id, token)` has no breadcrumb (`pit_dup`; a breadcrumb that lapsed and is not yet swept counts as absent): a duplicate cannot take over a token in flight, whichever face sends it;
+4. the three bounds, in this order: the table (`pit_full`), the ingress face (`pit_face_full`), the route (`pit_route_full`).
+
+Then the table inserts `(route id, token) → (face, now + ttl)`, where `ttl` is the frame's octet 18 in 100 ms, **clamped to 100 ms–10 s** (0 is 100 ms, over 100 is 10 s: neither is refused), and hands the frame to the route's **source** face as a datagram with the sink as ingress (`forward_side_from`, the code path an `UP` `Keep` takes, §14.5). The breadcrumb is inserted **before** the frame goes, since a reply may come back before the call returns; a source that cannot take the frame (full, gone, refusing) has the breadcrumb taken out again and the drop is counted `sink_full`. A **barred** face's `QUERY` passes, as its `UP` does (§14.7): it is the face's own sink's request and sources nothing.
+
+**`ANSWER`, from the source.** The face must be the route's **source** (else `wrong_source`, and the breadcrumb is not touched: a sink that knows a token cannot answer for the server, or burn the entry). A barred source's `ANSWER` is dropped (`quarantined`, as any frame it sources) and the breadcrumb stays. Then the breadcrumb of `(route id, token)` is **removed on lookup**: absent (never made, already answered, swept, or its face went) is `unmatched`; present and expired (`expiry` reached) is `late`; present and live goes by `forward_side_from(frame, class, source)` to **that one face**, on the class it came on. A breadcrumb is therefore answered once: a second `ANSWER` for the token is `unmatched`. A token names a breadcrumb of its own route only. A face that left the face table is `unmatched`; one that cannot take the frame is `sink_full`; one whose `SideRate` (§14.8) is spent is `quota`.
+
+**No Nack is built.** A forwarder can neither sign nor seal a refusal, and an unauthenticated refusal frame would add nothing a drop does not give: the asker sees silence until its own deadline.
+
+**Bounds** (`SideLimits`; `ttl_max` is the sink's TTL of §14.2, so the breadcrumb's is `pit_ttl_max`):
+
+| What | Field | Default | Over it |
+|---|---|---|---|
+| Breadcrumbs in the table | `pit_total` | 16,384 | `pit_full` |
+| Breadcrumbs one ingress face holds | `pit_per_face` | 256 | `pit_face_full` |
+| Breadcrumbs one route holds | `pit_per_route` | 1,024 | `pit_route_full` |
+| `QUERY` frames a face may send | `query_rate`, `query_burst` | 512 a second, burst 128 (0 refuses every `QUERY`) | `rate_refused` |
+| Life of a breadcrumb | `pit_ttl_max` | 10 s, and at least 100 ms | the frame's ttl is clamped |
+
+**Lifetime.** The 1 s sweep (§14.6) removes the lapsed breadcrumbs. A face that goes down takes its breadcrumbs with it (`remove_face`), and so does the source of a route that goes (they could never be answered); `drop_gone_faces` catches a face that left without one. A route that ends by its sinks lapsing leaves its breadcrumbs to their own ttl (10 s at most). Time is the engine's monotonic clock (§14.12, Clocks); nothing here rests on a wall clock.
+
+**Counters** (`side/list`, §14.11; `SideStats`): `breadcrumbs` (a gauge, those held now), `queries` and `answers` (frames passed up and down), and the refusals, each a drop with no other effect:
+
+| Counter | Frame | Meaning |
+|---|---|---|
+| `wrong_source` (with the other frames' drops) | `QUERY`, `ANSWER` | a `QUERY` from a face that is not a live sink; an `ANSWER` from a face that is not the source |
+| `quarantined` (likewise) | `ANSWER` | the source is barred (§14.7) |
+| `sink_full` (likewise) | both | the face the frame had to go to could not take it |
+| `quota` (likewise) | `ANSWER` | the asking face's rate (§14.8) is spent |
+| `rate_refused` | `QUERY` | over the face's `query_rate` |
+| `pit_dup` | `QUERY` | the token is in flight on the route |
+| `pit_full`, `pit_face_full`, `pit_route_full` | `QUERY` | a bound of the table, the face, the route |
+| `unmatched` | `ANSWER` | no breadcrumb: unknown, already answered, swept, or its face gone |
+| `late` | `ANSWER` | the breadcrumb had expired |
+
+**Threat notes.**
+
+- **A face that is not a sink asks.** It is `wrong_source`; no breadcrumb, no forward, and it costs the relay a header parse and a sink-list scan.
+- **A sink floods queries.** Its own rate and its own 256 breadcrumbs bound it; what it leaves is its own (per face), so it cannot starve another face of breadcrumbs except by the shared 16,384 of the table, which a thousand such faces would need. A relay never forwards more than the face's rate to the source.
+- **A sink squats a token.** A token in flight is a duplicate for every face, so a second asker cannot take over the first's breadcrumb (the first's answer goes to the first). A token is random and chosen by the asker, so a collision between two honest askers behind one relay costs the second a drop (`pit_dup`), and a retry with a fresh token.
+- **A sink steals or burns an answer.** An `ANSWER` is accepted only from the route's source, and the breadcrumb is not consumed by anything else: it goes to the one face that asked, and no other sink sees it, at any hop. A relay never learns what an answer or a query says, only the face it came over.
+- **The source forges for a sink that never asked.** It needs the token of a breadcrumb that is live, and the table sends the answer to that face only; an answer for a token that has no breadcrumb is `unmatched`. Whether the body is the server's is the query layer's check (the AEAD), not the forwarder's.
+- **Memory.** At most 16,384 breadcrumbs of a (route, token) key, a face and an expiry; ten seconds at most each.
 
 ## 15. Checkpoints
 
