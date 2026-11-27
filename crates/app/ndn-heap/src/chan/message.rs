@@ -518,6 +518,22 @@ impl Messages {
     fn sequence(&mut self) -> Result<u64, MessageError> {
         self.varint("original sequence")
     }
+
+    /// Parse every message of the frame into the end of `out`, written where it stays (no
+    /// message is returned through the iterator and moved again). On an error `out` holds the
+    /// messages before it and the frame is refused as a whole by the caller. The same checks as
+    /// the iterator: each message, then only padding after the last.
+    #[inline]
+    pub(crate) fn parse_into(&mut self, out: &mut Vec<Message>) -> Result<(), MessageError> {
+        while self.seen < self.count {
+            let message = self.message()?;
+            out.push(message);
+            self.seen += 1;
+            self.seq += 1;
+        }
+        self.done = true;
+        check_padding(&self.data[self.pos..])
+    }
 }
 
 impl Iterator for Messages {
@@ -858,6 +874,34 @@ mod tests {
             let got: Result<Vec<_>, _> =
                 Messages::new(Bytes::copy_from_slice(plain), 0, *count, 64).collect();
             assert_eq!(got.as_ref().err(), Some(want), "{plain:02x?}");
+            let mut into = Vec::new();
+            let parsed =
+                Messages::new(Bytes::copy_from_slice(plain), 0, *count, 64).parse_into(&mut into);
+            assert_eq!(parsed.as_ref().err(), Some(want), "parse_into {plain:02x?}");
+        }
+    }
+
+    /// `parse_into` gives the messages the iterator gives, in the same order, with the same
+    /// sequences and payloads.
+    #[test]
+    fn parse_into_gives_what_the_iterator_gives() {
+        let big = [0x33u8; 300];
+        let msgs = [
+            OutMessage::new(1, b"a"),
+            OutMessage::new(2, &big),
+            OutMessage::new(3, b""),
+        ];
+        for count in [1usize, 2, 3] {
+            let plain = Bytes::from(plaintext_of(&msgs[..count]));
+            let by_iter: Vec<Message> = Messages::new(plain.clone(), 40, count, MESSAGE_DEFAULT)
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let mut into = vec![];
+            Messages::new(plain, 40, count, MESSAGE_DEFAULT)
+                .parse_into(&mut into)
+                .unwrap();
+            assert_eq!(into, by_iter, "{count} messages");
+            assert_eq!(into.last().map(|m| m.seq), Some(40 + count as u64 - 1));
         }
     }
 

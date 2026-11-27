@@ -123,14 +123,20 @@ impl<T> Coalescing<T> {
                 return Offer::Stale;
             }
             slot.seq = seq;
-            let replaced = slot.item.replace(Queued { seq, weight, item });
-            if let Some(old) = replaced {
-                self.bytes = self.bytes - old.weight + weight;
+            // Written where it stays: the newer message replaces the older in place, or fills the
+            // empty slot, with no queued message built aside and moved in.
+            if let Some(queued) = slot.item.as_mut() {
+                let old = queued.weight;
+                queued.seq = seq;
+                queued.weight = weight;
+                queued.item = item;
+                self.bytes = self.bytes - old + weight;
                 // The pair keeps its turn; what the newer message adds is made room for by
                 // evicting others, never the pair itself.
                 self.make_room_besides(pair);
                 return Offer::Replaced;
             }
+            slot.item = Some(Queued { seq, weight, item });
             self.make_room(weight);
             self.bytes += weight;
             self.order.push_back(pair);

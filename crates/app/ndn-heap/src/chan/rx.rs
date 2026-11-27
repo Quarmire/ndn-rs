@@ -1040,7 +1040,7 @@ impl ChannelRx {
         }
         let body = match header.kind {
             SideKind::Data => {
-                let messages = match opened.messages(self.message_limit) {
+                let mut messages = match opened.messages(self.message_limit) {
                     Ok(messages) => messages,
                     Err(_) => {
                         stats.malformed.bump();
@@ -1048,15 +1048,10 @@ impl ChannelRx {
                     }
                 };
                 st.parsed.clear();
-                for message in messages {
-                    match message {
-                        Ok(message) => st.parsed.push(message),
-                        Err(_) => {
-                            st.parsed.clear();
-                            stats.malformed.bump();
-                            return Delivery::Dropped(Dropped::Malformed);
-                        }
-                    }
+                if messages.parse_into(&mut st.parsed).is_err() {
+                    st.parsed.clear();
+                    stats.malformed.bump();
+                    return Delivery::Dropped(Dropped::Malformed);
                 }
                 Body::Data(std::mem::take(&mut st.parsed))
             }
