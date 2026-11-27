@@ -994,8 +994,8 @@ impl SideTable {
     /// Route a frame the application of the face `from` hands over itself, and say so when the
     /// frame would be lost to a full sink: **`Err(Full)` with nothing counted but `held_back`**
     /// when `frame` is a datagram-class data frame of a route whose source is `from`, the
-    /// route has live sinks, and none of them has room now ([`Face::side_room`]
-    /// (ndn_transport::Face::side_room)). The frame is the sender's again, to keep and offer
+    /// route has live sinks, and none of them has room now
+    /// ([`Face::side_room`](ndn_transport::Face::side_room)). The frame is the sender's again, to keep and offer
     /// when there is room ([`SideTable::room`]); `on_frame` would have dropped it for each
     /// full sink and the sender would never have known. Any other frame (a stream frame, an
     /// `UP`, a `QUERY`, an `ANSWER`, one for no route, from a barred face, from a face that is

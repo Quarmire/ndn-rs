@@ -52,6 +52,23 @@ use ndn_transport::side_header::SideHeader;
 const ROOM_YIELDS: u32 = 256;
 const ROOM_RECHECK: Duration = Duration::from_millis(1);
 
+/// Sleep `dur` in a future that is `Send` on wasm32 as well: the connection's methods are
+/// `async_trait`, and the browser's timer future is not `Send`, so the timer runs on its own
+/// task there and this waits on a oneshot.
+async fn pause(dur: Duration) {
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::rt::sleep(dur).await;
+    #[cfg(target_arch = "wasm32")]
+    {
+        let (done, woken) = futures::channel::oneshot::channel();
+        crate::rt::spawn(async move {
+            crate::rt::sleep(dur).await;
+            let _ = done.send(());
+        });
+        let _ = woken.await;
+    }
+}
+
 /// Per-app in-process face buffer depth. Matches `MobileEngine`'s default.
 const APP_FACE_BUFFER: usize = 256;
 
@@ -229,7 +246,7 @@ impl Connection for EngineConnection {
                     yields += 1;
                     tokio::task::yield_now().await;
                 } else {
-                    crate::rt::sleep(ROOM_RECHECK).await;
+                    pause(ROOM_RECHECK).await;
                 }
             }
             let mut refused = self.refused.lock().unwrap_or_else(PoisonError::into_inner);
