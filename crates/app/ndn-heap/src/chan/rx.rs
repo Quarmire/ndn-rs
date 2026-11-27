@@ -2041,6 +2041,13 @@ fn unverifiable(period: Duration) -> EndReason {
     }
 }
 
+/// Octets of frames [`NodeHandle::deliver_frame`] takes before it hands the executor back once. A
+/// read loop that never waits would otherwise run ahead of the consumers of `Items` until a queue
+/// bound (1 MiB for the newest-per-name queue) evicts messages the node already opened and
+/// checked: the consumer runs about every 64 KiB, a sixteenth of that bound, and the yield is one
+/// in 56 frames of 1,162 octets, one in 7 of 9,000.
+const COOPERATE_OCTETS: usize = 64 * 1024;
+
 /// What a node's receiver holds: the channels it takes frames of and the `Items` it pushes to.
 #[derive(Default)]
 pub(crate) struct Receivers {
@@ -2067,8 +2074,23 @@ pub(crate) struct Receivers {
     ceiling: Ceiling,
     /// When the last warning of budget starvation was told.
     starved_noted: Mutex<Option<Instant>>,
+    /// Octets of frames delivered since the host's read loop last gave the executor back
+    /// ([`Self::cooperate`]).
+    since_yield: AtomicUsize,
 }
+
 impl Receivers {
+    /// `octets` of frames came in: whether [`COOPERATE_OCTETS`] have since the last time this said
+    /// so (and a new count begins). One relaxed counter, shared by every reader of the node.
+    fn cooperate(&self, octets: usize) -> bool {
+        let came = self.since_yield.fetch_add(octets, Ordering::Relaxed) + octets;
+        if came < COOPERATE_OCTETS {
+            return false;
+        }
+        self.since_yield.store(0, Ordering::Relaxed);
+        true
+    }
+
     /// A channel could not keep or hold a frame because the node's bytes for checkpoints and holds
     /// are taken by channels that hold more than their equal part while this one holds less:
     /// counted every time, and told as a warning once in [`STARVED_NOTICE`]. The channels over
@@ -2535,10 +2557,20 @@ impl NodeHandle {
     ///
     /// It **waits** only for a stream frame of a `Reliable` or `Window` channel while an `Items`
     /// that blocks has a full queue: awaiting it is the back pressure that stalls the sender.
-    /// Every other frame is taken without waiting.
+    /// Every other frame is taken without waiting for anything. But after every
+    /// [`COOPERATE_OCTETS`] of frames the call hands the executor back once (it returns pending,
+    /// woken at once), so that a host's read loop, which never waits, lets the consumers of
+    /// `Items` on its worker run between its bursts instead of running ahead of them until a queue
+    /// bound evicts messages the node already opened.
     pub async fn deliver_frame(&self, frame: Bytes, ingress: u64) -> Delivery {
-        self.inner
+        let octets = frame.len();
+        let delivery = self
+            .inner
             .chan_deliver(frame, ingress, Instant::now())
-            .await
+            .await;
+        if self.inner.chan.rx.cooperate(octets) {
+            crate::rt::yield_now().await;
+        }
+        delivery
     }
 }

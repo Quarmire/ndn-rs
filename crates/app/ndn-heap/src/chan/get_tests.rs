@@ -743,6 +743,101 @@ async fn latest_emissions_coalesce_per_name_and_lag_past_the_bound_while_kept_it
     );
 }
 
+/// The host's read loop never waits: `deliver_frame` takes every frame it is handed. On one worker
+/// with the consumer of `Items` (a host's runtime, a slow core) a loop that is never interrupted
+/// runs ahead of the consumer, until the queue's 1 MiB bound evicts messages that were opened,
+/// checked and queued for nothing. `deliver_frame` lets the consumer run once in a while.
+#[tokio::test(flavor = "current_thread")]
+async fn a_tight_read_loop_lets_the_consumer_run_so_a_burst_that_fits_in_turn_loses_nothing() {
+    let w = three(
+        LinkConfig {
+            datagram_max: 9_000,
+            datagram_capacity: 100_000,
+            ..LinkConfig::default()
+        },
+        4096,
+    )
+    .await;
+    let bob = w.bob();
+    let items = carol_get(&w, emitted_only());
+    w.join(ChannelMode::Latest).await;
+    let (delivered, missed) = (
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    );
+    let consumer = {
+        let (delivered, missed) = (delivered.clone(), missed.clone());
+        let mut items = items;
+        tokio::spawn(async move {
+            while let Some(next) = items.next().await {
+                match next {
+                    Ok(_) => delivered.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    Err(GetNotice::Lagged { missed: m }) => {
+                        missed.fetch_add(m, std::sync::atomic::Ordering::Relaxed)
+                    }
+                    Err(other) => panic!("{other:?}"),
+                };
+            }
+        })
+    };
+    // 1,600 messages of 1 KB on distinct names (1.7 MB, over the queue's 1 MiB bound), emitted in
+    // rounds the sender's own queue holds, each round let out to the link before the next.
+    let total = 1_600u64;
+    for i in 0..total {
+        let mut value = format!("{i:04}").into_bytes();
+        value.resize(1000, b'.');
+        bob.emit(
+            &n(&format!("/m/{i}")),
+            Bytes::from(value),
+            EmitOptions::latest(),
+        )
+        .await
+        .unwrap();
+        if i % 200 == 199 {
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+    // The frames are handed over in one loop, which the consumer shares the thread with.
+    let (mut frames, mut carried) = (0, 0u64);
+    while let Some(frame) = w.link.pop_datagram() {
+        match w.carol().deliver_frame(frame, 1).await {
+            super::rx::Delivery::Delivered { messages } => carried += messages as u64,
+            other => panic!("{other:?}"),
+        }
+        frames += 1;
+    }
+    assert!(frames > 100, "the burst is many frames: {frames}");
+    assert!(
+        carried > 1_000,
+        "the burst is over the queue's bound: {carried}"
+    );
+    let started = Instant::now();
+    while delivered.load(std::sync::atomic::Ordering::Relaxed)
+        + missed.load(std::sync::atomic::Ordering::Relaxed)
+        < carried
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{carried} carried, {} delivered, {} missed",
+            delivered.load(std::sync::atomic::Ordering::Relaxed),
+            missed.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    consumer.abort();
+    assert_eq!(
+        missed.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no message was evicted: the consumer ran between the frames of the burst"
+    );
+    assert_eq!(
+        delivered.load(std::sync::atomic::Ordering::Relaxed),
+        carried
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reliable_with_drop_discards_the_oldest_and_says_lagged_while_kept_items_are_unaffected() {
     let w = three(LinkConfig::default(), 4096).await;

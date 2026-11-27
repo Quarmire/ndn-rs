@@ -1268,12 +1268,7 @@ async fn a_message_costs_no_allocation_and_a_frame_a_fixed_few() {
         let frame = fx.data(SideClass::Datagram, *seq, &msgs(count, false));
         *seq += count;
         let carol = handle(fx.carol());
-        let (delivery, allocations) = count_allocations(|| {
-            carol
-                .deliver_frame(frame, 7)
-                .now_or_never()
-                .expect("no waiting")
-        });
+        let (delivery, allocations) = count_allocations(|| deliver_polling(&carol, frame));
         assert_eq!(
             delivery,
             Delivery::Delivered {
@@ -1304,6 +1299,19 @@ async fn a_message_costs_no_allocation_and_a_frame_a_fixed_few() {
 
 // -- What a queued message pins ---------------------------------------------------------------
 
+/// `deliver_frame` driven by hand: it waits for nothing, but hands the executor back once in a
+/// while ([`super::rx`]'s `COOPERATE_OCTETS`), which a poll loop with no executor takes as a
+/// `Pending` and polls again. Allocates nothing itself.
+fn deliver_polling(node: &crate::host::NodeHandle, frame: Bytes) -> Delivery {
+    let mut delivering = std::pin::pin!(node.deliver_frame(frame, 7));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(delivery) = delivering.as_mut().poll(&mut cx) {
+            return delivery;
+        }
+    }
+}
+
 /// A stream frame of `total` octets whose one message is named by `id` and has a one-octet
 /// payload: everything else is zero padding, which a receiver accepts after the messages.
 fn padded_frame(fx: &Fx, seq0: u64, id: u64, total: usize) -> Bytes {
@@ -1332,10 +1340,7 @@ fn pinned_by_padded_frames(fx: &Fx, frames: u64) -> i64 {
     let ((), live) = live_bytes(|| {
         for i in 0..frames {
             let frame = padded_frame(fx, start + i, i + 1, 1 << 20);
-            let delivery = carol
-                .deliver_frame(frame, 7)
-                .now_or_never()
-                .expect("no waiting");
+            let delivery = deliver_polling(&carol, frame);
             assert_eq!(delivery, Delivery::Delivered { messages: 1 });
         }
     });

@@ -19,6 +19,26 @@ pub(crate) use web_time::Instant;
 
 pub(crate) use ndn_app::rt::{sleep, spawn, timeout};
 
+/// Let the executor run its other ready tasks before this one goes on.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use tokio::task::yield_now;
+
+/// Let the executor run its other ready tasks before this one goes on (this target's `tokio` has
+/// no task functions: the task wakes itself and returns once).
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await;
+}
+
 /// The tasks one part of a node runs (the network half, the judge, the flusher, the node's
 /// own). [`Self::stop`] ends every one of them at its next poll, and drops what it held;
 /// [`Self::ended`] returns once each has been dropped, so whatever they held (the node, the
