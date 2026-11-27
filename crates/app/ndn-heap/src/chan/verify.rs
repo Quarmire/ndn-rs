@@ -480,30 +480,65 @@ impl Verify {
 
     /// The slot at `seq0`, made if it is not there; the run starts around it are kept.
     fn slot_mut(&mut self, seq0: u64) -> &mut Slot {
-        if !self.slots.contains_key(&seq0) {
-            let below = self.slots.range(..seq0).next_back().map(|(&s, _)| s);
-            let above = self.slots.range(seq0..).next().map(|(&s, _)| s);
-            if below.is_some_and(|below| seq0 - below > REPLAY_WINDOW) {
-                self.starts.insert(seq0);
-            }
-            if let Some(above) = above {
-                self.starts.remove(&above);
-                if above - seq0 > REPLAY_WINDOW {
-                    self.starts.insert(above);
+        // A frame above every slot (the sender's next one) has no slot above it and the highest
+        // one below it: no search for neighbours.
+        let top = self.slots.last_key_value().map(|(&s, _)| s);
+        match top {
+            Some(top) if seq0 > top => {
+                if seq0 - top > REPLAY_WINDOW {
+                    self.starts.insert(seq0);
                 }
             }
+            Some(_) if !self.slots.contains_key(&seq0) => {
+                let below = self.slots.range(..seq0).next_back().map(|(&s, _)| s);
+                let above = self.slots.range(seq0..).next().map(|(&s, _)| s);
+                if below.is_some_and(|below| seq0 - below > REPLAY_WINDOW) {
+                    self.starts.insert(seq0);
+                }
+                if let Some(above) = above {
+                    self.starts.remove(&above);
+                    if above - seq0 > REPLAY_WINDOW {
+                        self.starts.insert(above);
+                    }
+                }
+            }
+            _ => {}
         }
         self.slots.entry(seq0).or_default()
     }
 
-    /// Remove the slot at `seq0`; the run starts around it are kept.
+    /// Remove the slot at `seq0`; the run starts around it are kept. The lowest slot (what a
+    /// full channel forgets, and what a checkpoint settles first) is taken off the end of the
+    /// tree without a search.
     fn remove_slot(&mut self, seq0: u64) -> Option<Slot> {
-        let slot = self.slots.remove(&seq0)?;
-        self.starts.remove(&seq0);
-        self.pending.remove(&seq0);
-        let below = self.slots.range(..seq0).next_back().map(|(&s, _)| s);
-        if let Some(above) = self.slots.range(seq0..).next().map(|(&s, _)| s) {
-            self.starts.remove(&above);
+        let lowest = self
+            .slots
+            .first_key_value()
+            .is_some_and(|(&s, _)| s == seq0);
+        let (slot, below) = if lowest {
+            (self.slots.pop_first()?.1, None)
+        } else {
+            let slot = self.slots.remove(&seq0)?;
+            let below = self.slots.range(..seq0).next_back().map(|(&s, _)| s);
+            (slot, below)
+        };
+        if !self.starts.is_empty() {
+            self.starts.remove(&seq0);
+        }
+        if self.pending.first() == Some(&seq0) {
+            self.pending.pop_first();
+        } else {
+            self.pending.remove(&seq0);
+        }
+        let above = if lowest {
+            self.slots.first_key_value().map(|(&s, _)| s)
+        } else {
+            self.slots.range(seq0..).next().map(|(&s, _)| s)
+        };
+        if let Some(above) = above {
+            if !self.starts.is_empty() {
+                self.starts.remove(&above);
+            }
             if below.is_some_and(|below| above - below > REPLAY_WINDOW) {
                 self.starts.insert(above);
             }
@@ -576,7 +611,12 @@ impl Verify {
     /// was for the node's bytes ([`NotKept::Starved`]).
     pub(crate) fn offer(&mut self, seq0: u64, accepted: Accepted) -> (u64, Result<(), NotKept>) {
         let mut forgotten = 0;
-        if !self.slots.contains_key(&seq0) && self.slots.len() >= SLOTS_MAX {
+        let absent = self.slots.len() >= SLOTS_MAX
+            && self
+                .slots
+                .last_key_value()
+                .is_none_or(|(&top, _)| seq0 > top || !self.slots.contains_key(&seq0));
+        if absent {
             if self.far_above(seq0) {
                 return (0, Err(NotKept::Far));
             }
