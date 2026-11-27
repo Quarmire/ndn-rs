@@ -1081,6 +1081,59 @@ async fn an_answer_to_an_ask_made_before_the_channel_was_let_go_installs_no_sess
     assert_eq!(&got.bytes[..], b"z");
 }
 
+/// The other half of that rule, with the other ask held by hand instead of left to an announce's
+/// timing: while another ask of the channel is in flight (its answer lays the route again, and an
+/// `Unsub` now could take that one), the stale answer is discarded all the same, installs no
+/// session, and gives up no route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_answer_beside_another_ask_in_flight_installs_no_session_and_sends_no_unsub() {
+    use super::wire::ChannelMode;
+    let rig = rig(true).await;
+    let (carol, bob) = (rig.carol(), rig.bob());
+    let items = live(carol);
+    let info = carol.ask_channel(&space(), bob.name()).await.unwrap();
+    eventually("HELLO", || items.hello_seen()).await;
+    let (name, data, generation, asking) = ask_in_flight(carol, bob).await;
+
+    drop(items);
+    eventually("the route is gone", || rig.sinks(info.channel) == 0).await;
+    let _again = live(carol);
+    // An ask begun after the release: not stale, and still on its way.
+    let other = carol
+        .inner
+        .chan
+        .sessions
+        .asking(&space(), ChannelMode::Latest);
+    let unsubs = carol.inner.chan.route.unsubs.get();
+
+    let late = carol
+        .inner
+        .chan_take_answer(
+            &space(),
+            bob.name(),
+            ChannelMode::Latest,
+            &name,
+            data,
+            generation,
+            &asking,
+        )
+        .await;
+    assert!(
+        matches!(late, Err(super::error::ChanError::Superseded { .. })),
+        "an answer to an ask made before the channel was let go: {late:?}"
+    );
+    assert_eq!(
+        carol.inner.chan.route.unsubs.get(),
+        unsubs,
+        "another ask is on its way: its answer lays the route again, so none is given up"
+    );
+    assert!(
+        carol.inner.chan.sessions.get(info.channel).is_none(),
+        "the stale answer left a session nobody asked for"
+    );
+    drop(other);
+}
+
 /// The first hop toward a receiver is an Ethernet segment: it carries datagrams only. The sender
 /// learns that from the forwarder's face when the receiver asks, so a `Reliable` or `Window` ask
 /// is refused `NoStream` there (with what to do), instead of being answered and ending in
