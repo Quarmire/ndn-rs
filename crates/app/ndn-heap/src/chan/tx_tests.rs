@@ -625,6 +625,39 @@ async fn a_path_that_grew_takes_the_message_the_kept_size_refused_as_a_datagram(
 }
 
 #[tokio::test]
+async fn a_path_that_shrank_while_idle_refuses_a_message_it_can_no_longer_take_where_there_is_no_stream()
+ {
+    let rig = rig(
+        ChannelMode::Latest,
+        LinkConfig {
+            datagram_max: 9_000,
+            has_stream: false,
+            ..LinkConfig::default()
+        },
+    );
+    let latest = EmitOptions::latest();
+    // A first message keeps the room the path had: 9,000.
+    send(&rig, &name(1), b"first", &latest, at(&rig, 1)).await;
+    settle(&rig.tx).await;
+    // The path falls to 1,200 while the channel is idle, with nothing refused. A message that
+    // fits no datagram now and has no stream to go on is refused, not queued to be dropped.
+    rig.link.set_datagram_max(1_200);
+    let refused = error_of(
+        rig.tx
+            .emit(
+                &name(1),
+                &Bytes::from(vec![0u8; 3_000]),
+                &latest,
+                at(&rig, 2),
+            )
+            .await,
+    );
+    assert!(matches!(refused, EmitError::TooLarge { .. }), "{refused:?}");
+    settle(&rig.tx).await;
+    assert_eq!(rig.stats.lost_closed.get(), 0, "nothing queued then lost");
+}
+
+#[tokio::test]
 async fn a_frame_the_paths_size_fell_under_is_repacked_once_under_new_sequences_then_goes_on_the_stream()
  {
     let mut rig = rig(ChannelMode::Latest, LinkConfig::default());

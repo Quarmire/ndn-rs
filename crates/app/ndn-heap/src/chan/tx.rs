@@ -924,13 +924,17 @@ impl TxChannel {
         }
     }
 
-    /// The room a datagram frame has, as the carrier said it last, for a message that needs
-    /// `need`: the kept room if it is the attached carrier's and holds `need`, else the carrier is
-    /// asked and what it says is kept (see [`Self::datagram_room`]).
-    fn fitting_room(&self, carrier: &Arc<dyn Carrier>, need: usize) -> usize {
+    /// The room a datagram frame has, for a message that needs `need`. With `trust_kept` the
+    /// room the carrier said last is used if it is the attached carrier's and holds `need`; else
+    /// (and always without it) the carrier is asked and what it says is kept (see
+    /// [`Self::datagram_room`]). A message that fits no datagram has the stream to go on, which
+    /// is where a kept room that is too large costs one frame's repack; where there is no stream
+    /// it would be queued and lost, so the caller does not trust a kept room there.
+    fn fitting_room(&self, carrier: &Arc<dyn Carrier>, need: usize, trust_kept: bool) -> usize {
         let kept = self.datagram_room.load(Ordering::Relaxed);
         let room = (kept & u64::from(u32::MAX)) as usize;
-        if kept >> 32 == self.slot.generation() & u64::from(u32::MAX) && room >= need {
+        if trust_kept && kept >> 32 == self.slot.generation() & u64::from(u32::MAX) && room >= need
+        {
             return room;
         }
         let room = limits::datagram_limit(carrier.datagram_max_for(self.id), FRAME_CAP);
@@ -1065,7 +1069,7 @@ impl TxChannel {
                     },
                 })?;
         let datagram_room = if self.mode == ChannelMode::Latest {
-            self.fitting_room(carrier, need)
+            self.fitting_room(carrier, need, stream && !degraded)
         } else {
             usize::MAX
         };
