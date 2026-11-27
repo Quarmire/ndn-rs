@@ -847,3 +847,48 @@ async fn two_replicas_merging_the_same_heads_converge_without_looping() {
         "the winner is the same on both"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_merged_refuses_a_superseded_id_of_another_path_and_a_non_write() {
+    let mut f = fork(2, cfg()).await;
+    f.head(1, "/p", "p", &[]).await;
+    // `/q`'s first entry is superseded: it is applied at another path and no head.
+    let q1 = f.head(1, "/q", "q1", &[]).await;
+    let q2 = f.head(2, "/q", "q2", &[&q1]).await;
+    assert_eq!(f.heads_at("/q").await, [q2], "q1 is no head any more");
+    // The space's creation is an applied Members entry: it writes no path.
+    let creation_name = log_name(&f.devs[0].name, &space(), 1);
+    let creation = EntryRef {
+        device: f.devs[0].name.clone(),
+        seq: 1,
+        digest: crate::wire::signed_digest(&f.devs[0].store.get(&creation_name).unwrap()),
+    };
+    let before = f.own_seq();
+
+    let refused = f
+        .heap
+        .put_merged(&n("/p"), bytes("m"), &[q1], PutOptions::default())
+        .await
+        .expect_err("an applied entry of another path is refused whether or not it is a head");
+    assert!(
+        matches!(refused, HeapError::BadRequest { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(refused.next(), NextStep::FixRequest);
+    assert!(
+        refused.to_string().contains("/q"),
+        "it names the path: {refused}"
+    );
+
+    let refused = f
+        .heap
+        .put_merged(&n("/p"), bytes("m"), &[creation], PutOptions::default())
+        .await
+        .expect_err("a Members entry is no write at any path");
+    assert!(
+        matches!(refused, HeapError::BadRequest { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(refused.next(), NextStep::FixRequest);
+    assert_eq!(f.own_seq(), before, "a refusal signs nothing");
+}

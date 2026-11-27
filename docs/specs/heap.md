@@ -2873,13 +2873,17 @@ Everything else is `put`'s (an empty `bytes` is a removal that is a head and nam
 `merged` the same way; a value in pieces, `durable`, the sealed space's epoch).
 
 It refuses, before it signs anything, with `BadRequest` (`FixRequest`) for more than
-`MERGED_MAX` distinct ids and for an id that is an applied entry at another path (the
-refusal names that path), and with `NotReady` (`RetryLater`) for an id that is not an
+`MERGED_MAX` distinct ids, for an id that is an applied entry at another path (the
+refusal names that path) and for an id that is an applied entry that writes no path (a
+Members or Epoch entry); the path of an id is read from the entry itself, never from the
+register's heads, so the refusal is the same whether or not the entry is a head now. It
+refuses with `NotReady` (`RetryLater`) for an id that is not an
 applied entry here (not held yet, refused, held closed for want of a key, outside a cut:
 `applied(id)` is false): read the heads again. An id that **is** applied at `path` and is
 no head any more (something superseded it) is accepted and has no effect: whatever
 superseded it stays a head, concurrent with the new entry, and the library sees it. It
-cannot name an entry of another path, so it cannot supersede unrelated data, and naming
+cannot name an entry of another path or one that is no write, so it cannot supersede
+unrelated data, and naming
 fewer heads leaves more heads, never fewer: it cannot hide another writer's edit.
 
 *More than eight heads.* An entry names at most `MERGED_MAX`, so a fork of `N` heads is

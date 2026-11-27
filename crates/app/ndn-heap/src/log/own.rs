@@ -65,8 +65,9 @@ impl Log {
 
     /// The `after` of a write that merged exactly `ids` at `path`: sorted and without repeats,
     /// and refused (before anything is signed) when it names more than an entry can, or an
-    /// entry that is not applied here at `path`. An entry applied at `path` that is no head
-    /// any more is accepted: whatever superseded it stays a head.
+    /// entry that is not applied here as a write at `path` (an entry of another path or a
+    /// Members or Epoch entry is refused, head or not). An entry applied at `path` that is no
+    /// head any more is accepted: whatever superseded it stays a head.
     fn merged_after(&self, path: &Name, ids: &[EntryRef]) -> Result<Vec<EntryRef>, HeapError> {
         let mut after = ids.to_vec();
         after.sort();
@@ -92,15 +93,26 @@ impl Log {
                         .into(),
                 });
             }
-            let at = self.view().head_of(id).map(|head| head.path);
-            if at.as_ref().is_some_and(|at| at != path) {
-                return Err(HeapError::BadRequest {
-                    why: format!(
-                        "{name} is an entry at {}, not at {path}, so it cannot be named as \
-                         merged here; merge only the heads of {path} (`kept_all` lists them)",
-                        at.unwrap_or_else(Name::root)
-                    ),
-                });
+            match self.view().path_written(id) {
+                Some(at) if at == *path => {}
+                Some(at) => {
+                    return Err(HeapError::BadRequest {
+                        why: format!(
+                            "{name} is an entry at {at}, not at {path}, so it cannot be named \
+                             as merged here; merge only the heads of {path} (`kept_all` lists \
+                             them)"
+                        ),
+                    });
+                }
+                None => {
+                    return Err(HeapError::BadRequest {
+                        why: format!(
+                            "{name} writes no path (a Members or Epoch entry), so it cannot be \
+                             named as merged at {path}; merge only the heads of {path} \
+                             (`kept_all` lists them)"
+                        ),
+                    });
+                }
             }
         }
         Ok(after)

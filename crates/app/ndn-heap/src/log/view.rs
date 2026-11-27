@@ -94,6 +94,12 @@ impl<'a> View<'a> {
         self.opened_put(&entry, &log_name(&r.device, self.space, r.seq))
     }
 
+    /// The path the entry `r` writes, whether or not it is a head now; `None` when it is no
+    /// write (a Members or Epoch entry) or is not held as those bytes or cannot be opened.
+    pub(super) fn path_written(&self, r: &EntryRef) -> Option<Name> {
+        Some(self.put_of(r)?.path)
+    }
+
     /// The head the applied entry `r` makes; `None` when it is not held, not
     /// applied, or not a write. The register asks for it when an entry it
     /// superseded returns.
