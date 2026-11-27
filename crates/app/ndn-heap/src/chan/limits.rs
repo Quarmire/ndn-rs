@@ -72,10 +72,10 @@ pub(crate) const fn message_limit_for(frame_limit: usize) -> usize {
     }
 }
 
-/// The datagram frame limit: `min(max_datagram_size, S_FRAME_MAX)`. The
-/// carrier tells the codec the first (it changes with the path), the session
-/// the second; the result is never below [`MIN_FRAME_LEN`] (a carrier whose
-/// datagrams are smaller carries no channel frames).
+/// The datagram frame limit: `min(max_datagram_size, S_FRAME_MAX)`, at most
+/// [`STREAM_FRAME_MAX`]. The carrier tells the codec the first (it changes with the path), the
+/// session the second. A limit below [`MIN_FRAME_LEN`] is returned as it is: no frame fits it
+/// (a carrier whose datagrams are smaller carries no channel frames), and the writer refuses it.
 pub(crate) const fn datagram_limit(max_datagram_size: usize, session_frame_max: usize) -> usize {
     let limit = if max_datagram_size < session_frame_max {
         max_datagram_size

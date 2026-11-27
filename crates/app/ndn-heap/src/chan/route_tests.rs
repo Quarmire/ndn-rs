@@ -788,6 +788,43 @@ fn the_carrier_follows_the_live_limit_of_the_sinks_and_never_exceeds_it() {
     assert_eq!(live.datagram_max_for(7), 100_000);
 }
 
+/// A sink that takes next to nothing (a QUIC peer that declares a tiny datagram size, a face that
+/// is no datagram link) refuses its own copy of a frame; it does not make every other sink's
+/// frames small. No sink takes less than 1,150 octets into the node's limit (a QUIC datagram at
+/// the smallest path of 1,200 octets, less a header with the longest connection id, the tag and
+/// the frame's own header, is 1,156).
+#[test]
+fn one_sink_that_takes_next_to_nothing_does_not_shrink_the_frames_of_the_others() {
+    let conn = Arc::new(Sinks {
+        sink: Default::default(),
+    });
+    let live = ConnectionCarrier::new(
+        Arc::clone(&conn) as Arc<dyn Connection>,
+        Arc::new(Routes::default()),
+        DatagramSize::Live,
+    );
+    let host = |max| {
+        ConnectionCarrier::new(
+            Arc::clone(&conn) as Arc<dyn Connection>,
+            Arc::new(Routes::default()),
+            DatagramSize::Host(max),
+        )
+    };
+    conn.sink.store(100, Ordering::SeqCst);
+    assert_eq!(live.datagram_max_for(7), 1_150);
+    assert_eq!(host(1_500).datagram_max_for(7), 1_150);
+    assert_eq!(
+        host(1_000).datagram_max_for(7),
+        1_000,
+        "the host's ceiling stands"
+    );
+    // A sink at the floor, and one just over it, are taken as they say.
+    conn.sink.store(1_150, Ordering::SeqCst);
+    assert_eq!(live.datagram_max_for(7), 1_150);
+    conn.sink.store(1_151, Ordering::SeqCst);
+    assert_eq!(live.datagram_max_for(7), 1_151);
+}
+
 #[tokio::test]
 async fn the_carrier_says_full_and_calls_back_once_the_face_took_a_frame() {
     use ndn_face_local::InProcFace;

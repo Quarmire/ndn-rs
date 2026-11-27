@@ -88,6 +88,14 @@ pub(crate) const ROUTE_WAIT: Duration = Duration::from_secs(1);
 /// A frame over what a sink takes is refused there and counted, never cut.
 pub const DATAGRAM_FRAME_MAX: usize = 1_200;
 
+/// The least a sink's datagram limit counts for in the limit of a route: 1,150 octets, what one
+/// QUIC datagram carries at the smallest path (1,200 octets, less a header with the longest
+/// connection id, the AEAD tag and the datagram frame's own header: 1,156). A sink is a peer, and a
+/// QUIC peer chooses the datagram size it declares: a sink below the floor refuses its own copy
+/// of a larger frame, counted at the forwarder's side table, while the frames of every other sink
+/// of the route stay as large as theirs allow.
+pub(crate) const SINK_LIMIT_FLOOR: usize = 1_150;
+
 /// The most channels whose first `Keep` a node remembers (the forwarder's own route limit).
 const UP_CHANNELS_MAX: usize = 4096;
 
@@ -233,9 +241,9 @@ fn frame_id(frame: &Bytes) -> Option<u64> {
 ///
 /// Its datagram limit for a channel is what the forwarder says the sinks of that channel's route
 /// take **now** ([`Connection::side_sink_limit`]: the smallest live limit of the faces the
-/// forwarder fans the channel out to), read for every frame, never over the connection's own
-/// face's limit or the host's `ceiling`. Where the forwarder cannot say (a connection to a
-/// daemon, or a route with no sink yet) it is `unknown`.
+/// forwarder fans the channel out to, none counted below [`SINK_LIMIT_FLOOR`]), read for every
+/// frame, never over the connection's own face's limit or the host's `ceiling`. Where the
+/// forwarder cannot say (a connection to a daemon, or a route with no sink yet) it is `unknown`.
 pub(crate) struct ConnectionCarrier {
     conn: Arc<dyn Connection>,
     routes: Arc<Routes>,
@@ -306,7 +314,13 @@ impl Carrier for ConnectionCarrier {
     }
 
     fn datagram_max_for(&self, channel: u64) -> usize {
-        let sinks = self.conn.side_sink_limit(channel).unwrap_or(self.unknown);
+        // A sink is the peer's, and what it says takes the others' frames down with it: below
+        // the floor it refuses its own copy (counted at the forwarder) and no more.
+        let floor = SINK_LIMIT_FLOOR.min(self.ceiling);
+        let sinks = self
+            .conn
+            .side_sink_limit(channel)
+            .map_or(self.unknown, |limit| limit.max(floor));
         self.conn.side_frame_max().min(sinks).min(self.ceiling)
     }
 
