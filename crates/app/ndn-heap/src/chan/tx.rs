@@ -458,6 +458,48 @@ struct Packed {
     scratch: Vec<(u64, u64)>,
 }
 
+/// The frame the datagram writer has packed and not yet seen the carrier answer for.
+struct Flight {
+    seq0: u64,
+    /// The sealed frame, once it is: from then on the carrier may have sent it.
+    frame: Option<Bytes>,
+}
+
+/// Holds the datagram lane while a writer runs. A writer that **unwinds** between the pack and
+/// the carrier's answer (a panic in the seal or in the carrier) would otherwise leave
+/// `datagram_writing` set (the lane wedged for good) and `datagram_in_flight` set (a checkpoint's
+/// watermark held under the frame for good). The drop clears both. A frame that was sealed may
+/// have gone out before the panic, and a sequence is never sealed twice under a key, so it is
+/// treated as handed over: recorded in the ring (a checkpoint lists it, and a receiver that never
+/// got it counts a loss, never a forgery) and its messages leave the queue. A panic before the
+/// seal sent nothing: the messages wait again.
+struct LaneGuard<'a> {
+    tx: &'a Arc<TxChannel>,
+    flight: Option<Flight>,
+}
+
+impl Drop for LaneGuard<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let mut st = self.tx.state.lock();
+        st.datagram_in_flight = None;
+        st.datagram_writing = false;
+        match self.flight.take() {
+            Some(Flight {
+                seq0,
+                frame: Some(frame),
+            }) => {
+                st.latest.drop_inflight();
+                st.sent.record(seq0, &frame);
+                self.tx.arm_checkpoint(&mut st);
+            }
+            _ => st.latest.unmark_all_inflight(),
+        }
+    }
+}
+
 /// What a frame of the stream lane took out of the queues.
 enum Done {
     /// The control frame at the head of the FIFO.
@@ -1267,6 +1309,10 @@ impl TxChannel {
     /// rest to the carrier's writer task; the carrier's own task (`inline` false) writes until
     /// nothing waits or the carrier refuses.
     fn write_datagrams(self: &Arc<Self>, carrier: &Arc<dyn Carrier>, inline: bool, now: Instant) {
+        let mut lane = LaneGuard {
+            tx: self,
+            flight: None,
+        };
         let mut frames = 0usize;
         let mut shrunk: Option<usize> = None;
         loop {
@@ -1310,6 +1356,7 @@ impl TxChannel {
             };
             let count = packed.writer.len();
             let seq0 = packed.seq0;
+            lane.flight = Some(Flight { seq0, frame: None });
             let cipher = Arc::clone(&packed.cipher);
             let scratch = std::mem::take(&mut packed.scratch);
             let frame = match packed.writer.seal(&cipher) {
@@ -1317,10 +1364,18 @@ impl TxChannel {
                 Err(_) => {
                     self.stats.seal_failed.bump();
                     self.finish_datagram(scratch, seq0, None, 0, None);
+                    lane.flight = None;
                     continue;
                 }
             };
-            match carrier.try_send_datagram(frame.clone()) {
+            lane.flight = Some(Flight {
+                seq0,
+                frame: Some(frame.clone()),
+            });
+            let sent = carrier.try_send_datagram(frame.clone());
+            // The carrier answered: the arms below say what became of the frame.
+            lane.flight = None;
+            match sent {
                 Ok(()) => {
                     shrunk = None;
                     frames += 1;
@@ -2223,6 +2278,14 @@ impl TxChannel {
             && st.fifo.is_empty()
             && !st.datagram_writing
             && !st.stream_writing
+    }
+
+    /// Whether the datagram lane's writer flag is set and the first sequence of the frame it has
+    /// handed over and not recorded (a test asks).
+    #[cfg(test)]
+    pub(crate) fn datagram_lane(&self) -> (bool, Option<u64>) {
+        let st = self.state.lock();
+        (st.datagram_writing, st.datagram_in_flight)
     }
 
     /// The carrier calls back, as its writer task does (a test stands in for that task).

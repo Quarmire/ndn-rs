@@ -2057,6 +2057,63 @@ async fn an_isolated_message_asks_no_call_back_and_a_burst_does() {
     settle(&rig.tx).await;
 }
 
+/// A panic between the pack and the finish of a datagram frame (here in the carrier) must not
+/// pin the watermark below the frame or the lane's flag: the lane writes again and a checkpoint
+/// is judged by the whole of what was sent.
+#[tokio::test]
+async fn a_panic_while_a_frame_is_in_flight_does_not_wedge_the_datagram_lane() {
+    use futures::FutureExt;
+
+    let mut rig = rig(
+        ChannelMode::Latest,
+        LinkConfig {
+            datagram_capacity: 1_000_000,
+            ..LinkConfig::default()
+        },
+    );
+    let latest = EmitOptions::latest();
+    let armed = Arc::new(AtomicBool::new(true));
+    rig.link.on_datagram(Some(Arc::new({
+        let armed = Arc::clone(&armed);
+        move |_| {
+            if armed.swap(false, Ordering::SeqCst) {
+                panic!("the carrier panicked with a frame in flight");
+            }
+        }
+    })));
+    let emitted = std::panic::AssertUnwindSafe(rig.tx.emit(
+        &name(0),
+        &Bytes::from_static(b"one"),
+        &latest,
+        rig.t0,
+    ))
+    .catch_unwind()
+    .await;
+    assert!(emitted.is_err(), "the carrier's panic reached the emitter");
+    assert_eq!(
+        rig.tx.datagram_lane(),
+        (false, None),
+        "the unwinding writer left neither its flag nor a frame in flight"
+    );
+    // The frame the carrier panicked on may have gone out, and a sequence is never sealed twice
+    // under a key: it is in the ring (a checkpoint lists it) and its message is not packed again.
+    assert_eq!(
+        rig.tx.sent_frames(),
+        1,
+        "the frame in flight was recorded as handed over"
+    );
+    // The lane is usable: the next emission is written, alone.
+    send(&rig, &name(1), b"two", &latest, at(&rig, 1)).await;
+    settle(&rig.tx).await;
+    let seen = datagrams(&mut rig);
+    let payloads: Vec<&[u8]> = messages(&seen).iter().map(|m| &m.payload[..]).collect();
+    assert_eq!(
+        payloads,
+        [&b"two"[..]],
+        "the next emission reached the link and the message of the lost frame was not packed again"
+    );
+}
+
 /// An inline writer whose frame left nothing waiting releases the lane under the same lock that
 /// took the frame out of the queue (it used to look again: a second pack and a third lock round
 /// per message): when `emit` returns the channel is idle, an isolated message asked for no call

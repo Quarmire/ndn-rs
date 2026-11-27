@@ -228,6 +228,27 @@ impl LatestSet {
         replaced
     }
 
+    /// A writer unwound with a frame in flight that may have left: every message in a frame
+    /// being written is taken out (as `commit` takes the ones a frame carried), and how many
+    /// were is returned.
+    pub(crate) fn drop_inflight(&mut self) -> usize {
+        let mut taken = 0;
+        for id in 0..self.slots.len() {
+            if self.slots[id].as_ref().is_some_and(|p| p.inflight) {
+                self.take(id as u64);
+                taken += 1;
+            }
+        }
+        taken
+    }
+
+    /// A writer unwound before a frame was handed over: its messages wait again.
+    pub(crate) fn unmark_all_inflight(&mut self) {
+        for p in self.slots.iter_mut().flatten() {
+            p.inflight = false;
+        }
+    }
+
     /// Every waiting message, taken out, oldest first.
     pub(crate) fn drain_all(&mut self) -> Vec<Pending> {
         let mut out = Vec::with_capacity(self.live);
