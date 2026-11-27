@@ -304,7 +304,7 @@ impl Rig {
 
     async fn put(&mut self, path: &str, bytes: &str) -> Signed {
         let payload = Payload::Inline(Bytes::from(bytes.to_owned()));
-        self.signed(|log| log.put(&n(path), payload.clone(), vec![], NOW))
+        self.signed(|log| log.put(&n(path), payload.clone(), vec![], None, NOW))
             .await
     }
 
@@ -1050,6 +1050,7 @@ async fn a_non_writer_put_is_refused_not_allowed() {
             &n("/a"),
             Payload::Inline(Bytes::from_static(b"x")),
             vec![],
+            None,
             NOW,
         )
     };
@@ -2285,6 +2286,7 @@ async fn a_device_that_sees_its_own_entry_at_the_largest_seq_signs_no_more() {
         &n("/a"),
         Payload::Inline(Bytes::from_static(b"more")),
         vec![],
+        None,
         NOW,
     );
     assert!(
@@ -2726,6 +2728,7 @@ async fn a_guest_device_signs_no_members_or_epoch_entry_and_remembers_it() {
             &n("/diary"),
             Payload::Inline(Bytes::from_static(b"x")),
             vec![],
+            None,
             NOW
         ),
         Err(HeapError::NotAllowed { .. })

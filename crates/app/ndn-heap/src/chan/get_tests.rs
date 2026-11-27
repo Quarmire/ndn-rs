@@ -133,6 +133,8 @@ async fn get_gives_the_current_kept_values_in_path_order_and_caught_up_resolves_
                 id: id.clone(),
                 as_of: None,
                 removed: false,
+                winner: true,
+                supersedes: Vec::new(),
             }),
         })
     };
@@ -227,7 +229,9 @@ async fn a_removal_is_delivered_as_kept_with_removed_set() {
         Kind::Kept(Kept {
             id: gone,
             as_of: None,
-            removed: true
+            removed: true,
+            winner: true,
+            supersedes: Vec::new(),
         })
     );
 }

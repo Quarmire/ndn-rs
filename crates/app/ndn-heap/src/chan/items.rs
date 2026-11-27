@@ -574,7 +574,7 @@ impl Heap {
             });
         }
         let kept = if opts.kept {
-            Some(self.inner.kept_feed(&self.node, what.clone())?)
+            Some(self.inner.kept_feed(&self.node, what.clone(), opts.heads)?)
         } else {
             None
         };

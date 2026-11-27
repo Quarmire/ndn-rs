@@ -25,14 +25,14 @@ use crate::wire::{
 };
 
 /// The key a device of the world signs with.
-fn signer_of(dev: &Dev) -> Arc<dyn Signer> {
+pub(crate) fn signer_of(dev: &Dev) -> Arc<dyn Signer> {
     dev.keys
         .get_signer_sync(&dev.name.clone().append("KEY").append("1"))
         .expect("the device's key")
 }
 
 /// A Put body with an inline payload (empty: a removal).
-fn put_body(path: &str, payload: &str) -> Body {
+pub(crate) fn put_body(path: &str, payload: &str) -> Body {
     Body::Put(PutBody {
         path: n(path),
         payload: Payload::Inline(bytes(payload)),
@@ -41,7 +41,7 @@ fn put_body(path: &str, payload: &str) -> Body {
 
 /// Forge `dev`'s entry `seq` through the public wire surface, store it at its
 /// log name in the device's store, and return its id and packet.
-fn forge(
+pub(crate) fn forge(
     dev: &Dev,
     seq: u64,
     prev: Option<Prev>,
@@ -61,7 +61,7 @@ fn forge(
 }
 
 /// What the node made of a packet handed to it, as a fetch would.
-async fn take(node: &Node, packet: Bytes) -> Outcome {
+pub(crate) async fn take(node: &Node, packet: Bytes) -> Outcome {
     match node.inner.take(&space(), packet, false).await {
         Taken::Decided { outcome, .. } => outcome,
         Taken::Pending(w) => panic!("pending: {w}"),

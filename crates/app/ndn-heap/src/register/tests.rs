@@ -64,6 +64,8 @@ struct Replica {
     reg: Register,
     store: BTreeMap<Name, Bytes>,
     applied: BTreeMap<EntryRef, Head>,
+    /// The head-set changes the register reported, in order.
+    moved: Vec<HeadsChange>,
 }
 
 impl Replica {
@@ -72,6 +74,7 @@ impl Replica {
             reg: Register::new(space()),
             store: BTreeMap::new(),
             applied: BTreeMap::new(),
+            moved: Vec::new(),
         }
     }
 
@@ -86,6 +89,7 @@ impl Replica {
                 }
             }
         }
+        self.moved.extend(effects.heads);
         effects.changes
     }
 
@@ -217,6 +221,55 @@ fn a_version_over_another_replaces_it_whatever_the_digests() {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].was.as_ref().map(|h| &h.entry), Some(&a1.id));
     assert_eq!(changes[0].now.as_ref().map(|h| &h.entry), Some(&a2.id));
+}
+
+#[test]
+fn a_head_that_does_not_win_is_a_heads_change_and_no_value_change() {
+    let (a, b) = (
+        ent(1, 1, 1, 9, "/f", "a", &[]),
+        ent(2, 1, 1, 3, "/f", "b", &[]),
+    );
+    let mut r = Replica::new();
+    assert_eq!(r.take(&a).len(), 1, "the first head wins: a value change");
+    assert_eq!(r.moved.len(), 1);
+
+    // b ranks under a: the winner stays, so no value changes, and the heads did.
+    assert!(r.take(&b).is_empty(), "the winner did not move");
+    let HeadsChange {
+        path,
+        before,
+        after,
+    } = r.moved.last().unwrap();
+    assert_eq!(path, &n("/f"));
+    assert_eq!(before, &vec![a.id.clone()]);
+    let after: Vec<&EntryRef> = after.iter().map(|h| &h.entry).collect();
+    assert_eq!(after, vec![&a.id, &b.id], "the winner first");
+
+    // An entry that supersedes both is one head, and withdrawing it brings both back.
+    let c = ent(3, 1, 1, 1, "/f", "c", &[&a, &b]);
+    r.take(&c);
+    assert_eq!(r.moved.last().unwrap().after.len(), 1);
+    r.refuse(&c);
+    let back = r.moved.last().unwrap();
+    assert_eq!(back.before, vec![c.id.clone()]);
+    assert_eq!(back.after.len(), 2, "what it superseded returns");
+
+    // Nothing moves when nothing changed.
+    let seen = r.moved.len();
+    r.take(&a);
+    assert_eq!(r.moved.len(), seen, "a duplicate reports no heads change");
+
+    // What the changes say, applied in order, is what the register holds.
+    let mut folded: BTreeMap<Name, BTreeSet<EntryRef>> = BTreeMap::new();
+    for change in &r.moved {
+        let set: BTreeSet<EntryRef> = change.after.iter().map(|h| h.entry.clone()).collect();
+        if set.is_empty() {
+            folded.remove(&change.path);
+        } else {
+            folded.insert(change.path.clone(), set);
+        }
+    }
+    assert_eq!(folded, r.heads());
 }
 
 #[test]

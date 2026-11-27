@@ -19,6 +19,8 @@ mod error;
 mod face_up;
 mod fetch;
 mod fold;
+#[cfg(test)]
+mod heads_tests;
 mod heard;
 mod herald;
 pub mod host;
@@ -57,8 +59,9 @@ pub use crate::chan::route::{DATAGRAM_FRAME_MAX, SIDE_TTL};
 pub use crate::chan::rx::{Delivery, Dropped};
 pub use crate::chan::sessions::{ChannelInfo, EndReason};
 pub use crate::chan::verbs::{
-    Congestion, EmitError, EmitOptions, Emitted, GetNotice, GetOptions, Got, Kept, Kind, Live,
-    LiveEnd, Mode, Modes, STAND_MAX, STANDING_BYTES_MAX, STANDING_NAMES_MAX, Select, Trust, Window,
+    Congestion, EmitError, EmitOptions, Emitted, GetNotice, GetOptions, Got, HEADS_MAX, Heads,
+    Kept, Kind, Live, LiveEnd, Mode, Modes, STAND_MAX, STANDING_BYTES_MAX, STANDING_NAMES_MAX,
+    Select, Trust, Window,
 };
 pub use crate::chan::wire::{ChannelMode, RefusalCode};
 pub use crate::error::{Cut, HeapError, NextStep, Refusal, Timestamp};
@@ -67,7 +70,9 @@ pub use crate::log::{Alert, Change, Frontier, Members};
 pub use crate::node::{Clock, Config, Node, Transport};
 pub use crate::register::{EntryId, Item};
 pub use crate::revocation::{CutBound, CutProposal};
-pub use crate::space::{Changes, Follower, Heap, MembersChange, PutOptions, Share};
+pub use crate::space::{
+    Changes, Follower, Heap, MERGED_MAX, MembersChange, Merged, PutOptions, Share,
+};
 pub use crate::trust::{Adopter, Scoping};
 // The API takes and returns names; a caller needs no `ndn-packet` dependency for them.
 pub use ndn_packet::Name;

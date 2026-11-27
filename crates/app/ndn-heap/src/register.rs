@@ -119,6 +119,20 @@ pub(crate) struct ValueChange {
     pub now: Option<Head>,
 }
 
+/// A change of which entries are the heads of a path, whether or not the winner moved: a head
+/// that does not win arrives, a head is superseded, a withdrawn entry gives its place back.
+/// Only [`Effects::heads`] says it; a feed that asked for every head (`GetOptions::heads`)
+/// reads it, and the winner-only ones are told what they always were ([`ValueChange`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeadsChange {
+    /// The path.
+    pub path: Name,
+    /// The entries that were its heads before the call, in rank order (the winner first).
+    pub before: Vec<EntryRef>,
+    /// Its heads after the call, in rank order (the winner first); empty when it has none.
+    pub after: Vec<Head>,
+}
+
 /// What [`Register::apply`] and [`Register::withdraw`] ask of the log.
 #[derive(Debug, Default)]
 pub(crate) struct Effects {
@@ -128,6 +142,9 @@ pub(crate) struct Effects {
     /// The paths whose winner changed. One entry can change several paths:
     /// an `after` may name an entry of another path.
     pub changes: Vec<ValueChange>,
+    /// The paths whose set of heads changed, in path order: a superset of the paths of
+    /// `changes`.
+    pub heads: Vec<HeadsChange>,
 }
 
 /// A register read back from its persisted `heads/` records.
@@ -151,8 +168,8 @@ pub(crate) struct Register {
     at: HashMap<EntryRef, Name>,
 }
 
-/// The winners a call changes, by path, as they were before it.
-type Touched = BTreeMap<Name, Option<Head>>;
+/// The heads of each path a call touches, in rank order, as they were before it.
+type Touched = BTreeMap<Name, Vec<Head>>;
 
 /// The entries that name an entry in their `after` (read from the store).
 type Namers<'a> = &'a dyn Fn(&EntryRef) -> Vec<EntryRef>;
@@ -299,6 +316,12 @@ impl Register {
         self.paths.get(path).map_or(&[], Vec::as_slice)
     }
 
+    /// The head that `entry` is, if it is one now.
+    pub(crate) fn head(&self, entry: &EntryRef) -> Option<&Head> {
+        let path = self.at.get(entry)?;
+        self.heads_of(path).iter().find(|h| h.entry == *entry)
+    }
+
     /// Every path that has a value, as its winner, in path order: the first
     /// listing of a `watch`.
     pub(crate) fn values(&self) -> impl Iterator<Item = &Head> {
@@ -307,7 +330,6 @@ impl Register {
     }
 
     /// Every path that has heads, with them, the winner first.
-    #[cfg(test)]
     pub(crate) fn paths_with_heads(&self) -> impl Iterator<Item = (&Name, &[Head])> {
         self.paths.iter().map(|(p, hs)| (p, hs.as_slice()))
     }
@@ -348,11 +370,11 @@ impl Register {
         heads.insert(at, head);
     }
 
-    /// Remember the winner of `path` as it is now, once per call.
+    /// Remember the heads of `path` as they are now, once per call.
     fn note(&self, touched: &mut Touched, path: &Name) {
         touched
             .entry(path.clone())
-            .or_insert_with(|| self.winner(path).cloned());
+            .or_insert_with(|| self.heads_of(path).to_vec());
     }
 
     fn add_head(&mut self, touched: &mut Touched, head: Head) {
@@ -375,10 +397,11 @@ impl Register {
         }
     }
 
-    /// The `heads/` record of every touched path, and the winners that moved.
+    /// The `heads/` record of every touched path, the winners that moved and the paths whose
+    /// heads changed.
     fn finish(&self, touched: Touched, mut writes: Vec<StoreOp>) -> Effects {
-        let mut changes = Vec::new();
-        for (path, was) in touched {
+        let (mut changes, mut moved) = (Vec::new(), Vec::new());
+        for (path, before) in touched {
             let path_tlv = path_tlv(&path);
             let key = heads_key(&self.space, &path_tlv);
             let heads = self.heads_of(&path);
@@ -387,12 +410,27 @@ impl Register {
             } else {
                 StoreOp::Insert(key, heads_record(&path_tlv, heads))
             });
-            let now = self.winner(&path).cloned();
+            let (was, now) = (before.first().cloned(), self.winner(&path).cloned());
             if was.as_ref().map(|h| &h.entry) != now.as_ref().map(|h| &h.entry) {
                 changes.push(ValueChange { was, now });
             }
+            if before
+                .iter()
+                .map(|h| &h.entry)
+                .ne(heads.iter().map(|h| &h.entry))
+            {
+                moved.push(HeadsChange {
+                    path,
+                    before: before.into_iter().map(|h| h.entry).collect(),
+                    after: heads.to_vec(),
+                });
+            }
         }
-        Effects { writes, changes }
+        Effects {
+            writes,
+            changes,
+            heads: moved,
+        }
     }
 }
 

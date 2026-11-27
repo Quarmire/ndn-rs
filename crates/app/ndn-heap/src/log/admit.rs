@@ -792,7 +792,7 @@ impl Log {
     ) {
         match &entry.body {
             Body::Put(_) | Body::Sealed(_) => {
-                let changes = self.register_step(id, person, entry, on);
+                let changes = self.register_step(id, person, entry, on, fx);
                 self.value_changes(changes, fx);
             }
             Body::Members(body) => {
@@ -819,13 +819,15 @@ impl Log {
     }
 
     /// The register takes in (`on`) or gives back an entry, and the writes it
-    /// makes go in the batch. The changes of the winners are returned.
+    /// makes go in the batch. The changes of the winners are returned and those of the
+    /// heads go in `fx`.
     fn register_step(
         &mut self,
         id: &EntryRef,
         person: &Name,
         entry: &Entry,
         on: bool,
+        fx: &mut Effects,
     ) -> Vec<ValueChange> {
         let view = View {
             store: &self.store,
@@ -846,6 +848,7 @@ impl Log {
             self.register.withdraw(id, &entry.after, namers, load)
         };
         self.store.apply(eff.writes);
+        fx.heads.extend(eff.heads);
         eff.changes
     }
 

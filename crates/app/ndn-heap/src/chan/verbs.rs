@@ -352,12 +352,32 @@ pub enum Trust {
     Verified,
 }
 
+/// Which heads of a path `get` tells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Heads {
+    /// The winner of each path: the value `kept` reads. The default; what `get` always did.
+    #[default]
+    Winner,
+    /// Every head, each as its own [`Kind::Kept`] with [`Kept::winner`] and
+    /// [`Kept::supersedes`], at most [`HEADS_MAX`] per path (more is [`GetNotice::HeadsCapped`]),
+    /// and [`GetNotice::HeadsEnded`] for a head that leaves with no successor. For a library that
+    /// merges concurrent writes itself and puts the merge with `Heap::put_merged`. It tells
+    /// heads, not history: a superseded entry is never told.
+    All,
+}
+
+/// The most heads of one path an [`Heads::All`] stream tells.
+pub const HEADS_MAX: usize = 64;
+
 /// What a receiver of `get` asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GetOptions {
     /// Deliver the kept values first, then the changes of kept values as they arrive (default
     /// `true`). With `false` the stream carries emissions only.
     pub kept: bool,
+    /// Which heads of a path the kept values are: [`Heads::Winner`] (the default) or every head
+    /// ([`Heads::All`]). Emissions are unaffected.
+    pub heads: Heads,
     /// Whether to receive emissions (default [`Live::Emitted`]).
     pub live: Live,
     /// Which channel modes to join (default: all the senders offer).
@@ -374,6 +394,7 @@ impl Default for GetOptions {
     fn default() -> Self {
         GetOptions {
             kept: true,
+            heads: Heads::Winner,
             live: Live::Emitted,
             modes: Modes::ALL,
             trust: Trust::Prompt,
@@ -383,7 +404,10 @@ impl Default for GetOptions {
 }
 
 /// A kept value: what `watch` and `kept` call an `Item`, as `get` yields it.
+///
+/// The struct grows: build one with [`Kept::new`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Kept {
     /// The entry.
     pub id: EntryId,
@@ -391,8 +415,33 @@ pub struct Kept {
     pub as_of: Option<Duration>,
     /// The path has no value now: the item's bytes are empty and `id` is the entry that removed
     /// it (the entry this stream delivered last for the path when the register holds no head of
-    /// it any more).
+    /// it any more). With [`Heads::All`] a removal that is itself a head is told the same way:
+    /// it is a head concurrent with the others.
     pub removed: bool,
+    /// Whether this entry was the winner of its path (the head of highest rank) when it was
+    /// told. [`Heads::Winner`]: always `true`. [`Heads::All`]: a snapshot, as another head can
+    /// outrank it later; a reader that needs the winner now reads `Heap::kept`.
+    pub winner: bool,
+    /// The heads this stream had told at the path that are no longer heads once this item
+    /// applies (at most [`HEADS_MAX`]), so a reader that keeps a value per head deletes them and
+    /// inserts this one, and never holds a head the register has dropped. A head superseded
+    /// through entries the stream never saw is listed too: it is the stream's heads that count,
+    /// not the entries' `after`. [`Heads::Winner`]: always empty.
+    pub supersedes: Vec<EntryId>,
+}
+
+impl Kept {
+    /// A kept value written by the entry `id`: the winner, no value superseded, not a removal,
+    /// of no stated age. The other fields are public: set them.
+    pub fn new(id: EntryId) -> Kept {
+        Kept {
+            id,
+            as_of: None,
+            removed: false,
+            winner: true,
+            supersedes: Vec::new(),
+        }
+    }
 }
 
 /// An emission as received.
@@ -458,8 +507,9 @@ pub enum LiveEnd {
     },
 }
 
-/// What an `Items` says besides items.
+/// What an `Items` says besides items. The enum grows: match it with a wildcard arm.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GetNotice {
     /// The consumer fell behind, or the mode dropped messages: this many were missed. Told for
     /// emissions only (the mode dropped them: `Latest` past its bound, `Reliable` and `Window`
@@ -472,7 +522,9 @@ pub enum GetNotice {
     /// An entry this stream delivered was refused after the fact (a signed removal of its writer
     /// reached this device, a cut left it out): the value that stands is the one that follows,
     /// or none (a removal item) when the path has no head left. Told for an entry that was the
-    /// current value this stream had delivered at its path.
+    /// current value this stream had delivered at its path (with [`Heads::All`]: a head this
+    /// stream had told and still holds; what its withdrawal gives back, or [`GetNotice::HeadsEnded`]
+    /// when it gives nothing back, follows).
     Withdrawn {
         /// The entry.
         id: EntryId,
@@ -504,6 +556,29 @@ pub enum GetNotice {
         from: u64,
         /// The last retracted sequence.
         to: u64,
+    },
+    /// Heads this stream told left the head set of `path` and no new head came with them
+    /// (`Heads::All` only): a withdrawn entry with nothing to restore, or an entry that arrived
+    /// already superseded and that superseded a head. A reader that keeps one value per head
+    /// drops `ids`. Heads that a new item replaces are in that item's [`Kept::supersedes`]
+    /// instead, and the entries of this notice are never told again, unless they return as
+    /// items.
+    HeadsEnded {
+        /// The path.
+        path: Name,
+        /// The told heads that are no longer heads.
+        ids: Vec<EntryId>,
+    },
+    /// `path` has more than [`HEADS_MAX`] heads and this stream tells the [`HEADS_MAX`] of
+    /// highest rank (`Heads::All` only): `hidden` heads of lower rank are not told. Told when
+    /// the number changes, never silently: merge the heads told (`Heap::put_merged`) and the
+    /// others follow as the register's heads change, or read all of them with
+    /// [`Heap::kept_all`](crate::Heap::kept_all).
+    HeadsCapped {
+        /// The path.
+        path: Name,
+        /// How many heads of lower rank are not told.
+        hidden: u32,
     },
 }
 

@@ -1662,7 +1662,11 @@ async fn a_kept_feed_that_reads_the_heads_again_ends_while_an_entry_is_held_clos
     // Made before anything is held: nothing is closed yet.
     let mut feed = theirs
         .inner
-        .kept_feed(&bob.inner, Select::Prefix(Name::root()))
+        .kept_feed(
+            &bob.inner,
+            Select::Prefix(Name::root()),
+            crate::Heads::Winner,
+        )
         .unwrap();
     // Two changes it wants into a queue of one: the second is dropped.
     feed.queue.push(Change::Put(item.clone()));

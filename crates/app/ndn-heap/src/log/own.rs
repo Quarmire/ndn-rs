@@ -17,6 +17,11 @@ impl Log {
     /// store writes that belong to the same batch (the pieces of a blob).
     /// An empty inline payload removes the path.
     ///
+    /// `merged` names the heads the write supersedes: `None` is every head this log holds
+    /// now, as many as an entry names ([`Register::after_for_put`]); `Some(ids)` is exactly
+    /// `ids` (which [`Log::merged_after`] checks under this same lock), so a head that
+    /// arrived after the caller read the heads is still a head.
+    ///
     /// [`HeapError::NotReady`] while the space's creation (or the epoch's
     /// key, in a sealed space) has not been seen, [`HeapError::NotAllowed`]
     /// when this device's person is not a writer.
@@ -25,12 +30,17 @@ impl Log {
         path: &Name,
         payload: Payload,
         extra: Vec<StoreOp>,
+        merged: Option<&[EntryRef]>,
         now: u64,
     ) -> Result<Step, HeapError> {
         let epoch = self.judge_own()?;
         if let Some(ticket) = self.gate()? {
             return Ok(Step::Wait(ticket));
         }
+        let after = match merged {
+            None => self.register.after_for_put(path),
+            Some(ids) => self.merged_after(path, ids)?,
+        };
         let put = PutBody {
             path: path.clone(),
             payload,
@@ -50,8 +60,50 @@ impl Log {
                 })
             }
         };
-        let after = self.register.after_for_put(path);
         self.sign_next(Some(path), body, after, extra, now)
+    }
+
+    /// The `after` of a write that merged exactly `ids` at `path`: sorted and without repeats,
+    /// and refused (before anything is signed) when it names more than an entry can, or an
+    /// entry that is not applied here at `path`. An entry applied at `path` that is no head
+    /// any more is accepted: whatever superseded it stays a head.
+    fn merged_after(&self, path: &Name, ids: &[EntryRef]) -> Result<Vec<EntryRef>, HeapError> {
+        let mut after = ids.to_vec();
+        after.sort();
+        after.dedup();
+        if after.len() > AFTER_MAX {
+            return Err(HeapError::BadRequest {
+                why: format!(
+                    "{} distinct heads are more than the {AFTER_MAX} an entry can name; merge \
+                     in rounds: put the merge of at most {AFTER_MAX} of them, then of the rest \
+                     and that merge (`Merged::open` lists what is left)",
+                    after.len()
+                ),
+            });
+        }
+        for id in &after {
+            let name = id.name(&self.space);
+            if !self.applied(id) {
+                return Err(HeapError::NotReady {
+                    name,
+                    why: "it is not an applied entry of this space here (not held yet, refused, \
+                          held closed or outside a cut), so it cannot be named as merged; read \
+                          the heads again with `kept_all`, or try again once it is applied"
+                        .into(),
+                });
+            }
+            let at = self.view().head_of(id).map(|head| head.path);
+            if at.as_ref().is_some_and(|at| at != path) {
+                return Err(HeapError::BadRequest {
+                    why: format!(
+                        "{name} is an entry at {}, not at {path}, so it cannot be named as \
+                         merged here; merge only the heads of {path} (`kept_all` lists them)",
+                        at.unwrap_or_else(Name::root)
+                    ),
+                });
+            }
+        }
+        Ok(after)
     }
 
     /// Sign a Members entry (the space's creation, additions, removals). Only

@@ -87,7 +87,7 @@ use ndn_sync::DataStore;
 
 use crate::error::{Cut, HeapError, NextStep, Refusal};
 use crate::fold::{Fold, Readers};
-use crate::register::{EntryId, Head, Item, Register};
+use crate::register::{EntryId, Head, HeadsChange, Item, Register};
 use crate::reserve::{Flusher, Reservation, Ticket};
 use crate::revocation::Suspicion;
 use crate::seal::{self, Keys};
@@ -198,6 +198,9 @@ pub(crate) struct Blob {
 pub(crate) struct Effects {
     /// Public-API changes, in order.
     pub changes: Vec<Change>,
+    /// Changes of a path's set of heads, in order, for the feeds that asked for every head
+    /// (a superset of the paths `changes` puts or removes).
+    pub heads: Vec<HeadsChange>,
     /// Alerts for the host.
     pub alerts: Vec<Alert>,
     /// Entries to fetch.

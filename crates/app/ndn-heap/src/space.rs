@@ -36,13 +36,13 @@ use ndn_sync::StoreOp;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
-use crate::chan::verbs::{GetNotice, Got, Kept, Kind as GotKind, Select};
+use crate::chan::verbs::{GetNotice, Got, HEADS_MAX, Heads, Kept, Kind as GotKind, Select};
 use crate::error::{HeapError, Refusal};
 use crate::fold::Readers;
 use crate::log::{Alert, Blob, Change, Effects, Frontier, Log, Members, Step};
 use crate::node::NodeInner;
 use crate::pieces;
-use crate::register::{EntryId, Head, Item};
+use crate::register::{EntryId, Head, HeadsChange, Item};
 use crate::reserve::{FlushError, Publisher, Ticket};
 use crate::rt;
 use crate::seal;
@@ -90,6 +90,48 @@ pub struct PutOptions {
     pub durable: Option<bool>,
 }
 
+/// The most heads one entry can supersede: what [`Heap::put_merged`] names at most, and what
+/// [`Heap::put`] names of the heads it holds (the rest remain heads until a later write names
+/// them).
+pub const MERGED_MAX: usize = crate::wire::AFTER_MAX;
+
+/// What [`Heap::put_merged`] wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Merged {
+    /// The entry that was written.
+    pub id: EntryId,
+    /// The heads of the path other than `id` as of the put, in rank order: those a concurrent
+    /// writer's entry made that this merge did not name. Empty: the put left a single head.
+    pub open: Vec<EntryId>,
+}
+
+/// What a write signed: the entry, the ticket after its writes and, for a merge, the heads
+/// beside it.
+struct Written {
+    id: EntryId,
+    ticket: Ticket,
+    open: Vec<EntryId>,
+}
+
+/// For a merge, when the step signed: the heads of `path` other than the entry just applied,
+/// read under the lock that signed it.
+fn note_open(
+    log: &Log,
+    path: &Name,
+    merged: Option<&[EntryId]>,
+    step: &Step,
+    open: &mut Vec<EntryId>,
+) {
+    if let (Some(_), Step::Done(id, _)) = (merged, step) {
+        let heads = log.register.heads_of(path);
+        *open = heads
+            .iter()
+            .filter(|head| head.entry != *id)
+            .map(|head| head.entry.clone())
+            .collect();
+    }
+}
+
 // -- Watching ----------------------------------------------------------------------
 
 /// One place in a watcher's queue: a change, or a value in pieces that is
@@ -100,6 +142,16 @@ pub struct PutOptions {
 enum Slot {
     Change(Change),
     Blob(Blob),
+    /// The heads of a path after a change, for a feed that tells every head.
+    Heads(Arc<HeadsEvent>),
+}
+
+/// The heads of a path as they were after a change of them: references (entries, their writers
+/// and what they remove), never values; a feed reads a value from the store when it tells it.
+pub(crate) struct HeadsEvent {
+    path: Name,
+    /// The heads, the winner first.
+    now: Vec<Head>,
 }
 
 #[derive(Default)]
@@ -121,15 +173,20 @@ pub(crate) struct Queue {
     /// alerts and every path. A change the feed does not want would only fill its queue and make
     /// it read the heads again (a scan of every head under the log's lock) for nothing.
     only: Option<Select>,
+    /// A kept feed that tells every head ([`Heads::All`]): it is told the changes of a path's
+    /// heads ([`Slot::Heads`]) and not the changes of its winner, which the other feeds are told
+    /// and it has no use for. No other feed is told heads, or pays for them.
+    heads: bool,
 }
 
 impl Queue {
-    fn new(cap: usize, only: Option<Select>) -> Arc<Queue> {
+    fn new(cap: usize, only: Option<Select>, heads: bool) -> Arc<Queue> {
         Arc::new(Queue {
             st: Mutex::default(),
             waker: AtomicWaker::new(),
             cap: cap.max(1),
             only,
+            heads,
         })
     }
 
@@ -144,7 +201,9 @@ impl Queue {
 
     pub(crate) fn push(&self, change: Change) {
         let wanted = match &change {
-            Change::Put(item) | Change::Removed(item) => self.wants(Some(&item.path)),
+            Change::Put(item) | Change::Removed(item) => {
+                !self.heads && self.wants(Some(&item.path))
+            }
             // Names no path: a feed that told the entry says so, and one that did not, ignores it.
             Change::Withdrawn { .. } => true,
             Change::Members(_) | Change::Alert(_) | Change::Lagged { .. } => self.wants(None),
@@ -255,6 +314,7 @@ impl Stream for Changes {
             let change = match slot {
                 Slot::Change(change) => Some(change),
                 Slot::Blob(blob) => self.space.blob_change(&self.node, &blob),
+                Slot::Heads(_) => None,
             };
             if let Some(change) = change {
                 return Poll::Ready(Some(Ok(change)));
@@ -271,9 +331,9 @@ impl Drop for Changes {
 
 // -- The kept part of `get` --------------------------------------------------------------
 
-/// What a [`KeptFeed`] delivered at one path and still stands: the entry and the writer's
-/// person, which a removal told after a lag is built from when the register holds no head of the
-/// path any more.
+/// What a [`KeptFeed`] told at one path and still stands: the entry and the writer's person,
+/// which a removal told after a lag is built from when the register holds no head of the path
+/// any more.
 struct Delivered {
     id: EntryId,
     person: Name,
@@ -297,29 +357,51 @@ pub(crate) enum KeptStep {
     Ended,
 }
 
+/// What the store says of a head a feed is about to tell.
+enum HeadRead {
+    /// The value (empty for a removal).
+    Value(Bytes),
+    /// A value in pieces that is not whole here yet: told when its last piece is held.
+    Pending,
+    /// Its payload is not held: it is not told (as a winner whose payload is not held is not).
+    Absent,
+}
+
 /// The kept part of an `Items` (`Heap::get`): the heads under the selector as they were when it
 /// was made, in path order, then the register's changes, with the same queue as a `watch`
 /// ([`Config::watch_queue`](crate::node::Config)). Unlike a watch it is never told it lagged: a
 /// feed whose queue overflowed reads the heads again under the log's lock, in the same step that
-/// forgets what was dropped, and goes on from there. It remembers the entry it told at each path,
-/// so what it told is not told twice and what changed while it was behind is.
+/// forgets what was dropped, and goes on from there. It remembers the entries it told at each
+/// path, so what it told is not told twice and what changed while it was behind is.
+///
+/// [`Heads::Winner`] tells the winner of each path (one entry per path is remembered);
+/// [`Heads::All`] tells every head, and what it told is a set per path that each change of the
+/// heads is compared with.
 pub(crate) struct KeptFeed {
     /// The heads of the selector when the feed was made, in path order.
     listed: VecDeque<Slot>,
     /// What the last catch-up read and has not told: before anything the queue holds.
     again: VecDeque<Slot>,
-    /// A notice that `next_item` found before an item and gave back.
-    held: Option<GetNotice>,
+    /// What a change of heads made and has not been given yet, in the order it is told.
+    ready: VecDeque<Result<Got, GetNotice>>,
+    /// Notices that `listing_next` or `next_item` found before an item and gave back.
+    held: VecDeque<GetNotice>,
     queue: Arc<Queue>,
     space: Arc<SpaceInner>,
     node: Arc<NodeInner>,
     select: Select,
-    /// The value told at each path that has one now, by the entry.
-    delivered: BTreeMap<Name, Delivered>,
+    /// Which heads are told.
+    heads: Heads,
+    /// The entries told at each path that has one now, in the order told: the winner's alone
+    /// for [`Heads::Winner`], the heads told for [`Heads::All`].
+    told: BTreeMap<Name, Vec<Delivered>>,
+    /// The paths with more heads than [`HEADS_MAX`] and how many are not told: so that the gap
+    /// is said when it changes, not at every change of the path ([`Heads::All`]).
+    capped: BTreeMap<Name, u32>,
     /// The feed is over (its reader was removed, or it cannot trust the register): nothing more
     /// is told.
     ended: bool,
-    /// The entries behind `delivered`, so that a withdrawal is looked up and not searched for.
+    /// The entries behind `told`, so that a withdrawal is looked up and not searched for.
     told_ids: BTreeSet<EntryId>,
     /// The space's fold version ([`crate::fold::Fold::version`]) and the one the reader was last
     /// checked at: the check takes the log's lock, so it is made when the fold moved.
@@ -328,16 +410,15 @@ pub(crate) struct KeptFeed {
 }
 
 fn kept_got(item: Item, removed: bool) -> Got {
+    let mut kept = Kept::new(item.id);
+    kept.as_of = item.as_of;
+    kept.removed = removed;
     Got {
         path: item.path,
         bytes: item.bytes,
         by: item.by,
         writer: item.writer,
-        kind: GotKind::Kept(Kept {
-            id: item.id,
-            as_of: item.as_of,
-            removed,
-        }),
+        kind: GotKind::Kept(kept),
     }
 }
 
@@ -349,52 +430,66 @@ impl KeptFeed {
 
     /// The next head of the listing, `None` once it is told. A value in pieces is read now, and
     /// told only while it is the head of its path and whole (it is told as a change when its
-    /// last piece is held).
+    /// last piece is held). A notice the listing makes is held for [`Self::step`].
     pub(crate) fn listing_next(&mut self) -> Option<Got> {
         if let Some(notice) = self.reader_gone() {
-            self.held = Some(notice);
+            self.held.push_back(notice);
             return None;
         }
-        while let Some(slot) = self.listed.pop_front() {
-            let Some(Change::Put(item)) = self.resolve(slot) else {
-                continue;
-            };
-            if let Some(KeptStep::Got(got)) = self.admit(Change::Put(item)) {
-                return Some(got);
+        loop {
+            match self.ready.pop_front() {
+                Some(Ok(got)) => return Some(got),
+                Some(Err(notice)) => {
+                    self.held.push_back(notice);
+                    continue;
+                }
+                None => {}
+            }
+            match self.listed.pop_front()? {
+                Slot::Heads(event) => self.tell_heads(&event.path, &event.now),
+                slot => {
+                    let Some(Change::Put(item)) = self.resolve(slot) else {
+                        continue;
+                    };
+                    if let Some(KeptStep::Got(got)) = self.admit(Change::Put(item)) {
+                        return Some(got);
+                    }
+                }
             }
         }
-        None
     }
 
     fn resolve(&self, slot: Slot) -> Option<Change> {
         match slot {
             Slot::Change(change) => Some(change),
             Slot::Blob(blob) => self.space.blob_change(&self.node, &blob),
+            Slot::Heads(_) => None,
         }
     }
 
     /// What a change is to this feed: an item or a notice if it says something about what the
     /// feed told, nothing if it does not (another path, a head already told, the members, an
-    /// alert).
+    /// alert). The changes of the winners only: a feed of every head is told those of the heads
+    /// ([`Self::tell_heads`]).
     fn admit(&mut self, change: Change) -> Option<KeptStep> {
         match change {
             Change::Put(item) => {
                 if !self.select.matches(&item.path)
                     || self
-                        .delivered
+                        .told
                         .get(&item.path)
-                        .is_some_and(|told| told.id == item.id)
+                        .is_some_and(|told| told.iter().any(|d| d.id == item.id))
                 {
                     return None;
                 }
-                if let Some(was) = self.delivered.insert(
-                    item.path.clone(),
-                    Delivered {
-                        id: item.id.clone(),
-                        person: item.by.clone(),
-                    },
-                ) {
-                    self.told_ids.remove(&was.id);
+                let told = Delivered {
+                    id: item.id.clone(),
+                    person: item.by.clone(),
+                };
+                if let Some(was) = self.told.insert(item.path.clone(), vec![told]) {
+                    for gone in was {
+                        self.told_ids.remove(&gone.id);
+                    }
                 }
                 self.told_ids.insert(item.id.clone());
                 Some(KeptStep::Got(kept_got(item, false)))
@@ -405,9 +500,11 @@ impl KeptFeed {
                 let told = self
                     .select
                     .matches(&item.path)
-                    .then(|| self.delivered.remove(&item.path))
+                    .then(|| self.told.remove(&item.path))
                     .flatten()?;
-                self.told_ids.remove(&told.id);
+                for gone in told {
+                    self.told_ids.remove(&gone.id);
+                }
                 Some(KeptStep::Got(kept_got(item, true)))
             }
             Change::Withdrawn { id, why } => self
@@ -418,10 +515,120 @@ impl KeptFeed {
         }
     }
 
+    /// What the store says of `head`: its value, read now, or that it is a value in pieces not
+    /// whole here, or that its payload is not held.
+    fn read_head(&self, head: &Head) -> HeadRead {
+        if head.removal {
+            return HeadRead::Value(Bytes::new());
+        }
+        let shown = self.space.log.lock().shown(head);
+        match shown {
+            Some(Ok(item)) => HeadRead::Value(item.bytes),
+            Some(Err(blob)) => match self.space.read_blob(&self.node, &blob) {
+                Ok(bytes) => HeadRead::Value(bytes),
+                Err(_) => HeadRead::Pending,
+            },
+            None => HeadRead::Absent,
+        }
+    }
+
+    /// Tell what the heads `now` of `path` (the winner first) are to a feed that tells every
+    /// head, by comparing them with what it told at the path:
+    ///
+    /// - each of the [`HEADS_MAX`] of highest rank it has not told is an item, the winner among
+    ///   them marked; the first carries `supersedes`: every head told that is no head of those
+    ///   any more (so a reader that deletes them and inserts the item holds what the register
+    ///   does, whatever chain of entries the stream did not see lies between);
+    /// - with no item to carry them, those heads are told as [`GetNotice::HeadsEnded`], unless a
+    ///   value in pieces that is not whole yet is what will replace them;
+    /// - a path with more heads than are told says how many are not, when that number changes.
+    ///
+    /// The items and notices are queued in `ready`, in the order they are told.
+    fn tell_heads(&mut self, path: &Name, now: &[Head]) {
+        if !self.select.matches(path) {
+            return;
+        }
+        let shown = &now[..now.len().min(HEADS_MAX)];
+        let hidden = (now.len() - shown.len()) as u32;
+        let told: &[Delivered] = self.told.get(path).map_or(&[], Vec::as_slice);
+        let mut fresh: Vec<(&Head, Bytes)> = Vec::new();
+        let mut pending = false;
+        for head in shown {
+            if told.iter().any(|d| d.id == head.entry) {
+                continue;
+            }
+            match self.read_head(head) {
+                HeadRead::Value(bytes) => fresh.push((head, bytes)),
+                HeadRead::Pending => pending = true,
+                HeadRead::Absent => {}
+            }
+        }
+        let retired: Vec<EntryId> = told
+            .iter()
+            .filter(|d| !shown.iter().any(|h| h.entry == d.id))
+            .map(|d| d.id.clone())
+            .collect();
+        if !fresh.is_empty() {
+            let winner = &now[0].entry;
+            let entries = self.told.entry(path.clone()).or_default();
+            entries.retain(|d| !retired.contains(&d.id));
+            for id in &retired {
+                self.told_ids.remove(id);
+            }
+            for (i, (head, bytes)) in fresh.into_iter().enumerate() {
+                entries.push(Delivered {
+                    id: head.entry.clone(),
+                    person: head.person.clone(),
+                });
+                self.told_ids.insert(head.entry.clone());
+                let mut kept = Kept::new(head.entry.clone());
+                kept.removed = head.removal;
+                kept.winner = head.entry == *winner;
+                if i == 0 {
+                    kept.supersedes = retired.clone();
+                }
+                self.ready.push_back(Ok(Got {
+                    path: path.clone(),
+                    bytes,
+                    by: head.person.clone(),
+                    writer: head.entry.device.clone(),
+                    kind: GotKind::Kept(kept),
+                }));
+            }
+        } else if !retired.is_empty() && !pending {
+            if let Some(entries) = self.told.get_mut(path) {
+                entries.retain(|d| !retired.contains(&d.id));
+                if entries.is_empty() {
+                    self.told.remove(path);
+                }
+            }
+            for id in &retired {
+                self.told_ids.remove(id);
+            }
+            self.ready.push_back(Err(GetNotice::HeadsEnded {
+                path: path.clone(),
+                ids: retired,
+            }));
+        }
+        match (hidden, self.capped.get(path).copied()) {
+            (0, Some(_)) => {
+                self.capped.remove(path);
+            }
+            (hidden, was) if hidden > 0 && was != Some(hidden) => {
+                self.capped.insert(path.clone(), hidden);
+                self.ready.push_back(Err(GetNotice::HeadsCapped {
+                    path: path.clone(),
+                    hidden,
+                }));
+            }
+            _ => {}
+        }
+    }
+
     /// The next thing the changes say, without waiting; the caller has registered its waker
     /// ([`Self::watch`]).
     pub(crate) fn step(&mut self) -> KeptStep {
-        if let Some(notice) = self.held.take() {
+        if let Some(notice) = self.held.pop_front() {
             return KeptStep::Notice(notice);
         }
         if let Some(notice) = self.reader_gone() {
@@ -430,6 +637,11 @@ impl KeptFeed {
         loop {
             if self.ended {
                 return KeptStep::Ended;
+            }
+            match self.ready.pop_front() {
+                Some(Ok(got)) => return KeptStep::Got(got),
+                Some(Err(notice)) => return KeptStep::Notice(notice),
+                None => {}
             }
             let slot = match self.again.pop_front() {
                 Some(slot) => slot,
@@ -445,11 +657,22 @@ impl KeptFeed {
                     Taken::Closed => return KeptStep::Ended,
                 },
             };
-            let Some(change) = self.resolve(slot) else {
-                continue;
-            };
-            if let Some(step) = self.admit(change) {
-                return step;
+            match slot {
+                Slot::Heads(event) => self.tell_heads(&event.path, &event.now),
+                // A value in pieces became whole: it is told if it is a head still.
+                Slot::Blob(blob) if self.heads == Heads::All => {
+                    if let Some(event) = self.space.blob_heads(&blob) {
+                        self.tell_heads(&event.path, &event.now);
+                    }
+                }
+                slot => {
+                    let Some(change) = self.resolve(slot) else {
+                        continue;
+                    };
+                    if let Some(step) = self.admit(change) {
+                        return step;
+                    }
+                }
             }
         }
     }
@@ -460,7 +683,7 @@ impl KeptFeed {
         match self.step() {
             KeptStep::Got(got) => Some(got),
             KeptStep::Notice(notice) => {
-                self.held = Some(notice);
+                self.held.push_front(notice);
                 None
             }
             KeptStep::Pending | KeptStep::Ended => None,
@@ -472,6 +695,7 @@ impl KeptFeed {
         self.ended = true;
         self.listed.clear();
         self.again.clear();
+        self.ready.clear();
         GetNotice::KeptEnded { why }
     }
 
@@ -505,7 +729,9 @@ impl KeptFeed {
     /// again. Under the log's lock the queue forgets what it dropped and the register is read,
     /// so each change is either in what is read or queued after it. What is owed is every head
     /// under the selector that is not the entry already told at its path, and a removal for each
-    /// path told that has no value now, in path order. The feed ends instead (a notice says why)
+    /// path told that has no value now, in path order (for [`Heads::All`]: the heads of every
+    /// path under the selector, which [`Self::tell_heads`] compares with what was told, and of
+    /// every path told that has none now). The feed ends instead (a notice says why)
     /// when its reader was removed, or while an entry of a sealed space is held closed: its path
     /// is unknown, so a head may be an older value of it, or a removal's target, and `kept` is
     /// refused for the same reason.
@@ -529,6 +755,37 @@ impl KeptFeed {
                 space.sealed_error(&log)
             )));
         }
+        if self.heads == Heads::All {
+            let mut owed: BTreeMap<Name, Slot> = BTreeMap::new();
+            let mut owe = |path: &Name, now: &[Head]| {
+                let event = HeadsEvent {
+                    path: path.clone(),
+                    now: now.to_vec(),
+                };
+                owed.insert(path.clone(), Slot::Heads(Arc::new(event)));
+            };
+            match &self.select {
+                Select::Path(path) => {
+                    if !log.register.heads_of(path).is_empty() {
+                        owe(path, log.register.heads_of(path));
+                    }
+                }
+                Select::Prefix(_) => {
+                    for (path, heads) in log.register.paths_with_heads() {
+                        if self.select.matches(path) {
+                            owe(path, heads);
+                        }
+                    }
+                }
+            }
+            for path in self.told.keys() {
+                if log.register.heads_of(path).is_empty() {
+                    owe(path, &[]);
+                }
+            }
+            self.again.extend(owed.into_values());
+            return None;
+        }
         let mut owed: BTreeMap<Name, Slot> = BTreeMap::new();
         let heads: Vec<&Head> = match &self.select {
             Select::Path(path) => log.register.value(path).into_iter().collect(),
@@ -539,7 +796,7 @@ impl KeptFeed {
                 .collect(),
         };
         for head in heads {
-            let told = self.delivered.get(&head.path);
+            let told = self.told.get(&head.path).and_then(|told| told.first());
             if told.is_some_and(|told| told.id == head.entry) {
                 continue;
             }
@@ -553,10 +810,13 @@ impl KeptFeed {
                 None => {}
             }
         }
-        for (path, told) in &self.delivered {
+        for (path, told) in &self.told {
             if log.register.value(path).is_some() {
                 continue;
             }
+            let Some(told) = told.first() else {
+                continue;
+            };
             let item = match log.register.winner(path) {
                 Some(removal) => removal.item(Bytes::new()),
                 None => Item {
@@ -584,13 +844,17 @@ impl Drop for KeptFeed {
 impl SpaceInner {
     /// The kept part of an `Items` over `select`: the heads under it now, in path order, and a
     /// watcher registered in the same step under the log's lock, so no change lies between the
-    /// listing and the queue. [`HeapError::Sealed`] for a person a sealed space does not list as
-    /// a reader.
+    /// listing and the queue. `heads` says which: the winner of each path, or every head. A
+    /// feed of every head also owes the values in pieces of the heads that do not win: they are
+    /// gathered (they are fetched when only a winner is wanted). [`HeapError::Sealed`] for a
+    /// person a sealed space does not list as a reader.
     pub(crate) fn kept_feed(
         self: &Arc<Self>,
         node: &Arc<NodeInner>,
         select: Select,
+        heads: Heads,
     ) -> Result<KeptFeed, HeapError> {
+        let mut gather: Vec<Blob> = Vec::new();
         let (listed, queue, fold_version, checked) = {
             let log = self.log.lock();
             self.check_reader(&log)?;
@@ -598,39 +862,131 @@ impl SpaceInner {
                 return Err(self.sealed_error(&log));
             }
             let mut listed = VecDeque::new();
-            let mut list = |head: &Head| match log.shown(head) {
-                Some(Ok(item)) => listed.push_back(Slot::Change(Change::Put(item))),
-                Some(Err(blob)) => listed.push_back(Slot::Blob(blob)),
-                None => {}
-            };
-            match &select {
-                Select::Path(path) => log.register.value(path).into_iter().for_each(&mut list),
-                Select::Prefix(_) => log
-                    .register
-                    .values()
-                    .filter(|head| select.matches(&head.path))
-                    .for_each(&mut list),
+            match heads {
+                Heads::Winner => {
+                    let mut list = |head: &Head| match log.shown(head) {
+                        Some(Ok(item)) => listed.push_back(Slot::Change(Change::Put(item))),
+                        Some(Err(blob)) => listed.push_back(Slot::Blob(blob)),
+                        None => {}
+                    };
+                    match &select {
+                        Select::Path(path) => {
+                            log.register.value(path).into_iter().for_each(&mut list)
+                        }
+                        Select::Prefix(_) => log
+                            .register
+                            .values()
+                            .filter(|head| select.matches(&head.path))
+                            .for_each(&mut list),
+                    }
+                }
+                Heads::All => {
+                    let mut list = |path: &Name, now: &[Head]| {
+                        // The winner's pieces are gathered as any winner's are.
+                        for head in now.iter().skip(1).filter(|head| !head.removal) {
+                            if let Some(Err(blob)) = log.shown(head) {
+                                gather.push(blob);
+                            }
+                        }
+                        let event = HeadsEvent {
+                            path: path.clone(),
+                            now: now.to_vec(),
+                        };
+                        listed.push_back(Slot::Heads(Arc::new(event)));
+                    };
+                    match &select {
+                        Select::Path(path) => {
+                            let now = log.register.heads_of(path);
+                            if !now.is_empty() {
+                                list(path, now);
+                            }
+                        }
+                        Select::Prefix(_) => {
+                            for (path, now) in log.register.paths_with_heads() {
+                                if select.matches(path) {
+                                    list(path, now);
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            let queue = Queue::new(node.config.watch_queue, Some(select.clone()));
+            let queue = Queue::new(
+                node.config.watch_queue,
+                Some(select.clone()),
+                heads == Heads::All,
+            );
             self.watchers.lock().push(Arc::clone(&queue));
             let version = log.fold.version();
             let at = version.load(Ordering::SeqCst);
             (listed, queue, version, at)
         };
+        if !gather.is_empty() {
+            {
+                let mut owed = self.owed.lock();
+                for blob in gather.into_iter().filter(|b| !self.is_whole(node, b)) {
+                    owed.insert(blob.id.clone(), blob);
+                }
+            }
+            node.nudge(&self.name);
+        }
         Ok(KeptFeed {
             listed,
             again: VecDeque::new(),
-            held: None,
+            ready: VecDeque::new(),
+            held: VecDeque::new(),
             queue,
             space: Arc::clone(self),
             node: Arc::clone(node),
             select,
-            delivered: BTreeMap::new(),
+            heads,
+            told: BTreeMap::new(),
+            capped: BTreeMap::new(),
             ended: false,
             told_ids: BTreeSet::new(),
             checked,
             fold_version,
         })
+    }
+
+    /// The heads of the path of the value in pieces `blob`, if it is one of them now: what a
+    /// feed of every head reads again when the value became whole.
+    fn blob_heads(&self, blob: &Blob) -> Option<HeadsEvent> {
+        let log = self.log.lock();
+        let head = log.register.head(&blob.id)?;
+        Some(HeadsEvent {
+            path: head.path.clone(),
+            now: log.register.heads_of(&head.path).to_vec(),
+        })
+    }
+
+    /// Tell the feeds of every head that the heads of a path changed. Nothing is read or built
+    /// for a space with no such feed. A head that is new and does not win is a value in pieces
+    /// to gather when it is one (the winner's is [`Effects::blobs`]): they are added to
+    /// `blobs`.
+    fn tell_heads(&self, log: &Log, change: HeadsChange, blobs: &mut Vec<Blob>) {
+        let mut watchers = self.watchers.lock();
+        watchers.retain(|q| !q.is_closed());
+        let wanting: Vec<&Arc<Queue>> = watchers
+            .iter()
+            .filter(|q| q.heads && q.wants(Some(&change.path)))
+            .collect();
+        if wanting.is_empty() {
+            return;
+        }
+        let new = |head: &&Head| !change.before.contains(&head.entry) && !head.removal;
+        for head in change.after.iter().skip(1).filter(new) {
+            if let Some(Err(blob)) = log.shown(head) {
+                blobs.push(blob);
+            }
+        }
+        let event = Arc::new(HeadsEvent {
+            path: change.path,
+            now: change.after,
+        });
+        for q in wanting {
+            q.put(Slot::Heads(Arc::clone(&event)));
+        }
     }
 }
 
@@ -857,6 +1213,12 @@ impl SpaceInner {
         for change in fx.changes {
             self.tell(change);
         }
+        // The heads of a path that changed, for the feeds that tell every head; a head that
+        // does not win and is a value in pieces is gathered as a winner is.
+        let mut blobs = fx.blobs;
+        for change in fx.heads {
+            self.tell_heads(log, change, &mut blobs);
+        }
         for alert in fx.alerts {
             tracing::warn!(space = %self.name, ?alert, "alert");
             if matches!(alert, Alert::RolledBack { .. }) {
@@ -889,7 +1251,7 @@ impl SpaceInner {
         }
         Routed {
             ticket,
-            blobs: fx.blobs,
+            blobs,
             repair,
             nudge: !fx.wants.is_empty() || fx.membership,
         }
@@ -1486,22 +1848,27 @@ impl SpaceInner {
     }
 
     /// Tell every watcher a blob head that is whole: the queues hold the
-    /// reference and each watcher reads the value when it gets to it. Nothing
-    /// is told for a head that something newer superseded.
+    /// reference and each watcher reads the value when it gets to it. A feed of every head is
+    /// told whichever head it is; the others only the winner (nothing is told for a head that
+    /// something newer superseded).
     fn tell_blob(&self, blob: &Blob) {
-        let path = self
-            .log
-            .lock()
-            .register
-            .values()
-            .find(|h| h.entry == blob.id)
-            .map(|h| h.path.clone());
-        let Some(path) = path else {
-            return;
+        let (path, wins) = {
+            let log = self.log.lock();
+            let Some(head) = log.register.head(&blob.id) else {
+                return;
+            };
+            let wins = log
+                .register
+                .winner(&head.path)
+                .is_some_and(|winner| winner.entry == blob.id);
+            (head.path.clone(), wins)
         };
         let mut watchers = self.watchers.lock();
         watchers.retain(|q| !q.is_closed());
-        for q in watchers.iter().filter(|q| q.wants(Some(&path))) {
+        for q in watchers
+            .iter()
+            .filter(|q| q.wants(Some(&path)) && (q.heads || wins))
+        {
             q.put(Slot::Blob(blob.clone()));
         }
     }
@@ -1527,17 +1894,28 @@ impl SpaceInner {
         self.owed.lock().extend(owed.map(|b| (b.id.clone(), b)));
     }
 
-    /// The values owed their pieces that are still the head of their path:
-    /// what is fetched, and asked again while owed. One superseded is
-    /// dropped (it comes back if a removal makes it the head again).
+    /// The values owed their pieces that are still the head of their path (the winner, or any
+    /// head while a feed of every head is open): what is fetched, and asked again while owed.
+    /// One superseded is dropped (it comes back if a removal makes it the head again).
     pub(crate) fn unassembled(&self) -> Vec<Blob> {
+        let every = self
+            .watchers
+            .lock()
+            .iter()
+            .any(|q| q.heads && !q.is_closed());
         let mut owed = self.owed.lock();
         if owed.is_empty() {
             return Vec::new();
         }
         let heads: HashSet<EntryId> = {
             let log = self.log.lock();
-            log.register.values().map(|h| h.entry.clone()).collect()
+            if every {
+                let all = log.register.paths_with_heads();
+                all.flat_map(|(_, heads)| heads.iter().map(|h| h.entry.clone()))
+                    .collect()
+            } else {
+                log.register.values().map(|h| h.entry.clone()).collect()
+            }
         };
         owed.retain(|id, _| heads.contains(id));
         owed.values().cloned().collect()
@@ -1576,6 +1954,11 @@ impl Heap {
     /// served and announced at once (a Members or Epoch entry excepted); with
     /// `opts.durable` after the flush that covers it. Never waits for a peer.
     ///
+    /// The entry supersedes every head of `path` this device holds when it signs (at most
+    /// [`MERGED_MAX`]; the rest stay heads). A library that merges concurrent writes itself
+    /// does not use this: a head that arrived after it read the heads would be superseded
+    /// without having been merged. It uses [`Self::put_merged`].
+    ///
     /// A value over the inline limit goes in pieces under the entry, written
     /// in the entry's own batch, and is sealed whole first in a private space.
     pub async fn put(
@@ -1584,6 +1967,62 @@ impl Heap {
         bytes: Bytes,
         opts: PutOptions,
     ) -> Result<EntryId, HeapError> {
+        Ok(self.write(path, bytes, opts, None).await?.0)
+    }
+
+    /// Write `bytes` at `path` as the merge of exactly the heads `merged`: the entry supersedes
+    /// those and no others (sorted and without repeats), where [`Self::put`] supersedes every
+    /// head held when it signs. This is the put of a library that merges concurrent writes
+    /// itself ([`GetOptions::heads`](crate::GetOptions) of [`Heads::All`](crate::Heads) tells every head, and
+    /// [`Self::kept_all`] reads them): a head that arrived between the read and the put is
+    /// **not** named, so it stays a head, the next read tells it, and the library merges again.
+    /// Nothing the library did not merge is superseded, so nothing is lost without being seen.
+    ///
+    /// [`Merged::open`] is the heads of `path` other than the new entry as of the put, read
+    /// under the lock that signed it: empty means this put left a single head. At most
+    /// [`MERGED_MAX`] heads can be named, so a fork of `N` heads takes `⌈(N-1)/7⌉` rounds: merge
+    /// [`MERGED_MAX`] of them, then the heads left and that merge, and so on.
+    ///
+    /// **The library's contract** (not enforced; it is what makes replicas converge):
+    ///
+    /// 1. Merge deterministically: the same heads give the same bytes, whatever order they are
+    ///    given in and whichever replica merges.
+    /// 2. With the heads `S` read and their merge `R`, put **only if some head's bytes differ
+    ///    from `R`** (then `put_merged(R, S)`); if every head already holds `R`, write nothing.
+    ///    Two replicas that merge the same heads each put an entry of bytes `R`; a library that
+    ///    merged again whenever it saw two heads would merge those two forever, and one that
+    ///    follows the rule leaves two heads of equal bytes (the winner is the same on every
+    ///    replica) and writes nothing more.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put`], and: [`HeapError::BadRequest`] (fix the request) for more than
+    /// [`MERGED_MAX`] distinct ids and for an id that is applied at another path; and
+    /// [`HeapError::NotReady`] (retry later, or read the heads again) for an id that is not an
+    /// applied entry here (not held yet, refused, held closed or outside a cut). An id that is
+    /// applied at `path` and is no head any more (something superseded it) is accepted and
+    /// changes nothing: whatever superseded it stays a head, concurrent with the new entry.
+    /// Nothing is signed when it refuses.
+    pub async fn put_merged(
+        &self,
+        path: &Name,
+        bytes: Bytes,
+        merged: &[EntryId],
+        opts: PutOptions,
+    ) -> Result<Merged, HeapError> {
+        let (id, open) = self.write(path, bytes, opts, Some(merged)).await?;
+        Ok(Merged { id, open })
+    }
+
+    /// [`Self::put`] and [`Self::put_merged`]: `merged` is `None` for the heads held at signing
+    /// time, else exactly the heads merged. The entry and, for a merge, the heads beside it.
+    async fn write(
+        &self,
+        path: &Name,
+        bytes: Bytes,
+        opts: PutOptions,
+        merged: Option<&[EntryId]>,
+    ) -> Result<(EntryId, Vec<EntryId>), HeapError> {
         check_path(path)?;
         if bytes.len() as u64 > PAYLOAD_MAX {
             return Err(HeapError::TooLarge {
@@ -1591,36 +2030,52 @@ impl Heap {
                 limit: PAYLOAD_MAX,
             });
         }
-        let (id, ticket) = if bytes.len() <= INLINE_MAX {
-            self.put_inline(path, bytes).await?
+        let written = if bytes.len() <= INLINE_MAX {
+            self.put_inline(path, bytes, merged).await?
         } else {
-            self.put_blob(path, bytes).await?
+            self.put_blob(path, bytes, merged).await?
         };
         let durable = opts
             .durable
             .unwrap_or_else(|| !self.inner.log.lock().has_peers());
         if durable {
-            self.node.flusher.wait_durable(ticket).await?;
+            self.node.flusher.wait_durable(written.ticket).await?;
         }
-        tracing::trace!(target: TIMELINE, seq = id.seq, durable, "put_returns");
-        Ok(id)
+        tracing::trace!(target: TIMELINE, seq = written.id.seq, durable, "put_returns");
+        Ok((written.id, written.open))
     }
 
-    async fn put_inline(&self, path: &Name, bytes: Bytes) -> Result<(EntryId, Ticket), HeapError> {
+    async fn put_inline(
+        &self,
+        path: &Name,
+        bytes: Bytes,
+        merged: Option<&[EntryId]>,
+    ) -> Result<Written, HeapError> {
         let now = self.node.now();
-        self.inner
+        let mut open = Vec::new();
+        let (id, ticket) = self
+            .inner
             .sign_with(&self.node, |log| {
                 self.inner.may_seal(log)?;
-                log.put(path, Payload::Inline(bytes.clone()), vec![], now)
+                let step = log.put(path, Payload::Inline(bytes.clone()), vec![], merged, now)?;
+                note_open(log, path, merged, &step, &mut open);
+                Ok(step)
             })
-            .await
+            .await?;
+        Ok(Written { id, ticket, open })
     }
 
     /// A value in pieces: sealed whole, cut, and written with its entry. The
     /// work is done outside the lock for the seq and epoch the lock showed;
     /// if either moved before the entry is signed it is done again.
-    async fn put_blob(&self, path: &Name, bytes: Bytes) -> Result<(EntryId, Ticket), HeapError> {
+    async fn put_blob(
+        &self,
+        path: &Name,
+        bytes: Bytes,
+        merged: Option<&[EntryId]>,
+    ) -> Result<Written, HeapError> {
         let inner = &self.inner;
+        let mut open = Vec::new();
         loop {
             let (seq, epoch, key) = {
                 let log = inner.log.lock();
@@ -1657,11 +2112,13 @@ impl Heap {
                         Kind::ASSEMBLED.of(&name),
                         Bytes::from_static(&[1]),
                     ));
-                    log.put(path, blob.clone(), ops, now).map(Some)
+                    let step = log.put(path, blob.clone(), ops, merged, now)?;
+                    note_open(log, path, merged, &step, &mut open);
+                    Ok(Some(step))
                 })
                 .await?;
-            if let Some(signed) = signed {
-                return Ok(signed);
+            if let Some((id, ticket)) = signed {
+                return Ok(Written { id, ticket, open });
             }
         }
     }
@@ -1694,6 +2151,49 @@ impl Heap {
         }
     }
 
+    /// Every head of `path` now, the winner first, from what this node holds: it never waits for
+    /// the network. Empty when the path has no head. A removal that is a head is an item with
+    /// empty bytes (it is concurrent with the values: `put_merged` names it like any head).
+    /// Unlike [`Self::kept`] it returns more than one value when writers wrote concurrently,
+    /// every one of them (more than the [`HEADS_MAX`](crate::HEADS_MAX) a stream
+    /// tells, if there are): it is the point read for the library that merges (the stream is
+    /// `get` with [`Heads::All`](crate::Heads)).
+    ///
+    /// [`HeapError::Sealed`] when the space is sealed and this node's person is outside its
+    /// audience, or when an entry is held closed (its path is unknown), as `kept`;
+    /// [`HeapError::Unavailable`] when a head's value in pieces is not whole here: a head that
+    /// does not win is gathered while a [`Heads::All`](crate::Heads) stream is open, so
+    /// open one to have them fetched.
+    pub async fn kept_all(&self, path: &Name) -> Result<Vec<Item>, HeapError> {
+        let inner = &self.inner;
+        let heads: Vec<Head> = {
+            let log = inner.log.lock();
+            inner.check_reader(&log)?;
+            if log.sealed() && log.has_closed() {
+                return Err(inner.sealed_error(&log));
+            }
+            log.register.heads_of(path).to_vec()
+        };
+        let mut items = Vec::with_capacity(heads.len());
+        for head in &heads {
+            if head.removal {
+                items.push(head.item(Bytes::new()));
+                continue;
+            }
+            let shown = inner.log.lock().shown(head);
+            match shown {
+                Some(Ok(item)) => items.push(item),
+                Some(Err(blob)) => items.push(head.item(inner.read_blob(&self.node, &blob)?)),
+                None => {
+                    return Err(HeapError::Unavailable {
+                        name: head.entry.name(&inner.name),
+                    });
+                }
+            }
+        }
+        Ok(items)
+    }
+
     /// Watch the space: first every head held now that `since` does not
     /// already cover, then the changes as they happen.
     pub async fn watch(&self, since: &Frontier) -> Result<Changes, HeapError> {
@@ -1718,7 +2218,7 @@ impl Heap {
                     .map(|alert| Slot::Change(Change::Alert(alert.clone())));
                 heads.chain(blobs).chain(alerts).collect()
             };
-            let queue = Queue::new(self.node.config.watch_queue, None);
+            let queue = Queue::new(self.node.config.watch_queue, None, false);
             inner.watchers.lock().push(Arc::clone(&queue));
             (listed, queue)
         };
