@@ -952,3 +952,61 @@ async fn kept_changes_and_emissions_are_taken_in_turn_so_neither_starves_the_oth
     kept.dedup();
     assert_eq!(kept.len(), 40, "each kept path once: {got:?}");
 }
+
+/// A poll that finds nothing registers the consumer's waker and a message that then arrives wakes
+/// it; a poll that finds a message ready returns it and does not wake the waker it is given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_items_poll_registers_its_waker_only_when_nothing_is_ready_and_is_woken_by_the_next_message()
+ {
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    use futures::Stream;
+
+    struct Counting(AtomicUsize);
+    impl Wake for Counting {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let w = three(LinkConfig::default(), 4096).await;
+    let bob = w.bob();
+    let mut items = carol_get(&w, emitted_only());
+    let mut watcher = carol_get(&w, emitted_only());
+    w.join(ChannelMode::Latest).await;
+    // Frames that came with the join (HELLO, checkpoints) are not messages: drain what is there.
+    w.pump(|_| {}).await;
+    drain(&mut items);
+
+    let first = Arc::new(Counting(AtomicUsize::new(0)));
+    let first_waker = Waker::from(Arc::clone(&first));
+    let mut cx = Context::from_waker(&first_waker);
+    assert!(
+        matches!(Pin::new(&mut items).poll_next(&mut cx), Poll::Pending),
+        "nothing is ready"
+    );
+    assert_eq!(first.0.load(Ordering::SeqCst), 0);
+
+    bob.emit(&n("/w"), Bytes::from_static(b"one"), EmitOptions::latest())
+        .await
+        .unwrap();
+    pump_until(&w, &mut watcher, "one").await;
+    assert_eq!(
+        first.0.load(Ordering::SeqCst),
+        1,
+        "the message woke the waker the empty poll registered"
+    );
+
+    // A message is ready now: polled with another waker it is returned, and that is not woken.
+    let second = Arc::new(Counting(AtomicUsize::new(0)));
+    let second_waker = Waker::from(Arc::clone(&second));
+    let mut cx2 = Context::from_waker(&second_waker);
+    match Pin::new(&mut items).poll_next(&mut cx2) {
+        Poll::Ready(Some(Ok(got))) => assert_eq!(&got.bytes[..], b"one"),
+        other => panic!("the queued message is given: {other:?}"),
+    }
+    assert_eq!(second.0.load(Ordering::SeqCst), 0);
+}

@@ -418,8 +418,24 @@ impl Items {
         sink: &Sink,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Got, GetNotice>>> {
-        sink.waker.register(cx.waker());
         node.chan.rx.sweep_held_if_any(&node.chan.stats.rx);
+        // What is ready is taken without registering the waker: only a poll that finds nothing
+        // registers it, and then looks again, so a message queued between the two is not missed.
+        match Self::take_live(sink) {
+            (Some(item), _) => return Poll::Ready(Some(item)),
+            (None, true) => return Poll::Ready(None),
+            (None, false) => {}
+        }
+        sink.waker.register(cx.waker());
+        match Self::take_live(sink) {
+            (Some(item), _) => Poll::Ready(Some(item)),
+            (None, true) => Poll::Ready(None),
+            (None, false) => Poll::Pending,
+        }
+    }
+
+    /// The next item or notice the sink holds, and whether the sink is closed.
+    fn take_live(sink: &Sink) -> (Option<Result<Got, GetNotice>>, bool) {
         let mut st = sink.state.lock();
         let was_full = st.fifo.is_full();
         let next = st.take_notice_first();
@@ -429,11 +445,7 @@ impl Items {
         if freed {
             sink.room.notify_waiters();
         }
-        match next {
-            Some(item) => Poll::Ready(Some(item)),
-            None if closed => Poll::Ready(None),
-            None => Poll::Pending,
-        }
+        (next, closed)
     }
 
     /// The kept side: the next change as an item or a notice.

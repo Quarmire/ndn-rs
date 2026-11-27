@@ -1848,6 +1848,7 @@ impl ChannelRx {
             Body::Data(messages) => {
                 self.sequence(pipe, node, sinks, header, false);
                 let count = messages.len();
+                node.chan.stats.rx.messages.add(count as u64);
                 for message in messages.drain(..) {
                     self.accept(pipe, node, message, now);
                 }
@@ -1903,7 +1904,6 @@ impl ChannelRx {
     /// otherwise queue it for the sinks.
     fn accept(&self, pipe: &mut Pipe, node: &NodeInner, message: Message, now: Instant) {
         let stats = &node.chan.stats.rx;
-        stats.messages.bump();
         let named = message.name.is_some();
         let id = message.name_id;
         let resolved = match &message.name {
