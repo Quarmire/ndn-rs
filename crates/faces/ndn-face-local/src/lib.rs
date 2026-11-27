@@ -251,6 +251,12 @@ impl Transport for InProcFace {
         }
     }
 
+    /// Whether the side inbox has room for a frame now: under its frame bound and its byte
+    /// bound, the two reads `forward_side_from` makes first. Room is not reserved.
+    fn side_room(&self, _class: SideClass) -> bool {
+        self.side_tx.capacity() > 0 && self.side.queued.load(Ordering::Acquire) < SIDE_INBOX_BYTES
+    }
+
     async fn send_bytes_with_source(&self, pkt: Bytes, source: FaceId) -> Result<(), FaceError> {
         self.app_tx
             .send(TaggedBytes {
@@ -492,7 +498,15 @@ mod tests {
             Err(SideRefused::Full)
         );
         assert_eq!(handle.side_dropped(), 1);
+        assert!(
+            !face.side_room(SideClass::Datagram),
+            "an inbox at its frame bound has no room"
+        );
         assert!(handle.recv_side().await.is_some());
+        assert!(
+            face.side_room(SideClass::Datagram),
+            "the app took one: there is room for one"
+        );
         face.forward_side_from(small.clone(), SideClass::Datagram, FaceId(1))
             .unwrap();
         while handle.try_recv_side().is_some() {}

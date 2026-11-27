@@ -158,6 +158,10 @@ impl EtherPort for MockPort {
         true
     }
 
+    fn has_tx_room(&self) -> bool {
+        self.0.txq.lock().unwrap().len() < self.0.tx_cap
+    }
+
     fn flush_tx(&self) -> std::io::Result<()> {
         if !self.0.bus.stalled.load(Ordering::SeqCst) {
             self.0.bus.drain(&self.0);
@@ -551,6 +555,10 @@ async fn forward_side_is_full_when_the_send_queue_is_full_and_never_waits() {
         };
         let _peer = MockPort::on(&bus, 0x31, true, 4);
         bus.stall();
+        assert!(
+            face.side_room(SideClass::Datagram),
+            "an empty queue has room"
+        );
         for n in 1..=4u8 {
             assert_eq!(
                 face.forward_side(marked(60, n), SideClass::Datagram),
@@ -566,6 +574,14 @@ async fn forward_side_is_full_when_the_send_queue_is_full_and_never_waits() {
                 "multicast: {multicast_face}"
             );
         }
+        assert!(
+            !face.side_room(SideClass::Datagram),
+            "multicast: {multicast_face}: a full queue has no room"
+        );
+        assert!(
+            face.side_room(SideClass::Stream),
+            "the stream class is not carried: refused another way, nothing to wait for"
+        );
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "a full queue is refused at once, not waited on"
@@ -586,6 +602,10 @@ async fn forward_side_is_full_when_the_send_queue_is_full_and_never_waits() {
             .expect("room made, the waiting send completes")
             .unwrap()
             .unwrap();
+        assert!(
+            face.side_room(SideClass::Datagram),
+            "the medium drained the queue"
+        );
         let order: Vec<Bytes> = bus
             .frames_on_wire()
             .into_iter()

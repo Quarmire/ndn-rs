@@ -182,6 +182,11 @@ impl<P: EtherPort> Transport for MulticastEtherFace<P> {
             .map_err(|e| SideRefused::Io(e.to_string()))
     }
 
+    /// Whether the port's send queue has a slot for a frame: what `forward_side` reads first.
+    fn side_room(&self, class: SideClass) -> bool {
+        class != SideClass::Datagram || self.port.has_tx_room()
+    }
+
     fn set_send_mtu(&self, mtu: Option<u64>) -> Result<Option<u64>, MtuError> {
         let new = clamp_ether_mtu(mtu)?;
         self.mtu.store(new, Ordering::Relaxed);

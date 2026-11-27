@@ -287,6 +287,18 @@ impl PacketRing {
         true
     }
 
+    /// Whether [`try_push_tx`](Self::try_push_tx) would find a slot now: the read it makes first,
+    /// without a frame. Room is not reserved.
+    pub fn has_tx_room(&self) -> bool {
+        let mut q = self.tx.lock().unwrap();
+        self.reap(&mut q);
+        if q.released + q.staged >= self.tx_frame_nr {
+            return false;
+        }
+        let status = unsafe { read_tp_status(self.tx_frame(q.next)) };
+        status == libc::TP_STATUS_AVAILABLE
+    }
+
     /// Send every queued frame, each to its own destination: `send` is called once per run of
     /// consecutive frames with one destination, after marking exactly that run for the kernel,
     /// and must have the kernel send the marked frames to the address it is given (`sendto`).

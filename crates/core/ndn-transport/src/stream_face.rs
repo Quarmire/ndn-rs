@@ -259,6 +259,12 @@ where
         }
     }
 
+    /// Whether the lane's queue has room for a frame (a face with no lane has no queue to
+    /// fill, and refuses another way).
+    fn side_room(&self, _class: SideClass) -> bool {
+        self.lane.as_ref().is_none_or(|lane| lane.has_room())
+    }
+
     /// What the peer has said it reads: [`RECORD_MAX`] once it opened the lane (a forwarder's
     /// end read the client's hello; a client's end said hello), `0` before, and for a face with
     /// no lane.
@@ -477,6 +483,7 @@ mod tests {
             StreamFace::new(FaceId(1), FaceKind::Unix, None, None, r, w, SideTlvCodec)
                 .with_side_lane();
         face.open_side();
+        assert!(Transport::side_room(&face, SideClass::Datagram));
         for _ in 0..crate::side_stream::LANE_FRAMES {
             Transport::forward_side(&face, side(1, 46), SideClass::Datagram).unwrap();
         }
@@ -484,10 +491,18 @@ mod tests {
             Transport::forward_side(&face, side(1, 46), SideClass::Datagram),
             Err(SideRefused::Full)
         );
+        assert!(
+            !Transport::side_room(&face, SideClass::Datagram),
+            "a lane at its bound has no room"
+        );
         drop(pump);
         assert_eq!(
             Transport::forward_side(&face, side(1, 46), SideClass::Datagram),
             Err(SideRefused::Closed)
+        );
+        assert!(
+            Transport::side_room(&face, SideClass::Datagram),
+            "a closed lane refuses Closed, not Full: nothing to wait for"
         );
         assert_eq!(
             Transport::send_side(&face, side(1, 46), SideClass::Stream).await,

@@ -262,6 +262,15 @@ impl SideLane {
         Ok(())
     }
 
+    /// Whether [`try_push`](Self::try_push) may take a frame now and not refuse it
+    /// [`Full`](SideRefused::Full): fewer frames and octets wait than the bounds, or the lane is
+    /// closed (which refuses another way). The read `try_push` makes first, without the frame;
+    /// room is not reserved.
+    pub(crate) fn has_room(&self) -> bool {
+        let state = self.lock();
+        state.closed || (state.frames.len() < LANE_FRAMES && state.octets < LANE_OCTETS)
+    }
+
     /// Queue `frame`, waiting for room.
     pub(crate) async fn push(
         &self,
@@ -285,12 +294,8 @@ impl SideLane {
             let room = self.room.notified();
             tokio::pin!(room);
             room.as_mut().enable();
-            {
-                let state = self.lock();
-                if state.closed || (state.frames.len() < LANE_FRAMES && state.octets < LANE_OCTETS)
-                {
-                    return;
-                }
+            if self.has_room() {
+                return;
             }
             room.await;
         }

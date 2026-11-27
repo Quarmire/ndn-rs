@@ -24,6 +24,10 @@ pub trait EtherPort: Send + Sync + 'static {
     /// payload leaves for the `dst` it was queued with, whatever else is queued beside it.
     fn try_push_tx(&self, payload: &[u8], dst: &MacAddr) -> bool;
 
+    /// Whether [`try_push_tx`](Self::try_push_tx) would take a payload now: the read it makes
+    /// first, without one. Room is not reserved.
+    fn has_tx_room(&self) -> bool;
+
     /// Have what is queued sent now, each payload to its own destination. An error is the
     /// port's own (the interface is down); a send that would block is not one: the payloads
     /// stay queued for the kernel.
@@ -51,6 +55,10 @@ impl EtherPort for AfPacketPort {
 
     fn try_push_tx(&self, payload: &[u8], dst: &MacAddr) -> bool {
         self.ring.try_push_tx(payload, dst)
+    }
+
+    fn has_tx_room(&self) -> bool {
+        self.ring.has_tx_room()
     }
 
     fn flush_tx(&self) -> std::io::Result<()> {
