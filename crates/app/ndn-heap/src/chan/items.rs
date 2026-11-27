@@ -149,7 +149,7 @@ impl Sink {
 
     /// Push `outs` of a channel of `mode` that this sink's path filter keeps. `last` says no other
     /// sink follows, so the messages are moved instead of cloned. Wakes the consumer once.
-    pub(crate) fn deliver(&self, mode: ChannelMode, outs: &mut Vec<Out>, last: bool) {
+    pub(crate) fn deliver(&self, mode: ChannelMode, outs: &mut [Out], last: bool) {
         let mut pushed = false;
         {
             let mut st = self.state.lock();
