@@ -286,6 +286,99 @@ fn x25519_kek(
     Ok(ContentKey::from_bytes(*kek))
 }
 
+/// Domain label of the pair secret of [`pair_keys_to`] / [`RecipientKey::pair_keys_from`]. It
+/// differs from [`X25519_KEK_LABEL`] and from the channel path's own, so one agreement cannot
+/// yield a wrap key, nor a key of another path.
+const PAIR_LABEL: &[u8] = b"ndn-query/pair/1";
+/// Label of the key that seals an asker's queries.
+const PAIR_QUERY_LABEL: &[u8] = b"ndn-query/pair/q/1";
+/// Label of the key that seals a server's answers.
+const PAIR_ANSWER_LABEL: &[u8] = b"ndn-query/pair/a/1";
+
+/// The two directional keys of one asker and one server: `query` seals what the asker sends,
+/// `answer` what the server sends back. Neither is the other's, so a frame of one direction never
+/// opens as the other. Zeroized on drop; not `Clone`, and its `Debug` shows no octet.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct PairKeys {
+    /// Seals the asker's queries.
+    pub query: [u8; CK_LEN],
+    /// Seals the server's answers.
+    pub answer: [u8; CK_LEN],
+}
+
+impl core::fmt::Debug for PairKeys {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PairKeys(..)")
+    }
+}
+
+/// The pair keys of an X25519 agreement. The pair secret is HKDF-SHA256 over the shared secret
+/// (no salt) with `info` = the pair label, the ephemeral and the recipient public keys, the
+/// big-endian `u32` length of `context` and `context`; each directional key is then an HKDF-Expand
+/// of that secret under its own label. `context` binds what the two ends agree on (the names and
+/// the epoch); a different one gives other keys.
+fn pair_keys(
+    shared: &MontgomeryPoint,
+    ephemeral: &[u8; X25519_LEN],
+    recipient: &[u8; X25519_LEN],
+    context: &[u8],
+) -> Result<PairKeys, ConfidentialityError> {
+    let shared = zeroize::Zeroizing::new(shared.to_bytes());
+    if *shared == [0u8; X25519_LEN] {
+        return Err(ConfidentialityError::BadPublicKey);
+    }
+    let context_len = u32::try_from(context.len())
+        .map_err(|_| ConfidentialityError::Malformed)?
+        .to_be_bytes();
+    let mut pair = zeroize::Zeroizing::new([0u8; CK_LEN]);
+    Hkdf::<Sha256>::new(None, shared.as_ref())
+        .expand_multi_info(
+            &[PAIR_LABEL, ephemeral, recipient, &context_len, context],
+            pair.as_mut(),
+        )
+        .expect("32 octets is a valid HKDF-SHA256 output length");
+    let prk = Hkdf::<Sha256>::from_prk(pair.as_ref())
+        .expect("a 32-octet pseudorandom key is a valid HKDF-SHA256 key");
+    let mut keys = PairKeys {
+        query: [0u8; CK_LEN],
+        answer: [0u8; CK_LEN],
+    };
+    prk.expand(PAIR_QUERY_LABEL, &mut keys.query)
+        .expect("32 octets is a valid HKDF-SHA256 output length");
+    prk.expand(PAIR_ANSWER_LABEL, &mut keys.answer)
+        .expect("32 octets is a valid HKDF-SHA256 output length");
+    Ok(keys)
+}
+
+/// The pair keys of an asker and the server whose X25519 public key is `recipient`: a fresh
+/// ephemeral key agrees one secret with it and both directional keys derive from that
+/// ([`PairKeys`]), bound to `context`. Returns the ephemeral public key, which the recipient
+/// needs ([`RecipientKey::pair_keys_from`]). Authenticity is the caller's: take `recipient` only
+/// from data its holder signed, and sign what carries the ephemeral key.
+pub fn pair_keys_to(
+    recipient: &[u8; X25519_LEN],
+    context: &[u8],
+) -> Result<([u8; X25519_LEN], PairKeys), ConfidentialityError> {
+    let ephemeral = RecipientKey::generate();
+    let public = ephemeral.public();
+    let shared = MontgomeryPoint(*recipient).mul_clamped(ephemeral.secret);
+    let keys = pair_keys(&shared, &public, recipient, context)?;
+    Ok((public, keys))
+}
+
+impl RecipientKey {
+    /// The pair keys [`pair_keys_to`] derived to this key's public half, given the asker's
+    /// `ephemeral` public key and the same `context`.
+    pub fn pair_keys_from(
+        &self,
+        ephemeral: &[u8; X25519_LEN],
+        context: &[u8],
+    ) -> Result<PairKeys, ConfidentialityError> {
+        let shared = MontgomeryPoint(*ephemeral).mul_clamped(self.secret);
+        pair_keys(&shared, ephemeral, &self.public(), context)
+    }
+}
+
 /// When to rotate a content key: after `max_age`, or after `max_uses` seals,
 /// whichever comes first (NDNSF `HybridMessageCrypto` semantics).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -538,5 +631,79 @@ mod tests {
             wrap_ck_to(&[0u8; X25519_LEN], &ck, b"").err(),
             Some(ConfidentialityError::BadPublicKey)
         );
+    }
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use super::*;
+
+    #[test]
+    fn both_ends_derive_the_same_keys_and_they_are_distinct_per_direction() {
+        let server = RecipientKey::generate();
+        let (ephemeral, asker) = pair_keys_to(&server.public(), b"ctx").unwrap();
+        let at_server = server.pair_keys_from(&ephemeral, b"ctx").unwrap();
+        assert_eq!(asker.query, at_server.query);
+        assert_eq!(asker.answer, at_server.answer);
+        assert_ne!(
+            asker.query, asker.answer,
+            "one direction's key is not the other's"
+        );
+    }
+
+    #[test]
+    fn another_context_ephemeral_or_recipient_gives_other_keys() {
+        let server = RecipientKey::generate();
+        let (ephemeral, asker) = pair_keys_to(&server.public(), b"ctx").unwrap();
+        let same = |a: &PairKeys, b: &PairKeys| a.query == b.query || a.answer == b.answer;
+        // A different context.
+        let other_ctx = server.pair_keys_from(&ephemeral, b"ctx2").unwrap();
+        assert!(!same(&asker, &other_ctx));
+        // A context that moves octets across the length prefix.
+        let empty = server.pair_keys_from(&ephemeral, b"").unwrap();
+        assert!(!same(&asker, &empty));
+        // A different ephemeral (a second asker).
+        let (ephemeral2, asker2) = pair_keys_to(&server.public(), b"ctx").unwrap();
+        assert_ne!(ephemeral, ephemeral2);
+        assert!(!same(&asker, &asker2));
+        let wrong_ephemeral = server.pair_keys_from(&ephemeral2, b"ctx").unwrap();
+        assert!(!same(&asker, &wrong_ephemeral));
+        // A different recipient.
+        let mallory = RecipientKey::generate();
+        let wrong_recipient = mallory.pair_keys_from(&ephemeral, b"ctx").unwrap();
+        assert!(!same(&asker, &wrong_recipient));
+    }
+
+    #[test]
+    fn a_low_order_ephemeral_or_recipient_is_refused() {
+        let server = RecipientKey::generate();
+        assert_eq!(
+            pair_keys_to(&[0u8; X25519_LEN], b"ctx").err(),
+            Some(ConfidentialityError::BadPublicKey)
+        );
+        assert_eq!(
+            server.pair_keys_from(&[0u8; X25519_LEN], b"ctx").err(),
+            Some(ConfidentialityError::BadPublicKey)
+        );
+    }
+
+    #[test]
+    fn the_pair_label_is_not_the_wrap_key_label() {
+        // The same agreement as `wrap_ck_to`: its KEK is not a pair key.
+        let server = RecipientKey::generate();
+        let (ephemeral, keys) = pair_keys_to(&server.public(), b"").unwrap();
+        let shared = MontgomeryPoint(ephemeral).mul_clamped(server.secret);
+        let kek = x25519_kek(&shared, &ephemeral, &server.public()).unwrap();
+        assert_ne!(kek.expose(), &keys.query);
+        assert_ne!(kek.expose(), &keys.answer);
+        assert_ne!(PAIR_LABEL, X25519_KEK_LABEL);
+        assert_ne!(PAIR_LABEL, b"ndn-channel/pair/1".as_slice());
+    }
+
+    #[test]
+    fn the_debug_of_pair_keys_shows_no_octet() {
+        let server = RecipientKey::generate();
+        let (_, keys) = pair_keys_to(&server.public(), b"c").unwrap();
+        assert_eq!(format!("{keys:?}"), "PairKeys(..)");
     }
 }
