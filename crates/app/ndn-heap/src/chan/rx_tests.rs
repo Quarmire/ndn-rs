@@ -1566,6 +1566,19 @@ impl Wire {
         &self.rig.nodes[2]
     }
 
+    /// Stop bob's maintenance pass. It announces a channel that was never announced, and carol,
+    /// listening, answers an announce with an ask made as new while her own ask is in flight:
+    /// the sender welcomes it as a claim, which takes the channel's one replay a second
+    /// (channel.md 13.7), so a re-ask for a gap in the same second is answered without a replay.
+    /// A test that counts on its own asks keeps the pass still.
+    fn pause_bob_tick(&self) {
+        self.rig.nodes[1]
+            .inner
+            .chan
+            .tick_paused
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn items(&self, opts: GetOptions) -> Items {
         self.carol()
             .space(&space())
@@ -1805,6 +1818,7 @@ async fn reliable_with_drop_reports_a_gap() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn window_replays_to_a_late_joiner_and_a_gap_inside_it_is_recovered() {
     let w = wire(LinkConfig::default()).await;
+    w.pause_bob_tick();
     let bob = w.bob();
     let path = n("/chat");
     let opts = EmitOptions::window(super::verbs::Window::DEFAULT);
