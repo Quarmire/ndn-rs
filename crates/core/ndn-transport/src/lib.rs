@@ -74,7 +74,9 @@ pub use mac_addr::MacAddr;
 pub use ndn_packet::ContentHashTarget;
 pub use raw_packet::RawPacket;
 pub use side::{SIDE_MARKER, SideClass, SideRefused};
-pub use side_header::{HeaderError, SideHeader, SideKind, UpOp, UpRecord};
+pub use side_header::{
+    AnswerPrefix, HeaderError, QueryPrefix, SideHeader, SideKind, UpOp, UpRecord,
+};
 pub use side_stream::{Inbound, SidePump, SideTlvCodec};
 pub use stream_face::StreamFace;
 pub use tls::ClientTls;

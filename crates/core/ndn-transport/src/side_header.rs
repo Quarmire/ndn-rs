@@ -10,11 +10,12 @@
 //!
 //! `ver` is [`VERSION`] (1); `class` is 0 for a datagram and 1 for a stream, so
 //! a relay forwards a frame on the class it arrived on without reading
-//! further; `kind` is 0 `DATA`, 1 `CHECKPOINT`, 2 `CONTROL`, 4 `UP`. A relay
-//! routes on [`SideHeader`] alone: it never opens, re-packs or re-seals a
+//! further; `kind` is 0 `DATA`, 1 `CHECKPOINT`, 2 `CONTROL`, 4 `UP`, 5 `QUERY`, 6 `ANSWER`.
+//! A relay routes on [`SideHeader`] alone: it never opens, re-packs or re-seals a
 //! frame, so it needs nothing of the frame's body. The first octets that
 //! occur are [`DATA_DATAGRAM`] (0x20), [`DATA_STREAM`] (0x30), [`CHECKPOINT`]
-//! (0x31), [`CONTROL`] (0x32) and [`UP`] (0x24), and nothing else parses.
+//! (0x31), [`CONTROL`] (0x32), [`UP`] (0x24), [`QUERY`] (0x25), [`ANSWER_DATAGRAM`] (0x26)
+//! and [`ANSWER_STREAM`] (0x36), and nothing else parses. Kind 3 stays unassigned.
 //!
 //! The rest of a sealed frame (key epoch, sequence, count, body, tag) is the
 //! channel codec's, in `ndn-heap`; a relay has no use for it and none of it
@@ -32,6 +33,18 @@
 //! more octets whose octets after the 11th are all zero, and refuses
 //! anything else. (The sealed kinds carry their padding inside the AEAD, where
 //! a padded frame still has its tag at the end; see the channel codec.)
+//!
+//! # `QUERY` and `ANSWER`: the two frames that carry a token
+//!
+//! A `QUERY` goes **up** and its `ANSWER` comes back to the one face that asked. The forwarder
+//! matches them with a token the asker chose and reads nothing else of the body:
+//!
+//! | Frame | Octets a relay reads |
+//! |---|---|
+//! | `QUERY` (kind 5, datagram only) | 0 marker, 1 `0x25`, 2–9 route id, **10–17 token**, **18 ttl** in 100 ms ([`QueryPrefix`], 19 octets) |
+//! | `ANSWER` (kind 6, either class) | 0 marker, 1 `0x26`/`0x36`, 2–9 route id, **10–17 token** ([`AnswerPrefix`], 18 octets) |
+//!
+//! The rest of both is sealed by the channel codec in `ndn-heap`.
 
 use crate::side::{SIDE_MARKER, SideClass};
 
@@ -51,6 +64,12 @@ pub const CHECKPOINT: u8 = 0x31;
 pub const CONTROL: u8 = 0x32;
 /// `UP` (always a datagram).
 pub const UP: u8 = 0x24;
+/// `QUERY` (always a datagram).
+pub const QUERY: u8 = 0x25;
+/// `ANSWER` on a datagram.
+pub const ANSWER_DATAGRAM: u8 = 0x26;
+/// `ANSWER` on a stream.
+pub const ANSWER_STREAM: u8 = 0x36;
 
 /// The shortest frame on any carrier: an Ethernet payload under 46 octets is
 /// padded by the NIC, so no frame is allowed to be shorter.
@@ -67,6 +86,12 @@ pub const STREAM_FRAME_GRANT: usize = 1024 * 1024;
 /// [`MIN_FRAME_LEN`], is zero).
 pub const UP_LEN: usize = HEADER_LEN + 1;
 
+/// Octets of a `QUERY` a relay reads: the header, the token and the ttl.
+pub const QUERY_PREFIX_LEN: usize = HEADER_LEN + 9;
+
+/// Octets of an `ANSWER` a relay reads: the header and the token.
+pub const ANSWER_PREFIX_LEN: usize = HEADER_LEN + 8;
+
 /// What a frame is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SideKind {
@@ -78,6 +103,11 @@ pub enum SideKind {
     Control,
     /// An unsealed route-keeping record sent upstream.
     Up,
+    /// A sealed request sent upstream by a face that is a sink of the route; a relay leaves a
+    /// breadcrumb for its token.
+    Query,
+    /// A sealed reply to one `QUERY`, sent down to the one face that asked.
+    Answer,
 }
 
 impl SideKind {
@@ -88,6 +118,8 @@ impl SideKind {
             SideKind::Checkpoint => 1,
             SideKind::Control => 2,
             SideKind::Up => 4,
+            SideKind::Query => 5,
+            SideKind::Answer => 6,
         }
     }
 
@@ -98,19 +130,21 @@ impl SideKind {
             1 => Some(SideKind::Checkpoint),
             2 => Some(SideKind::Control),
             4 => Some(SideKind::Up),
+            5 => Some(SideKind::Query),
+            6 => Some(SideKind::Answer),
             _ => None,
         }
     }
 
     /// Whether a frame of this kind may travel on `class`: `CHECKPOINT` and
-    /// `CONTROL` are always streams, `UP` is always a datagram, `DATA` is
-    /// either.
+    /// `CONTROL` are always streams, `UP` and `QUERY` are always datagrams, `DATA` and
+    /// `ANSWER` are either.
     pub const fn allows(self, class: SideClass) -> bool {
         matches!(
             (self, class),
-            (SideKind::Data, _)
+            (SideKind::Data | SideKind::Answer, _)
                 | (SideKind::Checkpoint | SideKind::Control, SideClass::Stream)
-                | (SideKind::Up, SideClass::Datagram)
+                | (SideKind::Up | SideKind::Query, SideClass::Datagram)
         )
     }
 }
@@ -130,11 +164,13 @@ pub enum HeaderError {
     #[error("frame version {ver} is not the supported version 1: upgrade the older side")]
     Version { ver: u8 },
     /// A kind with no assignment.
-    #[error("frame kind {kind} is not assigned (0 DATA, 1 CHECKPOINT, 2 CONTROL, 4 UP)")]
+    #[error(
+        "frame kind {kind} is not assigned (0 DATA, 1 CHECKPOINT, 2 CONTROL, 4 UP, 5 QUERY, 6 ANSWER)"
+    )]
     UnknownKind { kind: u8 },
     /// A kind on a class it never uses.
     #[error(
-        "a {kind:?} frame is never sent as a {class:?}: CHECKPOINT and CONTROL are streams, UP is a datagram"
+        "a {kind:?} frame is never sent as a {class:?}: CHECKPOINT and CONTROL are streams, UP and QUERY are datagrams"
     )]
     WrongClass { kind: SideKind, class: SideClass },
     /// An `UP` operation that is not 1 (keep) or 2 (unsubscribe).
@@ -146,6 +182,12 @@ pub enum HeaderError {
     /// A frame that is not an `UP` where an `UP` record was expected.
     #[error("expected an UP record, found a {kind:?} frame")]
     NotUp { kind: SideKind },
+    /// A frame that is not a `QUERY` where a `QUERY` prefix was expected.
+    #[error("expected a QUERY frame, found a {kind:?} frame")]
+    NotQuery { kind: SideKind },
+    /// A frame that is not an `ANSWER` where an `ANSWER` prefix was expected.
+    #[error("expected an ANSWER frame, found a {kind:?} frame")]
+    NotAnswer { kind: SideKind },
 }
 
 /// The ten octets a relay routes on.
@@ -310,6 +352,104 @@ impl UpRecord {
     }
 }
 
+/// The 19 octets of a `QUERY` a relay reads: `0x00 | 0x25 | route id (8) | token (8) | ttl (1)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct QueryPrefix {
+    /// The route the query goes up.
+    pub id: u64,
+    /// The asker's token, random per query per server: opaque to a relay, which only matches an
+    /// `ANSWER` to it.
+    pub token: u64,
+    /// How long the breadcrumb lives, in units of 100 ms. A relay clamps it (100 ms to 10 s by
+    /// default), so 0 and anything over 100 are read as the nearest bound, never refused.
+    pub ttl_ticks: u8,
+}
+
+impl QueryPrefix {
+    /// The prefix as it starts a `QUERY`.
+    pub fn encode(&self) -> [u8; QUERY_PREFIX_LEN] {
+        let mut out = [0u8; QUERY_PREFIX_LEN];
+        out[1] = QUERY;
+        out[2..HEADER_LEN].copy_from_slice(&self.id.to_be_bytes());
+        out[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&self.token.to_be_bytes());
+        out[HEADER_LEN + 8] = self.ttl_ticks;
+        out
+    }
+
+    /// Reads the prefix of `frame` (its first 19 octets; the sealed rest is not looked at).
+    /// Never allocates.
+    pub fn parse(frame: &[u8]) -> Result<Self, HeaderError> {
+        let header = SideHeader::parse(frame)?;
+        if header.kind() != SideKind::Query {
+            return Err(HeaderError::NotQuery {
+                kind: header.kind(),
+            });
+        }
+        let Some(prefix) = frame.first_chunk::<QUERY_PREFIX_LEN>() else {
+            return Err(HeaderError::Truncated {
+                have: frame.len(),
+                need: QUERY_PREFIX_LEN,
+            });
+        };
+        let mut token = [0u8; 8];
+        token.copy_from_slice(&prefix[HEADER_LEN..HEADER_LEN + 8]);
+        Ok(Self {
+            id: header.id(),
+            token: u64::from_be_bytes(token),
+            ttl_ticks: prefix[HEADER_LEN + 8],
+        })
+    }
+}
+
+/// The 18 octets of an `ANSWER` a relay reads: `0x00 | 0x26 or 0x36 | route id (8) | token (8)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AnswerPrefix {
+    /// The class the answer travels on.
+    pub class: SideClass,
+    /// The route the answer comes down.
+    pub id: u64,
+    /// The token of the `QUERY` it answers.
+    pub token: u64,
+}
+
+impl AnswerPrefix {
+    /// The prefix as it starts an `ANSWER`.
+    pub fn encode(&self) -> [u8; ANSWER_PREFIX_LEN] {
+        let mut out = [0u8; ANSWER_PREFIX_LEN];
+        out[1] = match self.class {
+            SideClass::Datagram => ANSWER_DATAGRAM,
+            SideClass::Stream => ANSWER_STREAM,
+        };
+        out[2..HEADER_LEN].copy_from_slice(&self.id.to_be_bytes());
+        out[HEADER_LEN..].copy_from_slice(&self.token.to_be_bytes());
+        out
+    }
+
+    /// Reads the prefix of `frame` (its first 18 octets; the sealed rest is not looked at).
+    /// Never allocates.
+    pub fn parse(frame: &[u8]) -> Result<Self, HeaderError> {
+        let header = SideHeader::parse(frame)?;
+        if header.kind() != SideKind::Answer {
+            return Err(HeaderError::NotAnswer {
+                kind: header.kind(),
+            });
+        }
+        let Some(prefix) = frame.first_chunk::<ANSWER_PREFIX_LEN>() else {
+            return Err(HeaderError::Truncated {
+                have: frame.len(),
+                need: ANSWER_PREFIX_LEN,
+            });
+        };
+        let mut token = [0u8; 8];
+        token.copy_from_slice(&prefix[HEADER_LEN..]);
+        Ok(Self {
+            class: header.class(),
+            id: header.id(),
+            token: u64::from_be_bytes(token),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_octets_are_the_five_the_design_names() {
+    fn the_first_octets_are_the_eight_the_design_names() {
         let id = 0x0102_0304_0506_0708;
         for (class, kind, first) in [
             (SideClass::Datagram, SideKind::Data, DATA_DATAGRAM),
@@ -329,6 +469,9 @@ mod tests {
             (SideClass::Stream, SideKind::Checkpoint, CHECKPOINT),
             (SideClass::Stream, SideKind::Control, CONTROL),
             (SideClass::Datagram, SideKind::Up, UP),
+            (SideClass::Datagram, SideKind::Query, QUERY),
+            (SideClass::Datagram, SideKind::Answer, ANSWER_DATAGRAM),
+            (SideClass::Stream, SideKind::Answer, ANSWER_STREAM),
         ] {
             let h = SideHeader::new(class, kind, id).unwrap();
             assert_eq!(h.first_octet(), first);
@@ -336,8 +479,17 @@ mod tests {
             assert_eq!(SideHeader::parse(&h.encode()), Ok(h));
         }
         assert_eq!(
-            [DATA_DATAGRAM, DATA_STREAM, CHECKPOINT, CONTROL, UP],
-            [0x20, 0x30, 0x31, 0x32, 0x24]
+            [
+                DATA_DATAGRAM,
+                DATA_STREAM,
+                CHECKPOINT,
+                CONTROL,
+                UP,
+                QUERY,
+                ANSWER_DATAGRAM,
+                ANSWER_STREAM
+            ],
+            [0x20, 0x30, 0x31, 0x32, 0x24, 0x25, 0x26, 0x36]
         );
     }
 
@@ -388,7 +540,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(ok, [0x20, 0x24, 0x30, 0x31, 0x32]);
+        assert_eq!(ok, [0x20, 0x24, 0x25, 0x26, 0x30, 0x31, 0x32, 0x36]);
         assert_eq!(
             SideHeader::parse(&header(0x23, 7)),
             Err(HeaderError::UnknownKind { kind: 3 })
@@ -407,6 +559,23 @@ mod tests {
                 class: SideClass::Stream
             })
         );
+        // A QUERY is never a stream; an ANSWER is either.
+        assert_eq!(
+            SideHeader::parse(&header(0x35, 7)),
+            Err(HeaderError::WrongClass {
+                kind: SideKind::Query,
+                class: SideClass::Stream
+            })
+        );
+        // Kind 3 stays unassigned, and so do 7 and up.
+        for code in [3u8, 7, 8, 15] {
+            for class_bit in [0u8, 1] {
+                assert_eq!(
+                    SideHeader::parse(&header((VERSION << 5) | (class_bit << 4) | code, 7)),
+                    Err(HeaderError::UnknownKind { kind: code })
+                );
+            }
+        }
         assert!(SideHeader::new(SideClass::Datagram, SideKind::Control, 1).is_err());
     }
 
@@ -520,6 +689,120 @@ mod tests {
         assert_eq!(
             UpRecord::parse(&data),
             Err(HeaderError::NotUp {
+                kind: SideKind::Data
+            })
+        );
+    }
+
+    fn query_frame(id: u64, token: u64, ttl: u8, tail: usize) -> Vec<u8> {
+        let mut v = header(QUERY, id);
+        v.extend_from_slice(&token.to_be_bytes());
+        v.push(ttl);
+        v.extend_from_slice(&vec![0xee; tail]);
+        v
+    }
+
+    fn answer_frame(first: u8, id: u64, token: u64, tail: usize) -> Vec<u8> {
+        let mut v = header(first, id);
+        v.extend_from_slice(&token.to_be_bytes());
+        v.extend_from_slice(&vec![0xee; tail]);
+        v
+    }
+
+    /// The vectors of channel.md §11.1 for the two frames that carry a token: the first
+    /// octets, the 19- and 18-octet routing prefixes, and the refusals.
+    #[test]
+    fn the_golden_query_and_answer_prefixes() {
+        fn hex(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        assert_eq!([QUERY, ANSWER_DATAGRAM, ANSWER_STREAM], [0x25, 0x26, 0x36]);
+        assert_eq!((QUERY_PREFIX_LEN, ANSWER_PREFIX_LEN), (19, 18));
+        let id = 0x0102_0304_0506_0708;
+        let token = 0x1112_1314_1516_1718;
+
+        let q = QueryPrefix {
+            id,
+            token,
+            ttl_ticks: 30,
+        };
+        assert_eq!(hex(&q.encode()), "0025010203040506070811121314151617181e");
+        let wire = query_frame(id, token, 30, 33);
+        assert_eq!(QueryPrefix::parse(&wire), Ok(q));
+        assert_eq!(QueryPrefix::parse(&q.encode()), Ok(q));
+        let h = SideHeader::parse(&wire).unwrap();
+        assert_eq!(
+            (h.class(), h.kind()),
+            (SideClass::Datagram, SideKind::Query)
+        );
+
+        for class in [SideClass::Datagram, SideClass::Stream] {
+            let a = AnswerPrefix { class, id, token };
+            let first = if class == SideClass::Datagram {
+                "26"
+            } else {
+                "36"
+            };
+            assert_eq!(
+                hex(&a.encode()),
+                format!("00{first}01020304050607081112131415161718")
+            );
+            let wire = answer_frame(a.encode()[1], id, token, 17);
+            assert_eq!(AnswerPrefix::parse(&wire), Ok(a));
+            assert_eq!(AnswerPrefix::parse(&a.encode()), Ok(a));
+            let h = SideHeader::parse(&wire).unwrap();
+            assert_eq!((h.class(), h.kind()), (class, SideKind::Answer));
+        }
+    }
+
+    #[test]
+    fn a_short_or_mistyped_query_or_answer_prefix_is_refused() {
+        let q = query_frame(9, 9, 5, 40);
+        for n in 0..QUERY_PREFIX_LEN {
+            let want = if n < HEADER_LEN {
+                HeaderError::Truncated {
+                    have: n,
+                    need: HEADER_LEN,
+                }
+            } else {
+                HeaderError::Truncated {
+                    have: n,
+                    need: QUERY_PREFIX_LEN,
+                }
+            };
+            assert_eq!(QueryPrefix::parse(&q[..n]), Err(want));
+        }
+        let a = answer_frame(ANSWER_STREAM, 9, 9, 40);
+        for n in 0..ANSWER_PREFIX_LEN {
+            let want = if n < HEADER_LEN {
+                HeaderError::Truncated {
+                    have: n,
+                    need: HEADER_LEN,
+                }
+            } else {
+                HeaderError::Truncated {
+                    have: n,
+                    need: ANSWER_PREFIX_LEN,
+                }
+            };
+            assert_eq!(AnswerPrefix::parse(&a[..n]), Err(want));
+        }
+        assert_eq!(
+            QueryPrefix::parse(&a),
+            Err(HeaderError::NotQuery {
+                kind: SideKind::Answer
+            })
+        );
+        assert_eq!(
+            AnswerPrefix::parse(&q),
+            Err(HeaderError::NotAnswer {
+                kind: SideKind::Query
+            })
+        );
+        let data = header(DATA_DATAGRAM, 9);
+        assert_eq!(
+            QueryPrefix::parse(&data),
+            Err(HeaderError::NotQuery {
                 kind: SideKind::Data
             })
         );
