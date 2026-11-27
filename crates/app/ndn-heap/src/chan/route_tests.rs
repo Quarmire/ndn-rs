@@ -275,6 +275,15 @@ async fn rig(attach: bool) -> Rig {
         cancel,
     };
     shared(&rig).await;
+    // Bob is a writer the record holds no entry of, and his announce makes a listening member ask
+    // him (channel.md 9). These cases count the asks, routes and frames of the asks they make,
+    // so bob's maintenance pass, which announces, does not run; a case that wants the announce
+    // sends it (`chan_announce`).
+    rig.bob()
+        .inner
+        .chan
+        .tick_paused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     rig
 }
 
