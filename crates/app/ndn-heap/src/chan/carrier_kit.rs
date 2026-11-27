@@ -78,6 +78,8 @@ pub(crate) struct LinkStats {
     pub by_count: BTreeMap<u8, u64>,
     /// `CONTROL` frames taken.
     pub control_frames: u64,
+    /// `CHECKPOINT` frames taken.
+    pub checkpoint_frames: u64,
     /// [`Carrier::receiver_added`] calls: how often the stream's gate was armed.
     pub receivers_added: u64,
     /// [`Carrier::datagram_max`] calls: how often the sender asked for the path's size.
@@ -116,16 +118,23 @@ impl LinkState {
             Some(0) => {
                 *self.stats.by_count.entry(frame[19]).or_default() += 1;
             }
+            Some(1) => self.stats.checkpoint_frames += 1,
             Some(2) => self.stats.control_frames += 1,
             _ => {}
         }
     }
 }
 
+/// What a test runs while a datagram is on its way out: after the sender's writer handed it over
+/// and before the link took it, with no lock of the link held. Whatever it does (emit again,
+/// write a checkpoint) happens while the frame is in flight.
+pub(crate) type DatagramHook = Arc<dyn Fn(&Bytes) + Send + Sync>;
+
 /// One direction of a link.
 pub(crate) struct Link {
     state: Mutex<LinkState>,
     stream_room: Notify,
+    hook: Mutex<Option<DatagramHook>>,
 }
 
 impl Link {
@@ -144,7 +153,14 @@ impl Link {
                 stats: LinkStats::default(),
             }),
             stream_room: Notify::new(),
+            hook: Mutex::new(None),
         })
+    }
+
+    /// Run `hook` for every datagram handed to [`Carrier::try_send_datagram`], before the link
+    /// decides what to do with it; `None` takes it away.
+    pub(crate) fn on_datagram(&self, hook: Option<DatagramHook>) {
+        *self.hook.lock() = hook;
     }
 
     /// What the link counted.
@@ -252,6 +268,10 @@ impl Carrier for Link {
     }
 
     fn try_send_datagram(&self, frame: Bytes) -> Result<(), CarrierRefused> {
+        let hook = self.hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(&frame);
+        }
         let mut st = self.state.lock();
         if let Some(max) = st.shrinks.pop_front() {
             st.cfg.datagram_max = max;

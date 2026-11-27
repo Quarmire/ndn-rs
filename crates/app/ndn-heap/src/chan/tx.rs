@@ -289,6 +289,13 @@ struct State {
     big: LatestSet,
     fifo: Fifo,
     datagram_writing: bool,
+    /// The first sequence of the frame the datagram lane has handed to the carrier and has not
+    /// yet recorded in the ring (set when it is packed, under the lock; cleared where it is
+    /// recorded or found not sent). The frame may already be on its way to a receiver while it is
+    /// in none of the ring, the queues or the FIFO: a newer message of a name replaces the
+    /// message a frame in flight carries, and the queue then holds nothing at its sequence. A
+    /// checkpoint must not vouch for a range that covers it ([`TxChannel::watermark`]).
+    datagram_in_flight: Option<u64>,
     /// When an emitter last wrote a frame inline and found nothing else waiting (what
     /// [`BURST_GAP`] is measured from).
     last_inline: Option<Instant>,
@@ -524,6 +531,7 @@ impl TxChannel {
                 big: LatestSet::default(),
                 fifo: Fifo::default(),
                 datagram_writing: false,
+                datagram_in_flight: None,
                 last_inline: None,
                 stream_writing: false,
                 history: History::default(),
@@ -711,14 +719,19 @@ impl TxChannel {
     /// One past the highest sequence a checkpoint written now may vouch for: below the first
     /// sequence still waiting in a queue (a message that waits, or is in a frame being written, may
     /// still be sent as a frame whose `seq0` is that low, and that frame has to be judged by a
-    /// later checkpoint, not this one) and below the next sequence to be taken. Everything under it
-    /// is either in the ring of sent frames or was never going to be sent (replaced, dropped).
+    /// later checkpoint, not this one), below the first sequence of the frame the datagram lane
+    /// has handed to the carrier and not recorded (a newer message of a name replaces the message
+    /// that frame carries, so the queue no longer shows its sequence while the frame is already
+    /// on its way to a receiver, which would then take it for unlisted), and below the next
+    /// sequence to be taken. Everything under it is either in the ring of sent frames or was never
+    /// going to be sent (replaced, dropped).
     fn watermark(st: &State) -> u64 {
         let mut hi = st.next_seq;
         for first in [
             st.latest.iter().next().map(|p| p.seq),
             st.big.iter().next().map(|p| p.seq),
             st.fifo.iter().next().map(Item::seq),
+            st.datagram_in_flight,
         ]
         .into_iter()
         .flatten()
@@ -1332,6 +1345,7 @@ impl TxChannel {
                     self.stats.full.bump();
                     {
                         let mut st = self.state.lock();
+                        st.datagram_in_flight = None;
                         for _ in 0..st.latest.unmark_inflight(&scratch) {
                             self.stats.replaced.bump();
                         }
@@ -1349,6 +1363,7 @@ impl TxChannel {
                 }
                 Err(CarrierRefused::Closed) => {
                     let mut st = self.state.lock();
+                    st.datagram_in_flight = None;
                     st.scratch = scratch;
                     st.lose_pending(&self.stats);
                     st.datagram_writing = false;
@@ -1377,6 +1392,7 @@ impl TxChannel {
         idle_at: Option<Instant>,
     ) -> Option<bool> {
         let mut st = self.state.lock();
+        st.datagram_in_flight = None;
         for &(id, seq) in &scratch {
             st.latest.commit(id, seq);
         }
@@ -1406,6 +1422,7 @@ impl TxChannel {
     /// once more at the new size; messages of a frame that fell a second time go to the stream.
     fn resize(self: &Arc<Self>, scratch: Vec<(u64, u64)>, second: bool) {
         let mut st = self.state.lock();
+        st.datagram_in_flight = None;
         let stream = self.slot.get().is_some_and(|c| c.has_stream());
         for &(id, seq) in &scratch {
             self.stats.resized.bump();
@@ -1531,6 +1548,7 @@ impl TxChannel {
                 continue;
             }
             st.latest.mark_inflight(&scratch);
+            st.datagram_in_flight = Some(head);
             return Pack::Frame(Packed {
                 writer,
                 cipher: Arc::clone(&st.cipher),
