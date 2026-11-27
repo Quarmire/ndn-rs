@@ -2691,6 +2691,7 @@ registered and never under one of the core keywords above.
 | `settle` | 1 s | the wait for the first group vector at an unclean start (§4.8) |
 | `reserve_block` | 1,024 | seqs one durable reservation covers (§4.5) |
 | `watch_queue` | 4,096 (at least 1) | changes a watcher may leave unread before it lags (§10.4) |
+| `heads_read` | 64 MiB (`PAYLOAD_MAX`) | octets of values a stream of every head holds read ahead when the heads of a path change: it reads them in rank order until the next would pass this (the first is always read) and reads on as its reader takes them (§10.3 `get` item 6) |
 | `adopter` | none | adopts persons for the spaces that list them (§9.4); with none, their entries wait |
 | `holders` | empty | devices the host names as places that keep copies (a repo follower, a NAS): asked for held copies (`<H>/32=held/…`) of the entries and pieces a reader wants, and of the certificates a judgement waits for (§9.1), after the vouched heard members and within the same `RELAYS_ASKED` (8) in all; never granters; never this device (§7.4) |
 
@@ -2971,7 +2972,19 @@ ephemeral message of a channel and is never the current value of a path.
    longer among the `HEADS_MAX` (64) of highest rank leaves the stream's set. It tells
    heads, not history: a superseded entry is never told. A path with more than `HEADS_MAX`
    heads is told with its 64 of highest rank and a `GetNotice::HeadsCapped { path, hidden }`
-   says how many are not (when that number changes), so a gap is never silent.
+   says how many are not (when that number changes), so a gap is never silent. *What a
+   stream costs does not grow with the number of heads of a path*, which the register does
+   not cap (a writer makes one head per entry it signs without naming the others; the
+   register keeps a reference per head, §10.1): the change the register reports and the event
+   a stream queues hold the 64 heads of highest rank and how many there are in all, not every
+   head (so a queue of `watch_queue` events holds at most 64 head references each); the
+   values of the heads told are read in rank order and at most `Config::heads_read` octets
+   ahead (the first one always, whole), the rest as the reader takes what was read, so
+   64 values of 64 MiB are never held at once; and the pieces of a head that does not win are
+   fetched only for the 64 told (a head that rises into them is fetched then), not for the
+   heads beyond them. `kept_all` reads every head, also past the 64, and for those that
+   are values in pieces not whole here it asks for the pieces when it answers
+   `Unavailable`, while a stream of every head is open.
 7. *`supersedes` is stream-relative.* It lists the heads **this stream had told at the
    path** that are no longer heads once this item applies, whatever chain of entries lies
    between (a head `M2` that superseded `M` that superseded `A`, told to a reader that never
@@ -3117,7 +3130,9 @@ changes of a path's **set of heads** (a path whose heads differ before and after
 winner or not), not of its winner, and the stream tells them by comparing the set with what
 it told (§10.3 `get` items 6 and 7). The register reports them with each applied or
 withdrawn entry; a queue that did not ask for them is never given them, and `watch` is told
-exactly what it was.
+exactly what it was. The event a queue holds is the 64 heads of highest rank of the path and
+their number (§10.3 `get` item 6): the register's change holds no more, so a path with
+thousands of heads costs a queue what a path with 64 does.
 
 ### 10.5 Errors
 
@@ -3216,6 +3231,20 @@ decided show what they decided before.
   the space write at that path (§1.7, no per-path access control).
 - **A slow or hostile watcher** is bounded by `watch_queue`: it lags, it does not
   grow without bound and does not slow any other (§10.4).
+- **Many heads of one path.** A writer can make as many heads of one path as it
+  signs entries (an entry's `after` need not name the others, and `put_merged` with no ids
+  names none). The register holds a reference per head and rewrites the path's `heads/`
+  record at each change (O(heads), as it always did, §10.1); that is the **accepted
+  residual**, paid once per entry the writer signed (a signature each, by a writer the
+  space lists), and not capped in the register: the heads are a function of the set of
+  applied entries (§10.1), and a head dropped for a cap would have to be found again when
+  the better ranked head that displaced it is withdrawn. What a stream of every
+  head pays is bounded independently of it: events hold 64 heads and a count, values are read
+  under `heads_read`, and pieces of heads beyond the 64 told are not fetched (§10.3 `get`
+  item 6). `kept_all` is the exception, accepted: it answers with the value of every head
+  (memory proportional to the heads the writer made, at the host's own call, and its pieces
+  are owed for all of them), so a host that must stay bounded under a hostile writer reads
+  with `get` and `Heads::All` (64 heads, `heads_read`) and merges in rounds.
 - **`Item.by` is the namespace of the held context governing the writer's
   device name** (§9.1), not a claim in the entry: a host that shows who wrote a
   value shows `by` and `writer`, and not the entry's bytes.

@@ -40,6 +40,7 @@ use ndn_foundation_types::Name;
 use ndn_sync::StoreOp;
 use ndn_tlv::TlvWriter;
 
+use crate::HEADS_MAX;
 use crate::store::{Corrupt, heads_key, supers_key};
 use crate::wire::{
     AFTER_MAX, EntryRef, WireError, fields, once, read_name, read_ref, tlv, write_path, write_ref,
@@ -122,15 +123,23 @@ pub(crate) struct ValueChange {
 /// A change of which entries are the heads of a path, whether or not the winner moved: a head
 /// that does not win arrives, a head is superseded, a withdrawn entry gives its place back.
 /// Only [`Effects::heads`] says it; a feed that asked for every head (`GetOptions::heads`)
-/// reads it, and the winner-only ones are told what they always were ([`ValueChange`]).
+/// reads it, and the winner-only ones are told what they always were ([`ValueChange`]). It holds
+/// the [`HEADS_MAX`] heads of highest rank and how many there are in all, not every head: a
+/// writer can make as many heads of one path as it signs entries, and what a change costs, and
+/// a queue of them, must not grow with that.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HeadsChange {
     /// The path.
     pub path: Name,
-    /// The entries that were its heads before the call, in rank order (the winner first).
+    /// The [`HEADS_MAX`] of highest rank of the entries that were its heads before the call,
+    /// in rank order (the winner first).
     pub before: Vec<EntryRef>,
-    /// Its heads after the call, in rank order (the winner first); empty when it has none.
+    /// The [`HEADS_MAX`] of highest rank of its heads after the call, in rank order (the
+    /// winner first); empty when it has none.
     pub after: Vec<Head>,
+    /// How many heads the path has after the call: more than `after` holds when the path has
+    /// more than [`HEADS_MAX`].
+    pub total: usize,
 }
 
 /// What [`Register::apply`] and [`Register::withdraw`] ask of the log.
@@ -168,8 +177,16 @@ pub(crate) struct Register {
     at: HashMap<EntryRef, Name>,
 }
 
-/// The heads of each path a call touches, in rank order, as they were before it.
-type Touched = BTreeMap<Name, Vec<Head>>;
+/// The heads of each path a call touches as they were before it: the [`HEADS_MAX`] of highest
+/// rank, and how many there were in all.
+type Touched = BTreeMap<Name, (Vec<Head>, usize)>;
+
+/// The [`HEADS_MAX`] heads of highest rank of `heads` (rank order, the winner first): all a
+/// feed of every head tells of a path, and so all that a change of heads and a queued event
+/// hold of it, whatever the number of heads the path has.
+pub(crate) fn highest(heads: &[Head]) -> &[Head] {
+    &heads[..heads.len().min(HEADS_MAX)]
+}
 
 /// The entries that name an entry in their `after` (read from the store).
 type Namers<'a> = &'a dyn Fn(&EntryRef) -> Vec<EntryRef>;
@@ -372,9 +389,10 @@ impl Register {
 
     /// Remember the heads of `path` as they are now, once per call.
     fn note(&self, touched: &mut Touched, path: &Name) {
-        touched
-            .entry(path.clone())
-            .or_insert_with(|| self.heads_of(path).to_vec());
+        touched.entry(path.clone()).or_insert_with(|| {
+            let heads = self.heads_of(path);
+            (highest(heads).to_vec(), heads.len())
+        });
     }
 
     fn add_head(&mut self, touched: &mut Touched, head: Head) {
@@ -401,7 +419,7 @@ impl Register {
     /// heads changed.
     fn finish(&self, touched: Touched, mut writes: Vec<StoreOp>) -> Effects {
         let (mut changes, mut moved) = (Vec::new(), Vec::new());
-        for (path, before) in touched {
+        for (path, (before, was_total)) in touched {
             let path_tlv = path_tlv(&path);
             let key = heads_key(&self.space, &path_tlv);
             let heads = self.heads_of(&path);
@@ -414,15 +432,18 @@ impl Register {
             if was.as_ref().map(|h| &h.entry) != now.as_ref().map(|h| &h.entry) {
                 changes.push(ValueChange { was, now });
             }
-            if before
-                .iter()
-                .map(|h| &h.entry)
-                .ne(heads.iter().map(|h| &h.entry))
+            let top = highest(heads);
+            if was_total != heads.len()
+                || before
+                    .iter()
+                    .map(|h| &h.entry)
+                    .ne(top.iter().map(|h| &h.entry))
             {
                 moved.push(HeadsChange {
                     path,
                     before: before.into_iter().map(|h| h.entry).collect(),
-                    after: heads.to_vec(),
+                    after: top.to_vec(),
+                    total: heads.len(),
                 });
             }
         }

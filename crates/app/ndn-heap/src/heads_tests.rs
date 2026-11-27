@@ -23,7 +23,7 @@ use crate::register::EntryId;
 use crate::space::{Heap, PutOptions};
 use crate::surface_tests::{forge, put_body, take};
 use crate::test_kit::n;
-use crate::wire::{Entry, EntryRef, Prev, log_name};
+use crate::wire::{Body, Entry, EntryRef, Payload, Prev, PutBody, log_name};
 use crate::{Config, Merged};
 
 // -- What the cases are made of ----------------------------------------------------------------
@@ -891,4 +891,107 @@ async fn put_merged_refuses_a_superseded_id_of_another_path_and_a_non_write() {
     );
     assert_eq!(refused.next(), NextStep::FixRequest);
     assert_eq!(f.own_seq(), before, "a refusal signs nothing");
+}
+
+impl Fork {
+    /// Forge forging device `k`'s next entry: a blob at `path` (its pieces are nowhere), its
+    /// digest ranking under `bound` when there is one.
+    fn forged_blob(&mut self, k: usize, path: &str, bound: Option<&[u8; 32]>) -> (EntryId, Bytes) {
+        for i in 0..16_384u32 {
+            let (seq, digest) = self.last[k];
+            let prev = digest.map(|digest| Prev { digest, seq: None });
+            let mut root = [0u8; 32];
+            root[..4].copy_from_slice(&i.to_be_bytes());
+            let payload = Payload::Blob {
+                size: 1 << 20,
+                root,
+            };
+            let body = Body::Put(PutBody {
+                path: n(path),
+                payload,
+            });
+            let (id, packet) = forge(&self.devs[k], seq + 1, prev, vec![], body);
+            if bound.is_none_or(|bound| id.digest < *bound) {
+                self.last[k] = (seq + 1, Some(id.digest));
+                return (id, packet);
+            }
+        }
+        panic!("16384 blobs and none ranks under the bound");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_head_beyond_the_64_told_is_not_fetched() {
+    let mut f = fork(1, cfg()).await;
+    let _every = f.heap.get(everything(), all()).unwrap();
+    let mut lowest = [0xff; 32];
+    for _ in 0..crate::HEADS_MAX {
+        let (id, packet) = f.forged_blob(1, "/p", None);
+        lowest = lowest.min(id.digest);
+        f.apply(packet).await;
+    }
+    assert_eq!(
+        f.heap.inner.unassembled().len(),
+        crate::HEADS_MAX,
+        "the 64 heads a feed tells are fetched"
+    );
+    // Three more heads that all rank under those 64: nobody is told them.
+    for _ in 0..3 {
+        let (id, packet) = f.forged_blob(1, "/p", Some(&lowest));
+        lowest = lowest.min(id.digest);
+        f.apply(packet).await;
+    }
+    let held = f.heap.inner.log.lock().register.heads_of(&n("/p")).len();
+    assert_eq!(held, crate::HEADS_MAX + 3);
+    let owed = f.heap.inner.unassembled().len();
+    assert_eq!(
+        owed,
+        crate::HEADS_MAX,
+        "{owed} values are fetched: a head the feed will not tell is not fetched for it"
+    );
+
+    // `kept_all` reads every head, also past the 64: it says the pieces are not here yet, and
+    // makes them wanted, so that reading again finds them once fetched.
+    let refused = f.heap.kept_all(&n("/p")).await.unwrap_err();
+    assert!(
+        matches!(refused, HeapError::Unavailable { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(refused.next(), NextStep::RetryLater);
+    let owed = f.heap.inner.unassembled().len();
+    assert_eq!(
+        owed,
+        crate::HEADS_MAX + 3,
+        "{owed} values are fetched after a read of every head"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_all_feed_reads_ahead_no_more_than_its_byte_budget() {
+    let mut config = cfg();
+    config.heads_read = 250;
+    let mut f = fork(1, config).await;
+    for i in 0..6 {
+        f.head(1, "/p", &format!("{i}{}", "x".repeat(99)), &[])
+            .await;
+    }
+    let order = f.heads_at("/p").await;
+    let heap = &f.heap;
+    let mut feed = heap
+        .inner
+        .kept_feed(&heap.node, everything(), Heads::All)
+        .unwrap();
+    let mut told = Vec::new();
+    while let Some(got) = feed.listing_next() {
+        let ahead = feed.read_ahead();
+        assert!(
+            ahead <= 250,
+            "{ahead} octets of values read ahead with a budget of 250"
+        );
+        told.push(kept(&got).id.clone());
+    }
+    assert_eq!(
+        told, order,
+        "every head, in rank order, whatever the budget"
+    );
 }

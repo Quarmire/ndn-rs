@@ -1729,3 +1729,29 @@ async fn changes_a_kept_feed_does_not_want_never_take_a_place_in_its_queue() {
         .expect("an item");
     assert_eq!((got.path, got.bytes), (n("/a"), bytes("wanted")));
 }
+
+#[test]
+fn a_heads_event_holds_the_heads_of_highest_rank_and_how_many_there_are() {
+    let max = crate::HEADS_MAX;
+    let heads: Vec<Head> = (0..max + 6)
+        .map(|i| Head {
+            entry: crate::wire::EntryRef {
+                device: n("/alice/d"),
+                seq: i as u64 + 1,
+                digest: [(max + 6 - i) as u8; 32],
+            },
+            path: n("/p"),
+            person: n("/alice"),
+            removal: false,
+            size: 1,
+        })
+        .collect();
+    let event = HeadsEvent::of(&n("/p"), &heads);
+    assert_eq!(event.total, max + 6);
+    assert_eq!(event.now.len(), max, "{} heads held", event.now.len());
+    assert_eq!(
+        event.now[..],
+        heads[..max],
+        "the highest ranked, the winner first"
+    );
+}

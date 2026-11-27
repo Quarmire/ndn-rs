@@ -239,8 +239,10 @@ fn a_head_that_does_not_win_is_a_heads_change_and_no_value_change() {
         path,
         before,
         after,
+        total,
     } = r.moved.last().unwrap();
     assert_eq!(path, &n("/f"));
+    assert_eq!(*total, 2);
     assert_eq!(before, &vec![a.id.clone()]);
     let after: Vec<&EntryRef> = after.iter().map(|h| &h.entry).collect();
     assert_eq!(after, vec![&a.id, &b.id], "the winner first");
@@ -836,4 +838,31 @@ proptest! {
         prop_assert_eq!(a.persisted(), expected);
         prop_assert_eq!(winners(&a.reg), winners(&b.reg));
     }
+}
+
+#[test]
+fn a_heads_change_holds_the_heads_of_highest_rank_and_how_many_there_are() {
+    // Concurrent heads one after another, each ranking above the last: the change that
+    // reports them is as large as what a feed tells, however many heads the path has.
+    let max = crate::HEADS_MAX;
+    let mut r = Replica::new();
+    for i in 0..max + 6 {
+        let e = ent(1, 1, i as u64 + 1, i as u8 + 1, "/f", "v", &[]);
+        r.take(&e);
+    }
+    let change = r.moved.last().unwrap();
+    assert_eq!(change.total, max + 6, "the number of heads is said");
+    assert_eq!(change.after.len(), max, "{} heads held", change.after.len());
+    assert!(change.before.len() <= max, "{} before", change.before.len());
+    let top: Vec<&EntryRef> = r.reg.heads_of(&n("/f"))[..max]
+        .iter()
+        .map(|h| &h.entry)
+        .collect();
+    let held: Vec<&EntryRef> = change.after.iter().map(|h| &h.entry).collect();
+    assert_eq!(held, top, "the heads of highest rank, the winner first");
+    assert_eq!(
+        r.reg.heads_of(&n("/f")).len(),
+        max + 6,
+        "the register keeps every head"
+    );
 }

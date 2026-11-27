@@ -36,13 +36,15 @@ use ndn_sync::StoreOp;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
-use crate::chan::verbs::{GetNotice, Got, HEADS_MAX, Heads, Kept, Kind as GotKind, Select};
+#[cfg(doc)]
+use crate::chan::verbs::HEADS_MAX;
+use crate::chan::verbs::{GetNotice, Got, Heads, Kept, Kind as GotKind, Select};
 use crate::error::{HeapError, Refusal};
 use crate::fold::Readers;
 use crate::log::{Alert, Blob, Change, Effects, Frontier, Log, Members, Step};
 use crate::node::NodeInner;
 use crate::pieces;
-use crate::register::{EntryId, Head, HeadsChange, Item};
+use crate::register::{EntryId, Head, HeadsChange, Item, highest};
 use crate::reserve::{FlushError, Publisher, Ticket};
 use crate::rt;
 use crate::seal;
@@ -148,10 +150,25 @@ enum Slot {
 
 /// The heads of a path as they were after a change of them: references (entries, their writers
 /// and what they remove), never values; a feed reads a value from the store when it tells it.
+/// It holds the [`HEADS_MAX`] heads of highest rank and how many there are in all, which is all
+/// a feed tells, so a queue of them costs the same whatever the number of heads of a path.
 pub(crate) struct HeadsEvent {
     path: Name,
-    /// The heads, the winner first.
+    /// The [`HEADS_MAX`] heads of highest rank, the winner first.
     now: Vec<Head>,
+    /// How many heads the path has in all.
+    total: usize,
+}
+
+impl HeadsEvent {
+    /// The event of the heads `heads` of `path` (the winner first).
+    fn of(path: &Name, heads: &[Head]) -> HeadsEvent {
+        HeadsEvent {
+            path: path.clone(),
+            now: highest(heads).to_vec(),
+            total: heads.len(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -428,6 +445,17 @@ impl KeptFeed {
         self.queue.waker.register(waker);
     }
 
+    /// Bytes of values this feed holds read and has not given yet: what
+    /// [`Config::heads_read`](crate::node::Config) bounds.
+    #[cfg(test)]
+    pub(crate) fn read_ahead(&self) -> u64 {
+        self.ready
+            .iter()
+            .filter_map(|ready| ready.as_ref().ok())
+            .map(|got| got.bytes.len() as u64)
+            .sum()
+    }
+
     /// The next head of the listing, `None` once it is told. A value in pieces is read now, and
     /// told only while it is the head of its path and whole (it is told as a change when its
     /// last piece is held). A notice the listing makes is held for [`Self::step`].
@@ -446,7 +474,11 @@ impl KeptFeed {
                 None => {}
             }
             match self.listed.pop_front()? {
-                Slot::Heads(event) => self.tell_heads(&event.path, &event.now),
+                Slot::Heads(event) => {
+                    if let Some(rest) = self.tell_heads(&event) {
+                        self.listed.push_front(Slot::Heads(rest));
+                    }
+                }
                 slot => {
                     let Some(Change::Put(item)) = self.resolve(slot) else {
                         continue;
@@ -532,7 +564,7 @@ impl KeptFeed {
         }
     }
 
-    /// Tell what the heads `now` of `path` (the winner first) are to a feed that tells every
+    /// Tell what the heads of `event` (the winner first) are to a feed that tells every
     /// head, by comparing them with what it told at the path:
     ///
     /// - each of the [`HEADS_MAX`] of highest rank it has not told is an item, the winner among
@@ -543,29 +575,41 @@ impl KeptFeed {
     ///   value in pieces that is not whole yet is what will replace them;
     /// - a path with more heads than are told says how many are not, when that number changes.
     ///
-    /// The items and notices are queued in `ready`, in the order they are told.
-    fn tell_heads(&mut self, path: &Name, now: &[Head]) {
+    /// The items and notices are queued in `ready`, in the order they are told. The values are
+    /// read in rank order while they stay within [`Config::heads_read`](crate::node::Config)
+    /// (the first is always read): what is not read is returned as the event to tell next, once
+    /// the reader has taken what was queued, so a path of many large heads is never held read
+    /// whole at once.
+    fn tell_heads(&mut self, event: &Arc<HeadsEvent>) -> Option<Arc<HeadsEvent>> {
+        let (path, now) = (&event.path, &event.now[..]);
         if !self.select.matches(path) {
-            return;
+            return None;
         }
-        let shown = &now[..now.len().min(HEADS_MAX)];
-        let hidden = (now.len() - shown.len()) as u32;
+        let hidden = (event.total - now.len()) as u32;
         let told: &[Delivered] = self.told.get(path).map_or(&[], Vec::as_slice);
         let mut fresh: Vec<(&Head, Bytes)> = Vec::new();
         let mut pending = false;
-        for head in shown {
+        let (budget, mut spent, mut deferred) = (self.node.config.heads_read, 0u64, false);
+        for head in now {
             if told.iter().any(|d| d.id == head.entry) {
                 continue;
             }
+            if !fresh.is_empty() && spent.saturating_add(head.size) > budget {
+                deferred = true;
+                break;
+            }
             match self.read_head(head) {
-                HeadRead::Value(bytes) => fresh.push((head, bytes)),
+                HeadRead::Value(bytes) => {
+                    spent = spent.saturating_add(bytes.len() as u64);
+                    fresh.push((head, bytes));
+                }
                 HeadRead::Pending => pending = true,
                 HeadRead::Absent => {}
             }
         }
         let retired: Vec<EntryId> = told
             .iter()
-            .filter(|d| !shown.iter().any(|h| h.entry == d.id))
+            .filter(|d| !now.iter().any(|h| h.entry == d.id))
             .map(|d| d.id.clone())
             .collect();
         if !fresh.is_empty() {
@@ -610,6 +654,9 @@ impl KeptFeed {
                 ids: retired,
             }));
         }
+        if deferred {
+            return Some(Arc::clone(event));
+        }
         match (hidden, self.capped.get(path).copied()) {
             (0, Some(_)) => {
                 self.capped.remove(path);
@@ -623,6 +670,7 @@ impl KeptFeed {
             }
             _ => {}
         }
+        None
     }
 
     /// The next thing the changes say, without waiting; the caller has registered its waker
@@ -658,11 +706,17 @@ impl KeptFeed {
                 },
             };
             match slot {
-                Slot::Heads(event) => self.tell_heads(&event.path, &event.now),
+                Slot::Heads(event) => {
+                    if let Some(rest) = self.tell_heads(&event) {
+                        self.again.push_front(Slot::Heads(rest));
+                    }
+                }
                 // A value in pieces became whole: it is told if it is a head still.
                 Slot::Blob(blob) if self.heads == Heads::All => {
-                    if let Some(event) = self.space.blob_heads(&blob) {
-                        self.tell_heads(&event.path, &event.now);
+                    if let Some(event) = self.space.blob_heads(&blob)
+                        && let Some(rest) = self.tell_heads(&event)
+                    {
+                        self.again.push_front(Slot::Heads(rest));
                     }
                 }
                 slot => {
@@ -758,10 +812,7 @@ impl KeptFeed {
         if self.heads == Heads::All {
             let mut owed: BTreeMap<Name, Slot> = BTreeMap::new();
             let mut owe = |path: &Name, now: &[Head]| {
-                let event = HeadsEvent {
-                    path: path.clone(),
-                    now: now.to_vec(),
-                };
+                let event = HeadsEvent::of(path, now);
                 owed.insert(path.clone(), Slot::Heads(Arc::new(event)));
             };
             match &self.select {
@@ -845,8 +896,9 @@ impl SpaceInner {
     /// The kept part of an `Items` over `select`: the heads under it now, in path order, and a
     /// watcher registered in the same step under the log's lock, so no change lies between the
     /// listing and the queue. `heads` says which: the winner of each path, or every head. A
-    /// feed of every head also owes the values in pieces of the heads that do not win: they are
-    /// gathered (they are fetched when only a winner is wanted). [`HeapError::Sealed`] for a
+    /// feed of every head also owes the values in pieces of the heads that do not win and are
+    /// among the [`HEADS_MAX`] of highest rank (the ones it tells): they are gathered (they are
+    /// fetched when only a winner is wanted). [`HeapError::Sealed`] for a
     /// person a sealed space does not list as a reader.
     pub(crate) fn kept_feed(
         self: &Arc<Self>,
@@ -883,15 +935,12 @@ impl SpaceInner {
                 Heads::All => {
                     let mut list = |path: &Name, now: &[Head]| {
                         // The winner's pieces are gathered as any winner's are.
-                        for head in now.iter().skip(1).filter(|head| !head.removal) {
+                        let event = HeadsEvent::of(path, now);
+                        for head in event.now.iter().skip(1).filter(|head| !head.removal) {
                             if let Some(Err(blob)) = log.shown(head) {
                                 gather.push(blob);
                             }
                         }
-                        let event = HeadsEvent {
-                            path: path.clone(),
-                            now: now.to_vec(),
-                        };
                         listed.push_back(Slot::Heads(Arc::new(event)));
                     };
                     match &select {
@@ -951,19 +1000,21 @@ impl SpaceInner {
 
     /// The heads of the path of the value in pieces `blob`, if it is one of them now: what a
     /// feed of every head reads again when the value became whole.
-    fn blob_heads(&self, blob: &Blob) -> Option<HeadsEvent> {
+    fn blob_heads(&self, blob: &Blob) -> Option<Arc<HeadsEvent>> {
         let log = self.log.lock();
         let head = log.register.head(&blob.id)?;
-        Some(HeadsEvent {
-            path: head.path.clone(),
-            now: log.register.heads_of(&head.path).to_vec(),
-        })
+        Some(Arc::new(HeadsEvent::of(
+            &head.path,
+            log.register.heads_of(&head.path),
+        )))
     }
 
     /// Tell the feeds of every head that the heads of a path changed. Nothing is read or built
-    /// for a space with no such feed. A head that is new and does not win is a value in pieces
-    /// to gather when it is one (the winner's is [`Effects::blobs`]): they are added to
-    /// `blobs`.
+    /// for a space with no such feed. A head among the [`HEADS_MAX`] of highest rank that is new
+    /// there (the change holds no more) and does not win is a value in pieces to gather when it
+    /// is one (the winner's is [`Effects::blobs`]): they are added to `blobs`. A head beyond
+    /// them is not told by any feed, so its pieces are not fetched for one; they are when it
+    /// rises into the 64.
     fn tell_heads(&self, log: &Log, change: HeadsChange, blobs: &mut Vec<Blob>) {
         let mut watchers = self.watchers.lock();
         watchers.retain(|q| !q.is_closed());
@@ -983,6 +1034,7 @@ impl SpaceInner {
         let event = Arc::new(HeadsEvent {
             path: change.path,
             now: change.after,
+            total: change.total,
         });
         for q in wanting {
             q.put(Slot::Heads(Arc::clone(&event)));
@@ -2155,15 +2207,17 @@ impl Heap {
     /// the network. Empty when the path has no head. A removal that is a head is an item with
     /// empty bytes (it is concurrent with the values: `put_merged` names it like any head).
     /// Unlike [`Self::kept`] it returns more than one value when writers wrote concurrently,
-    /// every one of them (more than the [`HEADS_MAX`](crate::HEADS_MAX) a stream
+    /// every one of them (more than the [`HEADS_MAX`] a stream
     /// tells, if there are): it is the point read for the library that merges (the stream is
     /// `get` with [`Heads::All`](crate::Heads)).
     ///
     /// [`HeapError::Sealed`] when the space is sealed and this node's person is outside its
     /// audience, or when an entry is held closed (its path is unknown), as `kept`;
     /// [`HeapError::Unavailable`] when a head's value in pieces is not whole here: a head that
-    /// does not win is gathered while a [`Heads::All`](crate::Heads) stream is open, so
-    /// open one to have them fetched.
+    /// does not win is gathered while a [`Heads::All`](crate::Heads) stream is open, and only
+    /// among the [`HEADS_MAX`] of highest rank; this call also owes the pieces
+    /// of every head it finds not whole (all of them, past the 64 as well), which are fetched
+    /// while such a stream is open: open one and read again.
     pub async fn kept_all(&self, path: &Name) -> Result<Vec<Item>, HeapError> {
         let inner = &self.inner;
         let heads: Vec<Head> = {
@@ -2175,6 +2229,7 @@ impl Heap {
             log.register.heads_of(path).to_vec()
         };
         let mut items = Vec::with_capacity(heads.len());
+        let mut missing: Vec<Blob> = Vec::new();
         for head in &heads {
             if head.removal {
                 items.push(head.item(Bytes::new()));
@@ -2183,6 +2238,9 @@ impl Heap {
             let shown = inner.log.lock().shown(head);
             match shown {
                 Some(Ok(item)) => items.push(item),
+                Some(Err(blob)) if !inner.is_whole(&self.node, &blob) => missing.push(blob),
+                // The answer is an error already: a value is not read for it.
+                Some(Err(_)) if !missing.is_empty() => {}
                 Some(Err(blob)) => items.push(head.item(inner.read_blob(&self.node, &blob)?)),
                 None => {
                     return Err(HeapError::Unavailable {
@@ -2190,6 +2248,17 @@ impl Heap {
                     });
                 }
             }
+        }
+        if let Some(first) = missing.first() {
+            let name = first.id.name(&inner.name);
+            // The reader wants them: they are owed their pieces, which are fetched while a
+            // stream of every head is open, past the 64 it tells as well.
+            inner
+                .owed
+                .lock()
+                .extend(missing.into_iter().map(|b| (b.id.clone(), b)));
+            self.node.nudge(&inner.name);
+            return Err(HeapError::Unavailable { name });
         }
         Ok(items)
     }

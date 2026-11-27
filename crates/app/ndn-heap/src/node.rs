@@ -118,6 +118,11 @@ pub struct Config {
     /// How many changes a watcher may leave unread before it is told it
     /// lagged; at least 1.
     pub watch_queue: usize,
+    /// How many bytes of values a feed of every head (`GetOptions::heads`) holds read ahead
+    /// when the heads of a path change: it reads the heads in rank order until the next would
+    /// pass this (the first is always read) and reads on as its reader takes them, so a path
+    /// with many large heads is never held whole at once.
+    pub heads_read: u64,
     /// Devices the host names as places that keep copies of the space's entries and pieces (a
     /// repo follower, a NAS), asked for held copies (`<H>/32=held/…`) after the heard
     /// members that vouch, within the same eight asks in all (spec §7.4); and for the
@@ -155,6 +160,7 @@ impl Config {
             settle: Duration::from_secs(1),
             reserve_block: 1024,
             watch_queue: 4096,
+            heads_read: crate::wire::PAYLOAD_MAX,
             holders: Vec::new(),
             adopter: None,
             channel: crate::chan::config::ChannelConfig::default(),
