@@ -1240,9 +1240,9 @@ The cause is that a drain is about one frame long on a single worker, so nothing
 
 ### 16.6 Where this leaves the gates
 
-Against the targets of the design note every performance gate **except 8 B is missed**: the 64-octet half round trip (1.37 cold and 1.24 hot against 1.1), the 64-octet rate (1.837 M, about 5 % under the 1.94 M compared against), 128 octets to 1 KiB (0.23 to 0.449 of the raw datagram against 0.9) and 8 KiB (0.60 of the raw stream at 9,000 and 0.83 at 1,452 against 0.9). 8 B passes (2.110 M at 9,000, 1.07 times the figure compared against). What remains of the gap is the cold footprint of the idle path (latency) and the two AEAD passes on one worker (throughput), both of §16.3. What is not yet done and would help: the receiver's open off the reader thread (which needs `deliver_frame` to stop returning a per-frame result), the 4-octet prefix copy of ndn-ext's `side.rs`, a sender cache in `Heap::sender` (0.07 µs), a smaller cold footprint of the idle path, and striping a link over several connections (the design note's §17.6, undecided).
+These verdicts are **superseded by the performance pass (§18)**: every gate was measured again at the pins and again after the pass (§18.2), the causes of the gaps were attributed by profile (§18.3, §18.4) and what remains is stated with numbers (§18.5). The figures of §16.2 to §16.5 stay as the record of the tuning pass.
 
-**The owner's decision** is to finish stages 4–7 first and then to do **one focused performance pass**; the open items above are left to that pass.
+**The owner's decision** was to finish stages 4–7 first and then to do **one focused performance pass**; §18 is that pass.
 
 ### 16.7 Stages 4 and 5
 
@@ -1266,7 +1266,7 @@ Against the targets of the design note every performance gate **except 8 B is mi
 - **Hot latency read +18 % and +21 % in the two runs. Cold latency is not separable:** the first run read +21 %, the second −1.5 %, and the range of the pair ratios is wide.
 - **Per-message CPU moves 1 to 4 %.** That row uses a carrier with no stream, so it carries no checkpoints.
 - **The raw carrier is unchanged**, which clears the carrier and the host: a separate `carrier_bench` control (defaults, MTU 1,452, so not comparable to §16.2's raw rows) read 28.5 µs cold and 28.9 µs hot, and baseline against current throughput 0.974 (1 KiB datagram), 0.999 (1 KiB stream) and 1.009 (8 KiB stream). The channel against the raw half round trip: cold 1.16 in both trees, hot 1.17 in the baseline and 1.39 now.
-- **The cause was not isolated.** The checkpoint rows below point at checkpoints [INFERENCE: not shown].
+- **The cause of the receiver's share was found by the performance pass (§18.3):** `Verify::forget_farthest` and `Verify::judge` walked every settled slot of the 4,096-slot store on every frame and every checkpoint (14 % of all samples at 64 B). The 0.86 to 0.91 itself was not measured again against a stage-3 build.
 - **An oddity, not diagnosed:** in the current tree the per-message row delivers 99.97 to 99.99 % of the messages (the baseline 100 %), and the shortfall grows with the run [INFERENCE: a non-data frame takes a tap's release slot and `Latest` supersedes that round].
 
 **The cost of checkpoints** was measured in a forwarder-attached direct shape (a sender and a receiver, each on its own forwarder, over one real QUIC link), comparing the default period of 20 ms with the largest, 2,000 ms, 3 interleaved pairs. It is the **difference** between two periods, not against a build with no checkpoints, and it includes the stream writes, the wake-ups and the hashing of frames, not only the signatures. Share of one core:
@@ -1276,7 +1276,7 @@ Against the targets of the design note every performance gate **except 8 B is mi
 | 1,000 messages/s | 3.75 % | 3.87 % | 5.54 % | 3.83 % | sender −0.12, **receiver +1.71** |
 | 100 messages/s | 1.48 % | 1.11 % | 1.77 % | 1.04 % | sender +0.37, **receiver +0.73** |
 
-- **The design target** was under 0.5 % of a core for each active sender, on both sides. **The sender meets it** (+0.37 % at worst). **The receiver misses it:** +0.73 % at 100 messages/s and +1.71 % at 1,000.
+- **The design target** was under 0.5 % of a core for each active sender, on both sides. **The sender meets it** (+0.37 % at worst). **The receiver missed it:** +0.73 % at 100 messages/s and +1.71 % at 1,000. After the performance pass the receiver is at +0.52 % and +0.69 % (§18.6).
 - **Throughput** in the same shape at 20 ms is 0.75 (64 B) and 0.77 (1 KiB) of the 2,000 ms run; the 64 B p50 is 39.6 against 35.9 µs and p99 56 against 46 µs. Part of the 2 s gain is probably that the sender's ring evicts frames before they are hashed, so it is not a clean cost of signing [INFERENCE: the cost follows the rate of frames, which is frame hashing, §15.3].
 
 **Through a relay** (`chan_relay`: a sender, a relay and receivers A and B, each on its own forwarder, joined by real QUIC links; the relay holds no identity, trust or data layer, only routes and the side table; forwarder-attached nodes). Medians of 3 runs (14 for the latency rows); ranges in brackets:
@@ -1300,17 +1300,17 @@ Against the targets of the design note every performance gate **except 8 B is mi
 - **Throughput, 64 B**, medians of 3 [min, max]: A 410 k [394 k, 816 k], B 583 k [389 k, 833 k], C 440 k [437 k, 446 k], D 567 k [387 k, 739 k] messages/s, 1.98 M [1.63 M, 2.83 M] in all; one receiver behind a relay 909 k [905 k, 921 k]; direct 1.20 M [875 k, 1.27 M]. The sender emitted 1.1 to 1.5 M messages/s in each; the receivers' app-face inboxes drop at saturation, so the per-receiver figures are shares of that.
 - **Half round trip, 64 B p50 [min, max] (p99 median)**: direct 53.2 µs [51.4, 57.6] (106 µs); one relay, one receiver 102.5 µs [88.8, 134.0] (287 µs); four receivers A 111.8 µs [102.3, 160.0] (305 µs), B 133.6 µs [122.6, 170.7] (471 µs), C 161.4 µs [158.3, 166.9] (529 µs), D 97.7 µs [94.3, 148.0] (214 µs). The relay hop costs about 50 µs on the median over the direct link on this host. The four-receiver medians sit between 98 and 161 µs, about one relay hop above the direct link for the best and about two for the worst; the ranges of the repetitions overlap those of the one-receiver row, so **the rung does not show the fourth receiver's latency to be worse than one relay hop gives for the first**, and it does not show it to be equal either: a quiet, pinned run is needed to decide that, and none was made. The direct figure here (53 µs) is above the one-link row of the table above (36.2 µs) [INFERENCE: because of the load of this run], so no gate against stage 3's latency is claimed from these numbers.
 
-**Not run.** N1 (there is no such harness in ndn-ext: the `ndn-link` ladder measures something else) and any radio path (the radio sinks, §14.9, are tested in ndn-radio against test bearers; no channel was measured over a radio). `Trust::Verified`'s latency and a real network interface were not measured.
+**Not run.** N1 (there is no such harness in ndn-ext: the `ndn-link` ladder measures something else) and any radio path (the radio sinks, §14.9, are tested in ndn-radio against test bearers; no channel was measured over a radio). `Trust::Verified`'s latency was measured by the performance pass (§18.6); a real network interface was not measured.
 
-**The gates.** The gate of stage 4 and 5 that the one-link rung stays within 3 % of stage 3 (SHAPES-CHANNEL.md §13) is **not met**: throughput is 9 to 14 % down and hot latency up about 20 %. The checkpoint gate of under 0.5 % of a core per active sender is met by the sender and **missed by the receiver**. **Nothing was tuned**, by the owner's decision (§16.6): the performance pass after stage 7 owns these figures.
+**The gates.** The gate of stage 4 and 5 that the one-link rung stays within 3 % of stage 3 (SHAPES-CHANNEL.md §13) was **not met** when this was measured: throughput 9 to 14 % down and hot latency up about 20 %; the checkpoint gate was met by the sender and missed by the receiver. **Superseded by §18** (the cause on the receiver, the cost of checkpoints after it, the relay).
 
 ### 16.8 What the figures do not cover
 
 - A real network interface: every run is loopback.
-- `Reliable` and `Window` (only `Latest` was measured); `Trust::Verified`'s latency; and the setup's Interests crossing the link in the one-link rung (its two nodes share one forwarder; the relay rows of §16.7 do cross the links).
-- Zenoh was not rerun on this host; comparisons to it use the figures of the design note's baseline (§1.2), taken at another load. Zenoh was not measured at 128 B to 512 B.
-- A full table after the changes made since the tuning pass (§16.2), and the latency with and without an offload.
-- A quiet host: the figures were taken at load 5–6 on a shared host, and single latency pairs vary by ±5 µs.
+- `Reliable` and `Window` (only `Latest` was measured, also in §18); and the setup's Interests crossing the link in the one-link rung (its two nodes share one forwarder; the relay rows of §16.7 do cross the links). `Trust::Verified` is measured in §18.6.
+- Zenoh was rerun on this host at the load of the pass in §18 (same pairs as the channel); §16.2 to §16.7 compare with the design note's figures (§1.2), taken at another load. Zenoh was not measured at 128 B to 512 B.
+- The table after the changes since the tuning pass is §18.2.
+- A quiet host: the figures of §16 were taken at load 5–6 on a shared host, and single latency pairs vary by ±5 µs; §18 was taken at load 12 to 57 (§18.1).
 
 ## 17. The verbs: put, emit, get
 
@@ -1404,3 +1404,127 @@ A joiner therefore gets the **current kept state** (the listing), then what chan
 ### 17.8 What `get` does not do
 
 It does not resume (`watch` with a `Frontier` does, [heap.md](heap.md) §10.4); it does not give history, only the current value of each path and what changes after; it does not make a session (§17.1); it does not order an emission against a `put` (§17.3 item 4); and it adds nothing to the wire: no field of an entry or of a frame is new for it.
+
+## 18. Performance pass
+
+Informative, except that it names the two behaviours the pass changed and states them where they live (§12: `deliver_frame` hands the executor back once per 64 KiB; §14.10: the datagram limit is read from the sinks). It records what was measured after stage 7 against the owner's gates, what was found and changed, and what is left, with the number for each. The raw tables, the profiles and the commands are in the design note (SHAPES-CHANNEL.md §22). It replaces the verdicts of §16.6 and §16.7.
+
+### 18.1 Method
+
+- **Trees.** Before: ndn-rs `14466d3c`, ndn-ext `13c62b0` (the pins). After: ndn-rs `236795b3` (`818d3e03` differs by a doc comment), ndn-ext `22b8e47`. Release builds, `chan_ping`, `chan_relay`, `side_ping` and `carrier_bench` of `ndn-face-quic`.
+- **Gates** (the owner's), over one QUIC link on loopback at `path_mtu_max` 9,000, against raw quinn on the same link and Zenoh on this machine: 8 B and 64 B throughput at least Zenoh's; 64 B half round trip at most 1.1 times the raw datagram, cold and hot; 1 KiB throughput at least 0.9 times the raw datagram; 8 KiB at least 0.9 times the raw stream.
+- **Pairs.** Cores 10 to 13 only (two L3 complexes; their SMT siblings 42 to 45 belong to the host's other tenants), 3 s a row, channel, raw row and Zenoh run back to back in pairs, the order rotating each pair; 18 pairs a throughput row, 14 a latency row (cold, and hot with a spinner on each core: `sh` loops as in §16.1 and `yes` loops, which is Zenoh's own method). Ratios are formed per pair and then medianed; ranges are over pairs. Zenoh is the `Z1` row of a scratch copy of ndf's `versus` harness, run in the same pairs, so the Zenoh gate is judged **at the load of the channel's run**; its figures from the quiet host (1.98 M, 1.94 M msg/s) are given beside.
+- **Load.** The host is shared and was busy: before, 1-minute load 30 to 57, with other tenants on cores 10 to 13 (26 to 64 %) and their siblings (38 to 76 %) at the start; after, 12 to 40, mostly 14 to 20, with those cores 1 to 6 % busy except for two short bursts. The two runs are **not at the same load**: the channel's absolute rates were about half of the earlier quiet-host ones before the pass; Zenoh's were 0.74 to 0.92 of its quiet-host ones. Only same-pair ratios, the same-load Zenoh column and CPU time per message mean anything, and the spreads are wide (pair ratios over 25 % on every throughput row).
+- **Profiles.** `perf record` and `perf stat` (user space only: the host's `perf_event_paranoid` is 2; hardware counters work), the system share of each thread for the kernel, `strace -c -f` for system calls, and per-message CPU from `chan_ping only=cpu`. Instruction counts and CPU nanoseconds per message are used where wall rates are not resolvable.
+
+### 18.2 The gates, before and after
+
+Medians of 18 pairs (14 for latency); [min, max] over pairs. Zenoh is the same pairs' Zenoh.
+
+| row | before | after | ratio before → after | gate | verdict |
+|---|---|---|---|---|---|
+| 8 B throughput | 1.207 M [0.43, 1.81] | **2.580 M** [1.66, 2.71] | to Zenoh 0.68 → **1.32** [0.82, 2.04] (Zenoh 1.47 M → 1.97 M) | ≥ Zenoh | miss → **pass** (both halves: 1.25, 1.33) |
+| 64 B throughput | 1.022 M [0.57, 1.54] | **1.960 M** [1.09, 2.12] | to Zenoh 0.65 → **1.02** [0.58, 1.64] (Zenoh 1.46 M → 1.93 M) | ≥ Zenoh | miss → **marginal pass** (halves 0.95 and 1.03: a coin flip about the gate) |
+| 1 KiB throughput | 123 k [93, 538] | 589 k [270, 632] | to the raw datagram 0.13 → **0.47** (0.49 with the raw row in a process of its own) | ≥ 0.9 | **miss** |
+| 8 KiB throughput | 39 k [23, 85] | 79 k [24, 90] | to the raw stream 0.35 → **0.53** (0.65 with the raw row in its own process) | ≥ 0.9 | **miss** |
+| 64 B half round trip, cold | 51.6 µs [43.7, 96.3] | 43.8 µs [33.7, 48.3] | to the raw datagram 1.57 → **1.36** [1.08, 1.64] | ≤ 1.1 | **miss** |
+| 64 B half round trip, hot (`sh` spinners) | 70.1 µs | 43.7 µs | 1.71 → **1.19** [1.09, 1.50] | ≤ 1.1 | **miss** |
+| 64 B half round trip, hot (`yes` spinners) | 63.6 µs | 42.2 µs | 1.81 → **1.33** [1.04, 1.59] | ≤ 1.1 | **miss** |
+
+- **8 B and 64 B are the channel's own gain.** The controls moved too (Zenoh 1.34 and 1.32 times, the raw datagram 1.26 and 1.20 times between the two runs; the channel 2.1 and 1.9 times), so about 1.6 times at 8 B and 1.5 times at 64 B is the channel's: the receiver was the limit (§18.3).
+- **1 KiB and 8 KiB: the rise is mostly the host.** Both rows are bimodal per run (§18.4). Inside the good mode the ratio to the raw row did not move (1 KiB 0.51 → 0.49, 8 KiB 0.61 → 0.59); what changed is how many pairs were in the good mode (2 of 18 → 10 of 18 and 3 of 18 → 9 of 18), and that follows the load of the cores' siblings (§18.4). Read the verdicts, not the rise, from these two rows. The baseline's good-mode figures rest on 2 and 3 pairs.
+- **The face alone** (`side_ping`) is 1.03 to 1.06 times the raw datagram, before and after: the link adds 3 to 6 %, the channel the rest (channel over face 1.31 cold, 1.20 hot `sh`, 1.30 hot `yes`; before 1.52, 1.89, 1.73).
+- **Raw rows in their own process** give the same 1 KiB datagram figure as in one process (1.225 M against 1.242 M), so rows contaminating one another is small here.
+
+### 18.3 What was found and changed
+
+Each change is one commit, with the test that failed first where the old code was wrong, and an invariant test where it was only slow. Wire format, signed content, checkpoint window, seal, replay and verification are unchanged.
+
+| commit (ndn-rs) | cause | effect | test |
+|---|---|---|---|
+| `fddb7a93` | `Verify::forget_farthest` walked every slot from the highest down for each frame the 2 MiB bound forgot once a channel held 4,096 slots: 14.1 % of all samples at 64 B (29 % of the receiver thread), 4 to 5 % at 1 KiB and 8 KiB | a set of run starts kept on insert and removal makes it O(log n), the same slot chosen. 64 B receiver CPU 941 → 631 ns a delivered message (with the next); the 64 B half round trip cold 66 → 45 µs (after about 4,000 messages every frame had paid a ~20 µs walk) | invariants: the run start is kept for frames spaced wider than the window in total; the starts always equal a walk over the slots (6,000 random offers, forgets, judges) |
+| `73baeb72` | `Verify::judge` re-walked and re-allocated every settled slot below the range at each checkpoint (up to about 4,000; 30.6 % of the receiver's user samples at 1,000 messages/s) | visits only the slots that still hold an unjudged frame, in place; receiver checkpoint cost +2.96 → +0.56 % of a core at 1,000/s (§18.6) | invariants: verdicts unchanged, counts recounted after every step |
+| `7af97c13` | `Heap::emit` hashed the space's name and took a lock for every emission (`Tx::get`, 6.4 % of the sender thread at 64 B, with the hashing 12 %), and `enqueue` asked the carrier for the path's size on every message (two connection locks) | `Heap::emit` keeps the sender of a space (validated by `Tx::epoch`) and the channel keeps the datagram room the carrier last gave; sender 716 → 598 ns a message (`only=cpu`) | the room cache: **failed first** with the cache off (200 emissions asked 201 times); a kept sender is never used after the node replaced it; a path that grew takes the message the kept size refused as a datagram |
+| `ffaeadea` | 17 reference counts per emission, 8 of them not kept | none taken that is not kept (sender borrowed, carrier kept by generation, payload moved, name octets referenced only where read); 598 → 474 ns (`next_batch` 596 → 405); 8 B sender 566 → 377 ns an emission | the standing-clear test **failed first** (left 2, right 1); the payload is taken only when queued |
+| `9067a22c` | `attach_forwarder()` fixed every datagram frame at 1,200 octets (§14.10): on a link of 8,962 a message over about 1,150 went on the stream and a 1 KiB message filled a frame alone | the limit is the smallest live `side_frame_max` of the route's sinks (never over the node's own face or the host's ceiling): 1 KiB direct 150 k → 273 k a second, behind one relay 85 k → 142 k, sender CPU 8.5 → 5.3 µs a delivered message | **failed first** (`16 messages of 3,000 octets took Carried { datagrams: 0, stream_frames: 33 }`, link limit 8,962); a frame over a live limit is refused whole and counted |
+| `c150061c` | the face reader never let a link's task run between the frames of a burst (relay fan-out is non-blocking, one worker), so the link's buffer filled and the rest was refused | the reader yields once after a refused frame: relay frames out per frame in 0.88 → 0.99; 64 B at 4,096 paths +15 % | **failed first** (`sink_full: 50` of 50) |
+| `a7fb401d` | the slot store did about 14 tree searches a frame | 3 (in order, no neighbour search; `pop_first`): −1.3 k user instructions a frame, 6 % of a hop | invariants |
+| `71ac6779`, `82ea75c3`, `c5809bb8`, `bfedc134` | per-message moves and atomics on the receiver (Message 120 B, Out 192 B, Got 160 B; two atomics) | messages parsed into the frame's vector, a queued message replaced in place, one move from `Out` to the queue: −173 instructions a message (12 % of the receiver); receiver 8 B 468 → 404 ns, 64 B 641 → 502 ns a delivered message | `parse_into` gives what the iterator gives (and the malformed-plaintext table); the held and `Verified` tests |
+| `236795b3` | the 1 KiB and 8 KiB bad mode (§18.4): the host's read loop ran more than 1 MiB ahead of the consumer on a slow receiver's worker, so the `Latest` bound evicted messages already opened and checked | `deliver_frame` hands the executor back once per 64 KiB; a receiver that cannot keep up now sheds frames in the link's datagram queue, before any decryption. 1 KiB, receiver core slowed: 102 k → 311 k; natural 135 k → 305 k (12 pairs); 8 KiB slowed 27.7 k → 37.8 k; the bad mode's backlog (59 k datagrams, 506 MiB resident in 3 s) → 0 to 34 datagrams, 22 MiB | **failed first** (`missed == 0`: 79 evicted of 1,051 carried) |
+
+ndn-ext: `8e5c0bf` (`chan_ping` and `chan_relay` take `trust=prompt|verified`), `e1f06d5` (the forwarder-attached datagram-size tests), `7e0a89d` (`chan_relay relay_workers=<n>`), `22b8e47` (`LinkHandle::quic_stats`, read only; the thr rows print the link's counters).
+
+### 18.4 The cause of each remaining miss
+
+**1 KiB and 8 KiB throughput: two AEAD passes on one worker.** The raw rows' sender CPU is 0.98 µs a 1 KiB datagram (0.88 of a core at 897 k a second) and 6.3 µs an 8 KiB stream message. The channel adds, on the sender, one more AES-256-GCM pass over the frame (0.32 and 2.6 µs at 3.2 GB/s a core: one stitched `ring` kernel, 42 to 46 % of the sender thread at these sizes, the two passes not separable by symbol), one copy of the payload into the frame (0.1 and 0.8 µs), the hash of each sent frame for the checkpoint (0.15 and 0.5 µs: the hash is part of the signed content) and its own emit path (about 0.3 µs): the ratio **cannot exceed 0.63 at 1 KiB and 0.62 at 8 KiB** even with the emit path free, and the gate needs the extra work under 0.1 times the raw cost. The receiver pays the same second pass (AES open 47 to 53 % of its user time) and two copies of each frame. Measured in the good mode: 0.49 to 0.51 and 0.59 to 0.61 (0.65 at 8 KiB with the raw row in its own process). The old estimate of the ceiling (0.61 and 0.72 to 0.82, §16.3) was of the same order.
+
+- **`workers=2` does not help.** Emitter and driver on separate workers made both rows and the raw rows worse on this host: channel 1 KiB 339 to 459 k → 188 to 244 k, raw datagram 1.07 to 1.26 M → 0.53 M, channel 8 KiB 44 to 84 k → 24 to 52 k, raw stream 138 k → 97 k (2 pairs each): a hand-over costs more than the pass it hides, as in the two offload designs of §16.5.
+- **The 8 KiB row is on the datagram lane** at `path_mtu_max` 9,000 (284 k datagram frames against 172 stream frames in 4 s); the stream lane carries checkpoints and binds only (about 45 frames a second), so the 4-octet prefix copy of ndn-ext's `side.rs` and the stream reader's copy cannot move a gated row and were not changed.
+- **The bimodality** (1 KiB 93 to 540 k, 8 KiB 23 to 90 k in the baseline) is the receiver's core being slower than the sender's: the receiver thread's IPC was 2.1 to 2.3 in the good runs and 1.4 to 1.7 in the bad ones, rate and IPC tracked the load of the receiver core's SMT sibling (9 to 14 % busy: 74 to 79 k at 8 KiB; 39 to 86 %: 26 to 55 k), and a spinner on the receiver's sibling alone forced the bad mode at 1 KiB (103 k median) while one on the sender's gave a slow row with full frames (355 k). There was no UDP loss in the kernel, no QUIC loss, no congestion event and a congestion window of 100 to 600 MB in both modes: the sender cannot be throttled by flow control (datagrams have none) and a slower receiver simply delivers fewer. What the code did wrong in the bad mode is the read loop of `deliver_frame` (§18.3, `236795b3`); what remains is the host. Benchmark threads on cores of one L3 pair measured better than on two (45 to 84 k against 18 to 24 k at 8 KiB, 3 runs each).
+
+**64 B half round trip: the cold working set of the whole hop.** The face alone is 1.03 to 1.06 times the raw datagram; the channel adds about 12 µs a hop (about 35 k cycles) on cores where raw takes 31 µs. Counted per hop on both threads (user space, `chan_ping only=lat` against `carrier_bench only=lat`):
+
+| per hop | channel | raw |
+|---|---|---|
+| user cycles | 56 to 61 k | 21 to 27 k |
+| user instructions | 43 k | 21 to 26 k |
+| L1d load misses | 1,756 to 2,033 | 927 to 1,230 |
+| L2 misses (`cache-misses`) | 2,987 to 4,707 | 1,230 to 2,484 |
+| L1i misses | 171 to 524 | 121 to 300 |
+
+A channel hop touches about 2,000 cache lines (130 KB) against 59 KB for raw, with a 32 KB L1d: the code runs cold, at an IPC of about 0.7 for the hop. Where the extra cycles are: quinn +6.7 k (the same code at IPC 0.9 against 1.5, because the channel pushes its lines out), unresolved symbols +7.9 k, the channel's **receiver** +4.8 k (14 %: `dispatch` 32 L1d lines, half of them tree nodes of `Verify`; the reader closure 39; `Sink::deliver` 22; `process` 19), the channel's **sender** +3.3 k (135 L1d and 223 L2 misses a hop: reference counts 12.6 and 10.6, mutex words, the stack copies of `Packed` and `Pending`), tokio and locks +2.7 k, allocation and copies +2.3 k (about 9 allocations a hop on both threads), AES +1.75 k, checkpoint crypto 0.8 k, the face layer 0.6 k. **No single piece is more than about 1.6 µs** (removing the receiver's channel code entirely) and the gate needs about 8 to 10 µs: it takes a smaller working set for the whole hop (one runtime for the reader and the connection driver, busy-polling before the reader parks), which are design changes. The per-ping `tokio::time::timeout` of the harness, which the raw rows lack, makes no difference (`timer=0`: 42.75 against 38.4 µs, 10 pairs). The half round trip is also **bimodal per binary** on this host by ±8 µs (it was in the earlier passes: 32 to 33 µs against 40 to 47 µs a process), which is larger than any change the code can show; 14 pairs cannot resolve a 0.1 to 1 µs change, so the changes of this size (a flat sorted vector in place of `Verify`'s two tree sets, about 17 L1d lines and 0.1 to 0.15 µs; the sender's hot fields in one line; a lone-`Latest` fast path, about 400 instructions) were **not made**. The two counts of the table (the sender's and the receiver's own runs) differ in the L2 figure for the same reason the ranges are wide: the host.
+
+**64 B throughput: marginal.** The sender emits 1.8 to 2.5 M a second (491 ns an emission at 64 B, 377 ns at 8 B); the receiver, at 500 to 630 ns a delivered message at 64 B and 404 to 470 ns at 8 B, is the limit, and the harness's consumer runs on its thread. Zenoh at 1.93 M at this load needs about 465 ns on the receiver's one worker. The remaining receiver items are each 4 to 15 % at 8 B (the queue offer 14.6 %, parse about 20 %, memmove 13 %, `poll_next` 6.4 %, the drop of `Got` 4.3 %, AES 3.9 %): flat. The public `Got` carries three `Name` clones (14 atomic operations a message in all); sharing `by` and `writer` as one `Arc` would save four of them, about 50 to 60 ns of about 590, and is an API change (§18.5).
+
+**Frame fill is not a cause.** At 64 B the sender sends frames of about 4.4 KB (50 to 52 messages) against a limit of 8,962 because the harness's emitter passes over 256 paths and yields once, and the first two messages of a pass go out inline. Making frames larger (a message within 10 µs of the last inline write waits for the call back) raised the messages a frame from 50 to 63 and cut the frames a second by 25 to 38 %, and moved neither side's CPU a message (send 527 → 550 ns, receive 680 → 720 ns): per-frame cost is under 5 % of the per-message cost. It was removed.
+
+**The relay: one more QUIC hop.** One relay hop adds about 28 µs to the half round trip (relay1 minus direct, 4 pairs: 60, 18, 28, 27 µs), which is what a raw QUIC datagram hop costs on the same cores at the same time (28 to 39 µs). Per round trip the relay thread adds 2.7 `sendmsg`, 5.3 `recvmmsg` (half of them find nothing) and 4.4 `epoll_wait`, and quinn sends a 36-octet acknowledgement for each packet **before** the data is forwarded. The channel's own code on the relay (the side table `on_frame`, the face reader, the link face) is about 6 % of the relay thread's user samples; `SideTable::on_frame` is 0.15 % of all samples: under 1 µs of the 28. At 1 KiB the relay thread saturates (it decrypts and encrypts every 9 kB frame, AES-GCM 44 % of its user samples) and the kernel drops what it never read (the relay's frames in per frame out of the sender's link 0.46 to 0.55 at one worker); a relay with two workers (`relay_workers=2`, on four cores that ratio is 0.83; with every runtime on two workers on six cores it is 0.95 and 1 KiB behind the relay 160 k → 440 k; a daemon relay on a multi-thread runtime is not bound this way). Relay 64 B throughput (0.33 of direct after) is conflation of `Latest` over 256 paths: the same 52 messages a frame leave the sender in both shapes, behind the relay they arrive in bursts and the receiver keeps one value a path (at 4,096 paths relay1 delivers 905 k against direct 960 to 1,050 k).
+
+### 18.5 Options that need the owner's decision
+
+None of these was built. Each names what it trades.
+
+| option | numbers | property traded, and what changes for a user |
+|---|---|---|
+| Stripe a link over several QUIC connections | the connection is the ceiling: four independent connections gave 15.8 Gbit/s at 1 KiB and 18.2 Gbit/s at 8 KiB (about linear, SHAPES-CHANNEL.md §17.2); each has its own worker, so the two AEAD passes run in parallel | strict ordering and fate-sharing between stripes (`Latest` tolerates it, `Reliable` and `Window` would need a sequence merge on the receiver); memory and handshakes a link times the stripes. The only way to the 1 KiB and 8 KiB gates on this CPU. |
+| A CPU with VAES (Zen 3, Ice Lake and later) | `ring`'s AES-GCM is about three times faster there, for both passes and the raw rows | nothing; the gates are judged on the host they are measured on |
+| AES-128-GCM for the channel's seal | about 10 of 14 rounds, GHASH unchanged: a modest gain, [INFERENCE: not measured]; does not close a gap of 1.6 times | the key length, 256 → 128 bits, for every sealed frame; a new `S_AEAD` code |
+| Hash a frame for the checkpoint off the sender's thread | 5 % of the sender thread at 64 B, 7 to 8 % at 1 KiB and 8 KiB; cannot reach a gate alone | needs a spare core, a thread hand-over every 20 ms and a wasm fallback; same signed content |
+| The gates at 1 KiB and 8 KiB | one worker with two AEAD passes does 0.5 to 0.6 times the raw row (ceiling 0.62) | the gate, not the code: 0.5 times raw, or the raw row plus one more AEAD pass |
+| quinn acknowledgement frequency (`ack_eliciting_threshold` 10) | the raw hop's p50 39.0 → 27.3 µs (5 pairs); in `chan_relay` direct 47.1 → 42.7 and relay1 73.9 → 68.2 µs, 1 KiB throughput not better (inside the spread) | loss recovery waits up to `max_ack_delay` |
+| A relay with more than one worker | `relay_workers=2` on four cores: frames out per frame in 0.5 → 0.83; 64 B relay1 438 k → 580 k; all runtimes at two workers on six cores: 1 KiB 160 k → 440 k | deployment: a daemon relay on a multi-thread runtime is already not bound this way |
+| The first hop's datagram limit only | a relay whose own link takes less than the sender's first hop refuses a frame (counted `sink_error`); a signal back to the sender is a wire change | hosts set a ceiling with `attach_forwarder_with(n)` |
+| Busy-poll before the reader parks, or one runtime for the reader and the driver | the latency excess is the cold working set of a hop (§18.4); neither was built or measured | a core burnt; or a change of how a host runs its link |
+| `Verified` at line rate | back to back it delivers 0.6 % of the messages at 64 B and none at 1 KiB, because kept frames and held bodies charge one 2 MiB share twice, so frames are forgotten before their checkpoint arrives; nothing unverified is ever delivered | raise `CHANNEL_BYTES` and `NODE_BYTES` (for example 16 MiB and 64 MiB), or charge kept plus held once: receiver memory only |
+| Pre-decode the sender's Ed25519 key once a session | 5.3 µs of about 45 µs a checkpoint verification (0.03 % of a core at 50 a second) | needs `ed25519-dalek` in `ndn-heap` or a decoded-key type in `ndn-security` |
+| An out-of-place AEAD open | removes one copy of each frame (5 to 8 % of the receiver's samples at 1 KiB and 8 KiB) | `ring` 0.17.14 has none; pinning the shared receive buffer lets a key holder amplify memory |
+| `Got` carries `by` and `writer` as one `Arc` (an `origin`) | four atomics a message, 50 to 60 ns of about 590 on the receiver | a change of the public `Got` |
+| Shrink `Message` to about 56 octets / parse straight into `Out` | an estimated 5 to 8 % of the receiver's instructions at 8 B | touches the held and `Verified` paths; not started |
+
+### 18.6 Reported rows
+
+**The relay** (`chan_relay`, 3 repetitions in one process, medians; both shapes got faster, direct more than the relay, so the ratios are worse): 64 B half round trip direct 73.7 → 36.1 µs, one relay 91.8 → 73.6 µs (1.25 → 2.04 times; p99 145 → 50.5 and 400 → 110.5 µs); 1 KiB half round trip 80.7 → 38.8 and 120.6 → 80.0 µs; 64 B throughput 1.18 M → 1.87 M direct and 507 k → 622 k through the relay (0.43 → 0.33); 1 KiB 92.7 k → 531 k and 100 k → 193 k (1.08 → 0.36). The load differs (36 to 40 before, 15 after).
+
+**Checkpoints** (`chan_relay` direct, paced 64 B, 5 s, 4 interleaved pairs; the cost is the 20 ms period minus the 2,000 ms period, in percentage points of one core; target 0.5 on each side):
+
+| rate | sender before → after | receiver before → after |
+|---|---|---|
+| 100 a second | +0.32 → **+0.37** | +0.79 → **+0.52** [0.46, 0.71] |
+| 1,000 a second | +0.34 → **+0.45** | +2.83 → **+0.69** [0.31, 0.86] |
+
+The sender is within the target. The receiver is at it at 100 a second and 1.4 times over at 1,000. What is left is the verification of the signature: Ed25519 is about 78 µs a checkpoint in vivo with cold caches (0.39 % of a core at the 50 a second of the 20 ms period; 44.5 µs hot in a stand-alone benchmark, 0.22 %), and the stream path's system calls, acknowledgement and queue about 0.15 to 0.2 %. Reaching 0.5 % at 1,000 a second takes a longer period, which is a window change (§15.9), or a batch verification (23 µs a signature in a batch of 8, which a 20 ms period does not offer). The sender's cost is the hash of each frame and one signature a period, about 0.2 % of a core by arithmetic and +0.37 to +0.45 measured.
+
+**`Trust::Verified` against `Prompt`.** CPU per message is the same within noise (receiver paced 1,000 a second: 4.10 % against 3.98 % of a core before; 5.16 % against 5.16 % after; at 10,000 a second 6.70 % against 6.82 %): `Verified` costs a `Body::clone` a frame. The half round trip is **21.5 ms** (before 22.4 ms) against 40.6 µs for `Prompt`: a `Verified` frame waits for the checkpoint that covers it, and the period is 20 ms. Back to back it delivers 12 k messages a second at 64 B (0.6 %) and none at 1 KiB, and at 10,000 a second paced 29 % (`Latest` shows a consumer the newest value of each path once a checkpoint, at most paths times 50 a second; and at 1 KiB and over the share of §18.5). Nothing unverified is delivered in any of these.
+
+### 18.7 Tried and removed
+
+- **Frame fill** (§18.4): fewer, larger frames; no CPU moved.
+- **An inlined take chain** and **`&mut Message` through accept and resolve** on the receiver: the first lowers instructions by about 72 a message and does not show in nanoseconds (kept for the count, with the rest of `c5809bb8`); the second changed nothing (9.375 G against 9.398 G instructions). A per-frame precomputed charge in place of a division per message saved 8 instructions a message.
+- **A harness reader-yield knob**, after the library change (`236795b3`) made it redundant.
+- **quinn's acknowledgement frequency** (§18.5): not kept.
+
+### 18.8 What the figures do not cover, and the checks
+
+- Every run is loopback on one host shared with other tenants; the two runs of §18.2 differ in load, so the rise of the two bimodal rows cannot be attributed to the code, and the 64 B pass is a coin flip about the gate. `Reliable` and `Window` were not measured. No radio and no real interface.
+- Not re-measured against a stage-3 build: whether the 0.86 to 0.91 of §16.7 is entirely `Verify`'s walks.
+- The checks of the pass: `cargo test --workspace` in ndn-rs and in ndn-ext; clippy `--workspace --all-targets -D warnings` in both; `cargo fmt --check`; `cargo doc --workspace --no-deps` with `-Dwarnings`; the dependency guard and the retired-names guard; `cargo check --target wasm32-unknown-unknown` of the CI crate list; the full e2e (the forwarder and the app connection changed); the data conformance once clean and once faulty with `--check-determinism` (93 of 93 identical alone and in the suite, both).
