@@ -63,6 +63,8 @@ mod self_learning;
 mod side_fanout;
 #[path = "side_frames.rs"]
 mod side_frames;
+#[path = "side_pit.rs"]
+mod side_pit;
 #[path = "side_support.rs"]
 mod side_support;
 #[path = "side_table.rs"]

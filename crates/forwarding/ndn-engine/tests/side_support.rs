@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_runtime::{BoxFuture, Now, Runtime, Sleep, Spawn};
-use ndn_transport::side_header::{SideHeader, SideKind, UpOp, UpRecord};
+use ndn_transport::side_header::{AnswerPrefix, QueryPrefix, SideHeader, SideKind, UpOp, UpRecord};
 use ndn_transport::{
     FaceError, FaceId, FaceKind, FaceTrust, SIDE_MARKER, SideClass, SideRefused, Transport,
 };
@@ -270,6 +270,27 @@ pub fn data_frame(id: u64, len: usize) -> Bytes {
 /// An `UP` record (padded to 46 octets) on route `id`.
 pub fn up(id: u64, op: UpOp) -> Bytes {
     Bytes::copy_from_slice(&UpRecord { id, op }.encode())
+}
+
+/// A `QUERY` datagram on route `id` with `token` and a ttl of `ttl_ticks` (100 ms each), padded to
+/// `len` octets.
+pub fn query(id: u64, token: u64, ttl_ticks: u8, len: usize) -> Bytes {
+    let mut v = QueryPrefix {
+        id,
+        token,
+        ttl_ticks,
+    }
+    .encode()
+    .to_vec();
+    v.resize(len.max(v.len()), 0xA5);
+    Bytes::from(v)
+}
+
+/// An `ANSWER` on `class` on route `id` to the query with `token`, padded to `len` octets.
+pub fn answer(class: SideClass, id: u64, token: u64, len: usize) -> Bytes {
+    let mut v = AnswerPrefix { class, id, token }.encode().to_vec();
+    v.resize(len.max(v.len()), 0xA5);
+    Bytes::from(v)
 }
 
 /// Which of the engine's sleeps a [`WarpRuntime`] shortens.

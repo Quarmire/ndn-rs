@@ -68,7 +68,7 @@
 //!   ([`FaceKind::Wfb`], `WifiAware`, `WifiDirect`), per face via
 //!   [`set_rate`](SideTable::set_rate) and per kind in [`SideConfig`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -77,7 +77,7 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
 use ndn_runtime::Runtime;
-use ndn_transport::side_header::{SideHeader, SideKind, UpOp, UpRecord};
+use ndn_transport::side_header::{AnswerPrefix, QueryPrefix, SideHeader, SideKind, UpOp, UpRecord};
 use ndn_transport::{FaceId, FaceKind, FaceTable, SideClass, SideRefused};
 
 /// The clock a [`SideTable`] reads: monotonic nanoseconds ([`SideTable::new`] builds it from the
@@ -114,6 +114,20 @@ pub struct SideLimits {
     /// burst lets one `Keep` per receiver through at once up to this many; the rate over a
     /// longer time is still one per [`keep_forward_min`](Self::keep_forward_min).
     pub keep_forward_burst: u32,
+    /// Breadcrumbs the table holds, for `QUERY` frames in flight (default 16,384).
+    pub pit_total: usize,
+    /// Breadcrumbs one ingress face may hold (default 256).
+    pub pit_per_face: usize,
+    /// Breadcrumbs one route may hold (default 1,024).
+    pub pit_per_route: usize,
+    /// `QUERY` frames per second one sink face may send, the rate at which its allowance refills
+    /// (default 512). 0 refuses every `QUERY`.
+    pub query_rate: u32,
+    /// `QUERY` frames one sink face may send in quick succession (default 128).
+    pub query_burst: u32,
+    /// The longest a breadcrumb lives (default 10 s); a `QUERY` asking for more is clamped. Not
+    /// [`ttl_max`](Self::ttl_max), which bounds a *sink's* TTL.
+    pub pit_ttl_max: Duration,
 }
 
 impl Default for SideLimits {
@@ -127,6 +141,12 @@ impl Default for SideLimits {
             ttl_max: Duration::from_secs(300),
             keep_forward_min: Duration::from_secs(5),
             keep_forward_burst: 8,
+            pit_total: 16_384,
+            pit_per_face: 256,
+            pit_per_route: 1024,
+            query_rate: 512,
+            query_burst: 128,
+            pit_ttl_max: Duration::from_secs(10),
         }
     }
 }
@@ -271,6 +291,24 @@ pub enum SideDrop {
     /// A frame of the id from a face that is not the route's source, or an
     /// `UP` from a face that is not a sink of it.
     WrongSource,
+    /// A `QUERY` from a face over its [`query_rate`](SideLimits::query_rate).
+    QueryRate,
+    /// A `QUERY` whose (route, token) already has a breadcrumb.
+    PitDup,
+    /// A `QUERY` with the table already at [`pit_total`](SideLimits::pit_total).
+    PitFull,
+    /// A `QUERY` from a face already at [`pit_per_face`](SideLimits::pit_per_face).
+    PitFaceFull,
+    /// A `QUERY` on a route already at [`pit_per_route`](SideLimits::pit_per_route).
+    PitRouteFull,
+    /// An `ANSWER` with no breadcrumb for its (route, token), or whose face is gone.
+    Unmatched,
+    /// An `ANSWER` whose breadcrumb had expired.
+    Late,
+    /// The face the frame had to go to could not take it (full, gone or refusing).
+    SinkFull,
+    /// An `ANSWER` for a face whose [`SideRate`] had no room.
+    Quota,
 }
 
 /// What [`SideTable::on_frame`] did with a frame.
@@ -295,6 +333,10 @@ pub enum SideOutcome {
         route_removed: bool,
         forwarded: bool,
     },
+    /// A `QUERY`: a breadcrumb was left and the route's source was handed the frame.
+    Queried,
+    /// An `ANSWER`: its breadcrumb was consumed and the face that asked was handed the frame.
+    Answered,
 }
 
 /// One sink of a route, for [`RouteInfo`].
@@ -363,6 +405,20 @@ pub struct SideStats {
     pub refused_face_gone: u64,
     pub refused_not_carried: u64,
     pub refused_not_asked: u64,
+    /// Breadcrumbs held now (a gauge), and the `QUERY`s passed up and `ANSWER`s passed down.
+    pub breadcrumbs: u64,
+    pub queries: u64,
+    pub answers: u64,
+    /// `QUERY`s over a face's rate, and the other refusals of the breadcrumb table: a duplicate
+    /// (route, token), each bound, an `ANSWER` with no breadcrumb (`unmatched`) or an expired one
+    /// (`late`).
+    pub query_rate_refused: u64,
+    pub pit_dup: u64,
+    pub pit_full: u64,
+    pub pit_face_full: u64,
+    pub pit_route_full: u64,
+    pub unmatched: u64,
+    pub late: u64,
 }
 
 #[derive(Default)]
@@ -384,6 +440,15 @@ struct Counters {
     unsubs: AtomicU64,
     sinks_lapsed: AtomicU64,
     refused: [AtomicU64; SideRefusal::COUNT],
+    queries: AtomicU64,
+    answers: AtomicU64,
+    query_rate_refused: AtomicU64,
+    pit_dup: AtomicU64,
+    pit_full: AtomicU64,
+    pit_face_full: AtomicU64,
+    pit_route_full: AtomicU64,
+    unmatched: AtomicU64,
+    late: AtomicU64,
 }
 
 fn bump(c: &AtomicU64) {
@@ -415,6 +480,9 @@ struct FaceEntry {
     strikes: Mutex<Strikes>,
     /// The last time a side frame was handed to this face (ns).
     last_sent: AtomicU64,
+    /// The theoretical arrival time (ns) of this face's `QUERY` allowance: the face may send a
+    /// `QUERY` while it is within the burst of it (the generic cell rate algorithm).
+    query_tat: AtomicU64,
 }
 
 struct Bucket {
@@ -437,6 +505,7 @@ impl FaceEntry {
             bucket: Mutex::new(None),
             barred_until: AtomicU64::new(0),
             last_sent: AtomicU64::new(0),
+            query_tat: AtomicU64::new(0),
             strikes: Mutex::new(Strikes::default()),
         }
     }
@@ -470,6 +539,22 @@ impl FaceEntry {
         } else {
             false
         }
+    }
+
+    /// Whether this face may send a `QUERY` now, at `rate` a second with `burst` in quick
+    /// succession; charges it. A rate of 0 refuses every `QUERY`.
+    fn admit_query(&self, now: u64, rate: u32, burst: u32) -> bool {
+        if rate == 0 {
+            return false;
+        }
+        let interval = (1_000_000_000 / u64::from(rate)).max(1);
+        let tolerance = interval.saturating_mul(u64::from(burst.max(1)) - 1);
+        self.query_tat
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |tat| {
+                (tat.saturating_sub(now) <= tolerance)
+                    .then(|| tat.max(now).saturating_add(interval))
+            })
+            .is_ok()
     }
 }
 
@@ -523,6 +608,79 @@ impl Quota {
     }
 }
 
+/// What a frame's routing header says it is, for [`SideTable::on_frame`].
+enum Parsed {
+    /// `DATA`, `CHECKPOINT` or `CONTROL`: fanned out from the route's source.
+    Fan,
+    /// An `UP` record and its operation.
+    Up(UpOp),
+    /// A `QUERY` and the prefix a relay reads.
+    Query(QueryPrefix),
+    /// An `ANSWER` and the prefix a relay reads.
+    Answer(AnswerPrefix),
+}
+
+/// One breadcrumb: the face a `QUERY` came over, and when it lapses (ns).
+#[derive(Clone, Copy)]
+struct Crumb {
+    face: FaceId,
+    expires: u64,
+}
+
+/// The breadcrumbs of the queries in flight, keyed by (route id, token), with the counts the
+/// bounds read. Every change is made under one lock, so the counts and the map never disagree.
+#[derive(Default)]
+struct Pit {
+    crumbs: HashMap<(u64, u64), Crumb>,
+    per_face: HashMap<FaceId, usize>,
+    per_route: HashMap<u64, usize>,
+}
+
+impl Pit {
+    fn insert(&mut self, key: (u64, u64), crumb: Crumb) {
+        *self.per_face.entry(crumb.face).or_insert(0) += 1;
+        *self.per_route.entry(key.0).or_insert(0) += 1;
+        self.crumbs.insert(key, crumb);
+    }
+
+    fn remove(&mut self, key: (u64, u64)) -> Option<Crumb> {
+        let crumb = self.crumbs.remove(&key)?;
+        Quota::dec(&mut self.per_face, crumb.face);
+        Quota::dec_key(&mut self.per_route, key.0);
+        Some(crumb)
+    }
+
+    /// Keep the breadcrumbs `keep` accepts; returns how many were removed.
+    fn retain(&mut self, mut keep: impl FnMut(&(u64, u64), &Crumb) -> bool) -> usize {
+        let Pit {
+            crumbs,
+            per_face,
+            per_route,
+        } = self;
+        let before = crumbs.len();
+        crumbs.retain(|key, crumb| {
+            let kept = keep(key, crumb);
+            if !kept {
+                Quota::dec(per_face, crumb.face);
+                Quota::dec_key(per_route, key.0);
+            }
+            kept
+        });
+        before - crumbs.len()
+    }
+}
+
+impl Quota {
+    fn dec_key(map: &mut HashMap<u64, usize>, key: u64) {
+        if let Some(n) = map.get_mut(&key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&key);
+            }
+        }
+    }
+}
+
 /// The forwarder's fan-out table for side frames; see the [module](self).
 pub struct SideTable {
     config: SideConfig,
@@ -536,6 +694,8 @@ pub struct SideTable {
     /// The latest time any face is barred until: the data path skips the bar
     /// lookup while it is in the past.
     latest_bar_end: AtomicU64,
+    /// The breadcrumbs of the `QUERY` frames in flight. Taken after, never before, `quota`.
+    pit: Mutex<Pit>,
     counters: Counters,
 }
 
@@ -563,6 +723,7 @@ impl SideTable {
             quota: Mutex::new(Quota::default()),
             faces: DashMap::new(),
             latest_bar_end: AtomicU64::new(0),
+            pit: Mutex::new(Pit::default()),
             counters: Counters::default(),
         }
     }
@@ -778,35 +939,192 @@ impl SideTable {
         let Ok(header) = SideHeader::parse(&frame) else {
             return self.dropped(SideDrop::Malformed);
         };
-        let op = if header.kind() == SideKind::Up {
-            match UpRecord::parse(&frame) {
-                Ok(r) => Some(r.op),
-                Err(_) => return self.dropped(SideDrop::Malformed),
-            }
-        } else {
-            None
+        let parsed = match header.kind() {
+            SideKind::Up => UpRecord::parse(&frame).map(|r| Parsed::Up(r.op)),
+            SideKind::Query => QueryPrefix::parse(&frame).map(Parsed::Query),
+            SideKind::Answer => AnswerPrefix::parse(&frame).map(Parsed::Answer),
+            _ => Ok(Parsed::Fan),
+        };
+        let Ok(parsed) = parsed else {
+            return self.dropped(SideDrop::Malformed);
         };
         let now = self.now();
         // A bar is on what a face SENDS as a source. Its `UP` records are its own sinks'
         // management (`Keep`, `Unsub`): they pass, bounded as ever, and name no route they
         // are not a sink of (`WrongSource`). Dropping them would let the sinks the face holds
         // lapse within the TTL and end the senders' routes to it: the bar would cut the link
-        // in both directions.
-        if op.is_none() && self.is_quarantined(from, now) {
+        // in both directions. A `QUERY` is likewise a sink's own request, not a frame it
+        // sources, and passes; an `ANSWER` is sourced, and is dropped.
+        if !matches!(parsed, Parsed::Up(_) | Parsed::Query(_)) && self.is_quarantined(from, now) {
             return self.dropped(SideDrop::Quarantined);
         }
         let Some(route) = self.routes.get(&header.id()).map(|r| Arc::clone(&r)) else {
             return self.dropped(SideDrop::Unrouted);
         };
-        match op {
-            Some(op) => self.on_up(header.id(), &route, op, from, frame, faces, now),
-            None => {
+        match parsed {
+            Parsed::Up(op) => self.on_up(header.id(), &route, op, from, frame, faces, now),
+            Parsed::Query(query) => self.on_query(&route, query, from, frame, faces, now),
+            Parsed::Answer(answer) => self.on_answer(&route, answer, from, frame, faces, now),
+            Parsed::Fan => {
                 if route.source != from {
                     return self.dropped(SideDrop::WrongSource);
                 }
                 route.frames.fetch_add(1, Ordering::Relaxed);
                 route.bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
                 self.fan_out(&route, frame, header.class(), from, faces, now)
+            }
+        }
+    }
+
+    /// A `QUERY` from `from`, which must be a live sink of `route`: leave a breadcrumb for its
+    /// token and hand the frame to the route's source as a datagram, with `from` as its ingress
+    /// (the way an `UP` goes up). The refusals, cheapest first: not a sink, over the face's
+    /// rate, a token already in flight, then each bound; each drops the frame and counts.
+    #[allow(clippy::too_many_arguments)]
+    fn on_query(
+        &self,
+        route: &Arc<Route>,
+        query: QueryPrefix,
+        from: FaceId,
+        frame: Bytes,
+        faces: &FaceTable,
+        now: u64,
+    ) -> SideOutcome {
+        let limits = &self.config.limits;
+        let sinks = route.sinks.load();
+        let Some(sink) = sinks
+            .iter()
+            .find(|s| s.face == from && s.expires.load(Ordering::Relaxed) > now)
+        else {
+            return self.dropped(SideDrop::WrongSource);
+        };
+        if !sink
+            .entry
+            .admit_query(now, limits.query_rate, limits.query_burst)
+        {
+            return self.dropped(SideDrop::QueryRate);
+        }
+        let ttl = Duration::from_millis(u64::from(query.ttl_ticks.clamp(1, 100)) * 100)
+            .min(limits.pit_ttl_max);
+        let crumb = Crumb {
+            face: from,
+            expires: now.saturating_add(ns(ttl)),
+        };
+        let key = (query.id, query.token);
+        {
+            let mut pit = self.pit.lock().unwrap();
+            // A breadcrumb that lapsed and was not swept yet is absent, not a duplicate.
+            if pit.crumbs.get(&key).is_some_and(|c| c.expires <= now) {
+                pit.remove(key);
+            }
+            if pit.crumbs.contains_key(&key) {
+                drop(pit);
+                return self.dropped(SideDrop::PitDup);
+            }
+            let refused = if pit.crumbs.len() >= limits.pit_total {
+                Some(SideDrop::PitFull)
+            } else if pit.per_face.get(&from).copied().unwrap_or(0) >= limits.pit_per_face {
+                Some(SideDrop::PitFaceFull)
+            } else if pit.per_route.get(&key.0).copied().unwrap_or(0) >= limits.pit_per_route {
+                Some(SideDrop::PitRouteFull)
+            } else {
+                None
+            };
+            if let Some(why) = refused {
+                drop(pit);
+                return self.dropped(why);
+            }
+            pit.insert(key, crumb);
+        }
+        // The breadcrumb is in before the frame goes: an answer may come back before this
+        // returns. A forward that fails takes it out again, if it is still ours.
+        let len = frame.len() as u64;
+        let Some(source) = faces.get(route.source) else {
+            self.unwind(key, crumb);
+            return self.dropped(SideDrop::SinkFull);
+        };
+        match source.forward_side_from(frame, SideClass::Datagram, from) {
+            Ok(()) => {
+                let c = &self.counters;
+                bump(&c.queries);
+                bump(&c.frames_out);
+                c.bytes_out.fetch_add(len, Ordering::Relaxed);
+                route.frames.fetch_add(1, Ordering::Relaxed);
+                route.bytes.fetch_add(len, Ordering::Relaxed);
+                route.source_entry.last_sent.store(now, Ordering::Relaxed);
+                SideOutcome::Queried
+            }
+            Err(refused) => {
+                self.unwind(key, crumb);
+                self.refused_by_sink(&refused);
+                SideOutcome::Dropped(SideDrop::SinkFull)
+            }
+        }
+    }
+
+    /// Take back the breadcrumb of a `QUERY` that could not be forwarded, unless an answer or a
+    /// sweep already took it or another query holds the token now.
+    fn unwind(&self, key: (u64, u64), crumb: Crumb) {
+        let mut pit = self.pit.lock().unwrap();
+        if pit
+            .crumbs
+            .get(&key)
+            .is_some_and(|c| c.face == crumb.face && c.expires == crumb.expires)
+        {
+            pit.remove(key);
+        }
+    }
+
+    /// An `ANSWER` from `from`, which must be `route`'s source: consume the breadcrumb of its
+    /// token and hand the frame, on the class it came on, to the one face that asked. The
+    /// breadcrumb goes at the first lookup whatever follows, so a token answers once.
+    #[allow(clippy::too_many_arguments)]
+    fn on_answer(
+        &self,
+        route: &Arc<Route>,
+        answer: AnswerPrefix,
+        from: FaceId,
+        frame: Bytes,
+        faces: &FaceTable,
+        now: u64,
+    ) -> SideOutcome {
+        if route.source != from {
+            return self.dropped(SideDrop::WrongSource);
+        }
+        let crumb = self.pit.lock().unwrap().remove((answer.id, answer.token));
+        let Some(crumb) = crumb else {
+            return self.dropped(SideDrop::Unmatched);
+        };
+        if crumb.expires <= now {
+            return self.dropped(SideDrop::Late);
+        }
+        let Some(face) = faces.get(crumb.face) else {
+            return self.dropped(SideDrop::Unmatched);
+        };
+        let len = frame.len();
+        let entry = self.faces.get(&crumb.face).map(|e| Arc::clone(&e));
+        if let Some(e) = &entry
+            && e.rate_on.load(Ordering::Relaxed)
+            && !e.admit(now, len)
+        {
+            return self.dropped(SideDrop::Quota);
+        }
+        match face.forward_side_from(frame, answer.class, from) {
+            Ok(()) => {
+                let c = &self.counters;
+                bump(&c.answers);
+                bump(&c.frames_out);
+                c.bytes_out.fetch_add(len as u64, Ordering::Relaxed);
+                route.frames.fetch_add(1, Ordering::Relaxed);
+                route.bytes.fetch_add(len as u64, Ordering::Relaxed);
+                if let Some(e) = entry {
+                    e.last_sent.store(now, Ordering::Relaxed);
+                }
+                SideOutcome::Answered
+            }
+            Err(refused) => {
+                self.refused_by_sink(&refused);
+                SideOutcome::Dropped(SideDrop::SinkFull)
             }
         }
     }
@@ -818,6 +1136,15 @@ impl SideTable {
             SideDrop::Quarantined => &c.quarantined,
             SideDrop::Unrouted => &c.unrouted,
             SideDrop::WrongSource => &c.wrong_source,
+            SideDrop::Quota => &c.quota,
+            SideDrop::QueryRate => &c.query_rate_refused,
+            SideDrop::PitDup => &c.pit_dup,
+            SideDrop::PitFull => &c.pit_full,
+            SideDrop::PitFaceFull => &c.pit_face_full,
+            SideDrop::PitRouteFull => &c.pit_route_full,
+            SideDrop::Unmatched => &c.unmatched,
+            SideDrop::Late => &c.late,
+            SideDrop::SinkFull => &c.sink_full,
         });
         SideOutcome::Dropped(why)
     }
@@ -1002,16 +1329,24 @@ impl SideTable {
     /// face's bar history (a barred link that is dialed again at the same id
     /// is still barred) and drops its rate.
     pub fn remove_face(&self, face: FaceId) {
+        let mut sourceless = HashSet::new();
         {
             let mut q = self.quota.lock().unwrap();
             for (id, route) in self.snapshot() {
                 if route.source == face {
+                    sourceless.insert(id);
                     self.remove_route(&mut q, id, &route);
                 } else {
                     self.retain_sinks(&mut q, id, &route, |s| s.face != face);
                 }
             }
         }
+        // Its breadcrumbs go with it, and those of the routes it was the source of: no answer
+        // can come down a route that has no source.
+        self.pit
+            .lock()
+            .unwrap()
+            .retain(|key, c| c.face != face && !sourceless.contains(&key.0));
         if let Some(e) = self.faces.get(&face) {
             e.set_rate(None, 0);
         }
@@ -1045,20 +1380,29 @@ impl SideTable {
                 || recent
                 || Arc::strong_count(e) > 1
         });
+        self.pit.lock().unwrap().retain(|_, c| c.expires > now);
         removed
     }
 
     /// Drop the routes and sinks whose face is no longer in `faces`: the 1 s
     /// sweep's catch for any face that left without a `remove_face`.
     pub fn drop_gone_faces(&self, faces: &FaceTable) {
-        let mut q = self.quota.lock().unwrap();
-        for (id, route) in self.snapshot() {
-            if faces.get(route.source).is_none() {
-                self.remove_route(&mut q, id, &route);
-            } else {
-                self.retain_sinks(&mut q, id, &route, |s| faces.get(s.face).is_some());
+        let mut sourceless = HashSet::new();
+        {
+            let mut q = self.quota.lock().unwrap();
+            for (id, route) in self.snapshot() {
+                if faces.get(route.source).is_none() {
+                    sourceless.insert(id);
+                    self.remove_route(&mut q, id, &route);
+                } else {
+                    self.retain_sinks(&mut q, id, &route, |s| faces.get(s.face).is_some());
+                }
             }
         }
+        self.pit
+            .lock()
+            .unwrap()
+            .retain(|key, c| !sourceless.contains(&key.0) && faces.get(c.face).is_some());
     }
 
     // ---- quarantine ----
@@ -1252,6 +1596,16 @@ impl SideTable {
             refused_face_gone: refused(SideRefusal::FaceGone),
             refused_not_carried: refused(SideRefusal::NotCarried),
             refused_not_asked: refused(SideRefusal::NotAsked),
+            breadcrumbs: self.pit.lock().unwrap().crumbs.len() as u64,
+            queries: get(&c.queries),
+            answers: get(&c.answers),
+            query_rate_refused: get(&c.query_rate_refused),
+            pit_dup: get(&c.pit_dup),
+            pit_full: get(&c.pit_full),
+            pit_face_full: get(&c.pit_face_full),
+            pit_route_full: get(&c.pit_route_full),
+            unmatched: get(&c.unmatched),
+            late: get(&c.late),
         }
     }
 }
