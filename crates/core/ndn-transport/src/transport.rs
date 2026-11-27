@@ -210,6 +210,16 @@ pub trait Transport: Send + Sync + 'static {
         self.side_frame_max() != 0
     }
 
+    /// Whether a side frame of `class` handed to [`forward_side`](Transport::forward_side) now
+    /// would be taken and not refused [`Full`](SideRefused::Full): what a sender that was told
+    /// `Full` waits for before it tries again. A hint: room is not reserved, and a frame can
+    /// still find the queue full by the time it is sent. The default is `true`, a transport
+    /// with no queue to fill has nothing to wait for. It never blocks.
+    fn side_room(&self, class: SideClass) -> bool {
+        let _ = class;
+        true
+    }
+
     fn send_bytes(&self, wire: Bytes) -> impl Future<Output = Result<(), FaceError>> + Send;
 
     /// Send a burst of already-framed datagrams to the same peer in one shot.
@@ -317,6 +327,7 @@ pub trait ErasedTransport: Send + Sync + 'static {
     ) -> Result<(), SideRefused>;
     fn side_frame_max(&self) -> usize;
     fn side_carries(&self, class: SideClass) -> bool;
+    fn side_room(&self, class: SideClass) -> bool;
 
     fn send_bytes(
         &self,
@@ -407,6 +418,9 @@ impl<T: Transport> ErasedTransport for T {
     }
     fn side_carries(&self, class: SideClass) -> bool {
         Transport::side_carries(self, class)
+    }
+    fn side_room(&self, class: SideClass) -> bool {
+        Transport::side_room(self, class)
     }
 
     fn send_bytes(

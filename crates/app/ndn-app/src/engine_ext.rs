@@ -39,10 +39,18 @@ use ndn_packet::Name;
 use ndn_transport::{FaceId, SideClass, SideRefused};
 use tokio_util::sync::CancellationToken;
 
-use crate::connection::{Connection, InProcConnection, LpInfo, RouteEvents};
+use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
+
+use crate::connection::{Connection, InProcConnection, LpInfo, RouteEvents, side_check};
 use crate::error::AppError;
 use crate::node::ConnectionProvider;
 use crate::{Consumer, Node, Producer};
+use ndn_transport::side_header::SideHeader;
+
+/// Yields before a sender that was refused `Full` sleeps between looks for room, and the sleep.
+const ROOM_YIELDS: u32 = 256;
+const ROOM_RECHECK: Duration = Duration::from_millis(1);
 
 /// Per-app in-process face buffer depth. Matches `MobileEngine`'s default.
 const APP_FACE_BUFFER: usize = 256;
@@ -117,6 +125,7 @@ impl EngineFaceProvider {
             inner: InProcConnection::new(handle),
             engine: self.engine.clone(),
             face_id,
+            refused: Mutex::new(None),
         })
     }
 }
@@ -135,6 +144,9 @@ struct EngineConnection {
     inner: InProcConnection,
     engine: ForwarderEngine,
     face_id: FaceId,
+    /// The route of the datagram frame last refused `Full`: what [`Connection::side_ready`]
+    /// waits for room on.
+    refused: Mutex<Option<u64>>,
 }
 
 #[async_trait]
@@ -184,11 +196,47 @@ impl Connection for EngineConnection {
         self.inner.send_side(frame, class).await
     }
 
+    /// A datagram frame goes to the engine's side table at once, from here
+    /// ([`ForwarderEngine::side_send_local`]), and not through the face reader's queue, so that
+    /// a link with no room for it refuses it `Full` **to this caller**, who keeps the message
+    /// pending and coalescing, as it does for a link it holds itself. Through the queue the
+    /// reader would have found the sink full after the caller was told `Ok`, and the frame, with
+    /// the newest message of its names, was lost (counted `sink_full`, told to no one). A stream
+    /// frame keeps the queue ([`send_side`](Connection::send_side)).
     fn try_send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
-        self.inner.try_send_side(frame, class)
+        if class != SideClass::Datagram {
+            return self.inner.try_send_side(frame, class);
+        }
+        side_check(&frame, self.side_frame_max())?;
+        let route = SideHeader::parse(&frame).ok().map(|h| h.id());
+        let sent = self.engine.side_send_local(self.face_id, frame);
+        if matches!(sent, Err(SideRefused::Full)) {
+            *self.refused.lock().unwrap_or_else(PoisonError::into_inner) = route;
+        }
+        sent
     }
 
+    /// After a datagram was refused `Full`, completes when a sink of its route has room
+    /// ([`ForwarderEngine::side_room`]): the sink's own queue empties on another task, so this
+    /// yields to it and, a few hundred yields later, sleeps a millisecond between looks, as a
+    /// link's own waiting send does. Otherwise when the face's queue has room.
     async fn side_ready(&self) {
+        let route = *self.refused.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(id) = route {
+            let mut yields = 0;
+            while !self.engine.side_room(id, SideClass::Datagram) {
+                if yields < ROOM_YIELDS {
+                    yields += 1;
+                    tokio::task::yield_now().await;
+                } else {
+                    crate::rt::sleep(ROOM_RECHECK).await;
+                }
+            }
+            let mut refused = self.refused.lock().unwrap_or_else(PoisonError::into_inner);
+            if *refused == Some(id) {
+                *refused = None;
+            }
+        }
         self.inner.side_ready().await;
     }
 
@@ -277,6 +325,7 @@ impl EngineAppExt for ForwarderEngine {
             inner: InProcConnection::new(handle),
             engine: self.clone(),
             face_id,
+            refused: Mutex::new(None),
         })
     }
 

@@ -64,6 +64,11 @@ fn side_list(engine: &ForwarderEngine) -> ControlResponse {
     );
     let _ = writeln!(
         text,
+        "held_back={} (frames a local sender was told Full for and keeps: not drops)",
+        s.held_back
+    );
+    let _ = writeln!(
+        text,
         "up: keeps={} keeps_forwarded={} unsubs={} sinks_lapsed={}",
         s.keeps, s.keeps_forwarded, s.unsubs, s.sinks_lapsed
     );

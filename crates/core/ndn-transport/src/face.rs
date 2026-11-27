@@ -566,6 +566,12 @@ impl Face {
         self.transport.side_carries(class)
     }
 
+    /// Whether a side frame of `class` handed to the transport now would be taken and not
+    /// refused `Full` (see [`Transport::side_room`]): a hint, never a reservation.
+    pub fn side_room(&self, class: SideClass) -> bool {
+        self.transport.side_room(class)
+    }
+
     /// Send tagged with its originating face id. Passthrough routes the tag
     /// through the in-process tag-bag; LpLinkService drops it for now.
     pub async fn send_bytes_with_source(

@@ -423,6 +423,43 @@ impl ForwarderEngine {
             .datagram_limit(crate::side::SideId(id), &self.inner.face_table)
     }
 
+    /// Hand the side table a frame the application of `face` sends itself, without the face
+    /// reader's queue between ([`SideTable::send_local`](crate::side::SideTable::send_local)):
+    /// the same peel and the same counters (`in_side_frames`, `in_side_bytes` of the face), but a
+    /// datagram frame that no live sink has room for is **refused `Full` and not lost**, so
+    /// the application keeps it and offers it when [`side_room`](Self::side_room) says there is
+    /// room. Never blocks.
+    pub fn side_send_local(
+        &self,
+        face: FaceId,
+        frame: bytes::Bytes,
+    ) -> Result<(), ndn_transport::SideRefused> {
+        let octets = frame.len() as u64;
+        self.inner
+            .side
+            .send_local(face, frame, &self.inner.face_table)?;
+        if let Some(state) = self.inner.face_states.get(&face) {
+            state
+                .counters
+                .in_side_frames
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .counters
+                .in_side_bytes
+                .fetch_add(octets, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Whether a frame of `class` for side route `id` would find room at a sink now
+    /// ([`SideTable::room`](crate::side::SideTable::room)): what a sender told `Full` by
+    /// [`side_send_local`](Self::side_send_local) waits for. A hint, never a reservation.
+    pub fn side_room(&self, id: u64, class: ndn_transport::SideClass) -> bool {
+        self.inner
+            .side
+            .room(crate::side::SideId(id), class, &self.inner.face_table)
+    }
+
     #[cfg_attr(not(feature = "experimental-instrument"), doc(hidden))]
     pub fn pit(&self) -> Arc<Pit> {
         Arc::clone(&self.inner.pit)

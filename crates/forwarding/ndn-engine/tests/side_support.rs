@@ -206,6 +206,10 @@ impl Transport for TestFace {
         self.side_frame_max() != 0
             && (class == SideClass::Datagram || !self.log.datagram_only.load(Ordering::Relaxed))
     }
+    /// Room is what `forward_side_from` would not refuse `Full` for.
+    fn side_room(&self, _class: SideClass) -> bool {
+        !self.log.full.load(Ordering::Relaxed)
+    }
     fn forward_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
         self.forward_side_from(frame, class, FaceId::INVALID)
     }

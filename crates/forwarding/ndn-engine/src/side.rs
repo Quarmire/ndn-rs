@@ -396,6 +396,10 @@ pub struct SideStats {
     /// A sink's queue or send buffer had no room (also a sink face that was
     /// gone from the face table).
     pub sink_full: u64,
+    /// Frames a sender that hands them over itself ([`SideTable::send_local`]) was told `Full`
+    /// for, because no live sink had room: not lost, the sender keeps them and offers them
+    /// again, so not in `sink_full`.
+    pub held_back: u64,
     /// A sink refused for another reason (too large for it, closed, I/O).
     pub sink_error: u64,
     /// `UP` records accepted from a sink, and `Keep`s passed on, `Unsub`s.
@@ -444,6 +448,7 @@ struct Counters {
     quota: AtomicU64,
     quarantined: AtomicU64,
     sink_full: AtomicU64,
+    held_back: AtomicU64,
     sink_error: AtomicU64,
     keeps: AtomicU64,
     keeps_forwarded: AtomicU64,
@@ -984,6 +989,68 @@ impl SideTable {
                 self.fan_out(&route, frame, header.class(), from, faces, now)
             }
         }
+    }
+
+    /// Route a frame the application of the face `from` hands over itself, and say so when the
+    /// frame would be lost to a full sink: **`Err(Full)` with nothing counted but `held_back`**
+    /// when `frame` is a datagram-class data frame of a route whose source is `from`, the
+    /// route has live sinks, and none of them has room now ([`Face::side_room`]
+    /// (ndn_transport::Face::side_room)). The frame is the sender's again, to keep and offer
+    /// when there is room ([`SideTable::room`]); `on_frame` would have dropped it for each
+    /// full sink and the sender would never have known. Any other frame (a stream frame, an
+    /// `UP`, a `QUERY`, an `ANSWER`, one for no route, from a barred face, from a face that is
+    /// not the route's source) is `on_frame`'s, with its counts, and is `Ok`. A sink that has
+    /// room in the hint and refuses all the same (another sender filled it between the look
+    /// and the send) costs that sink the frame, counted `sink_full`, as on any hop. **Never
+    /// blocks.**
+    pub fn send_local(
+        &self,
+        from: FaceId,
+        frame: Bytes,
+        faces: &FaceTable,
+    ) -> Result<SideOutcome, SideRefused> {
+        if let Ok(header) = SideHeader::parse(&frame)
+            && header.class() == SideClass::Datagram
+            && !matches!(
+                header.kind(),
+                SideKind::Up | SideKind::Query | SideKind::Answer
+            )
+            && let Some(route) = self.routes.get(&header.id()).map(|r| Arc::clone(&r))
+            && route.source == from
+            && !self.is_quarantined(from, self.now())
+            && !self.has_room(&route, SideClass::Datagram, faces, self.now())
+        {
+            bump(&self.counters.held_back);
+            return Err(SideRefused::Full);
+        }
+        Ok(self.on_frame(from, frame, faces))
+    }
+
+    /// Whether a frame of `class` for route `id` would find room at a sink now: at least one
+    /// live sink has it ([`Face::side_room`](ndn_transport::Face::side_room)), or the route has
+    /// no live sink (there is nothing to wait for: the frame goes nowhere, as `on_frame` would
+    /// have it). A hint, as the faces' answer is: room is not reserved. What a sender that
+    /// `send_local` told `Full` waits on.
+    pub fn room(&self, id: SideId, class: SideClass, faces: &FaceTable) -> bool {
+        let Some(route) = self.routes.get(&id.0).map(|r| Arc::clone(&r)) else {
+            return true;
+        };
+        self.has_room(&route, class, faces, self.now())
+    }
+
+    fn has_room(&self, route: &Route, class: SideClass, faces: &FaceTable, now: u64) -> bool {
+        let sinks = route.sinks.load();
+        let mut live = false;
+        for sink in sinks.iter() {
+            if sink.expires.load(Ordering::Relaxed) <= now {
+                continue;
+            }
+            live = true;
+            if faces.get(sink.face).is_some_and(|f| f.side_room(class)) {
+                return true;
+            }
+        }
+        !live
     }
 
     /// A `QUERY` from `from`, which must be a live sink of `route`: leave a breadcrumb for its
@@ -1591,6 +1658,7 @@ impl SideTable {
             quota: get(&c.quota),
             quarantined: get(&c.quarantined),
             sink_full: get(&c.sink_full),
+            held_back: get(&c.held_back),
             sink_error: get(&c.sink_error),
             keeps: get(&c.keeps),
             keeps_forwarded: get(&c.keeps_forwarded),

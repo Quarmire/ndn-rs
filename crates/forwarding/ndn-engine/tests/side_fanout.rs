@@ -848,3 +848,63 @@ async fn a_full_sink_gets_to_drain_between_two_frames_of_a_burst() {
     );
     assert_eq!(hr.side().len(), BURST - 1, "{stats:?}");
 }
+
+/// A datagram frame that the application of the source face hands over itself
+/// (`side_send_local`) while no sink has room is refused `Full` **to it and not lost**: nothing
+/// of it is counted but `held_back` (not `sink_full`, not `frames_in`), a sink with room takes
+/// the frame offered again, `side_room` says when, and a frame `on_frame` is meant to drop
+/// (another face's, one of no route) is still counted as it counts.
+#[tokio::test]
+async fn a_frame_a_local_sender_hands_over_is_refused_to_it_while_no_sink_has_room() {
+    let (s, hs) = face(1, FaceKind::App);
+    let (r, hr) = face(2, FaceKind::App);
+    let (e, _sd) = engine(vec![s, r], 1).await;
+    session(&hr, &hs, labelled_data(ID, 30)).await;
+    eventually("the sink is installed", || sinks_of(&e, ID).len() == 1).await;
+    let datagram = ndn_transport::SideClass::Datagram;
+    assert!(e.side_room(ID, datagram), "an empty sink has room");
+
+    hr.log.full.store(true, Ordering::Relaxed);
+    assert!(!e.side_room(ID, datagram), "a full sink has none");
+    for _ in 0..50 {
+        assert_eq!(
+            e.side_send_local(FaceId(1), data_frame(ID, 1_200)),
+            Err(ndn_transport::SideRefused::Full)
+        );
+    }
+    let stats = e.side().stats();
+    assert_eq!(stats.held_back, 50, "{stats:?}");
+    assert_eq!(
+        (stats.sink_full, stats.frames_in, stats.frames_out),
+        (0, 0, 0),
+        "a frame told Full is not lost and not counted as seen: {stats:?}"
+    );
+
+    // With room again the frames are taken, offered again.
+    hr.log.full.store(false, Ordering::Relaxed);
+    assert!(e.side_room(ID, datagram));
+    for _ in 0..3 {
+        assert_eq!(e.side_send_local(FaceId(1), data_frame(ID, 1_200)), Ok(()));
+    }
+    assert_eq!(hr.side().len(), 3);
+    let stats = e.side().stats();
+    assert_eq!(
+        (stats.frames_in, stats.frames_out, stats.held_back),
+        (3, 3, 50),
+        "{stats:?}"
+    );
+
+    // What `on_frame` drops it still drops, counted there: a route nobody holds.
+    assert_eq!(
+        e.side_send_local(FaceId(1), data_frame(ID + 1, 1_200)),
+        Ok(())
+    );
+    assert_eq!(e.side().stats().unrouted, 1);
+    // A frame of the route from a face that is not its source is `wrong_source`, even when full.
+    hr.log.full.store(true, Ordering::Relaxed);
+    assert_eq!(e.side_send_local(FaceId(7), data_frame(ID, 1_200)), Ok(()));
+    let stats = e.side().stats();
+    assert_eq!((stats.wrong_source, stats.held_back), (1, 50), "{stats:?}");
+    // A route with no live sink has nothing to wait for.
+    assert!(e.side_room(ID + 1, datagram));
+}
