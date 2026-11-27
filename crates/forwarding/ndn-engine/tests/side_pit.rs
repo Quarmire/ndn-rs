@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_engine::side::{
-    SideConfig, SideDrop, SideId, SideLimits, SideOutcome, SideStats, SideTable,
+    SideConfig, SideDrop, SideId, SideLimits, SideOutcome, SideRate, SideStats, SideTable,
 };
 use ndn_transport::{FaceId, FaceKind, FaceTable, SideClass};
 
@@ -99,6 +99,8 @@ fn the_pit_limits_default_to_the_designed_values() {
         (16_384, 256, 1_024)
     );
     assert_eq!((l.query_rate, l.query_burst), (512, 128));
+    assert_eq!(l.pit_route_reserve, 8);
+    assert_eq!((l.route_query_rate, l.route_query_burst), (2_048, 512));
     assert_eq!(l.pit_ttl_max, Duration::from_secs(10));
 }
 
@@ -430,6 +432,117 @@ fn each_pit_bound_refuses_and_counts() {
     assert_eq!((s.pit_full, s.pit_face_full, s.pit_route_full), (0, 0, 1));
     fx.on_frame(10, answer(SideClass::Datagram, 1, 0x1, 60));
     assert_eq!(fx.on_frame(20, query(1, 0x5, 10, 80)), SideOutcome::Queried);
+}
+
+/// How many of `tokens` queries `from` has taken before the first refusal, and that refusal.
+fn until_refused(
+    fx: &Fx,
+    route: u64,
+    from: u64,
+    tokens: std::ops::Range<u64>,
+) -> (u64, SideOutcome) {
+    let mut taken = 0;
+    for token in tokens {
+        match fx.on_frame(from, query(route, token, 10, 80)) {
+            SideOutcome::Queried => taken += 1,
+            refused => return (taken, refused),
+        }
+    }
+    panic!("face {from} was never refused");
+}
+
+#[test]
+fn one_sink_cannot_use_up_the_breadcrumbs_of_a_route_the_others_hold_a_share_of() {
+    let fx = Fx::limits(SideLimits {
+        pit_per_route: 64,
+        ..roomy()
+    });
+    let _src = fx.app(10);
+    for sink in [20, 21, 22, 23] {
+        let _ = fx.app(sink);
+    }
+    fx.route(1, 10, &[20, 21, 22, 23]);
+    let reserve = 8;
+
+    // The hostile sink takes the route's room less the share held for each of the other three.
+    let (taken, why) = until_refused(&fx, 1, 20, 1_000..2_000);
+    assert_eq!(
+        (taken, why),
+        (
+            64 - 3 * reserve,
+            SideOutcome::Dropped(SideDrop::PitRouteFull)
+        )
+    );
+    // Each of the others still gets its share.
+    for (i, sink) in [21u64, 22, 23].into_iter().enumerate() {
+        let base = 10_000 * (i as u64 + 1);
+        for token in base..base + reserve {
+            assert_eq!(
+                fx.on_frame(sink, query(1, token, 10, 80)),
+                SideOutcome::Queried,
+                "sink {sink} token {token}"
+            );
+        }
+    }
+    // Beyond its share a sink waits for the route like any other.
+    assert_eq!(
+        fx.on_frame(21, query(1, 99_999, 10, 80)),
+        SideOutcome::Dropped(SideDrop::PitRouteFull)
+    );
+    assert_eq!(fx.stats().breadcrumbs, 64);
+}
+
+#[test]
+fn the_queries_of_all_the_sinks_of_a_route_are_bounded_on_the_way_up() {
+    // Each face is far under its own rate; together they would put 512 queries a face into the
+    // source's queue at once. The route has a rate of its own.
+    let fx = Fx::new();
+    let _src = fx.app(10);
+    for sink in [20, 21, 22] {
+        let _ = fx.app(sink);
+    }
+    fx.route(1, 10, &[20, 21, 22]);
+    for token in 0..512u64 {
+        let from = 20 + token % 3;
+        assert_eq!(
+            fx.on_frame(from, query(1, token, 10, 80)),
+            SideOutcome::Queried,
+            "token {token}"
+        );
+    }
+    assert_eq!(
+        fx.on_frame(22, query(1, 512, 10, 80)),
+        SideOutcome::Dropped(SideDrop::QueryRate),
+        "the 513th in quick succession"
+    );
+    let s = fx.stats();
+    assert_eq!((s.query_rate_refused, s.breadcrumbs), (1, 512));
+    // The refused query left nothing behind and the route refills.
+    fx.advance_ms(1);
+    assert_eq!(fx.on_frame(22, query(1, 512, 10, 80)), SideOutcome::Queried);
+}
+
+#[test]
+fn a_query_going_up_is_charged_to_the_source_faces_rate() {
+    let fx = Fx::new();
+    let src = fx.app(10);
+    let _a = fx.app(20);
+    fx.route(1, 10, &[20]);
+    fx.table
+        .set_rate(FaceId(10), Some(SideRate { bytes_per_sec: 100 }));
+    // The bucket holds a second's octets: two frames of 80 take it under, the third finds it empty.
+    assert_eq!(fx.on_frame(20, query(1, 1, 10, 80)), SideOutcome::Queried);
+    assert_eq!(fx.on_frame(20, query(1, 2, 10, 80)), SideOutcome::Queried);
+    assert_eq!(
+        fx.on_frame(20, query(1, 3, 10, 80)),
+        SideOutcome::Dropped(SideDrop::Quota)
+    );
+    let s = fx.stats();
+    assert_eq!(
+        (s.quota, s.breadcrumbs, src.side().len()),
+        (1, 2, 2),
+        "the refused query left no breadcrumb and reached nobody"
+    );
 }
 
 #[test]

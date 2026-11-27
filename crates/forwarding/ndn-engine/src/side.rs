@@ -48,8 +48,11 @@
 //!   up to the route's source as a datagram, with the sink as ingress; the `ANSWER`
 //!   ([`AnswerPrefix`]) from the source *removes* the breadcrumb and goes to that one face only.
 //!   Bounds [`pit_total`](SideLimits::pit_total), [`pit_per_face`](SideLimits::pit_per_face),
-//!   [`pit_per_route`](SideLimits::pit_per_route), a per-face
-//!   [`query_rate`](SideLimits::query_rate); a ttl of 100 ms to
+//!   [`pit_per_route`](SideLimits::pit_per_route) with a share held for each live sink of the
+//!   route ([`pit_route_reserve`](SideLimits::pit_route_reserve): no sink takes what the others
+//!   are owed), a per-face [`query_rate`](SideLimits::query_rate), a per-route rate up to the
+//!   source ([`route_query_rate`](SideLimits::route_query_rate)) and the source face's own
+//!   [`SideRate`] (`quota`); a ttl of 100 ms to
 //!   [`pit_ttl_max`](SideLimits::pit_ttl_max). Every refusal drops the frame and counts it
 //!   (`pit_dup`, `pit_full`, `unmatched`, `late`, ...): no Nack frame is built. A barred sink's
 //!   `QUERY` passes, a barred source's `ANSWER` is dropped. docs/specs/channel.md §14.13.
@@ -130,11 +133,26 @@ pub struct SideLimits {
     pub pit_per_face: usize,
     /// Breadcrumbs one route may hold (default 1,024).
     pub pit_per_route: usize,
+    /// The breadcrumbs of a route held for each of its **live sinks** (default 8): a sink with
+    /// fewer than this many on the route is always admitted (while the route is under
+    /// [`pit_per_route`](Self::pit_per_route)), and a sink at or over it is admitted only while
+    /// the route's room, less what every *other* live sink has not yet used of its share, is
+    /// left. So one sink, or a few, cannot take the whole route: each other sink keeps this many
+    /// queries in flight whatever they do. `pit_route_reserve × sinks_per_route` should not
+    /// exceed `pit_per_route` (8 × 64 = 512 of 1,024 by default); 0 reserves nothing.
+    pub pit_route_reserve: usize,
     /// `QUERY` frames per second one sink face may send, the rate at which its allowance refills
     /// (default 512). 0 refuses every `QUERY`.
     pub query_rate: u32,
     /// `QUERY` frames one sink face may send in quick succession (default 128).
     pub query_burst: u32,
+    /// `QUERY` frames per second **all** the sinks of one route may send up to its source
+    /// together (default 2,048, four faces' worth), a generic cell rate like
+    /// [`query_rate`](Self::query_rate): `N` sinks at their own rate would otherwise put `N`
+    /// times that into the source's queue. Counted `rate_refused`. 0 refuses every `QUERY`.
+    pub route_query_rate: u32,
+    /// `QUERY` frames the sinks of one route may send up in quick succession (default 512).
+    pub route_query_burst: u32,
     /// The longest a breadcrumb lives (default 10 s); a `QUERY` asking for more is clamped. Not
     /// [`ttl_max`](Self::ttl_max), which bounds a *sink's* TTL.
     pub pit_ttl_max: Duration,
@@ -154,8 +172,11 @@ impl Default for SideLimits {
             pit_total: 16_384,
             pit_per_face: 256,
             pit_per_route: 1024,
+            pit_route_reserve: 8,
             query_rate: 512,
             query_burst: 128,
+            route_query_rate: 2048,
+            route_query_burst: 512,
             pit_ttl_max: Duration::from_secs(10),
         }
     }
@@ -559,17 +580,7 @@ impl FaceEntry {
     /// Whether this face may send a `QUERY` now, at `rate` a second with `burst` in quick
     /// succession; charges it. A rate of 0 refuses every `QUERY`.
     fn admit_query(&self, now: u64, rate: u32, burst: u32) -> bool {
-        if rate == 0 {
-            return false;
-        }
-        let interval = (1_000_000_000 / u64::from(rate)).max(1);
-        let tolerance = interval.saturating_mul(u64::from(burst.max(1)) - 1);
-        self.query_tat
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |tat| {
-                (tat.saturating_sub(now) <= tolerance)
-                    .then(|| tat.max(now).saturating_add(interval))
-            })
-            .is_ok()
+        cell_admit(&self.query_tat, now, rate, burst)
     }
 }
 
@@ -602,6 +613,9 @@ struct Route {
     created: u64,
     /// The source face's state, stamped when an `UP` record goes to it.
     source_entry: Arc<FaceEntry>,
+    /// The theoretical arrival time (ns) of the route's `QUERY` allowance, all its sinks together
+    /// ([`SideLimits::route_query_rate`]).
+    query_tat: AtomicU64,
 }
 
 #[derive(Default)]
@@ -649,12 +663,16 @@ struct Pit {
     crumbs: HashMap<(u64, u64), Crumb>,
     per_face: HashMap<FaceId, usize>,
     per_route: HashMap<u64, usize>,
+    /// What each sink face holds on each route: the share the route keeps for it
+    /// ([`SideLimits::pit_route_reserve`]) is read from here.
+    per_route_face: HashMap<(u64, FaceId), usize>,
 }
 
 impl Pit {
     fn insert(&mut self, key: (u64, u64), crumb: Crumb) {
         *self.per_face.entry(crumb.face).or_insert(0) += 1;
         *self.per_route.entry(key.0).or_insert(0) += 1;
+        *self.per_route_face.entry((key.0, crumb.face)).or_insert(0) += 1;
         self.crumbs.insert(key, crumb);
     }
 
@@ -662,6 +680,7 @@ impl Pit {
         let crumb = self.crumbs.remove(&key)?;
         Quota::dec(&mut self.per_face, crumb.face);
         Quota::dec_key(&mut self.per_route, key.0);
+        Quota::dec_route_face(&mut self.per_route_face, (key.0, crumb.face));
         Some(crumb)
     }
 
@@ -671,6 +690,7 @@ impl Pit {
             crumbs,
             per_face,
             per_route,
+            per_route_face,
         } = self;
         let before = crumbs.len();
         crumbs.retain(|key, crumb| {
@@ -678,10 +698,45 @@ impl Pit {
             if !kept {
                 Quota::dec(per_face, crumb.face);
                 Quota::dec_key(per_route, key.0);
+                Quota::dec_route_face(per_route_face, (key.0, crumb.face));
             }
             kept
         });
         before - crumbs.len()
+    }
+
+    /// Whether `from`, a live sink of `route` (`sinks` are its sinks), may leave one more
+    /// breadcrumb there. The route's bound is never passed. Under its share
+    /// ([`SideLimits::pit_route_reserve`]) a sink is admitted; at or over it, only while the room
+    /// left in the route, less what every other live sink has not used of its own share, is not
+    /// spent: so no sink, and no few sinks, can take what the others are owed.
+    fn route_has_room(
+        &self,
+        route: u64,
+        from: FaceId,
+        sinks: &[Arc<Sink>],
+        now: u64,
+        limits: &SideLimits,
+    ) -> bool {
+        let held = self.per_route.get(&route).copied().unwrap_or(0);
+        if held >= limits.pit_per_route {
+            return false;
+        }
+        let share = |face: FaceId| {
+            self.per_route_face
+                .get(&(route, face))
+                .copied()
+                .unwrap_or(0)
+        };
+        if share(from) < limits.pit_route_reserve {
+            return true;
+        }
+        let owed: usize = sinks
+            .iter()
+            .filter(|s| s.face != from && s.expires.load(Ordering::Relaxed) > now)
+            .map(|s| limits.pit_route_reserve.saturating_sub(share(s.face)))
+            .sum();
+        held.saturating_add(owed) < limits.pit_per_route
     }
 }
 
@@ -694,6 +749,30 @@ impl Quota {
             }
         }
     }
+
+    fn dec_route_face(map: &mut HashMap<(u64, FaceId), usize>, key: (u64, FaceId)) {
+        if let Some(n) = map.get_mut(&key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&key);
+            }
+        }
+    }
+}
+
+/// The generic cell rate algorithm on the theoretical arrival time `tat` (ns): one cell is
+/// admitted while `tat` is within `burst` cells of `now`, and each admitted cell moves it on by
+/// `1 / rate` seconds. A rate of 0 admits nothing.
+fn cell_admit(tat: &AtomicU64, now: u64, rate: u32, burst: u32) -> bool {
+    if rate == 0 {
+        return false;
+    }
+    let interval = (1_000_000_000 / u64::from(rate)).max(1);
+    let tolerance = interval.saturating_mul(u64::from(burst.max(1)) - 1);
+    tat.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |tat| {
+        (tat.saturating_sub(now) <= tolerance).then(|| tat.max(now).saturating_add(interval))
+    })
+    .is_ok()
 }
 
 /// The forwarder's fan-out table for side frames; see the [module](self).
@@ -931,6 +1010,7 @@ impl SideTable {
                         bytes: AtomicU64::new(0),
                         created: now,
                         source_entry: self.entry(source),
+                        query_tat: AtomicU64::new(0),
                     }),
                 );
                 *q.per_source.entry(source).or_insert(0) += 1;
@@ -1102,7 +1182,7 @@ impl SideTable {
                 Some(SideDrop::PitFull)
             } else if pit.per_face.get(&from).copied().unwrap_or(0) >= limits.pit_per_face {
                 Some(SideDrop::PitFaceFull)
-            } else if pit.per_route.get(&key.0).copied().unwrap_or(0) >= limits.pit_per_route {
+            } else if !pit.route_has_room(key.0, from, &sinks, now, limits) {
                 Some(SideDrop::PitRouteFull)
             } else {
                 None
@@ -1116,6 +1196,22 @@ impl SideTable {
         // The breadcrumb is in before the frame goes: an answer may come back before this
         // returns. A forward that fails takes it out again, if it is still ours.
         let len = frame.len() as u64;
+        // What goes up is paid for before it goes: the sinks of the route together, and the
+        // source face's own rate (as every frame handed to a face is).
+        if !cell_admit(
+            &route.query_tat,
+            now,
+            limits.route_query_rate,
+            limits.route_query_burst,
+        ) {
+            self.unwind(key, crumb);
+            return self.dropped(SideDrop::QueryRate);
+        }
+        let source_entry = &route.source_entry;
+        if source_entry.rate_on.load(Ordering::Relaxed) && !source_entry.admit(now, frame.len()) {
+            self.unwind(key, crumb);
+            return self.dropped(SideDrop::Quota);
+        }
         let Some(source) = faces.get(route.source) else {
             self.unwind(key, crumb);
             return self.dropped(SideDrop::SinkFull);
