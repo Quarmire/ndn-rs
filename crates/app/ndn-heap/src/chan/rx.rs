@@ -2558,7 +2558,7 @@ impl NodeHandle {
     /// It **waits** only for a stream frame of a `Reliable` or `Window` channel while an `Items`
     /// that blocks has a full queue: awaiting it is the back pressure that stalls the sender.
     /// Every other frame is taken without waiting for anything. But after every
-    /// [`COOPERATE_OCTETS`] of frames the call hands the executor back once (it returns pending,
+    /// 64 KiB of frames the call hands the executor back once (it returns pending,
     /// woken at once), so that a host's read loop, which never waits, lets the consumers of
     /// `Items` on its worker run between its bursts instead of running ahead of them until a queue
     /// bound evicts messages the node already opened.
