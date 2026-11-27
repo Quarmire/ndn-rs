@@ -34,13 +34,15 @@ use crate::node::NodeInner;
 use crate::space::{Heap, KeptFeed, KeptStep};
 
 /// A message on its way to the sinks: the key of its pair, its sequence, the octets it is
-/// charged for (what it pins, [`super::message::Message::pinned`]) and the item.
+/// charged for (what it pins, [`super::message::Message::pinned`]) and the item. The item is
+/// taken out by the last sink (moved once, where a drained `Out` would move twice); `None` only
+/// after that.
 #[derive(Clone, Debug)]
 pub(crate) struct Out {
     pub(crate) pair: Pair,
     pub(crate) seq: u64,
     pub(crate) weight: usize,
-    pub(crate) got: Got,
+    pub(crate) got: Option<Got>,
 }
 
 /// The queues of one `Items`.
@@ -56,6 +58,7 @@ pub(crate) struct SinkState {
 }
 
 impl SinkState {
+    #[inline(always)]
     fn take_notice_first(&mut self) -> Option<Result<Got, GetNotice>> {
         let missed = self.latest.take_missed();
         if missed > 0 {
@@ -153,31 +156,35 @@ impl Sink {
             if st.closed {
                 return;
             }
-            let mut push = |st: &mut SinkState, out: Out| {
+            let mut push = |st: &mut SinkState, pair: Pair, seq: u64, weight: usize, got: Got| {
                 pushed = true;
                 match mode {
                     ChannelMode::Latest => {
-                        st.latest.offer(out.pair, out.seq, out.weight, out.got);
+                        st.latest.offer(pair, seq, weight, got);
                     }
                     ChannelMode::Reliable | ChannelMode::Window => match self.overflow {
-                        Congestion::Block => st.fifo.push(out.got, out.weight),
+                        Congestion::Block => st.fifo.push(got, weight),
                         Congestion::Drop => {
-                            st.fifo.push_dropping_oldest(out.got, out.weight);
+                            st.fifo.push_dropping_oldest(got, weight);
                         }
                     },
                 }
             };
-            if last {
-                for out in outs.drain(..) {
-                    if self.select.matches(&out.got.path) {
-                        push(&mut st, out);
-                    }
+            for out in outs.iter_mut() {
+                let wanted = out
+                    .got
+                    .as_ref()
+                    .is_some_and(|got| self.select.matches(&got.path));
+                if !wanted {
+                    continue;
                 }
-            } else {
-                for out in outs.iter() {
-                    if self.select.matches(&out.got.path) {
-                        push(&mut st, out.clone());
-                    }
+                let got = if last {
+                    out.got.take()
+                } else {
+                    out.got.clone()
+                };
+                if let Some(got) = got {
+                    push(&mut st, out.pair, out.seq, out.weight, got);
                 }
             }
         }
@@ -435,6 +442,7 @@ impl Items {
     }
 
     /// The next item or notice the sink holds, and whether the sink is closed.
+    #[inline(always)]
     fn take_live(sink: &Sink) -> (Option<Result<Got, GetNotice>>, bool) {
         let mut st = sink.state.lock();
         let was_full = st.fifo.is_full();

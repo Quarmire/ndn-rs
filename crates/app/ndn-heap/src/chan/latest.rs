@@ -199,6 +199,7 @@ impl<T> Coalescing<T> {
     }
 
     /// The oldest queued message and its sequence.
+    #[inline(always)]
     pub(crate) fn take(&mut self) -> Option<(Pair, u64, T)> {
         let pair = self.order.pop_front()?;
         let queued = self

@@ -1996,7 +1996,7 @@ impl ChannelRx {
             },
             seq,
             weight,
-            got: Got {
+            got: Some(Got {
                 path: name,
                 bytes: message.payload,
                 by: self.by.clone(),
@@ -2006,7 +2006,7 @@ impl ChannelRx {
                     stands: message.stand_secs.map(Duration::from_secs),
                     verified: pipe.verified,
                 }),
-            },
+            }),
         });
     }
 
