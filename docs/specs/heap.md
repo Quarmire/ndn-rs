@@ -2764,7 +2764,10 @@ impl Heap {
     pub fn name(&self) -> &Name;
     pub async fn put(&self, path: &Name, bytes: Bytes, opts: PutOptions)
                      -> Result<EntryId, HeapError>;
+    pub async fn put_merged(&self, path: &Name, bytes: Bytes, merged: &[EntryId], opts: PutOptions)
+                            -> Result<Merged, HeapError>;
     pub async fn kept(&self, path: &Name) -> Result<Option<Item>, HeapError>;
+    pub async fn kept_all(&self, path: &Name) -> Result<Vec<Item>, HeapError>;
     pub fn get(&self, what: Select, opts: GetOptions) -> Result<Items, HeapError>;
     pub async fn emit(&self, path: &Name, bytes: Bytes, opts: EmitOptions)
                       -> Result<(), EmitError>;
@@ -2777,6 +2780,8 @@ impl Heap {
     pub async fn change(&self, c: MembersChange) -> Result<EntryId, HeapError>;
 }
 pub struct PutOptions { pub durable: Option<bool> }
+pub struct Merged { pub id: EntryId, pub open: Vec<EntryId> }   // `open`: the heads of the path other than `id`, as of the put
+pub const MERGED_MAX: usize = 8;    // the most heads one entry names (`AFTER_MAX`, §3.5)
 pub struct Item { pub path: Name, pub bytes: Bytes, pub by: Name, pub writer: Name,
                   pub id: EntryId, pub as_of: Option<Duration> }
 pub struct EntryId { pub device: Name, pub seq: u64, pub digest: [u8; 32] }
@@ -2786,15 +2791,22 @@ pub struct MembersChange { pub add_writers: Vec<Name>, pub add_readers: Vec<Name
                            pub remove: Vec<Name> }
 pub struct Members { pub owner: Name, pub writers: Vec<Name>, pub readers: Readers }
 pub enum Select { Path(Name), Prefix(Name) }
-pub struct GetOptions { pub kept: bool, pub live: Live, pub modes: Modes,
-                        pub trust: Trust, pub congestion: Congestion }   // kept: true, Live::Emitted by default
+pub struct GetOptions { pub kept: bool, pub heads: Heads, pub live: Live, pub modes: Modes,
+                        pub trust: Trust, pub congestion: Congestion }   // kept: true, Heads::Winner, Live::Emitted by default
+pub enum Heads { Winner, All }      // `Winner` (the default) is what `get` always told; `All`: every head of a path
+pub const HEADS_MAX: usize = 64;    // the most heads of one path an `All` stream tells
 pub struct Items;   // Stream<Item = Result<Got, GetNotice>>; next, next_batch, caught_up, hello_seen
 pub struct Got { pub path: Name, pub bytes: Bytes, pub by: Name, pub writer: Name, pub kind: Kind }
 pub enum Kind { Kept(Kept), Emitted(Emitted) }
-pub struct Kept { pub id: EntryId, pub as_of: Option<Duration>, pub removed: bool }
+#[non_exhaustive]
+pub struct Kept { pub id: EntryId, pub as_of: Option<Duration>, pub removed: bool,
+                  pub winner: bool, pub supersedes: Vec<EntryId> }   // `Kept::new(id)`: winner, nothing superseded
+#[non_exhaustive]
 pub enum GetNotice { Lagged { missed: u64 }, Withdrawn { id: EntryId, why: Refusal },
                      LiveEnded(LiveEnd), KeptEnded { why: String },
-                     Retracted { writer: Name, from: u64, to: u64 } }
+                     Retracted { writer: Name, from: u64, to: u64 },
+                     HeadsEnded { path: Name, ids: Vec<EntryId> },
+                     HeadsCapped { path: Name, hidden: u32 } }
 ```
 
 A `Heap` is a cheap handle, `Clone`, on one space of one node. `Item.by` is the
@@ -2848,6 +2860,41 @@ device's own key is revoked by a context held here, `Untrusted`, or marked
 suspected, `Suspected`, §9.8: it signs nothing), `Local` (the disk, the keys, or
 a closing node). It never refuses for what a peer holds.
 
+**`put_merged(path, bytes, merged, opts)`** is `put` for a library that merges
+concurrent writes itself. `put` names, as the entries it supersedes, **every head of the
+path this device holds when it signs** (at most `MERGED_MAX`, §3.5), so a library that read
+the heads A and B, merged them and put while C arrived in between would supersede C without
+having merged it: a silent lost edit. `put_merged` names **exactly** `merged`, sorted and
+without repeats, and nothing else: C stays a head, the next `get` of every head tells it, and
+the library merges again. The names are checked and signed under the one lock that
+signs, so the check and the register are one step. `Merged.id` is the entry; `Merged.open`
+is the heads of `path` other than `id` as of that step (empty: the put left a single head).
+Everything else is `put`'s (an empty `bytes` is a removal that is a head and names
+`merged` the same way; a value in pieces, `durable`, the sealed space's epoch).
+
+It refuses, before it signs anything, with `BadRequest` (`FixRequest`) for more than
+`MERGED_MAX` distinct ids and for an id that is an applied entry at another path (the
+refusal names that path), and with `NotReady` (`RetryLater`) for an id that is not an
+applied entry here (not held yet, refused, held closed for want of a key, outside a cut:
+`applied(id)` is false): read the heads again. An id that **is** applied at `path` and is
+no head any more (something superseded it) is accepted and has no effect: whatever
+superseded it stays a head, concurrent with the new entry, and the library sees it. It
+cannot name an entry of another path, so it cannot supersede unrelated data, and naming
+fewer heads leaves more heads, never fewer: it cannot hide another writer's edit.
+
+*More than eight heads.* An entry names at most `MERGED_MAX`, so a fork of `N` heads is
+merged in `⌈(N-1)/7⌉` rounds: the library merges eight heads, then the `open` ones and
+its own merge (12 heads: eight, which leaves five heads; then those five).
+
+*The library's contract* (documented, not enforced): (a) merge **deterministically**: the
+same heads give the same bytes, in whatever order they are read and on whichever replica;
+(b) with the heads `S` read and their merge `R`, **put only if some head's bytes differ from
+`R`** (then `put_merged(R, S)`); if every head already holds `R`, write nothing. Two
+replicas that both merge A and B each put an entry of bytes `R`; a library that merged
+whenever it saw two heads would merge those two forever. With the rule the two equal
+heads stand (the winner is the same on every replica, §10.1) and nothing more is
+written.
+
 **`kept(path)`** reads what this node holds and never waits for the network:
 `Some(item)` the value, `None` for a path that has none or was removed. Stale,
 never wrong (§1.3 invariant 5): a path the node has not caught up on answers
@@ -2859,6 +2906,15 @@ has not arrived, so its path is unknown and no answer would be complete, §6.4)
 `kept` answers `NotReady` (`RetryLater`) to a reader that is entitled to every
 key it lacks, the keys being on their way by the grant pull (§7.8), and `Sealed`
 otherwise.
+
+**`kept_all(path)`** is the point read of every head of `path`, the winner first: the
+heads the register holds now, each an `Item` (a removal that is a head has empty `bytes`,
+and `put_merged` names it like any head), as `kept` reads the winner and with the same
+refusals (`Sealed`, `NotReady` while an entry of a sealed space is held closed, §6.4). It
+returns every head, also past the `HEADS_MAX` a stream tells. `Unavailable` (`RetryLater`)
+answers for a head whose value in pieces is not whole here: a head that does not win is
+gathered only while a `Heads::All` stream is open (the others are fetched as winners), so a
+library that merges large values opens one.
 
 **`get(what, opts)`** is the one stream of the space: its kept values and their
 changes merged with the emissions of its channels ([channel.md](channel.md)
@@ -2901,6 +2957,36 @@ ephemeral message of a channel and is never the current value of a path.
    this stream gave `id` as the value of its path; the entry it superseded
    returns as the next `Kept`. `Members` and `Alert` changes are not data and
    are not given (`watch` has them).
+6. *`heads: Heads::All`* tells every head of a path, not the winner only: the first
+   listing is, per path in path order, **every head in rank order** (§10.1: the winner
+   first), each its own `Kind::Kept` with `winner` (whether it was the winner when told: a
+   snapshot, as another head may outrank it later; `kept` reads it now) and `supersedes`
+   (below); a removal that is a head is told with `removed: true`. After that each
+   change of a path's set of heads is told: **every head the stream does not hold as told
+   is an item**, whether or not it wins, and a head that is superseded, withdrawn or no
+   longer among the `HEADS_MAX` (64) of highest rank leaves the stream's set. It tells
+   heads, not history: a superseded entry is never told. A path with more than `HEADS_MAX`
+   heads is told with its 64 of highest rank and a `GetNotice::HeadsCapped { path, hidden }`
+   says how many are not (when that number changes), so a gap is never silent.
+7. *`supersedes` is stream-relative.* It lists the heads **this stream had told at the
+   path** that are no longer heads once this item applies, whatever chain of entries lies
+   between (a head `M2` that superseded `M` that superseded `A`, told to a reader that never
+   saw `M`, lists `A`, not `M`). It is on the first new item of the change. A library keeps
+   `id → value`, deletes `supersedes`, inserts the item, and is never left holding a head
+   the register no longer has. A head that leaves with no new head to carry it (a withdrawn
+   entry with nothing to restore; an entry that arrives already superseded and supersedes
+   a told head) is told as `GetNotice::HeadsEnded { path, ids }`; a withdrawn entry this
+   stream told is also told `Withdrawn`, and a superseded entry that **returns** (its
+   superseder withdrawn) is told again, as an item that supersedes the withdrawn head,
+   because the stream no longer holds it. A value in pieces that is not whole here is told
+   when its last piece is held, and what it supersedes with it.
+8. *`Heads::Winner`* (the default) takes the path above and is unchanged: the same items,
+   `winner: true` and an empty `supersedes`, no head notice, and nothing is queued, read
+   or fetched for heads it did not ask for (the register reports a path's head changes
+   only to the streams that asked for every head). A stream that overflowed reads every
+   head again, instead of every winner, and tells what it did not tell: it loses no head.
+   `Kept` and `GetNotice` are `#[non_exhaustive]`: build a `Kept` with `Kept::new(id)`, match
+   a `GetNotice` with a wildcard arm.
 
 `get` refuses with `BadRequest` for `kept: false` with `Live::Off` (it asks for
 nothing), `NotAllowed` for `Live::Emitted` on a space this device only follows
@@ -3020,6 +3106,14 @@ a `Frontier` is). It refuses the listing (`NotReady`, as `kept` does) while an
 entry of a sealed space is held closed, and an open kept feed ends with
 `GetNotice::KeptEnded { why }` when its reader is removed or when it must read the
 heads again while an entry is held closed (channel.md §17.5, §17.7).
+
+**`get` with every head** is the same queue and the same order with one more kind of
+entry in it: for a stream that asked for `Heads::All` the register's changes are the
+changes of a path's **set of heads** (a path whose heads differ before and after a call,
+winner or not), not of its winner, and the stream tells them by comparing the set with what
+it told (§10.3 `get` items 6 and 7). The register reports them with each applied or
+withdrawn entry; a queue that did not ask for them is never given them, and `watch` is told
+exactly what it was.
 
 ### 10.5 Errors
 
