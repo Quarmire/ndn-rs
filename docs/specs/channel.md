@@ -287,7 +287,7 @@ The first octets that exist are exactly eight: `0x20` `DATA` on a datagram, `0x3
 |---|---|
 | at least 10 octets, marker, version, kind and class as above | the routing header is malformed |
 | at least 20 octets | `Truncated` |
-| kind is `DATA`, `CHECKPOINT` or `CONTROL` (an `UP` is not sealed) | `NotSealed` |
+| kind is `DATA`, `CHECKPOINT` or `CONTROL` (an `UP` is not sealed; a `QUERY` or an `ANSWER` has the query layer's layout, §11.5) | `NotSealed` for an `UP`, `QueryLayer` for a `QUERY` or an `ANSWER` |
 | `count` is 1 to 255 for `DATA` and 0 otherwise | `Count` |
 | `seq0` is below 2^63, and so is the sequence of the last message (`seq0` + `count` − 1, or `seq0` for a kind that takes one) | `SequenceExhausted` |
 | at least 46 octets | `TooShort` |
@@ -348,7 +348,7 @@ flags:  bit 0 NAMED    the full name rides here (the id is bound by this message
 - **`CHECKPOINT` (1):** a signed checkpoint of the frames sent (§15). Always on the stream. Its record is §15.2. The sender records every frame it sends except a `CHECKPOINT` frame (`ring.rs`: the frame's own `Bytes`, a reference and no copy, kept for at most 4,096 frames **and 4 MiB** per channel, the oldest forgotten and counted) and the hash a checkpoint lists, the first 16 octets of SHA-256 for a frame of at most 2,048 octets and of BLAKE3 above, is **computed when the ring is drained** for a checkpoint, not when the frame is sent.
 - **`CONTROL` (2):** always on the stream. The plaintext is `op (1) | …`: 1 `BIND` (id, name), 2 `UNBIND` (id), 3 `HELLO` (the first frame after a session starts: the sender's current sequence), 4 `END`, 5 `STANDING_BEGIN`, 6 `STANDING_END`. It takes one sequence.
 - **`UP` (4):** the unsealed 11-octet record `0x00 | 0x24 | id (8) | op (1)`, `op` 1 `Keep` or 2 `Unsub`, then zero octets to 46 (§11.3). It is accepted only from a face that is a sink of the route and changes nothing but that face's own entry (§14.5).
-- **`QUERY` (5), `ANSWER` (6):** a request sent up by a sink of the route and the reply that comes back to that one face. A forwarder matches them by a token in the clear at octets 10–17 and leaves a breadcrumb for it (§14.13); the rest of each frame is the query layer's, not this section's layout. `QUERY` is always a datagram, `ANSWER` is either class; first octets `0x25`, `0x26` and `0x36`. Kind 3 stays unassigned.
+- **`QUERY` (5), `ANSWER` (6):** a request sent up by a sink of the route and the reply that comes back to that one face. A forwarder matches them by a token in the clear at octets 10–17 and leaves a breadcrumb for it (§14.13); the rest of each frame is the query layer's, not this section's layout. `QUERY` is always a datagram, `ANSWER` is either class; first octets `0x25`, `0x26` and `0x36`. Kind 3 stays unassigned. **The channel receiver and sender take neither as a channel frame:** the 20-octet header of §11.1 refuses kinds 5 and 6 (`QueryLayer`, counted `kind`, §12.1 row 3), to build and to read, **before the AEAD and before the replay window is touched**. Otherwise a holder of a channel's key could seal a frame of kind 5 or 6 at a sequence ahead of the sender's, which would pass the AEAD, mark the window and be dropped with no record for a checkpoint to expose: the genuine frame at that sequence was then refused `replayed`, and nobody was accused (the exposure of §13.12 items 1 and 2 needs a record). The forwarder is unchanged: it still parses and routes both by the routing header (§14.13), and the query layer gives them a decoder of their own.
 
 ### 11.6 Limits
 
@@ -453,7 +453,7 @@ Each row costs at most the work it names, and **a frame that fails a row costs n
 |---|---|---|
 | 1 | at least 46 octets (§11.3) | `short` |
 | 2 | at most 16 MiB + 1 KiB, the largest frame any session may grant (§11.6) | `oversize` |
-| 3 | the header parses (§11.1): marker `0x00` (`marker`), version 1 (`version`), a kind that is assigned, sealed and on its class (`kind`: an unassigned kind, `CHECKPOINT` or `CONTROL` on a datagram, an `UP`), a `count` the kind allows (`count`), a `seq0` and last sequence below 2^63 (`sequence`) | the counter named |
+| 3 | the header parses (§11.1): marker `0x00` (`marker`), version 1 (`version`), a kind that is assigned, sealed, a channel's own and on its class (`kind`: an unassigned kind, `CHECKPOINT` or `CONTROL` on a datagram, an `UP`, a `QUERY` or an `ANSWER`, which have layouts of their own and are refused here, before the AEAD and before any mark of the replay window, §11.5), a `count` the kind allows (`count`), a `seq0` and last sequence below 2^63 (`sequence`) | the counter named |
 | 4 | a session of this channel id is held; if none is, a **stream** frame is **held** (below) and a datagram is dropped, and nothing under row 4 is done | `unknown_channel` (every frame of an id with no session), `held_unknown_full`, `held_unknown_evicted`, `held_unknown_expired` |
 | 5 | the frame is within the limit of its class: a datagram at most the session's `S_FRAME_MAX` (at least 46, at most 16 MiB + 1 KiB), a stream frame at most the larger of 1 MiB and `S_FRAME_MAX` (§11.6) | `oversize` |
 | 6 | a `Reliable` or `Window` channel's data comes on the stream | `wrong_class` |

@@ -1081,6 +1081,8 @@ impl ChannelRx {
                 );
                 return self.after(st, now, post, delivery);
             }
+            // `Header::new` refuses every other kind (`UP`, `QUERY`, `ANSWER`) before the AEAD, so
+            // none reaches here; the arm stays so that a kind added later is dropped, not opened.
             _ => {
                 stats.kind.bump();
                 return Delivery::Dropped(Dropped::Kind);

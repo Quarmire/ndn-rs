@@ -73,6 +73,11 @@ pub(crate) enum FrameError {
     /// An `UP` record where a sealed frame was expected.
     #[error("a {kind:?} frame is not sealed: it has no AEAD to open")]
     NotSealed { kind: SideKind },
+    /// A `QUERY` or an `ANSWER`: the forwarder routes them, and their layout is the query layer's.
+    #[error(
+        "a {kind:?} frame is not a channel frame: its layout is the query layer's, so the channel receiver does not open it; drop it (the forwarder routes it by its token without reading further)"
+    )]
+    QueryLayer { kind: SideKind },
     /// A `count` the kind does not allow.
     #[error(
         "a {kind:?} frame counts {count} messages: DATA carries 1 to 255, CHECKPOINT and CONTROL 0"
@@ -123,8 +128,10 @@ impl Header {
         seq0: u64,
         count: u8,
     ) -> Result<Self, FrameError> {
-        if kind == SideKind::Up {
-            return Err(FrameError::NotSealed { kind });
+        match kind {
+            SideKind::Up => return Err(FrameError::NotSealed { kind }),
+            SideKind::Query | SideKind::Answer => return Err(FrameError::QueryLayer { kind }),
+            SideKind::Data | SideKind::Checkpoint | SideKind::Control => {}
         }
         SideHeader::new(class, kind, channel)?;
         let counted = kind == SideKind::Data;
@@ -882,6 +889,26 @@ mod tests {
             Header::new(d, SideKind::Up, 1, 0, 0, 0),
             Err(FrameError::NotSealed { .. })
         ));
+        // `QUERY` and `ANSWER` are the forwarder's and the query layer's: never a channel header,
+        // to build or to read, whatever the class the routing header allows.
+        for (class, kind) in [
+            (d, SideKind::Query),
+            (d, SideKind::Answer),
+            (s, SideKind::Answer),
+        ] {
+            assert_eq!(
+                Header::new(class, kind, 1, 0, 0, 0),
+                Err(FrameError::QueryLayer { kind })
+            );
+            let routing = SideHeader::new(class, kind, 1).unwrap().encode();
+            let mut wire = [0u8; HEADER_LEN];
+            wire[..routing.len()].copy_from_slice(&routing);
+            assert_eq!(
+                Header::decode(&wire),
+                Err(FrameError::QueryLayer { kind }),
+                "{kind:?} on {class:?}"
+            );
+        }
         // The decoder applies the same rules to what arrives.
         let mut wire = Header::new(d, SideKind::Data, 1, 0, 5, 3).unwrap().encode();
         assert_eq!(Header::decode(&wire).unwrap().count, 3);

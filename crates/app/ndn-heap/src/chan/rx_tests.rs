@@ -9,6 +9,7 @@ use futures::FutureExt;
 use ndn_app::EngineAppExt;
 use ndn_engine::EngineBuilder;
 use ndn_foundation_types::Name;
+use ndn_transport::side_header;
 use ndn_transport::{SideClass, SideKind};
 use tokio_util::sync::CancellationToken;
 
@@ -20,7 +21,9 @@ use super::control::Control;
 use super::frame::open;
 use super::frame::{Header, seal};
 use super::items::Items;
-use super::limits::{FRAME_OVERHEAD, MESSAGE_DEFAULT, STREAM_FRAME_DEFAULT, STREAM_FRAME_MAX};
+use super::limits::{
+    FRAME_OVERHEAD, MESSAGE_DEFAULT, MIN_FRAME_LEN, STREAM_FRAME_DEFAULT, STREAM_FRAME_MAX,
+};
 use super::message::{MessageWriter, Origin, OutMessage, PAD};
 use super::replay::SEQ_JUMP_MAX;
 use super::rx::{Delivery, Dropped, RxStats};
@@ -526,6 +529,54 @@ async fn junk_is_dropped_before_any_cryptography() {
         "no junk reached the AEAD"
     );
     assert_eq!(fx.stats().accepted.get(), 0);
+}
+
+/// A frame sealed under the channel's own key (what a key holder can send) whose routing octet
+/// names a kind the channel does not carry: `Header::new` builds none, so it is sealed by hand.
+fn sealed_as(fx: &Fx, octet: u8, seq0: u64) -> Bytes {
+    let mut frame = vec![0u8; MIN_FRAME_LEN];
+    // A header with count 0 (QUERY and ANSWER are not counted frames); the kind octet is patched.
+    let header = Header::new(
+        SideClass::Stream,
+        SideKind::Checkpoint,
+        fx.info.channel,
+        fx.epoch(),
+        seq0,
+        0,
+    )
+    .unwrap();
+    frame[..20].copy_from_slice(&header.encode());
+    frame[1] = octet;
+    let (head, rest) = frame.split_at_mut(20);
+    let (body, tag) = rest.split_at_mut(MIN_FRAME_LEN - 20 - 16);
+    tag.copy_from_slice(&fx.cipher.seal_detached(header.nonce(), head, body));
+    Bytes::from(frame)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_query_or_an_answer_is_refused_before_the_aead_and_burns_no_sequence() {
+    let fx = latest().await;
+    let genuine = fx.data(SideClass::Datagram, 7, &[named(1, A, b"x")]);
+    // QUERY and ANSWER have a layout of their own; the forwarder routes them, the channel
+    // receiver does not take them as sealed frames, even from a holder of the key.
+    for (what, octet) in [
+        ("a QUERY", side_header::QUERY),
+        ("an ANSWER datagram", side_header::ANSWER_DATAGRAM),
+        ("an ANSWER stream", side_header::ANSWER_STREAM),
+    ] {
+        assert_eq!(
+            fx.deliver(sealed_as(&fx, octet, 7)).await,
+            Delivery::Dropped(Dropped::Kind),
+            "{what}"
+        );
+    }
+    assert_eq!(fx.stats().kind.get(), 3, "counted `kind`");
+    assert_eq!(fx.stats().aead_attempts.get(), 0, "no AEAD was tried");
+    // Sequence 7 was not marked: the genuine frame at it is delivered.
+    assert_eq!(
+        fx.deliver(genuine).await,
+        Delivery::Delivered { messages: 1 }
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
