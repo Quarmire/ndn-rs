@@ -194,12 +194,13 @@ The setup's TLV-TYPEs are the block **0x0660–0x06BF**, registered to this file
 | 0x069B | `R_CODE` | 1 `NotAudience`, 2 `Busy`, 3 `NoStream`, 4 `StaleEpoch`, 5 `TooMany`, 6 `NotReady` |
 | 0x069D | `R_TEXT` | UTF-8, at most 256 octets: why, and what to do |
 | 0x069F | `R_RETRY` | milliseconds |
-| 0x06A1 | `CHAN_ANNOUNCE` | `S_SENDER`, `ASK_MODE`+ (each mode once): the ApplicationParameters of an announce |
+| 0x06A1 | `CHAN_ANNOUNCE` | `S_SENDER`, `ASK_MODE`* (each mode once), `ANN_SERVES`*: the ApplicationParameters of an announce; at least one `ASK_MODE` or one `ANN_SERVES` |
 | 0x06A3 | `B_ID` | NonNegativeInteger: a name id |
 | 0x06A5 | `B_NAME` | Name |
 | 0x06A7 | `W_MESSAGES` | messages a window replays |
 | 0x06A9 | `W_BYTES` | octets a window replays |
 | 0x06AB | `W_MS` | milliseconds a window replays |
+| 0x06AC | `ANN_SERVES` | Name, repeatable (even: skipped by a reader that predates it): a prefix, relative to the space, the sender serves queries under; at most 16 per announce and 512 octets of name values in all ([query.md](query.md) §11) |
 
 The whole `CHAN_ASK` is at most 8 KiB and the whole `CHAN_SESSION` at most 8,000 octets: larger is refused when written and when read. The field order above is the order written; a reader accepts any order and refuses a field twice or a required field absent.
 
@@ -231,16 +232,26 @@ fd069932fd069b0101fd069d2461736b20746865206f776e657220746f2061646420796f75206173
 fd06a11afd06770c0803626f62080570686f6e65fd06670101fd06670103
 ```
 
+`CHAN_ANNOUNCE` with `ANN_SERVES` (the same octets are asserted in `chan/wire_tests.rs`): sender `/bob/phone`, mode `Latest`, serving `/world`; and the same sender with **no mode**, serving `/world` alone:
+
+```
+fd06a120fd06770c0803626f62080570686f6e65fd06670101fd06ac070805776f726c64
+fd06a11bfd06770c0803626f62080570686f6e65fd06ac070805776f726c64
+```
+
 ## 9. The announce
 
 A sender pushes, once when it opens a channel, at every change of the space's members, and every 30 s while the channel lives, **one unsigned Interest** `<sync group of the space>/32=chan/<digest>` whose ApplicationParameters are a `CHAN_ANNOUNCE` (the sender's device and its modes), InterestLifetime 1 s, HopLimit 8. Nobody answers it and nothing caches it. It rides the group every member's forwarder already carries ([heap.md](heap.md) §2.5).
+
+A device that **serves queries** ([query.md](query.md) §11) adds to the same announce one `ANN_SERVES` (0x06AC) per prefix it serves (at most 16 names and 512 octets of name values in all, shortest first), and sends the announce also when a prefix is first served, when one stops being served and every 30 s while any is served. A device that holds **no channel** announces its prefixes **alone**: a `CHAN_ANNOUNCE` with no `ASK_MODE` and at least one `ANN_SERVES`. An announce with neither a mode nor a prefix is malformed and is never sent, so a device that holds no channel and stops serving sends nothing and its hint lapses (item 5). `ANN_SERVES` is an even type: a reader that predates it skips it, and an announce without it is byte for byte what it was.
 
 A receiver takes it as a **hint only**:
 
 1. The parameters are at most 1 KiB (the length is checked before they are hashed, so no more is ever hashed) and hash to the digest in the name; the group is a space this device holds as a member.
 2. **Offline**, the announcing device's person (the person of the trust context governing it, which a device name in a person's own namespace says by itself) must be a **writer** of the space, and the name must be a device name (no keyword, no digest component, under no reserved prefix). Nothing about the *device* is needed: the record need hold **no entry of it**, because a writer who has put nothing holds none, and only writers emit (§4.2: a reader's device never sends, so a reader's announce is a stranger's; the case this serves is a writer who has not written yet). The announce is unsigned, so any name under a writer's namespace passes for one of her devices; that is why the hint decides nothing and why what it can make a device spend is bounded (items 3 and 4). A stranger's announce (a person who is no writer) costs this lookup and nothing else: no ask, no signature, no packet.
-3. The device must be **wanted**: this device holds a registration of interest in live data of the space (an `Items` of a `get` in stage 6 holds one). Without one the hint is counted and ignored: a device that wants nothing live asks nobody.
+3. To ask the device for a **channel**, it must be **wanted**: this device holds a registration of interest in live data of the space (an `Items` of a `get` in stage 6 holds one). Without one the hint is counted and ignored (the prefixes it serves, item 5, are recorded before this check): a device that wants nothing live asks nobody.
 4. A mode is asked of a device at most once in 10 s (the window is of the device **and the mode**: an unsigned claim of a mode the device has no channel in does not use up the window of a mode it has), and at most 32 announces have asks in progress per space; the rest are ignored. A mode of which this device holds a **usable session** already is not asked and costs nothing below: an announce with no mode left to ask is counted ignored. A device the record **vouches for** (an admitted entry of it is held: its key was judged for the space and its certificate is held) takes the limits above. So does a device that **answered** an announce-driven ask of this node with a session judged good (a signed answer by a key that stands as a writer; at most 1,024 such devices are remembered). A device that is neither (a writer who has put nothing and was not heard from yet, or a name nobody answers to) also takes, **for each mode asked**, a token of the space's **own bucket**: a burst of 4 asks, then one a second (`ANNOUNCE_UNVOUCHED_BURST`, `ANNOUNCE_UNVOUCHED_RATE`); modes beyond the tokens are not asked. So any number of names under a writer's namespace cost this device at most that many asks and never take what the vouched devices need. The bucket is the space's, not one per claimed person: the persons are the writers of the record, so a bucket each would multiply the most a stranger can make this device spend by their number, and a flood that names each of them would empty each. The ask is the setup of §3, judged as any ask is: the announce decides nothing, and what is believed of the device is what the **answer** proves. The answer is a Data signed by the device's key whose certificates it carries (§3.2) and the receiver judges by the durable rule from those and the certificates held, **fetching nothing** (§3.4 step 2); the key must stand as a writer (§3.4 step 3). So a writer who has never put is heard from his first emission, with no certificate fetched on the word of an unsigned packet, and a name that is no device's costs one signed ask that nobody answers (a `NoRoute` Nack or the ask's 4.5 s), then nothing.
+5. **The prefixes it serves are a hint too.** The hearer records the `ANN_SERVES` of an announce for the device after item 2's check and before item 3's, **whatever it decides about asking for a channel**: a device that serves and holds no channel (no `ASK_MODE`) is heard, and an announce with no mode makes no ask. An announce that lists no prefix removes the device's hint; a hint lives 90 s (three announce periods) and a space keeps the hints of at most 256 devices (the one heard longest ago is dropped). The hint decides nothing: it only suggests whom `Targets::Serving` asks ([query.md](query.md) §10.2); the asker judges the device a writer itself and the server judges the query. Being unsigned, a flood of announces naming writers' devices can crowd real servers out of the hint table (query.md §12).
 
 The sync driver never sees an announce: the sync face's reader takes a name of this shape off the face before the driver would see it. (A name under a group whose next component is not a version is not a Sync Interest in any case: the multi-group driver routes an Interest to a group by a trailing `v=` version component and drops one that has none.)
 
@@ -1406,13 +1417,16 @@ pub fn get(&self, what: Select, opts: GetOptions) -> Result<Items, HeapError>;
 pub async fn kept(&self, path: &Name) -> Result<Option<Item>, HeapError>;
 
 pub enum Select { Path(Name), Prefix(Name) }
-pub struct GetOptions {
+pub struct GetOptions {          // Clone, Debug, PartialEq, Eq: not Copy (it holds an Ask)
     pub kept: bool,              // kept values and their changes (default true)
+    pub heads: Heads,            // Heads::Winner (default) | Heads::All (§17.9); kept values only
     pub live: Live,              // Live::Emitted (default): also emissions; Live::Off
     pub modes: Modes,            // which channel modes to join (default: all the senders offer)
     pub trust: Trust,            // Trust::Prompt (default) | Trust::Verified (§15.8); emissions only
     pub congestion: Congestion,  // Block (default) | Drop; Reliable and Window emissions only
+    pub ask: Option<Ask>,        // None (default): no query; Some: ask the space's writers (§17.10, query.md)
 }
+pub enum Heads { Winner, All }
 pub struct Items;                // Stream<Item = Result<Got, GetNotice>>
 impl Items {
     pub async fn next(&mut self) -> Option<Result<Got, GetNotice>>;
@@ -1421,20 +1435,30 @@ impl Items {
     pub fn hello_seen(&self) -> bool;
 }
 pub struct Got { pub path: Name, pub bytes: Bytes, pub by: Name, pub writer: Name, pub kind: Kind }
-pub enum Kind { Kept(Kept), Emitted(Emitted) }
-pub struct Kept { pub id: EntryId, pub as_of: Option<Duration>, pub removed: bool }
+#[non_exhaustive]
+pub enum Kind { Kept(Kept), Emitted(Emitted), Answered(Answered) }   // Answered: a query's answer (§17.10)
+#[non_exhaustive]
+pub struct Kept { pub id: EntryId, pub as_of: Option<Duration>, pub removed: bool,
+                  pub winner: bool, pub supersedes: Vec<EntryId> }
 pub struct Emitted { pub seq: u64, pub stands: Option<Duration> }
+pub struct Answered { pub query: QueryId, pub via: Via, pub refusal: Option<AppRefusal>, pub proof: Option<Bytes> }
+#[non_exhaustive]
 pub enum GetNotice {
-    Lagged { missed: u64 },                          // emissions the mode dropped (§17.5)
+    Lagged { missed: u64 },                          // emissions the mode dropped, or answers dropped from a full queue (§17.5, §17.10)
     Withdrawn { id: EntryId, why: Refusal },         // a kept entry this stream gave was refused after the fact
     LiveEnded(LiveEnd),                              // the emission part ended (§12.7); kept values go on
+    KeptEnded { why: String },                       // the kept part ended (§17.7)
     Retracted { writer: Name, from: u64, to: u64 },  // a checkpoint contradicted emissions (§15.5)
+    HeadsEnded { path: Name, ids: Vec<EntryId> },    // §17.9
+    HeadsCapped { path: Name, hidden: u32 },         // §17.9
+    QueryFailed { server: Name, why: QueryError },   // one server of a query failed (§17.10)
+    AnswersDone { asked: u32, answered: u32, refused: u32, failed: u32, silent: u32, not_asked: u32 },   // told once (§17.10)
 }
 ```
 
 ### 17.1 What `get` creates
 
-`get` is synchronous and does no network I/O. When it returns, **both feeds are registered**: the kept watcher (the register's heads under `what` are listed and the watcher registered in one step under the space's lock, so no change falls between them) and, with `Live::Emitted`, the emission sink (§12.7). Nothing that happens after the call is lost for want of a first poll. `get` asks no sender for a session: that is `ask_channel_in`, or the announce-driven ask of a device that is listening (§9). Dropping the `Items` closes both feeds and releases the sink's sessions (§14.10).
+`get` is synchronous and does no network I/O. When it returns, **both feeds are registered**: the kept watcher (the register's heads under `what` are listed and the watcher registered in one step under the space's lock, so no change falls between them) and, with `Live::Emitted`, the emission sink (§12.7). With `GetOptions::ask` it also registers the **answer queue** and **spawns** the query on the node's tasks (§17.10), still with no I/O in the caller's task. Nothing that happens after the call is lost for want of a first poll. `get` asks no sender for a session: that is `ask_channel_in`, or the announce-driven ask of a device that is listening (§9). Dropping the `Items` closes the feeds, releases the sink's sessions (§14.10) and **cancels the query**.
 
 ### 17.2 `kind` is the authority
 
@@ -1444,10 +1468,10 @@ Every item says what it is. **`Kind::Kept`** is durable and signed: the head of 
 
 1. **The kept listing comes first, always**: every path under `what` that has a value, as the register's head, in path order (canonical NDN order of the path), each as `Kind::Kept` with `removed: false`. A path with no value (never written, or removed) has no item. A value in pieces that is not whole here is not listed; it is given as a kept change when its last piece is held. **While an entry of a sealed space is held closed** (its epoch key is not held yet, so the path it writes or removes is unknown) there is no listing: the register may show an older head of that path as current, as `kept` refuses for the same reason, so `get` is refused `NotReady` with the same reason (`kept` and `get` give the same text: the key is being fetched; try again).
 2. **`caught_up()` resolves after the listing was yielded**: when every path that had a value when `get` returned has been given by `next` or `next_batch`. Called before the listing was read, it reads the rest of it into the `Items`' own buffer (the next `next` gives it, before anything else): it never waits for the caller. At once when `kept` is `false`.
-3. **Emissions that arrive during the listing are held** (queued in the sink under the bounds of §17.5) **and come after it**: nothing emitted is yielded before the last item of the listing.
-4. **After the listing, the two sources alternate fairly**: when both have something queued, the one that was not taken last is taken first, so neither starves the other. **No order is promised between a kept item and an emitted one**: an emission made after a `put` can reach a receiver before the `put` does (kept data travels by sync, emissions by the channel), and the reverse.
+3. **Emissions and answers that arrive during the listing are held** (emissions queued in the sink under the bounds of §17.5, answers in the answer queue of §17.10) **and come after it**: nothing emitted or answered is yielded before the last item of the listing.
+4. **After the listing, the sources alternate fairly** (kept, emitted and answered; the two of them that exist in a stream without a query): the poll starts after the source taken last, so the one not taken last is taken first among those with something queued, and none starves another. **No order is promised between a kept item and an emitted or an answered one**: an emission or an answer made after a `put` can reach a receiver before the `put` does (kept data travels by sync, emissions by the channel, answers by the signed path of [query.md](query.md)), and the reverse.
 5. **Within a source**: kept items are in the order the register applied the changes of this node, and **never an older value of a path after a newer one**; emitted items are in the mode's order (§12.6): `Reliable` and `Window` in sequence order, `Latest` the newest per sender and name, never an older after a newer; across channels, arrival order.
-6. **A notice comes after the items queued before it in its own source**: `Lagged`, `LiveEnded` and `Retracted` after the emissions (§12.7), `Withdrawn` after the kept items.
+6. **A notice comes after the items queued before it in its own source**: `Lagged`, `LiveEnded` and `Retracted` after the emissions (§12.7), `Withdrawn` after the kept items, `QueryFailed`, `AnswersDone` and the `Lagged` of dropped answers after the answers (§17.10).
 
 A joiner therefore gets the **current kept state** (the listing), then what changes, and with it what is being emitted, without a connect step and without a gap between the listing and the changes.
 
@@ -1473,15 +1497,16 @@ A joiner therefore gets the **current kept state** (the listing), then what chan
 
 `get` refuses at creation, each with a reason and a next step ([heap.md](heap.md) §10.5):
 
-- **`BadRequest`** for `kept: false` with `Live::Off`: it asks for nothing; ask for kept values, emissions, or both.
+- **`BadRequest`** for `kept: false` with `Live::Off` and no `ask`: it asks for nothing; ask for kept values, emissions, a query, or a combination. And for an `ask` that is over a limit or names what is refused, each with its reason: a query over 2,048 octets, a deadline of zero or over 10 s, `answer_max` of zero or over 4,096, a path over 255 octets, `Targets::Devices` empty, naming more than 16 or a name that is no device, or this device, and `QueryPath::Channel` (reserved) ([query.md](query.md) §3.2).
 - **`NotAllowed`** for `Live::Emitted` on a space this device only follows: a follower takes no part in channels; open the space as a member, or read the kept values with `Live::Off`. A follower **may** read kept values with `Live::Off`.
 - **`Sealed`** (`AskOwner`) for kept values of a sealed space whose audience does not list this device's person: a **non-member**, or a member that was **removed** (as soon as this node holds the record that removes her), gets no kept value. With `kept: false` the call succeeds (it does no I/O), and a non-member gets **no emission** either: no sender answers her ask (§3.4, §4.1), so she holds no session. **An `Items` that is open when its reader is removed** ends its kept part at its next step: the fold moved, so it checks the reader once (one atomic load when nothing moved) and, when she is none, gives nothing it had queued or read ahead, says `GetNotice::KeptEnded { why }` (the removal, and to ask the owner to add the person as a reader) and then ends; the emissions side goes on until its sessions end (§3.6). A feed whose queue overflowed ends the same way instead of re-reading the register, and also while an entry of a sealed space is held closed (`KeptEnded` says so: a new `get` is refused `NotReady` until the key arrives).
+- **`NotAllowed`** (`AskOwner`) for an `ask` on a space this device only follows, or from a device whose key does not stand as a listed reader or writer; **`NotReady`** for an `ask` before the space's record is held ([query.md](query.md) §3.2).
 
-`put` and `emit` need a writer (`NotAllowed` and `NotWriter` otherwise). `get` needs a reader or a writer. `kept` answers as before ([heap.md](heap.md) §10.3).
+`put` and `emit` need a writer (`NotAllowed` and `NotWriter` otherwise). `get` needs a reader or a writer, and so does a query (`ask`); `serve` needs a writer ([query.md](query.md) §3.1). `kept` answers as before ([heap.md](heap.md) §10.3).
 
 ### 17.8 What `get` does not do
 
-It does not resume (`watch` with a `Frontier` does, [heap.md](heap.md) §10.4); it does not give history, only the current value of each path (of each head, with `Heads::All`, §17.9) and what changes after; it does not make a session (§17.1); it does not order an emission against a `put` (§17.3 item 4); and it adds nothing to the wire: no field of an entry or of a frame is new for it.
+It does not resume (`watch` with a `Frontier` does, [heap.md](heap.md) §10.4); it does not give history, only the current value of each path (of each head, with `Heads::All`, §17.9) and what changes after; it does not make a session (§17.1); it does not order an emission against a `put` (§17.3 item 4); and it adds nothing to the wire: no field of an entry or of a frame is new for it (a query, §17.10, is the separate signed packet of [query.md](query.md), and no frame carries it).
 
 ### 17.9 Every head: `GetOptions::heads`
 
@@ -1496,6 +1521,18 @@ It does not resume (`watch` with a `Frontier` does, [heap.md](heap.md) §10.4); 
 7. **A slow reader (§17.5)** loses no head. The queue holds one reference per changed path (the path, its 64 heads of highest rank and how many there are in all, never a value: a value is read from the store when it is told, so a writer's thousands of heads at one path cost a queue what 64 do), at most `Config::watch_queue`, and only for streams that asked for every head: **a `Winner` stream is never queued a head it does not tell**, so a flood of concurrent writes cannot make it read the heads again, and an `All` stream pays for the heads it asked for. When a wanted change does not fit, the stream reads every head under `what` in the same step that forgets what was dropped, and compares each path's heads with what it told, so it tells every head it did not tell, retires every one it holds that left, and does so in path order before any later change. The cost is the lock and a scan of every head under `what`, as for winners.
 
 It adds nothing to the wire: no entry carries a field for heads (an entry's `after` already says what it supersedes), and the merge put, `put_merged`, signs an ordinary Put entry whose `after` lists exactly the heads its writer merged ([heap.md](heap.md) §10.3).
+
+### 17.10 Asking: `GetOptions::ask`
+
+`GetOptions::ask` is `None` by default: `get` is then exactly what §17.1 to §17.9 say. With `Some(Ask)` the same stream also carries a **query** to the devices of the space's writers and what they answer. The feature is specified in [query.md](query.md) (the API, the signed packets, sealing, the server's and the asker's judging, limits); this section states what it changes in the stream.
+
+1. **A third source.** An answer is a `Kind::Answered(Answered { query, via, refusal, proof })` item: not durable, **not an entry, never the current value of a path** and never told again. `writer` is the answering server's device and `by` the person of the key that signed the answer. A handler's own refusal is an `Answered` with `refusal` set and empty `bytes`. `GetNotice::QueryFailed { server, why }` tells a server that failed (`why.next()` says what to do) and `GetNotice::AnswersDone { asked, answered, refused, failed, silent, not_asked }` is told **once**, when every server asked has resolved or the query's deadline has passed, with `asked = answered + refused + failed + silent` (query.md §10.3).
+2. **The order** is §17.3's: the kept listing first, answers that arrive during it come after it, then the sources alternate. No order is promised between an answer and a kept or emitted item. `QueryFailed` and `AnswersDone` come after the answers queued before them and are never dropped.
+3. **A query-only stream.** With `kept: false` and `live: Live::Off` and an `ask`, the stream carries the query alone and **ends** (`None`) once `AnswersDone` has been yielded. With kept values or emissions on, the stream goes on and `AnswersDone` is a notice. `caught_up()` is about the kept listing and is unaffected (at once when `kept` is `false`).
+4. **A slow reader** (§17.5). Answers queue in a queue of their own, **64 answers and 1 MiB charged**: when it is full the **oldest** answers are dropped and `GetNotice::Lagged { missed }` is told in their place. The server is never made to wait, and a slow reader of answers delays no kept item or emission.
+5. **Duplicates** (§17.4). An answer is never merged with a kept item or an emission, and two servers' answers are two items.
+6. **The types.** `GetOptions` is no longer `Copy` (it holds an `Ask`; it is `Clone`, `Debug`, `PartialEq` and `Eq`): pass a clone where a copy was passed. `Kind` and `GetNotice` are `#[non_exhaustive]` and gained the variants above: match them with a wildcard arm.
+7. **Dropping the `Items` cancels the query**: its Interests are dropped, its pending slots released and a late answer discarded; a handler already running is not told.
 
 ## 18. Performance pass
 

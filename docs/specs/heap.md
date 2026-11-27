@@ -247,10 +247,11 @@ device.
 | entry | `<D>/32=log/<S>/seq=<n>`, `n ≥ 1` | one `ENTRY` TLV (§3) | a key of device `D` |
 | chunk of the payload of entry `E` | `<E>/32=piece/seg=<i>` | the chunk's octets (§8) | DigestSha256 |
 | manifest node `k` of entry `E` | `<E>/32=piece/32=manifest/seg=<k>` | `DIGEST`* (§8) | DigestSha256 |
-| seal key of device `D` | `<D>/32=seal/<public key>`, the last component 32 octets | one `SEAL_KEY` TLV (§6.2) | a key of device `D` |
+| seal key of device `D` | `<D>/32=seal/<public key>`, the last component 32 octets; also asked by the **keyless** name `<D>/32=seal` (an Interest with CanBePrefix), which `D` answers with the same signed packet | one `SEAL_KEY` TLV (§6.2) | a key of device `D` |
 | grant | `<G>/32=grant/<GrantAsk TLV>`, the last component one GenericNameComponent holding the `GRANT_ASK` TLV, which carries the asker's seal key packet and the certificates of its signer chain | one `GRANT` TLV (§6.5) | a key of the granter `G` |
 | held copy | `<H>/32=held/<Name TLV of the original>`, the last component one GenericNameComponent | the complete wire of the original packet | DigestSha256 |
 | channel ask and session (never stored; [channel.md](channel.md)) | `<D>/32=chan/<ParametersSha256Digest>`, exactly one component after the keyword, a ParametersSha256DigestComponent of 32 octets | the ask's ApplicationParameters (a `CHAN_ASK`) go in the Interest; the Data's Content is a `CHAN_SESSION` or a `CHAN_REFUSAL` | the Interest by a key of the asker's device, the Data by a key of device `D` |
+| query and its answer (never stored; [query.md](query.md)) | `<D>/32=query/<ParametersSha256Digest>`, exactly one component after the keyword, a ParametersSha256DigestComponent of 32 octets | the query's ApplicationParameters (a `QUERY_ASK`) go in the Interest; the Data's Content is a `QUERY_ANSWER`, `FreshnessPeriod` 0, `CachePolicy` `NoCache` | the Interest by a key of the asker's device, the Data by a key of device `D` |
 | sync group | `<O>/32=sync/<c1>[/<c2>…]` | State Vector Sync Interests and Data (§7) | as `ndn-sync` |
 
 A space is not a packet: it exists as the entries under its name. Entries are
@@ -307,6 +308,13 @@ Every name parses one way, and a node MUST refuse a name that does not parse.
   component follows, a ParametersSha256DigestComponent of 32 octets. Nothing else parses (no
   component, two, a generic one, a digest of another length). The announce of a channel has the
   same two components under a sync group instead of a device ([channel.md](channel.md) §9).
+- **Query.** `D` is the components before the first `32=query` (a device name); exactly one
+  component follows, a ParametersSha256DigestComponent of 32 octets. Nothing else parses, as for a
+  channel ask ([query.md](query.md) §5).
+- **Seal key, keyless.** `<D>/32=seal` with `D` a device name and nothing after the keyword is the
+  keyless name of `D`'s seal key packet: an asker that knows the device and not yet its key sends
+  an Interest for it with CanBePrefix and takes the signed packet it is answered with
+  ([query.md](query.md) §7.1). The keyed name above is not the keyless name.
 - **Sync group.** `<O>/32=sync` followed by the 1 to 4 components of a space's
   rest (§2.5).
 
@@ -321,9 +329,10 @@ name is none of these. If it is a keyword:
 |---|---|
 | `log` | an entry, or a piece under one |
 | `held` | a held copy |
-| `seal` | a seal key packet |
+| `seal` | a seal key packet, by its keyed name or by the keyless `<D>/32=seal` |
 | `grant` | a grant answer |
 | `chan` | a channel session or a signed refusal ([channel.md](channel.md)) |
+| `query` | a query: a signed answer, a Nack, or nothing ([query.md](query.md)) |
 | any other, **registered by an extension** (§10.9) | that extension's answer |
 | any other | not served |
 
@@ -1848,7 +1857,8 @@ A name under `/localhost` is never served.
 | `<E>/32=piece/…` with `E` this device's entry | the piece, if the entry is served |
 | `<H>/32=held/<Name TLV>` with `H` this device | the packet named — another device's entry, or a piece — **only if it is held and admitted** (a follower serves what it verified), or a **certificate** its validator vouches for (the name is a key name `<device>/KEY/<id>`, answered with the newest certificate of the key, or a certificate name; at most 4,096 octets; one fetched and not yet vouched for by a walk is not served; an NDNCERT decision `…/ndncert-approve/…` is no certificate), or a certificate of **this device's own chain** (below), wrapped as the Content of a DigestSha256 packet, so it carries no claim of having been signed by this device |
 | `<D>/KEY/<id>`, or a certificate name `<D>/KEY/<id>/<issuer>/<version>`, with `D` this device | the certificate of this device's own signing key (the newest for the key name), as its issuer signed it, **whether a walk vouched for it or not** (a device that never judged its own chain has none vouched); a name of another key is Nacked |
-| `<D>/32=seal/<pk>` with `D` this device and `pk` its recipient public key | its seal key packet |
+| `<D>/32=seal/<pk>` with `D` this device and `pk` its recipient public key, or the keyless `<D>/32=seal` with `D` this device | its seal key packet |
+| `<D>/32=query/<digest>` with `D` this device | judged and answered by [query.md](query.md) §8: a signed answer, a Nack, or nothing |
 | `<G>/32=grant/<ask>` with `G` this device | by §6.5 |
 | `<D>/32=<keyword>/…` with `D` this device and `keyword` registered by an extension | by §10.9: what the extension answers, else Nacked |
 
@@ -2772,6 +2782,7 @@ impl Heap {
     pub fn get(&self, what: Select, opts: GetOptions) -> Result<Items, HeapError>;
     pub async fn emit(&self, path: &Name, bytes: Bytes, opts: EmitOptions)
                       -> Result<(), EmitError>;
+    pub fn serve(&self, prefix: Name, handler: impl Handler) -> Result<Serving, ServeError>;   // query.md §3.1
     pub async fn watch(&self, since: &Frontier) -> Result<Changes, HeapError>;
     // `Frontier::everything()`: everything held now is seen, so no head is replayed and no value read; only what follows is told.
     pub fn members(&self) -> Members;
@@ -2793,12 +2804,14 @@ pub struct MembersChange { pub add_writers: Vec<Name>, pub add_readers: Vec<Name
 pub struct Members { pub owner: Name, pub writers: Vec<Name>, pub readers: Readers }
 pub enum Select { Path(Name), Prefix(Name) }
 pub struct GetOptions { pub kept: bool, pub heads: Heads, pub live: Live, pub modes: Modes,
-                        pub trust: Trust, pub congestion: Congestion }   // kept: true, Heads::Winner, Live::Emitted by default
+                        pub trust: Trust, pub congestion: Congestion, pub ask: Option<Ask> }
+                        // kept: true, Heads::Winner, Live::Emitted, ask: None by default; `Clone`, not `Copy`
 pub enum Heads { Winner, All }      // `Winner` (the default) is what `get` always told; `All`: every head of a path
 pub const HEADS_MAX: usize = 64;    // the most heads of one path an `All` stream tells
 pub struct Items;   // Stream<Item = Result<Got, GetNotice>>; next, next_batch, caught_up, hello_seen
 pub struct Got { pub path: Name, pub bytes: Bytes, pub by: Name, pub writer: Name, pub kind: Kind }
-pub enum Kind { Kept(Kept), Emitted(Emitted) }
+#[non_exhaustive]
+pub enum Kind { Kept(Kept), Emitted(Emitted), Answered(Answered) }   // Answered: a query's answer, never an entry (query.md §3.2)
 #[non_exhaustive]
 pub struct Kept { pub id: EntryId, pub as_of: Option<Duration>, pub removed: bool,
                   pub winner: bool, pub supersedes: Vec<EntryId> }   // `Kept::new(id)`: winner, nothing superseded
@@ -2807,8 +2820,17 @@ pub enum GetNotice { Lagged { missed: u64 }, Withdrawn { id: EntryId, why: Refus
                      LiveEnded(LiveEnd), KeptEnded { why: String },
                      Retracted { writer: Name, from: u64, to: u64 },
                      HeadsEnded { path: Name, ids: Vec<EntryId> },
-                     HeadsCapped { path: Name, hidden: u32 } }
+                     HeadsCapped { path: Name, hidden: u32 },
+                     QueryFailed { server: Name, why: QueryError },
+                     AnswersDone { asked: u32, answered: u32, refused: u32, failed: u32, silent: u32, not_asked: u32 } }
 ```
+
+**`serve` and `GetOptions::ask`** are not part of the log: a handler on a writer's device
+answers a query by name, to the asker alone, and **no answer is an entry**, stored, cached or
+anyone's current value. `Kind::Answered`, `GetNotice::QueryFailed` and
+`GetNotice::AnswersDone` carry what a query yields through `get`; the API, the names
+(`<D>/32=query/<digest>`, the keyless `<D>/32=seal`), the TLV block 0x06C0–0x06FF, sealing in a
+sealed space and the server's judging are in [query.md](query.md).
 
 A `Heap` is a cheap handle, `Clone`, on one space of one node. `Item.by` is the
 person of the writer (the namespace of the held context that governs its device's name, §9.1),
@@ -3303,7 +3325,7 @@ impl Heap { pub fn removed_by(&self, person: &Name) -> Option<EntryId>; }
 none, and answers `HeapError::BadRequest` (next step `FixRequest`) when it
 claims no keyword; a word that is not a keyword (lowercase ASCII letters,
 digits and `-`, at least one); a core keyword (§2.4: `data`, `log`, `seal`,
-`grant`, `held`, `piece`, `manifest`, `sync`, `chan`); or a keyword
+`grant`, `held`, `piece`, `manifest`, `sync`, `chan`, `query`); or a keyword
 claimed already, by another extension or twice by itself. An Interest whose
 name is under this device's own name and whose keyword right after it is
 registered is **given to that extension, and to no other code**: it answers
@@ -3876,7 +3898,7 @@ and every even number of the block are free.
 | 0x063D | `ASKER_CERT` | the wire of one certificate of the asker's signer chain (a whole Data), at most 4 in a `GRANT_ASK`, each at most 4,096 octets, 6,144 in all | 2.3, 3.3, 6.5 |
 
 Name keywords this specification owns (KeywordNameComponent, TLV-TYPE 0x20): `data`,
-`log`, `piece`, `manifest`, `seal`, `grant`, `held`, `sync` (§2); `chan` is channel.md's. The numbers
+`log`, `piece`, `manifest`, `seal`, `grant`, `held`, `sync` (§2); `chan` is channel.md's and `query` is query.md's. The numbers
 that the deletions of the former data layer freed (inside 0x0520–0x057F, except the numbers
 `invite.md` lists, and 0x05C0–0x05FE) stay quarantined, so no stale `ndn-data` packet ever decodes as
 new content; the block 0x0640–0x0653 belongs to the custodian remote signer of
