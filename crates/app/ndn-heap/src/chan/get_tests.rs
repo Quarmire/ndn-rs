@@ -55,6 +55,7 @@ fn seen(got: &Got) -> Seen {
         Kind::Kept(kept) if kept.removed => "removed",
         Kind::Kept(_) => "kept",
         Kind::Emitted(_) => "emitted",
+        Kind::Answered(_) => "answered",
     };
     (
         got.path.to_string(),
@@ -577,7 +578,7 @@ async fn by_is_the_authenticated_person_and_writer_the_device_for_both_kinds() {
         .iter()
         .find_map(|g| match &g.kind {
             Kind::Kept(k) => Some(k),
-            Kind::Emitted(_) => None,
+            Kind::Emitted(_) | Kind::Answered(_) => None,
         })
         .expect("a kept item");
     assert_eq!(kept.id, id);
@@ -901,7 +902,7 @@ async fn reliable_with_drop_discards_the_oldest_and_says_lagged_while_kept_items
         congestion: Congestion::Drop,
         ..GetOptions::default()
     };
-    let mut items = carol_get(&w, dropping);
+    let mut items = carol_get(&w, dropping.clone());
     // The watcher drops too, so it is drained as it goes and never stalls the stream.
     let mut watcher = carol_get(
         &w,
@@ -927,6 +928,7 @@ async fn reliable_with_drop_discards_the_oldest_and_says_lagged_while_kept_items
             Ok(got) => match got.kind {
                 Kind::Kept(_) => kept.push(seen(&got)),
                 Kind::Emitted(_) => emitted_seen.push(got.bytes[0]),
+                Kind::Answered(a) => panic!("no query was asked: {a:?}"),
             },
             Err(GetNotice::Lagged { missed: m }) => missed += m,
             Err(other) => panic!("{other:?}"),
@@ -980,6 +982,7 @@ async fn reliable_with_block_stalls_the_stream_loses_nothing_and_kept_items_stil
                 Ok(Some(Ok(got))) => match got.kind {
                     Kind::Kept(_) => kept.push(seen(&got)),
                     Kind::Emitted(_) => values.push(got.bytes[0]),
+                    Kind::Answered(a) => panic!("no query was asked: {a:?}"),
                 },
                 Ok(Some(Err(notice))) => panic!("Block loses nothing: {notice:?}"),
                 Ok(None) => panic!("the stream ended"),

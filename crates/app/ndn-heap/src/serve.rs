@@ -48,6 +48,7 @@ use crate::chan::answer::ChanAnswer;
 use crate::chan::hub::ChanPort;
 use crate::chan::route::setup_headers;
 use crate::limit::Counts;
+use crate::query::QueryOutcome;
 use crate::seal::seal_key_matches;
 use crate::sync::{HostRef, Net, Shared};
 use crate::trust::Judged;
@@ -160,6 +161,15 @@ pub(crate) async fn answer(net: Arc<Net>, interest: Interest, responder: Respond
             }
             None
         }
+        // `<D>/32=query/<digest>`: a query, judged and answered by the node (query.md): a signed
+        // answer, a Nack, or nothing at all for `Reply::Pass`.
+        Some(Served::Query) => {
+            if let Some(port) = shared.chan.get().and_then(Weak::upgrade) {
+                shared.tasks.clone().spawn(query(port, interest, responder));
+                return;
+            }
+            None
+        }
         // `<D>/KEY/<id>` (or a certificate of that key): the certificate a validator asks for
         // by the KeyLocator of this device's entries. The device answers for its own chain
         // and for nothing else of the kind ([`own_key_name`]).
@@ -211,6 +221,26 @@ async fn chan(port: Arc<dyn ChanPort>, interest: Interest, responder: Responder)
     };
     if let Err(e) = sent {
         tracing::debug!(%name, "channel answer not sent: {e}");
+    }
+}
+
+/// Answer a query (query.md). The answer is signed by this device, `FreshnessPeriod` 0 and never
+/// cached (`CachePolicy = NoCache`: it is for this asker alone). A query the handler passed on is
+/// left unanswered: dropping the [`Responder`] sends nothing, so the asker counts the server
+/// silent at its own deadline.
+async fn query(port: Arc<dyn ChanPort>, interest: Interest, responder: Responder) {
+    let name = (*interest.name).clone();
+    let sent = match port.query(interest, responder.incoming_face()).await {
+        QueryOutcome::Data(wire) => {
+            responder
+                .respond_bytes_with(wire, setup_headers(None))
+                .await
+        }
+        QueryOutcome::Nack(reason) => responder.nack(reason).await,
+        QueryOutcome::Silent => Ok(()),
+    };
+    if let Err(e) = sent {
+        tracing::debug!(%name, "query answer not sent: {e}");
     }
 }
 

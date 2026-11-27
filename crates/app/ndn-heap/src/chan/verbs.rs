@@ -12,6 +12,7 @@ use ndn_foundation_types::Name;
 use super::sessions::EndReason;
 use super::wire::ChannelMode;
 use crate::error::{NextStep, Refusal};
+use crate::query::{Answered, Ask, QueryError};
 use crate::register::EntryId;
 
 /// The longest stand lifetime: one hour.
@@ -370,7 +371,7 @@ pub enum Heads {
 pub const HEADS_MAX: usize = 64;
 
 /// What a receiver of `get` asks for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetOptions {
     /// Deliver the kept values first, then the changes of kept values as they arrive (default
     /// `true`). With `false` the stream carries emissions only.
@@ -388,6 +389,12 @@ pub struct GetOptions {
     /// stalls the stream (back pressure to the sender), [`Congestion::Drop`] discards the oldest and
     /// says [`GetNotice::Lagged`]. `Latest` ignores it. Default `Block`.
     pub congestion: Congestion,
+    /// Ask the servers of the space a question: each answer is a [`Kind::Answered`] item and the
+    /// stream says [`GetNotice::AnswersDone`] when every server asked has resolved. `None` (the
+    /// default) asks nothing and `get` is what it always was. With `kept: false` and
+    /// `live: Live::Off` the stream is a query alone: it ends after `AnswersDone`. See
+    /// `docs/specs/query.md`.
+    pub ask: Option<Ask>,
 }
 
 impl Default for GetOptions {
@@ -399,6 +406,7 @@ impl Default for GetOptions {
             modes: Modes::ALL,
             trust: Trust::Prompt,
             congestion: Congestion::Block,
+            ask: None,
         }
     }
 }
@@ -470,6 +478,9 @@ pub enum Kind {
     Kept(Kept),
     /// A live emission: not durable, never the current value of the path.
     Emitted(Emitted),
+    /// A server's answer to this query (`GetOptions::ask`): not durable, not an entry, never
+    /// the current value of a path and never told again.
+    Answered(Answered),
 }
 
 /// One item `get` yields.
@@ -512,8 +523,10 @@ pub enum LiveEnd {
 #[non_exhaustive]
 pub enum GetNotice {
     /// The consumer fell behind, or the mode dropped messages: this many were missed. Told for
-    /// emissions only (the mode dropped them: `Latest` past its bound, `Reliable` and `Window`
-    /// with [`Congestion::Drop`], or a gap in the sequence). A slow reader of kept values is
+    /// emissions (the mode dropped them: `Latest` past its bound, `Reliable` and `Window`
+    /// with [`Congestion::Drop`], or a gap in the sequence) and for answers of a query (the
+    /// answer queue holds 64 answers and 1 MiB: past it the oldest are dropped, in their place
+    /// in the stream, and the server is never made to wait). A slow reader of kept values is
     /// never told this: it is given the current values again from the store.
     Lagged {
         /// How many.
@@ -579,6 +592,39 @@ pub enum GetNotice {
         path: Name,
         /// How many heads of lower rank are not told.
         hidden: u32,
+    },
+    /// A query to one server failed (`GetOptions::ask`): `why` says what and, by
+    /// [`QueryError::next`], what to do. Counted `failed` in [`GetNotice::AnswersDone`].
+    QueryFailed {
+        /// The server's device, or the space's name when no server is known.
+        server: Name,
+        /// Why.
+        why: QueryError,
+    },
+    /// Every server a query asked has resolved, or its deadline passed (`GetOptions::ask`): told
+    /// **once** per `get`, after the answers and failures that came before it. Each server
+    /// asked is in exactly one bucket, so `asked == answered + refused + failed + silent`.
+    /// `not_asked` counts the servers known beyond the 16 a query asks. The deadline is
+    /// liveness, never correctness: an answer that came later was dropped and cannot be told
+    /// from silence.
+    AnswersDone {
+        /// Servers the query addressed: each is in exactly one of the buckets below. A device
+        /// named in `Targets::Devices` that is no writer is counted `failed` (a
+        /// [`QueryError::NotWriter`] is told) and nothing is sent to it; a device that
+        /// `Targets::Serving` or `Targets::Person` finds is no writer is not addressed and not
+        /// counted.
+        asked: u32,
+        /// Servers that gave bytes.
+        answered: u32,
+        /// Servers whose handler refused (an [`Answered`] with a refusal).
+        refused: u32,
+        /// Servers a [`GetNotice::QueryFailed`] was told for.
+        failed: u32,
+        /// Servers that said nothing by the deadline (a `Pass`, a dropped query, a slow handler,
+        /// a server that is down).
+        silent: u32,
+        /// Servers known and not asked, past the limit of 16.
+        not_asked: u32,
     },
 }
 

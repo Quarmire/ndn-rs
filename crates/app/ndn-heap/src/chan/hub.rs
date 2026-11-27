@@ -38,6 +38,7 @@ use super::tx::Tx;
 use super::verify::Bucket;
 use super::wire::{Announce, ChannelMode};
 use crate::node::NodeInner;
+use crate::query::QueryOutcome;
 use crate::rt::{self, Instant};
 use crate::wire::{chan_prefix, is_device_name, parse_chan_announce_name, sync_group_of};
 
@@ -355,6 +356,12 @@ pub(crate) type PortFuture<'a> = futures::future::BoxFuture<'a, ChanAnswer>;
 /// The future of a [`ChanPort::answer`].
 #[cfg(target_arch = "wasm32")]
 pub(crate) type PortFuture<'a> = futures::future::LocalBoxFuture<'a, ChanAnswer>;
+/// The future of a [`ChanPort::query`].
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type QueryFuture<'a> = futures::future::BoxFuture<'a, QueryOutcome>;
+/// The future of a [`ChanPort::query`].
+#[cfg(target_arch = "wasm32")]
+pub(crate) type QueryFuture<'a> = futures::future::LocalBoxFuture<'a, QueryOutcome>;
 
 /// What the network half asks of the node for channels: the answer to an ask, and an announce
 /// heard. The network half holds it weakly and only once the node is whole.
@@ -362,6 +369,9 @@ pub(crate) trait ChanPort: Send + Sync {
     /// Answer an ask (`serve::chan`) that arrived over the forwarder's face `ingress`, when the
     /// connection says which.
     fn answer(&self, interest: Interest, ingress: Option<FaceId>) -> PortFuture<'_>;
+    /// Answer a query (`serve::query`) that arrived over the forwarder's face `ingress`: a
+    /// signed answer, a Nack, or nothing.
+    fn query(&self, interest: Interest, ingress: Option<FaceId>) -> QueryFuture<'_>;
     /// An announce was heard on the sync face (never answered).
     fn heard(&self, interest: &Interest);
 }
@@ -372,6 +382,10 @@ pub(crate) type PortCell = Arc<OnceLock<Weak<dyn ChanPort>>>;
 impl ChanPort for NodeInner {
     fn answer(&self, interest: Interest, ingress: Option<FaceId>) -> PortFuture<'_> {
         Box::pin(async move { self.chan_answer(&interest, ingress).await })
+    }
+
+    fn query(&self, interest: Interest, ingress: Option<FaceId>) -> QueryFuture<'_> {
+        Box::pin(async move { self.query_answer(&interest, ingress).await })
     }
 
     fn heard(&self, interest: &Interest) {
@@ -389,17 +403,24 @@ impl NodeInner {
         }
     }
 
-    /// Push the announce of this device's channels over `space`: one unsigned Interest
-    /// `<sync group>/32=chan/<digest>`, ApplicationParameters this device and its modes, lifetime 1 s,
-    /// HopLimit 8. It is answered by nobody and cached nowhere; a receiver takes it as a hint.
+    /// Push the announce of this device over `space`: one unsigned Interest
+    /// `<sync group>/32=chan/<digest>`, ApplicationParameters this device, its channel modes and
+    /// the prefixes it serves queries under (at most 16 names and 512 octets of name values,
+    /// shortest first: the rest are left out), lifetime 1 s, HopLimit 8. A device with no
+    /// channel announces its prefixes alone (no mode), and one with neither announces nothing:
+    /// the hint of a device that stopped serving lapses after 90 s when no channel lets it say
+    /// so. It is answered by nobody and cached nowhere; a receiver takes it as a hint.
     pub(crate) async fn chan_announce(&self, space: &Name) {
         let modes = self.chan.channels.modes(space);
-        let Some(group) = sync_group_of(space).filter(|_| !modes.is_empty()) else {
+        let serves = self.query_serves(space);
+        let Some(group) = sync_group_of(space).filter(|_| !modes.is_empty() || !serves.is_empty())
+        else {
             return;
         };
         let record = Announce {
             sender: self.device.clone(),
             modes,
+            serves,
         }
         .encode();
         let wire = InterestBuilder::new(chan_prefix(&group))
@@ -407,7 +428,9 @@ impl NodeInner {
             .hop_limit(8)
             .app_parameters(record.to_vec())
             .build();
-        self.chan.channels.announced(space, Instant::now());
+        let now = Instant::now();
+        self.chan.channels.announced(space, now);
+        self.query.server.announced(space, now);
         if let Some(net) = self.net()
             && net.send_sync(wire).await.is_ok()
         {
@@ -436,7 +459,12 @@ impl NodeInner {
         let Some(params) = announce_params(interest, &digest) else {
             return;
         };
-        let Ok(Announce { sender, modes, .. }) = Announce::decode(params) else {
+        let Ok(Announce {
+            sender,
+            modes,
+            serves,
+        }) = Announce::decode(params)
+        else {
             return;
         };
         if sender == self.device {
@@ -466,6 +494,12 @@ impl NodeInner {
             stats.announce_ignored.bump();
             return;
         }
+        // The prefixes it says it serves are a hint too, recorded whatever is decided about
+        // asking it for a channel (a device that only serves has no mode to ask for); an
+        // announce that lists none removes the device's hint.
+        self.query
+            .hints
+            .record(&space, &sender, &serves, Instant::now());
         let now = Instant::now();
         if !self.chan.is_listening(&space) {
             stats.announce_ignored.bump();
@@ -580,6 +614,14 @@ impl NodeInner {
             tx.idle_checkpoint(now);
         }
         announce.extend(self.chan.channels.announce_due(now));
+        // The prefixes this device serves are announced as often, and the pair keys of askers
+        // that no longer stand go with the move that removed them.
+        announce.extend(
+            self.query
+                .server
+                .announce_due(&self.query.table.spaces(), now),
+        );
+        self.query_rejudge();
         announce.sort();
         announce.dedup();
         for space in announce {

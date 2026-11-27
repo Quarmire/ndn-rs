@@ -52,7 +52,7 @@ use crate::sync::{HostRef, Net, NetEnd, Taken};
 use crate::trust::{Adopter, Adoption, Judge, Judged, TipCut, Verified};
 use crate::wire::{
     EpochId, GrantAsk, device_of, is_device_name, is_namespace, log_name, parse_log_name,
-    parse_seal_key_name, parse_space_name,
+    parse_seal_key_name, parse_seal_prefix, parse_space_name,
 };
 
 #[cfg(test)]
@@ -224,6 +224,9 @@ pub(crate) struct NodeInner {
     /// What the node keeps of channels: its channels as a sender, its sessions as a receiver
     /// ([`crate::chan`]).
     pub(crate) chan: Chan,
+    /// What the node keeps of queries: the prefixes it serves and the state of both halves of
+    /// the signed path ([`crate::query`]).
+    pub(crate) query: crate::query::QueryNode,
 }
 
 /// What the store says of a space opened before: a member (1) or a carrier
@@ -328,6 +331,7 @@ impl Node {
             tasks: Tasks::new(),
             net_end: Mutex::new(None),
             chan: Chan::new(),
+            query: Default::default(),
         });
         let node = Node {
             inner: Arc::clone(&inner),
@@ -1295,10 +1299,17 @@ impl NodeInner {
         self.store.get(piece)
     }
 
+    /// This device's own seal key packet, for its keyed name `<D>/32=seal/<public key>` or its
+    /// keyless one `<D>/32=seal`: an asker that knows the device and not yet its key sends an
+    /// Interest for the keyless name with CanBePrefix and takes the packet it is answered with
+    /// (a signed Data, so the key is the device's word and not the answerer's). Any other device's
+    /// name, and any other key, is answered with nothing.
     pub(crate) fn seal_key_packet(&self, name: &Name) -> Option<Bytes> {
-        let (device, public) = parse_seal_key_name(name)?;
-        (device == self.device && public == self.recipient.public())
-            .then(|| self.seal_packet.clone())
+        let own = match parse_seal_key_name(name) {
+            Some((device, public)) => device == self.device && public == self.recipient.public(),
+            None => parse_seal_prefix(name).is_some_and(|device| device == self.device),
+        };
+        own.then(|| self.seal_packet.clone())
     }
 
     pub(crate) fn blobs(&self, space: &Name) -> Vec<Blob> {

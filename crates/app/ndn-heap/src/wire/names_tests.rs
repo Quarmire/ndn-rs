@@ -420,6 +420,9 @@ fn the_keyword_router_names_each_served_kind_in_one_look() {
         // parses to nothing there.
         n("/alice/laptop/32=chan"),
         n("/alice/laptop/32=chan/x"),
+        query_ask_name(&device, &[3; 32]),
+        n("/alice/laptop/32=query"),
+        n("/alice/laptop/32=query/x"),
         held_name(&device, &n("/bob/phone/32=log/bob/32=data/x/seq=1")),
         // Misplaced keywords: one after another, a lone keyword, a keyword
         // the layer does not use, the marker of a space.
@@ -450,6 +453,8 @@ fn the_keyword_router_names_each_served_kind_in_one_look() {
             Some(Served::Seal)
         } else if parse_chan_name(name).is_some() {
             Some(Served::Chan)
+        } else if parse_query_name(name).is_some() {
+            Some(Served::Query)
         } else if parse_log_name(name).is_some() || parse_piece_name(name).is_some() {
             Some(Served::Log)
         } else {
@@ -463,13 +468,14 @@ fn the_keyword_router_names_each_served_kind_in_one_look() {
         Served::Log => (parse_log_name(name).is_some() || parse_piece_name(name).is_some())
             .then_some(Served::Log),
         Served::Chan => parse_chan_name(name).map(|_| Served::Chan),
+        Served::Query => parse_query_name(name).map(|_| Served::Query),
     };
     let mut seen = std::collections::BTreeSet::new();
     for name in &names {
         assert_eq!(routed(name), chain(name), "{name}");
         seen.extend(chain(name).map(|k| format!("{k:?}")));
     }
-    assert_eq!(seen.len(), 5, "the table reaches every route: {seen:?}");
+    assert_eq!(seen.len(), 6, "the table reaches every route: {seen:?}");
     // The one look is the first keyword and nothing else.
     assert_eq!(served_kind(&log), Some(Served::Log));
     assert_eq!(served_kind(&held_name(&device, &log)), Some(Served::Held));
@@ -495,6 +501,7 @@ fn every_keyword_the_layers_names_carry_is_a_core_keyword() {
         held_name(&device, &log),
         sync_group_of(&space).unwrap(),
         chan_ask_name(&device, &[4; 32]),
+        query_ask_name(&device, &[6; 32]),
         chan_announce_name(&sync_group_of(&space).unwrap(), &[5; 32]),
     ];
     let mut seen = std::collections::BTreeSet::new();
@@ -725,5 +732,97 @@ fn a_chan_name_is_one_digest_under_a_device_and_nothing_else_parses() {
         group.clone().append("x"),
     ] {
         assert_eq!(parse_chan_announce_name(&bad), None, "{bad}");
+    }
+}
+
+/// `<device>/32=query/<digest>` has the grammar of a channel ask under its own keyword: exactly
+/// one ParametersSha256DigestComponent of 32 octets after it, a device before it, nothing else.
+#[test]
+fn a_query_name_is_one_digest_under_a_device_and_nothing_else_parses() {
+    let device = n("/alice/laptop");
+    let digest = [9u8; 32];
+    let name = query_ask_name(&device, &digest);
+    let comps = name.components();
+    assert_eq!(comps.len(), 4, "device, device, the keyword, the digest");
+    assert_eq!(comps[2], kw(b"query"));
+    assert_eq!(
+        comps[3].typ,
+        ndn_foundation_types::tlv_type::PARAMETERS_SHA256
+    );
+    assert_eq!(parse_query_name(&name), Some((device.clone(), digest)));
+    assert_eq!(served_kind(&name), Some(Served::Query));
+    assert_eq!(query_prefix(&device), n("/alice/laptop/32=query"));
+    assert_eq!(
+        parse_query_prefix(&query_prefix(&device)),
+        Some(device.clone())
+    );
+    assert_eq!(parse_query_prefix(&chan_prefix(&device)), None);
+    assert_eq!(parse_query_prefix(&name), None);
+    assert_eq!(parse_chan_prefix(&query_prefix(&device)), None);
+    assert_eq!(parse_query_name(&chan_ask_name(&device, &digest)), None);
+    assert_eq!(parse_chan_name(&name), None);
+
+    let with = |c: NameComponent| query_prefix(&device).append_component(c);
+    let digest_component = |v: &[u8]| {
+        NameComponent::new(
+            ndn_foundation_types::tlv_type::PARAMETERS_SHA256,
+            Bytes::copy_from_slice(v),
+        )
+    };
+    for bad in [
+        // no component after the keyword, two, or one that is no parameters digest
+        query_prefix(&device),
+        name.clone().append("more"),
+        with(generic("digest")),
+        with(NameComponent::new(
+            ndn_foundation_types::tlv_type::IMPLICIT_SHA256,
+            Bytes::copy_from_slice(&digest),
+        )),
+        // a digest of 31 or 33 octets
+        with(digest_component(&digest[..31])),
+        with(digest_component(&[9; 33])),
+        // a device with a keyword, with a digest, or none at all
+        query_ask_name(&n("/alice/32=held/laptop"), &digest),
+        query_ask_name(&device.clone().append_implicit_digest([1; 32]), &digest),
+        query_ask_name(&Name::root(), &digest),
+        // another keyword
+        n("/alice/laptop/32=grant").append_component(digest_component(&digest)),
+    ] {
+        assert_eq!(parse_query_name(&bad), None, "{bad}");
+    }
+    assert_eq!(parse_query_prefix(&Name::root()), None);
+    assert_eq!(
+        parse_query_prefix(&n("/alice/32=held/laptop/32=query")),
+        None
+    );
+}
+
+/// The keyless seal name is `<device>/32=seal` and nothing longer: the keyed name is
+/// [`parse_seal_key_name`]'s, and neither parses as the other.
+#[test]
+fn the_keyless_seal_name_is_a_device_and_the_keyword_and_nothing_else() {
+    let device = n("/alice/laptop");
+    let keyless = seal_prefix(&device);
+    assert_eq!(keyless, n("/alice/laptop/32=seal"));
+    assert_eq!(parse_seal_prefix(&keyless), Some(device.clone()));
+    assert_eq!(served_kind(&keyless), Some(Served::Seal));
+    assert_eq!(parse_seal_key_name(&keyless), None);
+    let keyed = seal_key_name(&device, &[7; 32]);
+    assert_eq!(parse_seal_prefix(&keyed), None);
+    assert!(
+        keyed.has_prefix(&keyless),
+        "the packet answers a CanBePrefix Interest"
+    );
+    for bad in [
+        Name::root(),
+        n("/32=seal"),
+        n("/alice/32=held/laptop/32=seal"),
+        n("/alice/laptop/32=chan"),
+        device
+            .clone()
+            .append_implicit_digest([1; 32])
+            .append_component(kw(b"seal")),
+    ] {
+        assert_eq!(parse_seal_prefix(&bad), None, "{bad}");
     }
 }

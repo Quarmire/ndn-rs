@@ -31,7 +31,9 @@ use crate::seal::GrantRefusal;
 use crate::sync::Taken;
 use crate::test_kit::n;
 use crate::trust::{Judged, Verified};
-use crate::wire::{EpochId, GrantAsk, encode_seal_key, log_name, parse_log_name, seal_key_name};
+use crate::wire::{
+    EpochId, GrantAsk, encode_seal_key, log_name, parse_log_name, parse_seal_prefix, seal_key_name,
+};
 
 /// The space the cases run in.
 pub(crate) const SPACE: &str = "/alice/32=data/notes";
@@ -638,7 +640,9 @@ impl Host for Toyhost {
     fn seal_key_packet(&self, name: &Name) -> Option<Bytes> {
         let st = self.st.lock();
         let packet = st.seal.clone()?;
-        (Data::decode(packet.clone()).ok()?.name.as_ref() == name).then_some(packet)
+        // As the node: the packet's own name, or the keyless `<D>/32=seal` of this device.
+        let keyless = parse_seal_prefix(name).is_some_and(|device| device == self.device);
+        (keyless || Data::decode(packet.clone()).ok()?.name.as_ref() == name).then_some(packet)
     }
 
     fn blobs(&self, _space: &Name) -> Vec<Blob> {

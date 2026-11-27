@@ -883,6 +883,19 @@ impl Log {
             .is_some_and(|d| d.held.count() > d.nonvouching)
     }
 
+    /// The devices of `person` that are vouched for ([`Self::vouches`]), in name order: the
+    /// devices the record knows of that person (what `Targets::Person` asks).
+    pub(crate) fn devices_of(&self, person: &Name) -> Vec<Name> {
+        let mut found: Vec<Name> = self
+            .devices
+            .iter()
+            .filter(|(_, d)| d.person == *person && d.held.count() > d.nonvouching)
+            .map(|(device, _)| device.clone())
+            .collect();
+        found.sort();
+        found
+    }
+
     /// Whether a device other than this one is vouched for: an admitted
     /// entry of it is held. What the group's unsigned vector says of who is
     /// there decides nothing.

@@ -45,7 +45,7 @@ use crate::rt::{self, Instant, Tasks};
 use crate::store::{Kind, Link};
 use crate::wire::{
     ASKER_CHAIN_MAX, ASKER_CHAIN_OCTETS_MAX, chan_ask_name, device_of, log_prefix, parse_chan_name,
-    parse_log_name,
+    parse_log_name, parse_query_name, query_ask_name,
 };
 
 /// The first pause before a person the host could not adopt is asked again;
@@ -797,7 +797,8 @@ impl Judge {
         judged
     }
 
-    /// Judge `interest`, an ask `<responder>/32=chan/<digest>` signed by `key`, a key of another
+    /// Judge `interest`, an ask `<responder>/32=chan/<digest>` or a query
+    /// `<responder>/32=query/<digest>` signed by `key`, a key of another
     /// device, for `space`: the same walk as [`Self::validate_asker_packet`] makes for the Data
     /// of a grant ask (the live rule: an Interest is signed now, so a certificate must be valid
     /// now), from the certificates held and `chain`, the certificates the ask carries (at most
@@ -813,12 +814,17 @@ impl Judge {
         key: &Name,
         chain: &[Bytes],
     ) -> InterestJudged {
-        let (Some(device), Some((_, digest))) = (device_of(key), parse_chan_name(&interest.name))
-        else {
+        let Some(device) = device_of(key) else {
             return InterestJudged::Refused(Refusal::BadSignature);
         };
         // The name the signer's context is chosen by: the same ask, as if under the asker.
-        let as_asker = chan_ask_name(&device, &digest);
+        let as_asker = if let Some((_, digest)) = parse_chan_name(&interest.name) {
+            chan_ask_name(&device, &digest)
+        } else if let Some((_, digest)) = parse_query_name(&interest.name) {
+            query_ask_name(&device, &digest)
+        } else {
+            return InterestJudged::Refused(Refusal::BadSignature);
+        };
         let view = self.view_for(&as_asker, space, true);
         let mut taken = Vec::new();
         let mut outcome = None;

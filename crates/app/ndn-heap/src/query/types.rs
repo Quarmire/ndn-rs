@@ -1,0 +1,440 @@
+//! The public types of `serve` and of a query on `get` (docs/specs/query.md, The API): what a
+//! handler is given and answers, what an asker asks, what it is told, and why a query failed.
+//!
+//! **An answer is not an entry.** Nothing here is stored: a [`Query`] lives while its handler
+//! runs, an [`Answered`] is an item of one `Items` and is never replayed, and the asker's
+//! pending set and the server's in-flight set are memory bounded by outstanding queries.
+
+use std::time::Duration;
+
+use bytes::Bytes;
+use ndn_foundation_types::Name;
+
+use crate::error::NextStep;
+use crate::rt::Instant;
+
+/// The id an asker gives a query: eight random octets, echoed by the server in its answer, the
+/// same to every server of one `get`. A handler with side effects keys them on it and on the
+/// asker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct QueryId(pub u64);
+
+impl std::fmt::Display for QueryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
+/// Which path a query came by. The enum grows with the channel path: match it with a wildcard
+/// arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Via {
+    /// A signed Interest and a signed Data: the answer is the server device's own statement and
+    /// proves it to anyone, [`Answered::proof`] keeps it. In a sealed space the octets are
+    /// sealed to the pair of devices as well; the signature covers the sealed octets.
+    Signed,
+}
+
+/// Which path a query takes ([`Ask::via`]).
+///
+/// Only the signed path is built: [`QueryPath::Channel`] is refused at `get` with the reason and
+/// what to ask instead, and [`QueryPath::Auto`] takes the channel only for a session the
+/// application opened with `Channel`, so it is always the signed path until the channel path
+/// exists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum QueryPath {
+    /// The channel for a session this application opened, else signed. The default.
+    #[default]
+    Auto,
+    /// Always the signed Interest.
+    Signed,
+    /// Always the channel, opening its session if none is held. Refused until it is built.
+    Channel,
+}
+
+/// Who is asked.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum Targets {
+    /// The devices whose announce lists a prefix of the asked path (a hint: the server's own
+    /// judgement of the query is the authority), judged offline as writers of the space; the 16
+    /// heard last. The default.
+    #[default]
+    Serving,
+    /// Exactly these devices (at most 16).
+    Devices(Vec<Name>),
+    /// The known devices of this person that are writers (at most 16).
+    Person(Name),
+}
+
+/// The most servers one query asks.
+pub const TARGETS_MAX: usize = 16;
+
+/// The most octets of a query on the signed path.
+pub const QUERY_MAX: usize = crate::wire::QUERY_BYTES_MAX;
+
+/// The longest deadline of a query: ten seconds.
+pub const DEADLINE_MAX: Duration = Duration::from_secs(10);
+
+/// What a receiver of `get` asks the servers of the space (`GetOptions::ask`).
+///
+/// Build one with [`Ask::new`]: the fields are public and the defaults are the ones listed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ask {
+    /// The query octets: at most [`QUERY_MAX`] (2,048).
+    pub query: Bytes,
+    /// Who is asked (default [`Targets::Serving`]).
+    pub targets: Targets,
+    /// Which path (default [`QueryPath::Auto`]).
+    pub via: QueryPath,
+    /// How long the query lives, setup and handler together: 1 ms to [`DEADLINE_MAX`] (default 3
+    /// s). **Liveness only**: a late answer is dropped and counted as silence; nothing the
+    /// application decides should depend on the deadline.
+    pub deadline: Duration,
+    /// The largest answer told (default [`ANSWER_MAX_DEFAULT`]); a larger one is a
+    /// [`QueryError::AnswerTooLarge`] failure.
+    pub answer_max: usize,
+    /// Keep the signed Data of each answer ([`Answered::proof`]); default `false`.
+    pub proof: bool,
+}
+
+/// The largest answer [`Ask::answer_max`] allows by default, and the most the signed path
+/// carries: 4 KiB.
+pub const ANSWER_MAX_DEFAULT: usize = crate::wire::ANSWER_BYTES_MAX;
+
+impl Ask {
+    /// A query of `query` to the devices that serve the path, by the path that suits, within 3 s.
+    pub fn new(query: impl Into<Bytes>) -> Ask {
+        Ask {
+            query: query.into(),
+            targets: Targets::Serving,
+            via: QueryPath::Auto,
+            deadline: Duration::from_secs(3),
+            answer_max: ANSWER_MAX_DEFAULT,
+            proof: false,
+        }
+    }
+}
+
+/// The asker, as the server's space judged it when the query arrived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Asker {
+    /// The asker's person: the one the trust context vouched for the signing key as.
+    pub person: Name,
+    /// The asker's device.
+    pub device: Name,
+}
+
+/// A query, as a handler is given it.
+#[derive(Clone, Debug)]
+pub struct Query {
+    /// The asker's id of the query; the same to every server of one `get`.
+    pub id: QueryId,
+    /// The asked name, relative to the space; a served prefix is a prefix of it.
+    pub path: Name,
+    /// The query octets.
+    pub bytes: Bytes,
+    /// Who asked, as judged when the query arrived: a handler that does something for the asker
+    /// still judges her itself, since a removal after that moves nothing it already began.
+    pub asker: Asker,
+    /// Which path it came by.
+    pub via: Via,
+    pub(crate) deadline: Instant,
+}
+
+impl Query {
+    /// How long the asker still waits: the handler's future is dropped at that moment and its
+    /// answer, if it made one, is not sent.
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
+
+/// The application's own refusal: a code it defines and a text for the asker, at most 256
+/// octets (a longer text is cut at a character boundary). Not a system failure: the asker is
+/// told it as an answer ([`Answered::refusal`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppRefusal {
+    /// The application's code.
+    pub code: u16,
+    /// The application's words.
+    pub text: String,
+}
+
+/// The most octets of a refusal's text.
+pub const REFUSAL_TEXT_MAX: usize = 256;
+
+impl AppRefusal {
+    /// A refusal with `code` and `text`; `text` is cut to [`REFUSAL_TEXT_MAX`] octets.
+    pub fn new(code: u16, text: impl Into<String>) -> AppRefusal {
+        let mut text = text.into();
+        if text.len() > REFUSAL_TEXT_MAX {
+            let mut cut = REFUSAL_TEXT_MAX;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+        }
+        AppRefusal { code, text }
+    }
+}
+
+/// What a handler answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reply {
+    /// The answer: at most 4,096 octets on the signed path. A larger result is the handler's
+    /// `put` and an answer that names the path.
+    Answer(Bytes),
+    /// The application's refusal, told to the asker as an answer.
+    Refuse(AppRefusal),
+    /// Nothing for this query: nothing is sent, and the asker counts this server silent at its
+    /// deadline. A handler that wants the asker to know says [`Reply::Refuse`].
+    Pass,
+}
+
+impl Reply {
+    /// [`Reply::Refuse`] with `code` and `text`.
+    pub fn refuse(code: u16, text: impl Into<String>) -> Reply {
+        Reply::Refuse(AppRefusal::new(code, text))
+    }
+}
+
+/// The future of a [`Handler::answer`].
+#[cfg(not(target_arch = "wasm32"))]
+pub type HandlerFuture = futures::future::BoxFuture<'static, Reply>;
+/// The future of a [`Handler::answer`].
+#[cfg(target_arch = "wasm32")]
+pub type HandlerFuture = futures::future::LocalBoxFuture<'static, Reply>;
+
+/// What answers the queries of a served prefix: it runs once per query that reaches it and its
+/// result goes to that asker once. Any `Fn(Query) -> impl Future<Output = Reply>` is one.
+///
+/// **No answers family.** A handler's result is never stored, cached, recomputed, sealed by a
+/// reader or made an entry: the handler is a producer callback and nothing else
+/// (docs/specs/query.md, the invariant).
+pub trait Handler: Send + Sync + 'static {
+    /// Answer `query`.
+    fn answer(&self, query: Query) -> HandlerFuture;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<F, Fut> Handler for F
+where
+    F: Fn(Query) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Reply> + Send + 'static,
+{
+    fn answer(&self, query: Query) -> HandlerFuture {
+        Box::pin(self(query))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<F, Fut> Handler for F
+where
+    F: Fn(Query) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Reply> + 'static,
+{
+    fn answer(&self, query: Query) -> HandlerFuture {
+        Box::pin(self(query))
+    }
+}
+
+/// What a query's answer item is (`Kind::Answered`): the server's word, never an entry and
+/// never the current value of a path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Answered {
+    /// The query this answers.
+    pub query: QueryId,
+    /// Which path it came by.
+    pub via: Via,
+    /// The handler's own refusal; the item's bytes are then empty. Not a failure: the
+    /// application's word, counted `refused`.
+    pub refusal: Option<AppRefusal>,
+    /// The signed Data the server sent, when [`Ask::proof`] was set: the server device's
+    /// statement, which anyone who holds the space's record can check.
+    pub proof: Option<Bytes>,
+}
+
+/// Why a query to one server failed: told as [`GetNotice::QueryFailed`](crate::GetNotice) and
+/// counted `failed`. [`QueryError::next`] says what to do. The enum grows (the channel path adds
+/// its setup refusals): match it with a wildcard arm.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum QueryError {
+    /// No device is known to serve the path.
+    #[error(
+        "no device is known to serve {path}: name the servers with Targets::Devices, or ask the \
+         space's owner which device serves it"
+    )]
+    NoServer {
+        /// The asked path.
+        path: Name,
+    },
+    /// The server refused to answer this device, or nothing routes to it.
+    #[error(
+        "the server did not answer: it does not list this device's person (or this device has \
+         no standing in the space, or the person is outside a sealed space's audience), the \
+         query was signed more than 120 s from the server's clock or before the server began \
+         serving (check this device's clock), or no route reaches it; ask the owner to list the \
+         person, correct the clock, and check that the server's device is reachable"
+    )]
+    NotListed,
+    /// The server serves no prefix of the path.
+    #[error(
+        "the device serves no prefix of {path}: ask a device that serves it (Targets::Serving), \
+         or name the path it serves"
+    )]
+    NotServed {
+        /// The asked path.
+        path: Name,
+    },
+    /// The server could not take the query now.
+    #[error(
+        "the server could not take the query now (over a limit of its own, or it had seen a \
+         copy of this query already); try again later with a new get"
+    )]
+    Busy,
+    /// The server does not hold the asker's certificate chain yet, or the sealed space's epoch.
+    #[error(
+        "the server cannot judge this device yet (it does not hold its certificate chain or the \
+         space's epoch); try again in a moment"
+    )]
+    NotYet,
+    /// Nothing answered or routed the query.
+    #[error(
+        "no route to the server, or its forwarder dropped the query; try again later (the \
+         server may be down)"
+    )]
+    Unreachable,
+    /// A query or an answer is over its limit.
+    #[error("over the limit of {max} octets: {what}; send less, or put the data and name its path")]
+    TooLarge {
+        /// What is over.
+        what: &'static str,
+        /// The limit.
+        max: u64,
+    },
+    /// An answer is larger than [`Ask::answer_max`].
+    #[error(
+        "the answer is {size} octets, over answer_max {max}: raise answer_max, or have the \
+         handler put the data and answer its path"
+    )]
+    AnswerTooLarge {
+        /// Its size.
+        size: usize,
+        /// The limit asked for.
+        max: usize,
+    },
+    /// The answer failed to verify as the server's.
+    #[error("the answer did not verify as the server's ({why}); try again later")]
+    BadAnswer {
+        /// Why.
+        why: String,
+    },
+    /// This device has as many queries outstanding as it may.
+    #[error(
+        "this device has as many queries outstanding as it may (64 in all, 16 to one server); \
+         try again when some have finished"
+    )]
+    TooManyOutstanding,
+    /// The named device is no writer of the space, as this device judges it now.
+    #[error(
+        "{device} is no writer of the space by the record held here, so it serves nothing and \
+         was not asked: name a writer's device, or ask the owner whether it may write"
+    )]
+    NotWriter {
+        /// The device named.
+        device: Name,
+    },
+    /// The space or this device's standing does not allow the query yet.
+    #[error("the query cannot be sent: {why}")]
+    NotReady {
+        /// Why, and what to do.
+        why: String,
+    },
+}
+
+impl QueryError {
+    /// What to do about it, in the heap's vocabulary.
+    pub fn next(&self) -> NextStep {
+        match self {
+            QueryError::NoServer { .. } | QueryError::NotServed { .. } => NextStep::FixRequest,
+            QueryError::NotListed => NextStep::AskOwner,
+            QueryError::NotWriter { .. } => NextStep::FixRequest,
+            QueryError::Busy
+            | QueryError::NotYet
+            | QueryError::Unreachable
+            | QueryError::BadAnswer { .. }
+            | QueryError::TooManyOutstanding
+            | QueryError::NotReady { .. } => NextStep::RetryLater,
+            QueryError::TooLarge { .. } | QueryError::AnswerTooLarge { .. } => NextStep::FixRequest,
+        }
+    }
+}
+
+/// Why `Heap::serve` refused. [`ServeError::next`] says what to do.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ServeError {
+    /// This device is no writer of the space: only a writer's device serves.
+    #[error(
+        "this device may not serve in {space}: {why}; a reader asks, a writer's device serves \
+         (ask the owner to make this person a writer, or serve from a writer's device)"
+    )]
+    NotWriter {
+        /// The space.
+        space: Name,
+        /// Why.
+        why: String,
+    },
+    /// The space is not ready here: its record is not held yet.
+    #[error("{space} is not ready to serve: {why}; try again later")]
+    NotReady {
+        /// The space.
+        space: Name,
+        /// Why.
+        why: String,
+    },
+    /// The prefix is already served by this heap.
+    #[error(
+        "{existing} is already served by this heap: drop that Serving first, or serve a nested \
+         prefix (nested prefixes are allowed; the longest one answers)"
+    )]
+    Overlap {
+        /// The prefix served.
+        existing: Name,
+    },
+    /// This heap serves as many prefixes as it may.
+    #[error("this heap serves as many prefixes as it may ({max}); drop a Serving first")]
+    TooMany {
+        /// The limit.
+        max: usize,
+    },
+    /// The prefix is over 255 octets.
+    #[error("the prefix is {size} octets, over the limit of {max}: serve a shorter prefix")]
+    BadPrefix {
+        /// Its size.
+        size: usize,
+        /// The limit.
+        max: usize,
+    },
+}
+
+impl ServeError {
+    /// What to do about it, in the heap's vocabulary.
+    pub fn next(&self) -> NextStep {
+        match self {
+            ServeError::NotWriter { .. } => NextStep::AskOwner,
+            ServeError::NotReady { .. } => NextStep::RetryLater,
+            ServeError::Overlap { .. }
+            | ServeError::TooMany { .. }
+            | ServeError::BadPrefix { .. } => NextStep::FixRequest,
+        }
+    }
+}
+
+/// The most prefixes one heap serves.
+pub const SERVE_PREFIXES_MAX: usize = 64;
+
+/// The longest served prefix, in octets of its name.
+pub const SERVE_PREFIX_MAX: usize = 255;

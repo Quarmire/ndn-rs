@@ -1112,6 +1112,7 @@ async fn the_announce_of_a_stranger_costs_a_lookup_and_no_ask() {
     let record = Announce {
         sender: dave.name().clone(),
         modes: vec![ChannelMode::Latest],
+        serves: Vec::new(),
     }
     .encode();
     let wire = InterestBuilder::new(chan_prefix(&group))
@@ -1590,6 +1591,7 @@ fn announce_wire(sender: &str, modes: &[ChannelMode]) -> Bytes {
     let record = Announce {
         sender: n(sender),
         modes: modes.to_vec(),
+        serves: Vec::new(),
     }
     .encode();
     InterestBuilder::new(chan_prefix(&sync_group_of(&space()).unwrap()))

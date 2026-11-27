@@ -15,6 +15,8 @@
 //! | sync group | `<O>/32=sync/<c1>[/<c2>…]` |
 //! | channel ask and session | `<D>/32=chan/<ParametersSha256Digest>` |
 //! | channel announce | `<sync group>/32=chan/<ParametersSha256Digest>` |
+//! | query and its answer | `<D>/32=query/<ParametersSha256Digest>` |
+//! | seal key, keyless | `<D>/32=seal` (answered by the keyed packet; CanBePrefix) |
 //!
 //! Every name parses one way: `D`, `O`, `G` and `H` have no keyword component,
 //! so the first keyword ends them; a seal key's and a grant's last component
@@ -35,17 +37,19 @@ const SEAL: &[u8] = b"seal";
 const GRANT: &[u8] = b"grant";
 const HELD: &[u8] = b"held";
 const CHAN: &[u8] = b"chan";
+const QUERY: &[u8] = b"query";
 pub(super) const PIECE: &[u8] = b"piece";
 pub(super) const MANIFEST: &[u8] = b"manifest";
 const SYNC: &[u8] = ndn_security::trust_context::SYNC_GROUP_KEYWORD;
 
 /// Every keyword the layer's own names carry: a space (`data`), an entry
 /// (`log`), its pieces (`piece`, `manifest`), a seal key, a grant, a held copy
-/// (`seal`, `grant`, `held`), a sync group (`sync`) and a channel ask (`chan`). The sibling
+/// (`seal`, `grant`, `held`), a sync group (`sync`), a channel ask (`chan`) and a query (`query`). The sibling
 /// surface refuses an extension that claims one
 /// of them ([`crate::host`]).
-pub(crate) const CORE_KEYWORDS: &[&[u8]] =
-    &[DATA, LOG, SEAL, GRANT, HELD, PIECE, MANIFEST, SYNC, CHAN];
+pub(crate) const CORE_KEYWORDS: &[&[u8]] = &[
+    DATA, LOG, SEAL, GRANT, HELD, PIECE, MANIFEST, SYNC, CHAN, QUERY,
+];
 
 /// The most components a space name has after its `32=data`.
 pub(crate) const SPACE_REST_MAX: usize = 4;
@@ -261,6 +265,22 @@ pub fn parse_seal_key_name(name: &Name) -> Option<(Name, [u8; 32])> {
     Some((device, public.as_ref().try_into().ok()?))
 }
 
+/// `<device>/32=seal`: the keyless name of a device's own seal key packet, for an asker that
+/// knows the device and not yet its key (the Interest carries CanBePrefix and the answer is the
+/// packet `<device>/32=seal/<public key>`).
+///
+/// Public: a sibling crate's cases name it as the layer does.
+pub fn seal_prefix(device: &Name) -> Name {
+    device.clone().append_component(kw(SEAL))
+}
+
+/// The device of `<device>/32=seal`, the keyless name of its seal key packet: `None` for any other
+/// name (a keyed seal key name included).
+pub(crate) fn parse_seal_prefix(name: &Name) -> Option<Name> {
+    let (last, device) = name.components().split_last()?;
+    (is_kw(last, SEAL) && is_device_comps(device)).then(|| name_of(device))
+}
+
 /// The most octets of the seal key packet a grant ask carries: a signed Data of one X25519 key
 /// is a few hundred, so this bounds what an ask may make a granter hold and decode, and the
 /// size of the Interest name.
@@ -450,6 +470,8 @@ pub(crate) enum Served {
     Grant,
     /// `<device>/32=chan/<ParametersSha256Digest>`: a channel ask, answered by a session.
     Chan,
+    /// `<device>/32=query/<ParametersSha256Digest>`: a query, answered by a signed Data.
+    Query,
 }
 
 /// Which [`Served`] name `name` can be, by one look: each kind's parser takes
@@ -463,6 +485,7 @@ pub(crate) fn served_kind(name: &Name) -> Option<Served> {
         SEAL => Some(Served::Seal),
         GRANT => Some(Served::Grant),
         CHAN => Some(Served::Chan),
+        QUERY => Some(Served::Query),
         _ => None,
     }
 }
@@ -511,6 +534,53 @@ pub fn parse_chan_name(name: &Name) -> Option<(Name, [u8; 32])> {
         return None;
     }
     let digest = <[u8; CHAN_DIGEST_LEN]>::try_from(digest.value.as_ref()).ok()?;
+    Some((name_of(&comps[..at]), digest))
+}
+
+/// The octets of a query's parameters digest: the last component of its name.
+const QUERY_DIGEST_LEN: usize = 32;
+
+/// `<device>/32=query`: what a query is named under before its parameters digest is appended (an
+/// Interest with ApplicationParameters gets that component from its encoder).
+///
+/// Public: a sibling crate's cases name a query as the layer does.
+pub fn query_prefix(device: &Name) -> Name {
+    device.clone().append_component(kw(QUERY))
+}
+
+/// The device of `<device>/32=query`, the name a query is made under before its digest: `None`
+/// for any other name.
+pub(crate) fn parse_query_prefix(name: &Name) -> Option<Name> {
+    let (last, device) = name.components().split_last()?;
+    (is_kw(last, QUERY) && is_device_comps(device)).then(|| name_of(device))
+}
+
+/// A query's name, and the name of the Data that answers it:
+/// `<device>/32=query/<ParametersSha256Digest>`, `device` the device that answers.
+///
+/// Public: a sibling crate's cases name a query as the layer does.
+pub fn query_ask_name(device: &Name, digest: &[u8; 32]) -> Name {
+    query_prefix(device).append_component(NameComponent::new(
+        tlv_type::PARAMETERS_SHA256,
+        Bytes::copy_from_slice(digest),
+    ))
+}
+
+/// Parse `<device>/32=query/<ParametersSha256Digest>`: `device` is everything before the first
+/// `32=query` (a device name, so it holds no keyword), exactly one component follows, and it is a
+/// ParametersSha256DigestComponent of 32 octets. Nothing else parses.
+///
+/// Public: a sibling crate that filters names tells a query by it.
+pub fn parse_query_name(name: &Name) -> Option<(Name, [u8; 32])> {
+    let comps = name.components();
+    let at = comps.iter().position(|c| is_kw(c, QUERY))?;
+    let [digest] = &comps[at + 1..] else {
+        return None;
+    };
+    if !is_device_comps(&comps[..at]) || digest.typ != tlv_type::PARAMETERS_SHA256 {
+        return None;
+    }
+    let digest = <[u8; QUERY_DIGEST_LEN]>::try_from(digest.value.as_ref()).ok()?;
     Some((name_of(&comps[..at]), digest))
 }
 

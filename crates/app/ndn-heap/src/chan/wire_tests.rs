@@ -97,6 +97,7 @@ fn announce() -> Announce {
     Announce {
         sender: n("/bob/phone"),
         modes: vec![ChannelMode::Latest, ChannelMode::Window],
+        serves: Vec::new(),
     }
 }
 
@@ -358,4 +359,130 @@ fn an_ask_that_holds_no_session_says_so_in_one_empty_even_field() {
         ChanAsk::decode(twice),
         Err(WireError::Duplicate(_))
     ));
+}
+
+/// The octets of a name's components: the value of a `Name` TLV or of an `ANN_SERVES`.
+fn name_value(name: &Name) -> Vec<u8> {
+    let mut w = TlvWriter::new();
+    for c in name.components() {
+        w.write_tlv(c.typ, &c.value);
+    }
+    w.finish().to_vec()
+}
+
+/// An announce of `/bob/phone` with these modes, plus raw `ANN_SERVES` values.
+fn announce_with_serves(modes: &[ChannelMode], serves: &[Vec<u8>]) -> Bytes {
+    let base = Announce {
+        sender: n("/bob/phone"),
+        modes: modes.to_vec(),
+        serves: Vec::new(),
+    }
+    .encode();
+    let extra: Vec<(u64, &[u8])> = serves.iter().map(|s| (ANN_SERVES, s.as_slice())).collect();
+    with_extra(&base, &extra)
+}
+
+const GOLDEN_ANNOUNCE_SERVES: &str =
+    "fd06a120fd06770c0803626f62080570686f6e65fd06670101fd06ac070805776f726c64";
+const GOLDEN_ANNOUNCE_SERVES_ONLY: &str =
+    "fd06a11bfd06770c0803626f62080570686f6e65fd06ac070805776f726c64";
+
+#[test]
+fn an_announce_carries_the_prefixes_it_serves_and_may_hold_no_channel() {
+    let with = Announce {
+        modes: vec![ChannelMode::Latest],
+        serves: vec![n("/world")],
+        ..announce()
+    };
+    assert_eq!(hex(&with.encode()), GOLDEN_ANNOUNCE_SERVES);
+    assert_eq!(
+        Announce::decode(unhex(GOLDEN_ANNOUNCE_SERVES)).unwrap(),
+        with
+    );
+    // A device that serves and holds no channel.
+    let only = Announce {
+        modes: Vec::new(),
+        serves: vec![n("/world")],
+        ..announce()
+    };
+    assert_eq!(hex(&only.encode()), GOLDEN_ANNOUNCE_SERVES_ONLY);
+    assert_eq!(
+        Announce::decode(unhex(GOLDEN_ANNOUNCE_SERVES_ONLY)).unwrap(),
+        only
+    );
+    // Without serves it is the old format, byte for byte, and an old reader's announce decodes.
+    assert_eq!(announce().encode(), unhex(GOLDEN_ANNOUNCE));
+    assert!(
+        Announce::decode(unhex(GOLDEN_ANNOUNCE))
+            .unwrap()
+            .serves
+            .is_empty()
+    );
+    // Several names keep their order; even, so a reader that predates it skips it.
+    let several = Announce {
+        serves: vec![n("/a"), n("/b/c"), Name::root()],
+        ..announce()
+    };
+    assert_eq!(Announce::decode(several.encode()).unwrap(), several);
+    assert_eq!(ANN_SERVES % 2, 0);
+}
+
+#[test]
+fn an_announce_names_at_most_16_prefixes_and_512_octets_and_something_to_do() {
+    let short = name_value(&n("/a"));
+    let ok = announce_with_serves(&[ChannelMode::Latest], &vec![short.clone(); 16]);
+    assert_eq!(Announce::decode(ok).unwrap().serves.len(), 16);
+    let seventeen = announce_with_serves(&[ChannelMode::Latest], &vec![short; 17]);
+    assert!(
+        matches!(
+            Announce::decode(seventeen),
+            Err(WireError::TooMany { max: 16, .. })
+        ),
+        "17 names"
+    );
+
+    // Four names of 128 octets are exactly 512; four of 129 are over it.
+    let sized = |component: usize| name_value(&Name::root().append(vec![b'x'; component]));
+    assert_eq!(sized(126).len(), 128);
+    let at = announce_with_serves(&[ChannelMode::Latest], &vec![sized(126); 4]);
+    assert_eq!(Announce::decode(at).unwrap().serves.len(), 4);
+    let over = announce_with_serves(&[ChannelMode::Latest], &vec![sized(127); 4]);
+    assert!(
+        matches!(
+            Announce::decode(over),
+            Err(WireError::TooLarge {
+                max: SERVES_OCTETS_MAX,
+                ..
+            })
+        ),
+        "over 512 octets of names"
+    );
+
+    // Neither a mode nor a prefix: nothing the announce says, so it is refused.
+    let neither = Announce {
+        modes: Vec::new(),
+        serves: Vec::new(),
+        ..announce()
+    };
+    assert!(matches!(
+        Announce::decode(neither.encode()),
+        Err(WireError::Missing(_))
+    ));
+    // A serves that is no name.
+    let bad = announce_with_serves(&[ChannelMode::Latest], &[vec![0x08, 0x05, b'a']]);
+    assert!(matches!(
+        Announce::decode(bad),
+        Err(WireError::Malformed(_))
+    ));
+    // An unknown even type beside serves is skipped; an odd one is refused.
+    let wire = Announce {
+        serves: vec![n("/world")],
+        ..announce()
+    }
+    .encode();
+    assert!(Announce::decode(with_extra(&wire, &[(0x06BE, b"x")])).is_ok());
+    assert_eq!(
+        Announce::decode(with_extra(&wire, &[(0x06BF, b"x")])),
+        Err(WireError::UnknownCritical(0x06BF))
+    );
 }

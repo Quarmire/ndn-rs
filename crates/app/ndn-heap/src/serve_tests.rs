@@ -20,7 +20,7 @@ use crate::sync::net_kit::*;
 use crate::test_kit::n;
 use crate::wire::{
     EpochId, GrantAsk, PieceKind, encode_seal_key, grant_name, held_name, log_name, piece_name,
-    seal_key_name,
+    seal_key_name, seal_prefix,
 };
 
 const ME: &str = "/alice/laptop";
@@ -196,6 +196,58 @@ async fn the_seal_key_packet_is_served_under_its_own_name() {
     assert!(
         s.ask(&seal_key_name(&me(), &[8; 32])).await.is_none(),
         "a key this device never published"
+    );
+}
+
+/// An asker that knows a device and not yet its seal key (a query sealed to the server) asks for
+/// `<D>/32=seal` with CanBePrefix and is answered with the device's signed seal key packet; the
+/// keyed name still answers, and another device's keyless name answers nothing.
+#[tokio::test(start_paused = true)]
+async fn the_seal_key_packet_is_served_under_the_keyless_name_too() {
+    let s = serving("/").await;
+    let packet = s
+        .host
+        .st
+        .lock()
+        .seal
+        .clone()
+        .expect("the toy host holds a packet");
+    let ask_prefix = |name: Name| {
+        let before = s.wire.answers();
+        s.wire.inject(
+            InterestBuilder::new(name)
+                .can_be_prefix()
+                .lifetime(Duration::from_secs(2))
+                .build(),
+        );
+        before
+    };
+    let before = ask_prefix(seal_prefix(&me()));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(s.wire.answers(), before + 1);
+    let got = s
+        .wire
+        .answer_at(before)
+        .expect("the keyless name is answered");
+    assert_eq!(got.raw(), &packet);
+    assert_eq!(
+        *got.name,
+        seal_key_name(&me(), &[7; 32]),
+        "the answer names its key: the asker takes the key from the signed packet"
+    );
+    assert_eq!(
+        s.ask(&seal_key_name(&me(), &[7; 32]))
+            .await
+            .map(|d| d.raw().clone()),
+        Some(packet),
+        "the keyed name still answers"
+    );
+    let before = ask_prefix(seal_prefix(&n(PHONE)));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(s.wire.answers(), before + 1, "a Nack, not silence");
+    assert!(
+        s.wire.answer_at(before).is_none(),
+        "another device's keyless name is answered with nothing"
     );
 }
 

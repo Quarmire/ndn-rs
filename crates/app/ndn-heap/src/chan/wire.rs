@@ -98,6 +98,9 @@ pub(crate) const W_MESSAGES: u64 = 0x06A7;
 pub(crate) const W_BYTES: u64 = 0x06A9;
 /// NonNegativeInteger: milliseconds a window replays.
 pub(crate) const W_MS: u64 = 0x06AB;
+/// Name, repeatable (at most [`SERVES_MAX`] and [`SERVES_OCTETS_MAX`] in all): a prefix, relative to
+/// the space, the sender serves queries under. Even, so a reader that predates it skips it.
+pub(crate) const ANN_SERVES: u64 = 0x06AC;
 
 /// The most octets of an ask's ApplicationParameters.
 pub(crate) const ASK_MAX: usize = 8 * 1024;
@@ -114,6 +117,10 @@ pub(crate) const TABLE_BINDS_MAX: usize = 64;
 pub(crate) const TABLE_OCTETS_MAX: usize = 4 * 1024;
 /// The most octets of a refusal's text.
 pub(crate) const TEXT_MAX: usize = 256;
+/// The most prefixes an announce lists as served.
+pub(crate) const SERVES_MAX: usize = 16;
+/// The most octets of name values an announce lists as served, in all.
+pub(crate) const SERVES_OCTETS_MAX: usize = 512;
 /// The most carrier kinds an ask lists.
 const CARRIERS_MAX: usize = 16;
 /// The most octets of one certificate an ask or a session carries (the held-copy limit).
@@ -229,7 +236,7 @@ impl RefusalCode {
 // -- Helpers ---------------------------------------------------------------------------------
 
 /// A TLV of type `typ` whose value is the components of `name` (a `Name` value).
-fn write_name_as(w: &mut TlvWriter, typ: u64, name: &Name) {
+pub(crate) fn write_name_as(w: &mut TlvWriter, typ: u64, name: &Name) {
     w.write_nested(typ, |w| {
         for c in name.components() {
             w.write_tlv(c.typ, &c.value);
@@ -238,7 +245,7 @@ fn write_name_as(w: &mut TlvWriter, typ: u64, name: &Name) {
 }
 
 /// A TLV of type `typ` whose value is an `EPOCH_ID`'s fields.
-fn write_epoch_as(w: &mut TlvWriter, typ: u64, epoch: &EpochId) {
+pub(crate) fn write_epoch_as(w: &mut TlvWriter, typ: u64, epoch: &EpochId) {
     // `write_epoch_id` writes the `EPOCH_ID` TLV; its value is what `typ` holds.
     let mut inner = TlvWriter::new();
     write_epoch_id(&mut inner, epoch);
@@ -249,7 +256,7 @@ fn write_epoch_as(w: &mut TlvWriter, typ: u64, epoch: &EpochId) {
 }
 
 /// What `slot` holds, or the refusal that names the missing field.
-fn need<T>(slot: Option<T>, what: &'static str) -> Result<T, WireError> {
+pub(crate) fn need<T>(slot: Option<T>, what: &'static str) -> Result<T, WireError> {
     slot.ok_or(WireError::Missing(what))
 }
 
@@ -273,7 +280,7 @@ fn read_lifetime(v: &[u8]) -> Result<u64, WireError> {
 }
 
 /// Take certificate `cert` into `chain` under the limits of a grant ask's chain.
-fn take_cert(
+pub(crate) fn take_cert(
     chain: &mut Vec<Bytes>,
     octets: &mut usize,
     cert: Bytes,
@@ -774,17 +781,28 @@ impl Answer {
 
 // -- The announce -----------------------------------------------------------------------------
 
-/// What a sender pushes into a space's sync group: who it is and the modes it has channels in.
+/// What a sender pushes into a space's sync group: who it is, the modes it has channels in and the
+/// prefixes it serves queries under.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Announce {
     /// The sender's device.
     pub sender: Name,
-    /// The modes, each once.
+    /// The modes, each once. Empty when the device holds no channel and only serves queries
+    /// (`serves` is then not empty).
     pub modes: Vec<ChannelMode>,
+    /// The prefixes (relative paths) the device serves queries under: a hint to the askers
+    /// (`ANN_SERVES`). At most [`SERVES_MAX`] names and [`SERVES_OCTETS_MAX`] octets of name
+    /// values in all.
+    pub serves: Vec<Name>,
 }
 
 impl Announce {
-    /// The `CHAN_ANNOUNCE` TLV.
+    /// The `CHAN_ANNOUNCE` TLV: the sender, each mode, then each served prefix.
+    ///
+    /// The encoder checks nothing: an announce that names neither a mode nor a served prefix, or
+    /// more served prefixes than [`SERVES_MAX`] and [`SERVES_OCTETS_MAX`] allow, encodes, and
+    /// [`Announce::decode`] refuses it. The caller does not send such an announce (a device with
+    /// no channel and nothing served announces nothing; one that serves more keeps to the limits).
     pub(crate) fn encode(&self) -> Bytes {
         let mut w = TlvWriter::new();
         w.write_nested(CHAN_ANNOUNCE, |w| {
@@ -792,11 +810,15 @@ impl Announce {
             for mode in &self.modes {
                 write_nni(w, ASK_MODE, mode.code());
             }
+            for prefix in &self.serves {
+                write_name_as(w, ANN_SERVES, prefix);
+            }
         });
         w.finish()
     }
 
-    /// Decode a `CHAN_ANNOUNCE` TLV: a device and one to three modes.
+    /// Decode a `CHAN_ANNOUNCE` TLV: a device, up to three modes and up to [`SERVES_MAX`] served
+    /// prefixes of at most [`SERVES_OCTETS_MAX`] octets in all; at least one mode or one prefix.
     pub(crate) fn decode(content: Bytes) -> Result<Announce, WireError> {
         let value = only(
             content,
@@ -804,6 +826,7 @@ impl Announce {
             "an announce is one CHAN_ANNOUNCE TLV",
         )?;
         let (mut sender, mut modes) = (None, Vec::new());
+        let (mut serves, mut serves_octets) = (Vec::new(), 0usize);
         fields!(value, |v| {
             S_SENDER => once(&mut sender, read_name(v)?, "an announce's sender")?,
             ASK_MODE => {
@@ -813,13 +836,34 @@ impl Announce {
                 }
                 modes.push(mode)
             },
+            ANN_SERVES => {
+                serves_octets += v.len();
+                if serves.len() == SERVES_MAX {
+                    return Err(WireError::TooMany {
+                        what: "an announce's served prefixes",
+                        count: serves.len() + 1,
+                        max: SERVES_MAX,
+                    });
+                }
+                if serves_octets > SERVES_OCTETS_MAX {
+                    return Err(WireError::TooLarge {
+                        what: "an announce's served prefixes",
+                        size: serves_octets,
+                        max: SERVES_OCTETS_MAX,
+                    });
+                }
+                serves.push(read_name(v)?)
+            },
         });
-        if modes.is_empty() {
-            return Err(WireError::Missing("an announce's modes"));
+        if modes.is_empty() && serves.is_empty() {
+            return Err(WireError::Missing(
+                "an announce's modes or served prefixes (it must name a channel mode or a prefix the sender serves)",
+            ));
         }
         Ok(Announce {
             sender: need(sender, "an announce's sender")?,
             modes,
+            serves,
         })
     }
 }

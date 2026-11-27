@@ -9,7 +9,7 @@ use super::sessions::ChannelInfo;
 use super::wire::ChannelMode;
 use crate::error::HeapError;
 use crate::host::NodeHandle;
-use crate::wire::parse_chan_prefix;
+use crate::wire::{parse_chan_prefix, parse_query_prefix};
 
 impl NodeHandle {
     /// Ask the device `device` for its **`Latest`** channel over `space` and hold the session it
@@ -47,27 +47,33 @@ impl NodeHandle {
         Ok(session.info())
     }
 
-    /// Sign the ask `<device>/32=chan/<digest>` whose ApplicationParameters are `parameters` (a
-    /// `CHAN_ASK`): an InterestSignatureInfo with this device's key as the KeyLocator, a
-    /// SignatureNonce and a SignatureTime, MustBeFresh, an InterestLifetime of 4 s. `prefix` must be
-    /// `<device>/32=chan` and `parameters` must decode as a `CHAN_ASK`: the node signs no other
-    /// Interest, since a signed Interest of the device's key is a command wherever the key is
-    /// trusted. `device` may not lie under `/localhost` or `/localhop`.
+    /// Sign the Interest of a channel's ask or of a query: `prefix` is `<device>/32=chan` and
+    /// `parameters` a `CHAN_ASK` (the ask `<device>/32=chan/<digest>`, InterestLifetime 4 s), or
+    /// `prefix` is `<device>/32=query` and `parameters` a `QUERY_ASK` (the query
+    /// `<device>/32=query/<digest>`, InterestLifetime the query's own deadline). Either way:
+    /// an InterestSignatureInfo with this device's key as the KeyLocator, a SignatureNonce and a
+    /// SignatureTime, MustBeFresh. The node signs no other Interest, since a signed Interest of
+    /// the device's key is a command wherever the key is trusted: `parameters` must decode as
+    /// the record the name says, and `device` may not lie under `/localhost` or `/localhop`.
     ///
     /// # Errors
     ///
-    /// [`HeapError::BadRequest`] when `prefix` is not `<device>/32=chan`, `device` is under a
-    /// reserved prefix, or `parameters` are no `CHAN_ASK`;
+    /// [`HeapError::BadRequest`] when `prefix` is neither `<device>/32=chan` nor
+    /// `<device>/32=query`, `device` is under a reserved prefix, or `parameters` are not the
+    /// record that name takes (a `CHAN_ASK`, a `QUERY_ASK`);
     /// [`HeapError::Local`] when the key does not sign synchronously.
     pub fn sign_interest(&self, prefix: &Name, parameters: &[u8]) -> Result<Bytes, HeapError> {
-        let Some(device) = parse_chan_prefix(prefix) else {
-            return Err(HeapError::BadRequest {
-                why: format!(
-                    "{prefix} is not a name this node signs an Interest for: only \
-                     `<device>/32=chan`, the ask of a channel"
-                ),
-            });
-        };
-        self.inner.sign_ask(&device, parameters)
+        if let Some(device) = parse_chan_prefix(prefix) {
+            return self.inner.sign_ask(&device, parameters);
+        }
+        if let Some(device) = parse_query_prefix(prefix) {
+            return self.inner.sign_query(&device, parameters);
+        }
+        Err(HeapError::BadRequest {
+            why: format!(
+                "{prefix} is not a name this node signs an Interest for: only \
+                 `<device>/32=chan` (the ask of a channel) and `<device>/32=query` (a query)"
+            ),
+        })
     }
 }

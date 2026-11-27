@@ -97,6 +97,14 @@ impl FrameCipher {
         }
     }
 
+    /// The 32 octets `key` (a key of a pair of devices, not of a channel) prepared for `aead`.
+    pub(crate) fn from_key_octets(key: &[u8; 32], aead: Aead) -> Self {
+        Self {
+            aead,
+            key: imp::Key::new(key, aead),
+        }
+    }
+
     /// Encrypts `buf` in place and returns the tag over `aad` and the
     /// ciphertext. `nonce` must never repeat under this key.
     pub(crate) fn seal_detached(

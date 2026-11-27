@@ -1755,3 +1755,31 @@ fn a_heads_event_holds_the_heads_of_highest_rank_and_how_many_there_are() {
         "the highest ranked, the winner first"
     );
 }
+
+/// A real node answers for its own seal key packet under the keyed name and the keyless
+/// `<D>/32=seal`, and for no other key and no other device's keyless name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_serves_its_seal_key_packet_under_the_keyless_name_too() {
+    use crate::wire::{seal_key_name, seal_prefix};
+    let devs = world(&["/alice/laptop", "/bob/phone"]).await;
+    let (alice, _) = boot(&devs[0], cfg()).await;
+    let keyed = seal_key_name(&devs[0].name, &alice.inner.seal_public());
+    let packet = alice.inner.seal_key_packet(&keyed).expect("the keyed name");
+    assert_eq!(
+        alice.inner.seal_key_packet(&seal_prefix(&devs[0].name)),
+        Some(packet),
+        "the keyless name of this device answers with the same signed packet"
+    );
+    assert_eq!(
+        alice.inner.seal_key_packet(&seal_prefix(&devs[1].name)),
+        None,
+        "another device's keyless name"
+    );
+    assert_eq!(
+        alice
+            .inner
+            .seal_key_packet(&seal_key_name(&devs[0].name, &[9; 32])),
+        None,
+        "a key this device never published"
+    );
+}

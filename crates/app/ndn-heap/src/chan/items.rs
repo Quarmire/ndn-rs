@@ -31,6 +31,7 @@ use super::verbs::{Congestion, GetNotice, GetOptions, Got, Live, LiveEnd, Modes,
 use super::wire::ChannelMode;
 use crate::error::HeapError;
 use crate::node::NodeInner;
+use crate::query::AnswerSink;
 use crate::space::{Heap, KeptFeed, KeptStep};
 
 /// A message on its way to the sinks: the key of its pair, its sequence, the octets it is
@@ -345,10 +346,14 @@ pub struct Items {
     live: Option<Emission>,
     /// The kept values, when asked for.
     kept: Option<KeptFeed>,
+    /// The answers of a query (`GetOptions::ask`), when asked for: a source of its own, with a
+    /// queue of its own.
+    answers: Option<Arc<AnswerSink>>,
     /// The kept listing that [`Items::caught_up`] read before it was asked for.
     ready: VecDeque<Got>,
-    /// Whether the kept changes are polled before the emissions on the next poll.
-    kept_turn: bool,
+    /// The source taken last (0 kept, 1 emissions, 2 answers): the next poll starts after it,
+    /// so the sources take turns.
+    last: u8,
 }
 
 /// The emission side of an `Items`.
@@ -393,6 +398,9 @@ impl Items {
             if freed {
                 live.sink.room.notify_waiters();
             }
+        }
+        if let Some(answers) = &self.answers {
+            answers.take_items(buf);
         }
         buf.len() - before
     }
@@ -485,32 +493,55 @@ impl Stream for Items {
         {
             return Poll::Ready(Some(Ok(got)));
         }
-        // Then the two sources in turn: the one that gave last goes second.
-        let (mut kept_ended, mut live_ended) = (this.kept.is_none(), this.live.is_none());
-        for pass in 0..2 {
-            if (pass == 0) == this.kept_turn {
-                if let Some(feed) = &mut this.kept {
-                    match Self::poll_kept(feed, cx) {
-                        Poll::Ready(Some(next)) => {
-                            this.kept_turn = false;
-                            return Poll::Ready(Some(next));
+        // Then the sources in turn: the poll starts after the one that gave last.
+        let (mut kept_ended, mut live_ended, mut answers_ended) = (
+            this.kept.is_none(),
+            this.live.is_none(),
+            this.answers.is_none(),
+        );
+        for step in 1..=3 {
+            match (this.last + step) % 3 {
+                0 => {
+                    if let Some(feed) = &mut this.kept {
+                        match Self::poll_kept(feed, cx) {
+                            Poll::Ready(Some(next)) => {
+                                this.last = 0;
+                                return Poll::Ready(Some(next));
+                            }
+                            Poll::Ready(None) => kept_ended = true,
+                            Poll::Pending => {}
                         }
-                        Poll::Ready(None) => kept_ended = true,
-                        Poll::Pending => {}
                     }
                 }
-            } else if let Some(live) = &this.live {
-                match Self::poll_live(&this.node, &live.sink, cx) {
-                    Poll::Ready(Some(next)) => {
-                        this.kept_turn = true;
-                        return Poll::Ready(Some(next));
+                1 => {
+                    if let Some(live) = &this.live {
+                        match Self::poll_live(&this.node, &live.sink, cx) {
+                            Poll::Ready(Some(next)) => {
+                                this.last = 1;
+                                return Poll::Ready(Some(next));
+                            }
+                            Poll::Ready(None) => live_ended = true,
+                            Poll::Pending => {}
+                        }
                     }
-                    Poll::Ready(None) => live_ended = true,
-                    Poll::Pending => {}
+                }
+                _ => {
+                    if let Some(answers) = &this.answers {
+                        match answers.poll_next(cx) {
+                            Poll::Ready(Some(next)) => {
+                                this.last = 2;
+                                return Poll::Ready(Some(next));
+                            }
+                            Poll::Ready(None) => answers_ended = true,
+                            Poll::Pending => {}
+                        }
+                    }
                 }
             }
         }
-        if kept_ended && live_ended {
+        // A query alone (no kept values, no emissions) ends after its `AnswersDone`; with either
+        // of the others on, the stream goes on.
+        if kept_ended && live_ended && answers_ended {
             Poll::Ready(None)
         } else {
             Poll::Pending
@@ -526,6 +557,11 @@ impl Drop for Items {
             self.node.chan.rx.remove_sink(&live.sink);
             // A session no other `Items` takes lapses, and its route is given up.
             self.node.chan_route_release(&live.sink);
+        }
+        // The query is cancelled: its Interests are dropped, its pending slots released, and a
+        // late answer is discarded.
+        if let Some(answers) = &self.answers {
+            answers.close();
         }
     }
 }
@@ -548,20 +584,54 @@ impl Heap {
     /// that comes after this call is lost. See [`Items`] for the order, what a slow reader
     /// keeps and loses, and what `by` is.
     ///
+    /// With [`GetOptions::ask`] the same stream also carries the answers of a query to the
+    /// space's servers (docs/specs/query.md): the call judges the request and **spawns** the
+    /// query on the node's tasks, so it does no I/O here; each answer is a
+    /// [`Kind::Answered`](super::verbs::Kind::Answered) item, a failed server is a
+    /// [`GetNotice::QueryFailed`], and [`GetNotice::AnswersDone`] ends the query. With
+    /// `kept: false` and [`Live::Off`] the stream is that query alone and ends after
+    /// `AnswersDone`. Dropping the `Items` cancels the query.
+    ///
     /// # Errors
     ///
-    /// [`HeapError::BadRequest`] for `kept: false` with [`Live::Off`] (it asks for nothing: ask
-    /// for kept values, emissions, or both); [`HeapError::NotAllowed`] for emissions of a space
-    /// this device only follows (a follower takes no part in channels: open the space as a
-    /// member; it may read kept values with [`Live::Off`]); [`HeapError::Sealed`] when the
-    /// space is sealed and this device's person is no reader of it (kept values only: with
-    /// `kept: false` a non-member gets no session, so no emission).
+    /// [`HeapError::BadRequest`] for `kept: false` with [`Live::Off`] and no `ask` (it asks for
+    /// nothing: ask for kept values, emissions, a query, or a combination), and for an `ask`
+    /// that is over a limit (a query over 2,048 octets, a deadline of zero or over 10 s, more
+    /// than 16 devices named, an `answer_max` of zero or over 4,096, [`QueryPath::Channel`],
+    /// which is not built in this version of the layer), each with its reason;
+    /// [`HeapError::NotAllowed`] for emissions or a query of a space this device only follows
+    /// (a follower takes no part in channels or queries: open the space as a member; it may
+    /// read kept values with [`Live::Off`]) and for a query from a device that is no listed
+    /// member; [`HeapError::NotReady`] for a query before the space's record is held;
+    /// [`HeapError::Sealed`] when the space is sealed and this device's person is no reader of
+    /// it (kept values only: with `kept: false` a non-member gets no session, so no emission).
+    ///
+    /// [`QueryPath::Channel`]: crate::QueryPath::Channel
     pub fn get(&self, what: Select, opts: GetOptions) -> Result<Items, HeapError> {
+        let run = match &opts.ask {
+            Some(ask) => Some(self.node.query_prepare(&self.inner, &what, ask.clone())?),
+            None => None,
+        };
+        let items = self.items(what, opts, run.as_ref().map(|run| Arc::clone(&run.sink)))?;
+        if let Some(run) = run {
+            self.node.query_spawn(run);
+        }
+        Ok(items)
+    }
+
+    /// [`Heap::get`] with the answer queue given: nothing asks the servers for it.
+    pub(crate) fn items(
+        &self,
+        what: Select,
+        opts: GetOptions,
+        answers: Option<Arc<AnswerSink>>,
+    ) -> Result<Items, HeapError> {
         let live = opts.live == Live::Emitted;
-        if !opts.kept && !live {
+        if !opts.kept && !live && answers.is_none() {
             return Err(HeapError::BadRequest {
-                why: "`kept: false` with `Live::Off` asks for nothing: ask for kept values \
-                      (`kept: true`), for emissions (`live: Live::Emitted`), or both"
+                why: "`kept: false` with `Live::Off` and no `ask` asks for nothing: ask for kept \
+                      values (`kept: true`), for emissions (`live: Live::Emitted`), for a query \
+                      (`ask`), or a combination"
                     .into(),
             });
         }
@@ -598,8 +668,9 @@ impl Heap {
             node: Arc::clone(&self.node),
             live,
             kept,
+            answers,
             ready: VecDeque::new(),
-            kept_turn: false,
+            last: 0,
         })
     }
 }

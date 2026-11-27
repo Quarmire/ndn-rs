@@ -125,6 +125,12 @@ impl Bucket {
             false
         }
     }
+
+    /// The tokens it holds, as of the last [`Self::take`] (no refill is counted).
+    #[cfg(test)]
+    pub(crate) fn tokens(&self) -> f64 {
+        self.tokens
+    }
 }
 
 /// The node's ceiling on verified checkpoints ([`NODE_CHECKPOINTS_PER_SEC`]).

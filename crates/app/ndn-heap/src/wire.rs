@@ -58,6 +58,7 @@ mod digest;
 mod names;
 mod pieces;
 mod prim;
+mod query;
 mod sign;
 pub(crate) mod tlv;
 mod types;
@@ -69,7 +70,16 @@ pub(crate) use pieces::*;
 pub use prim::WireError;
 pub(crate) use prim::{
     each, fields, once, only, read_array, read_epoch_id, read_name, read_nni, write_epoch_id,
-    write_nni,
+    write_name, write_nni,
+};
+#[expect(
+    unused_imports,
+    reason = "the query halves take these up; remove the unused ones then"
+)]
+pub(crate) use query::{
+    A_SEALED, ANSWER_BYTES_MAX, ANSWER_CONTENT_MAX, ANSWER_SEALED_MAX, ANSWER_TEXT_MAX, AnswerBody,
+    AskSeal, DEADLINE_MAX_MS, QUERY_ASK_MAX, QUERY_BYTES_MAX, QUERY_PATH_MAX, QUERY_SEALED_MAX,
+    QueryAnswer, QueryAsk, Status, name_value_len,
 };
 pub(crate) use sign::{SignError, sign_entry};
 
@@ -78,8 +88,9 @@ pub use names::ASKER_CHAIN_MAX;
 pub(crate) use names::ASKER_CHAIN_OCTETS_MAX;
 pub use names::{
     GrantAsk, LogName, SpaceName, chan_ask_name, chan_prefix, grant_name, held_name, is_namespace,
-    log_name, parse_chan_name, parse_grant_name, parse_held_name, parse_log_name,
-    parse_seal_key_name, parse_space_name, seal_key_name, sync_group_of,
+    log_name, parse_chan_name, parse_grant_name, parse_held_name, parse_log_name, parse_query_name,
+    parse_seal_key_name, parse_space_name, query_ask_name, query_prefix, seal_key_name,
+    seal_prefix, sync_group_of,
 };
 pub use pieces::{PieceKind, PieceName, parse_piece_name, piece_name};
 pub use types::*;
