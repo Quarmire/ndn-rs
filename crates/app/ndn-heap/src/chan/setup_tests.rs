@@ -1585,43 +1585,224 @@ async fn a_session_reusing_another_senders_channel_id_is_refused() {
     assert_eq!(bob.inner.chan.sessions.all().len(), 1);
 }
 
-/// The announce is unsigned: a name under a writer's namespace that is no device the record
-/// holds an entry of is no sender to ask.
+/// The announce of `sender` over the space's sync group, as a member's forwarder carries it.
+fn announce_wire(sender: &str, modes: &[ChannelMode]) -> Bytes {
+    let record = Announce {
+        sender: n(sender),
+        modes: modes.to_vec(),
+    }
+    .encode();
+    InterestBuilder::new(chan_prefix(&sync_group_of(&space()).unwrap()))
+        .lifetime(Duration::from_secs(1))
+        .hop_limit(8)
+        .app_parameters(record.to_vec())
+        .build()
+}
+
+/// This node holds a `Latest` channel of the space open: what a first `emit` makes.
+fn open_latest(node: &Node) {
+    let judged = (
+        node.inner.judge.generation(),
+        node.inner
+            .space_of(&space())
+            .unwrap()
+            .log
+            .lock()
+            .fold
+            .version()
+            .load(std::sync::atomic::Ordering::SeqCst),
+    );
+    node.inner
+        .chan
+        .channels
+        .open(
+            &space(),
+            ChannelMode::Latest,
+            in_force_of(node),
+            judged,
+            Instant::now(),
+        )
+        .unwrap();
+}
+
+/// The announce is unsigned, so a name under a writer's namespace passes for one of her devices
+/// whether or not the record holds an entry of it. What the hint costs is the ask it makes: one
+/// signature of this device's own, one Interest, and nothing else (no signature verified, no
+/// session, no certificate held on its word); a name no device answers is given up after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_announce_of_a_device_the_record_holds_nothing_of_makes_no_ask() {
+async fn an_announce_of_a_name_no_device_answers_costs_one_ask_and_installs_nothing() {
     let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
     let (share, change) = public_with(&["/bob"], &["/carol"]);
     shared(&rig, share, change).await;
     let carol = &rig.nodes[2];
-    let group = sync_group_of(&space()).unwrap();
     let _listening = carol.inner.chan_listen(&space());
-    let record = Announce {
-        sender: n("/bob/ghost"),
-        modes: vec![ChannelMode::Latest],
-    }
-    .encode();
-    let wire = InterestBuilder::new(chan_prefix(&group))
-        .lifetime(Duration::from_secs(1))
-        .hop_limit(8)
-        .app_parameters(record.to_vec())
-        .build();
-    rig.syncs[0].send(wire).await.unwrap();
+    let signed = || {
+        carol
+            .inner
+            .signatures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let before = signed();
+    rig.syncs[0]
+        .send(announce_wire("/bob/ghost", &[ChannelMode::Latest]))
+        .await
+        .unwrap();
     let stats = &carol.inner.chan.stats;
-    eventually("carol heard the announce", || {
-        stats.announces_heard.get() >= 1
-    })
-    .await;
+    eventually("carol asked the name", || stats.asked.get() >= 1).await;
     assert_eq!(
         stats.announce_strangers.get(),
         0,
         "bob's person is a writer"
     );
     assert_eq!(
-        (stats.announce_asks.get(), stats.asked.get()),
-        (0, 0),
-        "and a name nobody holds an entry of makes no ask"
+        (
+            stats.announce_asks.get(),
+            stats.asked.get(),
+            stats.announce_ignored.get()
+        ),
+        (1, 1, 0),
+        "one ask, made because the person is a writer; nothing is believed of the name"
     );
-    assert_eq!(stats.announce_ignored.get(), 1);
+    assert_eq!(signed() - before, 1, "the one signature is the ask's");
+    assert_eq!(
+        carol.inner.judge.interest_walks(),
+        0,
+        "no signature was verified on the word of the announce"
+    );
+    assert!(
+        carol
+            .inner
+            .chan
+            .sessions
+            .find(&space(), &n("/bob/ghost"), ChannelMode::Latest)
+            .is_none(),
+        "no session of a device nobody answered for"
+    );
+}
+
+/// A writer who has put nothing is a device the record holds no entry of, and his announce is
+/// acted on all the same: the ask it makes is judged by the answer's signature and the
+/// certificates it carries, which the space's trust judges, and the session installs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_announce_of_a_writer_who_never_put_makes_a_listening_member_ask_him() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
+    let (share, change) = public_with(&["/bob"], &["/carol"]);
+    shared(&rig, share, change).await;
+    let (bob, carol) = (&rig.nodes[1], &rig.nodes[2]);
+    assert!(
+        !carol
+            .inner
+            .space_of(&space())
+            .unwrap()
+            .log
+            .lock()
+            .vouches(bob.name()),
+        "the case needs a record that holds no entry of bob's device"
+    );
+    open_latest(bob);
+    let _listening = carol.inner.chan_listen(&space());
+    bob.inner.chan_announce(&space()).await;
+    eventually("carol holds bob's session", || {
+        carol
+            .inner
+            .chan
+            .sessions
+            .find(&space(), bob.name(), ChannelMode::Latest)
+            .is_some()
+    })
+    .await;
+    let s = &carol.inner.chan.stats;
+    assert_eq!((s.announce_asks.get(), s.announce_ignored.get()), (1, 0));
+}
+
+/// What a stranger can make this device spend is bounded and has a pool of its own: any number
+/// of names under a writer's namespace take a burst of asks and then one a second, and a device
+/// the record vouches for is asked the whole while.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn names_the_record_holds_nothing_of_are_asked_in_a_bounded_burst_and_never_starve_a_vouched_device()
+ {
+    use super::hub::ANNOUNCE_UNVOUCHED_BURST;
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
+    let (share, change) = public_with(&["/bob"], &["/carol"]);
+    shared(&rig, share, change).await;
+    let (alice, carol) = (&rig.nodes[0], &rig.nodes[2]);
+    let _listening = carol.inner.chan_listen(&space());
+    let started = std::time::Instant::now();
+    let names = 24usize;
+    for i in 0..names {
+        rig.syncs[0]
+            .send(announce_wire(
+                &format!("/bob/ghost{i}"),
+                &[ChannelMode::Latest],
+            ))
+            .await
+            .unwrap();
+    }
+    let s = &carol.inner.chan.stats;
+    eventually("carol heard them all", || {
+        s.announces_heard.get() >= names as u64
+    })
+    .await;
+    let allowed = ANNOUNCE_UNVOUCHED_BURST as u64 + started.elapsed().as_secs() + 1;
+    assert!(
+        s.announce_asks.get() <= allowed,
+        "{} asks for {names} names, at most {allowed} allowed",
+        s.announce_asks.get()
+    );
+    assert_eq!(
+        s.announce_asks.get() + s.announce_ignored.get(),
+        names as u64,
+        "every name was either asked or counted ignored"
+    );
+    // The owner's device is vouched for by the record: asked whatever the strangers took. (Its
+    // channel opens now, so that its own announce is not among the asks counted above.)
+    open_latest(alice);
+    alice.inner.chan_announce(&space()).await;
+    eventually("carol holds alice's session", || {
+        carol
+            .inner
+            .chan
+            .sessions
+            .find(&space(), alice.name(), ChannelMode::Latest)
+            .is_some()
+    })
+    .await;
+}
+
+/// What is no device's name is not worth an ask slot, and a reader is no sender: a reader's
+/// device never emits (channel.md §4.2), so her person is no writer and her announce is a
+/// stranger's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_announce_naming_no_device_or_a_reader_makes_no_ask() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet", "/dave/pc"]).await;
+    let (share, change) = public_with(&["/bob"], &["/carol"]);
+    shared(&rig, share, change).await;
+    // Bob listens: the announce of a node's own device is dropped before it is judged.
+    let bob = &rig.nodes[1];
+    let _listening = bob.inner.chan_listen(&space());
+    for sender in [
+        "/bob/32=log/x",
+        "/bob/phone/32=chan/x",
+        "/carol/tablet",
+        "/dave/pc",
+    ] {
+        rig.syncs[0]
+            .send(announce_wire(sender, &[ChannelMode::Latest]))
+            .await
+            .unwrap();
+    }
+    let s = &bob.inner.chan.stats;
+    eventually("bob heard all four", || s.announces_heard.get() >= 4).await;
+    assert_eq!(
+        (s.announce_asks.get(), s.asked.get()),
+        (0, 0),
+        "none of them makes an ask"
+    );
+    assert_eq!(
+        (s.announce_strangers.get(), s.announce_ignored.get()),
+        (2, 2),
+        "a reader and a stranger are no writers; two names under a writer are no devices"
+    );
 }
 
 /// `sign_interest` signs the ask of a channel and nothing else: the parameters decode as a

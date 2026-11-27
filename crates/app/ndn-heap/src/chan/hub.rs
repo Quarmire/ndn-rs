@@ -34,10 +34,11 @@ use super::rx::{Receivers, RxStats};
 use super::sessions::{EndReason, RecvSessions};
 use super::standing::{Who, gate, standing};
 use super::tx::Tx;
+use super::verify::Bucket;
 use super::wire::Announce;
 use crate::node::NodeInner;
 use crate::rt::{self, Instant};
-use crate::wire::{chan_prefix, parse_chan_announce_name, sync_group_of};
+use crate::wire::{chan_prefix, is_device_name, parse_chan_announce_name, sync_group_of};
 
 /// How often the maintenance task looks at the channels without being woken.
 pub(crate) const TICK: Duration = Duration::from_millis(250);
@@ -47,6 +48,16 @@ pub(crate) const ANNOUNCE_ASK_EVERY: Duration = Duration::from_secs(10);
 
 /// The most announce-driven asks one space has in progress.
 pub(crate) const ANNOUNCE_PENDING_MAX: usize = 32;
+
+/// The announce-driven asks of devices **the record holds no admitted entry of** (a writer who
+/// has put nothing, or a name nobody holds) a space may begin in a burst, and then a second:
+/// the announce is unsigned, so any name under a writer's namespace passes for a device of hers,
+/// and the ask it makes costs this device one signature and an Interest. The pool is its own, so
+/// a stranger's names never take what the devices the record vouches for need.
+pub(crate) const ANNOUNCE_UNVOUCHED_BURST: f64 = 4.0;
+
+/// The rate, a second, at which [`ANNOUNCE_UNVOUCHED_BURST`] fills again.
+pub(crate) const ANNOUNCE_UNVOUCHED_RATE: f64 = 1.0;
 
 /// The most octets of an announce's ApplicationParameters.
 const ANNOUNCE_MAX: usize = 1024;
@@ -116,8 +127,8 @@ pub(crate) struct Stats {
     pub(crate) announces_heard: Counter,
     /// Announces of a device that is no writer of the space (a lookup and nothing else).
     pub(crate) announce_strangers: Counter,
-    /// Announces of a writer that were not acted on (not wanted, over a limit, or of a device the
-    /// record holds no admitted entry of).
+    /// Announces of a writer that were not acted on (not wanted, over a limit, or a name that is
+    /// no device's).
     pub(crate) announce_ignored: Counter,
     /// Asks an announce made this device send.
     pub(crate) announce_asks: Counter,
@@ -130,13 +141,17 @@ pub(crate) struct Stats {
 struct Heard {
     asked: HashMap<(Name, Name), Instant>,
     pending: HashMap<Name, usize>,
+    /// Per space, what is left of the asks of devices the record holds no entry of.
+    unvouched: HashMap<Name, Bucket>,
 }
 
 impl Heard {
     /// Whether an announce of `device` over `space` may make an ask at `now`: not one of that
-    /// device sooner than [`ANNOUNCE_ASK_EVERY`] ago, and not past [`ANNOUNCE_PENDING_MAX`] in
-    /// progress for the space. If it may, it is counted in progress.
-    fn admit(&mut self, space: &Name, device: &Name, now: Instant) -> bool {
+    /// device sooner than [`ANNOUNCE_ASK_EVERY`] ago, not past [`ANNOUNCE_PENDING_MAX`] in
+    /// progress for the space and, for a device the record holds no admitted entry of
+    /// (`vouched` false), a token of the space's own bucket ([`ANNOUNCE_UNVOUCHED_BURST`]). If it
+    /// may, it is counted in progress.
+    fn admit(&mut self, space: &Name, device: &Name, vouched: bool, now: Instant) -> bool {
         let key = (space.clone(), device.clone());
         if self
             .asked
@@ -146,6 +161,15 @@ impl Heard {
             return false;
         }
         if self.pending.get(space).copied().unwrap_or(0) >= ANNOUNCE_PENDING_MAX {
+            return false;
+        }
+        if !vouched
+            && !self
+                .unvouched
+                .entry(space.clone())
+                .or_insert_with(|| Bucket::new(ANNOUNCE_UNVOUCHED_RATE, ANNOUNCE_UNVOUCHED_BURST))
+                .take(now)
+        {
             return false;
         }
         if self.asked.len() > 4096 {
@@ -322,10 +346,15 @@ impl NodeInner {
         }
     }
 
-    /// An announce was heard (`ChanPort::heard`): a hint, and nothing more. It costs a lookup of
-    /// the announcer's person in the record of the space; only a writer's device of which the
-    /// record holds an admitted entry, while this device wants live data of the space, makes it
-    /// ask, each device at most once in 10 s and at most 32 asks in progress for a space.
+    /// An announce was heard (`ChanPort::heard`): a hint, and nothing more. It costs, cheapest
+    /// first: a hash of at most 1 KiB, a lookup of the announcer's person in the record of the
+    /// space (the person its name lies in, which is no entry's to say), and a table lookup of
+    /// whether this device wants live data of the space; only an announce of a writer's device
+    /// that passes all of them can make an ask, each device at most once in 10 s, at most 32
+    /// asks in progress for a space, and, for a device the record holds no admitted entry of (a
+    /// writer who has put nothing is such a device), within a bucket of the space's own. The ask
+    /// is the check: the answer is judged by signature from the certificates it carries, so
+    /// nothing is fetched and a name no device answers costs one ask.
     pub(crate) fn chan_heard(&self, interest: &Interest) {
         let stats = &self.chan.stats;
         stats.announces_heard.bump();
@@ -364,15 +393,17 @@ impl NodeInner {
             return;
         }
         // The announce is unsigned, so any name under a writer's namespace passes for one of
-        // that writer's devices. Only a device the record holds an admitted entry of (its key was
-        // judged for the space, its certificate is held) is worth an ask slot; any other is
-        // asked by name (`ask_channel`), not by hint.
-        if !vouched {
+        // that writer's devices, whether or not the record holds an entry of it (a writer who
+        // has put nothing holds none). What is cheap to say of a name is said before an ask
+        // slot is spent: a device name, under no reserved prefix.
+        if !vouched && (!is_device_name(&sender) || super::ask::is_reserved(&sender)) {
             stats.announce_ignored.bump();
             return;
         }
         let now = Instant::now();
-        if !self.chan.is_listening(&space) || !self.chan.heard.lock().admit(&space, &sender, now) {
+        if !self.chan.is_listening(&space)
+            || !self.chan.heard.lock().admit(&space, &sender, vouched, now)
+        {
             stats.announce_ignored.bump();
             return;
         }

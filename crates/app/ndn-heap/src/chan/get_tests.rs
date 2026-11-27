@@ -581,6 +581,55 @@ async fn by_is_the_authenticated_person_and_writer_the_device_for_both_kinds() {
     assert_eq!((&read.by, &read.writer), (&n("/bob"), &n("/bob/phone")));
 }
 
+/// A writer who has put nothing is heard from his first emission (channel.md §9): the receiver
+/// holds no entry of his device, so it cannot vouch for it by the record, and the announce he
+/// pushes is taken as a hint all the same. His person is a writer the record lists; the ask the
+/// hint makes is signed, and his answer carries his certificates, so what he says of himself is
+/// judged by the space's trust and not believed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_who_never_put_is_heard_from_his_first_emission() {
+    let w = three(LinkConfig::default(), 4096).await;
+    let bob = w.bob();
+    let device = n("/bob/phone");
+    let vouched = |w: &Wire| carol_heap(w).inner.log.lock().vouches(&device);
+    assert!(
+        !vouched(&w),
+        "the case needs a receiver that holds no entry of bob's device: he has put nothing"
+    );
+    // Carol only waits: she asks nobody by name; the announce is what tells her.
+    let mut watcher = carol_get(&w, emitted_only());
+    let started = Instant::now();
+    let mut got = Vec::new();
+    while got.is_empty() {
+        bob.emit(
+            &n("/cursor"),
+            Bytes::from_static(b"here"),
+            EmitOptions::latest(),
+        )
+        .await
+        .unwrap();
+        w.pump(|_| {}).await;
+        got.extend(drain(&mut watcher).into_iter().flatten());
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "bob's emissions never reached carol, who holds no entry of his device: the announce \
+             of a writer who has not put was not acted on"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(&got[0].bytes[..], b"here");
+    assert_eq!((&got[0].by, &got[0].writer), (&n("/bob"), &device));
+    assert!(
+        matches!(got[0].kind, Kind::Emitted(_)),
+        "an emission, not a kept value: {:?}",
+        got[0]
+    );
+    assert!(
+        !vouched(&w),
+        "carol still holds no entry of his device: he was heard without a put"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_removed_member_gets_nothing_neither_kept_values_nor_a_session() {
     let w = three(LinkConfig::default(), 4096).await;

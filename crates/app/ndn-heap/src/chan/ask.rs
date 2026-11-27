@@ -66,7 +66,7 @@ fn bad_answer(sender: &Name, why: impl Into<String>) -> ChanError {
 /// Whether `device` lies under a reserved prefix, `/localhost` or `/localhop`: no device of the
 /// network is named so, and a command signed under such a name is what a forwarder takes from its
 /// own host or its neighbour.
-fn is_reserved(device: &Name) -> bool {
+pub(super) fn is_reserved(device: &Name) -> bool {
     device
         .components()
         .first()
