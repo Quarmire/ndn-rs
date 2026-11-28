@@ -522,6 +522,177 @@ fn the_queries_of_all_the_sinks_of_a_route_are_bounded_on_the_way_up() {
     assert_eq!(fx.on_frame(22, query(1, 512, 10, 80)), SideOutcome::Queried);
 }
 
+/// The route's `QUERY` rate is cut up per sink: four faces' worth of junk (each at its own
+/// face rate, so each passes the face's check) fill the route's cell, and a fifth sink that
+/// asks once a second still gets its query to the source from its own share.
+#[test]
+fn sinks_flooding_junk_cannot_starve_another_sink_of_the_route_rate() {
+    // The face rate is the default 512 a second; the route takes 1,024, half of what the four
+    // flooding faces offer, so the route's cell is full and stays full.
+    let fx = Fx::limits(SideLimits {
+        route_query_rate: 1_024,
+        route_query_burst: 64,
+        ..SideLimits::default()
+    });
+    let _src = fx.app(10);
+    for sink in 20..=24 {
+        let _ = fx.app(sink);
+    }
+    fx.route(1, 10, &[20, 21, 22, 23, 24]);
+
+    let mut token = 0u64;
+    let mut asked = 0;
+    for ms in 0..5_000u64 {
+        // Junk with a fresh token each time, ttl 1 (100 ms): a flooder is under every other
+        // bound, and only the rates are in play.
+        for flooder in 20..=23 {
+            token += 1;
+            let _ = fx.on_frame(flooder, query(1, token, 1, 80));
+        }
+        if ms % 1_000 == 500 {
+            token += 1;
+            asked += 1;
+            assert_eq!(
+                fx.on_frame(24, query(1, token, 1, 80)),
+                SideOutcome::Queried,
+                "the sink that sends one query a second was dropped at the forwarder at {ms} ms \
+                 (query {asked}), behind four sinks flooding the route's rate"
+            );
+        }
+        if ms % 100 == 99 {
+            fx.table.sweep(fx.now());
+        }
+        fx.advance_ms(1);
+    }
+    let s = fx.stats();
+    assert!(
+        s.query_rate_refused > 1_000,
+        "the flood was held back by the rates: {s:?}"
+    );
+    assert_eq!(asked, 5);
+}
+
+/// A lone active sink is not lowered by the others' shares being kept: the shares of the idle
+/// sinks go to it, and the route takes what it always took (its burst, then its rate).
+#[test]
+fn a_lone_active_sink_gets_the_whole_route_rate_beside_idle_sinks() {
+    let fx = Fx::limits(SideLimits {
+        query_rate: 1_000_000,
+        query_burst: 1_000_000,
+        route_query_rate: 100,
+        route_query_burst: 10,
+        ..SideLimits::default()
+    });
+    let _src = fx.app(10);
+    for sink in 20..=24 {
+        let _ = fx.app(sink);
+    }
+    fx.route(1, 10, &[20, 21, 22, 23, 24]);
+
+    let mut queried = 0u64;
+    for token in 0..10_000u64 {
+        if fx.on_frame(20, query(1, token, 1, 80)) == SideOutcome::Queried {
+            queried += 1;
+        }
+        if token % 100 == 99 {
+            fx.table.sweep(fx.now());
+        }
+        fx.advance_ms(1);
+    }
+    // 10 s at 100 a second and a burst of 10.
+    assert!(
+        (1_000..=1_012).contains(&queried),
+        "a lone sink took {queried} of the 1,010 the route allows in 10 s"
+    );
+}
+
+/// One round of junk while the route is full: each of `flooders` sends a query, with a token
+/// no other has used.
+/// (The engine sweeps lapsed breadcrumbs every second; here it is every round.)
+fn flood(fx: &Fx, flooders: &[u64], token: &mut u64) {
+    fx.table.sweep(fx.now());
+    for &f in flooders {
+        *token += 1;
+        let _ = fx.on_frame(f, query(1, *token, 1, 80));
+    }
+}
+
+/// A sink's share is its own: it is made with the sink and goes with it. A sink that joins
+/// while the route is full gets its first query at once (its share is whole), not a burst of
+/// them; a sink that leaves and joins again is a new sink with the same, and installing a
+/// sink that is there gives it nothing: no way to a fresh allowance.
+#[test]
+fn a_sinks_share_is_made_with_it_and_a_new_sink_has_no_burst() {
+    let fx = Fx::limits(SideLimits {
+        query_rate: 1_000_000,
+        query_burst: 1_000_000,
+        route_query_rate: 1_024,
+        route_query_burst: 64,
+        ..SideLimits::default()
+    });
+    let _src = fx.app(10);
+    for sink in 20..=25 {
+        let _ = fx.app(sink);
+    }
+    let flooders = [20, 21, 23, 24];
+    fx.route(1, 10, &flooders);
+    // Four sinks offer about 4,000 a second to a route that takes 1,024: it is full.
+    let mut token = 0u64;
+    for _ in 0..200 {
+        flood(&fx, &flooders, &mut token);
+        fx.advance_ms(1);
+    }
+
+    // A new sink: one query now, a second not until its share (1,024 / 64 = 16 a second, one
+    // per 62.5 ms) has refilled, with the route as full as ever.
+    fx.route(1, 10, &[22]);
+    flood(&fx, &flooders, &mut token);
+    assert_eq!(
+        fx.on_frame(22, query(1, 9_001, 1, 80)),
+        SideOutcome::Queried
+    );
+    assert_eq!(
+        fx.on_frame(22, query(1, 9_002, 1, 80)),
+        SideOutcome::Dropped(SideDrop::QueryRate)
+    );
+    for _ in 0..62 {
+        fx.advance_ms(1);
+        flood(&fx, &flooders, &mut token);
+    }
+    assert_eq!(
+        fx.on_frame(22, query(1, 9_003, 1, 80)),
+        SideOutcome::Dropped(SideDrop::QueryRate)
+    );
+    fx.advance_ms(1);
+    flood(&fx, &flooders, &mut token);
+    assert_eq!(
+        fx.on_frame(22, query(1, 9_004, 1, 80)),
+        SideOutcome::Queried
+    );
+
+    // Installing a sink that is there refreshes it and gives it nothing.
+    fx.route(1, 10, &[22]);
+    flood(&fx, &flooders, &mut token);
+    assert_eq!(
+        fx.on_frame(22, query(1, 9_005, 1, 80)),
+        SideOutcome::Dropped(SideDrop::QueryRate)
+    );
+
+    // A sink that left and joined again is a new one: its share is whole, but only one.
+    fx.table.remove_face(FaceId(22));
+    let _ = fx.app(22);
+    fx.route(1, 10, &[22]);
+    flood(&fx, &flooders, &mut token);
+    assert_eq!(
+        fx.on_frame(22, query(1, 9_006, 1, 80)),
+        SideOutcome::Queried
+    );
+    assert_eq!(
+        fx.on_frame(22, query(1, 9_007, 1, 80)),
+        SideOutcome::Dropped(SideDrop::QueryRate)
+    );
+}
+
 #[test]
 fn a_query_going_up_is_charged_to_the_source_faces_rate() {
     let fx = Fx::new();

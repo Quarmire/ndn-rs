@@ -51,7 +51,8 @@
 //!   [`pit_per_route`](SideLimits::pit_per_route) with a share held for each live sink of the
 //!   route ([`pit_route_reserve`](SideLimits::pit_route_reserve): no sink takes what the others
 //!   are owed), a per-face [`query_rate`](SideLimits::query_rate), a per-route rate up to the
-//!   source ([`route_query_rate`](SideLimits::route_query_rate)) and the source face's own
+//!   source ([`route_query_rate`](SideLimits::route_query_rate), shared out by sink: each sink
+//!   keeps its own share of it whatever the others send) and the source face's own
 //!   [`SideRate`] (`quota`); a ttl of 100 ms to
 //!   [`pit_ttl_max`](SideLimits::pit_ttl_max). Every refusal drops the frame and counts it
 //!   (`pit_dup`, `pit_full`, `unmatched`, `late`, ...): no Nack frame is built. A barred sink's
@@ -150,6 +151,15 @@ pub struct SideLimits {
     /// together (default 2,048, four faces' worth), a generic cell rate like
     /// [`query_rate`](Self::query_rate): `N` sinks at their own rate would otherwise put `N`
     /// times that into the source's queue. Counted `rate_refused`. 0 refuses every `QUERY`.
+    ///
+    /// It is shared out by sink as the breadcrumbs are (`pit_route_reserve`): each sink has a
+    /// share of `route_query_rate / sinks_per_route` (32 a second by default) and a burst of
+    /// `route_query_burst / sinks_per_route` (8, at least 1), which it may always spend, and
+    /// once spent it takes from the route's cell with the other sinks, so one sink, or a few,
+    /// can use the route's whole rate while the rest are idle but cannot spend a share another
+    /// sink has not. A sink's share is fixed by these limits: a sink that joins or leaves
+    /// changes no other's. A new sink starts with its burst spent (one `QUERY`, then its rate).
+    /// A relay face that carries many askers is one sink, and has one share.
     pub route_query_rate: u32,
     /// `QUERY` frames the sinks of one route may send up in quick succession (default 512).
     pub route_query_burst: u32,
@@ -594,6 +604,9 @@ struct Sink {
     /// one adds `keep_forward_min`, and one is passed while what is owed is within the burst
     /// (`keep_forward_burst`). 0 before the first.
     kept: AtomicU64,
+    /// The theoretical arrival time (ns) of this sink's share of its route's `QUERY` rate
+    /// ([`query_share`]); made with the sink and gone with it.
+    query_tat: AtomicU64,
 }
 
 impl Sink {
@@ -614,7 +627,7 @@ struct Route {
     /// The source face's state, stamped when an `UP` record goes to it.
     source_entry: Arc<FaceEntry>,
     /// The theoretical arrival time (ns) of the route's `QUERY` allowance, all its sinks together
-    /// ([`SideLimits::route_query_rate`]).
+    /// ([`SideLimits::route_query_rate`]); each sink's share is in the sink.
     query_tat: AtomicU64,
 }
 
@@ -769,10 +782,62 @@ fn cell_admit(tat: &AtomicU64, now: u64, rate: u32, burst: u32) -> bool {
     }
     let interval = (1_000_000_000 / u64::from(rate)).max(1);
     let tolerance = interval.saturating_mul(u64::from(burst.max(1)) - 1);
+    cell_admit_within(tat, now, interval, tolerance)
+}
+
+/// [`cell_admit`] with the interval and the tolerance given in ns.
+fn cell_admit_within(tat: &AtomicU64, now: u64, interval: u64, tolerance: u64) -> bool {
     tat.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |tat| {
         (tat.saturating_sub(now) <= tolerance).then(|| tat.max(now).saturating_add(interval))
     })
     .is_ok()
+}
+
+/// The interval (ns) and the tolerance (ns) of one sink's share of its route's `QUERY` rate: the
+/// route's [`route_query_rate`](SideLimits::route_query_rate) and
+/// [`route_query_burst`](SideLimits::route_query_burst) divided by
+/// [`sinks_per_route`](SideLimits::sinks_per_route), the most sinks a route has, so the shares
+/// of every sink a route can hold together are at most its rate. A share is fixed by the limits:
+/// no sink that joins or leaves changes another's. At least one `QUERY` is a share's burst. A
+/// route rate of 0 has no share (every `QUERY` is refused).
+fn query_share(limits: &SideLimits) -> (u64, u64) {
+    let sinks = limits.sinks_per_route.max(1) as u64;
+    let route = (1_000_000_000 / u64::from(limits.route_query_rate.max(1))).max(1);
+    let interval = route.saturating_mul(sinks);
+    let burst = (u64::from(limits.route_query_burst) / sinks).max(1);
+    (interval, interval.saturating_mul(burst - 1))
+}
+
+/// Whether `sink`'s `QUERY` may go up its `route` now. A sink first spends its own share of the
+/// route's rate ([`query_share`]); when that is spent it takes from what the route's cell has
+/// left, so a sink alone, or the few that send, use the shares the other sinks do not: the
+/// route's rate in all, as ever. Every `QUERY` that goes up, from a share or from the cell, is
+/// charged to the cell, so the route is held to its rate; but a sink within its share is
+/// admitted whatever the others have spent of the cell, so no sink, and no few sinks, can use
+/// what another is owed. Two atomic updates, no scan of the sinks.
+fn route_query_admit(route: &Route, sink: &Sink, now: u64, limits: &SideLimits) -> bool {
+    if limits.route_query_rate == 0 {
+        return false;
+    }
+    let route_interval = (1_000_000_000 / u64::from(limits.route_query_rate)).max(1);
+    let (interval, tolerance) = query_share(limits);
+    if cell_admit_within(&sink.query_tat, now, interval, tolerance) {
+        // Paid from the share; the route's cell is charged all the same (it may be over its
+        // burst by it: the shares together are at most its rate, so it comes back).
+        route
+            .query_tat
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |tat| {
+                Some(tat.max(now).saturating_add(route_interval))
+            })
+            .ok();
+        return true;
+    }
+    cell_admit(
+        &route.query_tat,
+        now,
+        limits.route_query_rate,
+        limits.route_query_burst,
+    )
 }
 
 /// The forwarder's fan-out table for side frames; see the [module](self).
@@ -957,6 +1022,7 @@ impl SideTable {
             Self::check_faces(faces, source, sink)?;
         }
         let sink_entry = self.entry(sink);
+        let share_tolerance = query_share(limits).1;
         let new_sink = || {
             Arc::new(Sink {
                 face: sink,
@@ -964,6 +1030,9 @@ impl SideTable {
                 ttl_ns: AtomicU64::new(ttl_ns),
                 expires: AtomicU64::new(now.saturating_add(ttl_ns)),
                 kept: AtomicU64::new(0),
+                // A new sink's share starts with its burst spent: one `QUERY`, then its rate. A
+                // sink that leaves and joins again gains no fresh burst by it.
+                query_tat: AtomicU64::new(now.saturating_add(share_tolerance)),
             })
         };
         let existing = self.routes.get(&id.0).map(|r| Arc::clone(&r));
@@ -1213,14 +1282,10 @@ impl SideTable {
         // The breadcrumb is in before the frame goes: an answer may come back before this
         // returns. A forward that fails takes it out again, if it is still ours.
         let len = frame.len() as u64;
-        // What goes up is paid for before it goes: the sinks of the route together, and the
-        // source face's own rate (as every frame handed to a face is).
-        if !cell_admit(
-            &route.query_tat,
-            now,
-            limits.route_query_rate,
-            limits.route_query_burst,
-        ) {
+        // What goes up is paid for before it goes: the sink's share of the route's rate and the
+        // route's cell (`route_query_admit`), and the source face's own rate (as every frame
+        // handed to a face is).
+        if !route_query_admit(route, sink, now, limits) {
             self.unwind(key, crumb);
             return self.dropped(SideDrop::QueryRate);
         }
