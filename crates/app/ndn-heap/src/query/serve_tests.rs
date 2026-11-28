@@ -1679,3 +1679,89 @@ async fn the_floor_is_set_before_the_prefix_is_reachable() {
         "{before} {floor} {after}"
     );
 }
+
+// -- The pair table, and what a copy or a forged chain costs -----------------------------------------
+
+/// The pair of `device` of `person` in the test space, for an agreement made by the server of
+/// `alice`: a real ephemeral key, as an asker derives it.
+fn take_pair(alice: &Node, person: &str, device: usize) -> (Name, Name, AskSeal) {
+    let asker = n(&format!("{person}/d{device}"));
+    let epoch = EpochId {
+        creator: n("/alice/laptop"),
+        seq: 1,
+    };
+    let context = pair_context(&space(), &asker, alice.name(), &epoch);
+    let (ephemeral, _) = ndn_security::pair_keys_to(&alice.recipient().public(), &context).unwrap();
+    let key = n(&format!("{person}/d{device}/32=KEY/1"));
+    (
+        asker,
+        key,
+        AskSeal {
+            ephemeral,
+            epoch,
+            seq: 0,
+        },
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_pair_table_drops_the_idlest_pair_of_the_person_with_most_and_refuses_no_one() {
+    let rig = rig(&["/alice/laptop", "/bob/phone"]).await;
+    public(&rig, &["/bob"]).await;
+    let alice = &rig.nodes[0];
+    let server = &alice.inner.query.server;
+    let space = space();
+    // As judged by what the node holds now: the maintenance tick that judges the pairs again
+    // leaves those judged by it alone (the made-up askers do not stand).
+    let live = (
+        alice.inner.judge.generation(),
+        alice
+            .inner
+            .space_of(&space)
+            .unwrap()
+            .log
+            .lock()
+            .fold
+            .version()
+            .load(Ordering::SeqCst),
+    );
+
+    let take = |person: &str, i: usize| {
+        let (device, key, seal) = take_pair(alice, person, i);
+        server
+            .pair(&alice.inner, &space, &device, &n(person), &key, &seal, live)
+            .is_some()
+    };
+
+    // One person with many devices fills the table; her 1025th is let in, her idlest is dropped.
+    for i in 0..=PAIRS_MAX {
+        assert!(
+            take("/many", i),
+            "device {i} of one person is refused a pair"
+        );
+    }
+    assert_eq!(server.pairs_held(), PAIRS_MAX, "the bound holds");
+    assert!(
+        !server.has_pair(&space, &n("/many/d0")),
+        "her oldest pair was dropped for her newest"
+    );
+
+    // A device of someone else is let in, and the one that pays is the idlest of the person
+    // who holds most. A pair used again is not the idlest.
+    assert!(take("/many", 1));
+    assert!(
+        take("/other", 0),
+        "a new person's first device is refused a pair because another person holds them all"
+    );
+    assert_eq!(server.pairs_held(), PAIRS_MAX);
+    assert!(server.has_pair(&space, &n("/other/d0")));
+    assert!(
+        server.has_pair(&space, &n("/many/d1")),
+        "used again: not the idlest"
+    );
+    assert!(
+        !server.has_pair(&space, &n("/many/d2")),
+        "the idlest of hers went"
+    );
+}
+

@@ -95,7 +95,8 @@ pub(crate) const PERSON_BURST: f64 = 128.0;
 /// The answer octets a second one asker person is sent, and the burst (4 MiB each).
 pub(crate) const PERSON_OCTETS_RATE: f64 = 4.0 * 1024.0 * 1024.0;
 
-/// The pair keys this node keeps, one per (space, asker device).
+/// The pair keys this node keeps, one per (space, asker device). Past it a new pair drops the
+/// least recently used of the person who holds most: a pair is a cache of one agreement.
 pub(crate) const PAIRS_MAX: usize = 1024;
 
 /// The asker persons this node keeps counters of before it sweeps those idle a minute.
@@ -272,15 +273,36 @@ struct Sealed {
     seal: AskSeal,
 }
 
-/// Why a pair could not be had.
-enum PairRefused {
-    /// The node keeps as many as it may.
-    Full,
-    /// The asker's key is no key an agreement can be made with.
-    BadKey,
+/// Drop the pair used least recently of the person who holds the most (of those who hold the
+/// most, the one whose idlest pair is the oldest).
+fn drop_idlest_of_the_largest_holder(pairs: &mut HashMap<(Name, Name), ServerPair>) {
+    // Per person: how many pairs, and the use stamp of the idlest.
+    let mut held: HashMap<&Name, (usize, u64)> = HashMap::new();
+    for pair in pairs.values() {
+        let entry = held.entry(&pair.person).or_insert((0, u64::MAX));
+        entry.0 += 1;
+        entry.1 = entry.1.min(pair.used);
+    }
+    let Some(person) = held
+        .into_iter()
+        .max_by_key(|(_, (count, idlest))| (*count, std::cmp::Reverse(*idlest)))
+        .map(|(person, _)| person.clone())
+    else {
+        return;
+    };
+    let idlest = pairs
+        .iter()
+        .filter(|(_, pair)| pair.person == person)
+        .min_by_key(|(_, pair)| pair.used)
+        .map(|(at, _)| at.clone());
+    if let Some(at) = idlest {
+        pairs.remove(&at);
+    }
 }
 
 // -- What the server keeps -------------------------------------------------------------------------
+    /// The person whose device it is: who pays when the table is full.
+    person: Name,
 
 /// What the server keeps: its limits, its replay set and its pair keys. In memory, bounded by the
 /// queries in flight and the members judged; a restart forgets all of it.
@@ -288,6 +310,8 @@ enum PairRefused {
 pub(crate) struct ServerState {
     replay: Replay,
     people: Mutex<HashMap<Name, Person>>,
+    /// When it was last used, in the order of [`ServerState::pair_uses`].
+    used: u64,
     /// The handlers running on this node.
     running: AtomicUsize,
     pairs: Mutex<HashMap<(Name, Name), ServerPair>>,
@@ -315,6 +339,8 @@ impl ServerState {
 
     /// A place for `person`'s handler: the node runs fewer than [`HANDLERS_MAX`], the person
     /// fewer than [`PERSON_INFLIGHT`], and she has answer octets left to be sent.
+    /// The uses of pairs so far: the stamp that orders them.
+    pair_uses: AtomicU64,
     pub(crate) fn slot(&self, person: &Name, now: Instant) -> Option<Slot<'_>> {
         let mut people = self.people.lock();
         let p = people
@@ -341,9 +367,19 @@ impl ServerState {
         })
     }
 
-    /// The pair keys of `device` in `space` for `seal`: the one held if it was derived for this
-    /// ephemeral key and epoch, else a new agreement (replacing the old).
-    fn pair(
+    /// The pair keys of `device` (of `person`, whose key `key` signed the query) in `space` for
+    /// `seal`: the one held if it was derived for this ephemeral key and epoch, else a new
+    /// agreement (replacing the old). `None`: the asker's key is no key an agreement can be made
+    /// with.
+    ///
+    /// A pair is a cache of one X25519 agreement, so a full table never refuses: it drops the pair
+    /// that was used least recently of the person who holds the most (a person with a thousand
+    /// devices pays with her own pairs, and a new person's first device is always let in).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one fact each, all from the query"
+    )]
+    pub(crate) fn pair(
         &self,
         node: &NodeInner,
         space: &Name,
@@ -351,37 +387,39 @@ impl ServerState {
         key: &Name,
         seal: &AskSeal,
         judged_at: (u64, u64),
-    ) -> Result<Arc<PairKeys>, PairRefused> {
+    ) -> Option<Arc<PairKeys>> {
         let at = (space.clone(), device.clone());
         {
-            let mut pairs = self.pairs.lock();
-            if let Some(held) = pairs.get_mut(&at) {
-                if held.ephemeral == seal.ephemeral && held.epoch == seal.epoch {
-                    held.judged_at = judged_at;
-                    return Ok(Arc::clone(&held.keys));
-                }
-            } else if pairs.len() >= PAIRS_MAX {
-                return Err(PairRefused::Full);
-            }
+            held.judged_at = judged_at;
+            held.used = self.pair_uses.fetch_add(1, Ordering::Relaxed);
+            return Some(Arc::clone(&held.keys));
         }
         let context = pair_context(space, device, &node.device, &seal.epoch);
         let keys = node
             .recipient()
             .pair_keys_from(&seal.ephemeral, &context)
-            .map_err(|_| PairRefused::BadKey)?;
+            .ok()?;
         self.agreements.fetch_add(1, Ordering::Relaxed);
         let keys = Arc::new(keys);
-        self.pairs.lock().insert(
+        let mut pairs = self.pairs.lock();
+        if !pairs.contains_key(&at) && pairs.len() >= PAIRS_MAX {
+            drop_idlest_of_the_largest_holder(&mut pairs);
+        }
+        pairs.insert(
+        person: &Name,
             at,
             ServerPair {
                 key: key.clone(),
                 ephemeral: seal.ephemeral,
                 epoch: seal.epoch.clone(),
+        if let Some(held) = self.pairs.lock().get_mut(&at)
+            && held.ephemeral == seal.ephemeral
+            && held.epoch == seal.epoch
                 keys: Arc::clone(&keys),
                 judged_at,
             },
         );
-        Ok(keys)
+        Some(keys)
     }
 
     /// Forget the pair of `device` in `space`.
@@ -398,11 +436,13 @@ impl ServerState {
 
     /// Of the pairs of `space`: those judged by `live` stay; the others stay only if `keep` says
     /// the asker still stands, and are then judged by `live`.
+                person: person.clone(),
     fn rejudge(&self, space: &Name, live: (u64, u64), mut keep: impl FnMut(&ServerPair) -> bool) {
         self.pairs.lock().retain(|(s, _), pair| {
             if s != space || pair.judged_at == live {
                 return true;
             }
+                used: self.pair_uses.fetch_add(1, Ordering::Relaxed),
             let stands = keep(pair);
             if stands {
                 pair.judged_at = live;
@@ -471,6 +511,13 @@ pub(crate) fn announced_prefixes(mut prefixes: Vec<Name>) -> Vec<Name> {
         if listed.len() == SERVES_MAX || octets > SERVES_OCTETS_MAX {
             break;
         }
+    #[cfg(test)]
+    pub(crate) fn has_pair(&self, space: &Name, device: &Name) -> bool {
+        self.pairs
+            .lock()
+            .contains_key(&(space.clone(), device.clone()))
+    }
+
         listed.push(prefix);
     }
     listed
@@ -645,11 +692,17 @@ impl NodeInner {
         // 8. A sealed query is opened under the pair key; the path is then known.
         let (path, bytes, sealed) = match (&ask.seal, epoch) {
             (Some(seal), Some(_)) => {
-                let keys = match server.pair(self, &ask.space, &asker_device, &key, seal, judged_at)
-                {
-                    Ok(keys) => keys,
-                    Err(PairRefused::Full) => return nack(NackReason::Congestion),
-                    Err(PairRefused::BadKey) => return nack(NackReason::NoRoute),
+                let Some(keys) = server.pair(
+                    self,
+                    &ask.space,
+                    &asker_device,
+                    &person,
+                    &key,
+                    seal,
+                    judged_at,
+                ) else {
+                    // The asker's key is no key an agreement can be made with.
+                    return nack(NackReason::NoRoute);
                 };
                 let aad = query_aad(
                     &self.device,
