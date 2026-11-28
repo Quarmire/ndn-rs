@@ -1757,7 +1757,12 @@ async fn a_reliable_burst_is_cut_by_a_checkpoint_every_so_many_octets_not_only_e
     for _ in 0..burst(CHECKPOINT_OCTETS - message.len()) {
         ck.emit(0, &message).await;
         sent += message.len();
-        checkpoints += ck.link.take_stream().iter().filter(|f| is_checkpoint(f)).count();
+        checkpoints += ck
+            .link
+            .take_stream()
+            .iter()
+            .filter(|f| is_checkpoint(f))
+            .count();
     }
     assert_eq!(
         checkpoints, 0,
@@ -1767,7 +1772,12 @@ async fn a_reliable_burst_is_cut_by_a_checkpoint_every_so_many_octets_not_only_e
     for _ in 0..2 {
         ck.emit(0, &message).await;
         sent += message.len();
-        checkpoints += ck.link.take_stream().iter().filter(|f| is_checkpoint(f)).count();
+        checkpoints += ck
+            .link
+            .take_stream()
+            .iter()
+            .filter(|f| is_checkpoint(f))
+            .count();
     }
     assert_eq!(
         checkpoints, 1,
@@ -1777,13 +1787,26 @@ async fn a_reliable_burst_is_cut_by_a_checkpoint_every_so_many_octets_not_only_e
     // is what the receiver verifies).
     for _ in 0..burst(CHECKPOINT_OCTETS) {
         ck.emit(0, &message).await;
-        checkpoints += ck.link.take_stream().iter().filter(|f| is_checkpoint(f)).count();
+        checkpoints += ck
+            .link
+            .take_stream()
+            .iter()
+            .filter(|f| is_checkpoint(f))
+            .count();
     }
     assert_eq!(checkpoints, 1, "no second checkpoint inside half a period");
     ck.advance(10).await;
     ck.emit(0, &message).await;
-    checkpoints += ck.link.take_stream().iter().filter(|f| is_checkpoint(f)).count();
-    assert_eq!(checkpoints, 2, "half a period on, the octets owed are checkpointed");
+    checkpoints += ck
+        .link
+        .take_stream()
+        .iter()
+        .filter(|f| is_checkpoint(f))
+        .count();
+    assert_eq!(
+        checkpoints, 2,
+        "half a period on, the octets owed are checkpointed"
+    );
 }
 
 /// A channel that sends nothing says it is alive every 5 s, with an empty checkpoint, and no more.
