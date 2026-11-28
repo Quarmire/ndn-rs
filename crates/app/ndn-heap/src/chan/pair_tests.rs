@@ -611,12 +611,11 @@ fn a_device_with_a_retired_pair_can_replace_it_in_a_full_table() {
     );
 }
 
-#[test]
-fn sweeping_and_rejudging_16384_pairs_is_linear() {
+/// A table of `n` pairs, one for each of `n` devices of one space.
+fn table_of(n: usize, now: Instant) -> ServerPairs {
     let pairs = ServerPairs::default();
-    let now = Instant::now();
     let lease = Duration::from_secs(3_600);
-    for i in 0..PAIRS_MAX as u64 {
+    for i in 0..n as u64 {
         pairs
             .install(
                 numbered(owner("s", &format!("d{i}"), 7), i, lease, now),
@@ -624,32 +623,67 @@ fn sweeping_and_rejudging_16384_pairs_is_linear() {
             )
             .unwrap();
     }
-    assert_eq!(pairs.count(), PAIRS_MAX);
-    // A bound that a pass linear in the table meets by a wide margin (tens of milliseconds in a
-    // debug build on a loaded machine, a few on an idle one) and one that compares each pair with
-    // each other pair (16,384 squared: 700 ms and more in a debug build) does not.
-    let bound = Duration::from_millis(400);
+    assert_eq!(pairs.count(), n);
+    pairs
+}
 
-    let began = std::time::Instant::now();
-    pairs.sweep(now + Duration::from_secs(1));
-    let swept = began.elapsed();
-    assert_eq!(pairs.count(), PAIRS_MAX, "nothing had lapsed");
-    assert!(swept < bound, "sweeping {PAIRS_MAX} pairs took {swept:?}");
+/// The fastest of `runs` runs of `pass` over a fresh table of `n` pairs: the least a pass costs,
+/// whatever else the machine was doing during the others.
+fn least_time(n: usize, runs: usize, pass: impl Fn(&ServerPairs, Instant, usize)) -> Duration {
+    let now = Instant::now();
+    (0..runs)
+        .map(|_| {
+            let pairs = table_of(n, now);
+            let began = std::time::Instant::now();
+            pass(&pairs, now, n);
+            began.elapsed()
+        })
+        .min()
+        .unwrap()
+}
+
+#[test]
+fn sweeping_and_rejudging_16384_pairs_is_linear() {
+    // Not a bound in milliseconds (a loaded machine moves those): the cost of a pass over the
+    // full table against its cost over an eighth of it. A pass linear in the table costs about 8
+    // times as much, one that compares each pair with each other pair (the first version of
+    // `sweep` and `rejudge`: 700 ms and more at 16,384 in a debug build) about 64 times. The
+    // fastest of several runs is taken at each size, and the small one is not read below a
+    // millisecond.
+    let (big, small) = (PAIRS_MAX, PAIRS_MAX / 8);
+    let allowed = |small: Duration| small.max(Duration::from_millis(1)) * 24;
+
+    let sweep = |pairs: &ServerPairs, now: Instant, n: usize| {
+        pairs.sweep(now + Duration::from_secs(1));
+        assert_eq!(pairs.count(), n, "nothing had lapsed");
+    };
+    let (swept_big, swept_small) = (least_time(big, 3, sweep), least_time(small, 3, sweep));
+    assert!(
+        swept_big < allowed(swept_small),
+        "sweeping {big} pairs took {swept_big:?} against {swept_small:?} for {small}: more than \
+         24 times, so more than linear in the table"
+    );
 
     // Every other device stops standing: the judgement is asked once for each pair it concerns,
     // and what it drops is dropped from the table of devices too.
-    let asked = std::cell::Cell::new(0usize);
-    let began = std::time::Instant::now();
-    let dropped = pairs.rejudge(&n(&["s"]), (2, 2), |_| {
-        asked.set(asked.get() + 1);
-        asked.get() % 2 == 0
-    });
-    let rejudged = began.elapsed();
-    assert_eq!(asked.get(), PAIRS_MAX, "each pair is judged once");
-    assert_eq!(dropped.len() + pairs.count(), PAIRS_MAX);
-    assert!(!dropped.is_empty() && pairs.count() > 0);
+    let rejudge = |pairs: &ServerPairs, _now: Instant, n: usize| {
+        let asked = std::cell::Cell::new(0usize);
+        let dropped = pairs.rejudge(&n_of_space(), (2, 2), |_| {
+            asked.set(asked.get() + 1);
+            asked.get() % 2 == 0
+        });
+        assert_eq!(asked.get(), n, "each pair is judged once");
+        assert_eq!(dropped.len() + pairs.count(), n);
+        assert!(!dropped.is_empty() && pairs.count() > 0);
+    };
+    let (judged_big, judged_small) = (least_time(big, 3, rejudge), least_time(small, 3, rejudge));
     assert!(
-        rejudged < bound,
-        "rejudging {PAIRS_MAX} pairs took {rejudged:?}"
+        judged_big < allowed(judged_small),
+        "rejudging {big} pairs took {judged_big:?} against {judged_small:?} for {small}: more than \
+         24 times, so more than linear in the table"
     );
+}
+
+fn n_of_space() -> Name {
+    n(&["s"])
 }
