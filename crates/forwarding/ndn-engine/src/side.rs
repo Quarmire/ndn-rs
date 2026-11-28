@@ -34,8 +34,9 @@
 //!   [`Face::forward_side_from`](ndn_transport::Face::forward_side_from), which
 //!   must not wait. A sink that cannot take it costs that sink the frame and is
 //!   counted `sink_full`: relays are lossy under congestion, visibly. **A stream frame is the
-//!   exception, at a face that reads its channel stream apart** ([`Face::side_stream_lane`]
-//!   (ndn_transport::Face::side_stream_lane): a QUIC link): that face's stream lane waits, with
+//!   exception, at a face that reads its channel stream apart** (see
+//!   [`Face::side_stream_lane`](ndn_transport::Face::side_stream_lane): a QUIC link): that face's
+//!   stream lane waits, with
 //!   the frame in hand, until every live sink has room for it ([`SideTable::stream_room`])
 //!   before it calls `on_frame`, and the face stops taking the stream's octets meanwhile, so
 //!   the peer's flow control and first-hop hold-back slow its sender. The rule is **per link
