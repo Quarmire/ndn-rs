@@ -67,8 +67,8 @@ pub use cert_cache::{CertCache, Certificate};
 pub use cert_fetcher::{CertFetcher, DirectFetchFn, FetchFn, FetchMiss, is_full_name};
 pub use cert_set::CertSet;
 pub use confidentiality::{
-    ContentKey, EpochPolicy, PairKeys, RecipientKey, RotatingKey, Sealed, pair_keys_to, unwrap_ck,
-    wrap_ck, wrap_ck_to,
+    ContentKey, EpochPolicy, PAIR_ID_LEN, PairKeys, RecipientKey, RotatingKey, Sealed,
+    pair_keys_to, unwrap_ck, wrap_ck, wrap_ck_to, wrap_ck_to_pair,
 };
 pub use cut_manifest::{BuiltManifest, CutManifestError, CutManifests, ManifestLookup};
 pub use error::TrustError;

@@ -246,6 +246,25 @@ impl RecipientKey {
         let kek = x25519_kek(&shared, ephemeral, &self.public())?;
         unwrap_ck(&kek, wrapped, aad)
     }
+
+    /// Open a content key [`wrap_ck_to_pair`] wrapped to this key's public half and the pair
+    /// keys of the same agreement, given the sender's `ephemeral` public key, the same `aad` and
+    /// the same `context`. One X25519 agreement gives both: the wrap key (label
+    /// [`X25519_KEK_LABEL`]) and the pair keys (the channel path's labels, which differ from it
+    /// and from the signed query path's).
+    pub fn unwrap_ck_pair(
+        &self,
+        ephemeral: &[u8; X25519_LEN],
+        wrapped: &Sealed,
+        aad: &[u8],
+        context: &[u8],
+    ) -> Result<(ContentKey, PairKeys), ConfidentialityError> {
+        let shared = MontgomeryPoint(*ephemeral).mul_clamped(self.secret);
+        let kek = x25519_kek(&shared, ephemeral, &self.public())?;
+        let ck = unwrap_ck(&kek, wrapped, aad)?;
+        let keys = pair_keys(&CHANNEL_PAIR, &shared, ephemeral, &self.public(), context)?;
+        Ok((ck, keys))
+    }
 }
 
 /// Wrap `ck` to the X25519 public key `recipient`: a fresh ephemeral key
@@ -267,6 +286,25 @@ pub fn wrap_ck_to(
     Ok((public, wrap_ck(&kek, ck, aad)))
 }
 
+/// [`wrap_ck_to`], and from the **same** agreement the pair keys of the channel path
+/// ([`PairKeys`]) bound to `context`: what the sender (the one that agreed the secret) keeps for
+/// the receiver, who derives the same with [`RecipientKey::unwrap_ck_pair`]. A second agreement
+/// would cost a second scalar multiplication for nothing; the labels keep the wrap key and the
+/// pair keys apart. Returns the ephemeral public key, the wrapped key and the pair keys.
+pub fn wrap_ck_to_pair(
+    recipient: &[u8; X25519_LEN],
+    ck: &ContentKey,
+    aad: &[u8],
+    context: &[u8],
+) -> Result<([u8; X25519_LEN], Sealed, PairKeys), ConfidentialityError> {
+    let ephemeral = RecipientKey::generate();
+    let public = ephemeral.public();
+    let shared = MontgomeryPoint(*recipient).mul_clamped(ephemeral.secret);
+    let kek = x25519_kek(&shared, &public, recipient)?;
+    let keys = pair_keys(&CHANNEL_PAIR, &shared, &public, recipient, context)?;
+    Ok((public, wrap_ck(&kek, ck, aad), keys))
+}
+
 /// The KEK of an X25519 agreement: HKDF-SHA256 with the shared secret as
 /// input key material, no salt, and `info` the domain label followed by the
 /// ephemeral and the recipient public keys.
@@ -286,14 +324,45 @@ fn x25519_kek(
     Ok(ContentKey::from_bytes(*kek))
 }
 
-/// Domain label of the pair secret of [`pair_keys_to`] / [`RecipientKey::pair_keys_from`]. It
-/// differs from [`X25519_KEK_LABEL`] and from the channel path's own, so one agreement cannot
-/// yield a wrap key, nor a key of another path.
+/// Domain label of the pair secret of [`pair_keys_to`] / [`RecipientKey::pair_keys_from`], the
+/// signed query path's. It differs from [`X25519_KEK_LABEL`] and from the channel path's
+/// ([`CHANNEL_PAIR`]), so one agreement cannot yield a wrap key, nor a key of another path.
 const PAIR_LABEL: &[u8] = b"ndn-query/pair/1";
 /// Label of the key that seals an asker's queries.
 const PAIR_QUERY_LABEL: &[u8] = b"ndn-query/pair/q/1";
 /// Label of the key that seals a server's answers.
 const PAIR_ANSWER_LABEL: &[u8] = b"ndn-query/pair/a/1";
+/// Label of the pair id of the signed path (not used on the wire there).
+const PAIR_ID_LABEL: &[u8] = b"ndn-query/pair/id/1";
+
+/// Octets of a pair id: the first eight of an HKDF-Expand of the pair secret, public by design (a
+/// server finds the pair a frame names in one lookup).
+pub const PAIR_ID_LEN: usize = 8;
+
+/// The four labels of one path's pair keys. Two paths share the derivation and no label.
+struct PairLabels {
+    pair: &'static [u8],
+    query: &'static [u8],
+    answer: &'static [u8],
+    id: &'static [u8],
+}
+
+/// The signed query path's labels.
+const QUERY_PAIR: PairLabels = PairLabels {
+    pair: PAIR_LABEL,
+    query: PAIR_QUERY_LABEL,
+    answer: PAIR_ANSWER_LABEL,
+    id: PAIR_ID_LABEL,
+};
+
+/// The channel path's labels: a pair of keys from the agreement of the session answer
+/// ([`wrap_ck_to_pair`]).
+const CHANNEL_PAIR: PairLabels = PairLabels {
+    pair: b"ndn-channel/pair/1",
+    query: b"ndn-channel/pair/q/1",
+    answer: b"ndn-channel/pair/a/1",
+    id: b"ndn-channel/pair/id/1",
+};
 
 /// The two directional keys of one asker and one server: `query` seals what the asker sends,
 /// `answer` what the server sends back. Neither is the other's, so a frame of one direction never
@@ -304,6 +373,9 @@ pub struct PairKeys {
     pub query: [u8; CK_LEN],
     /// Seals the server's answers.
     pub answer: [u8; CK_LEN],
+    /// The pair's public name: the first [`PAIR_ID_LEN`] octets of an HKDF-Expand of the pair
+    /// secret. It is derived from the key, so a re-key (a new ephemeral key) is a new id.
+    pub id: [u8; PAIR_ID_LEN],
 }
 
 impl core::fmt::Debug for PairKeys {
@@ -318,6 +390,7 @@ impl core::fmt::Debug for PairKeys {
 /// of that secret under its own label. `context` binds what the two ends agree on (the names and
 /// the epoch); a different one gives other keys.
 fn pair_keys(
+    labels: &PairLabels,
     shared: &MontgomeryPoint,
     ephemeral: &[u8; X25519_LEN],
     recipient: &[u8; X25519_LEN],
@@ -333,7 +406,7 @@ fn pair_keys(
     let mut pair = zeroize::Zeroizing::new([0u8; CK_LEN]);
     Hkdf::<Sha256>::new(None, shared.as_ref())
         .expand_multi_info(
-            &[PAIR_LABEL, ephemeral, recipient, &context_len, context],
+            &[labels.pair, ephemeral, recipient, &context_len, context],
             pair.as_mut(),
         )
         .expect("32 octets is a valid HKDF-SHA256 output length");
@@ -342,11 +415,14 @@ fn pair_keys(
     let mut keys = PairKeys {
         query: [0u8; CK_LEN],
         answer: [0u8; CK_LEN],
+        id: [0u8; PAIR_ID_LEN],
     };
-    prk.expand(PAIR_QUERY_LABEL, &mut keys.query)
+    prk.expand(labels.query, &mut keys.query)
         .expect("32 octets is a valid HKDF-SHA256 output length");
-    prk.expand(PAIR_ANSWER_LABEL, &mut keys.answer)
+    prk.expand(labels.answer, &mut keys.answer)
         .expect("32 octets is a valid HKDF-SHA256 output length");
+    prk.expand(labels.id, &mut keys.id)
+        .expect("8 octets is a valid HKDF-SHA256 output length");
     Ok(keys)
 }
 
@@ -362,7 +438,7 @@ pub fn pair_keys_to(
     let ephemeral = RecipientKey::generate();
     let public = ephemeral.public();
     let shared = MontgomeryPoint(*recipient).mul_clamped(ephemeral.secret);
-    let keys = pair_keys(&shared, &public, recipient, context)?;
+    let keys = pair_keys(&QUERY_PAIR, &shared, &public, recipient, context)?;
     Ok((public, keys))
 }
 
@@ -375,7 +451,7 @@ impl RecipientKey {
         context: &[u8],
     ) -> Result<PairKeys, ConfidentialityError> {
         let shared = MontgomeryPoint(*ephemeral).mul_clamped(self.secret);
-        pair_keys(&shared, ephemeral, &self.public(), context)
+        pair_keys(&QUERY_PAIR, &shared, ephemeral, &self.public(), context)
     }
 }
 
@@ -705,5 +781,112 @@ mod pair_tests {
         let server = RecipientKey::generate();
         let (_, keys) = pair_keys_to(&server.public(), b"c").unwrap();
         assert_eq!(format!("{keys:?}"), "PairKeys(..)");
+    }
+
+    /// What the channel path derives: one agreement, the wrapped key and the pair.
+    fn wrapped(
+        asker: &RecipientKey,
+        context: &[u8],
+    ) -> ([u8; X25519_LEN], Sealed, PairKeys, ContentKey) {
+        let ck = ContentKey::generate();
+        let (ephemeral, sealed, keys) =
+            wrap_ck_to_pair(&asker.public(), &ck, b"aad", context).unwrap();
+        (ephemeral, sealed, keys, ck)
+    }
+
+    #[test]
+    fn the_channel_pair_is_the_same_on_both_ends_and_the_key_still_opens() {
+        let asker = RecipientKey::generate();
+        let (ephemeral, sealed, at_server, ck) = wrapped(&asker, b"ctx");
+        let (opened, at_asker) = asker
+            .unwrap_ck_pair(&ephemeral, &sealed, b"aad", b"ctx")
+            .unwrap();
+        assert_eq!(opened.expose(), ck.expose());
+        assert_eq!(at_asker.query, at_server.query);
+        assert_eq!(at_asker.answer, at_server.answer);
+        assert_eq!(at_asker.id, at_server.id);
+        assert_ne!(at_server.query, at_server.answer);
+        assert_ne!(
+            at_server.query,
+            *ck.expose(),
+            "the channel key is not a pair key"
+        );
+        assert_ne!(at_server.answer, *ck.expose());
+    }
+
+    #[test]
+    fn the_channel_pair_differs_per_asker_per_context_and_per_ask() {
+        let asker = RecipientKey::generate();
+        let (ephemeral, sealed, keys, _) = wrapped(&asker, b"ctx");
+        let same =
+            |a: &PairKeys, b: &PairKeys| a.query == b.query || a.answer == b.answer || a.id == b.id;
+        // Another context (another channel, epoch or device name) opens the key but not the
+        // pair of the first.
+        let (_, other_ctx) = asker
+            .unwrap_ck_pair(&ephemeral, &sealed, b"aad", b"ctx2")
+            .unwrap();
+        assert!(!same(&keys, &other_ctx));
+        // Another asker (another recipient key) derives other keys from another agreement.
+        let (_, _, other_asker, _) = wrapped(&RecipientKey::generate(), b"ctx");
+        assert!(!same(&keys, &other_asker));
+        // The same asker asked again: a new ephemeral key, a new pair, a new id.
+        let (_, _, again, _) = wrapped(&asker, b"ctx");
+        assert!(!same(&keys, &again));
+    }
+
+    #[test]
+    fn the_channel_pair_is_not_the_signed_paths_nor_the_wrap_key() {
+        // The same shared secret, ephemeral, recipient and context under the two paths'
+        // labels give no key in common, and neither is the KEK.
+        let asker = RecipientKey::generate();
+        let ephemeral = RecipientKey::generate();
+        let shared = MontgomeryPoint(asker.public()).mul_clamped(ephemeral.secret);
+        let (e, r) = (ephemeral.public(), asker.public());
+        let channel = pair_keys(&CHANNEL_PAIR, &shared, &e, &r, b"ctx").unwrap();
+        let query = pair_keys(&QUERY_PAIR, &shared, &e, &r, b"ctx").unwrap();
+        let kek = x25519_kek(&shared, &e, &r).unwrap();
+        assert_ne!(channel.query, query.query);
+        assert_ne!(channel.answer, query.answer);
+        assert_ne!(channel.id, query.id);
+        for key in [&channel.query, &channel.answer, &query.query, &query.answer] {
+            assert_ne!(key, kek.expose());
+        }
+        for (a, b) in [
+            (CHANNEL_PAIR.pair, QUERY_PAIR.pair),
+            (CHANNEL_PAIR.query, QUERY_PAIR.query),
+            (CHANNEL_PAIR.answer, QUERY_PAIR.answer),
+            (CHANNEL_PAIR.id, QUERY_PAIR.id),
+            (CHANNEL_PAIR.pair, X25519_KEK_LABEL),
+        ] {
+            assert_ne!(a, b);
+        }
+    }
+
+    #[test]
+    fn a_low_order_ephemeral_or_recipient_is_refused_for_the_channel_pair_too() {
+        let asker = RecipientKey::generate();
+        let ck = ContentKey::generate();
+        assert_eq!(
+            wrap_ck_to_pair(&[0u8; X25519_LEN], &ck, b"aad", b"ctx").err(),
+            Some(ConfidentialityError::BadPublicKey)
+        );
+        let (_, sealed, _, _) = wrapped(&asker, b"ctx");
+        assert_eq!(
+            asker
+                .unwrap_ck_pair(&[0u8; X25519_LEN], &sealed, b"aad", b"ctx")
+                .err(),
+            Some(ConfidentialityError::BadPublicKey)
+        );
+    }
+
+    #[test]
+    fn a_wrong_aad_opens_no_key_and_so_no_pair() {
+        let asker = RecipientKey::generate();
+        let (ephemeral, sealed, _, _) = wrapped(&asker, b"ctx");
+        assert!(
+            asker
+                .unwrap_ck_pair(&ephemeral, &sealed, b"other", b"ctx")
+                .is_err()
+        );
     }
 }
