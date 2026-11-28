@@ -670,7 +670,7 @@ fn sweeping_and_rejudging_16384_pairs_is_linear() {
         let asked = std::cell::Cell::new(0usize);
         let dropped = pairs.rejudge(&n_of_space(), (2, 2), |_| {
             asked.set(asked.get() + 1);
-            asked.get() % 2 == 0
+            asked.get().is_multiple_of(2)
         });
         assert_eq!(asked.get(), n, "each pair is judged once");
         assert_eq!(dropped.len() + pairs.count(), n);
