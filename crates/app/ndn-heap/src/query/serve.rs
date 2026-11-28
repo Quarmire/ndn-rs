@@ -19,9 +19,11 @@
 //! 4. a copy of a query already answered (key, nonce and time in the replay set, which is only
 //!    read here): `Duplicate`, with no signature and no verification budget spent;
 //! 5. the signature verifies from the certificates held and the at most four carried, fetching
-//!    nothing: `Pending` is `NotYet`, a refusal `NoRoute`;
-//! 6. the query is no replay (key, nonce, time): `Duplicate`; then the asker person's rate
-//!    (charged only now that the key is the asker's): `Congestion`;
+//!    nothing, the verification budget (per ingress face and for the node) charged one unit for
+//!    every signature walk the judging makes, the first included: over it, `Congestion`;
+//!    `Pending` is `NotYet`, a refusal `NoRoute`;
+//! 6. the query enters the replay set (a copy that raced past step 4 is `Duplicate`); then the
+//!    asker person's rate (charged only now that the key is the asker's): `Congestion`;
 //! 7. standing again under the record's lock, this device a writer, and in a sealed space the
 //!    epoch in force is the query's (`NotYet`) and the person is in its audience (`NoRoute`): the
 //!    query is sealed there and plain in a public space, else `NoRoute`;
@@ -30,8 +32,6 @@
 //! 9. the asker person's handlers in flight and the server's: over them, `Congestion`, no wait
 //!    queue; then the handler runs under the query's deadline, and its answer is signed and sent.
 //!
-//! **Not the deleted answers family.** Nothing a handler answers is stored, cached, recomputed
-//! or made an entry; the state here is memory bounded by queries in flight and judged members.
 //! **The quiet period.** The replay set is memory, and a restart empties it, so a query a
 //! previous run answered, copied off the wire, would be judged new. What bounds it is the clock:
 //! a query that run accepted was signed at most 120 s after the moment it arrived, and the run
@@ -42,6 +42,8 @@
 //! asker should ask again later). The floor is set before the prefix enters the table, so no
 //! handler is reachable without it.
 //!
+//! **Not the deleted answers family.** Nothing a handler answers is stored, cached, recomputed
+//! or made an entry; the state here is memory bounded by queries in flight and judged members.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -158,9 +160,8 @@ impl Replay {
         }
     }
 
-    /// Record the query (asker key, `nonce`, signed `time`) seen at `now`, if it is new and the
-    /// set has room.
-    pub(crate) fn check(&self, key: &Name, nonce: &[u8], time: u64, now: Instant) -> Replayed {
+    /// The set's identifier of the query (asker key, `nonce`, signed `time`).
+    fn id_of(key: &Name, nonce: &[u8], time: u64) -> [u8; 16] {
         let mut hash = Sha256::new();
         hash.update(key.encode_to_tlv());
         hash.update((nonce.len() as u32).to_be_bytes());
@@ -169,7 +170,11 @@ impl Replay {
         let digest = hash.finalize();
         let mut id = [0u8; 16];
         id.copy_from_slice(&digest[..16]);
-        let mut set = self.seen.lock();
+        id
+    }
+
+    /// Forget what was seen [`REPLAY_KEPT`] before `now`.
+    fn expire(set: &mut ReplaySet, now: Instant) {
         while let Some((at, old)) = set.order.front().copied() {
             if now.saturating_duration_since(at) < REPLAY_KEPT {
                 break;
@@ -177,6 +182,25 @@ impl Replay {
             set.order.pop_front();
             set.ids.remove(&old);
         }
+    }
+
+    /// Whether the query (asker key, `nonce`, signed `time`) is in the set at `now`. Nothing is
+    /// recorded: a query enters by [`Self::check`], after its signature verified, so what is in
+    /// the set is what a verified query put there, and a copy of one is told so before it costs
+    /// a verification.
+    pub(crate) fn contains(&self, key: &Name, nonce: &[u8], time: u64, now: Instant) -> bool {
+        let id = Self::id_of(key, nonce, time);
+        let mut set = self.seen.lock();
+        Self::expire(&mut set, now);
+        set.ids.contains(&id)
+    }
+
+    /// Record the query (asker key, `nonce`, signed `time`) seen at `now`, if it is new and the
+    /// set has room.
+    pub(crate) fn check(&self, key: &Name, nonce: &[u8], time: u64, now: Instant) -> Replayed {
+        let id = Self::id_of(key, nonce, time);
+        let mut set = self.seen.lock();
+        Self::expire(&mut set, now);
         if set.ids.contains(&id) {
             return Replayed::Replay;
         }
@@ -258,6 +282,8 @@ impl Drop for Slot<'_> {
 
 /// The pair keys of one asker device in one space, with what they were derived for.
 struct ServerPair {
+    /// The person whose device it is: who pays when the table is full.
+    person: Name,
     /// The key that signed the asker's queries, to judge it again.
     key: Name,
     ephemeral: [u8; 32],
@@ -265,6 +291,8 @@ struct ServerPair {
     keys: Arc<PairKeys>,
     /// The trust generation and fold version the asker was last judged by.
     judged_at: (u64, u64),
+    /// When it was last used, in the order of [`ServerState::pair_uses`].
+    used: u64,
 }
 
 /// A sealed query, as the answer to it needs to know it.
@@ -301,8 +329,6 @@ fn drop_idlest_of_the_largest_holder(pairs: &mut HashMap<(Name, Name), ServerPai
 }
 
 // -- What the server keeps -------------------------------------------------------------------------
-    /// The person whose device it is: who pays when the table is full.
-    person: Name,
 
 /// What the server keeps: its limits, its replay set and its pair keys. In memory, bounded by the
 /// queries in flight and the members judged; a restart forgets all of it.
@@ -310,11 +336,11 @@ fn drop_idlest_of_the_largest_holder(pairs: &mut HashMap<(Name, Name), ServerPai
 pub(crate) struct ServerState {
     replay: Replay,
     people: Mutex<HashMap<Name, Person>>,
-    /// When it was last used, in the order of [`ServerState::pair_uses`].
-    used: u64,
     /// The handlers running on this node.
     running: AtomicUsize,
     pairs: Mutex<HashMap<(Name, Name), ServerPair>>,
+    /// The uses of pairs so far: the stamp that orders them.
+    pair_uses: AtomicU64,
     /// The X25519 agreements made for pairs.
     agreements: AtomicU64,
     /// When each space's served prefixes were last announced.
@@ -339,8 +365,6 @@ impl ServerState {
 
     /// A place for `person`'s handler: the node runs fewer than [`HANDLERS_MAX`], the person
     /// fewer than [`PERSON_INFLIGHT`], and she has answer octets left to be sent.
-    /// The uses of pairs so far: the stamp that orders them.
-    pair_uses: AtomicU64,
     pub(crate) fn slot(&self, person: &Name, now: Instant) -> Option<Slot<'_>> {
         let mut people = self.people.lock();
         let p = people
@@ -384,11 +408,15 @@ impl ServerState {
         node: &NodeInner,
         space: &Name,
         device: &Name,
+        person: &Name,
         key: &Name,
         seal: &AskSeal,
         judged_at: (u64, u64),
     ) -> Option<Arc<PairKeys>> {
         let at = (space.clone(), device.clone());
+        if let Some(held) = self.pairs.lock().get_mut(&at)
+            && held.ephemeral == seal.ephemeral
+            && held.epoch == seal.epoch
         {
             held.judged_at = judged_at;
             held.used = self.pair_uses.fetch_add(1, Ordering::Relaxed);
@@ -406,17 +434,15 @@ impl ServerState {
             drop_idlest_of_the_largest_holder(&mut pairs);
         }
         pairs.insert(
-        person: &Name,
             at,
             ServerPair {
+                person: person.clone(),
                 key: key.clone(),
                 ephemeral: seal.ephemeral,
                 epoch: seal.epoch.clone(),
-        if let Some(held) = self.pairs.lock().get_mut(&at)
-            && held.ephemeral == seal.ephemeral
-            && held.epoch == seal.epoch
                 keys: Arc::clone(&keys),
                 judged_at,
+                used: self.pair_uses.fetch_add(1, Ordering::Relaxed),
             },
         );
         Some(keys)
@@ -436,13 +462,11 @@ impl ServerState {
 
     /// Of the pairs of `space`: those judged by `live` stay; the others stay only if `keep` says
     /// the asker still stands, and are then judged by `live`.
-                person: person.clone(),
     fn rejudge(&self, space: &Name, live: (u64, u64), mut keep: impl FnMut(&ServerPair) -> bool) {
         self.pairs.lock().retain(|(s, _), pair| {
             if s != space || pair.judged_at == live {
                 return true;
             }
-                used: self.pair_uses.fetch_add(1, Ordering::Relaxed),
             let stands = keep(pair);
             if stands {
                 pair.judged_at = live;
@@ -488,6 +512,13 @@ impl ServerState {
     }
 
     #[cfg(test)]
+    pub(crate) fn has_pair(&self, space: &Name, device: &Name) -> bool {
+        self.pairs
+            .lock()
+            .contains_key(&(space.clone(), device.clone()))
+    }
+
+    #[cfg(test)]
     pub(crate) fn running(&self) -> usize {
         self.running.load(Ordering::SeqCst)
     }
@@ -511,13 +542,6 @@ pub(crate) fn announced_prefixes(mut prefixes: Vec<Name>) -> Vec<Name> {
         if listed.len() == SERVES_MAX || octets > SERVES_OCTETS_MAX {
             break;
         }
-    #[cfg(test)]
-    pub(crate) fn has_pair(&self, space: &Name, device: &Name) -> bool {
-        self.pairs
-            .lock()
-            .contains_key(&(space.clone(), device.clone()))
-    }
-
         listed.push(prefix);
     }
     listed
@@ -619,24 +643,31 @@ impl NodeInner {
             return nack(NackReason::NoRoute);
         }
 
-        // 4. The verification budget, whoever the query names.
-        if !self.chan.gates.verify(ingress, arrived) {
-            return nack(NackReason::Congestion);
+        // 4. A copy of a query already answered costs nothing: no verification budget and no
+        // signature check. The set is only read here; a query enters it after its signature
+        // verified, so nothing a stranger sends is ever in it.
+        if server.replay.contains(&key, nonce, signed_at, arrived) {
+            return nack(NackReason::Duplicate);
         }
 
-        // 5. The signature: the one expensive step.
+        // 5. The signature: the one expensive step, and the verification budget with it, whoever
+        // the query names: a unit for every signature walk, the first included (a query that
+        // carries a chain is walked once for each certificate of it this node does not hold).
         let generation = self.judge.generation();
-        match self
+        let judged = self
             .judge
-            .validate_interest(&ask.space, interest, &key, &ask.chain)
-            .await
-        {
-            crate::trust::InterestJudged::Valid => {}
-            crate::trust::InterestJudged::Pending(waiting) => {
+            .validate_interest_within(&ask.space, interest, &key, &ask.chain, || {
+                self.chan.gates.verify(ingress, arrived)
+            })
+            .await;
+        match judged {
+            None => return nack(NackReason::Congestion),
+            Some(crate::trust::InterestJudged::Valid) => {}
+            Some(crate::trust::InterestJudged::Pending(waiting)) => {
                 tracing::debug!(%key, "query not judged yet: {waiting}");
                 return nack(NackReason::NotYet);
             }
-            crate::trust::InterestJudged::Refused(why) => {
+            Some(crate::trust::InterestJudged::Refused(why)) => {
                 tracing::debug!(%key, "query refused: {why}");
                 return nack(NackReason::NoRoute);
             }

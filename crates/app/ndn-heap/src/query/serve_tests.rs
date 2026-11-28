@@ -1765,3 +1765,111 @@ async fn a_full_pair_table_drops_the_idlest_pair_of_the_person_with_most_and_ref
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_query_costs_no_signature_verification() {
+    let rig = rig(&["/alice/laptop", "/bob/phone"]).await;
+    let heap = public(&rig, &["/bob"]).await;
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let _serving = heap.serve(n("/game"), echo(&ran)).unwrap();
+    let judge = &alice.inner.judge;
+
+    let wire = signed_query(bob, alice, &plain_ask(bob, "/game/x", b"once"));
+    assert!(matches!(
+        outcome(&alice.inner, &wire).await,
+        QueryOutcome::Data(_)
+    ));
+    assert_eq!(judge.interest_walks(), 1, "the query was verified once");
+    for i in 0..1000 {
+        let r = outcome(&alice.inner, &wire).await;
+        assert!(is_nack(&r, NackReason::Duplicate), "copy {i}: {r:?}");
+    }
+    assert_eq!(
+        judge.interest_walks(),
+        1,
+        "a thousand copies were told Duplicate without a verification"
+    );
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_verification_token_pays_for_one_signature_walk() {
+    // Alice holds none of bob's certificates: judging his query takes a walk for each of the
+    // certificates it carries, and each walk is a verification of its own.
+    let rig = rig_with(
+        world_apart(&["/alice/laptop", "/bob/phone"]).await,
+        2,
+        |_, _| {},
+    )
+    .await;
+    let heap = public(&rig, &["/bob"]).await;
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let _serving = heap.serve(n("/game"), echo(&ran)).unwrap();
+    let judge = &alice.inner.judge;
+
+    // The ingress face has one token left (drained at a stamp an hour ahead: no refill counted).
+    let face = Some(FaceId(77));
+    let stamp = Instant::now() + Duration::from_secs(3600);
+    for _ in 0..255 {
+        assert!(alice.inner.chan.gates.verify(face, stamp));
+    }
+    let wire = signed_query(bob, alice, &plain_ask(bob, "/game/x", b"q"));
+    let walks = judge.interest_walks();
+    let r = alice.inner.query_answer(&interest_of(&wire), face).await;
+    let walks = judge.interest_walks() - walks;
+    assert!(
+        walks <= 1,
+        "one token paid for {walks} signature walks: {r:?}"
+    );
+    assert!(is_nack(&r, NackReason::Congestion), "{r:?}");
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_chain_is_walked_only_as_far_as_the_budget_pays() {
+    // Alice holds none of bob's certificates; dave forges a query in bob's name that carries bob's
+    // genuine chain, so it is walked once for every certificate it carries before the forged
+    // signature fails. Every walk is paid for, and the judging stops where the payment does.
+    let rig = rig_with(
+        world_apart(&["/alice/laptop", "/bob/phone", "/dave/pc"]).await,
+        3,
+        |_, _| {},
+    )
+    .await;
+    public(&rig, &["/bob"]).await;
+    let (alice, bob, dave) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
+    let judge = &alice.inner.judge;
+    let ask = plain_ask(bob, "/game/x", b"q");
+    let wire = hostile_query(dave, bob.writer(), alice, &ask.encode().unwrap());
+    let interest = interest_of(&wire);
+    let key = key_name_of(&interest.sig_info().unwrap().key_locator_name().unwrap());
+    let (interest, key, chain) = (&interest, &key, &ask.chain);
+    let judge_with = |allowed: usize| async move {
+        let mut asked = 0;
+        let walks = judge.interest_walks();
+        let judged = judge
+            .validate_interest_within(&space(), interest, key, chain, || {
+                asked += 1;
+                asked <= allowed
+            })
+            .await;
+        (judged, asked, (judge.interest_walks() - walks) as usize)
+    };
+
+    // Metered, while alice's cache is cold (a refused walk leaves it so): no walk is made that
+    // was not paid for, and the judging that was cut short says so. One unit buys the first
+    // walk, which cannot reach a verdict, and the second is refused.
+    for allowed in 0..2 {
+        let (judged, asked, made) = judge_with(allowed).await;
+        assert!(judged.is_none(), "{allowed} paid: {judged:?}");
+        assert_eq!((asked, made), (allowed + 1, allowed));
+    }
+    // Unmetered: the forgery is refused after two walks, each one asked for.
+    let (judged, asked, walks) = judge_with(usize::MAX).await;
+    assert!(
+        matches!(judged, Some(InterestJudged::Refused(_))),
+        "{judged:?}"
+    );
+    assert_eq!((asked, walks), (2, 2), "a unit was asked for each walk");
+}

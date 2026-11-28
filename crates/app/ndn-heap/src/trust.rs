@@ -807,6 +807,10 @@ impl Judge {
     /// fetched. The signer is judged by the context of its **own** device, not of the name the
     /// Interest is under (that is the responder's): the signer's person decides the schema and the
     /// anchors. Each signature walk is counted ([`Self::interest_walks`]).
+    ///
+    /// This one is for a caller that spends no budget of its own (a verifier of a kept proof):
+    /// a node that answers Interests from the network meters every walk by
+    /// [`Self::validate_interest_within`].
     pub(crate) async fn validate_interest(
         &self,
         space: &Name,
@@ -814,8 +818,45 @@ impl Judge {
         key: &Name,
         chain: &[Bytes],
     ) -> InterestJudged {
+        self.judge_interest(space, interest, key, chain, || true)
+            .await
+            .0
+    }
+
+    /// [`Self::validate_interest`] for a node that answers the Interest from the network:
+    /// `pay` is asked for one unit of the node's verification budget **before every signature
+    /// walk**, the first included, and the judgement stops with `None` when it says no. A walk
+    /// is the unit because that is what the validator repeats: each walk judges the Interest
+    /// afresh from the certificates held (a signature check each), and one Interest that
+    /// carries a chain is walked once more for every certificate of it the node did not hold
+    /// (at most `1 + ASKER_CHAIN_MAX` walks), so a budget charged once per Interest would let a
+    /// forged chain cost that many times what the budget says.
+    pub(crate) async fn validate_interest_within(
+        &self,
+        space: &Name,
+        interest: &Interest,
+        key: &Name,
+        chain: &[Bytes],
+        pay: impl FnMut() -> bool,
+    ) -> Option<InterestJudged> {
+        match self.judge_interest(space, interest, key, chain, pay).await {
+            (_, true) => None,
+            (judged, false) => Some(judged),
+        }
+    }
+
+    /// The walk of [`Self::validate_interest`]: the verdict, and whether `pay` refused a walk
+    /// (the verdict is then `Pending` and the caller says over the budget instead).
+    async fn judge_interest(
+        &self,
+        space: &Name,
+        interest: &Interest,
+        key: &Name,
+        chain: &[Bytes],
+        mut pay: impl FnMut() -> bool,
+    ) -> (InterestJudged, bool) {
         let Some(device) = device_of(key) else {
-            return InterestJudged::Refused(Refusal::BadSignature);
+            return (InterestJudged::Refused(Refusal::BadSignature), false);
         };
         // The name the signer's context is chosen by: the same ask, as if under the asker.
         let as_asker = if let Some((_, digest)) = parse_chan_name(&interest.name) {
@@ -823,12 +864,17 @@ impl Judge {
         } else if let Some((_, digest)) = parse_query_name(&interest.name) {
             query_ask_name(&device, &digest)
         } else {
-            return InterestJudged::Refused(Refusal::BadSignature);
+            return (InterestJudged::Refused(Refusal::BadSignature), false);
         };
         let view = self.view_for(&as_asker, space, true);
         let mut taken = Vec::new();
         let mut outcome = None;
+        let mut over_budget = false;
         for _ in 0..=chain.len().min(ASKER_CHAIN_MAX) {
+            if !pay() {
+                over_budget = true;
+                break;
+            }
             self.interest_walks.fetch_add(1, Ordering::Relaxed);
             let (verdict, missing) = view.validate_interest_cached_as(interest, &as_asker).await;
             let InterestValidationOutcome::Pending = verdict else {
@@ -875,7 +921,7 @@ impl Judge {
                 view.cert_cache().drop_unverified(cert);
             }
         }
-        judged
+        (judged, over_budget)
     }
 
     /// How many signature walks of signed Interests this judge made: the cost a stranger's ask

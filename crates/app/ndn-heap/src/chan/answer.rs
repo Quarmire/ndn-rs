@@ -14,10 +14,11 @@
 //!    `Congestion`;
 //! 4. the ask's `SignatureTime` is within 120 s of this device's clock (the one wall-clock
 //!    reading of the setup): else `NoRoute`;
-//! 5. the budget of signature verifications (per ingress face, under a ceiling of the node's):
-//!    else `Congestion`;
+//! 5. the budget of signature verifications (per ingress face, under a ceiling of the node's),
+//!    charged one unit **for every signature walk** step 6 makes, the first included: over it,
+//!    `Congestion`;
 //! 6. the signature verifies from the certificates held and the at most four carried, fetching
-//!    nothing ([`Judge::validate_interest`]): `Pending` is `NotYet`, a refusal `NoRoute`;
+//!    nothing ([`Judge::validate_interest_within`]): `Pending` is `NotYet`, a refusal `NoRoute`;
 //! 7. the ask is no replay (the replay guard of the signed Interest): `Duplicate`;
 //! 8. the asker key's token bucket (4 a second, burst 8), charged only now that the key is the
 //!    asker's: else `Congestion`.
@@ -372,29 +373,32 @@ impl NodeInner {
             stats.throttled.bump();
             return nack(NackReason::Congestion);
         }
-        // The budget of signature verifications, per ingress face and for the node. The key
-        // an unverified ask names is whatever its sender wrote, so no asker's bucket is charged
-        // here: what a face has not used is every other face's, and the node's ceiling bounds
-        // what verifying costs the CPU.
-        if !self.chan.gates.verify(ingress, now) {
-            stats.shed.bump();
-            return nack(NackReason::Congestion);
-        }
-
-        // 6. The signature: the one expensive step.
+        // 6. The signature: the one expensive step, metered by the budget of signature
+        // verifications, per ingress face and for the node, one unit for every signature walk
+        // (an ask that carries a chain is walked once for each certificate of it the node does
+        // not hold: a unit per ask would let a forged chain cost several times the budget). The
+        // key an unverified ask names is whatever its sender wrote, so no asker's bucket is
+        // charged here: what a face has not used is every other face's, and the node's ceiling
+        // bounds what verifying costs the CPU.
         let generation = self.judge.generation();
-        match self
+        let judged = self
             .judge
-            .validate_interest(&ask.space, interest, &key, &ask.chain)
-            .await
-        {
-            InterestJudged::Valid => {}
-            InterestJudged::Pending(waiting) => {
+            .validate_interest_within(&ask.space, interest, &key, &ask.chain, || {
+                self.chan.gates.verify(ingress, now)
+            })
+            .await;
+        match judged {
+            None => {
+                stats.shed.bump();
+                return nack(NackReason::Congestion);
+            }
+            Some(InterestJudged::Valid) => {}
+            Some(InterestJudged::Pending(waiting)) => {
                 tracing::debug!(%key, "ask not judged yet: {waiting}");
                 stats.pending.bump();
                 return nack(NackReason::NotYet);
             }
-            InterestJudged::Refused(why) => {
+            Some(InterestJudged::Refused(why)) => {
                 tracing::debug!(%key, "ask refused: {why}");
                 stats.unverified.bump();
                 return nack(NackReason::NoRoute);

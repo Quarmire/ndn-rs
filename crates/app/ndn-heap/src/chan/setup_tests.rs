@@ -11,6 +11,7 @@ use ndn_engine::EngineBuilder;
 use ndn_foundation_types::Name;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Interest, NackReason};
+use ndn_transport::FaceId;
 use tokio_util::sync::CancellationToken;
 
 use super::aead::Aead;
@@ -1305,6 +1306,37 @@ async fn an_ask_with_a_chain_the_sender_does_not_hold_is_nacked_not_yet_and_the_
     bob.ask_channel(&space(), alice.name())
         .await
         .expect("the chain is carried");
+}
+
+/// A signed ask that carries a chain is walked once for each certificate of it the sender does
+/// not hold, and each walk is a signature check: the verification budget is charged for every
+/// walk, so one token of it cannot pay for several.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_verification_token_pays_for_one_signature_walk_of_an_ask() {
+    let rig = rig_of(world_apart(&["/alice/laptop", "/bob/phone"]).await).await;
+    let (share, change) = public_with(&["/bob"], &[]);
+    shared(&rig, share, change).await;
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+
+    // The ingress face has one token left (drained at a stamp an hour ahead: no refill counted).
+    let face = Some(FaceId(77));
+    let stamp = Instant::now() + Duration::from_secs(3600);
+    for _ in 0..255 {
+        assert!(alice.inner.chan.gates.verify(face, stamp));
+    }
+    let (_, interest) = signed_ask(bob, alice, &ask_of(bob, ChannelMode::Latest));
+    let walks = alice.inner.judge.interest_walks();
+    let answer = alice.inner.chan_answer(&interest, face).await;
+    let walks = alice.inner.judge.interest_walks() - walks;
+    assert!(
+        walks <= 1,
+        "one token paid for {walks} signature walks: {answer:?}"
+    );
+    assert!(
+        matches!(answer, ChanAnswer::Nack(NackReason::Congestion)),
+        "{answer:?}"
+    );
+    assert_eq!(alice.inner.chan.stats.shed.get(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
