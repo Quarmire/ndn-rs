@@ -1809,6 +1809,126 @@ async fn a_reliable_burst_is_cut_by_a_checkpoint_every_so_many_octets_not_only_e
     );
 }
 
+/// Whatever asks for a checkpoint (the octets of a burst, the period's timer), a sender writes
+/// at most two in any one period (docs/specs/channel.md §15.3, §15.9: the receiver's own bucket
+/// verifies two a period). A burst that goes on for 400 ms at a 20 ms period, 640 KiB a
+/// millisecond, with the period's timer firing every third: the checkpoints it wrote are never
+/// closer than half a period, so no window of one period holds three.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sustained_burst_never_has_three_checkpoints_in_one_period() {
+    let ck = ck(ChannelMode::Reliable, latest(), LinkConfig::default()).await;
+    ck.pause_tick();
+    tokio::time::pause();
+    let tx = ck
+        .bob()
+        .inner
+        .chan
+        .tx
+        .get(&space(), ChannelMode::Reliable)
+        .expect("bob's channel");
+    let period = tx.checkpoint_period().expect("bob checkpoints").as_millis() as u64;
+    assert_eq!(period, 20);
+    ck.advance(25).await;
+    ck.advance(15).await;
+    ck.link.take_stream();
+    ck.link.take_datagrams();
+    let message = vec![7u8; 64 << 10];
+    let mut written: Vec<u64> = Vec::new();
+    for ms in 0..400u64 {
+        for _ in 0..10 {
+            ck.emit(0, &message).await;
+            for frame in ck.link.take_stream() {
+                if is_checkpoint(&frame) {
+                    written.push(ms);
+                }
+            }
+        }
+        if ms % 3 == 0 {
+            // The period's timer fires.
+            tx.checkpoint_due(Instant::now());
+            settle().await;
+            for frame in ck.link.take_stream() {
+                if is_checkpoint(&frame) {
+                    written.push(ms);
+                }
+            }
+        }
+        ck.advance(1).await;
+    }
+    assert!(
+        written.len() >= 30,
+        "400 ms of a burst is checkpointed about every half period: {written:?}"
+    );
+    for w in written.windows(3) {
+        assert!(
+            w[2] - w[0] >= period,
+            "three checkpoints written within one period ({period} ms): {w:?} of {written:?}"
+        );
+    }
+}
+
+/// A checkpoint waits in the stream's FIFO at most one at a time: the octets that come while one
+/// waits are behind it, and it does not list them; the next is queued once it is written, and
+/// the octets are still owed then (a checkpoint that was not queued did not reset them).
+#[tokio::test(flavor = "current_thread")]
+async fn two_checkpoints_are_never_queued_at_once_and_the_octets_owed_are_kept() {
+    use super::tx::CHECKPOINT_OCTETS;
+    let ck = ck(ChannelMode::Reliable, latest(), LinkConfig::default()).await;
+    ck.pause_tick();
+    let tx = ck
+        .bob()
+        .inner
+        .chan
+        .tx
+        .get(&space(), ChannelMode::Reliable)
+        .expect("bob's channel");
+    let bob = ck.bob().space(&space()).expect("bob holds the space");
+    let message = Bytes::from(vec![7u8; 64 << 10]);
+    let emit = |bytes: Bytes| {
+        bob.emit(&path(0), bytes, EmitOptions::reliable())
+            .now_or_never()
+            .expect("a Reliable emission with room does not wait")
+            .expect("bob emits")
+    };
+    // The real clock, and nothing yields: the stream's task does not run between these, so
+    // what is queued stays queued. Half a period is 10 ms; wait a clear 25 for each case.
+    std::thread::sleep(Duration::from_millis(25));
+    // The period's timer fires: one checkpoint waits.
+    tx.checkpoint_due(Instant::now());
+    assert_eq!(tx.checkpoints_queued(), 1, "the timer queued a checkpoint");
+    std::thread::sleep(Duration::from_millis(25));
+    // A bound's worth of octets behind it, half a period later: the bound is met and the time
+    // is right, but one waits already, and a second would list nothing the first does not.
+    for _ in 0..CHECKPOINT_OCTETS / message.len() {
+        emit(message.clone());
+    }
+    assert_eq!(
+        tx.checkpoints_queued(),
+        1,
+        "a second checkpoint was queued behind the one that waits"
+    );
+    // The stream's task runs: the checkpoint is written, then the messages behind it.
+    settle().await;
+    let first = ck.link.take_stream();
+    assert_eq!(
+        first.iter().filter(|f| is_checkpoint(f)).count(),
+        1,
+        "the one checkpoint that waited is the only one written"
+    );
+    assert_eq!(tx.checkpoints_queued(), 0);
+    // One more small message, half a period on: the octets behind the first checkpoint are
+    // still owed (the one that was not queued reset nothing), so the next is queued now.
+    std::thread::sleep(Duration::from_millis(25));
+    emit(Bytes::from_static(b"one more"));
+    settle().await;
+    let second = ck.link.take_stream();
+    assert_eq!(
+        second.iter().filter(|f| is_checkpoint(f)).count(),
+        1,
+        "the octets owed were forgotten: no checkpoint behind them"
+    );
+}
+
 /// A channel that sends nothing says it is alive every 5 s, with an empty checkpoint, and no more.
 #[tokio::test(flavor = "current_thread")]
 async fn an_idle_channel_sends_one_empty_checkpoint_every_five_seconds() {

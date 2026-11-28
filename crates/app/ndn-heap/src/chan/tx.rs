@@ -69,11 +69,19 @@ pub(crate) const BURST_GAP: Duration = Duration::from_micros(50);
 pub(crate) const QUEUE_BYTES: usize = 1 << 20;
 
 /// Payload octets of a `Reliable` or `Window` channel's messages a sender takes after the last
-/// checkpoint before it queues the next behind them, without waiting for the period (and at
-/// most two a period, the receiver's own bucket): 512 KiB. A receiver whose silence clock runs
-/// holds the frames accepted since its last verified checkpoint, twice charged (kept for the
-/// checkpoint, and held), within its channel's 2 MiB; this keeps what a late checkpoint finds
-/// there inside that, so lateness delays frames and loses none.
+/// checkpoint before it queues the next behind them, without waiting for the period: 512 KiB.
+/// Whatever the trigger, a sender queues no checkpoint within half a period of the last nor while
+/// one waits (`TxChannel::push_checkpoint`), so at most two a period: the receiver's own bucket.
+///
+/// A receiver whose silence clock runs holds the frames accepted since its last verified
+/// checkpoint, twice charged (kept for the checkpoint, and held), within its channel's 2 MiB: 1 MiB
+/// of frames. A late checkpoint finds only about the trigger's octets held **while the sender
+/// emits less than a trigger's worth in the half period the spacing keeps between two
+/// checkpoints** (the octets past the trigger wait for the half period to pass). A faster burst,
+/// more than about 1 MiB in half a period (at the longest period of 2 s: 1 MiB a second), has
+/// more frames held than the channel keeps: the receiver forgets the oldest (`unchecked`, and
+/// for a lane's held frames `held_dropped` and `Lagged`; never delivered unverified, never
+/// a mismatch) until a checkpoint lists the rest.
 pub(crate) const CHECKPOINT_OCTETS: usize = 512 << 10;
 
 /// The largest datagram frame a session names (`S_FRAME_MAX`): what the default `path_mtu_max` of
@@ -255,11 +263,35 @@ struct Ckpt {
     /// The period timer is running: it was armed by the first frame sent since the last
     /// checkpoint and fires one period after it.
     armed: bool,
-    /// When a checkpoint was last queued, or the channel was made.
+    /// When a checkpoint was last queued or written (the later), or the channel was made: the
+    /// next is not queued within half a period of it ([`TxChannel::push_checkpoint`]).
     last: Option<Instant>,
     /// Octets of `Reliable` or `Window` messages queued since a checkpoint was last queued
     /// ([`CHECKPOINT_OCTETS`]).
     octets: usize,
+}
+
+/// What asks for a checkpoint ([`TxChannel::push_checkpoint`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Why {
+    /// The period's timer.
+    Period,
+    /// [`CHECKPOINT_OCTETS`] of a burst.
+    Octets,
+    /// An idle channel's liveness checkpoint.
+    Idle,
+    /// The channel ended: its `END` needs a checkpoint after it.
+    End,
+}
+
+/// Why a checkpoint was not queued.
+enum NotQueued {
+    /// This channel sends none (no signer), or its sequences are nearly out.
+    Never,
+    /// One waits in the FIFO already.
+    Waiting,
+    /// The last was queued or written less than half a period ago: this much is left of it.
+    Soon(Duration),
 }
 
 /// What an emission asks the caller to do once the lock is released.
@@ -741,7 +773,7 @@ impl TxChannel {
         st.control(&Control::End);
         // A checkpoint after the `END`: it lists the frames before it and the `END` itself, so a
         // receiver that holds the `END` until a checkpoint lists it can end the session.
-        self.push_checkpoint(st);
+        let _ = self.push_checkpoint(st, Instant::now(), Why::End);
         if !st.stream_writing {
             st.stream_writing = true;
             st.end_kick = true;
@@ -756,43 +788,64 @@ impl TxChannel {
         self.checkpointing.as_ref().map(|c| c.period)
     }
 
+    /// How many checkpoints wait in the stream's FIFO.
+    #[cfg(test)]
+    pub(crate) fn checkpoints_queued(&self) -> u32 {
+        self.state.lock().ckpt.queued
+    }
+
     /// Reserve a sequence for a checkpoint and queue it on the stream's FIFO, in the order of the
-    /// sequences. What it lists is decided when it is written, not now. Returns whether it was
-    /// queued (the channel must have a signer and room in its sequences).
-    fn push_checkpoint(&self, st: &mut State) -> bool {
-        if self.checkpointing.is_none() || st.next_seq + SEQ_HEADROOM >= SEQ_END {
-            return false;
+    /// sequences. What it lists is decided when it is written, not now. **Every checkpoint goes
+    /// through here**, and this is what bounds a sender to two a period (the receiver verifies
+    /// that many: [`Bucket::for_period`](super::verify::Bucket::for_period)): outside an `END`,
+    /// none is queued while one waits, nor within half a period of the last queued or written, so
+    /// two are never closer than half a period, whichever of the period's timer, the octets of a
+    /// burst and an idle channel's liveness asked for it. An `END` always gets its own, after it
+    /// (a checkpoint that waits before the `END` does not list it), once. `octets` is reset only
+    /// here, when one is queued: octets that were not covered stay owed.
+    fn push_checkpoint(&self, st: &mut State, now: Instant, why: Why) -> Result<(), NotQueued> {
+        let Some(cp) = &self.checkpointing else {
+            return Err(NotQueued::Never);
+        };
+        if st.next_seq + SEQ_HEADROOM >= SEQ_END {
+            return Err(NotQueued::Never);
+        }
+        if why != Why::End {
+            if st.ckpt.queued > 0 {
+                return Err(NotQueued::Waiting);
+            }
+            let gap = cp.period / 2;
+            if let Some(at) = st.ckpt.last {
+                let since = now.saturating_duration_since(at);
+                if since < gap {
+                    return Err(NotQueued::Soon(gap - since));
+                }
+            }
         }
         let seq = st.take_seq();
         st.fifo.push(Item::Checkpoint { seq });
         st.ckpt.queued += 1;
         st.ckpt.octets = 0;
-        true
+        st.ckpt.last = Some(now);
+        Ok(())
     }
 
     /// `octets` of a `Reliable` or `Window` message were queued on the stream's FIFO: once
     /// [`CHECKPOINT_OCTETS`] have been since the last checkpoint was queued, queue the next
     /// behind them, whatever the period's timer has done (a timer that cannot run while the
-    /// runtime is busy would otherwise leave the whole burst unchecked). Not within half a
-    /// period of the last: a receiver verifies two a period.
+    /// runtime is busy would otherwise leave the whole burst unchecked). When
+    /// [`Self::push_checkpoint`] refuses (too soon after the last, or one waits) the octets stay
+    /// owed and the next message asks again; the period's timer, which runs again for what is
+    /// left of the half period, is the backstop for a burst that stops.
     fn checkpoint_for_octets(&self, st: &mut State, octets: usize, now: Instant) {
-        let Some(cp) = &self.checkpointing else {
+        if self.checkpointing.is_none() {
             return;
-        };
+        }
         st.ckpt.octets = st.ckpt.octets.saturating_add(octets);
         if st.ckpt.octets < CHECKPOINT_OCTETS {
             return;
         }
-        if st
-            .ckpt
-            .last
-            .is_some_and(|at| now.saturating_duration_since(at) < cp.period / 2)
-        {
-            return;
-        }
-        if self.push_checkpoint(st) {
-            st.ckpt.last = Some(now);
-        }
+        let _ = self.push_checkpoint(st, now, Why::Octets);
     }
 
     /// One past the highest sequence a checkpoint written now may vouch for: below the first
@@ -829,24 +882,40 @@ impl TxChannel {
         if st.ckpt.armed || st.ckpt.queued > 0 || st.ended {
             return;
         }
+        self.arm_timer(st, cp.period);
+    }
+
+    /// Run the period timer once `after` has passed (under the lock).
+    fn arm_timer(self: &Arc<Self>, st: &mut State, after: Duration) {
         st.ckpt.armed = true;
-        let (me, period) = (Arc::clone(self), cp.period);
+        let me = Arc::clone(self);
         self.tasks.spawn(async move {
-            sleep(period).await;
+            sleep(after).await;
             me.checkpoint_due(Instant::now());
         });
     }
 
-    /// The period of a checkpoint is over: queue it if frames were sent and none waits to be
-    /// written (one that waits lists everything sent by the time it is written).
+    /// The period of a checkpoint is over: queue it if frames were sent. [`Self::push_checkpoint`]
+    /// decides whether it may be queued now: none waits (one that waits lists everything sent by
+    /// the time it is written), and half a period has passed since the last was queued or written
+    /// (an octet checkpoint may have gone just before the timer fired); when only the time is
+    /// short the timer runs again for what is left of it, so the frames sent are not left
+    /// unchecked.
     pub(crate) fn checkpoint_due(self: &Arc<Self>, now: Instant) {
         let spawn = {
             let mut st = self.state.lock();
             st.ckpt.armed = false;
-            if st.ended || st.ckpt.queued > 0 || !st.sent.has_frames() {
+            if st.ended || !st.sent.has_frames() {
                 false
             } else {
-                self.queue_checkpoint(&mut st, now)
+                match self.queue_checkpoint(&mut st, now, Why::Period) {
+                    Ok(spawn) => spawn,
+                    Err(NotQueued::Soon(wait)) => {
+                        self.arm_timer(&mut st, wait);
+                        false
+                    }
+                    Err(NotQueued::Waiting | NotQueued::Never) => false,
+                }
             }
         };
         if spawn {
@@ -874,10 +943,11 @@ impl TxChannel {
                 .ckpt
                 .last
                 .is_none_or(|at| now.saturating_duration_since(at) >= Self::IDLE_CHECKPOINT);
-            if st.ended || st.ckpt.queued > 0 || st.ckpt.armed || !idle {
+            if st.ended || st.ckpt.armed || !idle {
                 false
             } else {
-                self.queue_checkpoint(&mut st, now)
+                self.queue_checkpoint(&mut st, now, Why::Idle)
+                    .unwrap_or(false)
             }
         };
         if spawn {
@@ -885,18 +955,15 @@ impl TxChannel {
         }
     }
 
-    /// Queue a checkpoint at `now`; true when the stream's writer must be spawned.
-    fn queue_checkpoint(&self, st: &mut State, now: Instant) -> bool {
-        if !self.push_checkpoint(st) {
-            return false;
-        }
-        st.ckpt.last = Some(now);
-        if st.stream_writing {
+    /// Queue a checkpoint at `now` for `why`; true when the stream's writer must be spawned.
+    fn queue_checkpoint(&self, st: &mut State, now: Instant, why: Why) -> Result<bool, NotQueued> {
+        self.push_checkpoint(st, now, why)?;
+        Ok(if st.stream_writing {
             false
         } else {
             st.stream_writing = true;
             true
-        }
+        })
     }
 
     /// The checkpoint at the head of the FIFO is written now: the range it covers and the frames
@@ -1820,6 +1887,10 @@ impl TxChannel {
                 st.ckpt.queued = st.ckpt.queued.saturating_sub(1);
                 if sent.is_some() {
                     st.ckpt.hi = st.ckpt.hi.max(hi);
+                    // The receiver sees it now, which is later than it was queued when the
+                    // stream was busy: the half period is counted from the later.
+                    let written = Instant::now();
+                    st.ckpt.last = Some(st.ckpt.last.map_or(written, |at| at.max(written)));
                     self.stats.checkpoints.bump();
                     if empty {
                         self.stats.empty_checkpoints.bump();

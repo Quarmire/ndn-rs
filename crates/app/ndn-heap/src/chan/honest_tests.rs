@@ -29,6 +29,28 @@ use super::wire::ChannelMode;
 use crate::node::tests::space;
 use crate::rt::Instant;
 
+/// The checkpoint period of these cases.
+const PERIOD: Duration = Duration::from_secs(2);
+
+/// The sender's clock as the period's timer reads it. A sender queues no checkpoint within half a
+/// period of the last (`TxChannel::push_checkpoint`), and its real timer fires a period after the
+/// frame that armed it: a case that makes the period end now reads the clock a period on from
+/// the last time it did (a clock that only moves forward), as the timer would have.
+struct Period(parking_lot::Mutex<Instant>);
+
+impl Period {
+    fn new() -> Period {
+        Period(parking_lot::Mutex::new(Instant::now()))
+    }
+
+    /// The period of a checkpoint ends: the timer fires at `tx`.
+    fn ends(&self, tx: &Arc<super::tx::TxChannel>) {
+        let mut at = self.0.lock();
+        *at += PERIOD;
+        tx.checkpoint_due(*at);
+    }
+}
+
 /// A frame whose message a newer emission of its name replaced while the frame was on its way
 /// out, with a checkpoint written meanwhile: the checkpoint's range must not cover the frame
 /// (it is not recorded yet), so the receiver, which gets the frame and then the checkpoint, has
@@ -58,6 +80,7 @@ async fn a_frame_in_flight_whose_message_was_replaced_is_not_contradicted_by_a_c
     ck.link.take_stream();
 
     let bob = ck.bob().space(&space()).expect("bob holds the space");
+    let clock = Period::new();
     let link = Arc::clone(&ck.link);
     let fired = Arc::new(AtomicBool::new(false));
     let before = link.stats().checkpoint_frames;
@@ -77,7 +100,7 @@ async fn a_frame_in_flight_whose_message_was_replaced_is_not_contradicted_by_a_c
             .expect("a Latest emission never waits")
             .expect("bob emits");
             // ...and the period of a checkpoint ends: the stream's task writes it, now.
-            tx.checkpoint_due(Instant::now());
+            clock.ends(&tx);
             let started = std::time::Instant::now();
             while link.stats().checkpoint_frames == before {
                 assert!(
@@ -193,6 +216,7 @@ async fn run(seed: u64, cfg: LinkConfig, opts: super::verbs::GetOptions, rounds:
     let mut delayed: Option<Bytes> = None;
     let mut told = Vec::new();
     let mut sent = 0u64;
+    let period = Arc::new(Period::new());
     let accused = |ck: &mut super::checkpoint_flow_tests::Ck, told: &mut Vec<_>, at: &str| {
         told.extend(ck.events());
         let s = ck.stats();
@@ -229,11 +253,12 @@ async fn run(seed: u64, cfg: LinkConfig, opts: super::verbs::GetOptions, rounds:
         let names: Vec<u8> = (0..1 + rng.below(4)).map(|_| rng.below(5) as u8).collect();
         let fired = Arc::new(AtomicBool::new(false));
         ck.link.on_datagram(Some(Arc::new({
-            let (bob, tx, link, fired) = (
+            let (bob, tx, link, fired, period) = (
                 bob.clone(),
                 Arc::clone(&tx),
                 Arc::clone(&ck.link),
                 Arc::clone(&fired),
+                Arc::clone(&period),
             );
             move |_frame: &Bytes| {
                 if fired.swap(true, Ordering::SeqCst) {
@@ -251,7 +276,7 @@ async fn run(seed: u64, cfg: LinkConfig, opts: super::verbs::GetOptions, rounds:
                     }
                 }
                 if matches!(hook, Hook::Checkpoint | Hook::Both) {
-                    tx.checkpoint_due(Instant::now());
+                    period.ends(&tx);
                     // The stream's task writes it on another thread; give it the chance to do
                     // so while the frame is in flight. What follows holds whether it did or not.
                     let started = std::time::Instant::now();
@@ -279,7 +304,7 @@ async fn run(seed: u64, cfg: LinkConfig, opts: super::verbs::GetOptions, rounds:
                 tokio::task::yield_now().await;
             }
             if rng.chance(10) {
-                tx.checkpoint_due(Instant::now());
+                period.ends(&tx);
             }
         }
         ck.link.on_datagram(None);
@@ -336,7 +361,7 @@ async fn run(seed: u64, cfg: LinkConfig, opts: super::verbs::GetOptions, rounds:
     }
     // Everything that is left reaches the receiver, and a last checkpoint covers it.
     ck.link.set_full(false);
-    tx.checkpoint_due(Instant::now());
+    period.ends(&tx);
     settle().await;
     backlog.extend(ck.link.take_datagrams());
     let stream = ck.link.take_stream();
