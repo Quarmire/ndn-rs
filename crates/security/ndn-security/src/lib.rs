@@ -108,8 +108,8 @@ pub use validator::{
 };
 pub use verifier::{
     Blake3DigestVerifier, Blake3KeyedVerifier, Ed25519PublicKey, Ed25519Verifier, Verifier,
-    VerifyOutcome,
-    ed25519_verify_batch, verify_by_sig_type, verify_digest, verify_public_key_signature,
+    VerifyOutcome, ed25519_verify_batch, verify_by_sig_type, verify_digest,
+    verify_public_key_signature,
 };
 #[cfg(feature = "yubikey-piv")]
 pub use yubikey::{
