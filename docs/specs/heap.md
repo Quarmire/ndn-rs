@@ -2832,6 +2832,10 @@ anyone's current value. `Kind::Answered`, `GetNotice::QueryFailed` and
 `GetNotice::AnswersDone` carry what a query yields through `get`; the API, the names
 (`<D>/32=query/<digest>`, the keyless `<D>/32=seal`), the TLV block 0x06C0–0x06FF, sealing in a
 sealed space, the server's judging and the verification of an answer's proof are in [query.md](query.md).
+A query takes one of two paths, chosen per server by `Ask::via` (`QueryPath::{Auto, Signed, Channel}`):
+the signed path above, or the **channel path** (query.md §15), in which one signed ask makes an `Ask`
+channel session ([channel.md](channel.md) §3.7) and each query after it is a sealed `QUERY` frame up and a
+sealed `ANSWER` frame down, with no signature and no TLV of this layer; `Answered::via` says which (`Signed` or `Sealed`).
 
 A `Heap` is a cheap handle, `Clone`, on one space of one node. `Item.by` is the
 person of the writer (the namespace of the held context that governs its device's name, §9.1),
