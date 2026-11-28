@@ -578,6 +578,18 @@ impl Face {
         self.transport.side_room_for(frame, class)
     }
 
+    /// Whether the transport hands over its channel stream's frames apart from the rest of
+    /// what it receives (see [`Transport::side_stream_lane`]).
+    pub fn side_stream_lane(&self) -> bool {
+        self.transport.side_stream_lane()
+    }
+
+    /// The next frame of the channel stream (see [`Transport::recv_side_stream`]). Side frames
+    /// bypass the link service: they carry no LP header and are never fragmented.
+    pub async fn recv_side_stream(&self) -> Result<Bytes, FaceError> {
+        self.transport.recv_side_stream().await
+    }
+
     /// Send tagged with its originating face id. Passthrough routes the tag
     /// through the in-process tag-bag; LpLinkService drops it for now.
     pub async fn send_bytes_with_source(

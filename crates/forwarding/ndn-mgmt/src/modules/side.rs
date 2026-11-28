@@ -69,6 +69,12 @@ fn side_list(engine: &ForwarderEngine) -> ControlResponse {
     );
     let _ = writeln!(
         text,
+        "stream_held={} (stream frames a link's stream lane waited for room for: not drops) \
+         stream_stalled={} (waited the bound, then routed: a full sink lost them)",
+        s.stream_held, s.stream_stalled
+    );
+    let _ = writeln!(
+        text,
         "up: keeps={} keeps_forwarded={} unsubs={} sinks_lapsed={}",
         s.keeps, s.keeps_forwarded, s.unsubs, s.sinks_lapsed
     );

@@ -45,12 +45,16 @@ pub struct Log {
     /// The datagram limit the face reports and enforces, as a link does (a datagram frame over
     /// it is refused `TooLarge`, never cut); 0: the default 10,000, enforced by nothing.
     pub side_max: std::sync::atomic::AtomicUsize,
+    /// The face reads its channel stream apart, through `recv_side_stream` (a QUIC link's way):
+    /// set by [`lane_face`].
+    pub lane: AtomicBool,
 }
 
 /// The test's end of a face.
 pub struct Handle {
     pub id: FaceId,
     tx: mpsc::UnboundedSender<Bytes>,
+    lane_tx: mpsc::UnboundedSender<Bytes>,
     pub log: Arc<Log>,
 }
 
@@ -58,6 +62,11 @@ impl Handle {
     /// Deliver `wire` to the engine as if it arrived on the face.
     pub fn inject(&self, wire: Bytes) {
         self.tx.send(wire).expect("face reader is gone");
+    }
+
+    /// Deliver `frame` to the engine on the face's channel stream (a [`lane_face`]).
+    pub fn inject_stream(&self, frame: Bytes) {
+        self.lane_tx.send(frame).expect("the stream lane is gone");
     }
 
     /// Close the face's receive side: the engine's reader sees `Closed`.
@@ -117,6 +126,7 @@ pub struct TestFace {
     kind: FaceKind,
     program: bool,
     inbox: AsyncMutex<mpsc::UnboundedReceiver<Bytes>>,
+    lane: AsyncMutex<mpsc::UnboundedReceiver<Bytes>>,
     log: Arc<Log>,
     /// Where `send_bytes` and `forward_side*` deliver: the far end's inbox.
     peer: Mutex<Option<mpsc::UnboundedSender<Bytes>>>,
@@ -124,6 +134,7 @@ pub struct TestFace {
 
 fn make(id: FaceId, kind: FaceKind, program: bool) -> (TestFace, Handle) {
     let (tx, rx) = mpsc::unbounded_channel();
+    let (lane_tx, lane_rx) = mpsc::unbounded_channel();
     let log = Arc::new(Log::default());
     (
         TestFace {
@@ -131,11 +142,25 @@ fn make(id: FaceId, kind: FaceKind, program: bool) -> (TestFace, Handle) {
             kind,
             program,
             inbox: AsyncMutex::new(rx),
+            lane: AsyncMutex::new(lane_rx),
             log: Arc::clone(&log),
             peer: Mutex::new(None),
         },
-        Handle { id, tx, log },
+        Handle {
+            id,
+            tx,
+            lane_tx,
+            log,
+        },
     )
+}
+
+/// A program face of `kind` that reads its channel stream apart from everything else
+/// ([`Handle::inject_stream`]), as a QUIC link does.
+pub fn lane_face(id: u64, kind: FaceKind) -> (TestFace, Handle) {
+    let (face, handle) = make(FaceId(id), kind, true);
+    handle.log.lane.store(true, Ordering::Relaxed);
+    (face, handle)
 }
 
 /// A face of `kind` that is a program face (its Data is not validated).
@@ -252,6 +277,12 @@ impl Transport for TestFace {
             .recv()
             .await
             .ok_or(FaceError::Closed)
+    }
+    fn side_stream_lane(&self) -> bool {
+        self.log.lane.load(Ordering::Relaxed)
+    }
+    async fn recv_side_stream(&self) -> Result<Bytes, FaceError> {
+        self.lane.lock().await.recv().await.ok_or(FaceError::Closed)
     }
 }
 

@@ -12,13 +12,13 @@ use ndn_engine::{EngineBuilder, EngineConfig, ForwarderEngine, ShutdownHandle};
 use ndn_packet::encode::{DataBuilder, InterestBuilder};
 use ndn_packet::lp::{LpHeaders, LpPacket, SideRoute, encode_lp_with_headers, is_lp_packet};
 use ndn_packet::{CachePolicyType, Data, Name};
-use ndn_transport::side_header::UpOp;
-use ndn_transport::{FaceId, FaceKind};
+use ndn_transport::side_header::{SideKind, UpOp};
+use ndn_transport::{FaceId, FaceKind, SideClass};
 use tokio_util::sync::CancellationToken;
 
 use crate::side_support::{
-    Handle, TestFace, Warp, WarpRuntime, data_frame, datagram_only_face, face, no_side_face, pair,
-    up,
+    Handle, TestFace, Warp, WarpRuntime, data_frame, datagram_only_face, face, frame, lane_face,
+    no_side_face, pair, up,
 };
 
 const ID: u64 = 0x5E55_10C0_FFEE;
@@ -907,4 +907,69 @@ async fn a_frame_a_local_sender_hands_over_is_refused_to_it_while_no_sink_has_ro
     assert_eq!((stats.wrong_source, stats.held_back), (1, 50), "{stats:?}");
     // A route with no live sink has nothing to wait for.
     assert!(e.side_room(&data_frame(ID + 1, 1_200)));
+}
+
+/// A **stream** frame that arrives on a face's channel stream lane while a sink has no room waits
+/// there for room, in hand, and is routed in order when there is some: nothing is counted
+/// `sink_full` for it (`stream_held` says it waited). The face's other traffic is not held by it:
+/// an NDN packet of the same face is forwarded meanwhile, and a **datagram** frame is still
+/// dropped visibly for the sink that has no room, as designed.
+#[tokio::test]
+async fn a_stream_frame_waits_on_the_lane_for_room_while_the_faces_other_traffic_flows() {
+    let (s, hs) = lane_face(1, FaceKind::App);
+    let (r, hr) = face(2, FaceKind::App);
+    let (e, _sd) = engine(vec![s, r], 1).await;
+    session(&hr, &hs, labelled_data(ID, 30)).await;
+    eventually("the sink is installed", || sinks_of(&e, ID).len() == 1).await;
+    e.fib()
+        .add_nexthop(&"/other".parse().unwrap(), FaceId(2), 1);
+
+    hr.log.full.store(true, Ordering::Relaxed);
+    let numbered = |i: u8| {
+        let mut v = frame(SideClass::Stream, SideKind::Data, ID, 64).to_vec();
+        *v.last_mut().unwrap() = i;
+        Bytes::from(v)
+    };
+    for i in 0..5 {
+        hs.inject_stream(numbered(i));
+    }
+    eventually("the first stream frame is held", || {
+        e.side().stats().stream_held == 1
+    })
+    .await;
+
+    // The lane takes no more while it holds one: nothing was routed, nothing lost.
+    let held = e.side().stats();
+    assert_eq!(
+        (held.frames_in, held.sink_full, held.stream_stalled),
+        (0, 0, 0),
+        "{held:?}"
+    );
+
+    // The same face's NDN packets and datagram frames are read meanwhile: an Interest it sends
+    // is forwarded, and a datagram frame, which may be lost, is lost visibly at the full sink.
+    let before = hr.sent().len();
+    hs.inject(
+        InterestBuilder::new("/other/x".parse::<Name>().unwrap())
+            .lifetime(Duration::from_secs(4))
+            .build(),
+    );
+    hr.wait_sent(before + 1).await;
+    hs.inject(data_frame(ID, 64));
+    eventually("the datagram frame met the full sink", || {
+        e.side().stats().sink_full == 1
+    })
+    .await;
+
+    // Room: the five stream frames go, in order, and none was counted lost.
+    hr.log.full.store(false, Ordering::Relaxed);
+    let got = hr.wait_side(5).await;
+    let order: Vec<u8> = got.iter().map(|r| *r.frame.last().unwrap()).collect();
+    assert_eq!(order, [0, 1, 2, 3, 4]);
+    let stats = e.side().stats();
+    assert_eq!(
+        (stats.sink_full, stats.stream_held, stats.stream_stalled),
+        (1, 1, 0),
+        "only the datagram was lost: {stats:?}"
+    );
 }

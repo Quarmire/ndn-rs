@@ -33,7 +33,15 @@
 //! - **Never blocks.** A sink is handed the frame with
 //!   [`Face::forward_side_from`](ndn_transport::Face::forward_side_from), which
 //!   must not wait. A sink that cannot take it costs that sink the frame and is
-//!   counted `sink_full`: relays are lossy under congestion, visibly.
+//!   counted `sink_full`: relays are lossy under congestion, visibly. **A stream frame is the
+//!   exception, at a face that reads its channel stream apart** ([`Face::side_stream_lane`]
+//!   (ndn_transport::Face::side_stream_lane): a QUIC link): that face's stream lane waits, with
+//!   the frame in hand, until every live sink has room for it ([`SideTable::stream_room`])
+//!   before it calls `on_frame`, and the face stops taking the stream's octets meanwhile, so
+//!   the peer's flow control and first-hop hold-back slow its sender. The rule is **per link
+//!   stream** (head-of-line: the frames of one stream stay in order, so a sink without room
+//!   holds back every route of that stream), bounded by [`STREAM_HOLD_MAX`]; the NDN packets and
+//!   datagram frames of the face are read by another task and never wait for it.
 //! - `UP` `Keep` refreshes that sink's expiry (its TTL after the Keep) and forwards one Keep to
 //!   the route's source while the sink is within its burst
 //!   ([`keep_forward_burst`](SideLimits::keep_forward_burst): a sink's first Keeps go at once,
@@ -431,6 +439,13 @@ pub struct SideStats {
     /// for, because no live sink had room: not lost, the sender keeps them and offers them
     /// again, so not in `sink_full`.
     pub held_back: u64,
+    /// Stream frames the link's stream lane had to wait for room for before routing them
+    /// ([`SideTable::stream_room`]): not lost, the face stopped taking the stream meanwhile, so
+    /// not in `sink_full`.
+    pub stream_held: u64,
+    /// Stream frames routed after waiting [`STREAM_HOLD_MAX`] for room: a sink that stays full
+    /// that long loses the frame (counted `sink_full` as well), as a dead sink would.
+    pub stream_stalled: u64,
     /// A sink refused for another reason (too large for it, closed, I/O).
     pub sink_error: u64,
     /// `UP` records accepted from a sink, and `Keep`s passed on, `Unsub`s.
@@ -480,6 +495,8 @@ struct Counters {
     quarantined: AtomicU64,
     sink_full: AtomicU64,
     held_back: AtomicU64,
+    stream_held: AtomicU64,
+    stream_stalled: AtomicU64,
     sink_error: AtomicU64,
     keeps: AtomicU64,
     keeps_forwarded: AtomicU64,
@@ -500,6 +517,15 @@ struct Counters {
 fn bump(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
+
+/// The longest a face's stream lane holds one stream frame for room at a sink
+/// ([`SideTable::stream_room`]) before routing it anyway: a sink that stays full this long is
+/// dead for the stream, and its loss of the frame is counted (`stream_stalled`, `sink_full`).
+/// The same bound as the link's own `STREAM_STALL` (30 s, ndn-link.md §9): a peer whose writes
+/// make no progress that long has its link closed, so this ends the wait of a frame in hand when
+/// the peer is not one that closes. A resource bound on one frame in hand, never a judgement
+/// on data.
+pub const STREAM_HOLD_MAX: Duration = Duration::from_secs(30);
 
 /// The first bar of a face, doubling per repeat.
 const BAR_BASE: Duration = Duration::from_secs(60);
@@ -1194,6 +1220,50 @@ impl SideTable {
         self.has_room(&route, frame, header.class(), faces, self.now())
     }
 
+    /// Whether `frame`, a stream-class frame that arrived over `from`'s channel stream, may be
+    /// routed now without a live sink losing it: it is no frame of a route (an `UP`, a `QUERY`,
+    /// an `ANSWER`, one for no route, from a face that is not the route's source, from a barred
+    /// face), or **every** live sink of its route that is still a face has room for it
+    /// ([`Face::side_room_for`](ndn_transport::Face::side_room_for)). What a face's stream
+    /// lane waits for before `on_frame`, so that a stream frame is never dropped for want of
+    /// room (a gap in `Reliable` and `Window`). A hint, as every room is: a sink that had room
+    /// at the look and refuses all the same costs the frame, counted `sink_full`. Never blocks.
+    pub fn stream_room(&self, from: FaceId, frame: &Bytes, faces: &FaceTable) -> bool {
+        let Ok(header) = SideHeader::parse(frame) else {
+            return true;
+        };
+        if matches!(
+            header.kind(),
+            SideKind::Up | SideKind::Query | SideKind::Answer
+        ) {
+            return true;
+        }
+        let Some(route) = self.routes.get(&header.id()).map(|r| Arc::clone(&r)) else {
+            return true;
+        };
+        let now = self.now();
+        if route.source != from || self.is_quarantined(from, now) {
+            return true;
+        }
+        let class = header.class();
+        route.sinks.load().iter().all(|sink| {
+            sink.expires.load(Ordering::Relaxed) <= now
+                || faces
+                    .get(sink.face)
+                    .is_none_or(|face| face.side_room_for(frame, class))
+        })
+    }
+
+    /// A stream frame is about to wait for room ([`stream_room`](Self::stream_room)).
+    pub(crate) fn count_stream_held(&self) {
+        bump(&self.counters.stream_held);
+    }
+
+    /// A stream frame waited [`STREAM_HOLD_MAX`] and is routed with a sink still full.
+    pub(crate) fn count_stream_stalled(&self) {
+        bump(&self.counters.stream_stalled);
+    }
+
     fn has_room(
         &self,
         route: &Route,
@@ -1837,6 +1907,8 @@ impl SideTable {
             quarantined: get(&c.quarantined),
             sink_full: get(&c.sink_full),
             held_back: get(&c.held_back),
+            stream_held: get(&c.stream_held),
+            stream_stalled: get(&c.stream_stalled),
             sink_error: get(&c.sink_error),
             keeps: get(&c.keeps),
             keeps_forwarded: get(&c.keeps_forwarded),

@@ -237,6 +237,27 @@ pub trait Transport: Send + Sync + 'static {
         self.side_room(class)
     }
 
+    /// Whether this transport hands over the frames of its **ordered channel stream** through
+    /// [`recv_side_stream`](Transport::recv_side_stream) and not through
+    /// [`recv_bytes`](Transport::recv_bytes). A transport with a stream of its own for channel
+    /// frames (a QUIC link) says `true` and keeps those frames out of `recv_bytes`, so that the
+    /// forwarder can stop taking them while a sink has no room, without ever holding back the
+    /// NDN packets and datagram frames of the same face. The default is `false`: such a
+    /// transport's stream frames (if it has any) arrive through `recv_bytes`, in line with
+    /// everything else, and cannot be held back apart. Fixed for the life of the transport.
+    fn side_stream_lane(&self) -> bool {
+        false
+    }
+
+    /// The next frame of the channel stream, in order, for a transport whose
+    /// [`side_stream_lane`](Transport::side_stream_lane) is `true`; `Err(Closed)` once that
+    /// stream has ended (the face may still read everything else). A single consumer. Waiting
+    /// here is the back pressure: a transport that is not read from stops taking the stream's
+    /// octets, and the peer's writes wait on flow control. The default never completes.
+    fn recv_side_stream(&self) -> impl Future<Output = Result<Bytes, FaceError>> + Send {
+        std::future::pending()
+    }
+
     fn send_bytes(&self, wire: Bytes) -> impl Future<Output = Result<(), FaceError>> + Send;
 
     /// Send a burst of already-framed datagrams to the same peer in one shot.
@@ -346,6 +367,10 @@ pub trait ErasedTransport: Send + Sync + 'static {
     fn side_carries(&self, class: SideClass) -> bool;
     fn side_room(&self, class: SideClass) -> bool;
     fn side_room_for(&self, frame: &[u8], class: SideClass) -> bool;
+    fn side_stream_lane(&self) -> bool;
+    fn recv_side_stream(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Bytes, FaceError>> + Send + '_>>;
 
     fn send_bytes(
         &self,
@@ -442,6 +467,14 @@ impl<T: Transport> ErasedTransport for T {
     }
     fn side_room_for(&self, frame: &[u8], class: SideClass) -> bool {
         Transport::side_room_for(self, frame, class)
+    }
+    fn side_stream_lane(&self) -> bool {
+        Transport::side_stream_lane(self)
+    }
+    fn recv_side_stream(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Bytes, FaceError>> + Send + '_>> {
+        Box::pin(Transport::recv_side_stream(self))
     }
 
     fn send_bytes(

@@ -35,6 +35,93 @@ pub(crate) fn inbound_meta_from_face_addr(
 /// that still waits for Data keeps its sending end open while it waits.
 pub const APP_FACE_DRAIN: Duration = Duration::from_secs(1);
 
+/// Yields a stream lane makes, looking for room each time, before it sleeps between looks
+/// (the first hop's wait does the same: `ndn-app`'s `EngineConnection::send_side`).
+const LANE_YIELDS: u32 = 256;
+/// The first sleep between looks; it doubles after each [`LANE_BACKOFF_EVERY`] looks, to 16 times
+/// this.
+const LANE_RECHECK: Duration = Duration::from_millis(1);
+const LANE_BACKOFF_EVERY: u32 = 32;
+
+/// What a face's stream lane needs of the engine.
+struct SideLane {
+    face_id: ndn_transport::FaceId,
+    cancel: tokio_util::sync::CancellationToken,
+    face_table: Arc<ndn_transport::FaceTable>,
+    face_states: Arc<dashmap::DashMap<ndn_transport::FaceId, crate::FaceState>>,
+    runtime: Arc<dyn ndn_runtime::Runtime>,
+    side: Arc<crate::side::SideTable>,
+}
+
+/// Read the frames of a face's channel stream (`Face::recv_side_stream`) and route each as the
+/// face reader routes a side frame, **after waiting until every live sink of its route has room
+/// for it** ([`SideTable::stream_room`](crate::side::SideTable::stream_room)), for at most
+/// [`STREAM_HOLD_MAX`](crate::side::STREAM_HOLD_MAX). While it waits it takes nothing more from
+/// the stream: the transport stops reading the peer's octets and the peer's flow control, and
+/// the first-hop hold-back behind it, slow the sender. A stream cannot drop a frame without
+/// breaking its channel's order, so the loss of a stream frame at the forwarder is the
+/// exception (a sink that stayed full for the bound, counted), not the congestion response.
+/// Ends when the face's stream ends or the face's token fires; the face reader, which reads
+/// everything else, is not told.
+async fn run_side_stream_lane(face: Arc<ndn_transport::Face>, lane: SideLane) {
+    let SideLane {
+        face_id,
+        cancel,
+        face_table,
+        face_states,
+        runtime,
+        side,
+    } = lane;
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            r = face.recv_side_stream() => match r {
+                Ok(frame) => frame,
+                Err(_) => return,
+            },
+        };
+        if let Some(state) = face_states.get(&face_id) {
+            state
+                .counters
+                .in_side_frames
+                .fetch_add(1, Ordering::Relaxed);
+            state
+                .counters
+                .in_side_bytes
+                .fetch_add(frame.len() as u64, Ordering::Relaxed);
+        }
+        if !side.stream_room(face_id, &frame, &face_table) {
+            side.count_stream_held();
+            let (mut yields, mut sleeps, mut waited) = (0u32, 0u32, Duration::ZERO);
+            loop {
+                if yields < LANE_YIELDS {
+                    yields += 1;
+                    tokio::task::yield_now().await;
+                } else {
+                    let step = LANE_RECHECK * (1 << (sleeps / LANE_BACKOFF_EVERY).min(4));
+                    sleeps += 1;
+                    waited += step;
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return,
+                        () = runtime.sleep(step) => {}
+                    }
+                }
+                if side.stream_room(face_id, &frame, &face_table) {
+                    break;
+                }
+                if waited >= crate::side::STREAM_HOLD_MAX {
+                    side.count_stream_stalled();
+                    break;
+                }
+            }
+        }
+        let outcome = side.on_frame(face_id, frame, &face_table);
+        trace!(target: t::FACE_SYSTEM, face=%face_id, ?outcome, "stream lane: side frame");
+    }
+}
+
 pub(crate) async fn run_face_reader(
     face: Arc<ndn_transport::Face>,
     tx: mpsc::Sender<InboundPacket>,
@@ -54,6 +141,23 @@ pub(crate) async fn run_face_reader(
         face_lifecycle_sink,
         side,
     } = ctx;
+
+    // A face that reads its channel stream apart (a QUIC link) has that stream's frames read by
+    // a task of their own, which can wait for room at a sink without this reader ever waiting:
+    // the NDN packets and datagram frames of the face keep flowing (channel.md §14.4).
+    if face.side_stream_lane() {
+        runtime.spawn(Box::pin(run_side_stream_lane(
+            Arc::clone(&face),
+            SideLane {
+                face_id,
+                cancel: cancel.clone(),
+                face_table: Arc::clone(&face_table),
+                face_states: Arc::clone(&face_states),
+                runtime: Arc::clone(&runtime),
+                side: Arc::clone(&side),
+            },
+        )));
+    }
     let kind = face.kind();
     let persistency = face_states
         .get(&face_id)
