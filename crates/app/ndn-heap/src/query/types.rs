@@ -59,7 +59,7 @@ pub enum Via {
 ///   [`QueryError::NoSession`] with the setup's reason, and a node without a forwarder is
 ///   [`QueryError::NotReady`].
 ///
-/// [`ask_channel_in`]: crate::NodeHandle::ask_channel_in
+/// [`ask_channel_in`]: crate::host::NodeHandle::ask_channel_in
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum QueryPath {
     /// The channel for a server whose session this device holds, else signed. The default.

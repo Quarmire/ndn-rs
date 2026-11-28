@@ -250,7 +250,7 @@ impl RecipientKey {
     /// Open a content key [`wrap_ck_to_pair`] wrapped to this key's public half and the pair
     /// keys of the same agreement, given the sender's `ephemeral` public key, the same `aad` and
     /// the same `context`. One X25519 agreement gives both: the wrap key (label
-    /// [`X25519_KEK_LABEL`]) and the pair keys (the channel path's labels, which differ from it
+    /// `X25519_KEK_LABEL`) and the pair keys (the channel path's labels, which differ from it
     /// and from the signed query path's).
     pub fn unwrap_ck_pair(
         &self,

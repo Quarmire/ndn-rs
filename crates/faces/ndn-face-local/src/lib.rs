@@ -264,7 +264,7 @@ impl Transport for InProcFace {
     }
 
     /// [`side_room`](Self::side_room) for this frame: the inbox must hold the frame under its
-    /// byte bound too ([`SideGauge::fits`], the test `forward_side_from` makes), not merely be
+    /// byte bound too (`SideGauge::fits`, the test `forward_side_from` makes), not merely be
     /// under it. A mebibyte stream frame judged room at 7.9 of 8 MiB was refused `Full` by
     /// `forward_side_from` and lost at the first hop, which a sender's hold-back claims to
     /// prevent.
