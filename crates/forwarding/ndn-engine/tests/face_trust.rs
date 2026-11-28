@@ -17,6 +17,7 @@
 //! whether a second Interest for the same name is answered from the content
 //! store (the upstream is not asked again) or reaches the upstream again.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -82,6 +83,28 @@ async fn recv_timeout(h: &InProcHandle, ms: u64) -> Option<Bytes> {
         .await
         .ok()
         .flatten()
+}
+
+/// Await `fut`, at most 20 s: a rig is built from local sockets and channels, so a wait that long
+/// is a hang, and it ends the test with what was awaited and what it means instead of the whole
+/// run timing out unexplained.
+async fn bounded<T>(awaited: &str, means: &str, fut: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(20), fut)
+        .await
+        .unwrap_or_else(|_| panic!("timed out after 20 s awaiting {awaited}: {means}"))
+}
+
+/// A socket path of this rig alone. The tests of this suite run in one process, in parallel, so
+/// a path made from the process id is shared by every rig of its kind: one rig's `bind` removes
+/// another's socket file, one rig's `cleanup` removes it from under a rig that has yet to dial,
+/// and a dial reaches the wrong listener, whose own client then never arrives.
+fn unique_socket_path(tag: &str) -> std::path::PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "ndn-face-trust-{tag}-{}-{}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn payload_of(wire: &Bytes) -> Option<Bytes> {
@@ -180,12 +203,20 @@ async fn rig_loopback_tcp() -> Rig {
 /// the peer's credentials.
 async fn rig_unix_with_credentials() -> Rig {
     let (engine, shutdown, consumer, _) = build(false).await;
-    let path = std::env::temp_dir().join(format!("ndn-face-trust-{}.sock", std::process::id()));
+    let path = unique_socket_path("creds");
     let listener = IpcListener::bind(path.to_str().unwrap()).unwrap();
-    let (client, accepted) = tokio::join!(
-        ipc_face_connect(FaceId(0), path.to_str().unwrap()),
-        listener.accept_as(FaceId(UPSTREAM), FaceKind::App)
-    );
+    let (client, accepted) = bounded(
+        "the dial of the rig's Unix socket and the listener's accept of it",
+        "the dial reached no listener or a listener of another rig (a socket path shared by two \
+         rigs of this process), so the accept never saw its client",
+        async {
+            tokio::join!(
+                ipc_face_connect(FaceId(0), path.to_str().unwrap()),
+                listener.accept_as(FaceId(UPSTREAM), FaceKind::App)
+            )
+        },
+    )
+    .await;
     engine.add_face(accepted.unwrap(), CancellationToken::new());
     listener.cleanup();
     Rig {
@@ -346,10 +377,7 @@ async fn rig_unix_foreign_uid() -> Option<Rig> {
         return None;
     }
     let (engine, shutdown, consumer, _) = build(false).await;
-    let path = std::env::temp_dir().join(format!(
-        "ndn-face-trust-foreign-{}.sock",
-        std::process::id()
-    ));
+    let path = unique_socket_path("foreign");
     let listener = IpcListener::bind(path.to_str().unwrap())
         .unwrap()
         .with_program_peers(ProgramPeers::with_daemon_uid(me + 1, &[]));
@@ -557,6 +585,21 @@ async fn a_refusal_from_a_program_face_is_kept() {
     for rig in [rig_app().await, rig_unix_with_credentials().await] {
         let got = refusal_claimed_by_upstream(&rig).await;
         assert_eq!(refusal_of(&got), Some(Refusal::Revoked));
+        rig.shutdown.shutdown().await;
+    }
+}
+
+/// The tests of this suite run in one process, in parallel: rigs built at the same time must
+/// not meet. Sixteen Unix-socket rigs set up at once all come up, each with a listener of its
+/// own (a rig that dials another rig's listener, or finds its socket file removed by another
+/// rig's `cleanup`, never completes its setup).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unix_socket_rigs_built_at_the_same_time_do_not_share_a_socket() {
+    let builds: Vec<_> = (0..16)
+        .map(|_| tokio::spawn(rig_unix_with_credentials()))
+        .collect();
+    for build in builds {
+        let rig = build.await.expect("a Unix-socket rig came up");
         rig.shutdown.shutdown().await;
     }
 }
