@@ -127,6 +127,12 @@ pub(crate) enum MessageError {
     /// A PAD flag followed by a non-zero octet.
     #[error("padding has a non-zero octet at {at}: drop the frame")]
     Padding { at: usize },
+    /// The buffer a frame's names are written to was not empty when the frame was read: a caller's
+    /// mistake, not the frame's.
+    #[error(
+        "the buffer for a frame's names held {held} names before the frame was read: clear it first (a bug in the caller, not a fault of the frame)"
+    )]
+    NamesNotEmpty { held: usize },
 }
 
 /// A message to be written.
@@ -621,15 +627,21 @@ impl Messages {
     /// Parse every message of the frame into the end of `out`, written where it stays (no
     /// message is returned and moved again), and the names the frame carries into the end of
     /// `names` (a message says which by its index, [`Message::name_index`], counted from the
-    /// frame's first: pass `names` empty). On an error `out` holds the messages before it and
-    /// the frame is refused as a whole by the caller. Each message is checked, then only padding
-    /// may follow the last.
+    /// frame's first). **`names` must be empty**: an index is one octet counted from the first
+    /// name written, so a buffer that already held names would number them wrongly (past 255 it
+    /// would wrap and a message would read another's name). A buffer that is not empty is refused
+    /// with [`MessageError::NamesNotEmpty`] before anything is read or written. On an error `out`
+    /// holds the messages before it and the frame is refused as a whole by the caller. Each
+    /// message is checked, then only padding may follow the last.
     #[inline]
     pub(crate) fn parse_into(
         &mut self,
         out: &mut Vec<Message>,
         names: &mut Vec<Bytes>,
     ) -> Result<(), MessageError> {
+        if !names.is_empty() {
+            return Err(MessageError::NamesNotEmpty { held: names.len() });
+        }
         while self.seen < self.count {
             let message = self.message(names)?;
             out.push(message);
@@ -1026,6 +1038,38 @@ mod tests {
             assert_eq!(read, by_iter, "{count} messages");
             assert_eq!(into.last().map(|m| m.seq), Some(40 + count as u64 - 1));
         }
+    }
+
+    /// `parse_into` numbers the names of a frame from the first it carries, so it needs `names`
+    /// empty. A buffer that is not empty is refused before anything is read (it would number the
+    /// 255th name of a long buffer as 0, and a message would then read another message's name),
+    /// and nothing is written to either buffer.
+    #[test]
+    fn parse_into_refuses_a_names_buffer_that_is_not_empty_and_writes_nothing() {
+        let named = |id: u64| {
+            let mut m = OutMessage::new(id, b"x");
+            m.name = Some(b"\x08\x01a");
+            m
+        };
+        let plain = Bytes::from(plaintext_of(&[named(1), named(2), named(3)]));
+        for held in [1usize, 2, 254, 255, 300] {
+            let (mut into, mut names) = (Vec::new(), vec![Bytes::from_static(b"held"); held]);
+            let result = Messages::new(plain.clone(), 0, 3, MESSAGE_DEFAULT)
+                .parse_into(&mut into, &mut names);
+            assert_eq!(
+                result,
+                Err(MessageError::NamesNotEmpty { held }),
+                "{held} names held: the frame was read and its names numbered from {held}"
+            );
+            assert!(into.is_empty(), "{held} names held: a message was written");
+            assert_eq!(names.len(), held, "{held} names held: a name was written");
+        }
+        // Empty, it reads.
+        let (mut into, mut names) = (Vec::new(), Vec::new());
+        Messages::new(plain, 0, 3, MESSAGE_DEFAULT)
+            .parse_into(&mut into, &mut names)
+            .unwrap();
+        assert_eq!(names.len(), 3);
     }
 
     #[test]
