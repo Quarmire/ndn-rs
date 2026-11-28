@@ -1073,16 +1073,18 @@ impl SideTable {
 
     /// Route a frame the application of the face `from` hands over itself, and say so when the
     /// frame would be lost to a full sink: **`Err(Full)` with nothing counted but `held_back`**
-    /// when `frame` is a datagram-class data frame of a route whose source is `from`, the
-    /// route has live sinks, and none of them has room for this frame now
-    /// ([`Face::side_room_for`](ndn_transport::Face::side_room_for)). The frame is the sender's
-    /// again, to keep and offer when there is room ([`SideTable::room`]); `on_frame` would have dropped it for each
-    /// full sink and the sender would never have known. Any other frame (a stream frame, an
-    /// `UP`, a `QUERY`, an `ANSWER`, one for no route, from a barred face, from a face that is
-    /// not the route's source) is `on_frame`'s, with its counts, and is `Ok`. A sink that has
-    /// room in the hint and refuses all the same (another sender filled it between the look
-    /// and the send) costs that sink the frame, counted `sink_full`, as on any hop. **Never
-    /// blocks.**
+    /// when `frame` is a data-class frame (`DATA`, `CHECKPOINT`, `CONTROL`, of either class) of
+    /// a route whose source is `from`, the route has live sinks, and none of them has room for
+    /// this frame now ([`Face::side_room_for`](ndn_transport::Face::side_room_for)). The frame
+    /// is the sender's again, to keep and offer when there is room ([`SideTable::room`]);
+    /// `on_frame` would have dropped it for each full sink and the sender would never have known.
+    /// A stream frame is held back like a datagram: a `Reliable` or `Window` message that the
+    /// first hop dropped would be a gap its own sender caused, with the sender told nothing.
+    /// Any other frame (an `UP`, a `QUERY`, an `ANSWER`, one for no route, from a barred face,
+    /// from a face that is not the route's source) is `on_frame`'s, with its counts, and is `Ok`.
+    /// A sink that has room in the hint and refuses all the same (another sender filled it
+    /// between the look and the send) costs that sink the frame, counted `sink_full`, as on any
+    /// hop. **Never blocks.**
     pub fn send_local(
         &self,
         from: FaceId,
@@ -1090,7 +1092,6 @@ impl SideTable {
         faces: &FaceTable,
     ) -> Result<SideOutcome, SideRefused> {
         if let Ok(header) = SideHeader::parse(&frame)
-            && header.class() == SideClass::Datagram
             && !matches!(
                 header.kind(),
                 SideKind::Up | SideKind::Query | SideKind::Answer
@@ -1098,7 +1099,7 @@ impl SideTable {
             && let Some(route) = self.routes.get(&header.id()).map(|r| Arc::clone(&r))
             && route.source == from
             && !self.is_quarantined(from, self.now())
-            && !self.has_room(&route, &frame, SideClass::Datagram, faces, self.now())
+            && !self.has_room(&route, &frame, header.class(), faces, self.now())
         {
             bump(&self.counters.held_back);
             return Err(SideRefused::Full);

@@ -43,7 +43,9 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-use crate::connection::{Connection, InProcConnection, LpInfo, RouteEvents, side_check};
+use crate::connection::{
+    Connection, InProcConnection, LpInfo, RouteEvents, side_check, side_error,
+};
 use crate::error::AppError;
 use crate::node::ConnectionProvider;
 use crate::{Consumer, Node, Producer};
@@ -239,8 +241,37 @@ impl Connection for EngineConnection {
         self.inner.side_frame_max()
     }
 
+    /// A datagram frame waits in the face's queue for room (the reader peels it). **A stream
+    /// frame goes to the side table at once, like a datagram, and is held back**: the table
+    /// refuses it `Full` when no sink of its route has room for it (the stream's queue is at its
+    /// bound, or a quota refuses it), and this waits for room and offers it again, so a
+    /// `Reliable` or `Window` frame is never dropped at the first hop for want of room. The
+    /// frames of one connection stay in order: one waits for the one before it.
     async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), AppError> {
-        self.inner.send_side(frame, class).await
+        if class != SideClass::Stream {
+            return self.inner.send_side(frame, class).await;
+        }
+        side_check(&frame, self.side_frame_max()).map_err(side_error)?;
+        let (mut yields, mut sleeps) = (0, 0u32);
+        loop {
+            match self.engine.side_send_local(self.face_id, frame.clone()) {
+                Err(SideRefused::Full) => {}
+                other => return other.map_err(side_error),
+            }
+            while !self.engine.side_room(&frame) {
+                if self.engine.faces().get(self.face_id).is_none() {
+                    return Err(AppError::Closed);
+                }
+                if yields < ROOM_YIELDS {
+                    yields += 1;
+                    tokio::task::yield_now().await;
+                } else {
+                    let step = ROOM_RECHECK * (1 << (sleeps / ROOM_BACKOFF_EVERY).min(4));
+                    sleeps += 1;
+                    pause(step).await;
+                }
+            }
+        }
     }
 
     /// A datagram frame goes to the engine's side table at once, from here
@@ -409,10 +440,12 @@ mod tests {
 
     use super::*;
 
-    /// A sink face that takes frames while `full` is clear and has no room while it is set.
+    /// A sink face that takes frames while `full` is clear and has no room while it is set; the
+    /// frames it took are in `seen`, in order.
     struct Gate {
         id: FaceId,
         full: Arc<AtomicBool>,
+        seen: Arc<Mutex<Vec<Bytes>>>,
     }
 
     impl Transport for Gate {
@@ -436,13 +469,17 @@ mod tests {
         }
         fn forward_side_from(
             &self,
-            _frame: Bytes,
+            frame: Bytes,
             _class: SideClass,
             _ingress: FaceId,
         ) -> Result<(), SideRefused> {
             if self.full.load(Ordering::SeqCst) {
                 Err(SideRefused::Full)
             } else {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(frame);
                 Ok(())
             }
         }
@@ -455,23 +492,32 @@ mod tests {
     }
 
     fn data_frame(route: u64) -> Bytes {
-        let mut v = SideHeader::new(SideClass::Datagram, SideKind::Data, route)
-            .expect("a datagram data header")
+        frame_of(SideClass::Datagram, route, 0)
+    }
+
+    /// A data frame of `class` for `route` whose last octet is `tag`.
+    fn frame_of(class: SideClass, route: u64, tag: u8) -> Bytes {
+        let mut v = SideHeader::new(class, SideKind::Data, route)
+            .expect("a data header")
             .encode()
             .to_vec();
         v.resize(200, 0xA5);
+        *v.last_mut().expect("a frame") = tag;
         Bytes::from(v)
     }
 
+    type Seen = Vec<Arc<Mutex<Vec<Bytes>>>>;
+
     /// An engine, a node connection on it, and one sink face per route in `routes`, each the
     /// only sink of its route with the node's face as the source. The switch of each sink says
-    /// whether it has room.
+    /// whether it has room, and what it took is in the second list.
     async fn rig(
         routes: &[u64],
     ) -> (
         ForwarderEngine,
         Arc<dyn Connection>,
         Vec<Arc<AtomicBool>>,
+        Seen,
         CancellationToken,
     ) {
         let (engine, shutdown) = EngineBuilder::new(Default::default())
@@ -489,13 +535,16 @@ mod tests {
             .find(|id| !before.contains(id))
             .expect("the connection's face");
         let mut gates = Vec::new();
+        let mut seen = Vec::new();
         for &route in routes {
             let full = Arc::new(AtomicBool::new(false));
+            let took = Arc::new(Mutex::new(Vec::new()));
             let id = engine.faces().alloc_id();
             engine.add_face(
                 Gate {
                     id,
                     full: Arc::clone(&full),
+                    seen: Arc::clone(&took),
                 },
                 cancel.child_token(),
             );
@@ -504,8 +553,61 @@ mod tests {
                 .install(SideId(route), source, id, Duration::from_secs(600))
                 .expect("the route installs");
             gates.push(full);
+            seen.push(took);
         }
-        (engine, conn, gates, cancel)
+        (engine, conn, gates, seen, cancel)
+    }
+
+    /// A stream frame the first hop has no room for is held back, not dropped: `send_side` does
+    /// not return while the sink is full (the old path queued it in the face, the reader found
+    /// the sink full and dropped it, counted `sink_full`, and the sender was told `Ok`); when
+    /// the sink has room the frames arrive once each, in the order they were sent.
+    #[tokio::test]
+    async fn a_stream_frame_the_first_hop_has_no_room_for_is_held_back_and_arrives_in_order() {
+        let (engine, conn, gates, seen, _cancel) = rig(&[1]).await;
+        gates[0].store(true, Ordering::SeqCst);
+        let sender = {
+            let conn = Arc::clone(&conn);
+            tokio::spawn(async move {
+                for tag in 1..=3u8 {
+                    conn.send_side(frame_of(SideClass::Stream, 1, tag), SideClass::Stream)
+                        .await
+                        .expect("held back, then sent");
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!sender.is_finished(), "told Ok while no sink had room");
+        assert!(seen[0].lock().unwrap().is_empty());
+        gates[0].store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), sender)
+            .await
+            .expect("the held-back frames go once there is room")
+            .expect("the sender task");
+        let tags: Vec<u8> = seen[0]
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| *f.last().expect("a frame"))
+            .collect();
+        assert_eq!(tags, [1, 2, 3], "every frame once, in order");
+        let stats = engine.side().stats();
+        assert_eq!(stats.sink_full, 0, "nothing was dropped");
+        assert!(stats.held_back >= 1, "the hold-back is counted");
+    }
+
+    /// With room, a stream frame costs the sender no wait.
+    #[tokio::test]
+    async fn a_stream_frame_with_room_goes_at_once() {
+        let (_engine, conn, _gates, seen, _cancel) = rig(&[1]).await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            conn.send_side(frame_of(SideClass::Stream, 1, 9), SideClass::Stream),
+        )
+        .await
+        .expect("no wait")
+        .expect("sent");
+        assert_eq!(seen[0].lock().unwrap().len(), 1);
     }
 
     /// One route whose only sink never drains must not hold back the others: the connection
@@ -516,7 +618,7 @@ mod tests {
     /// told that it could send).
     #[tokio::test]
     async fn a_route_whose_sink_never_drains_does_not_hold_back_the_datagrams_of_another() {
-        let (_engine, conn, gates, _cancel) = rig(&[1, 2]).await;
+        let (_engine, conn, gates, _seen, _cancel) = rig(&[1, 2]).await;
         gates[1].store(true, Ordering::SeqCst);
         assert_eq!(
             conn.try_send_side(data_frame(2), SideClass::Datagram),
@@ -551,7 +653,7 @@ mod tests {
     /// counts it), and the frame stays with the node.
     #[tokio::test]
     async fn the_wait_for_room_is_bounded() {
-        let (_engine, conn, gates, _cancel) = rig(&[1]).await;
+        let (_engine, conn, gates, _seen, _cancel) = rig(&[1]).await;
         gates[0].store(true, Ordering::SeqCst);
         assert_eq!(
             conn.try_send_side(data_frame(1), SideClass::Datagram),
