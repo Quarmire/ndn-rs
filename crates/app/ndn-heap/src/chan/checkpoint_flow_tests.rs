@@ -1872,14 +1872,27 @@ async fn a_sustained_burst_never_has_three_checkpoints_in_one_period() {
     }
 }
 
+/// Move the paused clock on by `ms` and **do not yield**: the sender's tasks (its period timer, its
+/// stream writer) stay where they are until the test awaits. `tokio::time::advance` moves the
+/// clock before its single yield, and polling it once is enough to move it.
+fn step(ms: u64) {
+    let _ = tokio::time::advance(Duration::from_millis(ms)).now_or_never();
+}
+
 /// A checkpoint waits in the stream's FIFO at most one at a time: the octets that come while one
 /// waits are behind it, and it does not list them; the next is queued once it is written, and
 /// the octets are still owed then (a checkpoint that was not queued did not reset them).
+///
+/// The clock is tokio's, paused: the sender's period timer (a real 20 ms sleep otherwise, which a
+/// loaded machine lets fire while the stream's task runs, queueing the second checkpoint the test
+/// means to count) fires only when the test moves the clock and awaits, and every step the test
+/// takes is a whole number of milliseconds of the clock it moves itself.
 #[tokio::test(flavor = "current_thread")]
 async fn two_checkpoints_are_never_queued_at_once_and_the_octets_owed_are_kept() {
     use super::tx::CHECKPOINT_OCTETS;
     let ck = ck(ChannelMode::Reliable, latest(), LinkConfig::default()).await;
     ck.pause_tick();
+    tokio::time::pause();
     let tx = ck
         .bob()
         .inner
@@ -1895,13 +1908,29 @@ async fn two_checkpoints_are_never_queued_at_once_and_the_octets_owed_are_kept()
             .expect("a Reliable emission with room does not wait")
             .expect("bob emits")
     };
-    // The real clock, and nothing yields: the stream's task does not run between these, so
-    // what is queued stays queued. Half a period is 10 ms; wait a clear 25 for each case.
-    std::thread::sleep(Duration::from_millis(25));
+    // The records the setup sent armed the sender's timer: let that checkpoint go, and half a
+    // period more pass, so the case starts with the sender quiet and the last checkpoint more
+    // than half a period back. Then one small message is sent and written, so that frames sent
+    // since the last checkpoint wait for the period's timer (a `checkpoint_due` with nothing
+    // sent queues nothing); it is far under the octet bound.
+    ck.advance(25).await;
+    ck.advance(15).await;
+    ck.link.take_stream();
+    ck.link.take_datagrams();
+    emit(Bytes::from_static(b"first"));
+    settle().await;
+    assert!(
+        ck.link.take_stream().iter().all(|f| !is_checkpoint(f)),
+        "a small message is written with no checkpoint: its period has not passed"
+    );
+    // The paused clock, and nothing yields between the steps from here: the stream's task does
+    // not run, so what is queued stays queued. Half a period is 10 ms; step a clear 25 for each
+    // case.
+    step(25);
     // The period's timer fires: one checkpoint waits.
     tx.checkpoint_due(Instant::now());
     assert_eq!(tx.checkpoints_queued(), 1, "the timer queued a checkpoint");
-    std::thread::sleep(Duration::from_millis(25));
+    step(25);
     // A bound's worth of octets behind it, half a period later: the bound is met and the time
     // is right, but one waits already, and a second would list nothing the first does not.
     for _ in 0..CHECKPOINT_OCTETS / message.len() {
@@ -1912,25 +1941,35 @@ async fn two_checkpoints_are_never_queued_at_once_and_the_octets_owed_are_kept()
         1,
         "a second checkpoint was queued behind the one that waits"
     );
-    // The stream's task runs: the checkpoint is written, then the messages behind it.
+    // The stream's task runs: the checkpoint is written, then the messages behind it. The clock
+    // does not move while it runs, so nothing but the one that waited can be queued.
     settle().await;
     let first = ck.link.take_stream();
+    let written = first.iter().filter(|f| is_checkpoint(f)).count();
     assert_eq!(
-        first.iter().filter(|f| is_checkpoint(f)).count(),
+        written,
         1,
-        "the one checkpoint that waited is the only one written"
+        "checkpoints written in the one drain ({} stream frames): only the one that waited, \
+         not one queued behind it by the octets of the burst",
+        first.len()
     );
-    assert_eq!(tx.checkpoints_queued(), 0);
+    assert_eq!(
+        tx.checkpoints_queued(),
+        0,
+        "the checkpoint that waited was written, and none was queued after it"
+    );
     // One more small message, half a period on: the octets behind the first checkpoint are
     // still owed (the one that was not queued reset nothing), so the next is queued now.
-    std::thread::sleep(Duration::from_millis(25));
+    step(25);
     emit(Bytes::from_static(b"one more"));
     settle().await;
     let second = ck.link.take_stream();
     assert_eq!(
         second.iter().filter(|f| is_checkpoint(f)).count(),
         1,
-        "the octets owed were forgotten: no checkpoint behind them"
+        "checkpoints written after the one more message ({} stream frames): the octets owed \
+         behind the first checkpoint were forgotten, so none was queued behind them",
+        second.len()
     );
 }
 
