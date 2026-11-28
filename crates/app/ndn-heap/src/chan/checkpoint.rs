@@ -35,7 +35,7 @@
 //! checkpoints) `lo` is raised past it, so a forgotten frame is never a mismatch.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use ndn_security::{Ed25519Verifier, Signer, VerifyOutcome};
+use ndn_security::{Ed25519PublicKey, Signer, VerifyOutcome};
 use sha2::{Digest, Sha256};
 
 use super::message::{MessageError, check_padding};
@@ -267,9 +267,9 @@ impl Record {
         })
     }
 
-    /// Whether the signature verifies under `public_key` (the 32 octets of an Ed25519 key) for
-    /// the channel `channel` at the full key epoch `epoch`.
-    pub(crate) fn verify(&self, channel: u64, epoch: u32, public_key: &[u8]) -> bool {
+    /// Whether the signature verifies under `public_key` (an Ed25519 key, decoded once by the
+    /// caller) for the channel `channel` at the full key epoch `epoch`.
+    pub(crate) fn verify(&self, channel: u64, epoch: u32, public_key: &Ed25519PublicKey) -> bool {
         let message = signed_message(
             channel,
             epoch,
@@ -279,7 +279,7 @@ impl Record {
             &self.digest,
         );
         matches!(
-            Ed25519Verifier.verify_sync(&message, &self.signature, public_key),
+            public_key.verify(&message, &self.signature),
             VerifyOutcome::Valid
         )
     }

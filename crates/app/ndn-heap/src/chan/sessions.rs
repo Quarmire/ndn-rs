@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use ndn_foundation_types::Name;
+use ndn_security::Ed25519PublicKey;
 use parking_lot::Mutex;
 
 use super::aead::Aead;
@@ -145,6 +146,29 @@ impl Terms {
     }
 }
 
+/// The sender's Ed25519 public key as a checkpoint is verified under: the octets the certificate
+/// carries and the key decoded from them, once. `key` is `None` for octets that are not a point,
+/// which no signature verifies under (every checkpoint then fails, as it did when the octets
+/// were decoded for each one).
+pub(crate) struct SignerKey {
+    octets: [u8; 32],
+    key: Option<Ed25519PublicKey>,
+}
+
+impl SignerKey {
+    fn new(octets: [u8; 32]) -> Self {
+        Self {
+            octets,
+            key: Ed25519PublicKey::from_bytes(&octets),
+        }
+    }
+
+    /// The decoded key; `None` when the octets are not a point.
+    pub(crate) fn key(&self) -> Option<&Ed25519PublicKey> {
+        self.key.as_ref()
+    }
+}
+
 struct State {
     current: Held,
     previous: Option<(Held, Instant)>,
@@ -153,10 +177,10 @@ struct State {
     terms: Terms,
     /// The key that signed the sender's last answer.
     sender_key: Name,
-    /// The 32 octets of that key's Ed25519 public key, as a certificate this device vouches for
-    /// carries it: what a checkpoint's signature is verified under. `None` when no such
+    /// That key's Ed25519 public key, as a certificate this device vouches for carries it, decoded
+    /// once when it is set: what a checkpoint's signature is verified under. `None` when no such
     /// certificate was found (checkpoints then cannot be verified, which is not forgery).
-    signer_public: Option<[u8; 32]>,
+    signer_public: Option<Arc<SignerKey>>,
     /// When a failed renewal may be tried again.
     retry_at: Option<Instant>,
     ended: Option<EndReason>,
@@ -331,17 +355,30 @@ impl RecvSession {
             .then(|| (state.current._key.clone(), state.current.epoch))
     }
 
-    /// The 32 octets of the Ed25519 public key checkpoints of this channel are verified under
-    /// (see [`Self::set_signer_public`]).
+    /// The sender's checkpoint key, decoded (see [`Self::set_signer_public`]): a checkpoint is
+    /// verified under it without decoding the 32 octets again.
+    pub(crate) fn signer_key(&self) -> Option<Arc<SignerKey>> {
+        self.state.lock().signer_public.clone()
+    }
+
+    /// The 32 octets of the Ed25519 public key checkpoints of this channel are verified under.
+    #[cfg(test)]
     pub(crate) fn signer_public(&self) -> Option<[u8; 32]> {
-        self.state.lock().signer_public
+        self.state.lock().signer_public.as_ref().map(|k| k.octets)
     }
 
     /// The sender's key, as this device found it in a certificate it vouches for when the answer
     /// was taken (an answer's own key is the one that signed it: the digest the validator
-    /// resolved to a certificate names exactly this key). Set at each install and renewal.
+    /// resolved to a certificate names exactly this key). Set at each install and renewal; the
+    /// key is decoded here, once, and a renewal that finds the same octets keeps the decoded key.
     pub(crate) fn set_signer_public(&self, public: Option<[u8; 32]>) {
-        self.state.lock().signer_public = public;
+        let mut state = self.state.lock();
+        let kept = match (&state.signer_public, public) {
+            (Some(held), Some(octets)) if held.octets == octets => return,
+            (_, None) => None,
+            (_, Some(octets)) => Some(Arc::new(SignerKey::new(octets))),
+        };
+        state.signer_public = kept;
     }
 
     /// The key epoch of the key held now.

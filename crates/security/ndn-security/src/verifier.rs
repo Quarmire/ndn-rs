@@ -248,29 +248,46 @@ impl Verifier for HmacSha256Verifier {
     }
 }
 
-pub struct Ed25519Verifier;
+/// An Ed25519 public key decoded once (the point decompression of `VerifyingKey::from_bytes`
+/// costs a few microseconds), for a verifier that checks many signatures under one key: a
+/// channel's checkpoints. [`Ed25519PublicKey::verify`] answers exactly as
+/// [`Ed25519Verifier::verify_sync`] does under the same 32 octets.
+#[derive(Clone, Debug)]
+pub struct Ed25519PublicKey(ed25519_dalek::VerifyingKey);
 
-impl Ed25519Verifier {
-    pub fn verify_sync(&self, region: &[u8], sig_value: &[u8], public_key: &[u8]) -> VerifyOutcome {
-        use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+impl Ed25519PublicKey {
+    /// Decodes the 32 octets of a key; `None` for a wrong length or an octet string that is not a
+    /// point (what [`Ed25519Verifier::verify_sync`] answers `Invalid` for).
+    pub fn from_bytes(public_key: &[u8]) -> Option<Self> {
+        let bytes: &[u8; 32] = public_key.try_into().ok()?;
+        ed25519_dalek::VerifyingKey::from_bytes(bytes)
+            .ok()
+            .map(Self)
+    }
 
-        // Reject a wrong-length key outright rather than substituting a zero key
-        // (audit X-4) — matches the async `verify` path's InvalidKey behaviour.
-        let Ok(pk_bytes): Result<&[u8; 32], _> = public_key.try_into() else {
-            return VerifyOutcome::Invalid;
-        };
-        let Ok(vk) = VerifyingKey::from_bytes(pk_bytes) else {
-            return VerifyOutcome::Invalid;
-        };
+    /// Whether `sig_value` (64 octets) is this key's signature over `region`.
+    pub fn verify(&self, region: &[u8], sig_value: &[u8]) -> VerifyOutcome {
+        use ed25519_dalek::{Signature, Verifier as _};
 
         let Ok(sig_bytes): Result<&[u8; 64], _> = sig_value.try_into() else {
             return VerifyOutcome::Invalid;
         };
-        let sig = Signature::from_bytes(sig_bytes);
-
-        match vk.verify(region, &sig) {
+        match self.0.verify(region, &Signature::from_bytes(sig_bytes)) {
             Ok(()) => VerifyOutcome::Valid,
             Err(_) => VerifyOutcome::Invalid,
+        }
+    }
+}
+
+pub struct Ed25519Verifier;
+
+impl Ed25519Verifier {
+    pub fn verify_sync(&self, region: &[u8], sig_value: &[u8], public_key: &[u8]) -> VerifyOutcome {
+        // Reject a wrong-length key outright rather than substituting a zero key
+        // (audit X-4) — matches the async `verify` path's InvalidKey behaviour.
+        match Ed25519PublicKey::from_bytes(public_key) {
+            Some(key) => key.verify(region, sig_value),
+            None => VerifyOutcome::Invalid,
         }
     }
 }
@@ -425,6 +442,58 @@ mod tests {
         let sk = SigningKey::from_bytes(seed);
         let pk = sk.verifying_key().to_bytes();
         (sk, pk)
+    }
+
+    /// A key decoded once answers as the verifier does for each call of the same 32 octets:
+    /// valid, a signature over another region, another key's signature, a short signature, a
+    /// wrong-length key, and octet strings that are not points.
+    #[test]
+    fn a_decoded_key_answers_as_the_per_call_verifier_does() {
+        let (sk, pk) = keypair(&[1u8; 32]);
+        let (other, _) = keypair(&[2u8; 32]);
+        let region = b"signed region";
+        let good = sk.sign(region).to_bytes();
+        let wrong_signer = other.sign(region).to_bytes();
+        let key = Ed25519PublicKey::from_bytes(&pk).expect("a real key decodes");
+        for (region, sig) in [
+            (&region[..], &good[..]),
+            (b"another region", &good[..]),
+            (&region[..], &wrong_signer[..]),
+            (&region[..], &good[..63]),
+            (&region[..], &[0u8; 64][..]),
+            (&region[..], &[][..]),
+        ] {
+            assert_eq!(
+                key.verify(region, sig),
+                Ed25519Verifier.verify_sync(region, sig, &pk)
+            );
+        }
+        assert_eq!(key.verify(region, &good), VerifyOutcome::Valid);
+        assert!(Ed25519PublicKey::from_bytes(&pk[..31]).is_none());
+        assert!(Ed25519PublicKey::from_bytes(&[pk.as_slice(), &[0]].concat()).is_none());
+        let mut refused = 0;
+        for n in 0..=255u8 {
+            let mut bytes = [n; 32];
+            bytes[0] = n.wrapping_mul(7);
+            let decoded = Ed25519PublicKey::from_bytes(&bytes);
+            if let Some(key) = &decoded {
+                assert_eq!(
+                    key.verify(region, &good),
+                    Ed25519Verifier.verify_sync(region, &good, &bytes)
+                );
+            } else {
+                refused += 1;
+                assert_eq!(
+                    Ed25519Verifier.verify_sync(region, &good, &bytes),
+                    VerifyOutcome::Invalid,
+                    "a key that does not decode never verifies"
+                );
+            }
+        }
+        assert!(
+            refused > 0,
+            "the sweep met octet strings that are not points"
+        );
     }
 
     #[tokio::test]

@@ -1541,13 +1541,18 @@ impl ChannelRx {
                 return Delivery::Dropped(Dropped::Malformed);
             }
         };
-        let Some(public) = self.session.signer_public() else {
+        let Some(signer) = self.session.signer_key() else {
             // No certificate of the sender's key was found when its answer was taken: nothing can
             // be verified, which says nothing against the sender. The silence rule applies.
             stats.unverifiable_checkpoints.bump();
             return Delivery::Checkpoint;
         };
-        if !record.verify(self.channel, epoch, &public) {
+        // The key was decoded when the session took it; octets that are not a point verify
+        // nothing, and the checkpoint is judged as any other that does not verify.
+        if !signer
+            .key()
+            .is_some_and(|key| record.verify(self.channel, epoch, key))
+        {
             return self.bad_checkpoint(node, header, frame, ingress, epoch, post);
         }
         stats.checkpoints_verified.bump();

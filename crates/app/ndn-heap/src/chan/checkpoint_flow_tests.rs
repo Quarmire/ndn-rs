@@ -352,6 +352,11 @@ impl Ck {
             .expect("carol found bob's certificate")
     }
 
+    /// bob's key as Carol decoded it once for the session.
+    pub(super) fn public_key(&self) -> ndn_security::Ed25519PublicKey {
+        ndn_security::Ed25519PublicKey::from_bytes(&self.public()).expect("bob's key is a point")
+    }
+
     /// The record a checkpoint frame carries, opened as a holder of the key opens it.
     pub(super) fn record_of(&self, frame: &Bytes) -> Record {
         let opened = open(&self.cipher, frame.clone(), 1 << 20).expect("a frame under the key");
@@ -430,7 +435,7 @@ async fn a_forgery_by_a_key_holder_is_exposed_by_the_next_checkpoint_with_eviden
     );
     // A third party that holds the key can check the proof by the sender's key alone.
     let record = ck.record_of(&e.proof);
-    assert!(record.verify(e.channel, e.key_epoch, &ck.public()));
+    assert!(record.verify(e.channel, e.key_epoch, &ck.public_key()));
     assert!(
         record.listed(e.seq0).next().is_none() && Header::decode(&e.frame).unwrap().seq0 == e.seq0,
         "the signed list holds no frame at the forged sequence"

@@ -27,8 +27,12 @@ fn signer() -> Ed25519Signer {
     Ed25519Signer::from_seed(&[0x42; 32], "/bob/phone/KEY/1".parse::<Name>().unwrap())
 }
 
-fn public() -> [u8; 32] {
+fn public_octets() -> [u8; 32] {
     <[u8; 32]>::try_from(&signer().public_key().unwrap()[..]).unwrap()
+}
+
+fn public() -> Ed25519PublicKey {
+    Ed25519PublicKey::from_bytes(&public_octets()).unwrap()
 }
 
 /// Three frames: `seq0` 5, 9 and 30, whose hashes are runs of 16 octets from 0x10, 0x20, 0x30.
@@ -68,7 +72,7 @@ fn frame(aead: Aead) -> Bytes {
 #[test]
 fn the_golden_record_is_these_octets() {
     assert_eq!(
-        hex(&public()),
+        hex(&public_octets()),
         "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12"
     );
     assert_eq!(
@@ -140,7 +144,9 @@ fn a_record_reads_back_and_verifies_only_for_its_channel_epoch_and_range() {
         !read.verify(CHANNEL, EPOCH + 256, &public()),
         "epochs 256 apart"
     );
-    assert!(!read.verify(CHANNEL, EPOCH, &[7; 32]), "another key");
+    let another = Ed25519Signer::from_seed(&[7; 32], "/eve/phone/KEY/1".parse::<Name>().unwrap());
+    let another = Ed25519PublicKey::from_bytes(&another.public_key().unwrap()).unwrap();
+    assert!(!read.verify(CHANNEL, EPOCH, &another), "another key");
     // Another range with the same list: the range is signed too.
     let mut shifted = plain.to_vec();
     shifted[1] += 1; // hi 41

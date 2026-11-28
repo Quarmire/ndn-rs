@@ -349,3 +349,41 @@ async fn is_current_moves_with_the_fold_version_and_not_with_time() {
         "the space's fold changed since the sender was judged"
     );
 }
+
+/// The sender's checkpoint key is decoded when the session takes it, once: a renewal that finds the
+/// same 32 octets keeps the decoded key (nothing decoded again), another key replaces it, octets
+/// that are not a point are held with no decoded key (nothing verifies under them), and `None`
+/// removes it.
+#[tokio::test]
+async fn the_senders_checkpoint_key_is_decoded_once_and_kept_across_a_renewal() {
+    let f = fixture().await;
+    let s = f.session(&record(7, 0, 3600), [1; 32], Instant::now());
+    assert!(s.signer_key().is_none());
+    let alice = ndn_security::Ed25519Signer::from_seed(&[1; 32], n("/bob/phone/KEY/1"));
+    let public =
+        <[u8; 32]>::try_from(&ndn_security::Signer::public_key(&alice).unwrap()[..]).unwrap();
+    s.set_signer_public(Some(public));
+    let first = s.signer_key().expect("a key");
+    assert!(first.key().is_some(), "a real key decodes");
+    s.set_signer_public(Some(public));
+    assert!(
+        Arc::ptr_eq(&first, &s.signer_key().unwrap()),
+        "the same octets at a renewal: the decoded key is kept"
+    );
+    let other = ndn_security::Ed25519Signer::from_seed(&[2; 32], n("/bob/phone/KEY/1"));
+    let other =
+        <[u8; 32]>::try_from(&ndn_security::Signer::public_key(&other).unwrap()[..]).unwrap();
+    s.set_signer_public(Some(other));
+    assert!(!Arc::ptr_eq(&first, &s.signer_key().unwrap()));
+    assert_eq!(s.signer_public(), Some(other));
+    // Octets that are not a point: found by sweep, held, decoding to nothing.
+    let not_a_point = (0..=255u8)
+        .map(|n| [n; 32])
+        .find(|octets| ndn_security::Ed25519PublicKey::from_bytes(octets).is_none())
+        .expect("a 32-octet string that is not a point");
+    s.set_signer_public(Some(not_a_point));
+    assert!(s.signer_key().expect("held").key().is_none());
+    assert_eq!(s.signer_public(), Some(not_a_point));
+    s.set_signer_public(None);
+    assert!(s.signer_key().is_none());
+}
