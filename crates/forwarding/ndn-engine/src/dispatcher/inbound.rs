@@ -60,7 +60,9 @@ struct SideLane {
 /// the stream: the transport stops reading the peer's octets and the peer's flow control, and
 /// the first-hop hold-back behind it, slow the sender. A stream cannot drop a frame without
 /// breaking its channel's order, so the loss of a stream frame at the forwarder is the
-/// exception (a sink that stayed full for the bound, counted), not the congestion response.
+/// exception (a sink that stayed full for the bound, counted, and then **demoted**: the lane
+/// does not wait for that face again for a penalty, so one sink holds the stream once and not
+/// for every frame behind it), not the congestion response.
 /// Ends when the face's stream ends or the face's token fires; the face reader, which reads
 /// everything else, is not told.
 async fn run_side_stream_lane(face: Arc<ndn_transport::Face>, lane: SideLane) {
@@ -112,7 +114,7 @@ async fn run_side_stream_lane(face: Arc<ndn_transport::Face>, lane: SideLane) {
                     break;
                 }
                 if waited >= crate::side::STREAM_HOLD_MAX {
-                    side.count_stream_stalled();
+                    side.stream_stalled(face_id, &frame, &face_table);
                     break;
                 }
             }

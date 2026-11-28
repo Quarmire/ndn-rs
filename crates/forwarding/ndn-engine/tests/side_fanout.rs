@@ -973,3 +973,84 @@ async fn a_stream_frame_waits_on_the_lane_for_room_while_the_faces_other_traffic
         "only the datagram was lost: {stats:?}"
     );
 }
+
+/// A sink that stays full holds a link's stream lane **once**, not for every frame behind it
+/// (security review F1/F2 of the lane): after the lane waited `STREAM_HOLD_MAX` for it, that sink
+/// loses stream frames, visibly (`sink_full`), without the lane waiting for it, for a penalty that
+/// doubles with each repeat. Without that a member that reads one frame in a bound could hold
+/// every route of the link's stream indefinitely, and the peer's write, finding the link's inbox
+/// full for its own `STREAM_STALL`, would close the honest link.
+#[tokio::test]
+async fn a_sink_that_stays_full_holds_the_stream_lane_once_and_then_for_longer_penalties() {
+    let rt = WarpRuntime::new(1_000_000_000_000_000_000, Warp::All);
+    let (s, hs) = lane_face(1, FaceKind::App);
+    let (r, hr) = face(2, FaceKind::App);
+    let (e, _sd) = EngineBuilder::new(EngineConfig::default())
+        .runtime(rt.clone())
+        .face(s)
+        .face(r)
+        .build()
+        .await
+        .expect("engine build");
+    e.fib().add_nexthop(&"/chan".parse().unwrap(), FaceId(1), 0);
+    session(&hr, &hs, labelled_data(ID, 300)).await;
+    eventually("the sink is installed", || sinks_of(&e, ID).len() == 1).await;
+
+    hr.log.full.store(true, Ordering::Relaxed);
+    let stream_frame = || frame(SideClass::Stream, SideKind::Data, ID, 64);
+    for _ in 0..5 {
+        hs.inject_stream(stream_frame());
+    }
+    eventually("the five frames were routed", || {
+        e.side().stats().frames_in == 5
+    })
+    .await;
+    let stats = e.side().stats();
+    assert_eq!(
+        (
+            stats.stream_held,
+            stats.stream_stalled,
+            stats.stream_demoted,
+            stats.sink_full
+        ),
+        (1, 1, 1, 5),
+        "one wait of the bound, then the full sink loses frames without a wait: {stats:?}"
+    );
+
+    // The penalty (60 s) ends: the next frame holds the lane again, and the next penalty is
+    // twice as long (120 s): 61 s later a frame is still not waited for.
+    rt.advance(Duration::from_secs(61));
+    hs.inject_stream(stream_frame());
+    eventually("the sixth frame was routed", || {
+        e.side().stats().frames_in == 6
+    })
+    .await;
+    let stats = e.side().stats();
+    assert_eq!(
+        (
+            stats.stream_held,
+            stats.stream_stalled,
+            stats.stream_demoted
+        ),
+        (2, 2, 2),
+        "{stats:?}"
+    );
+    rt.advance(Duration::from_secs(61));
+    hs.inject_stream(stream_frame());
+    eventually("the seventh frame was routed", || {
+        e.side().stats().frames_in == 7
+    })
+    .await;
+    let stats = e.side().stats();
+    assert_eq!(
+        (stats.stream_held, stats.stream_stalled, stats.sink_full),
+        (2, 2, 7),
+        "a second penalty is longer than the first: {stats:?}"
+    );
+
+    // A sink with room during its penalty is given the frame, as any sink is.
+    hr.log.full.store(false, Ordering::Relaxed);
+    hs.inject_stream(stream_frame());
+    assert_eq!(hr.wait_side(1).await.len(), 1);
+    assert_eq!(e.side().stats().sink_full, 7);
+}

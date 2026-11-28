@@ -92,7 +92,7 @@
 //!   [`set_rate`](SideTable::set_rate) and per kind in [`SideConfig`].
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -102,6 +102,7 @@ use dashmap::DashMap;
 use ndn_runtime::Runtime;
 use ndn_transport::side_header::{AnswerPrefix, QueryPrefix, SideHeader, SideKind, UpOp, UpRecord};
 use ndn_transport::{FaceId, FaceKind, FaceTable, SideClass, SideRefused};
+use tracing::warn;
 
 /// The clock a [`SideTable`] reads: monotonic nanoseconds ([`SideTable::new`] builds it from the
 /// engine runtime's `Now::now`, not the wall clock).
@@ -447,6 +448,10 @@ pub struct SideStats {
     /// Stream frames routed after waiting [`STREAM_HOLD_MAX`] for room: a sink that stays full
     /// that long loses the frame (counted `sink_full` as well), as a dead sink would.
     pub stream_stalled: u64,
+    /// Sinks demoted by it: each held a stream lane for the bound and is lossy for its penalty
+    /// ([`STREAM_LOSSY_BASE`], doubling per repeat), so the lane does not wait for it. The
+    /// log names the face.
+    pub stream_demoted: u64,
     /// A sink refused for another reason (too large for it, closed, I/O).
     pub sink_error: u64,
     /// `UP` records accepted from a sink, and `Keep`s passed on, `Unsub`s.
@@ -498,6 +503,7 @@ struct Counters {
     held_back: AtomicU64,
     stream_held: AtomicU64,
     stream_stalled: AtomicU64,
+    stream_demoted: AtomicU64,
     sink_error: AtomicU64,
     keeps: AtomicU64,
     keeps_forwarded: AtomicU64,
@@ -521,12 +527,24 @@ fn bump(c: &AtomicU64) {
 
 /// The longest a face's stream lane holds one stream frame for room at a sink
 /// ([`SideTable::stream_room`]) before routing it anyway: a sink that stays full this long is
-/// dead for the stream, and its loss of the frame is counted (`stream_stalled`, `sink_full`).
-/// The same bound as the link's own `STREAM_STALL` (30 s, ndn-link.md §9): a peer whose writes
-/// make no progress that long has its link closed, so this ends the wait of a frame in hand when
-/// the peer is not one that closes. A resource bound on one frame in hand, never a judgement
+/// dead for the stream, and its loss of the frame is counted (`stream_stalled`, `sink_full`),
+/// and the sink is **demoted** ([`STREAM_LOSSY_BASE`]). A third of the link's own `STREAM_STALL`
+/// (30 s, ndn-link.md §9): a peer whose writes make no progress that long has its link closed,
+/// and the lane's wait must end, and the inbox it held full drain again, well before the
+/// peer's own timer lapses, or a third party's slow sink would cost an honest sender its link.
+/// The engine cannot know a peer's setting of the stall (`LinkHandle::set_stream_stall`); the
+/// default is what it keeps under. A resource bound on one frame in hand, never a judgement
 /// on data.
-pub const STREAM_HOLD_MAX: Duration = Duration::from_secs(30);
+pub const STREAM_HOLD_MAX: Duration = Duration::from_secs(10);
+
+/// How long a sink face that held a stream lane for [`STREAM_HOLD_MAX`] is **lossy**: for this
+/// long the lane does not wait for it, so it gives the sink the stream frames it has room for and
+/// loses the rest visibly (`sink_full`), and the link's stream flows for every other sink.
+/// Doubles with each repeat of the same face, to `BAR_MAX` (1 h), and starts again at this after
+/// `BAR_CLEAN` (1 h) without one. What bounds one face's hold of a link's stream to
+/// `STREAM_HOLD_MAX` once in `STREAM_LOSSY_BASE + STREAM_HOLD_MAX`, rather than for every
+/// frame behind it.
+pub const STREAM_LOSSY_BASE: Duration = Duration::from_secs(60);
 
 /// The first bar of a face, doubling per repeat.
 const BAR_BASE: Duration = Duration::from_secs(60);
@@ -556,6 +574,11 @@ struct FaceEntry {
     /// The theoretical arrival time (ns) of this face's `QUERY` allowance: the face may send a
     /// `QUERY` while it is within the burst of it (the generic cell rate algorithm).
     query_tat: AtomicU64,
+    /// The face is a sink a stream lane does not wait for until this time (ns); 0: never was
+    /// ([`STREAM_LOSSY_BASE`]).
+    stream_lossy_until: AtomicU64,
+    /// How many times in a row the face held a stream lane for the bound.
+    stream_strikes: AtomicU32,
 }
 
 struct Bucket {
@@ -580,7 +603,34 @@ impl FaceEntry {
             last_sent: AtomicU64::new(0),
             query_tat: AtomicU64::new(0),
             strikes: Mutex::new(Strikes::default()),
+            stream_lossy_until: AtomicU64::new(0),
+            stream_strikes: AtomicU32::new(0),
         }
+    }
+
+    /// Whether a stream lane waits for this face as a sink at `now`.
+    fn stream_waited_for(&self, now: u64) -> bool {
+        self.stream_lossy_until.load(Ordering::Relaxed) <= now
+    }
+
+    /// The face held a stream lane for the bound: it is lossy for the next penalty, which
+    /// doubles with each repeat and starts again after [`BAR_CLEAN`] clean. Returns the length.
+    fn demote_stream(&self, now: u64) -> Duration {
+        let until = self.stream_lossy_until.load(Ordering::Relaxed);
+        let strikes = if until != 0 && now >= until.saturating_add(ns(BAR_CLEAN)) {
+            0
+        } else {
+            self.stream_strikes.load(Ordering::Relaxed)
+        };
+        let length = STREAM_LOSSY_BASE
+            .checked_mul(1u32 << strikes.min(16))
+            .unwrap_or(BAR_MAX)
+            .min(BAR_MAX);
+        self.stream_strikes
+            .store(strikes.saturating_add(1), Ordering::Relaxed);
+        self.stream_lossy_until
+            .fetch_max(now.saturating_add(ns(length)), Ordering::Relaxed);
+        length
     }
 
     fn set_rate(&self, rate: Option<SideRate>, now: u64) {
@@ -1222,37 +1272,59 @@ impl SideTable {
     }
 
     /// Whether `frame`, a stream-class frame that arrived over `from`'s channel stream, may be
-    /// routed now without a live sink losing it: it is no frame of a route (an `UP`, a `QUERY`,
-    /// an `ANSWER`, one for no route, from a face that is not the route's source, from a barred
-    /// face), or **every** live sink of its route that is still a face has room for it
-    /// ([`Face::side_room_for`](ndn_transport::Face::side_room_for)). What a face's stream
-    /// lane waits for before `on_frame`, so that a stream frame is never dropped for want of
-    /// room (a gap in `Reliable` and `Window`). A hint, as every room is: a sink that had room
-    /// at the look and refuses all the same costs the frame, counted `sink_full`. Never blocks.
+    /// routed now without a sink the lane waits for losing it: it is no frame of a route (an
+    /// `UP`, a `QUERY`, an `ANSWER`, one for no route, from a face that is not the route's
+    /// source, from a barred face), or **every** live sink of its route that is still a face
+    /// **and that the lane waits for** has room for it
+    /// ([`Face::side_room_for`](ndn_transport::Face::side_room_for)). A sink that held a lane
+    /// for [`STREAM_HOLD_MAX`] is lossy for a penalty ([`STREAM_LOSSY_BASE`]) and is not
+    /// waited for: it is given the frame if it has room and loses it, counted `sink_full`, if
+    /// not. What a face's stream lane waits for before `on_frame`, so that a stream frame is
+    /// not dropped for want of room (a gap in `Reliable` and `Window`) at a sink that drains.
+    /// A hint, as every room is: a sink that had room at the look and refuses all the same
+    /// costs the frame, counted `sink_full`. Never blocks.
     pub fn stream_room(&self, from: FaceId, frame: &Bytes, faces: &FaceTable) -> bool {
-        let Ok(header) = SideHeader::parse(frame) else {
+        let Some((route, class, now)) = self.stream_route(from, frame) else {
             return true;
         };
+        route
+            .sinks
+            .load()
+            .iter()
+            .all(|sink| !Self::stream_blocks(sink, frame, class, faces, now))
+    }
+
+    /// The route of a stream frame the lane must look at the sinks of, with the frame's class
+    /// and the time of the look: `None` for every frame that has no sink to wait for.
+    fn stream_route(&self, from: FaceId, frame: &Bytes) -> Option<(Arc<Route>, SideClass, u64)> {
+        let header = SideHeader::parse(frame).ok()?;
         if matches!(
             header.kind(),
             SideKind::Up | SideKind::Query | SideKind::Answer
         ) {
-            return true;
+            return None;
         }
-        let Some(route) = self.routes.get(&header.id()).map(|r| Arc::clone(&r)) else {
-            return true;
-        };
+        let route = self.routes.get(&header.id()).map(|r| Arc::clone(&r))?;
         let now = self.now();
         if route.source != from || self.is_quarantined(from, now) {
-            return true;
+            return None;
         }
-        let class = header.class();
-        route.sinks.load().iter().all(|sink| {
-            sink.expires.load(Ordering::Relaxed) <= now
-                || faces
-                    .get(sink.face)
-                    .is_none_or(|face| face.side_room_for(frame, class))
-        })
+        Some((route, header.class(), now))
+    }
+
+    /// Whether `sink` is one the lane waits for and has no room for `frame` now.
+    fn stream_blocks(
+        sink: &Sink,
+        frame: &Bytes,
+        class: SideClass,
+        faces: &FaceTable,
+        now: u64,
+    ) -> bool {
+        sink.expires.load(Ordering::Relaxed) > now
+            && sink.entry.stream_waited_for(now)
+            && faces
+                .get(sink.face)
+                .is_some_and(|face| !face.side_room_for(frame, class))
     }
 
     /// A stream frame is about to wait for room ([`stream_room`](Self::stream_room)).
@@ -1260,9 +1332,33 @@ impl SideTable {
         bump(&self.counters.stream_held);
     }
 
-    /// A stream frame waited [`STREAM_HOLD_MAX`] and is routed with a sink still full.
-    pub(crate) fn count_stream_stalled(&self) {
+    /// A stream frame waited [`STREAM_HOLD_MAX`] and is routed with a sink still full: count it,
+    /// and make each sink that still has no room for it **lossy** for its penalty, so the
+    /// lane never waits for that face again until the penalty ends. The face is named in the
+    /// log at `warn`, which is what the operator reads to find the member that holds the
+    /// stream (the counters are the table's, not a face's).
+    pub(crate) fn stream_stalled(&self, from: FaceId, frame: &Bytes, faces: &FaceTable) {
         bump(&self.counters.stream_stalled);
+        let Some((route, class, now)) = self.stream_route(from, frame) else {
+            return;
+        };
+        for sink in route.sinks.load().iter() {
+            if Self::stream_blocks(sink, frame, class, faces, now) {
+                let penalty = sink.entry.demote_stream(now);
+                bump(&self.counters.stream_demoted);
+                warn!(
+                    target: "ndn_engine::side",
+                    source = %from,
+                    sink = %sink.face,
+                    penalty_s = penalty.as_secs(),
+                    "a sink held its source link's channel stream for {} s without taking a frame: \
+                     it loses stream frames it has no room for, without the stream waiting for it, \
+                     for {} s",
+                    STREAM_HOLD_MAX.as_secs(),
+                    penalty.as_secs()
+                );
+            }
+        }
     }
 
     fn has_room(
@@ -1704,6 +1800,10 @@ impl SideTable {
             e.rate_on.load(Ordering::Relaxed)
                 || e.barred_until.load(Ordering::Relaxed) > now
                 || recent
+                || {
+                    let lossy = e.stream_lossy_until.load(Ordering::Relaxed);
+                    lossy != 0 && lossy.saturating_add(clean) > now
+                }
                 || Arc::strong_count(e) > 1
         });
         self.pit.lock().unwrap().retain(|_, c| c.expires > now);
@@ -1910,6 +2010,7 @@ impl SideTable {
             held_back: get(&c.held_back),
             stream_held: get(&c.stream_held),
             stream_stalled: get(&c.stream_stalled),
+            stream_demoted: get(&c.stream_demoted),
             sink_error: get(&c.sink_error),
             keeps: get(&c.keeps),
             keeps_forwarded: get(&c.keeps_forwarded),

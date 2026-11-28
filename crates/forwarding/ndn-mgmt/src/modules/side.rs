@@ -70,8 +70,10 @@ fn side_list(engine: &ForwarderEngine) -> ControlResponse {
     let _ = writeln!(
         text,
         "stream_held={} (stream frames a link's stream lane waited for room for: not drops) \
-         stream_stalled={} (waited the bound, then routed: a full sink lost them)",
-        s.stream_held, s.stream_stalled
+         stream_stalled={} (waited the bound, then routed: a full sink lost them) \
+         stream_demoted={} (sinks that held the stream for the bound: lossy for a penalty, the \
+         log names the face)",
+        s.stream_held, s.stream_stalled, s.stream_demoted
     );
     let _ = writeln!(
         text,
