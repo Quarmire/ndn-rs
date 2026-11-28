@@ -2783,6 +2783,7 @@ impl Heap {
     pub async fn emit(&self, path: &Name, bytes: Bytes, opts: EmitOptions)
                       -> Result<(), EmitError>;
     pub fn serve(&self, prefix: Name, handler: impl Handler) -> Result<Serving, ServeError>;   // query.md §3.1
+    pub async fn verify_answer_proof(&self, proof: &[u8]) -> Result<VerifiedAnswer, ProofError>;   // query.md §10.1
     pub async fn watch(&self, since: &Frontier) -> Result<Changes, HeapError>;
     // `Frontier::everything()`: everything held now is seen, so no head is replayed and no value read; only what follows is told.
     pub fn members(&self) -> Members;
@@ -2830,7 +2831,7 @@ answers a query by name, to the asker alone, and **no answer is an entry**, stor
 anyone's current value. `Kind::Answered`, `GetNotice::QueryFailed` and
 `GetNotice::AnswersDone` carry what a query yields through `get`; the API, the names
 (`<D>/32=query/<digest>`, the keyless `<D>/32=seal`), the TLV block 0x06C0–0x06FF, sealing in a
-sealed space and the server's judging are in [query.md](query.md).
+sealed space, the server's judging and the verification of an answer's proof are in [query.md](query.md).
 
 A `Heap` is a cheap handle, `Clone`, on one space of one node. `Item.by` is the
 person of the writer (the namespace of the held context that governs its device's name, §9.1),
