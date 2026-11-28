@@ -1730,6 +1730,62 @@ async fn a_flood_of_frames_costs_one_signature_per_period() {
     );
 }
 
+/// What a `Reliable` sender lets pass unchecked is bounded in octets as well as in time: after
+/// `CHECKPOINT_OCTETS` of messages since the last checkpoint one is queued behind them without
+/// waiting for the period, so a receiver whose silence clock runs (the sender, or the runtime it
+/// shares, was slow to write the period's checkpoint) holds at most that much and a late
+/// checkpoint is a delay, never a `Lagged`. At most two a period (the receiver's own bucket).
+#[tokio::test(flavor = "current_thread")]
+async fn a_reliable_burst_is_cut_by_a_checkpoint_every_so_many_octets_not_only_every_period() {
+    use super::tx::CHECKPOINT_OCTETS;
+    let ck = ck(ChannelMode::Reliable, latest(), LinkConfig::default()).await;
+    ck.pause_tick();
+    tokio::time::pause();
+    // The records the setup sent armed the sender's timer: let that checkpoint go (the clock
+    // jumps the whole step, so the checkpoint is queued at its end), and then half a period
+    // more pass, so the case starts with the sender quiet, the period's timer stopped and the
+    // last checkpoint more than half a period back.
+    ck.advance(25).await;
+    ck.advance(15).await;
+    ck.link.take_stream();
+    ck.link.take_datagrams();
+    let message = vec![7u8; 64 << 10];
+    let burst = |octets: usize| octets.div_ceil(message.len());
+    let mut checkpoints = 0usize;
+    let mut sent = 0usize;
+    // Under the bound: no checkpoint, the clock has not moved.
+    for _ in 0..burst(CHECKPOINT_OCTETS - message.len()) {
+        ck.emit(0, &message).await;
+        sent += message.len();
+        checkpoints += ck.link.take_stream().iter().filter(|f| is_checkpoint(f)).count();
+    }
+    assert_eq!(
+        checkpoints, 0,
+        "{sent} octets of messages are under the bound: no checkpoint before the period"
+    );
+    // Over it: one is queued behind the messages, with no time passed.
+    for _ in 0..2 {
+        ck.emit(0, &message).await;
+        sent += message.len();
+        checkpoints += ck.link.take_stream().iter().filter(|f| is_checkpoint(f)).count();
+    }
+    assert_eq!(
+        checkpoints, 1,
+        "{sent} octets of messages went with no checkpoint when {CHECKPOINT_OCTETS} had passed"
+    );
+    // Another bound's worth at once: not another checkpoint within half a period (two a period
+    // is what the receiver verifies).
+    for _ in 0..burst(CHECKPOINT_OCTETS) {
+        ck.emit(0, &message).await;
+        checkpoints += ck.link.take_stream().iter().filter(|f| is_checkpoint(f)).count();
+    }
+    assert_eq!(checkpoints, 1, "no second checkpoint inside half a period");
+    ck.advance(10).await;
+    ck.emit(0, &message).await;
+    checkpoints += ck.link.take_stream().iter().filter(|f| is_checkpoint(f)).count();
+    assert_eq!(checkpoints, 2, "half a period on, the octets owed are checkpointed");
+}
+
 /// A channel that sends nothing says it is alive every 5 s, with an empty checkpoint, and no more.
 #[tokio::test(flavor = "current_thread")]
 async fn an_idle_channel_sends_one_empty_checkpoint_every_five_seconds() {

@@ -68,6 +68,14 @@ pub(crate) const BURST_GAP: Duration = Duration::from_micros(50);
 /// Payload octets a queue holds: 1 MiB.
 pub(crate) const QUEUE_BYTES: usize = 1 << 20;
 
+/// Payload octets of a `Reliable` or `Window` channel's messages a sender takes after the last
+/// checkpoint before it queues the next behind them, without waiting for the period (and at
+/// most two a period, the receiver's own bucket): 512 KiB. A receiver whose silence clock runs
+/// holds the frames accepted since its last verified checkpoint, twice charged (kept for the
+/// checkpoint, and held), within its channel's 2 MiB; this keeps what a late checkpoint finds
+/// there inside that, so lateness delays frames and loses none.
+pub(crate) const CHECKPOINT_OCTETS: usize = 512 << 10;
+
 /// The largest datagram frame a session names (`S_FRAME_MAX`): what the default `path_mtu_max` of
 /// the link (9,000) carries.
 pub(crate) const FRAME_CAP: usize = 9_000;
@@ -249,6 +257,9 @@ struct Ckpt {
     armed: bool,
     /// When a checkpoint was last queued, or the channel was made.
     last: Option<Instant>,
+    /// Octets of `Reliable` or `Window` messages queued since a checkpoint was last queued
+    /// ([`CHECKPOINT_OCTETS`]).
+    octets: usize,
 }
 
 /// What an emission asks the caller to do once the lock is released.
@@ -755,7 +766,33 @@ impl TxChannel {
         let seq = st.take_seq();
         st.fifo.push(Item::Checkpoint { seq });
         st.ckpt.queued += 1;
+        st.ckpt.octets = 0;
         true
+    }
+
+    /// `octets` of a `Reliable` or `Window` message were queued on the stream's FIFO: once
+    /// [`CHECKPOINT_OCTETS`] have been since the last checkpoint was queued, queue the next
+    /// behind them, whatever the period's timer has done (a timer that cannot run while the
+    /// runtime is busy would otherwise leave the whole burst unchecked). Not within half a
+    /// period of the last: a receiver verifies two a period.
+    fn checkpoint_for_octets(&self, st: &mut State, octets: usize, now: Instant) {
+        let Some(cp) = &self.checkpointing else {
+            return;
+        };
+        st.ckpt.octets = st.ckpt.octets.saturating_add(octets);
+        if st.ckpt.octets < CHECKPOINT_OCTETS {
+            return;
+        }
+        if st
+            .ckpt
+            .last
+            .is_some_and(|at| now.saturating_duration_since(at) < cp.period / 2)
+        {
+            return;
+        }
+        if self.push_checkpoint(st) {
+            st.ckpt.last = Some(now);
+        }
     }
 
     /// One past the highest sequence a checkpoint written now may vouch for: below the first
@@ -1243,7 +1280,9 @@ impl TxChannel {
                 self.stats.dropped.bump();
             }
         } else {
+            let octets = message.payload.len();
             st.fifo.push(Item::Data(message));
+            self.checkpoint_for_octets(st, octets, now);
         }
         Ok(Step::Done(self.kicks(st)))
     }
