@@ -33,6 +33,8 @@ pub(crate) mod key;
 pub(crate) mod latest;
 pub(crate) mod limits;
 pub(crate) mod message;
+pub(crate) mod pair;
+pub(crate) mod qframe;
 pub(crate) mod queues;
 pub(crate) mod replay;
 pub(crate) mod ring;

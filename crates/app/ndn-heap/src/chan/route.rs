@@ -149,7 +149,8 @@ impl Routes {
         true
     }
 
-    fn conn(&self) -> Option<Arc<dyn Connection>> {
+    /// The connection to the forwarder, when one is attached ([`NodeHandle::attach_forwarder`]).
+    pub(crate) fn conn(&self) -> Option<Arc<dyn Connection>> {
         self.conn.lock().clone()
     }
 
@@ -487,14 +488,26 @@ fn up_frame(id: u64, op: UpOp) -> Bytes {
 impl NodeInner {
     /// One frame the forwarder routed to this node's app face.
     async fn chan_side_frame(&self, frame: Bytes, ingress: FaceId) {
-        // The forwarder's own maintenance record: a receiver's `Keep` came back for the id.
-        if let Ok(header) = SideHeader::parse(&frame)
-            && header.kind() == SideKind::Up
-        {
-            if let Ok(UpRecord { id, op: UpOp::Keep }) = UpRecord::parse(&frame) {
-                self.chan.route.note_keep(id);
+        // The forwarder's own maintenance record, and the two frames of the query layer, which
+        // have layouts of their own ([`super::qframe`]): none is a sealed channel frame.
+        if let Ok(header) = SideHeader::parse(&frame) {
+            match header.kind() {
+                SideKind::Up => {
+                    if let Ok(UpRecord { id, op: UpOp::Keep }) = UpRecord::parse(&frame) {
+                        self.chan.route.note_keep(id);
+                    }
+                    return;
+                }
+                SideKind::Query => {
+                    self.query_frame(frame, ingress);
+                    return;
+                }
+                SideKind::Answer => {
+                    self.query_answer_frame(frame);
+                    return;
+                }
+                SideKind::Data | SideKind::Checkpoint | SideKind::Control => {}
             }
-            return;
         }
         self.chan_deliver(frame, ingress.0, Instant::now()).await;
     }
@@ -591,7 +604,7 @@ impl NodeInner {
 
     /// End `session` as left and drop it; nobody is told it ended, since an `Items` made later has
     /// not seen the session it would be told of.
-    fn chan_let_go(&self, session: &RecvSession) {
+    pub(crate) fn chan_let_go(&self, session: &RecvSession) {
         session.end(EndReason::Left);
         self.chan.sessions.remove(session.id());
         self.chan.rx.release_channel(session.id());

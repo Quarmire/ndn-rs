@@ -152,6 +152,8 @@ impl NodeInner {
     /// End every channel of `space` as [`Self::chan_close`] ends one; returns the senders that
     /// were told to.
     pub(crate) fn chan_close_space(&self, space: &Name) -> Vec<Arc<TxChannel>> {
+        // The pairs of its `Ask` channels go with it: no query of the space opens again.
+        self.chan.pairs.drop_space(space);
         let mut told = Vec::new();
         for (mode, ended) in self.chan.channels.close_space(space) {
             if let Some(tx) = self.chan.tx.get(space, mode) {

@@ -152,14 +152,20 @@ pub enum ChannelMode {
     Reliable,
     /// Reliable, plus a replayable history.
     Window,
+    /// A quiet channel for queries: it carries no emission and no checkpoint, holds the route (so
+    /// every hop has a sink for the asker's face and a source toward the server) and gives each
+    /// asker a pairwise key. Queries go up as `QUERY` frames and answers come back as `ANSWER`
+    /// frames, sealed under it (docs/specs/query.md, the channel path).
+    Ask,
 }
 
 impl ChannelMode {
     /// Every mode.
-    pub(crate) const ALL: [ChannelMode; 3] = [
+    pub(crate) const ALL: [ChannelMode; 4] = [
         ChannelMode::Latest,
         ChannelMode::Reliable,
         ChannelMode::Window,
+        ChannelMode::Ask,
     ];
 
     /// The mode's code on the wire.
@@ -168,6 +174,7 @@ impl ChannelMode {
             ChannelMode::Latest => 1,
             ChannelMode::Reliable => 2,
             ChannelMode::Window => 3,
+            ChannelMode::Ask => 4,
         }
     }
 
@@ -177,15 +184,17 @@ impl ChannelMode {
             1 => Ok(ChannelMode::Latest),
             2 => Ok(ChannelMode::Reliable),
             3 => Ok(ChannelMode::Window),
+            4 => Ok(ChannelMode::Ask),
             _ => Err(WireError::Malformed(
-                "a channel mode is 1 (Latest), 2 (Reliable) or 3 (Window)",
+                "a channel mode is 1 (Latest), 2 (Reliable), 3 (Window) or 4 (Ask)",
             )),
         }
     }
 
-    /// Whether the mode needs a stream (it may not drop).
+    /// Whether the mode needs a stream (it may not drop). `Ask` sends no frame of its own on the
+    /// stream: its answers use the stream only when they are too large for a datagram.
     pub(crate) fn needs_stream(self) -> bool {
-        self != ChannelMode::Latest
+        matches!(self, ChannelMode::Reliable | ChannelMode::Window)
     }
 }
 
@@ -831,6 +840,11 @@ impl Announce {
             S_SENDER => once(&mut sender, read_name(v)?, "an announce's sender")?,
             ASK_MODE => {
                 let mode = ChannelMode::from_code(read_nni(&v)?)?;
+                if mode == ChannelMode::Ask {
+                    return Err(WireError::Malformed(
+                        "an announce lists no Ask mode: a server's prefixes (ANN_SERVES) say that it answers queries, and an Ask channel is made by the asker's own ask",
+                    ));
+                }
                 if modes.contains(&mode) {
                     return Err(WireError::Duplicate("an announce's mode"));
                 }

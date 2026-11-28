@@ -30,6 +30,7 @@ use super::bar::BarSlot;
 use super::channels::Channels;
 use super::evidence::EvidenceLog;
 use super::gates::Gates;
+use super::pair::{ASK_IDLE, AskPairs, ServerPairs};
 use super::route::Routes;
 use super::rx::{Receivers, RxStats};
 use super::sessions::{EndReason, RecvSessions};
@@ -258,6 +259,9 @@ pub(crate) fn announce_params(interest: &Interest, digest: &[u8]) -> Option<Byte
     (Sha256::digest(&portion).as_slice() == digest).then(|| params.clone())
 }
 
+/// The locks of the `Ask` asks being made, one per (space, server).
+type AskLocks = HashMap<(Name, Name), Arc<tokio::sync::Mutex<()>>>;
+
 /// What a node keeps of channels.
 pub(crate) struct Chan {
     /// This device's channels as a sender.
@@ -284,6 +288,13 @@ pub(crate) struct Chan {
     pub(crate) bar: BarSlot,
     /// The last [`super::evidence::EVIDENCE_KEPT`] frames shown not to be a sender's.
     pub(crate) evidence: EvidenceLog,
+    /// The pairs this device holds as the server of `Ask` channels ([`super::pair`]).
+    pub(crate) pairs: ServerPairs,
+    /// The pairs it holds as an asker, by session.
+    pub(crate) ask_pairs: AskPairs,
+    /// One lock per (space, server) of the `Ask` asks being made, so they are made one at a
+    /// time ([`NodeInner::chan_ask_since`]).
+    ask_locks: Mutex<AskLocks>,
     /// Test seam: while set, the node's channels send no checkpoints (their sessions say
     /// `S_CKPT_MS` 0), so the tests of frames and batching see the frames they sent and nothing
     /// else. The checkpoint tests clear it.
@@ -311,6 +322,9 @@ impl Chan {
             route: Arc::new(Routes::default()),
             bar: BarSlot::default(),
             evidence: EvidenceLog::default(),
+            pairs: ServerPairs::default(),
+            ask_pairs: AskPairs::default(),
+            ask_locks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             checkpoints_off: std::sync::atomic::AtomicBool::new(true),
             wake: Arc::new(Notify::new()),
@@ -324,6 +338,23 @@ impl Chan {
     /// Wake the maintenance task now.
     pub(crate) fn wake(&self) {
         self.wake.notify_one();
+    }
+
+    /// The lock of the `Ask` asks of this device to `server` over `space`.
+    pub(crate) fn ask_lock(&self, space: &Name, server: &Name) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.ask_locks
+                .lock()
+                .entry((space.clone(), server.clone()))
+                .or_default(),
+        )
+    }
+
+    /// Forget the locks nobody holds.
+    fn ask_locks_sweep(&self) {
+        self.ask_locks
+            .lock()
+            .retain(|_, lock| Arc::strong_count(lock) > 1);
     }
 
     fn is_listening(&self, space: &Name) -> bool {
@@ -608,6 +639,11 @@ impl NodeInner {
             };
             members.as_ref().is_none_or(|m| m.contains(&person))
         };
+        // The pairs of the `Ask` channels are judged by the same rule, and go with the move that
+        // removed their asker: the next query of a removed person finds no pair to open.
+        self.chan
+            .pairs
+            .rejudge(space, judged_at, |owner| stands(&owner.device, &owner.key));
         self.chan
             .channels
             .rejudged(space, judged_at, audience.as_ref(), now, stands)
@@ -641,7 +677,13 @@ impl NodeInner {
                 }
             }
         }
-        let (_lapsed, _ended) = self.chan.channels.expire(now);
+        let (lapsed, _ended) = self.chan.channels.expire(now);
+        for (space, mode, device) in &lapsed {
+            if *mode == ChannelMode::Ask {
+                self.chan.pairs.drop_device(space, device);
+            }
+        }
+        self.chan.pairs.sweep(now);
         // An idle channel says it is alive: an empty checkpoint every 5 s, nothing else.
         for tx in self.chan.tx.all() {
             tx.idle_checkpoint(now);
@@ -662,7 +704,22 @@ impl NodeInner {
         }
         // The receiver: what lapsed ends; a session whose counters moved is judged again; a
         // session due its renewal asks again (the same channel, a new key and lifetime).
+        // A session of an `Ask` channel nobody queried for a minute is let go (with an `Unsub`);
+        // the next query asks again.
+        for id in self.chan.ask_pairs.idle(now, ASK_IDLE) {
+            if let Some(session) = self.chan.sessions.get(id) {
+                self.chan_let_go(&session);
+            }
+            self.chan.ask_pairs.remove(id);
+        }
         self.chan.sessions.lapse(now);
+        self.chan.ask_pairs.retain_sessions(|id| {
+            self.chan
+                .sessions
+                .get(id)
+                .is_some_and(|session| session.ended().is_none())
+        });
+        self.chan.ask_locks_sweep();
         for session in self.chan.sessions.all() {
             if !session.is_current() {
                 let _ = session.recheck(self);
@@ -708,5 +765,7 @@ impl NodeInner {
             session.end(EndReason::Left);
         }
         self.chan.rx.close_all();
+        self.chan.pairs.drop_all();
+        self.chan.ask_pairs.retain_sessions(|_| false);
     }
 }

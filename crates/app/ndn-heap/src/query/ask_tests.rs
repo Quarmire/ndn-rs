@@ -13,8 +13,8 @@ use ndn_foundation_types::Name;
 use super::answers::{ANSWER_QUEUE_BYTES, ANSWER_QUEUE_ITEMS, AnswerSink};
 use super::ask::{Outcome, PENDING_PER_SERVER, PENDING_TOTAL, Pending, drive};
 use super::types::{
-    ANSWER_MAX_DEFAULT, Answered, AppRefusal, Ask, DEADLINE_MAX, QueryError, QueryId, QueryPath,
-    Targets, Via,
+    ANSWER_MAX_CHANNEL, ANSWER_MAX_DEFAULT, Answered, AppRefusal, Ask, DEADLINE_MAX, QueryError,
+    QueryId, QueryPath, Targets, Via,
 };
 use crate::chan::items::Items;
 use crate::chan::verbs::{Author, GetNotice, GetOptions, Got, Kind, Live, Select};
@@ -184,25 +184,36 @@ async fn get_with_ask_refuses_each_bad_request_with_its_reason() {
     )
     .expect("sixteen devices are the most, and are allowed");
 
-    for max in [0, ANSWER_MAX_DEFAULT + 1] {
+    for (via, max) in [
+        (QueryPath::Auto, 0),
+        (QueryPath::Signed, 0),
+        (QueryPath::Signed, ANSWER_MAX_DEFAULT + 1),
+        (QueryPath::Auto, ANSWER_MAX_CHANNEL + 1),
+        (QueryPath::Channel, ANSWER_MAX_CHANNEL + 1),
+    ] {
         let mut ask = base();
+        ask.via = via;
         ask.answer_max = max;
         let why = bad_request(&heap, ask);
-        assert!(why.contains("answer_max") && why.contains("4096"), "{why}");
+        assert!(
+            why.contains("answer_max") && why.contains("4096"),
+            "{via:?} {max}: {why}"
+        );
     }
 
     let mut ask = base();
     ask.via = QueryPath::Channel;
+    ask.proof = true;
     let why = bad_request(&heap, ask);
     assert!(
-        why.contains("not built") && why.contains("QueryPath::Signed"),
-        "says it is not built and what to ask instead: {why}"
+        why.contains("proof") && why.contains("QueryPath::Signed"),
+        "only the signed path proves, and it says what to ask instead: {why}"
     );
-    for via in [QueryPath::Auto, QueryPath::Signed] {
+    for via in [QueryPath::Auto, QueryPath::Signed, QueryPath::Channel] {
         let mut ask = base();
         ask.via = via;
         heap.get(Select::Path(n("/q")), query_only(ask))
-            .expect("the signed path is built");
+            .expect("every path is taken at get");
     }
 
     let why = bad_request(

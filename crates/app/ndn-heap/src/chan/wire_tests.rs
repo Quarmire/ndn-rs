@@ -284,7 +284,7 @@ fn a_record_missing_a_field_or_naming_an_unknown_code_is_refused() {
         Err(WireError::Malformed(_))
     ));
     let mut w = TlvWriter::new();
-    w.write_nested(CHAN_ASK, |w| write_nni(w, ASK_MODE, 4));
+    w.write_nested(CHAN_ASK, |w| write_nni(w, ASK_MODE, 5));
     assert!(matches!(
         ChanAsk::decode(w.finish()),
         Err(WireError::Malformed(_))
@@ -301,6 +301,54 @@ fn a_record_missing_a_field_or_naming_an_unknown_code_is_refused() {
         ChanAsk::decode(twice),
         Err(WireError::Duplicate(_))
     ));
+}
+
+/// The `Ask` mode is code 4 in an ask and in a session (golden octets: the mode field is
+/// `fd0667 01 04`), and an announce lists none: decoding one is refused, with the reason.
+#[test]
+fn the_ask_mode_is_code_4_in_an_ask_and_a_session_and_no_announce_lists_it() {
+    assert_eq!(ChannelMode::Ask.code(), 4);
+    assert_eq!(ChannelMode::ALL.len(), 4);
+    assert!(!ChannelMode::Ask.needs_stream());
+    let ask = ChanAsk {
+        mode: ChannelMode::Ask,
+        ..ask()
+    };
+    let wire = ask.encode().unwrap();
+    assert!(
+        hex(&wire).contains("fd06670104"),
+        "ASK_MODE 4: {}",
+        hex(&wire)
+    );
+    assert_eq!(ChanAsk::decode(wire).unwrap(), ask);
+    let session = SessionRecord {
+        mode: ChannelMode::Ask,
+        ckpt_ms: 0,
+        ..session()
+    };
+    let wire = session.encode().unwrap();
+    assert!(
+        hex(&wire).contains("fd067b0104"),
+        "the session names mode 4: {}",
+        hex(&wire)
+    );
+    let Answer::Session(back) = Answer::decode(wire).unwrap() else {
+        panic!("a session");
+    };
+    assert_eq!(back.mode, ChannelMode::Ask);
+    assert_eq!(back.ckpt_ms, 0);
+
+    let mut w = TlvWriter::new();
+    w.write_nested(CHAN_ANNOUNCE, |w| {
+        write_name_as(w, S_SENDER, &n("/bob/phone"));
+        write_nni(w, ASK_MODE, 1);
+        write_nni(w, ASK_MODE, 4);
+    });
+    let why = Announce::decode(w.finish()).unwrap_err();
+    assert!(
+        why.to_string().contains("no Ask mode"),
+        "an announce that lists Ask says so: {why}"
+    );
 }
 
 /// A session's lifetime is what a receiver counts on its clock: a hostile writer's `2^63` must not

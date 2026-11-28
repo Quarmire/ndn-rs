@@ -300,6 +300,12 @@ impl RecvSession {
         &self.sender
     }
 
+    /// The key name that signed the session answer: the sender's device key as this device found
+    /// it at the last install or renewal. A query's answer is judged by the standing of this key.
+    pub(crate) fn sender_key(&self) -> Name {
+        self.state.lock().sender_key.clone()
+    }
+
     /// The space.
     pub(crate) fn space(&self) -> &Name {
         &self.space

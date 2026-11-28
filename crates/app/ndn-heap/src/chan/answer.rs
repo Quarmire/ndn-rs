@@ -33,27 +33,32 @@
 //! replay limiter admits it, else `Busy` with the time to wait), the key is wrapped to the ask's
 //! recipient and the session is signed, `FreshnessPeriod` 0.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 use ndn_packet::encode::DataBuilder;
 use ndn_packet::{Interest, NackReason};
+use ndn_security::PairKeys;
 use ndn_security::ReplayCheck;
 use ndn_security::Signer;
 use ndn_security::cert_name::key_name_of;
-use ndn_security::confidentiality::{ContentKey, wrap_ck_to};
+use ndn_security::confidentiality::{ContentKey, wrap_ck_to, wrap_ck_to_pair};
 use ndn_transport::FaceId;
 use sha2::{Digest, Sha256};
 
 use super::aead::Aead;
 
-use super::channels::{Admitted, Asker, Cap};
+use super::channels::{Admitted, Asker, Cap, receivers_cap};
 use super::key::ChannelKey;
+use super::pair::{PairOwner, ServerPair, pair_context};
 use super::standing::{Who, gate, standing};
 use super::tx::{ClaimRefused, Terms};
 use super::wire::{
-    ASK_MAX, CarrierOffer, ChanAsk, RefusalCode, RefusalRecord, SessionRecord, Window, carrier,
+    ASK_MAX, CarrierOffer, ChanAsk, ChannelMode, RefusalCode, RefusalRecord, SessionRecord, Window,
+    carrier,
 };
 use crate::error::HeapError;
 use crate::node::NodeInner;
@@ -129,6 +134,33 @@ pub(crate) fn session_data(
     signed(signer, name, &content)
 }
 
+/// [`session_data`] for an `Ask` channel: the key is wrapped to the asker's recipient key as
+/// before, and from the **same** agreement the pair keys of the channel path are derived, bound
+/// to `context` ([`super::pair::pair_context`]). The session record is the one every mode gets;
+/// the pair is what only this server and this asker device hold.
+pub(crate) fn session_data_pair(
+    signer: &dyn Signer,
+    name: &Name,
+    mut record: SessionRecord,
+    key: &ChannelKey,
+    recipient: &[u8; 32],
+    context: &[u8],
+) -> Result<(Bytes, PairKeys), HeapError> {
+    let content = ContentKey::from_bytes(*key.expose());
+    let (ephemeral, sealed, pair) =
+        wrap_ck_to_pair(recipient, &content, &name.encode_to_tlv(), context).map_err(|e| {
+            HeapError::local(format!("the key cannot be wrapped to the asker: {e}"))
+        })?;
+    let mut wrap = ephemeral.to_vec();
+    wrap.extend_from_slice(&sealed.to_bytes());
+    record.wrap = Bytes::from(wrap);
+    record.key_id = key.id();
+    let content = record
+        .encode()
+        .map_err(|e| HeapError::local(format!("the session cannot be written: {e}")))?;
+    Ok((signed(signer, name, &content)?, pair))
+}
+
 /// The signed refusal Data `name`.
 pub(crate) fn refusal_data(
     signer: &dyn Signer,
@@ -145,7 +177,22 @@ enum Verdict {
     /// A signed refusal.
     Refuse(RefusalRecord),
     /// The asker is admitted: sign the session.
-    Admit(Box<Admitted>, ChanAsk),
+    Admit(Box<Admitted>, ChanAsk, Box<AskerFacts>),
+}
+
+/// What the judgement found of the asker, for the pair an `Ask` channel gives it.
+struct AskerFacts {
+    /// The asker's device.
+    device: Name,
+    /// Its person.
+    person: Name,
+    /// The key that signed the ask.
+    key: Name,
+    /// `(trust generation, fold version)` it was judged by.
+    judged_at: (u64, u64),
+    /// The space's fold version itself, which the pair keeps: with the trust generation it says
+    /// at each query whether the asker's standing may have moved.
+    fold: Arc<AtomicU64>,
 }
 
 fn refuse(code: RefusalCode, text: impl Into<String>, retry_ms: u64) -> Verdict {
@@ -182,24 +229,73 @@ impl NodeInner {
         match self.chan_judge(interest, ingress).await {
             Verdict::Nack(reason) => ChanAnswer::Nack(reason),
             Verdict::Refuse(refusal) => self.chan_refusal(&name, &refusal),
-            Verdict::Admit(admitted, ask) => {
+            Verdict::Admit(admitted, ask, who) => {
                 // What the session says of this sender, and the frames queued on the stream
-                // after it. A claim the limiter refuses queues nothing and is told so.
-                let terms = match self.chan_tx_welcome(&ask, &admitted) {
-                    Ok(terms) => terms,
-                    Err(claim) => {
-                        return self.chan_refusal(
-                            &name,
-                            &RefusalRecord {
-                                code: RefusalCode::Busy,
-                                text: claim_refused_text(claim),
-                                retry_ms: claim.retry_ms,
-                            },
-                        );
+                // after it. A claim the limiter refuses queues nothing and is told so. An `Ask`
+                // channel sends no frame of its own: nothing is welcomed, nothing queued.
+                let terms = if ask.mode == ChannelMode::Ask {
+                    Terms {
+                        table: Vec::new(),
+                        window: None,
+                        frame_max: FRAME_MAX,
+                        seq: admitted.seq,
+                        ckpt_ms: 0,
+                    }
+                } else {
+                    match self.chan_tx_welcome(&ask, &admitted) {
+                        Ok(terms) => terms,
+                        Err(claim) => {
+                            return self.chan_refusal(
+                                &name,
+                                &RefusalRecord {
+                                    code: RefusalCode::Busy,
+                                    text: claim_refused_text(claim),
+                                    retry_ms: claim.retry_ms,
+                                },
+                            );
+                        }
                     }
                 };
-                match self.chan_session(&name, &admitted, &ask, terms) {
-                    Ok(wire) => {
+                match self.chan_session(&name, &admitted, &ask, &who, terms) {
+                    Ok((wire, pair)) => {
+                        // The pair is held before the session leaves: the asker may query the
+                        // moment it has the Data.
+                        if let Some((keys, aead)) = pair {
+                            let owner = PairOwner {
+                                space: ask.space.clone(),
+                                channel: admitted.id,
+                                key_epoch: admitted.key_epoch,
+                                device: who.device.clone(),
+                                person: who.person.clone(),
+                                key: who.key.clone(),
+                                stream: ask.carriers.contains(&carrier::STREAM),
+                            };
+                            let now = Instant::now();
+                            let lease = now
+                                + Duration::from_secs(admitted.lifetime)
+                                + super::channels::LEASE_GRACE;
+                            let pair = ServerPair::new(
+                                &keys,
+                                aead,
+                                owner,
+                                who.judged_at,
+                                Arc::clone(&who.fold),
+                                lease,
+                            );
+                            if self.chan.pairs.install(pair, now).is_err() {
+                                return self.chan_refusal(
+                                    &name,
+                                    &RefusalRecord {
+                                        code: RefusalCode::TooMany,
+                                        text: "this device holds as many query pairs as it may \
+                                               (16,384): ask again later, or ask a device that \
+                                               serves fewer askers"
+                                            .into(),
+                                        retry_ms: 30_000,
+                                    },
+                                );
+                            }
+                        }
                         self.signatures
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.chan.stats.answered.bump();
@@ -233,14 +329,18 @@ impl NodeInner {
         }
     }
 
-    /// The signed session for `ask`, as `admitted` gives it, saying `terms` of this sender.
+    /// The signed session for `ask`, as `admitted` gives it, saying `terms` of this sender. For
+    /// an `Ask` channel the key is wrapped with the pair the asker device `who` will hold, which
+    /// is returned with the AEAD the session names.
+    #[allow(clippy::type_complexity)]
     fn chan_session(
         &self,
         name: &Name,
         admitted: &Admitted,
         ask: &ChanAsk,
+        who: &AskerFacts,
         terms: Terms,
-    ) -> Result<Bytes, HeapError> {
+    ) -> Result<(Bytes, Option<(PairKeys, Aead)>), HeapError> {
         let carriers = [carrier::DATAGRAM, carrier::STREAM]
             .into_iter()
             .filter(|kind| ask.carriers.contains(kind))
@@ -278,7 +378,27 @@ impl NodeInner {
         if sized.encode().is_err() {
             session.certs.clear();
         }
+        if ask.mode == ChannelMode::Ask {
+            let aead = session.aead;
+            let context = pair_context(
+                &ask.space,
+                admitted.id,
+                admitted.key_epoch,
+                &who.device,
+                &self.device,
+            );
+            let (wire, keys) = session_data_pair(
+                &*self.signer,
+                name,
+                session,
+                &admitted.key,
+                &ask.recipient,
+                &context,
+            )?;
+            return Ok((wire, Some((keys, aead))));
+        }
         session_data(&*self.signer, name, session, &admitted.key, &ask.recipient)
+            .map(|wire| (wire, None))
     }
 
     async fn chan_judge(&self, interest: &Interest, ingress: Option<FaceId>) -> Verdict {
@@ -505,10 +625,8 @@ impl NodeInner {
                 0,
             );
         }
-        let judged_at = (
-            generation,
-            log.fold.version().load(std::sync::atomic::Ordering::SeqCst),
-        );
+        let fold = log.fold.version();
+        let judged_at = (generation, fold.load(std::sync::atomic::Ordering::SeqCst));
         let asker = Asker {
             device: &asker_device,
             person: &person,
@@ -527,7 +645,17 @@ impl NodeInner {
                     self.chan.stats.rekeys.bump();
                 }
                 drop(log);
-                Verdict::Admit(Box::new(admitted), ask)
+                Verdict::Admit(
+                    Box::new(admitted),
+                    ask,
+                    Box::new(AskerFacts {
+                        device: asker_device,
+                        person,
+                        key,
+                        judged_at,
+                        fold,
+                    }),
+                )
             }
             Err(Cap::Channels) => refuse(
                 RefusalCode::TooMany,
@@ -537,8 +665,11 @@ impl NodeInner {
             ),
             Err(Cap::Receivers) => refuse(
                 RefusalCode::TooMany,
-                "this channel has as many receivers as it may (256): ask again later, when a \
-                 receiver has gone",
+                format!(
+                    "this channel has as many receivers as it may ({}): ask again later, when \
+                     a receiver has gone",
+                    receivers_cap(ask.mode)
+                ),
                 30_000,
             ),
             Err(Cap::Person) => refuse(

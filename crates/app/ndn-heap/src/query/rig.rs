@@ -2,7 +2,7 @@
 //! queries a test builds by hand (a correct one, a sealed one, a hostile one) without going
 //! through `get`, so the server is tested alone.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -15,11 +15,13 @@ use ndn_packet::encode::InterestBuilder;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
 use ndn_packet::{CachePolicyType, Data, Interest, NackReason};
 use ndn_security::PairKeys;
+use ndn_transport::{FaceId, SideClass, SideRefused};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use super::seal::{answer_aad, open_answer, pair_context, query_aad, seal_query};
 use crate::chan::answer::ASK_CLOCK_WINDOW_MS;
+use crate::chan::qframe::QueryHeader;
 use crate::chan::standing::{Who, gate};
 use crate::error::Timestamp;
 use crate::fold::Readers;
@@ -55,10 +57,14 @@ pub(super) async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
 }
 
 /// A face that records the query answers a node sends through it, and the cache policy each
-/// went out with.
+/// went out with, and the side frames (channel frames, `QUERY` and `ANSWER`) it sends; it passes
+/// the side path of its forwarder through (so [`NodeHandle::attach_forwarder`] works on a rig
+/// node), and `swallow_queries` holds the `QUERY` frames back from the forwarder.
 pub(super) struct Tap {
     inner: Arc<dyn Connection>,
     sent: Mutex<Vec<(Name, Option<CachePolicyType>)>>,
+    side: Mutex<Vec<(Bytes, SideClass)>>,
+    swallow_queries: AtomicBool,
 }
 
 impl Tap {
@@ -69,6 +75,32 @@ impl Tap {
             .filter(|(n, _)| n == name)
             .map(|(_, policy)| *policy)
             .collect()
+    }
+
+    /// Every side frame this node sent, in order, with the class it asked for.
+    pub(super) fn side_sent(&self) -> Vec<(Bytes, SideClass)> {
+        self.side.lock().clone()
+    }
+
+    /// The `QUERY` frames this node sent, in order.
+    pub(super) fn queries(&self) -> Vec<Bytes> {
+        self.side
+            .lock()
+            .iter()
+            .filter(|(frame, _)| QueryHeader::parse(frame).is_ok())
+            .map(|(frame, _)| frame.clone())
+            .collect()
+    }
+
+    /// Hold the `QUERY` frames back from the forwarder (`true`): a test then answers them by
+    /// hand. They are still recorded by [`Self::queries`].
+    pub(super) fn swallow_queries(&self, on: bool) {
+        self.swallow_queries.store(on, Ordering::SeqCst);
+    }
+
+    fn note(&self, frame: &Bytes, class: SideClass) -> bool {
+        self.side.lock().push((frame.clone(), class));
+        self.swallow_queries.load(Ordering::SeqCst) && QueryHeader::parse(frame).is_ok()
     }
 }
 
@@ -99,6 +131,42 @@ impl Connection for Tap {
     }
     async fn register_prefix(&self, prefix: &Name) -> Result<(), AppError> {
         self.inner.register_prefix(prefix).await
+    }
+    fn side_frame_max(&self) -> usize {
+        self.inner.side_frame_max()
+    }
+    fn open_side(&self) {
+        self.inner.open_side();
+    }
+    async fn send_side(&self, frame: Bytes, class: SideClass) -> Result<(), AppError> {
+        if self.note(&frame, class) {
+            return Ok(());
+        }
+        self.inner.send_side(frame, class).await
+    }
+    fn try_send_side(&self, frame: Bytes, class: SideClass) -> Result<(), SideRefused> {
+        if self.note(&frame, class) {
+            return Ok(());
+        }
+        self.inner.try_send_side(frame, class)
+    }
+    async fn side_ready(&self) {
+        self.inner.side_ready().await;
+    }
+    async fn recv_side(&self) -> Option<(Bytes, FaceId)> {
+        self.inner.recv_side().await
+    }
+    async fn side_quarantine(&self, face: FaceId) -> Result<Duration, AppError> {
+        self.inner.side_quarantine(face).await
+    }
+    fn side_carries(&self, face: FaceId, class: SideClass) -> bool {
+        self.inner.side_carries(face, class)
+    }
+    fn side_carries_here(&self, class: SideClass) -> bool {
+        self.inner.side_carries_here(class)
+    }
+    fn side_sink_limit(&self, channel: u64) -> Option<usize> {
+        self.inner.side_sink_limit(channel)
     }
 }
 
@@ -191,6 +259,8 @@ async fn start_node(
     let tap = Arc::new(Tap {
         inner: engine.app_face(cancel.child_token()),
         sent: Mutex::new(Vec::new()),
+        side: Mutex::new(Vec::new()),
+        swallow_queries: AtomicBool::new(false),
     });
     let mut config = fast();
     config.clock = rig_clock(Arc::clone(&config.clock), Arc::clone(clocked));

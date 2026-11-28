@@ -26,11 +26,13 @@ use ndn_app::{AppError, Consumer};
 use ndn_foundation_types::Name;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Interest, NackReason};
+use ndn_security::PairKeys;
 use ndn_security::confidentiality::Sealed;
 
 use super::channels::LIFETIME_DEFAULT;
 use super::error::ChanError;
 use super::key::ChannelKey;
+use super::pair::{AskPair, pair_context};
 use super::sessions::{Asking, NotInstalled, RecvSession};
 use super::standing::{Who, gate, standing};
 use super::wire::{Answer, ChanAsk, ChannelMode, SessionRecord, carrier};
@@ -137,6 +139,24 @@ impl NodeInner {
     /// (`ASK_SINCE`): the sender replays what its window holds from there. `None` asks for no
     /// replay.
     pub(crate) async fn chan_ask_since(
+        &self,
+        space: &Name,
+        sender: &Name,
+        mode: ChannelMode,
+        since: Option<u64>,
+    ) -> Result<Arc<RecvSession>, ChanError> {
+        // The asks of one `Ask` channel to one server are made one at a time: each gives a new
+        // pair and replaces the one the server holds, so two in flight could leave this device
+        // with the pair the server has already replaced.
+        let _one_at_a_time = if mode == ChannelMode::Ask {
+            Some(self.chan.ask_lock(space, sender).lock_owned().await)
+        } else {
+            None
+        };
+        self.chan_ask_unlocked(space, sender, mode, since).await
+    }
+
+    async fn chan_ask_unlocked(
         &self,
         space: &Name,
         sender: &Name,
@@ -372,9 +392,17 @@ impl NodeInner {
                     });
                 }
             }
-            // 6. The key.
-            let channel_key =
-                unwrap_session_key(self, &record, name).map_err(|why| bad_answer(sender, why))?;
+            // 6. The key (and, for an `Ask` channel, the pair of the same agreement).
+            let (channel_key, pair) = if mode == ChannelMode::Ask {
+                let (key, keys) = unwrap_session_pair(self, &record, name, sender)
+                    .map_err(|why| bad_answer(sender, why))?;
+                (key, Some(keys))
+            } else {
+                let key = unwrap_session_key(self, &record, name)
+                    .map_err(|why| bad_answer(sender, why))?;
+                (key, None)
+            };
+            let (record_id, record_epoch, record_aead) = (record.id, record.key_epoch, record.aead);
             // 7. Installed.
             let judged_at = (generation, log.fold.version().load(Ordering::SeqCst));
             let now = Instant::now();
@@ -429,6 +457,12 @@ impl NodeInner {
                     (session, Some(replay))
                 }
             };
+            if let Some(keys) = pair {
+                self.chan.ask_pairs.set(
+                    session.id(),
+                    AskPair::new(&keys, record_aead, record_id, record_epoch, Instant::now()),
+                );
+            }
             self.chan.stats.installed.bump();
             (session, replay)
         };
@@ -455,6 +489,43 @@ pub(crate) fn unwrap_session_key(
         return Err("the key it wraps is not the key it names (S_KEY_ID)".into());
     }
     Ok(key)
+}
+
+/// [`unwrap_session_key`] for an `Ask` channel, and the pair keys of the same agreement, bound to
+/// the space, the channel, the key epoch, this device and `server`.
+pub(crate) fn unwrap_session_pair(
+    node: &NodeInner,
+    record: &SessionRecord,
+    name: &Name,
+    server: &Name,
+) -> Result<(ChannelKey, PairKeys), String> {
+    let wrap = &record.wrap;
+    if wrap.len() <= EPHEMERAL {
+        return Err("the wrapped key is too short".into());
+    }
+    let ephemeral = <[u8; 32]>::try_from(&wrap[..EPHEMERAL]).expect("32 octets");
+    let sealed = Sealed::from_bytes(&wrap[EPHEMERAL..])
+        .map_err(|e| format!("the wrapped key is malformed ({e})"))?;
+    let context = pair_context(
+        &record.space,
+        record.id,
+        record.key_epoch,
+        &node.device,
+        server,
+    );
+    let (opened, keys) = node
+        .recipient()
+        .unwrap_ck_pair(&ephemeral, &sealed, &name.encode_to_tlv(), &context)
+        .map_err(|_| {
+            "the key does not open under this device's recipient secret with the Data's name \
+             as its AAD: it was wrapped to another device, or to another name"
+                .to_string()
+        })?;
+    let key = ChannelKey::from_bytes(*opened.expose());
+    if key.id() != record.key_id {
+        return Err("the key it wraps is not the key it names (S_KEY_ID)".into());
+    }
+    Ok((key, keys))
 }
 
 /// The 32 octets `wrap` (the ephemeral key, then the sealed key) hides, opened with `recipient`

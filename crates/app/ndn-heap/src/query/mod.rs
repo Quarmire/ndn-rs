@@ -11,6 +11,12 @@ mod answers;
 mod ask;
 #[cfg(test)]
 mod ask_tests;
+mod chan_ask;
+#[cfg(test)]
+mod chan_ask_tests;
+mod chan_serve;
+#[cfg(test)]
+mod chan_serve_tests;
 #[cfg(test)]
 mod rig;
 mod seal;
@@ -31,10 +37,10 @@ pub(crate) use seal::{
 pub(crate) use serve::QueryOutcome;
 pub use serving::Serving;
 pub use types::{
-    ANSWER_MAX_DEFAULT, Answered, AppRefusal, Ask, Asker, DEADLINE_MAX, Handler, HandlerFuture,
-    ProofError, ProvenAnswer, QUERY_MAX, Query, QueryError, QueryId, QueryPath, REFUSAL_TEXT_MAX,
-    Reply, SERVE_PREFIX_MAX, SERVE_PREFIXES_MAX, ServeError, TARGETS_MAX, Targets, VerifiedAnswer,
-    Via,
+    ANSWER_MAX_CHANNEL, ANSWER_MAX_DEFAULT, Answered, AppRefusal, Ask, Asker, CHANNEL_QUERY_MAX,
+    DEADLINE_MAX, Handler, HandlerFuture, ProofError, ProvenAnswer, QUERY_MAX, Query, QueryError,
+    QueryId, QueryPath, REFUSAL_TEXT_MAX, Reply, SERVE_PREFIX_MAX, SERVE_PREFIXES_MAX, ServeError,
+    TARGETS_MAX, Targets, VerifiedAnswer, Via,
 };
 
 /// What a node keeps of queries: the prefixes it serves, the announce hints it has heard, and

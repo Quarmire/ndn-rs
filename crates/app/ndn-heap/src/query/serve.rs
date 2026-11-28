@@ -61,7 +61,7 @@ use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 use super::seal::{answer_aad, open_query, pair_context, query_aad, seal_answer};
-use super::types::{Asker, Query, QueryId, Reply, Via};
+use super::types::{Asker, Handler, Query, QueryId, Reply, Via};
 use crate::chan::answer::ASK_CLOCK_WINDOW_MS;
 use crate::chan::standing::{Who, gate, standing};
 use crate::chan::verify::Bucket;
@@ -93,6 +93,13 @@ pub(crate) const HANDLERS_MAX: usize = 64;
 /// verified.
 pub(crate) const PERSON_RATE: f64 = 64.0;
 pub(crate) const PERSON_BURST: f64 = 128.0;
+
+/// The queries a second one asker person is admitted on the channel path, and the burst: a bucket
+/// of its own (the signed path's is the dearer one, a signature each). Charged once the query has
+/// opened under the pair key and its counter is marked (step 8 of `chan_serve`): charged before,
+/// a forger who names a valid pair id could drain the person's bucket; over it, a sealed `Busy`.
+pub(crate) const CHAN_RATE: f64 = 256.0;
+pub(crate) const CHAN_BURST: f64 = 256.0;
 
 /// The answer octets a second one asker person is sent, and the burst (4 MiB each).
 pub(crate) const PERSON_OCTETS_RATE: f64 = 4.0 * 1024.0 * 1024.0;
@@ -235,6 +242,8 @@ impl Octets {
 struct Person {
     inflight: usize,
     rate: Bucket,
+    /// The channel path's bucket ([`CHAN_RATE`]).
+    chan_rate: Bucket,
     octets: Octets,
     last: Instant,
 }
@@ -244,6 +253,7 @@ impl Person {
         Person {
             inflight: 0,
             rate: Bucket::new(PERSON_RATE, PERSON_BURST),
+            chan_rate: Bucket::new(CHAN_RATE, CHAN_BURST),
             octets: Octets {
                 credit: PERSON_OCTETS_RATE,
                 at: None,
@@ -262,19 +272,33 @@ pub(crate) struct Slot<'a> {
 impl Slot<'_> {
     /// The answer of `octets` was sent to the person: her budget of answer octets pays for it.
     pub(crate) fn charge(&self, octets: usize, now: Instant) {
-        if let Some(p) = self.server.people.lock().get_mut(&self.person) {
-            p.octets.refill(now);
-            p.octets.credit -= octets as f64;
-        }
+        self.server.charge(&self.person, octets, now);
     }
 }
 
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
-        self.server.running.fetch_sub(1, Ordering::SeqCst);
-        if let Some(p) = self.server.people.lock().get_mut(&self.person) {
-            p.inflight = p.inflight.saturating_sub(1);
-        }
+        self.server.release(&self.person);
+    }
+}
+
+/// A [`Slot`] that holds its node, for a handler that runs in a task of its own: the place is
+/// taken when the query arrives and given back when the task ends.
+pub(crate) struct OwnedSlot {
+    node: Arc<NodeInner>,
+    person: Name,
+}
+
+impl OwnedSlot {
+    /// The answer of `octets` was sent to the person: her budget of answer octets pays for it.
+    pub(crate) fn charge(&self, octets: usize, now: Instant) {
+        self.node.query.server.charge(&self.person, octets, now);
+    }
+}
+
+impl Drop for OwnedSlot {
+    fn drop(&mut self) {
+        self.node.query.server.release(&self.person);
     }
 }
 
@@ -328,6 +352,31 @@ fn drop_idlest_of_the_largest_holder(pairs: &mut HashMap<(Name, Name), ServerPai
     }
 }
 
+/// The counters of `person`, new at `now` if none are held; the people idle for a while are
+/// swept first when many are held.
+fn person_of<'a>(
+    people: &'a mut HashMap<Name, Person>,
+    person: &Name,
+    now: Instant,
+) -> &'a mut Person {
+    if people.len() >= PEOPLE_SWEEP {
+        people.retain(|_, p| p.inflight > 0 || now.saturating_duration_since(p.last) < REPLAY_KEPT);
+    }
+    let p = people
+        .entry(person.clone())
+        .or_insert_with(|| Person::new(now));
+    p.last = now;
+    p
+}
+
+/// Run `handler` on `query` under the asker's deadline, which both paths share: its reply, or
+/// `None` when the deadline came first (the handler's future is dropped and whatever it would
+/// have answered is never sent).
+pub(crate) async fn run_handler(handler: &Arc<dyn Handler>, query: Query) -> Option<Reply> {
+    let wait = query.deadline.saturating_duration_since(Instant::now());
+    rt::timeout(wait, handler.answer(query)).await.ok()
+}
+
 // -- What the server keeps -------------------------------------------------------------------------
 
 /// What the server keeps: its limits, its replay set and its pair keys. In memory, bounded by the
@@ -348,32 +397,29 @@ pub(crate) struct ServerState {
 }
 
 impl ServerState {
-    /// One token of `person`'s query rate.
+    /// One token of `person`'s query rate on the signed path.
     pub(crate) fn admit(&self, person: &Name, now: Instant) -> bool {
-        let mut people = self.people.lock();
-        if people.len() >= PEOPLE_SWEEP {
-            people.retain(|_, p| {
-                p.inflight > 0 || now.saturating_duration_since(p.last) < REPLAY_KEPT
-            });
-        }
-        let p = people
-            .entry(person.clone())
-            .or_insert_with(|| Person::new(now));
-        p.last = now;
-        p.rate.take(now)
+        person_of(&mut self.people.lock(), person, now)
+            .rate
+            .take(now)
     }
 
-    /// A place for `person`'s handler: the node runs fewer than [`HANDLERS_MAX`], the person
+    /// One token of `person`'s query rate on the channel path ([`CHAN_RATE`]): not the signed
+    /// path's bucket, so one path's load never spends the other's.
+    pub(crate) fn admit_channel(&self, person: &Name, now: Instant) -> bool {
+        person_of(&mut self.people.lock(), person, now)
+            .chan_rate
+            .take(now)
+    }
+
+    /// Take a place for `person`'s handler: the node runs fewer than [`HANDLERS_MAX`], the person
     /// fewer than [`PERSON_INFLIGHT`], and she has answer octets left to be sent.
-    pub(crate) fn slot(&self, person: &Name, now: Instant) -> Option<Slot<'_>> {
+    fn take(&self, person: &Name, now: Instant) -> bool {
         let mut people = self.people.lock();
-        let p = people
-            .entry(person.clone())
-            .or_insert_with(|| Person::new(now));
-        p.last = now;
+        let p = person_of(&mut people, person, now);
         p.octets.refill(now);
         if p.inflight >= PERSON_INFLIGHT || p.octets.credit <= 0.0 {
-            return None;
+            return false;
         }
         if self
             .running
@@ -382,11 +428,44 @@ impl ServerState {
             })
             .is_err()
         {
-            return None;
+            return false;
         }
         p.inflight += 1;
-        Some(Slot {
+        true
+    }
+
+    /// Give back a place [`Self::take`] gave.
+    fn release(&self, person: &Name) {
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        if let Some(p) = self.people.lock().get_mut(person) {
+            p.inflight = p.inflight.saturating_sub(1);
+        }
+    }
+
+    /// An answer of `octets` was sent to `person`: her budget of answer octets pays for it.
+    fn charge(&self, person: &Name, octets: usize, now: Instant) {
+        if let Some(p) = self.people.lock().get_mut(person) {
+            p.octets.refill(now);
+            p.octets.credit -= octets as f64;
+        }
+    }
+
+    /// A place for `person`'s handler ([`Self::take`]), given back when the [`Slot`] drops.
+    pub(crate) fn slot(&self, person: &Name, now: Instant) -> Option<Slot<'_>> {
+        self.take(person, now).then(|| Slot {
             server: self,
+            person: person.clone(),
+        })
+    }
+
+    /// [`Self::slot`] for a handler that runs in a task of its own.
+    pub(crate) fn slot_owned(
+        node: &Arc<NodeInner>,
+        person: &Name,
+        now: Instant,
+    ) -> Option<OwnedSlot> {
+        node.query.server.take(person, now).then(|| OwnedSlot {
+            node: Arc::clone(node),
             person: person.clone(),
         })
     }
@@ -796,8 +875,7 @@ impl NodeInner {
             via: Via::Signed,
             deadline,
         };
-        let wait = deadline.saturating_duration_since(Instant::now());
-        let Ok(reply) = rt::timeout(wait, handler.answer(query)).await else {
+        let Some(reply) = run_handler(&handler, query).await else {
             return QueryOutcome::Silent;
         };
         let Some(status) = status_of(reply) else {

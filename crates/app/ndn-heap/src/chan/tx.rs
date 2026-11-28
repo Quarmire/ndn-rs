@@ -2523,6 +2523,8 @@ fn index(mode: ChannelMode) -> usize {
         ChannelMode::Latest => 0,
         ChannelMode::Reliable => 1,
         ChannelMode::Window => 2,
+        // `emit` names a `Mode`, which has no `Ask`: an `Ask` channel has no sender.
+        ChannelMode::Ask => unreachable!("no emission is made in the Ask mode"),
     }
 }
 

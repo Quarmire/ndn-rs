@@ -304,6 +304,8 @@ impl Modes {
             ChannelMode::Latest => self.latest,
             ChannelMode::Reliable => self.reliable,
             ChannelMode::Window => self.window,
+            // A query is not a message of a live channel: no `Modes` joins the `Ask` channel.
+            ChannelMode::Ask => false,
         }
     }
 }

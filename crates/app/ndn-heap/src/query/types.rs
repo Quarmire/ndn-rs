@@ -10,6 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 
+use crate::chan::error::ChanError;
 use crate::error::{NextStep, Timestamp};
 use crate::rt::Instant;
 
@@ -25,8 +26,7 @@ impl std::fmt::Display for QueryId {
     }
 }
 
-/// Which path a query came by. The enum grows with the channel path: match it with a wildcard
-/// arm.
+/// Which path a query came by. The enum grows with the paths: match it with a wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Via {
@@ -36,22 +36,38 @@ pub enum Via {
     /// asker's clock. In a sealed space the octets are sealed to the pair of devices as well; the
     /// signature covers the sealed octets, so a proof there shows the exchange and not its words.
     Signed,
+    /// A `QUERY` and an `ANSWER` frame of an `Ask` channel, each sealed under one of the two keys
+    /// of the pair the asker and the server share (docs/specs/query.md, the channel path). The
+    /// frame that opens under the asker's key is the asker's and the one that opens under the
+    /// server's key is the server's: origin authentication between those two devices and **no
+    /// proof** for a third party (either could have made any frame), which is why
+    /// [`Ask::proof`] is signed-path only. The pair seals every query, in a public space as well
+    /// as a sealed one.
+    Sealed,
 }
 
-/// Which path a query takes ([`Ask::via`]).
+/// Which path a query takes ([`Ask::via`]), per server asked.
 ///
-/// Only the signed path is built: [`QueryPath::Channel`] is refused at `get` with the reason and
-/// what to ask instead, and [`QueryPath::Auto`] takes the channel only for a session the
-/// application opened with `Channel`, so it is always the signed path until the channel path
-/// exists.
+/// * [`QueryPath::Auto`] takes the channel only for a server whose `Ask` session this device
+///   already holds with a pair (an earlier `Channel` query or [`ask_channel_in`] with
+///   `ChannelMode::Ask` made it, and it has not been idle for 60 s), a forwarder is attached, the
+///   query fits one channel frame ([`CHANNEL_QUERY_MAX`] octets of query, a frame of at most
+///   1,150 octets) and [`Ask::proof`] is not set. Otherwise it is the signed path. It never
+///   creates a session.
+/// * [`QueryPath::Channel`] creates the `Ask` session if none is held (one signed ask, inside the
+///   deadline) and never falls back to signed: a refused setup is
+///   [`QueryError::NoSession`] with the setup's reason, and a node without a forwarder is
+///   [`QueryError::NotReady`].
+///
+/// [`ask_channel_in`]: crate::NodeHandle::ask_channel_in
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum QueryPath {
-    /// The channel for a session this application opened, else signed. The default.
+    /// The channel for a server whose session this device holds, else signed. The default.
     #[default]
     Auto,
     /// Always the signed Interest.
     Signed,
-    /// Always the channel, opening its session if none is held. Refused until it is built.
+    /// Always the channel, opening its session if none is held.
     Channel,
 }
 
@@ -72,8 +88,16 @@ pub enum Targets {
 /// The most servers one query asks.
 pub const TARGETS_MAX: usize = 16;
 
-/// The most octets of a query on the signed path.
+/// The most octets of a query on the signed path (and on `Auto`, which may fall to it).
 pub const QUERY_MAX: usize = crate::wire::QUERY_BYTES_MAX;
+
+/// The most octets of a query on the channel path: one datagram on the smallest floor
+/// ([`QueryPath::Channel`] refuses more; [`QueryPath::Auto`] goes signed for it).
+pub const CHANNEL_QUERY_MAX: usize = crate::chan::qframe::QUERY_BYTES_MAX;
+
+/// The most octets of an answer the channel path carries, and the most `answer_max` it allows:
+/// 64 KiB (a datagram when the sealed frame fits, else a stream frame).
+pub const ANSWER_MAX_CHANNEL: usize = 65_536;
 
 /// The longest deadline of a query: ten seconds.
 pub const DEADLINE_MAX: Duration = Duration::from_secs(10);
@@ -83,7 +107,8 @@ pub const DEADLINE_MAX: Duration = Duration::from_secs(10);
 /// Build one with [`Ask::new`]: the fields are public and the defaults are the ones listed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ask {
-    /// The query octets: at most [`QUERY_MAX`] (2,048).
+    /// The query octets: at most [`QUERY_MAX`] (2,048) on the signed path, at most
+    /// [`CHANNEL_QUERY_MAX`] (1,024) on [`QueryPath::Channel`].
     pub query: Bytes,
     /// Who is asked (default [`Targets::Serving`]).
     pub targets: Targets,
@@ -93,8 +118,9 @@ pub struct Ask {
     /// s). **Liveness only**: a late answer is dropped and counted as silence; nothing the
     /// application decides should depend on the deadline.
     pub deadline: Duration,
-    /// The largest answer told (default [`ANSWER_MAX_DEFAULT`]); a larger one is a
-    /// [`QueryError::AnswerTooLarge`] failure.
+    /// The largest answer told (default [`ANSWER_MAX_DEFAULT`], 4,096): at most
+    /// [`ANSWER_MAX_DEFAULT`] on [`QueryPath::Signed`], at most [`ANSWER_MAX_CHANNEL`] (65,536)
+    /// on `Channel` and `Auto`. A larger answer is a [`QueryError::AnswerTooLarge`] failure.
     pub answer_max: usize,
     /// Keep the proof of each answer ([`Answered::proof`]: the signed query and the signed
     /// answer, which a third party verifies from the space's record with
@@ -531,6 +557,20 @@ pub enum QueryError {
         /// Why, and what to do.
         why: String,
     },
+    /// [`QueryPath::Channel`] could not set up the `Ask` session the query goes over: the
+    /// setup's own refusal, which says why and what to do ([`ChanError::next`]). The query was
+    /// not sent signed instead.
+    #[error("the channel session for the query cannot be set up: {why}")]
+    NoSession {
+        /// The setup's refusal.
+        why: ChanError,
+    },
+    /// This device's queue to its forwarder is full: the query was not sent.
+    #[error(
+        "this device's queue to its forwarder is full, so the query was not sent; try again in a \
+         moment, with fewer queries at once"
+    )]
+    Congested,
 }
 
 impl QueryError {
@@ -545,8 +585,10 @@ impl QueryError {
             | QueryError::Unreachable
             | QueryError::BadAnswer { .. }
             | QueryError::TooManyOutstanding
+            | QueryError::Congested
             | QueryError::NotReady { .. } => NextStep::RetryLater,
             QueryError::TooLarge { .. } | QueryError::AnswerTooLarge { .. } => NextStep::FixRequest,
+            QueryError::NoSession { why } => why.next(),
         }
     }
 }

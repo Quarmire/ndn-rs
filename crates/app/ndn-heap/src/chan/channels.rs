@@ -37,6 +37,19 @@ pub(crate) const CHANNELS_PER_SENDER: usize = 64;
 /// The most receivers one channel keeps.
 pub(crate) const RECEIVERS_PER_CHANNEL: usize = 256;
 
+/// The most receivers (askers) one `Ask` channel keeps: a receiver of it holds a pair of keys
+/// (about 200 octets with its replay window) and no frames are sent to it, so the cap is four
+/// times the others'.
+pub(crate) const ASKERS_PER_CHANNEL: usize = 1_024;
+
+/// The receivers `mode`'s channel keeps at most.
+pub(crate) const fn receivers_cap(mode: ChannelMode) -> usize {
+    match mode {
+        ChannelMode::Ask => ASKERS_PER_CHANNEL,
+        _ => RECEIVERS_PER_CHANNEL,
+    }
+}
+
 /// The most receivers of one channel one person's devices may hold. A person chooses how many
 /// devices ask with her keys, so the channel's places are bounded per person: no member can fill
 /// them for the others (the channel keeps 256, so at least eight people can always be receivers).
@@ -460,7 +473,7 @@ impl Channels {
             if hers >= RECEIVERS_PER_PERSON {
                 return Err(Cap::Person);
             }
-            if channel.receivers.len() >= RECEIVERS_PER_CHANNEL {
+            if channel.receivers.len() >= receivers_cap(mode) {
                 return Err(Cap::Receivers);
             }
         }
@@ -472,7 +485,7 @@ impl Channels {
             r.delivered == channel.key_epoch
                 && now.saturating_duration_since(r.issued) >= r.lifetime / 2
         });
-        let rekeyed = renewal && channel.rekey_allowed(now);
+        let rekeyed = renewal && mode != ChannelMode::Ask && channel.rekey_allowed(now);
         if rekeyed {
             channel.rekey(now);
         }
@@ -522,13 +535,14 @@ impl Channels {
         Some(table.channels.get(&(space.clone(), mode))?.send_key())
     }
 
-    /// The modes of the channels of `space`.
+    /// The modes of the channels of `space` that an announce lists: an `Ask` channel is not one
+    /// (the prefixes a device serves say it answers queries, and the channel is the asker's).
     pub(crate) fn modes(&self, space: &Name) -> Vec<ChannelMode> {
         let table = self.table.lock();
         table
             .channels
             .keys()
-            .filter(|(s, _)| s == space)
+            .filter(|(s, m)| s == space && *m != ChannelMode::Ask)
             .map(|(_, m)| *m)
             .collect()
     }
@@ -638,7 +652,9 @@ impl Channels {
             for device in gone {
                 channel.receivers.remove(&device);
                 lapsed.push((space.clone(), *mode, device));
-                channel.rekey_owed = true;
+                if *mode != ChannelMode::Ask {
+                    channel.rekey_owed = true;
+                }
             }
             // A lapse is a key an absent receiver may still hold, not an emergency: the lapses of
             // a stretch are one re-key, made when [`REKEY_MIN`] has passed since the last.

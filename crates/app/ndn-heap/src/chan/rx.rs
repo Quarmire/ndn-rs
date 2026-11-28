@@ -2474,6 +2474,13 @@ impl NodeInner {
             // A session whose held frames are being taken in is not yet taking frames: a stream
             // frame that arrives meanwhile queues behind them, so the order of arrival is kept.
             if let Some(session) = known.filter(|_| !rx.replaying(header.channel)) {
+                // An `Ask` channel carries no emission and no checkpoint: its sender sends none,
+                // and a frame of a data layout that names its id is dropped before any key is
+                // tried (the channel key every asker holds opens no frame of it).
+                if session.mode() == ChannelMode::Ask {
+                    stats.kind.bump();
+                    return Delivery::Dropped(Dropped::Kind);
+                }
                 let channel = rx.channel_for(&session, self);
                 rx.remember(generation, &channel);
                 return channel.receive(self, header, frame, ingress, now).await;

@@ -37,6 +37,15 @@ impl NodeHandle {
     }
 
     /// [`Self::ask_channel`] for a channel of `mode`.
+    ///
+    /// With [`ChannelMode::Ask`] the session carries no emission: it gives this device and the
+    /// server a **pair** of keys that seal the `QUERY` and `ANSWER` frames of queries
+    /// ([`QueryPath::Channel`](crate::QueryPath::Channel); [`QueryPath::Auto`](crate::QueryPath::Auto)
+    /// takes the channel for a server whose `Ask` session is held). A `Channel` query makes the
+    /// session itself, so this is for an application that wants it warm before its first `Auto`
+    /// query. The session is kept while queries use it, and let go (with an `Unsub`) after a minute
+    /// with none, or after three queries in a row that the server never answered: asking again
+    /// makes a new one. The errors are those of [`Self::ask_channel`].
     pub async fn ask_channel_in(
         &self,
         space: &Name,

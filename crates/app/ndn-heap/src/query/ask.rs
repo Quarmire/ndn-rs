@@ -40,8 +40,9 @@ use sha2::{Digest, Sha256};
 
 use super::answers::AnswerSink;
 use super::types::{
-    ANSWER_MAX_DEFAULT, Answered, AppRefusal, Ask, DEADLINE_MAX, ProofError, ProvenAnswer,
-    QUERY_MAX, QueryError, QueryId, QueryPath, TARGETS_MAX, Targets, VerifiedAnswer, Via,
+    ANSWER_MAX_CHANNEL, ANSWER_MAX_DEFAULT, Answered, AppRefusal, Ask, CHANNEL_QUERY_MAX,
+    DEADLINE_MAX, ProofError, ProvenAnswer, QUERY_MAX, QueryError, QueryId, QueryPath, TARGETS_MAX,
+    Targets, VerifiedAnswer, Via,
 };
 use super::{answer_aad, open_answer, pair_context, query_aad, seal_query};
 use crate::chan::ask::is_reserved;
@@ -67,11 +68,12 @@ pub(crate) const PENDING_PER_SERVER: usize = 16;
 /// The most server seal keys, and the most pair keys, one node caches.
 pub(crate) const KEYS_MAX: usize = 64;
 
-/// What the asker keeps: its pending queries and its pair keys.
+/// What the asker keeps: its pending queries, its pair keys, and the state of the channel path.
 #[derive(Default)]
 pub(crate) struct AskState {
-    pending: Mutex<Pending>,
+    pub(super) pending: Mutex<Pending>,
     keys: Mutex<Keys>,
+    pub(crate) chan: super::chan_ask::ChanAskState,
 }
 
 // -- The pending set ------------------------------------------------------------------------------
@@ -396,11 +398,11 @@ pub(crate) async fn drive<F, Fut>(
 /// A query judged at creation, ready to run.
 pub(crate) struct Run {
     pub(crate) sink: Arc<AnswerSink>,
-    held: Arc<SpaceInner>,
-    path: Name,
-    ask: Ask,
-    id: QueryId,
-    deadline: Instant,
+    pub(super) held: Arc<SpaceInner>,
+    pub(super) path: Name,
+    pub(super) ask: Ask,
+    pub(super) id: QueryId,
+    pub(super) deadline: Instant,
 }
 
 #[cfg(test)]
@@ -452,16 +454,16 @@ fn fetch_stop(e: AppError) -> Stop {
     }
 }
 
-fn bad_answer(why: impl Into<String>) -> Stop {
+pub(super) fn bad_answer(why: impl Into<String>) -> Stop {
     Stop::Failed(QueryError::BadAnswer { why: why.into() })
 }
 
-fn not_ready(why: impl Into<String>) -> Stop {
+pub(super) fn not_ready(why: impl Into<String>) -> Stop {
     Stop::Failed(QueryError::NotReady { why: why.into() })
 }
 
 /// The milliseconds of `remaining`, rounded up, within what the wire carries.
-fn deadline_ms(remaining: Duration) -> u32 {
+pub(super) fn deadline_ms(remaining: Duration) -> u32 {
     let ms = remaining.as_micros().div_ceil(1000);
     u32::try_from(ms)
         .unwrap_or(DEADLINE_MAX_MS)
@@ -487,13 +489,23 @@ impl NodeInner {
                     .into(),
             });
         }
-        if ask.via == QueryPath::Channel {
+        let channel = ask.via == QueryPath::Channel;
+        if channel && ask.proof {
             return Err(bad(
-                "QueryPath::Channel is not built in this version of the layer: ask \
-                 QueryPath::Signed, or QueryPath::Auto (which is the signed path until the \
-                 channel path exists)"
+                "QueryPath::Channel cannot keep a proof: a frame sealed to a pair proves nothing to \
+                 a third party (either device could have made it), and only the signed path \
+                 proves; ask QueryPath::Signed, or QueryPath::Auto (which goes signed when a proof \
+                 is asked), or ask without Ask::proof"
                     .into(),
             ));
+        }
+        if channel && ask.query.len() > CHANNEL_QUERY_MAX {
+            return Err(bad(format!(
+                "the query is {} octets, over the limit of {CHANNEL_QUERY_MAX} on \
+                 QueryPath::Channel: send less, or put the data and send its path; \
+                 QueryPath::Auto sends up to {QUERY_MAX} octets by the signed path",
+                ask.query.len()
+            )));
         }
         if ask.query.len() > QUERY_MAX {
             return Err(bad(format!(
@@ -509,11 +521,21 @@ impl NodeInner {
                 ask.deadline, DEADLINE_MAX
             )));
         }
-        if ask.answer_max == 0 || ask.answer_max > ANSWER_MAX_DEFAULT {
+        if ask.via == QueryPath::Signed {
+            if ask.answer_max == 0 || ask.answer_max > ANSWER_MAX_DEFAULT {
+                return Err(bad(format!(
+                    "answer_max is {}: the signed path carries answers of 1 to \
+                     {ANSWER_MAX_DEFAULT} octets; ask for a size in that range, ask \
+                     QueryPath::Auto or QueryPath::Channel (they carry up to {ANSWER_MAX_CHANNEL}), \
+                     or have the handler put the data and answer its path",
+                    ask.answer_max
+                )));
+            }
+        } else if ask.answer_max == 0 || ask.answer_max > ANSWER_MAX_CHANNEL {
             return Err(bad(format!(
-                "answer_max is {}: the signed path carries answers of 1 to {ANSWER_MAX_DEFAULT} \
-                 octets; ask for a size in that range, or have the handler put the data and \
-                 answer its path",
+                "answer_max is {}: the channel path carries answers of 1 to {ANSWER_MAX_CHANNEL} \
+                 octets (the signed path 1 to {ANSWER_MAX_DEFAULT}); ask for a size in that \
+                 range, or have the handler put the data and answer its path",
                 ask.answer_max
             )));
         }
@@ -526,6 +548,17 @@ impl NodeInner {
                 "the asked path is {path_octets} octets, over the limit of {QUERY_PATH_MAX}: ask a \
                  shorter path"
             )));
+        }
+        if channel {
+            let frame = super::chan_ask::frame_len(&path, ask.query.len());
+            if frame > super::chan_ask::FRAME_MAX {
+                return Err(bad(format!(
+                    "the query would be a frame of {frame} octets, over the {} a datagram carries \
+                     on every path: ask a shorter path or send less, or ask QueryPath::Auto (it \
+                     goes signed for a query that does not fit one frame)",
+                    super::chan_ask::FRAME_MAX
+                )));
+            }
         }
         if let Targets::Devices(devices) = &ask.targets {
             if devices.is_empty() {
@@ -688,7 +721,6 @@ impl NodeInner {
     }
 
     async fn ask_server_inner(self: &Arc<Self>, run: &Run, server: &Name) -> Result<Outcome, Stop> {
-        let space = &run.held.name;
         // Judged now, from the record held: a query goes to a writer's device and to no other.
         let (writer, sealed, judged_at) = {
             let person = self.person_of(server);
@@ -724,6 +756,24 @@ impl NodeInner {
                 server: server.clone(),
             }
         };
+        // The channel where this server's path is the channel (docs of `chan_ask`).
+        if let Some((session, pair)) = self.query_channel_for(run, server).await? {
+            return self.ask_server_channel(run, server, &session, pair).await;
+        }
+        self.ask_signed(run, server, sealed, judged_at).await
+    }
+
+    /// Ask `server` once by the signed path: one signed Interest, one signed Data judged.
+    /// `sealed` is the epoch in force of a sealed space and `judged_at` what the judges said when
+    /// `server` was found a writer.
+    async fn ask_signed(
+        self: &Arc<Self>,
+        run: &Run,
+        server: &Name,
+        sealed: Option<Option<EpochId>>,
+        judged_at: (u64, u64),
+    ) -> Result<Outcome, Stop> {
+        let space = &run.held.name;
         // A sealed space seals the query to the server's recipient key for the epoch in force.
         let seal = match sealed {
             None => None,

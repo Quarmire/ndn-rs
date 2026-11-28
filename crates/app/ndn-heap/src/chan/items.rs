@@ -160,7 +160,9 @@ impl Sink {
             let mut push = |st: &mut SinkState, pair: Pair, seq: u64, weight: usize, got: Got| {
                 pushed = true;
                 match mode {
-                    ChannelMode::Latest => {
+                    // An `Ask` channel delivers no message (the receiver drops its frames); were
+                    // one to arrive it is held as the newest of its name, never queued.
+                    ChannelMode::Latest | ChannelMode::Ask => {
                         st.latest.offer(pair, seq, weight, got);
                     }
                     ChannelMode::Reliable | ChannelMode::Window => match self.overflow {
@@ -597,9 +599,10 @@ impl Heap {
     ///
     /// [`HeapError::BadRequest`] for `kept: false` with [`Live::Off`] and no `ask` (it asks for
     /// nothing: ask for kept values, emissions, a query, or a combination), and for an `ask`
-    /// that is over a limit (a query over 2,048 octets, a deadline of zero or over 10 s, more
-    /// than 16 devices named, an `answer_max` of zero or over 4,096, [`QueryPath::Channel`],
-    /// which is not built in this version of the layer), each with its reason;
+    /// that is over a limit (a query over 2,048 octets, or over 1,024 on [`QueryPath::Channel`],
+    /// or one whose frame would pass 1,150 octets there; a deadline of zero or over 10 s; more
+    /// than 16 devices named; an `answer_max` of zero or over 4,096 on [`QueryPath::Signed`] and
+    /// over 65,536 on `Channel` and `Auto`; [`Ask::proof`] on `Channel`), each with its reason;
     /// [`HeapError::NotAllowed`] for emissions or a query of a space this device only follows
     /// (a follower takes no part in channels or queries: open the space as a member; it may
     /// read kept values with [`Live::Off`]) and for a query from a device that is no listed
@@ -608,6 +611,8 @@ impl Heap {
     /// it (kept values only: with `kept: false` a non-member gets no session, so no emission).
     ///
     /// [`QueryPath::Channel`]: crate::QueryPath::Channel
+    /// [`QueryPath::Signed`]: crate::QueryPath::Signed
+    /// [`Ask::proof`]: crate::Ask::proof
     pub fn get(&self, what: Select, opts: GetOptions) -> Result<Items, HeapError> {
         let run = match &opts.ask {
             Some(ask) => Some(self.node.query_prepare(&self.inner, &what, ask.clone())?),
