@@ -2,12 +2,14 @@
 //! queries a test builds by hand (a correct one, a sealed one, a hostile one) without going
 //! through `get`, so the server is tested alone.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_app::{AppError, Connection, EngineAppExt, LpInfo};
 use ndn_engine::EngineBuilder;
+use ndn_engine::ForwarderEngine;
 use ndn_foundation_types::Name;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::lp::{LpPacket, is_lp_packet};
@@ -17,10 +19,13 @@ use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use super::seal::{answer_aad, open_answer, pair_context, query_aad, seal_query};
+use crate::chan::answer::ASK_CLOCK_WINDOW_MS;
 use crate::chan::standing::{Who, gate};
+use crate::error::Timestamp;
 use crate::fold::Readers;
+use crate::node::NodeInner;
 use crate::node::tests::{Dev, cfg, space, world};
-use crate::node::{Config, Node, Transport};
+use crate::node::{Clock, Config, Node, Transport};
 use crate::space::{Heap, MembersChange, Share};
 use crate::test_kit::n;
 use crate::wire::{
@@ -107,13 +112,107 @@ pub(super) struct Rig {
     pub(super) syncs: Vec<Arc<dyn Connection>>,
     /// Every device of the world, started or not.
     pub(super) devs: Vec<Dev>,
+    engine: ForwarderEngine,
+    /// The nodes whose clock is [`rig_clock`].
+    clocked: Arc<Clocked>,
     cancel: CancellationToken,
+}
+
+/// What the rig's clocks watch: the nodes of the rig, and how far the quiet periods of those that
+/// serve have moved the clock.
+#[derive(Default)]
+struct Clocked {
+    nodes: Mutex<Vec<Watched>>,
+    moved: AtomicU64,
+}
+
+struct Watched {
+    node: Weak<NodeInner>,
+    /// Its quiet period is in [`Clocked::moved`].
+    counted: bool,
+}
+
+impl Clocked {
+    /// The milliseconds the rig's clock is ahead of the system's: a quiet period for each node
+    /// that has armed its replay floor.
+    fn moved(&self) -> u64 {
+        let pending: Vec<(usize, Weak<NodeInner>)> = self
+            .nodes
+            .lock()
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| !w.counted)
+            .map(|(i, w)| (i, w.node.clone()))
+            .collect();
+        for (i, node) in pending {
+            // Upgraded out of the lock: the last reference of a node dropped under it would read
+            // this clock again.
+            let armed = node
+                .upgrade()
+                .is_some_and(|n| n.query.replay_floor.get().is_some());
+            if armed {
+                let mut nodes = self.nodes.lock();
+                if !nodes[i].counted {
+                    nodes[i].counted = true;
+                    self.moved
+                        .fetch_add(ASK_CLOCK_WINDOW_MS + 1_000, Ordering::SeqCst);
+                }
+            }
+        }
+        self.moved.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for Rig {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
+}
+
+/// The wall clock of a rig's nodes: the system's, moved on by the quiet period (the replay
+/// floor's [`ASK_CLOCK_WINDOW_MS`] and a second) every time a node of the rig has begun to serve.
+/// A server refuses signed queries until its floor, so a test that is not about the floor is one
+/// whose askers waited it out, and every node of the rig reads the same time. A test about the
+/// floor sets its own clocks with `tweak`.
+fn rig_clock(base: Clock, clocked: Arc<Clocked>) -> Clock {
+    Arc::new(move || Timestamp(base().0 + clocked.moved()))
+}
+
+/// A node of `dev` on new faces of `engine`, its `Config` (after [`fast`] and [`rig_clock`])
+/// changed by `tweak`.
+async fn start_node(
+    engine: &ForwarderEngine,
+    cancel: &CancellationToken,
+    clocked: &Arc<Clocked>,
+    dev: &Dev,
+    tweak: impl FnOnce(&mut Config),
+) -> (Node, Arc<Tap>, Arc<dyn Connection>) {
+    let sync = engine.app_face(cancel.child_token());
+    let tap = Arc::new(Tap {
+        inner: engine.app_face(cancel.child_token()),
+        sent: Mutex::new(Vec::new()),
+    });
+    let mut config = fast();
+    config.clock = rig_clock(Arc::clone(&config.clock), Arc::clone(clocked));
+    tweak(&mut config);
+    let node = Node::start(
+        Transport {
+            node: ndn_app::Node::from_connection(Arc::clone(&tap) as Arc<dyn Connection>),
+            sync: Arc::clone(&sync),
+        },
+        dev.name.clone(),
+        Arc::clone(&dev.keys),
+        Arc::clone(&dev.validator),
+        Arc::clone(&dev.store),
+        config,
+    )
+    .await
+    .expect("the node starts");
+    clocked.nodes.lock().push(Watched {
+        node: Arc::downgrade(&node.inner),
+        counted: false,
+    });
+    (node, tap, sync)
 }
 
 /// The first `started` of `devs` started on one engine, each node's `Config` (after [`fast`])
@@ -133,39 +232,49 @@ pub(super) async fn rig_with(
         ndn_namespace::sync_group::carry(&engine, &ns);
     }
     let cancel = CancellationToken::new();
+    let clocked = Arc::new(Clocked::default());
     let (mut nodes, mut syncs, mut taps) = (Vec::new(), Vec::new(), Vec::new());
     for (i, dev) in devs.iter().take(started).enumerate() {
-        let sync = engine.app_face(cancel.child_token());
-        syncs.push(Arc::clone(&sync));
-        let tap = Arc::new(Tap {
-            inner: engine.app_face(cancel.child_token()),
-            sent: Mutex::new(Vec::new()),
-        });
-        taps.push(Arc::clone(&tap));
-        let mut config = fast();
-        tweak(i, &mut config);
-        nodes.push(
-            Node::start(
-                Transport {
-                    node: ndn_app::Node::from_connection(tap as Arc<dyn Connection>),
-                    sync,
-                },
-                dev.name.clone(),
-                Arc::clone(&dev.keys),
-                Arc::clone(&dev.validator),
-                Arc::clone(&dev.store),
-                config,
-            )
-            .await
-            .expect("the node starts"),
-        );
+        let (node, tap, sync) =
+            start_node(&engine, &cancel, &clocked, dev, |config| tweak(i, config)).await;
+        nodes.push(node);
+        taps.push(tap);
+        syncs.push(sync);
     }
     Rig {
         nodes,
         taps,
         syncs,
         devs,
+        engine,
+        clocked,
         cancel,
+    }
+}
+
+impl Rig {
+    /// Node `i` stopped and started again over the same keys and store, as a process that
+    /// restarted finds them: its replay set, pair keys and served prefixes are gone, and it holds
+    /// the space it held. Whoever held its [`Heap`] or a [`Serving`](super::Serving) must have
+    /// dropped them. Waits until the space is ready again.
+    pub(super) async fn restart(&mut self, i: usize, tweak: impl FnOnce(&mut Config)) {
+        let old = self.nodes.remove(i);
+        old.close().await;
+        let (node, tap, sync) = start_node(
+            &self.engine,
+            &self.cancel,
+            &self.clocked,
+            &self.devs[i],
+            tweak,
+        )
+        .await;
+        self.nodes.insert(i, node);
+        self.taps[i] = tap;
+        self.syncs[i] = sync;
+        eventually("the restarted node holds the space again", || {
+            ready(&self.nodes[i])
+        })
+        .await;
     }
 }
 

@@ -57,6 +57,12 @@ impl Heap {
     /// Serving is **not** storing: nothing a handler answers is kept, cached or made an entry,
     /// and a second `get` runs the handler again (docs/specs/query.md).
     ///
+    /// **Quiet period.** The first `serve` of a node starts a quiet period of 120 s (plus how far
+    /// an asker's clock is behind this node's): a signed query made before it ends is refused
+    /// with a plain Nack, and before the first `serve` every signed query is. A restart empties
+    /// the replay set, and only the clock can tell a copy of a query the last run answered from
+    /// a new one; the asker sees the refusal and should ask again later.
+    ///
     /// # Errors
     ///
     /// Each [`ServeError`] says why and, by [`ServeError::next`], what to do: `NotWriter` (a
@@ -89,17 +95,16 @@ impl Heap {
                 },
             })?;
         }
+        // The replay floor is armed **before** the prefix is in the table: a handler is never
+        // reachable while there is no floor. The first call of a node arms it; a call refused
+        // below leaves it armed, which is sound: the floor only has to be 120 s past a moment
+        // that is after this process started, and this call is.
+        self.node.query.arm_replay_floor(self.node.now());
         let token = self
             .node
             .query
             .table
             .add(&space, prefix.clone(), Arc::new(handler))?;
-        // The replay floor: a signed query made before the first `serve` is refused (a restart
-        // empties the replay guard, and what was signed before this moment may be a copy).
-        self.node
-            .query
-            .serving_since
-            .get_or_init(|| self.node.now());
         self.node.query_announce(&space);
         Ok(Serving {
             node: Arc::clone(&self.node),

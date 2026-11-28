@@ -12,9 +12,12 @@
 //! 2. the lookup budget (per ingress face and for the node, shared with channel asks), then the
 //!    space is open here as a member and the key **stands** as a listed person: else `NoRoute`
 //!    (`Congestion` over the budget);
-//! 3. `SignatureTime` is within 120 s of this device's clock **and not before the moment `serve`
-//!    began**: else `NoRoute`;
-//! 4. the verification budget: else `Congestion`;
+//! 3. `SignatureTime` is within 120 s of this device's clock **and after the replay floor**, the
+//!    moment of the first `serve` plus 120 s (the quiet period below); a device that has not
+//!    begun to serve has no floor and answers no signed query: else a plain `NoRoute`, signing
+//!    and sealing nothing;
+//! 4. a copy of a query already answered (key, nonce and time in the replay set, which is only
+//!    read here): `Duplicate`, with no signature and no verification budget spent;
 //! 5. the signature verifies from the certificates held and the at most four carried, fetching
 //!    nothing: `Pending` is `NotYet`, a refusal `NoRoute`;
 //! 6. the query is no replay (key, nonce, time): `Duplicate`; then the asker person's rate
@@ -29,6 +32,16 @@
 //!
 //! **Not the deleted answers family.** Nothing a handler answers is stored, cached, recomputed
 //! or made an entry; the state here is memory bounded by queries in flight and judged members.
+//! **The quiet period.** The replay set is memory, and a restart empties it, so a query a
+//! previous run answered, copied off the wire, would be judged new. What bounds it is the clock:
+//! a query that run accepted was signed at most 120 s after the moment it arrived, and the run
+//! ended before this one's first `serve`. The **replay floor** is therefore that moment plus
+//! 120 s ([`ASK_CLOCK_WINDOW_MS`]): a query signed at or before it is refused, whatever the
+//! asker's clock. The price is a quiet period after every start of up to 120 s plus the amount
+//! the asker's clock is behind this one's, in which a signed query is refused (`NoRoute`: the
+//! asker should ask again later). The floor is set before the prefix enters the table, so no
+//! handler is reachable without it.
+//!
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -536,11 +549,26 @@ impl NodeInner {
             return nack(NackReason::NoRoute);
         }
 
-        // 3. The clock: within 120 s of this device's, and not before `serve` began (a restart
-        // empties the replay set, and what was signed before it may be a copy).
-        let floor = self.query.serving_since.get().copied().unwrap_or(0);
-        if self.now().abs_diff(signed_at) > ASK_CLOCK_WINDOW_MS || signed_at < floor {
-            tracing::debug!(%key, signed_at, floor, "query signed out of the clock window");
+        // 3. The clock: within 120 s of this device's, and after the replay floor, `serve`'s
+        // first moment plus that window (see [`QueryNode::replay_floor`](super::QueryNode)). No
+        // floor, no query: a node that has not begun to serve answers no signed query, not even
+        // `NotServed` (sealed, it would reuse the nonce of an answer given before a restart). A
+        // refusal here is a plain Nack and signs and seals nothing.
+        let Some(floor) = self.query.replay_floor.get().copied() else {
+            tracing::debug!(%key, "query refused: this device has not begun to serve (the first `serve` opens it to signed queries after a quiet period of 120 s)");
+            return nack(NackReason::NoRoute);
+        };
+        if self.now().abs_diff(signed_at) > ASK_CLOCK_WINDOW_MS {
+            tracing::debug!(%key, signed_at, "query signed more than 120 s from this device's clock");
+            return nack(NackReason::NoRoute);
+        }
+        if signed_at <= floor {
+            tracing::debug!(
+                %key,
+                signed_at,
+                floor,
+                "query refused in the quiet period after this device began to serve: a query signed up to the floor may be a copy of one a previous run answered (the asker should ask again later)"
+            );
             return nack(NackReason::NoRoute);
         }
 

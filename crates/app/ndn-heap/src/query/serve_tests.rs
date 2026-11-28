@@ -5,7 +5,7 @@
 //! The queries are built by hand (`rig`): the server is tested alone, and a test that needs a
 //! crafted query (a stale clock, a forged key, a copy) makes it.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,24 +14,31 @@ use ndn_app::AppError;
 use ndn_foundation_types::Name;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{CachePolicyType, NackReason};
+use ndn_security::cert_name::key_name_of;
+use ndn_transport::FaceId;
 use tokio::sync::Semaphore;
 
+use super::pair_context;
 use super::rig::{
     answer_of, bare_ask, bare_query_at, eventually, hostile_query, hostile_query_at, in_force_of,
-    interest_of, nacked, name_of, pair, plain_ask, public, rig, rig_started, rig_with, send,
-    send_for, shared, signed_by, signed_query, signed_query_at, status_of,
+    interest_of, nacked, name_of, pair, plain_ask, public, rig, rig_started, rig_with, sealed,
+    send, send_for, shared, signed_by, signed_query, signed_query_at, status_of,
 };
-use super::{AppRefusal, Handler, Query, QueryId, QueryOutcome, Reply, ServeError, Via};
+use super::serve::PAIRS_MAX;
+use super::{AppRefusal, Handler, Query, QueryId, QueryOutcome, Reply, ServeError, Serving, Via};
+use crate::chan::answer::ASK_CLOCK_WINDOW_MS;
 use crate::chan::wire::{Announce, ChannelMode};
 use crate::error::NextStep;
+use crate::error::Timestamp;
 use crate::fold::Readers;
-use crate::node::Node;
-use crate::node::NodeInner;
-use crate::node::tests::{space, world_apart};
+use crate::node::tests::{space, world, world_apart};
+use crate::node::{Clock, Config, Node, NodeInner};
 use crate::rt::Instant;
+use crate::space::Heap;
 use crate::space::{MembersChange, Share};
 use crate::test_kit::n;
-use crate::wire::{AnswerBody, Status, chan_prefix, sync_group_of};
+use crate::trust::InterestJudged;
+use crate::wire::{AnswerBody, AskSeal, EpochId, Status, chan_prefix, sync_group_of};
 
 /// A handler that answers the octets it was asked, and counts the queries that reached it.
 fn echo(ran: &Arc<AtomicUsize>) -> impl Handler {
@@ -467,36 +474,66 @@ async fn a_replayed_signed_query_is_a_duplicate_and_the_handler_ran_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_query_signed_before_serve_began_is_refused() {
-    let rig = rig(&["/alice/laptop", "/bob/phone"]).await;
+async fn a_query_signed_up_to_the_floor_is_refused_and_one_after_it_is_answered() {
+    let moved = Arc::new(AtomicU64::new(0));
+    let rig = rig_with(
+        world(&["/alice/laptop", "/bob/phone"]).await,
+        2,
+        |_, config| config.clock = moved_clock(&moved, 0),
+    )
+    .await;
     let heap = public(&rig, &["/bob"]).await;
     let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
     let ran = Arc::new(AtomicUsize::new(0));
-    let before = alice.inner.now() - 5_000;
     let _serving = heap.serve(n("/game"), echo(&ran)).unwrap();
+    let floor = *alice.inner.query.replay_floor.get().unwrap();
 
-    // What was signed before the first `serve` may be a copy a restart's empty replay set would
-    // run: refused, though it is fresh by the clock window.
-    let old = signed_query_at(bob, alice, &plain_ask(bob, "/game/x", b"old"), before);
-    assert!(nacked(&send(bob, old).await, NackReason::NoRoute));
+    // In the quiet period a query made now, however fresh by the clock window, may be a copy a
+    // restart's empty replay set would run: refused with a Nack, before any signature.
+    advance(&moved, 10_000);
+    let early = signed_query(bob, alice, &plain_ask(bob, "/game/x", b"early"));
+    assert!(nacked(&send(bob, early).await, NackReason::NoRoute));
     assert_eq!(ran.load(Ordering::SeqCst), 0);
-    let new = signed_query(bob, alice, &plain_ask(bob, "/game/x", b"new"));
-    assert!(send(bob, new).await.is_ok());
+    assert_eq!(alice.inner.judge.interest_walks(), 0);
+
+    // The floor itself is inside the quiet period; the next millisecond is not.
+    advance(&moved, ASK_CLOCK_WINDOW_MS);
+    let at =
+        |signed_at: u64| signed_query_at(bob, alice, &plain_ask(bob, "/game/x", b"q"), signed_at);
+    assert!(
+        alice.inner.now() > floor,
+        "the quiet period is over by this clock"
+    );
+    assert!(nacked(&send(bob, at(floor)).await, NackReason::NoRoute));
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    let data = send(bob, at(floor + 1))
+        .await
+        .expect("signed after the floor");
+    assert_eq!(status_of(&data), Status::Answered(Bytes::from_static(b"q")));
     assert_eq!(ran.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_clock_window_holds() {
-    let rig = rig(&["/alice/laptop", "/bob/phone"]).await;
-    public(&rig, &["/bob"]).await;
+    let moved = Arc::new(AtomicU64::new(0));
+    let rig = rig_with(
+        world(&["/alice/laptop", "/bob/phone"]).await,
+        2,
+        |_, config| config.clock = moved_clock(&moved, 0),
+    )
+    .await;
+    let heap = public(&rig, &["/bob"]).await;
     let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
-    // This device serves nothing yet, so no floor stands: both sides of the window are shown,
-    // and a query inside it is a signed NotServed.
+    let ran = Arc::new(AtomicUsize::new(0));
+    // `/game` is served, `/x/..` is not: a query inside the window is a signed NotServed. The
+    // quiet period and the window behind it are over: every offset shown is after the floor.
+    let _serving = heap.serve(n("/game"), echo(&ran)).unwrap();
+    advance(&moved, 2 * ASK_CLOCK_WINDOW_MS + 2_000);
     let at = |offset: i64| {
         let wire = signed_query_at(
             bob,
             alice,
-            &plain_ask(bob, "/game/x", b"q"),
+            &plain_ask(bob, "/x/y", b"q"),
             alice.inner.now().checked_add_signed(offset).unwrap(),
         );
         send(bob, wire)
@@ -758,8 +795,12 @@ async fn an_answer_over_4096_is_a_signed_toolarge_status() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_lookup_and_verification_budgets_are_shared_with_channel_asks() {
     let rig = rig(&["/alice/laptop", "/bob/phone", "/dave/pc"]).await;
-    public(&rig, &["/bob"]).await;
+    let heap = public(&rig, &["/bob"]).await;
     let (alice, bob, dave) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
+    // Only a node that serves judges signed queries at all (and the rig's clocks have moved past
+    // the quiet period that follows).
+    let ran = Arc::new(AtomicUsize::new(0));
+    let _serving = heap.serve(n("/game"), echo(&ran)).unwrap();
     let gates = &alice.inner.chan.gates;
     // Drained at a stamp an hour ahead, so that no refill of the milliseconds that follow is
     // counted (a bucket measures its refill from the last stamp it was given).
@@ -899,7 +940,8 @@ async fn a_sealed_space_query_and_answer_are_ciphertext_on_the_wire() {
         );
     }
     let data = send(bob, wire).await.unwrap();
-    for hidden in [&b"the answer is 42"[..], b"42"] {
+    // (Not "42" alone: two octets show up by chance in about 1 run in 100 of a signed Data.)
+    for hidden in [&b"the answer is 42"[..], b"answer"] {
         assert!(
             !contains(data.raw(), hidden),
             "the answer shows {hidden:?} to a forwarder"
@@ -1458,4 +1500,182 @@ async fn a_hostile_query_with_a_forged_time_is_judged_by_the_window_before_a_sig
     );
     assert!(nacked(&send(bob, wire).await, NackReason::NoRoute));
     assert_eq!(alice.inner.judge.interest_walks(), 0);
+}
+
+// -- The replay floor ----------------------------------------------------------------------------
+
+/// A clock a test moves: the system's, `skew_ms` ahead, and `moved` more.
+fn moved_clock(moved: &Arc<AtomicU64>, skew_ms: u64) -> Clock {
+    let wall = Config::new().clock;
+    let moved = Arc::clone(moved);
+    Arc::new(move || Timestamp(wall().0 + skew_ms + moved.load(Ordering::SeqCst)))
+}
+
+fn advance(moved: &Arc<AtomicU64>, ms: u64) {
+    moved.fetch_add(ms, Ordering::SeqCst);
+}
+
+/// Serve `/game` at `heap` as soon as the record is held for writing (a restarted node reads it
+/// from its store).
+async fn serve_when_ready(heap: &Heap, ran: &Arc<AtomicUsize>) -> Serving {
+    let mut serving = None;
+    eventually("the restarted device may serve", || {
+        serving = heap.serve(n("/game"), echo(ran)).ok();
+        serving.is_some()
+    })
+    .await;
+    serving.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_captured_query_cannot_run_again_after_a_restart_whatever_the_askers_clock() {
+    // Alice serves; bob's clock is 100 s ahead of hers, inside the 120 s window. Both clocks are
+    // the system's, moved by `moved`.
+    let moved = Arc::new(AtomicU64::new(0));
+    let mut rig = rig_with(
+        world(&["/alice/laptop", "/bob/phone"]).await,
+        2,
+        |i, config| config.clock = moved_clock(&moved, if i == 1 { 100_000 } else { 0 }),
+    )
+    .await;
+    let heap = public(&rig, &["/bob"]).await;
+    let ran = Arc::new(AtomicUsize::new(0));
+    let serving = heap.serve(n("/game"), echo(&ran)).unwrap();
+
+    // The quiet period over (alice's replay floor passed, by bob's clock too), bob asks and the
+    // handler runs: an eavesdropper keeps the wire.
+    advance(&moved, ASK_CLOCK_WINDOW_MS + 1_000);
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    let captured = signed_query(bob, alice, &plain_ask(bob, "/game/x", b"grant"));
+    assert!(matches!(
+        outcome(&alice.inner, &captured).await,
+        QueryOutcome::Data(_)
+    ));
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+    // Alice restarts 5 s later and serves again 2 s after that: her replay set is empty, and the
+    // captured query is still inside the window by her clock (93 s old) and was signed after the
+    // moment she began serving by bob's clock.
+    drop(serving);
+    drop(heap);
+    advance(&moved, 5_000);
+    rig.restart(0, |config| config.clock = moved_clock(&moved, 0))
+        .await;
+    advance(&moved, 2_000);
+    let heap = rig.nodes[0].space(&space()).expect("the space is restored");
+    let _serving = serve_when_ready(&heap, &ran).await;
+    let alice = &rig.nodes[0];
+    let replayed = outcome(&alice.inner, &captured).await;
+    assert!(
+        is_nack(&replayed, NackReason::NoRoute),
+        "the captured query must be refused after a restart, got {replayed:?}"
+    );
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "the handler ran once, not twice"
+    );
+    assert_eq!(
+        alice.inner.judge.interest_walks(),
+        0,
+        "refused by the floor before any signature was checked"
+    );
+
+    // It stays refused to the end of the window it was signed in; a query bob signs after the
+    // floor is answered.
+    advance(&moved, 30_000);
+    assert!(is_nack(
+        &outcome(&alice.inner, &captured).await,
+        NackReason::NoRoute
+    ));
+    let bob = &rig.nodes[1];
+    let fresh = signed_query(bob, alice, &plain_ask(bob, "/game/x", b"fresh"));
+    assert!(matches!(
+        outcome(&alice.inner, &fresh).await,
+        QueryOutcome::Data(_)
+    ));
+    assert_eq!(ran.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sealed_query_before_the_first_serve_is_a_plain_nack_so_no_nonce_is_used_twice() {
+    let mut rig = rig(&["/alice/laptop", "/bob/phone"]).await;
+    let heap = sealed(&rig, &["/bob"], &[]).await;
+    let ran = Arc::new(AtomicUsize::new(0));
+    let serving = heap.serve(n("/game"), echo(&ran)).unwrap();
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    let keys = pair(bob, alice, &in_force_of(alice).unwrap());
+    let (ask, sent) = keys.ask(bob, alice, "/game/x", b"secret");
+    let captured = signed_query(bob, alice, &ask);
+    let data = match outcome(&alice.inner, &captured).await {
+        QueryOutcome::Data(wire) => wire,
+        other => panic!("answered before the restart: {other:?}"),
+    };
+    assert!(!data.is_empty() && sent.id == ask.id);
+
+    // Alice restarts and serves nothing yet. The copy is inside its window and her replay set is
+    // empty, but an answer would be sealed under the same key and counter as the first.
+    drop(serving);
+    drop(heap);
+    rig.restart(0, |_| {}).await;
+    let alice = &rig.nodes[0];
+    let signed_before = signed(alice);
+    let replayed = outcome(&alice.inner, &captured).await;
+    assert!(
+        is_nack(&replayed, NackReason::NoRoute),
+        "a node that serves nothing yet answers no signed query, got {replayed:?}"
+    );
+    assert_eq!(signed(alice), signed_before, "nothing was sealed or signed");
+    assert_eq!(alice.inner.judge.interest_walks(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_handler_is_reachable_while_the_floor_is_unset() {
+    let rig = rig(&["/alice/laptop", "/bob/phone"]).await;
+    public(&rig, &["/bob"]).await;
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    // The prefix is in the table and no `serve` has set the floor: the instant between the two
+    // statements of a `serve` that registers before it arms the floor.
+    let handler: Arc<dyn Handler> = Arc::new(echo(&ran));
+    alice
+        .inner
+        .query
+        .table
+        .add(&space(), n("/game"), handler)
+        .unwrap();
+    assert!(alice.inner.query.replay_floor.get().is_none());
+    let wire = signed_query(bob, alice, &plain_ask(bob, "/game/x", b"q"));
+    let r = outcome(&alice.inner, &wire).await;
+    assert!(is_nack(&r, NackReason::NoRoute), "{r:?}");
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "no handler ran");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_floor_is_set_before_the_prefix_is_reachable() {
+    // `serve` arms the floor first: when the table holds the prefix, the floor stands, a clock
+    // window past the moment `serve` began.
+    let moved = Arc::new(AtomicU64::new(0));
+    let rig = rig_with(
+        world(&["/alice/laptop", "/bob/phone"]).await,
+        2,
+        |_, config| config.clock = moved_clock(&moved, 0),
+    )
+    .await;
+    let heap = public(&rig, &["/bob"]).await;
+    let alice = &rig.nodes[0];
+    let before = alice.inner.now();
+    let ran = Arc::new(AtomicUsize::new(0));
+    let _serving = heap.serve(n("/game"), echo(&ran)).unwrap();
+    let after = alice.inner.now();
+    let floor = *alice
+        .inner
+        .query
+        .replay_floor
+        .get()
+        .expect("the floor is set");
+    assert!(
+        (before + ASK_CLOCK_WINDOW_MS..=after + ASK_CLOCK_WINDOW_MS).contains(&floor),
+        "{before} {floor} {after}"
+    );
 }
