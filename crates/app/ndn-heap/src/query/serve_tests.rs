@@ -1160,12 +1160,88 @@ async fn the_announce_lists_what_is_served_and_a_hearer_records_a_hint() {
     .await;
     assert!(hinted(bob, "/stranger/x").is_empty());
 
-    // An announce with an empty `serves` (and a mode, which it must carry) removes the hint.
+    // An announce with an empty `serves` (and a mode, which it must carry) takes no hint away:
+    // it is unsigned, so anyone could send it in the name of the real server.
+    let before = bob.inner.chan.stats.announces_heard.get();
     rig.syncs[0]
         .send(announce_wire("/alice/laptop", &[ChannelMode::Latest], &[]))
         .await
         .unwrap();
-    eventually("the hint is removed", || hinted(bob, "/game/x").is_empty()).await;
+    eventually("bob heard it", || {
+        bob.inner.chan.stats.announces_heard.get() > before
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(hinted(bob, "/game/x"), vec![alice.name().clone()]);
+}
+
+/// Hand `node` the announce `wire` as its sync face would, without the forwarder.
+fn hear(node: &Node, wire: Bytes) {
+    let interest = ndn_packet::Interest::decode(wire).expect("an announce is an Interest");
+    node.inner.chan_heard(&interest);
+}
+
+/// An announce is unsigned: anyone may name a device. So a hint only grows by what is said of a
+/// device, and only its expiry takes it away (a spoofed announce of the real server with no
+/// prefix, or with another one, must not make the asker lose it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unsigned_announce_naming_a_server_cannot_take_its_hint_away() {
+    let rig = rig(&["/alice/laptop", "/bob/phone"]).await;
+    let _heap = public(&rig, &["/bob"]).await;
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    hear(
+        bob,
+        announce_wire("/alice/laptop", &[ChannelMode::Latest], &["/game"]),
+    );
+    assert_eq!(hinted(bob, "/game/x"), vec![alice.name().clone()]);
+    // The same name with a mode and no prefix.
+    hear(
+        bob,
+        announce_wire("/alice/laptop", &[ChannelMode::Latest], &[]),
+    );
+    assert_eq!(
+        hinted(bob, "/game/x"),
+        vec![alice.name().clone()],
+        "an announce that lists nothing takes no hint away"
+    );
+    // The same name listing another prefix.
+    hear(
+        bob,
+        announce_wire("/alice/laptop", &[ChannelMode::Latest], &["/other"]),
+    );
+    assert_eq!(
+        hinted(bob, "/game/x"),
+        vec![alice.name().clone()],
+        "an announce that lists another prefix does not replace the first"
+    );
+}
+
+/// Names that are no device (a stranger makes them up under a writer's namespace) must not push
+/// the real server out of the targets of a query, whatever their number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spoofed_device_names_do_not_crowd_the_real_server_out_of_the_targets() {
+    let rig = rig(&["/alice/laptop", "/bob/phone"]).await;
+    let _heap = public(&rig, &["/bob"]).await;
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    hear(
+        bob,
+        announce_wire("/alice/laptop", &[ChannelMode::Latest], &["/game"]),
+    );
+    for i in 0..256 {
+        hear(
+            bob,
+            announce_wire(
+                &format!("/alice/fake{i}"),
+                &[ChannelMode::Latest],
+                &["/game"],
+            ),
+        );
+    }
+    let targets: Vec<Name> = hinted(bob, "/game/x").into_iter().take(16).collect();
+    assert!(
+        targets.contains(alice.name()),
+        "the real server is among the 16 devices a query asks: {targets:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1181,10 +1257,29 @@ async fn the_announce_is_sent_again_when_the_set_served_changes() {
     let second = heap.serve(n("/b"), echo(&ran)).unwrap();
     eventually("bob hears /b", || !hinted(bob, "/b/x").is_empty()).await;
     assert_eq!(hinted(bob, "/a/x"), vec![alice.name().clone()]);
-    // Dropping the first lists the rest: the hint of /a goes with the next announce, which the
-    // drop sends.
+    // Dropping the first lists the rest in the next announce, which the drop sends. A hearer does
+    // not take /a away on that word (an announce is unsigned, so one that did would let anyone
+    // take a server's hint away): /a lapses after the hint's 90 s, and a query that reaches
+    // the server meanwhile is answered NotServed.
+    let before = bob.inner.chan.stats.announces_heard.get();
     drop(first);
-    eventually("bob stops hearing /a", || hinted(bob, "/a/x").is_empty()).await;
+    let (_, record) = alice.inner.announce_record(&space()).unwrap();
+    assert_eq!(Announce::decode(record).unwrap().serves, vec![n("/b")]);
+    eventually("bob heard the next announce", || {
+        bob.inner.chan.stats.announces_heard.get() > before
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(hinted(bob, "/a/x"), vec![alice.name().clone()]);
+    let lapsed = Instant::now() + super::table::HINT_TTL + Duration::from_secs(1);
+    assert!(
+        bob.inner
+            .query
+            .hints
+            .serving(&space(), &n("/a/x"), lapsed)
+            .is_empty(),
+        "/a lapses with its 90 s"
+    );
     assert_eq!(hinted(bob, "/b/x"), vec![alice.name().clone()]);
     drop(second);
 }

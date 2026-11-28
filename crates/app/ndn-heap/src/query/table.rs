@@ -121,90 +121,271 @@ impl ServeTable {
     }
 }
 
-/// How long a heard announce counts as a hint: three of the announce's 30 s periods.
+/// How long a heard prefix counts as a hint: three of the announce's 30 s periods.
 pub(crate) const HINT_TTL: Duration = Duration::from_secs(90);
 
-/// The most devices one space keeps hints of: the ones heard last.
+/// The most devices one space keeps hints of among those **vouched for**: the ones the record
+/// holds an admitted entry of, or that answered a signed query. The record bounds the first
+/// kind, an announce cannot make one; a table past it drops the device heard longest ago.
 pub(crate) const HINTS_PER_SPACE: usize = 256;
 
-/// What an announce said of one device.
+/// The most vouched devices one person has hints of: a writer's devices are more than one
+/// query asks ([`TARGETS_MAX`](super::types::TARGETS_MAX)), and no person may take the table.
+pub(crate) const HINTS_PER_PERSON: usize = 32;
+
+/// The most devices one space keeps hints of that nothing vouches for: an announce is unsigned,
+/// so any name under a writer's namespace passes for one of her devices (a writer who has put
+/// nothing has no entry, and is such a device too). This pool is its own, so that names a
+/// stranger makes up cannot push a vouched device out.
+pub(crate) const HINTS_UNVOUCHED_PER_SPACE: usize = 16;
+
+/// The most unvouched devices of one person: names a stranger makes up under her namespace
+/// fill her share and no more. A device already held is always refreshed; a new name is not
+/// taken once the share is full (the first heard stay until they lapse).
+pub(crate) const HINTS_UNVOUCHED_PER_PERSON: usize = 4;
+
+/// The most devices per space remembered as having answered a signed query.
+pub(crate) const PROVEN_PER_SPACE: usize = 64;
+
+/// What an announce said of one device: the prefixes, each as of when it was last heard.
+#[derive(Clone)]
 struct Hint {
     device: Name,
-    serves: Vec<Name>,
-    heard: Instant,
+    person: Name,
+    /// The record held an admitted entry of the device when it was last heard.
+    vouched: bool,
+    serves: Vec<(Name, Instant)>,
+}
+
+impl Hint {
+    fn lapsed(heard: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(heard) >= HINT_TTL
+    }
+
+    /// The moment the newest prefix not lapsed was heard, if any.
+    fn heard(&self, now: Instant) -> Option<Instant> {
+        self.serves
+            .iter()
+            .map(|(_, at)| *at)
+            .filter(|at| !Self::lapsed(*at, now))
+            .max()
+    }
+
+    /// The moment the newest prefix of `path` not lapsed was heard, if any.
+    fn heard_for(&self, path: &Name, now: Instant) -> Option<Instant> {
+        self.serves
+            .iter()
+            .filter(|(p, at)| path.has_prefix(p) && !Self::lapsed(*at, now))
+            .map(|(_, at)| *at)
+            .max()
+    }
+
+    /// Take `serves` as heard at `now`: a prefix held is refreshed, a new one is added unless
+    /// the device holds [`SERVE_PREFIXES_MAX`] not lapsed (nothing is replaced: what is said of
+    /// a device in the clear takes nothing away). The lapsed go.
+    fn hear(&mut self, serves: &[Name], now: Instant) {
+        self.serves.retain(|(_, at)| !Self::lapsed(*at, now));
+        for prefix in serves {
+            if let Some((_, at)) = self.serves.iter_mut().find(|(p, _)| p == prefix) {
+                *at = now;
+            } else if self.serves.len() < SERVE_PREFIXES_MAX {
+                self.serves.push((prefix.clone(), now));
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct SpaceHints {
+    hints: Vec<Hint>,
+    /// The devices whose signed answer to a query was judged good, and when.
+    proven: HashMap<Name, Instant>,
+}
+
+impl SpaceHints {
+    /// Vouched for: the record holds an entry of it, or it answered a signed query.
+    fn protected(&self, hint: &Hint) -> bool {
+        hint.vouched || self.proven.contains_key(&hint.device)
+    }
+
+    /// Order of trust: answered a signed query, then vouched by the record, then neither.
+    fn rank(&self, hint: &Hint) -> u8 {
+        if self.proven.contains_key(&hint.device) {
+            2
+        } else {
+            u8::from(hint.vouched)
+        }
+    }
+
+    /// The index of the hint heard longest ago among those `pick` takes that no signed answer
+    /// vouched for.
+    fn oldest(&self, now: Instant, pick: impl Fn(&Hint) -> bool) -> Option<usize> {
+        self.hints
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| pick(h) && !self.proven.contains_key(&h.device))
+            .min_by_key(|(_, h)| h.heard(now))
+            .map(|(i, _)| i)
+    }
+
+    /// Make room for `hint` in its pool (a device that is not in the table). `false`: the pool is
+    /// full of what must stay, and the hint is not taken.
+    fn make_room(&mut self, hint: &Hint, now: Instant) -> bool {
+        if self.protected(hint) {
+            let held = |s: &Self, person: Option<&Name>| {
+                s.hints
+                    .iter()
+                    .filter(|h| s.protected(h) && person.is_none_or(|p| h.person == *p))
+                    .count()
+            };
+            while held(self, Some(&hint.person)) >= HINTS_PER_PERSON {
+                let Some(i) = self.oldest(now, |h| h.person == hint.person) else {
+                    return false;
+                };
+                self.hints.swap_remove(i);
+            }
+            while held(self, None) >= HINTS_PER_SPACE {
+                let Some(i) = self.oldest(now, |_| true) else {
+                    return false;
+                };
+                self.hints.swap_remove(i);
+            }
+            true
+        } else {
+            let held = |person: Option<&Name>| {
+                self.hints
+                    .iter()
+                    .filter(|h| !self.protected(h) && person.is_none_or(|p| h.person == *p))
+                    .count()
+            };
+            held(Some(&hint.person)) < HINTS_UNVOUCHED_PER_PERSON
+                && held(None) < HINTS_UNVOUCHED_PER_SPACE
+        }
+    }
 }
 
 /// The devices announces say serve queries, per space: **a hint**, as every announce is. The
 /// asker still judges the device a writer offline before it asks, and the server's own judgement
 /// of the query is the authority.
+///
+/// An announce is unsigned and anyone may name a device, so a hint is trusted as far as it can
+/// be vouched for:
+/// - an announce never removes or replaces a hint, it only adds prefixes to a device and
+///   refreshes the ones it lists: only the lapse ([`HINT_TTL`], per prefix) takes a prefix away;
+/// - devices the record holds an admitted entry of, and devices that answered a signed query
+///   ([`Self::proven`]), are kept in a pool names a stranger cannot reach, bounded per person
+///   ([`HINTS_PER_PERSON`]) and per space ([`HINTS_PER_SPACE`]);
+/// - every other device is kept in a small pool of its own ([`HINTS_UNVOUCHED_PER_SPACE`], per
+///   person [`HINTS_UNVOUCHED_PER_PERSON`]) and a new name is refused when it is full;
+/// - devices are returned best vouched first: answered a signed query, then vouched by the
+///   record, then neither, and within each the one heard last first.
 #[derive(Default)]
 pub(crate) struct Hints {
-    spaces: Mutex<HashMap<Name, Vec<Hint>>>,
+    spaces: Mutex<HashMap<Name, SpaceHints>>,
     heard: Notify,
 }
 
 impl Hints {
-    /// An announce of `device` over `space` was heard at `now`, listing `serves` (empty: the
-    /// device serves nothing now, and its hint goes). A table past [`HINTS_PER_SPACE`] drops the
-    /// device heard longest ago.
-    pub(crate) fn record(&self, space: &Name, device: &Name, serves: &[Name], now: Instant) {
-        {
+    /// An announce of `device` (of `person`) over `space` was heard at `now`, listing `serves`;
+    /// `vouched`: the record holds an admitted entry of the device. An announce that lists
+    /// nothing is nothing to record: it takes no hint away, since it is unsigned.
+    pub(crate) fn record(
+        &self,
+        space: &Name,
+        device: &Name,
+        person: &Name,
+        vouched: bool,
+        serves: &[Name],
+        now: Instant,
+    ) {
+        if serves.is_empty() {
+            return;
+        }
+        let taken = {
             let mut spaces = self.spaces.lock();
-            let hints = spaces.entry(space.clone()).or_default();
-            hints.retain(|h| {
-                h.device != *device && now.saturating_duration_since(h.heard) < HINT_TTL
+            let held = spaces.entry(space.clone()).or_default();
+            held.hints.retain(|h| h.heard(now).is_some());
+            let old = held
+                .hints
+                .iter()
+                .position(|h| h.device == *device)
+                .map(|i| held.hints.swap_remove(i));
+            let mut hint = old.clone().unwrap_or_else(|| Hint {
+                device: device.clone(),
+                person: person.clone(),
+                vouched,
+                serves: Vec::new(),
             });
-            if !serves.is_empty() {
-                if hints.len() >= HINTS_PER_SPACE
-                    && let Some(oldest) = hints
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, h)| h.heard)
-                        .map(|(i, _)| i)
-                {
-                    hints.swap_remove(oldest);
-                }
-                hints.push(Hint {
-                    device: device.clone(),
-                    serves: serves.to_vec(),
-                    heard: now,
-                });
+            hint.vouched = vouched;
+            hint.person = person.clone();
+            hint.hear(serves, now);
+            let taken = !hint.serves.is_empty() && held.make_room(&hint, now);
+            if taken {
+                held.hints.push(hint);
+            } else if let Some(old) = old {
+                held.hints.push(old);
             }
-            if hints.is_empty() {
+            if held.hints.is_empty() && held.proven.is_empty() {
                 spaces.remove(space);
             }
+            taken
+        };
+        if taken {
+            self.heard.notify_waiters();
         }
-        self.heard.notify_waiters();
+    }
+
+    /// `device` answered a signed query over `space` and the answer was judged good (a signature
+    /// by a key that stands as a writer): it is no name a stranger made up, so its hint is
+    /// vouched for and outranks the ones heard later that are not. At most
+    /// [`PROVEN_PER_SPACE`] are remembered, the one proven longest ago going first.
+    pub(crate) fn proven(&self, space: &Name, device: &Name, now: Instant) {
+        let mut spaces = self.spaces.lock();
+        let held = spaces.entry(space.clone()).or_default();
+        if held.proven.len() >= PROVEN_PER_SPACE
+            && !held.proven.contains_key(device)
+            && let Some(oldest) = held
+                .proven
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(d, _)| d.clone())
+        {
+            held.proven.remove(&oldest);
+        }
+        held.proven.insert(device.clone(), now);
     }
 
     /// The devices of `space` heard to serve a prefix of `path` within [`HINT_TTL`] of `now`,
-    /// the one heard last first.
+    /// the best vouched first and, among equals, the one heard last.
     pub(crate) fn serving(&self, space: &Name, path: &Name, now: Instant) -> Vec<Name> {
         let spaces = self.spaces.lock();
-        let mut found: Vec<&Hint> = spaces
-            .get(space)
-            .into_iter()
-            .flatten()
-            .filter(|h| now.saturating_duration_since(h.heard) < HINT_TTL)
-            .filter(|h| h.serves.iter().any(|p| path.has_prefix(p)))
+        let Some(held) = spaces.get(space) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(u8, Instant, &Name)> = held
+            .hints
+            .iter()
+            .filter_map(|h| Some((held.rank(h), h.heard_for(path, now)?, &h.device)))
             .collect();
-        found.sort_by_key(|h| std::cmp::Reverse(h.heard));
-        found.into_iter().map(|h| h.device.clone()).collect()
+        found.sort_by_key(|(rank, at, _)| std::cmp::Reverse((*rank, *at)));
+        found.into_iter().map(|(_, _, d)| d.clone()).collect()
     }
 
-    /// Every device of `space` heard to serve something within [`HINT_TTL`] of `now`, the one
-    /// heard last first: the announcing devices a `Targets::Person` query may add to the ones
-    /// the record knows.
+    /// Every device of `space` heard to serve something within [`HINT_TTL`] of `now`, in the
+    /// order of [`Self::serving`]: the announcing devices a `Targets::Person` query may add to
+    /// the ones the record knows.
     pub(crate) fn devices(&self, space: &Name, now: Instant) -> Vec<Name> {
         let spaces = self.spaces.lock();
-        let mut found: Vec<&Hint> = spaces
-            .get(space)
-            .into_iter()
-            .flatten()
-            .filter(|h| now.saturating_duration_since(h.heard) < HINT_TTL)
+        let Some(held) = spaces.get(space) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(u8, Instant, &Name)> = held
+            .hints
+            .iter()
+            .filter_map(|h| Some((held.rank(h), h.heard(now)?, &h.device)))
             .collect();
-        found.sort_by_key(|h| std::cmp::Reverse(h.heard));
-        found.into_iter().map(|h| h.device.clone()).collect()
+        found.sort_by_key(|(rank, at, _)| std::cmp::Reverse((*rank, *at)));
+        found.into_iter().map(|(_, _, d)| d.clone()).collect()
     }
 
     /// Resolves at the next announce recorded: what an asker with no known server waits on.
@@ -284,22 +465,43 @@ mod tests {
         ));
     }
 
+    /// The person of a test device: its first component (`/alice/a` is `/alice`'s).
+    fn person(device: &str) -> Name {
+        Name::from_components(n(device).components()[..1].iter().cloned())
+    }
+
+    fn record(
+        hints: &Hints,
+        space: &Name,
+        device: &str,
+        vouched: bool,
+        serves: &[&str],
+        at: Instant,
+    ) {
+        let serves: Vec<Name> = serves.iter().map(|s| n(s)).collect();
+        hints.record(space, &n(device), &person(device), vouched, &serves, at);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn hints_are_found_by_prefix_newest_first_and_lapse() {
         let hints = Hints::default();
         let space = n("/alice/32=data/game");
         let t0 = Instant::now();
-        hints.record(&space, &n("/alice/a"), &[n("/world")], t0);
-        hints.record(
+        record(&hints, &space, "/alice/a", true, &["/world"], t0);
+        record(
+            &hints,
             &space,
-            &n("/alice/b"),
-            &[n("/world/pickup")],
+            "/alice/b",
+            true,
+            &["/world/pickup"],
             t0 + Duration::from_secs(1),
         );
-        hints.record(
+        record(
+            &hints,
             &space,
-            &n("/alice/c"),
-            &[n("/other")],
+            "/alice/c",
+            true,
+            &["/other"],
             t0 + Duration::from_secs(2),
         );
         let now = t0 + Duration::from_secs(3);
@@ -314,31 +516,237 @@ mod tests {
                 .is_empty(),
             "a hint older than its TTL is not one"
         );
-        hints.record(&space, &n("/alice/a"), &[], now);
+    }
+
+    /// An announce is unsigned: what it says of a device adds to the hint and refreshes it, and
+    /// nothing it says (no prefix, another prefix) takes a prefix away. Only the lapse does, a
+    /// prefix at a time.
+    #[tokio::test(start_paused = true)]
+    async fn an_announce_takes_nothing_away_only_the_lapse_does() {
+        let hints = Hints::default();
+        let space = n("/alice/32=data/game");
+        let t0 = Instant::now();
+        record(&hints, &space, "/alice/a", true, &["/world"], t0);
+        let now = t0 + Duration::from_secs(1);
+        record(&hints, &space, "/alice/a", true, &[], now);
+        record(&hints, &space, "/alice/a", true, &["/other"], now);
         assert_eq!(
-            hints.serving(&space, &n("/world/pickup/1"), now),
-            vec![n("/alice/b")],
-            "an announce that lists nothing takes the device's hint away"
+            hints.serving(&space, &n("/world/1"), now),
+            vec![n("/alice/a")],
+            "neither an empty announce nor another prefix removes /world"
+        );
+        assert_eq!(
+            hints.serving(&space, &n("/other/1"), now),
+            vec![n("/alice/a")]
+        );
+        // /world is said again at +60 s, /other is not: at +100 s /other lapsed and /world did
+        // not.
+        record(
+            &hints,
+            &space,
+            "/alice/a",
+            true,
+            &["/world"],
+            t0 + Duration::from_secs(60),
+        );
+        let later = t0 + Duration::from_secs(100);
+        assert_eq!(
+            hints.serving(&space, &n("/world/1"), later),
+            vec![n("/alice/a")]
+        );
+        assert!(hints.serving(&space, &n("/other/1"), later).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_prefixes_of_a_device_are_bounded_and_the_first_stay() {
+        let hints = Hints::default();
+        let space = n("/alice/32=data/game");
+        let t0 = Instant::now();
+        let many: Vec<String> = (0..SERVE_PREFIXES_MAX + 8)
+            .map(|i| format!("/p{i}"))
+            .collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        record(&hints, &space, "/alice/a", true, &many, t0);
+        let now = t0 + Duration::from_secs(1);
+        assert_eq!(
+            hints.serving(&space, &n("/p0"), now),
+            vec![n("/alice/a")],
+            "the first heard stay"
+        );
+        assert!(
+            hints
+                .serving(&space, &n(&format!("/p{}", SERVE_PREFIXES_MAX + 7)), now)
+                .is_empty(),
+            "the ones over the bound are not kept"
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_hints_kept_per_space_are_bounded_and_the_oldest_goes() {
+    async fn the_vouched_hints_per_space_are_bounded_and_the_oldest_goes() {
         let hints = Hints::default();
         let space = n("/alice/32=data/game");
         let t0 = Instant::now();
+        // Many persons, each under its own bound.
         for i in 0..(HINTS_PER_SPACE + 5) {
-            hints.record(
+            record(
+                &hints,
                 &space,
-                &n(&format!("/alice/d{i}")),
-                &[n("/w")],
+                &format!("/p{}/d{i}", i % 16),
+                true,
+                &["/w"],
                 t0 + Duration::from_millis(i as u64),
             );
         }
         let now = t0 + Duration::from_secs(1);
         let found = hints.serving(&space, &n("/w"), now);
         assert_eq!(found.len(), HINTS_PER_SPACE);
-        assert!(!found.contains(&n("/alice/d0")), "the first heard went");
-        assert!(found.contains(&n(&format!("/alice/d{}", HINTS_PER_SPACE + 4))));
+        assert!(!found.contains(&n("/p0/d0")), "the first heard went");
+        assert!(found.contains(&n(&format!("/p4/d{}", HINTS_PER_SPACE + 4))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_person_cannot_take_more_than_her_share_of_the_vouched_hints() {
+        let hints = Hints::default();
+        let space = n("/alice/32=data/game");
+        let t0 = Instant::now();
+        for i in 0..(HINTS_PER_PERSON + 8) {
+            record(
+                &hints,
+                &space,
+                &format!("/alice/d{i}"),
+                true,
+                &["/w"],
+                t0 + Duration::from_millis(i as u64),
+            );
+        }
+        record(
+            &hints,
+            &space,
+            "/bob/phone",
+            true,
+            &["/w"],
+            t0 + Duration::from_secs(1),
+        );
+        let found = hints.serving(&space, &n("/w"), t0 + Duration::from_secs(2));
+        assert_eq!(found.len(), HINTS_PER_PERSON + 1);
+        assert!(
+            found.contains(&n("/bob/phone")),
+            "another person's hint is kept"
+        );
+        assert!(!found.contains(&n("/alice/d0")), "the oldest of hers went");
+    }
+
+    /// Names nothing vouches for fill a small pool of their own and cannot push out a device the
+    /// record vouches for, nor one that was heard first and is not vouched: a new name is refused
+    /// once the share of its person is full.
+    #[tokio::test(start_paused = true)]
+    async fn names_nothing_vouches_for_cannot_crowd_a_real_device_out() {
+        let hints = Hints::default();
+        let space = n("/alice/32=data/game");
+        let t0 = Instant::now();
+        record(&hints, &space, "/alice/real", true, &["/w"], t0);
+        record(&hints, &space, "/bob/real", false, &["/w"], t0);
+        for i in 0..512 {
+            record(
+                &hints,
+                &space,
+                &format!("/{}/fake{i}", ["alice", "bob", "carol"][i % 3]),
+                false,
+                &["/w"],
+                t0 + Duration::from_millis(1 + i as u64),
+            );
+        }
+        let found = hints.serving(&space, &n("/w"), t0 + Duration::from_secs(2));
+        assert_eq!(found[0], n("/alice/real"), "the vouched device comes first");
+        assert!(
+            found.contains(&n("/bob/real")),
+            "so does the one heard first"
+        );
+        let fakes = |person: &str| {
+            found
+                .iter()
+                .filter(|d| d.to_string().starts_with(&format!("/{person}/fake")))
+                .count()
+        };
+        assert!(fakes("alice") <= HINTS_UNVOUCHED_PER_PERSON);
+        assert!(
+            fakes("bob") < HINTS_UNVOUCHED_PER_PERSON,
+            "bob's share held bob/real"
+        );
+        assert!(
+            found.len() - 1 <= HINTS_UNVOUCHED_PER_SPACE,
+            "the pool of the space is {HINTS_UNVOUCHED_PER_SPACE}, found {}",
+            found.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_device_that_answered_outranks_newer_hints_that_did_not() {
+        let hints = Hints::default();
+        let space = n("/alice/32=data/game");
+        let t0 = Instant::now();
+        record(&hints, &space, "/alice/old", false, &["/w"], t0);
+        record(
+            &hints,
+            &space,
+            "/alice/vouched",
+            true,
+            &["/w"],
+            t0 + Duration::from_secs(1),
+        );
+        record(
+            &hints,
+            &space,
+            "/alice/new",
+            false,
+            &["/w"],
+            t0 + Duration::from_secs(2),
+        );
+        let now = t0 + Duration::from_secs(3);
+        assert_eq!(
+            hints.serving(&space, &n("/w"), now),
+            vec![n("/alice/vouched"), n("/alice/new"), n("/alice/old")],
+            "vouched first, then the newest"
+        );
+        hints.proven(&space, &n("/alice/old"), now);
+        assert_eq!(
+            hints.serving(&space, &n("/w"), now)[0],
+            n("/alice/old"),
+            "a device that answered a signed query comes before every other"
+        );
+        // It is no longer held in the pool of the unvouched: the share of its person has room.
+        record(&hints, &space, "/alice/more1", false, &["/w"], now);
+        record(&hints, &space, "/alice/more2", false, &["/w"], now);
+        record(&hints, &space, "/alice/more3", false, &["/w"], now);
+        assert!(
+            hints
+                .serving(&space, &n("/w"), now)
+                .contains(&n("/alice/more3"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_devices_remembered_as_answered_are_bounded_and_the_oldest_goes() {
+        let hints = Hints::default();
+        let space = n("/alice/32=data/game");
+        let t0 = Instant::now();
+        for i in 0..(PROVEN_PER_SPACE + 3) {
+            hints.proven(
+                &space,
+                &n(&format!("/p{i}/d")),
+                t0 + Duration::from_millis(i as u64),
+            );
+        }
+        // The earliest forgotten answered no more outranks: both heard at once, the one that
+        // is still proven is first.
+        let now = t0 + Duration::from_secs(1);
+        record(&hints, &space, "/p0/d", false, &["/w"], now);
+        record(&hints, &space, "/p66/d", false, &["/w"], now);
+        let found = hints.serving(&space, &n("/w"), now);
+        assert_eq!(
+            found[0],
+            n("/p66/d"),
+            "p66 is proven, p0 was forgotten: {found:?}"
+        );
     }
 }

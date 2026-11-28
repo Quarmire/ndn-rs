@@ -403,26 +403,34 @@ impl NodeInner {
         }
     }
 
-    /// Push the announce of this device over `space`: one unsigned Interest
-    /// `<sync group>/32=chan/<digest>`, ApplicationParameters this device, its channel modes and
-    /// the prefixes it serves queries under (at most 16 names and 512 octets of name values,
-    /// shortest first: the rest are left out), lifetime 1 s, HopLimit 8. A device with no
-    /// channel announces its prefixes alone (no mode), and one with neither announces nothing:
-    /// the hint of a device that stopped serving lapses after 90 s when no channel lets it say
-    /// so. It is answered by nobody and cached nowhere; a receiver takes it as a hint.
-    pub(crate) async fn chan_announce(&self, space: &Name) {
+    /// The group and the ApplicationParameters of the announce of this device over `space`: this
+    /// device, its channel modes and the prefixes it serves queries under (at most 16 names and
+    /// 512 octets of name values, shortest first: the rest are left out). `None`: a device with
+    /// no channel and no prefix has nothing to announce.
+    pub(crate) fn announce_record(&self, space: &Name) -> Option<(Name, bytes::Bytes)> {
         let modes = self.chan.channels.modes(space);
         let serves = self.query_serves(space);
-        let Some(group) = sync_group_of(space).filter(|_| !modes.is_empty() || !serves.is_empty())
-        else {
-            return;
-        };
+        let group = sync_group_of(space).filter(|_| !modes.is_empty() || !serves.is_empty())?;
         let record = Announce {
             sender: self.device.clone(),
             modes,
             serves,
         }
         .encode();
+        Some((group, record))
+    }
+
+    /// Push the announce of this device over `space` ([`Self::announce_record`]): one unsigned
+    /// Interest `<sync group>/32=chan/<digest>`, lifetime 1 s, HopLimit 8. A device with no
+    /// channel announces its prefixes alone (no mode), and one with neither announces nothing.
+    /// A hearer keeps what an announce says as a hint, which lapses after 90 s unless a later
+    /// announce says it again: a device that stopped serving a prefix is not forgotten by an
+    /// announce (an announce is unsigned, so one that removed a hint would let anyone remove
+    /// it), only by the lapse. It is answered by nobody and cached nowhere.
+    pub(crate) async fn chan_announce(&self, space: &Name) {
+        let Some((group, record)) = self.announce_record(space) else {
+            return;
+        };
         let wire = InterestBuilder::new(chan_prefix(&group))
             .lifetime(Duration::from_secs(1))
             .hop_limit(8)
@@ -477,8 +485,8 @@ impl NodeInner {
         else {
             return;
         };
+        let person = self.person_of(&sender);
         let (writer, vouched) = self.space_of(&space).map_or((false, false), |held| {
-            let person = self.person_of(&sender);
             let log = held.log.lock();
             (log.fold.is_writer(&person), log.vouches(&sender))
         });
@@ -495,11 +503,12 @@ impl NodeInner {
             return;
         }
         // The prefixes it says it serves are a hint too, recorded whatever is decided about
-        // asking it for a channel (a device that only serves has no mode to ask for); an
-        // announce that lists none removes the device's hint.
+        // asking it for a channel (a device that only serves has no mode to ask for). An
+        // announce that lists none records nothing: it is unsigned, so one that removed a hint
+        // would let anyone remove the hint of a real server.
         self.query
             .hints
-            .record(&space, &sender, &serves, Instant::now());
+            .record(&space, &sender, &person, vouched, &serves, Instant::now());
         let now = Instant::now();
         if !self.chan.is_listening(&space) {
             stats.announce_ignored.bump();
@@ -532,6 +541,7 @@ impl NodeInner {
                 match node.chan_ask(&space, &sender, mode).await {
                     Ok(session) => {
                         node.chan.heard.lock().answered(&space, &sender);
+                        node.query.hints.proven(&space, &sender, Instant::now());
                         node.chan_release_unwanted(&session);
                     }
                     Err(why) => {
