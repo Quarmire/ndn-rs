@@ -617,17 +617,20 @@ async fn a_real_setup_verifies_the_senders_own_checkpoints() {
     }
     let frames = stream_until_covered(&ck).await;
     // The kit took what the ask queued (bob's `HELLO`) off the stream: those sequences are
-    // missing here, and a reader is told so.
-    let first = frames
-        .iter()
-        .map(|f| Header::decode(f).unwrap().seq0)
-        .min()
-        .unwrap();
-    let skipped = first - ck.start();
+    // missing here, and a reader is told so. The reader is given the frames before any
+    // checkpoint, so the gap it is told runs from where its stream begins to the first frame
+    // that is no checkpoint: a checkpoint the sender's timer wrote earlier (when it fires
+    // depends on the machine) has a sequence of its own below the data's, and is no part of it.
     let (checkpoints, rest): (Vec<&Bytes>, Vec<&Bytes>) = frames
         .iter()
         .partition(|f| Header::decode(f).unwrap().kind == SideKind::Checkpoint);
     assert!(!checkpoints.is_empty());
+    let first = rest
+        .iter()
+        .map(|f| Header::decode(f).unwrap().seq0)
+        .min()
+        .expect("bob wrote frames besides checkpoints");
+    let skipped = first - ck.start();
     for f in rest {
         ck.deliver(f, HONEST, Instant::now()).await;
     }

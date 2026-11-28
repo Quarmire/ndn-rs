@@ -758,25 +758,38 @@ async fn an_asker_over_its_rate_is_nacked_congestion_after_its_signature_verifie
     let (alice, bob, dave) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2]);
     let stats = &alice.inner.chan.stats;
     let mut nacks = Vec::new();
+    let walks_before = alice.inner.judge.interest_walks() as usize;
+    let started = std::time::Instant::now();
     for _ in 0..30 {
         let (_, interest) = signed_ask(bob, alice, &ask_of(bob, ChannelMode::Latest));
         if let ChanAnswer::Nack(reason) = alice.inner.chan_answer(&interest, None).await {
             nacks.push(reason);
         }
     }
-    assert!(!nacks.is_empty(), "a burst of 30 asks is over 4 a second");
+    // What the burst took, however slowly this machine signed the asks: the bucket refills at
+    // 4 a second while they were made.
+    let elapsed = started.elapsed();
     assert!(
         nacks.iter().all(|r| *r == NackReason::Congestion),
         "{nacks:?}"
     );
     assert_eq!(stats.throttled.get() as usize, nacks.len());
     // The rate is the asker's, charged once the signature verified: the 8 asks of her burst
-    // (and the few tokens refilled meanwhile) cost their walk; once her bucket is empty the
-    // others are refused before their signature is checked.
-    let walks = alice.inner.judge.interest_walks();
+    // always cost their walk, and past them an ask costs one only for a token the bucket
+    // refilled while the asks were made; once her bucket is empty the others are refused before
+    // their signature is checked. So the walks are the asks that were not refused, and never
+    // more than the burst and the refill.
+    let walks = alice.inner.judge.interest_walks() as usize - walks_before;
+    let refilled = (elapsed.as_secs_f64() * 4.0).ceil() as usize + 1;
+    assert!(walks >= 8, "{walks} walks for 30 asks of one key");
     assert!(
-        (8..=14).contains(&walks),
-        "{walks} walks for 30 asks of one key"
+        walks <= 8 + refilled,
+        "{walks} walks for 30 asks of one key made in {elapsed:?}: the burst of 8 and {refilled} tokens at most"
+    );
+    assert!(
+        walks + nacks.len() >= 30,
+        "an ask was refused for the rate or cost its walk: {walks} walks, {} refused",
+        nacks.len()
     );
     // A stranger is told nothing of the rate: his Nack is the stranger's, and costs no walk.
     let walks = alice.inner.judge.interest_walks();
