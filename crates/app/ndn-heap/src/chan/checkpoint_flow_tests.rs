@@ -2102,3 +2102,94 @@ fn the_forgery_text_states_the_bar_outcome_it_knows() {
         "{with}"
     );
 }
+
+/// The checkpoint hash is taken when the ring is drained, not when a frame is sent: what a
+/// checkpoint signs is the record an eager sender would have signed. A real sender sends frames
+/// of both hash classes (SHA-256 to 2,048 octets, BLAKE3 above), and the record in its checkpoint
+/// is the octets that `checkpoint::sign` makes of the same frames hashed one by one with the
+/// digest crates directly, under the same range, epoch and key (Ed25519 signs deterministically,
+/// so the whole record, signature included, is equal).
+#[tokio::test(flavor = "current_thread")]
+async fn a_checkpoint_hashed_when_the_ring_is_drained_is_the_record_an_eager_hash_signs() {
+    use sha2::{Digest, Sha256};
+    let ck = ck(ChannelMode::Reliable, latest(), LinkConfig::default()).await;
+    ck.pause_tick();
+    tokio::time::pause();
+    // The records that began the channel are in the ring: let their checkpoint go first.
+    ck.advance(25).await;
+    ck.advance(15).await;
+    ck.link.take_stream();
+    ck.link.take_datagrams();
+    let sizes = [64usize, 3_000, 20_000, 1, 2_000, 9_000];
+    for (i, size) in sizes.iter().enumerate() {
+        ck.emit(i as u8, &vec![i as u8 + 1; *size]).await;
+    }
+    ck.advance(25).await;
+    ck.advance(15).await;
+    // Every frame the sender sent but a checkpoint is listed: data and the records that bind names.
+    let mut data = Vec::new();
+    let mut checkpoints = Vec::new();
+    for frame in ck
+        .link
+        .take_stream()
+        .into_iter()
+        .chain(ck.link.take_datagrams())
+    {
+        let header = Header::decode(&frame).unwrap();
+        match header.kind {
+            SideKind::Checkpoint => checkpoints.push(frame),
+            _ => data.push((header.seq0, frame)),
+        }
+    }
+    data.sort_by_key(|(seq0, _)| *seq0);
+    assert!(data.iter().any(|(_, f)| f.len() > 2_048), "a BLAKE3 frame");
+    assert!(
+        data.iter().any(|(_, f)| f.len() <= 2_048),
+        "a SHA-256 frame"
+    );
+    let record = {
+        let opened = open(
+            &ck.cipher,
+            checkpoints.last().expect("a checkpoint").clone(),
+            1 << 20,
+        )
+        .expect("a frame under the key");
+        opened.plaintext().to_vec()
+    };
+    let decoded = Record::decode(&record).expect("a checkpoint");
+    assert_eq!(
+        decoded.entries.len(),
+        data.len(),
+        "the checkpoint lists every frame the sender sent since the last"
+    );
+    let eager: Vec<(u64, [u8; 16])> = data
+        .iter()
+        .map(|(seq0, frame)| {
+            let mut hash = [0u8; 16];
+            if frame.len() <= 2_048 {
+                hash.copy_from_slice(&Sha256::digest(frame)[..16]);
+            } else {
+                hash.copy_from_slice(&blake3::hash(frame).as_bytes()[..16]);
+            }
+            (*seq0, hash)
+        })
+        .collect();
+    let reference = checkpoint::sign(
+        &*ck.bob().inner.signer,
+        ck.info.channel,
+        ck.send.key_epoch,
+        decoded.lo,
+        decoded.hi,
+        &eager,
+    )
+    .unwrap();
+    assert_eq!(
+        record,
+        reference.to_vec(),
+        "the record signed when the ring was drained is the record signed over eager hashes"
+    );
+    assert!(
+        decoded.verify(ck.info.channel, ck.send.key_epoch, &ck.public_key()),
+        "and it verifies under the sender's key"
+    );
+}
