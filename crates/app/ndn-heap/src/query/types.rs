@@ -452,9 +452,10 @@ pub enum QueryError {
     #[error(
         "the server did not answer: it does not list this device's person (or this device has \
          no standing in the space, or the person is outside a sealed space's audience), the \
-         query was signed more than 120 s from the server's clock or before the server began \
-         serving (check this device's clock), or no route reaches it; ask the owner to list the \
-         person, correct the clock, and check that the server's device is reachable"
+         query was signed more than 120 s from the server's clock, the server began serving less \
+         than 120 s ago (a server that has just started refuses signed queries for that long), \
+         or no route reaches it; ask the owner to list the person, correct the clock, check that \
+         the server's device is reachable, and ask again in a couple of minutes"
     )]
     NotListed,
     /// The server serves no prefix of the path.
