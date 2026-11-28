@@ -52,7 +52,7 @@ use super::replay::{Replay, ReplayWindow};
 use super::rx_hold::Hold;
 use super::rx_names::{Held, Names, Seen};
 use super::sessions::{EndReason, RecvSession, RecvSessions, Unknown};
-use super::verbs::{Emitted, Got, Kind, LiveEnd, Trust};
+use super::verbs::{Author, Emitted, Got, Kind, LiveEnd, Trust};
 use super::verify::{
     Accepted, Bucket, Budget, Ceiling, Charge, Dup, Judged, Mismatch, NotKept, Share, Silence,
     Verify,
@@ -508,9 +508,8 @@ pub(crate) struct ChannelRx {
     channel: u64,
     space: Name,
     mode: ChannelMode,
-    /// The writer's device and person.
-    writer: Name,
-    by: Name,
+    /// The writer's person and device, shared by every item the channel delivers.
+    author: Arc<Author>,
     aead: Aead,
     datagram_limit: usize,
     stream_limit: usize,
@@ -536,8 +535,7 @@ impl ChannelRx {
             channel: session.id(),
             space: session.space().clone(),
             mode: session.mode(),
-            by: node.person_of(&writer),
-            writer,
+            author: Author::shared(node.person_of(&writer), writer),
             aead: terms.aead,
             datagram_limit: frame_max.clamp(MIN_FRAME_LEN, STREAM_FRAME_MAX),
             stream_limit: frame_max.clamp(STREAM_FRAME_DEFAULT, STREAM_FRAME_MAX),
@@ -904,7 +902,7 @@ impl ChannelRx {
             st.replay.rebase(signed);
             node.chan.stats.rx.window_rebased.bump();
             tracing::warn!(
-                writer = %self.writer, channel = format_args!("{:016x}", self.channel),
+                writer = %self.author.writer, channel = format_args!("{:016x}", self.channel),
                 window = probed, sender = signed,
                 "the replay window of this channel was ahead of the sender (a holder of the channel key sealed a frame far above the sender's): put back at the sender's sequence"
             );
@@ -919,7 +917,7 @@ impl ChannelRx {
             return;
         }
         node.chan.stats.rx.reasks.bump();
-        let (space, sender, mode) = (self.space.clone(), self.writer.clone(), self.mode);
+        let (space, sender, mode) = (self.space.clone(), self.author.writer.clone(), self.mode);
         let flag = Arc::clone(&self.reasking);
         let task = node.arc();
         node.tasks.spawn(async move {
@@ -1238,13 +1236,13 @@ impl ChannelRx {
             sink.end(
                 self.channel,
                 LiveEnd::Ended {
-                    writer: self.writer.clone(),
+                    writer: self.author.writer.clone(),
                     reason: EndReason::Unverifiable {
                         why: format!(
                             "{} sends no checkpoints on this channel (its path has no stream), so \
                              nothing it sends can be verified: ask for `Trust::Prompt`, or use a \
                              path with a stream",
-                            self.writer
+                            self.author.writer
                         ),
                     },
                 },
@@ -1429,7 +1427,7 @@ impl ChannelRx {
                 stats.mismatches.bump();
                 post.bars.push(ingress);
                 post.alerts.push(Alert::ChannelForgery {
-                    writer: self.writer.clone(),
+                    writer: self.author.writer.clone(),
                     channel: self.channel,
                     key_epoch: epoch,
                     seq: header.seq0,
@@ -1458,7 +1456,7 @@ impl ChannelRx {
         node.chan.evidence.push(ChannelEvidence::new(
             kind,
             self.channel,
-            self.writer.clone(),
+            self.author.writer.clone(),
             epoch,
             seq0,
             frame,
@@ -1600,7 +1598,7 @@ impl ChannelRx {
         );
         post.bars.push(ingress);
         post.alerts.push(Alert::ChannelCheckpoint {
-            writer: self.writer.clone(),
+            writer: self.author.writer.clone(),
             channel: self.channel,
             key_epoch: epoch,
             via: FaceId(ingress),
@@ -1611,7 +1609,7 @@ impl ChannelRx {
                  not verify under {w}'s key, so a holder of the channel key made it; {}: ask {w} \
                  again once that link is dealt with",
                 bar_said(node.chan.bar.get().is_some(), ingress),
-                w = self.writer
+                w = self.author.writer
             ),
         };
         post.end = Some(why.clone());
@@ -1659,7 +1657,7 @@ impl ChannelRx {
                     st.highest.max(seq0)
                 };
                 for sink in lanes.prompt.iter() {
-                    sink.retract(&self.writer, seq0, to);
+                    sink.retract(&self.author.writer, seq0, to);
                 }
                 if st.pending_end == Some(seq0) {
                     st.pending_end = None;
@@ -1668,7 +1666,7 @@ impl ChannelRx {
             if !post.bars.contains(&accepted.ingress) {
                 post.bars.push(accepted.ingress);
                 post.alerts.push(Alert::ChannelForgery {
-                    writer: self.writer.clone(),
+                    writer: self.author.writer.clone(),
                     channel: self.channel,
                     key_epoch: accepted.epoch,
                     seq: seq0,
@@ -2006,8 +2004,7 @@ impl ChannelRx {
             got: Some(Got {
                 path: name,
                 bytes: message.payload,
-                by: self.by.clone(),
-                writer: self.writer.clone(),
+                author: Arc::clone(&self.author),
                 kind: Kind::Emitted(Emitted {
                     seq,
                     stands: message.stand_secs.map(Duration::from_secs),
@@ -2110,7 +2107,7 @@ impl Receivers {
         }
         *noted = Some(now);
         tracing::warn!(
-            writer = %ch.writer, channel = format_args!("{:016x}", ch.channel),
+            writer = %ch.author.writer, channel = format_args!("{:016x}", ch.channel),
             "the node's 8 MiB for frames kept for checkpoints and frames held is taken by channels \
              that hold more than their equal part: frames of this channel go unchecked or are \
              dropped from the hold until they give it back (counted `budget_starved`). If it keeps \
@@ -2226,7 +2223,7 @@ impl Receivers {
             sink.end(
                 id,
                 LiveEnd::Ended {
-                    writer: ch.writer.clone(),
+                    writer: ch.author.writer.clone(),
                     reason: why.clone(),
                 },
             );

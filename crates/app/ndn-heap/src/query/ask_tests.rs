@@ -17,7 +17,7 @@ use super::types::{
     Targets, Via,
 };
 use crate::chan::items::Items;
-use crate::chan::verbs::{GetNotice, GetOptions, Got, Kind, Live, Select};
+use crate::chan::verbs::{Author, GetNotice, GetOptions, Got, Kind, Live, Select};
 use crate::error::HeapError;
 use crate::fold::Readers;
 use crate::node::Node;
@@ -48,8 +48,7 @@ fn answer_of(server: &str, id: u64, text: &str) -> Got {
     Got {
         path: n("/q"),
         bytes: Bytes::copy_from_slice(text.as_bytes()),
-        by: n("/bob"),
-        writer: n(server),
+        author: Author::shared(n("/bob"), n(server)),
         kind: Kind::Answered(Answered {
             query: QueryId(id),
             via: Via::Signed,
@@ -409,7 +408,7 @@ async fn asked_is_always_answered_plus_refused_plus_failed_plus_silent() {
         assert_eq!(notices, *failed, "round {round}");
         let mut writers: Vec<_> = rest
             .iter()
-            .filter_map(|r| r.as_ref().ok().map(|g| g.writer.clone()))
+            .filter_map(|r| r.as_ref().ok().map(|g| g.author.writer.clone()))
             .collect();
         writers.sort();
         writers.dedup();
@@ -1192,8 +1191,12 @@ async fn a_listed_asker_gets_the_handlers_answer_signed_by_the_servers_device() 
     };
     assert_eq!(got.path, n("/world/pickup/1"), "the asked name");
     assert_eq!(got.bytes.as_ref(), b"pong:4");
-    assert_eq!(got.writer, n("/alice/laptop"), "the server's device");
-    assert_eq!(got.by, n("/alice"), "its person, as the asker judged it");
+    assert_eq!(got.author.writer, n("/alice/laptop"), "the server's device");
+    assert_eq!(
+        got.author.by,
+        n("/alice"),
+        "its person, as the asker judged it"
+    );
     let Kind::Answered(answered) = &got.kind else {
         panic!("an answer: {got:?}");
     };
@@ -1223,7 +1226,7 @@ async fn a_reader_may_ask() {
         panic!("one answer and its end: {told:?}");
     };
     assert_eq!(got.bytes.as_ref(), b"echo:hi");
-    assert_eq!(got.writer, n("/alice/laptop"));
+    assert_eq!(got.author.writer, n("/alice/laptop"));
     assert_eq!(*finished, done(1, 1, 0, 0, 0));
     // A reader's device never serves.
     assert!(
@@ -1261,10 +1264,13 @@ async fn several_servers_answer_and_done_counts_add_up() {
     assert_eq!(items.len(), 2, "{told:?}");
     let alice = items
         .iter()
-        .find(|g| g.writer == n("/alice/laptop"))
+        .find(|g| g.author.writer == n("/alice/laptop"))
         .unwrap();
     assert_eq!(alice.bytes.as_ref(), b"alice:?");
-    let phone = items.iter().find(|g| g.writer == n("/bob/phone")).unwrap();
+    let phone = items
+        .iter()
+        .find(|g| g.author.writer == n("/bob/phone"))
+        .unwrap();
     assert!(phone.bytes.is_empty());
     let Kind::Answered(a) = &phone.kind else {
         panic!()
@@ -1751,8 +1757,8 @@ async fn a_sealed_space_query_end_to_end_one_agreement_for_two_queries() {
             panic!("round {round}: {told:?}");
         };
         assert_eq!(got.bytes.as_ref(), b"s:secret");
-        assert_eq!(got.writer, n("/alice/laptop"));
-        assert_eq!(got.by, n("/alice"));
+        assert_eq!(got.author.writer, n("/alice/laptop"));
+        assert_eq!(got.author.by, n("/alice"));
         assert_eq!(*finished, done(1, 1, 0, 0, 0));
     }
     assert_eq!(runs.load(Ordering::SeqCst), 2);

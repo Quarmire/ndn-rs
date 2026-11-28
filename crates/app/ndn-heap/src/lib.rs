@@ -60,9 +60,9 @@ pub use crate::chan::route::{DATAGRAM_FRAME_MAX, SIDE_TTL};
 pub use crate::chan::rx::{Delivery, Dropped};
 pub use crate::chan::sessions::{ChannelInfo, EndReason};
 pub use crate::chan::verbs::{
-    Congestion, EmitError, EmitOptions, Emitted, GetNotice, GetOptions, Got, HEADS_MAX, Heads,
-    Kept, Kind, Live, LiveEnd, Mode, Modes, STAND_MAX, STANDING_BYTES_MAX, STANDING_NAMES_MAX,
-    Select, Trust, Window,
+    Author, Congestion, EmitError, EmitOptions, Emitted, GetNotice, GetOptions, Got, HEADS_MAX,
+    Heads, Kept, Kind, Live, LiveEnd, Mode, Modes, STAND_MAX, STANDING_BYTES_MAX,
+    STANDING_NAMES_MAX, Select, Trust, Window,
 };
 pub use crate::chan::wire::{ChannelMode, RefusalCode};
 pub use crate::error::{Cut, HeapError, NextStep, Refusal, Timestamp};

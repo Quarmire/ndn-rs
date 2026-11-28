@@ -4,6 +4,7 @@
 //! One place declares them so the sender (`emit`) and the receiver (`get`) agree: the options, the
 //! modes, the error with its [`NextStep`], and the item a receiver gets.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -473,7 +474,7 @@ pub struct Emitted {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Kind {
-    /// A kept value: durable and signed by `Got::writer`'s device, the register's head of its
+    /// A kept value: durable and signed by the device `Got::author` names (`Author::writer`), the register's head of its
     /// path.
     Kept(Kept),
     /// A live emission: not durable, never the current value of the path.
@@ -483,13 +484,11 @@ pub enum Kind {
     Answered(Answered),
 }
 
-/// One item `get` yields.
+/// Who wrote an item: the writer's person and device. One `Author` is shared by every item of a
+/// session (an `Arc` in each [`Got`], cloned with one reference count), so an item does not carry
+/// two names of its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Got {
-    /// The path, relative to the space.
-    pub path: Name,
-    /// The payload.
-    pub bytes: Bytes,
+pub struct Author {
     /// The writer's person. For a kept value, the person of the trust context that validated the
     /// signing key of the entry. For an emission, the person of the sender's device as judged
     /// when the session was set up: the channel's, not proof that this frame is the sender's
@@ -497,6 +496,24 @@ pub struct Got {
     pub by: Name,
     /// The writer's device.
     pub writer: Name,
+}
+
+impl Author {
+    /// The author `by` of `writer`'s device, shared.
+    pub fn shared(by: Name, writer: Name) -> Arc<Author> {
+        Arc::new(Author { by, writer })
+    }
+}
+
+/// One item `get` yields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Got {
+    /// The path, relative to the space.
+    pub path: Name,
+    /// The payload.
+    pub bytes: Bytes,
+    /// The writer's person (`author.by`) and device (`author.writer`).
+    pub author: Arc<Author>,
     /// What it is.
     pub kind: Kind,
 }

@@ -6,6 +6,7 @@
 //! that need a sender and a receiver run on three nodes over a [`Link`] the test pumps by hand, so
 //! what reached the receiver, and when, is the test's to say.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -15,7 +16,9 @@ use ndn_foundation_types::Name;
 use super::carrier_kit::LinkConfig;
 use super::items::Items;
 use super::rx_tests::{Wire, eventually, rig_tuned, shared};
-use super::verbs::{Congestion, EmitOptions, GetNotice, GetOptions, Got, Kept, Kind, Live, Select};
+use super::verbs::{
+    Author, Congestion, EmitOptions, GetNotice, GetOptions, Got, Kept, Kind, Live, Select,
+};
 use super::wire::ChannelMode;
 use crate::error::{HeapError, Refusal};
 use crate::log::Frontier;
@@ -128,8 +131,7 @@ async fn get_gives_the_current_kept_values_in_path_order_and_caught_up_resolves_
         Ok(Got {
             path: n(path),
             bytes: Bytes::copy_from_slice(bytes.as_bytes()),
-            by: n("/alice"),
-            writer: dev.name.clone(),
+            author: Author::shared(n("/alice"), dev.name.clone()),
             kind: Kind::Kept(Kept {
                 id: id.clone(),
                 as_of: None,
@@ -571,8 +573,12 @@ async fn by_is_the_authenticated_person_and_writer_the_device_for_both_kinds() {
         .collect();
     assert_eq!(got.len(), 2, "{got:?}");
     for one in &got {
-        assert_eq!(one.by, n("/bob"), "the writer's person: {one:?}");
-        assert_eq!(one.writer, n("/bob/phone"), "the writer's device: {one:?}");
+        assert_eq!(one.author.by, n("/bob"), "the writer's person: {one:?}");
+        assert_eq!(
+            one.author.writer,
+            n("/bob/phone"),
+            "the writer's device: {one:?}"
+        );
     }
     let kept = got
         .iter()
@@ -623,7 +629,10 @@ async fn a_writer_who_never_put_is_heard_from_his_first_emission() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(&got[0].bytes[..], b"here");
-    assert_eq!((&got[0].by, &got[0].writer), (&n("/bob"), &device));
+    assert_eq!(
+        (&got[0].author.by, &got[0].author.writer),
+        (&n("/bob"), &device)
+    );
     assert!(
         matches!(got[0].kind, Kind::Emitted(_)),
         "an emission, not a kept value: {:?}",
@@ -633,6 +642,40 @@ async fn a_writer_who_never_put_is_heard_from_his_first_emission() {
         !vouched(&w),
         "carol still holds no entry of his device: he was heard without a put"
     );
+}
+
+/// Every emission of one session carries the same `Author`, one reference to the sender's person and
+/// device (REPLY-26 §3.2): no `Name` is cloned for an item, and what the item says of its writer is
+/// what the session said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_emissions_of_one_session_share_one_author() {
+    let w = three(LinkConfig::default(), 4096).await;
+    let mut watcher = carol_get(&w, emitted_only());
+    w.join(ChannelMode::Latest).await;
+    for (i, path) in ["/a", "/b", "/c"].into_iter().enumerate() {
+        w.bob()
+            .emit(
+                &n(path),
+                Bytes::from(format!("m{i}")),
+                EmitOptions::latest(),
+            )
+            .await
+            .unwrap();
+    }
+    let got = pump_until(&w, &mut watcher, "m2").await;
+    let emitted: Vec<&Got> = got
+        .iter()
+        .filter(|g| matches!(g.kind, Kind::Emitted(_)))
+        .collect();
+    assert!(emitted.len() >= 3, "{got:?}");
+    for g in &emitted {
+        assert!(
+            Arc::ptr_eq(&g.author, &emitted[0].author),
+            "one author for the session: {g:?}"
+        );
+    }
+    assert_eq!(emitted[0].author.by, n("/bob"));
+    assert_eq!(emitted[0].author.writer, n("/bob/phone"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

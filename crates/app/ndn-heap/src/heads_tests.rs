@@ -230,8 +230,8 @@ async fn winner_mode_is_unchanged_byte_for_byte() {
         (
             first.path.clone(),
             first.bytes.clone(),
-            first.by.clone(),
-            first.writer.clone()
+            first.author.by.clone(),
+            first.author.writer.clone()
         ),
         (
             n("/p"),

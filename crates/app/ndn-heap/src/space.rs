@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 
 #[cfg(doc)]
 use crate::chan::verbs::HEADS_MAX;
-use crate::chan::verbs::{GetNotice, Got, Heads, Kept, Kind as GotKind, Select};
+use crate::chan::verbs::{Author, GetNotice, Got, Heads, Kept, Kind as GotKind, Select};
 use crate::error::{HeapError, Refusal};
 use crate::fold::Readers;
 use crate::log::{Alert, Blob, Change, Effects, Frontier, Log, Members, Step};
@@ -433,8 +433,7 @@ fn kept_got(item: Item, removed: bool) -> Got {
     Got {
         path: item.path,
         bytes: item.bytes,
-        by: item.by,
-        writer: item.writer,
+        author: Author::shared(item.by, item.writer),
         kind: GotKind::Kept(kept),
     }
 }
@@ -634,8 +633,7 @@ impl KeptFeed {
                 self.ready.push_back(Ok(Got {
                     path: path.clone(),
                     bytes,
-                    by: head.person.clone(),
-                    writer: head.entry.device.clone(),
+                    author: Author::shared(head.person.clone(), head.entry.device.clone()),
                     kind: GotKind::Kept(kept),
                 }));
             }

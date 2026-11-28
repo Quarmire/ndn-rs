@@ -46,7 +46,7 @@ use super::types::{
 use super::{answer_aad, open_answer, pair_context, query_aad, seal_query};
 use crate::chan::ask::is_reserved;
 use crate::chan::standing::{Unstanding, Who, gate, standing};
-use crate::chan::verbs::{GetNotice, Got, Kind, Select};
+use crate::chan::verbs::{Author, GetNotice, Got, Kind, Select};
 use crate::error::{HeapError, Timestamp};
 use crate::node::NodeInner;
 use crate::rt::Instant;
@@ -915,11 +915,11 @@ impl NodeInner {
         } else {
             None
         };
+        let author = Author::shared(person.clone(), server.clone());
         let got = |bytes: Bytes, refusal: Option<AppRefusal>| Got {
             path: run.path.clone(),
             bytes,
-            by: person.clone(),
-            writer: server.clone(),
+            author: Arc::clone(&author),
             kind: Kind::Answered(Answered {
                 query: run.id,
                 via: Via::Signed,

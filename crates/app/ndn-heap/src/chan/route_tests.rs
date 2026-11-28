@@ -382,7 +382,7 @@ async fn a_session_data_reaches_the_receiver_with_its_route_and_frames_then_flow
     let got = next(&mut items).await.expect("an item");
     assert_eq!(got.path.to_string(), "/a");
     assert_eq!(&got.bytes[..], b"x");
-    assert_eq!(&got.writer, rig.bob().name());
+    assert_eq!(&got.author.writer, rig.bob().name());
     assert!(
         rig.engine.side().stats().frames_out >= 2,
         "HELLO and the emission"
