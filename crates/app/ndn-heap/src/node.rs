@@ -308,6 +308,8 @@ impl Node {
             config.adopter.clone(),
         );
         let conn = transport.node.connection();
+        let suspicion = Suspicion::open(Arc::clone(&store));
+        judge.watch_suspicion(&suspicion);
         let inner = Arc::new_cyclic(|me| NodeInner {
             me: me.clone(),
             device: device.clone(),
@@ -317,7 +319,7 @@ impl Node {
             conn: Arc::clone(&conn),
             recipient,
             judge,
-            suspicion: Suspicion::open(Arc::clone(&store)),
+            suspicion,
             store,
             flusher,
             config,

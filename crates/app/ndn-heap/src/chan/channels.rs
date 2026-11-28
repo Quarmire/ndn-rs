@@ -506,6 +506,39 @@ impl Channels {
         Ok(channel.admitted(&receiver, rekeyed, fresh, !fresh && asker.new))
     }
 
+    /// Take back the receiver [`Self::admit`] made for `device` at `issued`, because what the
+    /// caller owed the asker with it (an `Ask` channel's pair) could not be made: a refused
+    /// setup holds no place of the channel or of the asker's person. Nothing happens if the
+    /// receiver is no longer that one (a later ask renewed it), or if it was a renewal rather
+    /// than a new place (`fresh` says which).
+    pub(crate) fn unadmit(
+        &self,
+        space: &Name,
+        mode: ChannelMode,
+        device: &Name,
+        issued: Instant,
+        fresh: bool,
+    ) {
+        if !fresh {
+            return;
+        }
+        let mut table = self.table.lock();
+        let Some(channel) = table.channels.get_mut(&(space.clone(), mode)) else {
+            return;
+        };
+        if channel
+            .receivers
+            .get(device)
+            .is_some_and(|r| r.issued == issued)
+        {
+            channel.receivers.remove(device);
+            channel.sync_live();
+            if channel.receivers.is_empty() && channel.empty_since.is_none() {
+                channel.empty_since = Some(issued);
+            }
+        }
+    }
+
     /// Make the channel of `(space, mode)` if there is none (the sender's own start, before
     /// anyone asked). `Err` when the sender keeps [`CHANNELS_PER_SENDER`] already.
     pub(crate) fn open(

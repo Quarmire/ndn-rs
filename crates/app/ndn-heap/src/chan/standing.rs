@@ -8,6 +8,8 @@
 //! a person, or the context that revokes a key, is held. [`gate`] asks the same of this device
 //! itself.
 
+use std::time::Duration;
+
 use ndn_foundation_types::Name;
 use ndn_security::cert_name::key_name_of;
 use ndn_security::{SignedTrustContext, Validator};
@@ -131,6 +133,41 @@ fn read_chain(view: &Validator, context: &SignedTrustContext, key: &Name) -> Cha
         want = (*issuer).clone();
     }
     Chain::Unknown
+}
+
+/// How long the certificates above `key` last, by the clock the validator judges them by: the
+/// least time left of any certificate on the chain the node holds (the key's own, then each
+/// issuer's, up to an anchor), or `None` when none of them has an end. The signed path judges a
+/// signed ask or query against each of these at the moment it is made, so a standing that
+/// rests on the chain ends with the first of them: [`Duration::ZERO`] when one has lapsed. It
+/// reads only certificates vouched for (a walk reached an anchor through them), and fetches
+/// nothing.
+pub(crate) fn chain_lasts(log: &Log, judge: &Judge, key: &Name) -> Option<Duration> {
+    let view = judge.view_for(key, &log.space, true);
+    let context = view.keyring().context_for(key);
+    let cache = view.cert_cache();
+    let now = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+    let mut ends: Option<u64> = None;
+    let mut want = key.clone();
+    for _ in 0..CHAIN_HOPS {
+        if context.is_anchor(&want) {
+            break;
+        }
+        let Some(cert) = cache.get_vouched(&want) else {
+            break;
+        };
+        if cert.valid_until != u64::MAX {
+            ends = Some(ends.map_or(cert.valid_until, |e| e.min(cert.valid_until)));
+        }
+        let Some(issuer) = cert.issuer else { break };
+        if key_name_of(&issuer) == key_name_of(&want) {
+            break;
+        }
+        want = (*issuer).clone();
+    }
+    ends.map(|end| Duration::from_nanos(end.saturating_sub(now)))
 }
 
 /// This device may take part: the creation of the space is held and this device's key stands as

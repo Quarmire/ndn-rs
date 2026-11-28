@@ -10,10 +10,14 @@
 //! 2. the pair id names a live pair of this node on this route: else `unknown_pair`, **no AEAD**;
 //! 3. the key epoch octet is the pair's, and the counter is fresh in the pair's window: else
 //!    `unknown_pair` / `replayed`, no AEAD (nothing is marked);
-//! 4. the asker was judged by what this node holds now: two atomic loads (the trust generation
-//!    and the space's fold version) against what she was judged by; if either moved the pair's
-//!    space is judged again offline ([`NodeInner::chan_rejudge`]) and a pair whose asker no longer
-//!    stands is gone: `rejudged_out`, **before any AEAD**;
+//! 4. the asker was judged by what this node holds now: two atomic loads (the trust generation,
+//!    which a revocation **and a suspicion mark or lift** move, and the space's fold version)
+//!    against what she was judged by; if either moved the pair's space is judged again offline
+//!    ([`NodeInner::chan_rejudge`]) and a pair whose asker no longer stands is gone:
+//!    `rejudged_out`, **before any AEAD**. (What the clock alone ends is the pair's lease, which
+//!    step 2 reads: the pair lives its session's lifetime, at most an hour, and not past the
+//!    earliest end of the certificates of her chain, as the signed path would refuse her from
+//!    then on);
 //! 5. one AEAD open under `Kq` with the 36 header octets as the additional data: `bad_seal`
 //!    (nothing is marked: a forged frame burns no counter);
 //! 6. the counter is marked in the pair's window. **A counter is marked after the AEAD opened and

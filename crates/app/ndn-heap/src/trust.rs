@@ -21,8 +21,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -41,6 +41,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::error::{Cut, Refusal, Timestamp};
+use crate::revocation::Suspicion;
 use crate::rt::{self, Instant, Tasks};
 use crate::store::{Kind, Link};
 use crate::wire::{
@@ -617,6 +618,10 @@ pub(crate) struct Judge {
     /// How many person adoptions so far refused more than the version before
     /// them: what a keyring's own revocation epoch counts for its contexts.
     scoped_revocations: AtomicU64,
+    /// How many times a key was marked suspected or lifted ([`Suspicion::epoch`]), once the node
+    /// has joined its suspicion map to the judge ([`Self::watch_suspicion`]): a mark changes what
+    /// stands as surely as a revocation does, so it moves [`Self::generation`] too.
+    suspicions: OnceLock<Arc<AtomicU64>>,
     /// How many signature walks of signed Interests the judge has made ([`Self::validate_interest`]):
     /// what a test reads to show an Interest that was refused before its signature cost none.
     interest_walks: AtomicU64,
@@ -657,6 +662,7 @@ impl Judge {
             scopes: Mutex::new(scopes),
             events,
             scoped_revocations: AtomicU64::new(0),
+            suspicions: OnceLock::new(),
             interest_walks: AtomicU64::new(0),
             tasks: Tasks::new(),
         });
@@ -684,14 +690,26 @@ impl Judge {
     }
 
     /// A counter that moves whenever a verdict given before may have changed
-    /// for the worse: the keyring adopted a revoking context, or a person's
-    /// newer version refuses more than the one before. Read it before
-    /// judging; if it reads the same after, the verdict stands.
+    /// for the worse: the keyring adopted a revoking context, a person's
+    /// newer version refuses more than the one before, or a key was marked
+    /// suspected (or the mark lifted). Read it before judging; if it reads
+    /// the same after, the verdict stands.
     pub(crate) fn generation(&self) -> u64 {
         self.validator
             .keyring()
             .revocation_epoch()
             .wrapping_add(self.scoped_revocations.load(Ordering::SeqCst))
+            .wrapping_add(
+                self.suspicions
+                    .get()
+                    .map_or(0, |epoch| epoch.load(Ordering::SeqCst)),
+            )
+    }
+
+    /// Join the node's suspicion map to this judge: from now on a mark or a lift moves
+    /// [`Self::generation`]. Once, at the node's start.
+    pub(crate) fn watch_suspicion(&self, suspicion: &Suspicion) {
+        let _ = self.suspicions.set(suspicion.epoch());
     }
 
     /// The version of `person`'s context adopted here for spaces, if one is.

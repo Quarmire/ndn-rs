@@ -10,7 +10,8 @@
 //!
 //! [`is_current`]: super::sessions::RecvSession::is_current
 
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
@@ -303,6 +304,10 @@ pub(crate) struct Chan {
     wake: Arc<Notify>,
     listening: Mutex<HashMap<Name, usize>>,
     heard: Mutex<Heard>,
+    /// The spaces whose channels were re-keyed or lost a receiver by a judgement that was not the
+    /// maintenance pass's (a query's), and are announced by the next pass: the pass finds
+    /// nothing moved afterwards, because the judgement restamped what it judged.
+    announce_owed: Mutex<BTreeSet<Name>>,
     /// Test seam: while set, the maintenance pass does nothing, so a test can show what the frame
     /// layer decides before the node's own pass has noticed a change.
     #[cfg(test)]
@@ -330,6 +335,7 @@ impl Chan {
             wake: Arc::new(Notify::new()),
             listening: Mutex::new(HashMap::new()),
             heard: Mutex::new(Heard::default()),
+            announce_owed: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             tick_paused: std::sync::atomic::AtomicBool::new(false),
         }
@@ -633,20 +639,37 @@ impl NodeInner {
         // stands is kept; the epoch that arrives is judged when it does.
         let audience = if sealed { log.fold.in_force() } else { None };
         let members = audience.as_ref().map(|e| log.fold.audience(e));
-        let stands = |_device: &Name, key: &Name| {
-            let Ok(person) = standing(&log, &self.judge, key, Who::Listed) else {
-                return false;
-            };
-            members.as_ref().is_none_or(|m| m.contains(&person))
+        // One judgement for each key, however many pairs and receivers hold it (a device that
+        // asked again holds two pairs, and each device is a receiver as well): standing reads the
+        // trust state, and this runs under the space's lock.
+        let judged: RefCell<HashMap<Name, bool>> = RefCell::new(HashMap::new());
+        let stands = |key: &Name| {
+            if let Some(known) = judged.borrow().get(key) {
+                return *known;
+            }
+            let verdict = standing(&log, &self.judge, key, Who::Listed)
+                .is_ok_and(|person| members.as_ref().is_none_or(|m| m.contains(&person)));
+            judged.borrow_mut().insert(key.clone(), verdict);
+            verdict
         };
         // The pairs of the `Ask` channels are judged by the same rule, and go with the move that
         // removed their asker: the next query of a removed person finds no pair to open.
         self.chan
             .pairs
-            .rejudge(space, judged_at, |owner| stands(&owner.device, &owner.key));
-        self.chan
-            .channels
-            .rejudged(space, judged_at, audience.as_ref(), now, stands)
+            .rejudge(space, judged_at, |owner| stands(&owner.key));
+        let done =
+            self.chan
+                .channels
+                .rejudged(space, judged_at, audience.as_ref(), now, |_, key| {
+                    stands(key)
+                });
+        // Whoever judged, the move is announced by the next pass: it finds the channels judged
+        // already (this judgement restamped them) and would say nothing until the periodic one.
+        if !done.dropped.is_empty() || !done.rekeyed.is_empty() {
+            self.chan.announce_owed.lock().insert(space.clone());
+            self.chan.wake();
+        }
+        done
     }
 
     /// One pass of the maintenance task at `now`.
@@ -671,12 +694,10 @@ impl NodeInner {
                     .any(|(_, at)| *at != live)
             });
             if moved {
-                let done = self.chan_rejudge(&space, now);
-                if !done.dropped.is_empty() || !done.rekeyed.is_empty() {
-                    announce.push(space);
-                }
+                self.chan_rejudge(&space, now);
             }
         }
+        announce.extend(std::mem::take(&mut *self.chan.announce_owed.lock()));
         let (lapsed, _ended) = self.chan.channels.expire(now);
         for (space, mode, device) in &lapsed {
             if *mode == ChannelMode::Ask {

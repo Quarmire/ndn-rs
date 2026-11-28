@@ -7,7 +7,11 @@
 //! one (a signed ask, inside the query's deadline; a refusal is [`QueryError::NoSession`], never
 //! a fall back to signed); `Auto` takes the channel only for a session already held with its
 //! pair, a forwarder attached, a query that fits one frame, and no proof asked, and is signed
-//! otherwise. `Auto` never creates a session.
+//! otherwise. `Auto` creates a session in one case only: the session was let go because the
+//! server stopped answering (three silent queries, or the pair used up), not because nobody
+//! asked for a minute. That release owes the server **one** setup, made by the next `Auto` query
+//! inside its deadline and before it goes signed: a relay that dropped frames does not choose
+//! the path for good.
 //!
 //! **One query.** [`NodeInner::ask_server_channel`] takes the next number of the pair's counter
 //! (taken once, whatever becomes of the send: a retry is a new query), a random 64-bit token,
@@ -27,8 +31,10 @@
 //!
 //! **Silence.** A query nothing answered by its deadline is one silent query of its pair; three
 //! in a row ([`AskPair::silence`]) mean the server has forgotten the pair (a restart, an
-//! eviction), and the session is let go: the next `Channel` query asks again. Cancelling a query
-//! (dropping its `Items`) is not silence.
+//! eviction), and the session is let go: the next `Channel` query asks again. A silent query
+//! sent **before** an answer that opened under the pair is no part of the run (the server held
+//! the pair when it answered: that query hit a limit or a `Pass`, or was lost). Cancelling a
+//! query (dropping its `Items`) is not silence.
 //!
 //! **No answers family.** Nothing here keeps an answer: the pending entry holds a one-shot
 //! sender and is gone with the answer; the pair holds counters and keys.
@@ -103,12 +109,25 @@ struct Waiting {
     qseq: u64,
 }
 
-/// What the asker keeps of the channel path: the queries waiting, by (route, token).
+/// What the asker keeps of the channel path: the queries waiting, by (route, token), and the
+/// servers whose session this node let go for their silence.
 #[derive(Default)]
 pub(crate) struct ChanAskState {
     waiting: Mutex<HashMap<(u64, u64), Waiting>>,
+    /// `(space, server)` → when this node let the session go because the server stopped
+    /// answering (or the pair was used up), not because nobody asked for a minute: the next
+    /// `Auto` query owes the channel one setup before it goes signed. At most
+    /// [`OWED_MAX`] entries, each good for [`OWED_FOR`].
+    owed: Mutex<HashMap<(Name, Name), Instant>>,
     pub(crate) stats: ChanAskStats,
 }
+
+/// The most servers a node remembers it owes a setup to.
+const OWED_MAX: usize = 256;
+
+/// How long a silence release owes the server a setup: after it, the server is asked again by a
+/// `Channel` query or by an announce, and `Auto` is as it is for a server never asked.
+const OWED_FOR: Duration = Duration::from_secs(600);
 
 impl ChanAskState {
     /// Register the query `(route, token)`; `None` when a query of that key waits already.
@@ -139,6 +158,26 @@ impl ChanAskState {
     pub(crate) fn pending(&self) -> usize {
         self.waiting.lock().len()
     }
+
+    /// This node let the session with `server` go at `now` because the server stopped answering:
+    /// its next `Auto` query makes one setup before going signed.
+    fn owe(&self, space: &Name, server: &Name, now: Instant) {
+        let mut owed = self.owed.lock();
+        owed.retain(|_, at| now.saturating_duration_since(*at) < OWED_FOR);
+        let key = (space.clone(), server.clone());
+        if owed.len() < OWED_MAX || owed.contains_key(&key) {
+            owed.insert(key, now);
+        }
+    }
+
+    /// Whether a setup is owed to `server` (and it is not owed again: one setup for each
+    /// release).
+    fn take_owed(&self, space: &Name, server: &Name, now: Instant) -> bool {
+        self.owed
+            .lock()
+            .remove(&(space.clone(), server.clone()))
+            .is_some_and(|at| now.saturating_duration_since(at) < OWED_FOR)
+    }
 }
 
 /// A registered query, removed when dropped: answered (the entry is gone already), past its
@@ -147,6 +186,8 @@ struct Wait<'a> {
     node: &'a NodeInner,
     key: (u64, u64),
     pair: Arc<AskPair>,
+    /// When the query was registered, which is before its frame was sent.
+    sent: Instant,
     deadline: Instant,
 }
 
@@ -156,7 +197,7 @@ impl Drop for Wait<'_> {
         let unanswered = state.waiting.lock().remove(&self.key).is_some();
         if unanswered && Instant::now() >= self.deadline {
             state.stats.silent.bump();
-            if self.pair.silence() {
+            if self.pair.silence(self.sent) {
                 self.node.query_release_pair(&self.pair);
             }
         }
@@ -191,6 +232,10 @@ impl NodeInner {
             return;
         }
         if let Some(session) = self.chan.sessions.get(pair.channel) {
+            self.query
+                .ask
+                .chan
+                .owe(session.space(), session.sender(), Instant::now());
             self.chan_let_go(&session);
         }
         self.chan.ask_pairs.remove(pair.channel);
@@ -213,7 +258,34 @@ impl NodeInner {
                 if run.ask.proof || !fits || self.chan.route.conn().is_none() {
                     return Ok(None);
                 }
-                Ok(self.query_held(space, server))
+                if let Some(held) = self.query_held(space, server) {
+                    return Ok(Some(held));
+                }
+                // A session this node let go because the server stopped answering is not let go
+                // for good: three dropped frames are no reason to send the next query in the
+                // clear. One setup, inside the query's deadline and in half of what is left of
+                // it (the other half is the signed path's), and then the query goes as it
+                // would. A setup costs the server what a signed query costs it.
+                if !self.query.ask.chan.take_owed(space, server, Instant::now()) {
+                    return Ok(None);
+                }
+                let half = run.deadline.saturating_duration_since(Instant::now()) / 2;
+                if half.is_zero() {
+                    return Ok(None);
+                }
+                match crate::rt::timeout(half, self.chan_ask(space, server, ChannelMode::Ask)).await
+                {
+                    Ok(Ok(session)) => Ok(self
+                        .chan
+                        .ask_pairs
+                        .get(session.id())
+                        .map(|pair| (session, pair))),
+                    Ok(Err(why)) => {
+                        tracing::debug!(%space, %server, "the setup an `Auto` query owed: {why}");
+                        Ok(None)
+                    }
+                    Err(_) => Ok(None),
+                }
             }
             QueryPath::Channel => {
                 if self.chan.route.conn().is_none() {
@@ -291,6 +363,7 @@ impl NodeInner {
             node: self,
             key,
             pair: Arc::clone(&pair),
+            sent: Instant::now(),
             deadline: run.deadline,
         };
         let header = QueryHeader {
@@ -429,7 +502,7 @@ impl NodeInner {
         let resolved = open_status(&waiting, &header, &frame[..ANSWER_HEADER_LEN], sealed);
         match &resolved {
             Ok(_) => {
-                waiting.pair.answered();
+                waiting.pair.answered(Instant::now());
                 state.stats.answers.bump();
             }
             Err(why) => {

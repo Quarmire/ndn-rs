@@ -428,13 +428,40 @@ fn an_askers_counter_is_used_up_at_the_limit_and_never_wraps() {
 #[test]
 fn three_silent_queries_in_a_row_say_the_server_forgot_the_pair_and_an_answer_resets_it() {
     let (_, keys) = keys();
-    let pair = AskPair::new(&keys, Aead::Aes256Gcm, 7, 0, Instant::now());
-    assert!(!pair.silence());
-    assert!(!pair.silence());
-    pair.answered();
-    assert!(!pair.silence());
-    assert!(!pair.silence());
-    assert!(pair.silence());
+    let t0 = Instant::now();
+    let pair = AskPair::new(&keys, Aead::Aes256Gcm, 7, 0, t0);
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    assert!(!pair.silence(at(1)));
+    assert!(!pair.silence(at(2)));
+    pair.answered(at(3));
+    assert!(!pair.silence(at(4)));
+    assert!(!pair.silence(at(5)));
+    assert!(pair.silence(at(6)));
+}
+
+#[test]
+fn a_silent_query_sent_before_an_answer_is_no_evidence_the_pair_is_gone() {
+    let (_, keys) = keys();
+    let t0 = Instant::now();
+    let pair = AskPair::new(&keys, Aead::Aes256Gcm, 7, 0, t0);
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    // Five queries in flight; the server answers the fifth (it limited, passed or lost the
+    // others): their silence says nothing of the pair, however many there are.
+    pair.answered(at(10));
+    for sent in 1..=5 {
+        assert!(
+            !pair.silence(at(sent)),
+            "query sent at {sent} ms, answered at 10 ms"
+        );
+    }
+    // A query sent after the answer is evidence again, three in a row.
+    assert!(!pair.silence(at(11)));
+    assert!(!pair.silence(at(12)));
+    assert!(pair.silence(at(13)));
+    // And an answer to a query sent later still ends the run.
+    pair.answered(at(20));
+    assert!(!pair.silence(at(14)), "sent before the answer");
+    assert!(!pair.silence(at(21)));
 }
 
 #[test]
@@ -461,4 +488,168 @@ fn the_asker_keeps_a_pair_per_session_and_lets_idle_and_vanished_ones_go() {
     assert_eq!(pairs.count(), 1);
     pairs.remove(2);
     assert_eq!(pairs.count(), 0);
+}
+
+/// A pair with fixed octets and a counter for the id: for the tests of the table's bounds, which
+/// are not about the agreement.
+fn numbered(owner: PairOwner, id: u64, lease: Duration, now: Instant) -> ServerPair {
+    let keys = PairKeys {
+        query: [1; 32],
+        answer: [2; 32],
+        id: id.to_be_bytes(),
+    };
+    ServerPair::new(
+        &keys,
+        Aead::Aes256Gcm,
+        owner,
+        (1, 1),
+        Arc::new(AtomicU64::new(1)),
+        now + lease,
+    )
+}
+
+#[test]
+fn a_device_asking_every_250_ms_holds_at_most_two_pairs() {
+    // The per-key ask rate lets a device ask four times a second, and the maintenance pass sweeps
+    // every 250 ms: the replaced pairs of one device may not pile up behind its current one.
+    let pairs = ServerPairs::default();
+    let start = Instant::now();
+    let lease = Duration::from_secs(3_600);
+    for i in 0..80u64 {
+        let now = start + Duration::from_millis(250 * i);
+        pairs
+            .install(numbered(owner("s", "a", 7), i, lease, now), now)
+            .unwrap();
+        pairs.sweep(now);
+        assert!(
+            pairs.count() <= 2,
+            "after {} asks of one device the table holds {} pairs: one current and one retired \
+             is the most",
+            i + 1,
+            pairs.count()
+        );
+    }
+    // The newest is the device's, and the one before it is the one in grace.
+    let now = start + Duration::from_millis(250 * 79);
+    assert!(pairs.get(&78u64.to_be_bytes(), 7, now).is_some());
+    assert!(pairs.get(&79u64.to_be_bytes(), 7, now).is_some());
+    assert!(
+        pairs.get(&77u64.to_be_bytes(), 7, now).is_none(),
+        "gone at once"
+    );
+}
+
+#[test]
+fn a_retired_pair_of_a_device_is_dropped_at_once_by_its_next_replacement() {
+    let pairs = ServerPairs::default();
+    let now = Instant::now();
+    let lease = Duration::from_secs(600);
+    for i in 0..3u64 {
+        pairs
+            .install(numbered(owner("s", "a", 7), i, lease, now), now)
+            .unwrap();
+    }
+    assert_eq!(pairs.count(), 2);
+    assert!(pairs.get(&0u64.to_be_bytes(), 7, now).is_none());
+    assert!(pairs.get(&1u64.to_be_bytes(), 7, now).is_some(), "in grace");
+    assert!(pairs.get(&2u64.to_be_bytes(), 7, now).is_some());
+    // Another device, and the same device in another space, keep theirs.
+    pairs
+        .install(numbered(owner("s", "b", 7), 10, lease, now), now)
+        .unwrap();
+    pairs
+        .install(numbered(owner("t", "a", 8), 11, lease, now), now)
+        .unwrap();
+    pairs
+        .install(numbered(owner("s", "a", 7), 3, lease, now), now)
+        .unwrap();
+    assert_eq!(pairs.count(), 4);
+    assert!(pairs.get(&10u64.to_be_bytes(), 7, now).is_some());
+    assert!(pairs.get(&11u64.to_be_bytes(), 8, now).is_some());
+}
+
+#[test]
+fn a_device_with_a_retired_pair_can_replace_it_in_a_full_table() {
+    let pairs = ServerPairs::default();
+    let now = Instant::now();
+    let lease = Duration::from_secs(600);
+    pairs
+        .install(numbered(owner("s", "first", 7), u64::MAX, lease, now), now)
+        .unwrap();
+    pairs
+        .install(
+            numbered(owner("s", "first", 7), u64::MAX - 1, lease, now),
+            now,
+        )
+        .unwrap();
+    for i in 0..(PAIRS_MAX - 2) as u64 {
+        pairs
+            .install(
+                numbered(owner("s", &format!("d{i}"), 7), i, lease, now),
+                now,
+            )
+            .unwrap();
+    }
+    assert_eq!(pairs.count(), PAIRS_MAX);
+    // A third ask of the first device frees the pair it retired and takes its place.
+    assert!(
+        pairs
+            .install(
+                numbered(owner("s", "first", 7), u64::MAX - 2, lease, now),
+                now
+            )
+            .is_ok(),
+        "the replaced pair makes room for its replacement"
+    );
+    assert_eq!(pairs.count(), PAIRS_MAX);
+    // A new device finds the table full.
+    assert_eq!(
+        pairs
+            .install(numbered(owner("s", "new", 7), 1 << 40, lease, now), now)
+            .err(),
+        Some(Full::Table)
+    );
+}
+
+#[test]
+fn sweeping_and_rejudging_16384_pairs_is_linear() {
+    let pairs = ServerPairs::default();
+    let now = Instant::now();
+    let lease = Duration::from_secs(3_600);
+    for i in 0..PAIRS_MAX as u64 {
+        pairs
+            .install(
+                numbered(owner("s", &format!("d{i}"), 7), i, lease, now),
+                now,
+            )
+            .unwrap();
+    }
+    assert_eq!(pairs.count(), PAIRS_MAX);
+    // A bound that a pass linear in the table meets by a wide margin (tens of milliseconds in a
+    // debug build on a loaded machine, a few on an idle one) and one that compares each pair with
+    // each other pair (16,384 squared: 700 ms and more in a debug build) does not.
+    let bound = Duration::from_millis(400);
+
+    let began = std::time::Instant::now();
+    pairs.sweep(now + Duration::from_secs(1));
+    let swept = began.elapsed();
+    assert_eq!(pairs.count(), PAIRS_MAX, "nothing had lapsed");
+    assert!(swept < bound, "sweeping {PAIRS_MAX} pairs took {swept:?}");
+
+    // Every other device stops standing: the judgement is asked once for each pair it concerns,
+    // and what it drops is dropped from the table of devices too.
+    let asked = std::cell::Cell::new(0usize);
+    let began = std::time::Instant::now();
+    let dropped = pairs.rejudge(&n(&["s"]), (2, 2), |_| {
+        asked.set(asked.get() + 1);
+        asked.get() % 2 == 0
+    });
+    let rejudged = began.elapsed();
+    assert_eq!(asked.get(), PAIRS_MAX, "each pair is judged once");
+    assert_eq!(dropped.len() + pairs.count(), PAIRS_MAX);
+    assert!(!dropped.is_empty() && pairs.count() > 0);
+    assert!(
+        rejudged < bound,
+        "rejudging {PAIRS_MAX} pairs took {rejudged:?}"
+    );
 }

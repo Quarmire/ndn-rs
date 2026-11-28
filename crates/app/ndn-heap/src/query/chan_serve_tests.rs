@@ -8,30 +8,34 @@
 //! frame the server sends is read from a [`Link`] attached as its carrier.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
+use ndn_packet::{Data, Interest};
+use ndn_security::PairKeys;
 use ndn_transport::FaceId;
 use ndn_transport::{SideClass, SideKind};
 use tokio::sync::Semaphore;
 
-use super::rig::{Rig, eventually, public, rig, sealed};
+use super::rig::{Rig, eventually, public, rig, rig_with, sealed};
 use super::serve::{HANDLERS_MAX, PERSON_BURST, PERSON_INFLIGHT};
 use super::{Handler, Query, QueryId, Reply, Serving, Via};
 use crate::chan::aead::{Aead, FrameCipher};
+use crate::chan::answer::ChanAnswer;
 use crate::chan::carrier_kit::{Link, LinkConfig};
 use crate::chan::frame::Header;
-use crate::chan::pair::{AskPair, PairOwner, PairStats, ServerPair, nonce};
+use crate::chan::pair::{AskPair, PAIRS_MAX, PairOwner, PairStats, ServerPair, nonce};
 use crate::chan::qframe::{
     ANSWER_HEADER_LEN, ANSWER_OVERHEAD, AnswerHeader, ChanStatus, QUERY_HEADER_LEN, QueryHeader,
     QueryPlain,
 };
-use crate::chan::wire::ChannelMode;
+use crate::chan::wire::{Answer, ChanAsk, ChannelMode, carrier};
+use crate::error::Timestamp;
 use crate::node::Node;
-use crate::node::tests::space;
+use crate::node::tests::{space, world_with};
 use crate::rt::Instant;
 use crate::space::{Heap, MembersChange};
 use crate::test_kit::n;
@@ -118,6 +122,11 @@ enum Kind {
 impl Bed {
     async fn new(kind: Kind, link: LinkConfig, handler: impl Handler) -> Bed {
         let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
+        Bed::on(rig, kind, link, handler).await
+    }
+
+    /// A bed over `rig`, whose devices are alice, bob and carol.
+    async fn on(rig: Rig, kind: Kind, link: LinkConfig, handler: impl Handler) -> Bed {
         let heap = match kind {
             Kind::Public => public(&rig, &["/bob", "/carol"]).await,
             Kind::Sealed => sealed(&rig, &["/bob"], &["/carol"]).await,
@@ -1407,4 +1416,318 @@ async fn a_large_answer_goes_on_the_stream_class() {
     let mut forged = got[0].0.to_vec();
     forged[1] = 0x36;
     assert!(open(&pair, &Bytes::from(forged), 1).is_none());
+}
+
+// -- Gate review: what the signed path would refuse, the channel path refuses too ----------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspected_asker_key_gets_no_answer_at_its_next_channel_query() {
+    let seen = Arc::new(Seen::default());
+    let bed = Bed::new(Kind::Public, LinkConfig::default(), echo(&seen)).await;
+    // The maintenance pass would drop the pair on its own; the per-query check is the case.
+    bed.alice()
+        .inner
+        .chan
+        .tick_paused
+        .store(true, Ordering::SeqCst);
+    let pair = bed.pair(bed.bob()).await;
+    let s = bed.stats();
+    bed.send(ask(&pair, 0, b"before the mark"));
+    assert_eq!(
+        open(&pair, &bed.answers(1).await[0].0, 0).unwrap().1,
+        answered(b"before the mark")
+    );
+
+    // The key is marked suspected here: no entry, no signed query and no signed ask of it is
+    // taken any more, and no channel query either.
+    bed.alice()
+        .suspect(bed.bob().writer(), Timestamp(1))
+        .unwrap();
+    assert!(
+        in_game(bed.alice(), bed.bob()),
+        "nothing dropped the pair yet"
+    );
+    let (opens, ran) = (s.opens.get(), seen.count());
+    bed.send(ask(&pair, 1, b"after the mark"));
+    assert_eq!(
+        s.rejudged_out.get(),
+        1,
+        "the suspicion moved what the asker was judged by: judged again, and out"
+    );
+    assert_eq!(s.opens.get(), opens, "before any AEAD");
+    assert!(!in_game(bed.alice(), bed.bob()), "and the pair is gone");
+    bed.silence().await;
+    assert_eq!(seen.count(), ran, "no handler ran");
+
+    // The same key, once unsuspected, asks for a new session and is answered again.
+    assert!(bed.alice().unsuspect(bed.bob().writer()));
+    let again = bed.pair(bed.bob()).await;
+    bed.send(ask(&again, 0, b"unsuspected"));
+    assert_eq!(
+        open(&again, &bed.answers(1).await[0].0, 0).unwrap().1,
+        answered(b"unsuspected")
+    );
+}
+
+/// Bob's certificate lasts [`LAPSE_AFTER_MS`] from the world's making.
+const LAPSE_AFTER_MS: u64 = 25_000;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lapsed_certificate_ends_the_pair() {
+    let year = 365 * 24 * 3600 * 1000;
+    let devs = world_with(
+        &["/alice/laptop", "/bob/phone", "/carol/tablet"],
+        |name| Name::from_components(name.components()[..1].iter().cloned()),
+        |name| {
+            if *name == n("/bob/phone") {
+                LAPSE_AFTER_MS
+            } else {
+                year
+            }
+        },
+    )
+    .await;
+    let world_made = Instant::now();
+    let seen = Arc::new(Seen::default());
+    let rig = rig_with(devs, 3, |_, _| {}).await;
+    let bed = Bed::on(rig, Kind::Public, LinkConfig::default(), echo(&seen)).await;
+    let pair = bed.pair(bed.bob()).await;
+    let s = bed.stats();
+    bed.send(ask(&pair, 0, b"while valid"));
+    assert_eq!(
+        open(&pair, &bed.answers(1).await[0].0, 0).unwrap().1,
+        answered(b"while valid"),
+        "her certificate stands: answered"
+    );
+
+    // The pair ends where the asker's certificate does, not at its lifetime (an hour).
+    let lease = bed
+        .alice()
+        .inner
+        .chan
+        .pairs
+        .lease_until(&space(), bed.bob().name())
+        .expect("the pair is held");
+    assert!(
+        lease <= world_made + Duration::from_millis(LAPSE_AFTER_MS),
+        "the pair opens queries {:?} past the instant her certificate lapses",
+        lease.saturating_duration_since(world_made + Duration::from_millis(LAPSE_AFTER_MS))
+    );
+
+    // The certificate lapses (the clock says so; nothing else moves).
+    let began = std::time::Instant::now();
+    while Instant::now() < lease + Duration::from_millis(1_500) {
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "the lapse never came"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let ran = seen.count();
+    bed.send(ask(&pair, 1, b"after the lapse"));
+    assert_eq!(
+        s.opens.get(),
+        1,
+        "the lapsed asker's query is dropped before any AEAD"
+    );
+    bed.silence().await;
+    assert_eq!(seen.count(), ran, "no handler ran");
+    assert!(!in_game(bed.alice(), bed.bob()), "the pair is gone");
+
+    // The signed path refuses her for the same reason: a new ask is not answered.
+    assert!(
+        bed.bob()
+            .inner
+            .chan_ask(&space(), bed.alice().name(), ChannelMode::Ask)
+            .await
+            .is_err(),
+        "the signed ask of a lapsed certificate is refused"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_asker_chosen_lifetime_is_capped_by_the_server_and_the_session_says_so() {
+    // The most an asker may hold a pair for: an hour, which is what an asker asks by default.
+    const CAP: u64 = 3_600;
+    let seen = Arc::new(Seen::default());
+    let bed = Bed::new(Kind::Public, LinkConfig::default(), echo(&seen)).await;
+    let (alice, bob) = (bed.alice(), bed.bob());
+    let ask = ChanAsk {
+        space: space(),
+        prefix: Name::root(),
+        mode: ChannelMode::Ask,
+        recipient: bob.recipient().public(),
+        carriers: vec![carrier::DATAGRAM, carrier::STREAM],
+        lifetime: 86_400,
+        epoch: None,
+        since: None,
+        new: false,
+        chain: bob.inner.signer_chain(),
+    };
+    let wire = bob
+        .inner
+        .sign_ask(alice.name(), &ask.encode().unwrap())
+        .unwrap();
+    let interest = Interest::decode(wire).unwrap();
+    let began = Instant::now();
+    let ChanAnswer::Session { wire, .. } = alice.inner.chan_answer(&interest, None).await else {
+        panic!("a member's ask for a day is answered");
+    };
+    let data = Data::decode(wire).unwrap();
+    let Answer::Session(told) = Answer::decode(data.content().unwrap().clone()).unwrap() else {
+        panic!("the answer is a session");
+    };
+    assert_eq!(
+        told.lifetime, CAP,
+        "the asker is told the lifetime it was given, so its renewal at 75 % keeps working"
+    );
+    let lease = alice
+        .inner
+        .chan
+        .pairs
+        .lease_until(&space(), bob.name())
+        .expect("the pair is held");
+    assert!(
+        lease <= began + Duration::from_secs(CAP + 6),
+        "the pair is held {:?} past its lifetime and grace",
+        lease.saturating_duration_since(began + Duration::from_secs(CAP + 6))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_setup_refused_for_a_full_pair_table_takes_no_receiver_slot() {
+    let seen = Arc::new(Seen::default());
+    let bed = Bed::new(Kind::Public, LinkConfig::default(), echo(&seen)).await;
+    let alice = bed.alice();
+    // The table is full of other devices' live pairs (fixed octets and a counter for the id: the
+    // bound is the table's, not the agreement's).
+    let now = Instant::now();
+    for i in 0..PAIRS_MAX as u64 {
+        let keys = PairKeys {
+            query: [1; 32],
+            answer: [2; 32],
+            id: i.to_be_bytes(),
+        };
+        let owner = PairOwner {
+            space: n("/other"),
+            channel: 7,
+            key_epoch: 0,
+            device: n(&format!("/other/d{i}")),
+            person: n("/other"),
+            key: n(&format!("/other/d{i}/KEY/1")),
+            stream: false,
+        };
+        let pair = ServerPair::new(
+            &keys,
+            Aead::Aes256Gcm,
+            owner,
+            (0, 0),
+            Arc::new(AtomicU64::new(0)),
+            now + Duration::from_secs(3_600),
+        );
+        alice.inner.chan.pairs.install(pair, now).unwrap();
+    }
+    assert_eq!(alice.inner.chan.pairs.count(), PAIRS_MAX);
+
+    let refused = bob_asks(&bed).await;
+    assert!(
+        refused.is_err(),
+        "a full table refuses the setup: {refused:?}"
+    );
+    assert_eq!(
+        alice
+            .inner
+            .chan
+            .channels
+            .receiver_count(&space(), ChannelMode::Ask),
+        0,
+        "the refused setup left a receiver behind: a slot of the channel (and of her person's 32) \
+         taken by an asker that holds no pair"
+    );
+}
+
+/// Bob asks alice for an `Ask` session.
+async fn bob_asks(
+    bed: &Bed,
+) -> Result<Arc<crate::chan::sessions::RecvSession>, crate::chan::error::ChanError> {
+    bed.bob()
+        .inner
+        .chan_ask(&space(), bed.alice().name(), ChannelMode::Ask)
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejudge_a_query_drove_is_announced_by_the_next_pass() {
+    let seen = Arc::new(Seen::default());
+    let bed = Bed::new(Kind::Public, LinkConfig::default(), echo(&seen)).await;
+    let alice = bed.alice();
+    let pair = bed.pair(bed.bob()).await;
+    let sent = &alice.inner.chan.stats.announces_sent;
+    eventually("the first announce", || sent.get() >= 1).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // The pass is held while bob is removed and a query of his finds the fold moved: the
+    // query's own judgement is what drops the pair and re-keys the channel.
+    alice.inner.chan.tick_paused.store(true, Ordering::SeqCst);
+    let before = fold_version(alice);
+    bed.heap
+        .change(MembersChange {
+            remove: vec![n("/bob")],
+            ..MembersChange::default()
+        })
+        .await
+        .unwrap();
+    eventually("alice's fold moved", || fold_version(alice) != before).await;
+    bed.send(ask(&pair, 0, b"after the removal"));
+    assert_eq!(bed.stats().rejudged_out.get(), 1);
+    let announced = sent.get();
+
+    // The next pass announces the move now, not at the 30 s period.
+    alice.inner.chan.tick_paused.store(false, Ordering::SeqCst);
+    alice.inner.chan.wake();
+    eventually("the re-key a query drove is announced", || {
+        sent.get() > announced
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_space_is_never_left_so_a_pair_holds_the_fold_of_the_space_it_was_made_for() {
+    let seen = Arc::new(Seen::default());
+    let bed = Bed::new(Kind::Public, LinkConfig::default(), echo(&seen)).await;
+    let pair = bed.pair(bed.bob()).await;
+    let alice = bed.alice();
+
+    // A pair keeps the space's fold version by its handle. The only things that take a space out of
+    // a node's table are a follower's close and a failed `create`; a member space cannot be
+    // followed (and so has no follower to close), and `create` holds no pair before it succeeds.
+    // So the log, and the counter in it, outlives every pair of the space.
+    let fold = alice
+        .inner
+        .space_of(&space())
+        .unwrap()
+        .log
+        .lock()
+        .fold
+        .version();
+    let held = alice
+        .inner
+        .chan
+        .pairs
+        .get(&pair.id(), pair.channel, Instant::now())
+        .unwrap();
+    assert!(
+        held.fold_is(&fold),
+        "the pair holds the live space's counter"
+    );
+    let followed = alice.follow(&space()).await;
+    assert!(
+        matches!(
+            followed.err(),
+            Some(crate::error::HeapError::BadRequest { .. })
+        ),
+        "a member space is not followed, so it is never left"
+    );
+    assert!(held.fold_is(&fold));
+    assert!(in_game(alice, bed.bob()));
 }

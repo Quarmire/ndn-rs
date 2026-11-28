@@ -53,8 +53,8 @@ use super::aead::Aead;
 
 use super::channels::{Admitted, Asker, Cap, receivers_cap};
 use super::key::ChannelKey;
-use super::pair::{PairOwner, ServerPair, pair_context};
-use super::standing::{Who, gate, standing};
+use super::pair::{PAIR_LIFETIME_MAX, PairOwner, ServerPair, pair_context};
+use super::standing::{Who, chain_lasts, gate, standing};
 use super::tx::{ClaimRefused, Terms};
 use super::wire::{
     ASK_MAX, CarrierOffer, ChanAsk, ChannelMode, RefusalCode, RefusalRecord, SessionRecord, Window,
@@ -193,6 +193,11 @@ struct AskerFacts {
     /// The space's fold version itself, which the pair keeps: with the trust generation it says
     /// at each query whether the asker's standing may have moved.
     fold: Arc<AtomicU64>,
+    /// When the ask was admitted: the instant its receiver was made at.
+    at: Instant,
+    /// How long the certificates of the asker's chain last, if any of them ends
+    /// ([`chain_lasts`]): the pair ends with the first.
+    lapse: Option<Duration>,
 }
 
 fn refuse(code: RefusalCode, text: impl Into<String>, retry_ms: u64) -> Verdict {
@@ -271,9 +276,12 @@ impl NodeInner {
                                 stream: ask.carriers.contains(&carrier::STREAM),
                             };
                             let now = Instant::now();
-                            let lease = now
-                                + Duration::from_secs(admitted.lifetime)
+                            // The pair lives its session's lifetime and the grace, and not
+                            // past the asker's certificates: after one lapses the signed path
+                            // refuses her ask and her query, so the channel does not answer her.
+                            let full = Duration::from_secs(admitted.lifetime)
                                 + super::channels::LEASE_GRACE;
+                            let lease = now + who.lapse.map_or(full, |lapse| lapse.min(full));
                             let pair = ServerPair::new(
                                 &keys,
                                 aead,
@@ -283,6 +291,15 @@ impl NodeInner {
                                 lease,
                             );
                             if self.chan.pairs.install(pair, now).is_err() {
+                                // A setup refused holds nothing: not the place it took in the
+                                // channel, nor in the table of its person's devices.
+                                self.chan.channels.unadmit(
+                                    &ask.space,
+                                    ask.mode,
+                                    &who.device,
+                                    who.at,
+                                    admitted.fresh,
+                                );
                                 return self.chan_refusal(
                                     &name,
                                     &RefusalRecord {
@@ -627,11 +644,20 @@ impl NodeInner {
         }
         let fold = log.fold.version();
         let judged_at = (generation, fold.load(std::sync::atomic::Ordering::SeqCst));
+        let lapse = (ask.mode == ChannelMode::Ask)
+            .then(|| chain_lasts(&log, &self.judge, &key))
+            .flatten();
         let asker = Asker {
             device: &asker_device,
             person: &person,
             key: &key,
-            wanted: ask.lifetime,
+            // An `Ask` channel's pair is held for what the asker asked, and at most
+            // [`PAIR_LIFETIME_MAX`]; the session says the lifetime it was given.
+            wanted: if ask.mode == ChannelMode::Ask {
+                ask.lifetime.min(PAIR_LIFETIME_MAX)
+            } else {
+                ask.lifetime
+            },
             new: ask.new,
             stream: ask.carriers.contains(&carrier::STREAM),
         };
@@ -654,6 +680,8 @@ impl NodeInner {
                         key,
                         judged_at,
                         fold,
+                        at: now,
+                        lapse,
                     }),
                 )
             }

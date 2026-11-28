@@ -1430,3 +1430,156 @@ async fn the_handler_is_given_the_query_id_of_the_get_on_the_channel_path() {
     assert_ne!(again.query, ids[0]);
     assert_eq!(seen.lock().last().map(|(id, _)| *id), Some(again.query));
 }
+
+// -- Gate review ------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_dropped_frames_do_not_silently_move_auto_to_the_signed_path() {
+    let duo = duo(false).await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let _serving = duo.alice.serve(n("/world"), echo("echo:", &runs)).unwrap();
+    warm(&duo, &alice()).await;
+    let first = held(duo.bob_node(), &alice()).expect("held");
+    let first_pair = duo.bob_node().inner.chan.ask_pairs.get(first).unwrap().id();
+
+    // A relay drops three queries of the pair: the asker lets the session go.
+    duo.tap().swallow_queries(true);
+    let mut quick = ask(QueryPath::Auto, &["/alice/laptop"], b"q");
+    quick.deadline = Duration::from_millis(400);
+    for i in 0..3 {
+        let told = asked(&duo.bob, "/world/a", quick.clone()).await;
+        assert!(
+            matches!(&told[..], [Err(end)] if *end == done(1, 0, 0, 0, 1)),
+            "query {i} is silent: {told:?}"
+        );
+    }
+    assert!(
+        held(duo.bob_node(), &alice()).is_none(),
+        "three in a row: the session is let go"
+    );
+    assert_eq!(duo.tap().queries().len(), 3);
+
+    // The next `Auto` query is not sent in the clear because of that: it asks once more for a
+    // session, inside its deadline, and goes sealed.
+    duo.tap().swallow_queries(false);
+    let asked_before = duo.bob_node().inner.chan.stats.asked.get();
+    let told = asked(
+        &duo.bob,
+        "/world/a",
+        ask(QueryPath::Auto, &["/alice/laptop"], b"4"),
+    )
+    .await;
+    let (got, answered_by) = one_answer(&told);
+    assert_eq!(
+        answered_by.via,
+        Via::Sealed,
+        "after a silence release `Auto` went to the signed path (a public space's query in the \
+         clear) without trying the channel again"
+    );
+    assert_eq!(got.bytes.as_ref(), b"echo:4");
+    assert_eq!(
+        duo.bob_node().inner.chan.stats.asked.get(),
+        asked_before + 1,
+        "one setup"
+    );
+    let now = held(duo.bob_node(), &alice()).expect("a session is held again");
+    let new_pair = duo.bob_node().inner.chan.ask_pairs.get(now).unwrap().id();
+    assert_ne!(new_pair, first_pair, "a new pair, from a new setup");
+
+    // The setup was owed once: with the session let go for being idle, `Auto` is signed again.
+    let session = duo.bob_node().inner.chan.sessions.get(now).unwrap();
+    duo.bob_node().inner.chan_let_go(&session);
+    duo.bob_node().inner.chan.ask_pairs.remove(now);
+    let told = asked(
+        &duo.bob,
+        "/world/a",
+        ask(QueryPath::Auto, &["/alice/laptop"], b"5"),
+    )
+    .await;
+    assert_eq!(one_answer(&told).1.via, Via::Signed);
+    assert!(held(duo.bob_node(), &alice()).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queries_sent_before_an_answer_are_no_evidence_that_the_server_forgot_the_pair() {
+    let duo = duo(false).await;
+    warm(&duo, &alice()).await;
+    // Four queries are in flight on the pair; the server answers the last (the others hit a limit
+    // or a `Pass`, or a relay lost them): the pair is plainly held.
+    duo.tap().swallow_queries(true);
+    let mut slow = ask(QueryPath::Channel, &["/alice/laptop"], b"q");
+    slow.deadline = Duration::from_millis(700);
+    let reading = async {
+        tokio::join!(
+            asked(&duo.bob, "/world/x", slow.clone()),
+            asked(&duo.bob, "/world/x", slow.clone()),
+            asked(&duo.bob, "/world/x", slow.clone()),
+            asked(&duo.bob, "/world/x", slow.clone()),
+        )
+    };
+    let answering = async {
+        let last = query_after(duo.tap(), 3).await;
+        duo.bob_node().inner.query_answer_frame(answer_frame(
+            duo.bob_node(),
+            &last,
+            &answered("the last"),
+        ));
+    };
+    let ((a, b, c, d), ()) = tokio::join!(reading, answering);
+    let told = [a, b, c, d];
+    let silent = told
+        .iter()
+        .filter(|t| matches!(&t[..], [Err(end)] if *end == done(1, 0, 0, 0, 1)))
+        .count();
+    let answered_ones = told
+        .iter()
+        .filter(|t| matches!(&t[..], [Ok(_), Err(end)] if *end == done(1, 1, 0, 0, 0)))
+        .count();
+    assert_eq!((silent, answered_ones), (3, 1), "{told:?}");
+    assert!(
+        held(duo.bob_node(), &alice()).is_some(),
+        "three silent queries sent before an answer did not release a pair the server answered"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspected_server_is_no_server_at_the_askers_next_channel_query() {
+    let duo = duo(false).await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let _serving = duo.alice.serve(n("/world"), echo("echo:", &runs)).unwrap();
+    let told = asked(
+        &duo.bob,
+        "/world/a",
+        ask(QueryPath::Channel, &["/alice/laptop"], b"1"),
+    )
+    .await;
+    one_answer(&told);
+
+    // Bob's node marks the server's key suspected: whatever the channel brings under that session
+    // is not the server's, as the signed path would say.
+    duo.bob_node()
+        .suspect(duo.alice_node().writer(), crate::error::Timestamp(1))
+        .unwrap();
+    let told = asked(
+        &duo.bob,
+        "/world/a",
+        ask(QueryPath::Channel, &["/alice/laptop"], b"2"),
+    )
+    .await;
+    assert!(
+        told.iter().all(|t| t.is_err()),
+        "a suspected server answered: {told:?}"
+    );
+    assert!(
+        matches!(
+            one_failure(&told),
+            QueryError::BadAnswer { .. } | QueryError::NoSession { .. }
+        ),
+        "{told:?}"
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "a query was sent to a server this node marks suspected, and its handler ran"
+    );
+}

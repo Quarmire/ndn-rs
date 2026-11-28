@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ndn_foundation_types::Name;
@@ -65,8 +65,15 @@ pub(crate) const BUSY_EVERY: Duration = Duration::from_secs(1);
 
 /// The consecutive queries of one pair that nothing answered before the asker lets the session
 /// go and asks again (a restarted or evicting server never answers a pair it forgot, and nothing
-/// else tells the asker).
+/// else tells the asker). A query counts only if it was sent after the last answer that opened
+/// under the pair ([`AskPair::silence`]): a server that answered a query sent later holds the
+/// pair, whatever became of this one.
 pub(crate) const SILENT_MAX: u32 = 3;
+
+/// The most an asker may hold a pair for, whatever lifetime its ask names: an hour, which is
+/// what a node asks by default. The session says the lifetime it was given, so the asker renews
+/// at 75 % of it; a longer one asked for (the wire allows 24 hours) is given this.
+pub(crate) const PAIR_LIFETIME_MAX: u64 = 3_600;
 
 /// The counter of an asker's queries under a pair stays below this: 2^62 (the nonce has 8
 /// octets and the frame refuses 2^63; a pair that reaches it is let go and asked again).
@@ -212,7 +219,11 @@ pub(crate) struct ServerPair {
     /// `(trust generation, fold version)` the asker was judged by last.
     judged_at: Mutex<(u64, u64)>,
     /// The space's fold version, shared with the record: with the trust generation it says, in
-    /// two atomic loads, whether anything the asker was judged by has moved.
+    /// two atomic loads, whether anything the asker was judged by has moved. It cannot go stale:
+    /// a space is opened as a member once and never left (only a follower is closed, and a
+    /// member space cannot be followed), so the log that owns this counter outlives every pair
+    /// of its space, and a node's stop drops them all
+    /// (`a_member_space_is_never_left_so_a_pair_holds_the_fold_of_the_space_it_was_made_for`).
     fold: Arc<AtomicU64>,
     /// When the receiver's lease ends: no query opens after it.
     lease_until: Instant,
@@ -296,6 +307,12 @@ impl ServerPair {
         self.judged_at() != (generation, self.fold.load(Ordering::SeqCst))
     }
 
+    /// Whether the pair holds `fold`, the space's own counter (a test asks).
+    #[cfg(test)]
+    pub(crate) fn fold_is(&self, fold: &Arc<AtomicU64>) -> bool {
+        Arc::ptr_eq(&self.fold, fold)
+    }
+
     fn restamp(&self, at: (u64, u64)) {
         *self.judged_at.lock() = at;
     }
@@ -362,11 +379,20 @@ pub(crate) struct PairStats {
     pub(crate) not_sent: Counter,
 }
 
+/// What the table holds of one asker device in one space: its current pair, and the pair that one
+/// replaced while that pair is in its grace. **At most these two**: a device that asks again at
+/// once drops the older retired pair, so the rate it asks at does not grow what it holds.
+#[derive(Clone, Copy)]
+struct Held {
+    current: [u8; 8],
+    retired: Option<[u8; 8]>,
+}
+
 #[derive(Default)]
 struct ServerTable {
     by_id: HashMap<[u8; 8], Arc<ServerPair>>,
-    /// The current pair of each (space, asker device).
-    by_asker: HashMap<(Name, Name), [u8; 8]>,
+    /// The pairs of each (space, asker device).
+    by_asker: HashMap<(Name, Name), Held>,
     uses: u64,
 }
 
@@ -379,27 +405,45 @@ pub(crate) struct ServerPairs {
 
 impl ServerPairs {
     /// Hold `pair`; the pair this asker device had before is retired (it opens queries for
-    /// [`RETIRED_GRACE`] more). `Err` when the table is full: nothing was held.
+    /// [`RETIRED_GRACE`] more), and the one it had retired before that is dropped at once, so a
+    /// device holds at most two pairs whatever the rate it asks at. `Err` when the table is
+    /// full: nothing was held.
     pub(crate) fn install(&self, pair: ServerPair, now: Instant) -> Result<Arc<ServerPair>, Full> {
         let mut table = self.table.lock();
+        let at = (pair.owner.space.clone(), pair.owner.device.clone());
+        // The older retired pair is of no use: the asker installed the current one a round trip
+        // after the server made it, and the one before it long since.
+        if let Some(older) = table.by_asker.get_mut(&at).and_then(|h| h.retired.take()) {
+            table.by_id.remove(&older);
+        }
         if table.by_id.len() >= PAIRS_MAX {
             sweep(&mut table, now);
             if table.by_id.len() >= PAIRS_MAX {
                 return Err(Full::Table);
             }
         }
-        let at = (pair.owner.space.clone(), pair.owner.device.clone());
-        if let Some(old) = table.by_asker.get(&at).copied()
-            && old != pair.id
-            && let Some(old) = table.by_id.get(&old)
-        {
-            *old.retired.lock() = Some(now + RETIRED_GRACE);
-        }
+        let replaced = table
+            .by_asker
+            .get(&at)
+            .map(|h| h.current)
+            .filter(|current| *current != pair.id);
+        let retired = replaced.filter(|old| {
+            table.by_id.get(old).is_some_and(|old| {
+                *old.retired.lock() = Some(now + RETIRED_GRACE);
+                true
+            })
+        });
         table.uses += 1;
         pair.used.store(table.uses, Ordering::Relaxed);
         let id = pair.id;
         let pair = Arc::new(pair);
-        table.by_asker.insert(at, id);
+        table.by_asker.insert(
+            at,
+            Held {
+                current: id,
+                retired,
+            },
+        );
         table.by_id.insert(id, Arc::clone(&pair));
         Ok(pair)
     }
@@ -442,32 +486,55 @@ impl ServerPairs {
 
     /// The pairs of `space` judged by `live` stay; the others stay only if `keep` says the asker
     /// still stands, and are then judged by `live`. Returns the devices dropped.
+    ///
+    /// `keep` is asked **outside the table's lock** (it reads the space's record and the trust
+    /// state, once for each pair judged): the pairs to judge are taken under it, the verdicts are
+    /// applied under it, and nothing is held across the asking, so a query of another space
+    /// waits for a copy of a few pointers and a pass over the table, never for a judgement. A
+    /// pair that was replaced or dropped meanwhile is simply not there to apply a verdict to.
     pub(crate) fn rejudge(
         &self,
         space: &Name,
         live: (u64, u64),
         mut keep: impl FnMut(&PairOwner) -> bool,
     ) -> Vec<Name> {
+        let stale: Vec<Arc<ServerPair>> = self
+            .table
+            .lock()
+            .by_id
+            .values()
+            .filter(|pair| pair.owner.space == *space && pair.judged_at() != live)
+            .cloned()
+            .collect();
+        let verdicts: Vec<(Arc<ServerPair>, bool)> = stale
+            .into_iter()
+            .map(|pair| {
+                let stands = keep(&pair.owner);
+                (pair, stands)
+            })
+            .collect();
         let mut table = self.table.lock();
-        let mut dropped = Vec::new();
-        table.by_id.retain(|_, pair| {
-            if pair.owner.space != *space {
-                return true;
-            }
-            let stands = pair.judged_at() == live || keep(&pair.owner);
+        let ServerTable {
+            by_id, by_asker, ..
+        } = &mut *table;
+        for (pair, stands) in verdicts {
             if stands {
                 pair.restamp(live);
+            } else {
+                by_id.remove(&pair.id);
             }
-            stands
-        });
+        }
         // `by_asker` follows `by_id`; a device is dropped when its current pair went.
-        let held: Vec<[u8; 8]> = table.by_id.keys().copied().collect();
-        table.by_asker.retain(|(s, d), id| {
-            let kept = held.contains(id);
-            if !kept && s == space {
-                dropped.push(d.clone());
+        let mut dropped = Vec::new();
+        by_asker.retain(|(s, d), held| {
+            if !by_id.contains_key(&held.current) {
+                if s == space {
+                    dropped.push(d.clone());
+                }
+                return false;
             }
-            kept
+            held.retired = held.retired.filter(|id| by_id.contains_key(id));
+            true
         });
         dropped.sort();
         dropped.dedup();
@@ -493,12 +560,30 @@ impl ServerPairs {
             .by_asker
             .contains_key(&(space.clone(), device.clone()))
     }
+
+    /// When the current pair of `device` in `space` stops opening queries (a test asks).
+    #[cfg(test)]
+    pub(crate) fn lease_until(&self, space: &Name, device: &Name) -> Option<Instant> {
+        let table = self.table.lock();
+        let held = table.by_asker.get(&(space.clone(), device.clone()))?;
+        Some(table.by_id.get(&held.current)?.lease_until)
+    }
 }
 
 fn sweep(table: &mut ServerTable, now: Instant) {
-    table.by_id.retain(|_, p| p.live(now));
-    let held: Vec<[u8; 8]> = table.by_id.keys().copied().collect();
-    table.by_asker.retain(|_, id| held.contains(id));
+    let ServerTable {
+        by_id, by_asker, ..
+    } = table;
+    by_id.retain(|_, p| p.live(now));
+    // One lookup in `by_id` for each device, not a search of it. A device whose current pair is
+    // gone is forgotten; a retired pair that outlived it ends by its own grace.
+    by_asker.retain(|_, held| {
+        if !by_id.contains_key(&held.current) {
+            return false;
+        }
+        held.retired = held.retired.filter(|id| by_id.contains_key(id));
+        true
+    });
 }
 
 // -- The asker's half -----------------------------------------------------------------------------
@@ -513,7 +598,7 @@ pub(crate) struct AskPair {
     ciphers: PairCiphers,
     next: AtomicU64,
     used: Mutex<Instant>,
-    silent: AtomicU32,
+    silence: Mutex<Silence>,
 }
 
 impl std::fmt::Debug for AskPair {
@@ -541,7 +626,7 @@ impl AskPair {
             ciphers: PairCiphers::new(keys, aead),
             next: AtomicU64::new(0),
             used: Mutex::new(now),
-            silent: AtomicU32::new(0),
+            silence: Mutex::new(Silence::default()),
         }
     }
 
@@ -578,16 +663,36 @@ impl AskPair {
         *self.used.lock()
     }
 
-    /// An answer opened under the pair: the server holds it.
-    pub(crate) fn answered(&self) {
-        self.silent.store(0, Ordering::Relaxed);
+    /// An answer opened under the pair at `now`: the server holds it.
+    pub(crate) fn answered(&self, now: Instant) {
+        let mut silence = self.silence.lock();
+        silence.run = 0;
+        silence.heard = Some(now);
     }
 
-    /// A query of the pair got nothing by its deadline. Returns whether [`SILENT_MAX`] in a row
-    /// did: the server has probably forgotten the pair, and the session should be let go.
-    pub(crate) fn silence(&self) -> bool {
-        self.silent.fetch_add(1, Ordering::Relaxed) + 1 >= SILENT_MAX
+    /// A query of the pair, sent at `sent`, got nothing by its deadline. Returns whether
+    /// [`SILENT_MAX`] in a row did: the server has probably forgotten the pair, and the session
+    /// should be let go. A query sent **before** the last answer that opened under the pair is
+    /// not one of the run: the server held the pair when it answered, so this query was
+    /// limited (`Busy` is sent once a second), passed, or lost on the way, and none of those
+    /// says the pair is gone.
+    pub(crate) fn silence(&self, sent: Instant) -> bool {
+        let mut silence = self.silence.lock();
+        if silence.heard.is_some_and(|heard| heard >= sent) {
+            return false;
+        }
+        silence.run += 1;
+        silence.run >= SILENT_MAX
     }
+}
+
+/// What an asker knows of its server's silence under one pair.
+#[derive(Default)]
+struct Silence {
+    /// The queries in a row that nothing answered.
+    run: u32,
+    /// When the last answer opened under the pair.
+    heard: Option<Instant>,
 }
 
 /// The pairs an asker holds, by the id of the session (the channel) they belong to. A session

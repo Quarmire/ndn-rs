@@ -43,6 +43,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use ndn_foundation_types::Name;
@@ -447,6 +448,9 @@ pub(crate) const SUSPECTS_PER_PERSON: usize = 16;
 pub(crate) struct Suspicion {
     marks: Mutex<BTreeMap<Name, Timestamp>>,
     store: Arc<dyn DataStore>,
+    /// Moves after every mark made and every mark lifted: the trust generation counts it
+    /// ([`Judge::generation`]), so what was judged by it is judged again.
+    epoch: Arc<AtomicU64>,
 }
 
 impl Suspicion {
@@ -463,7 +467,13 @@ impl Suspicion {
         Arc::new(Suspicion {
             marks: Mutex::new(marks),
             store,
+            epoch: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// The counter that moves whenever a mark is made or lifted.
+    pub(crate) fn epoch(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.epoch)
     }
 
     /// Since when `key` (a key name, or one of its certificate names) is
@@ -514,6 +524,7 @@ impl Suspicion {
             Bytes::copy_from_slice(&since.0.to_be_bytes()),
         );
         marks.insert(key, since);
+        self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Lift the mark of `key`: new entries of it are taken again. Whether
@@ -525,6 +536,7 @@ impl Suspicion {
         let was = self.marks.lock().remove(&key).is_some();
         if was {
             self.store.remove(&Kind::SUSPECTED.of(&key));
+            self.epoch.fetch_add(1, Ordering::SeqCst);
         }
         was
     }
