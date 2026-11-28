@@ -355,9 +355,79 @@ impl MessageWriter {
     }
 }
 
-/// A message read from an opened frame.
+/// A message read from an opened frame, as the receiver holds it: 64 octets, written once by
+/// [`Messages::parse_into`] where it stays until the sinks have it. What does not fit a message
+/// of its own is beside it: the names a frame carries are the frame's (`names`, in order), and a
+/// message points at its name by index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Message {
+    /// The payload: a slice of the opened frame when the frame is small or the payload is at
+    /// least half of it, a copy otherwise ([`SHARE_FRAME_MAX`]).
+    pub payload: Bytes,
+    /// The message's sequence: the frame's `seq0` plus its index.
+    pub seq: u64,
+    /// The original sequence, when the message replays an earlier one (`flags` says which way);
+    /// 0 otherwise.
+    original: u64,
+    /// The octets a queued message is charged for: its payload when copied; when it shares the
+    /// frame, the larger of the payload and the frame's share per message (the frame's octets
+    /// over its message count), so the messages of a frame together are charged what the frame
+    /// is.
+    pinned: u32,
+    /// Seconds the emission stands for, when `flags` has `STAND` (at most an hour).
+    stand: u32,
+    /// The name id, 1 to 4,096.
+    name_id: u16,
+    /// `NAMED`, `STAND`, `STANDING` and `REPLAYED` as the message carried them.
+    flags: u8,
+    /// The place of this message's name among the frame's names, when `flags` has `NAMED`.
+    name_ix: u8,
+}
+
+const _: () = assert!(std::mem::size_of::<Message>() == 64);
+// A charge and a stand time fit the octets a message keeps them in.
+const _: () = assert!((super::limits::STREAM_FRAME_MAX as u64) < u32::MAX as u64);
+const _: () = assert!(STAND_SECS_MAX <= u32::MAX as u64);
+const _: () = assert!(NAMES_PER_CHANNEL <= u16::MAX as u64);
+
+impl Message {
+    /// The name id.
+    pub(crate) fn name_id(&self) -> u64 {
+        u64::from(self.name_id)
+    }
+
+    /// The octets this message is charged for while it is queued.
+    pub(crate) fn pinned(&self) -> usize {
+        self.pinned as usize
+    }
+
+    /// Seconds the emission stands for, when it does.
+    pub(crate) fn stand_secs(&self) -> Option<u64> {
+        (self.flags & STAND != 0).then_some(u64::from(self.stand))
+    }
+
+    /// Where the message was first sent, when it replays an earlier one.
+    pub(crate) fn origin(&self) -> Option<Origin> {
+        if self.flags & STANDING != 0 {
+            Some(Origin::Standing(self.original))
+        } else if self.flags & REPLAYED != 0 {
+            Some(Origin::Replayed(self.original))
+        } else {
+            None
+        }
+    }
+
+    /// The place of the message's name among its frame's names, when it carries one.
+    pub(crate) fn name_index(&self) -> Option<usize> {
+        (self.flags & NAMED != 0).then_some(usize::from(self.name_ix))
+    }
+}
+
+/// A message with everything it carries as its own value: what tests read a frame as (the
+/// receiver reads [`Message`]).
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadMessage {
     /// The message's sequence: the frame's `seq0` plus its index.
     pub seq: u64,
     /// The name id.
@@ -368,19 +438,31 @@ pub(crate) struct Message {
     pub stand_secs: Option<u64>,
     /// Set when the message replays an earlier one.
     pub origin: Option<Origin>,
-    /// The payload: a slice of the opened frame when the frame is small or the payload is at
-    /// least half of it, a copy otherwise ([`SHARE_FRAME_MAX`]).
+    /// The payload.
     pub payload: Bytes,
-    /// The octets a queued message is charged for: its payload when copied; when it shares the
-    /// frame, the larger of the payload and the frame's share per message (the frame's octets
-    /// over its message count), so the messages of a frame together are charged what the frame
-    /// is.
+    /// The octets a queued message is charged for.
     pub pinned: usize,
 }
 
-/// The messages of an opened `DATA` frame, in order. After the last, the
-/// iterator checks that only padding remains and yields one error if not; after
-/// any error it ends.
+#[cfg(test)]
+impl ReadMessage {
+    /// `message` with its name taken from `names`, the names of its frame.
+    pub(crate) fn of(message: &Message, names: &[Bytes]) -> Self {
+        Self {
+            seq: message.seq,
+            name_id: message.name_id(),
+            name: message.name_index().map(|at| names[at].clone()),
+            stand_secs: message.stand_secs(),
+            origin: message.origin(),
+            payload: message.payload.clone(),
+            pinned: message.pinned(),
+        }
+    }
+}
+
+/// The messages of an opened `DATA` frame, in order. [`parse_into`](Self::parse_into) writes
+/// them where the receiver keeps them; after the last it checks that only padding remains. (Tests
+/// read the frame through the iterator, which yields [`ReadMessage`]s and ends after one error.)
 #[derive(Debug)]
 pub(crate) struct Messages {
     data: Bytes,
@@ -389,6 +471,7 @@ pub(crate) struct Messages {
     count: usize,
     seen: usize,
     max_message: usize,
+    #[cfg(test)]
     done: bool,
 }
 
@@ -402,6 +485,7 @@ impl Messages {
             count,
             seen: 0,
             max_message: max_message.min(MESSAGE_MAX),
+            #[cfg(test)]
             done: false,
         }
     }
@@ -426,19 +510,32 @@ impl Messages {
 
     /// The payload of `len` octets at the cursor and what it is charged: shared with the frame
     /// when the frame is small or the payload is most of it, a copy of its own otherwise.
-    fn take_payload(&mut self, len: usize) -> Result<(Bytes, usize), MessageError> {
+    fn take_payload(&mut self, len: usize) -> Result<(Bytes, u32), MessageError> {
         let whole = self.data.len();
         let shared = whole <= SHARE_FRAME_MAX || len.saturating_mul(2) >= whole;
         let slice = self.take(len, "payload")?;
         if shared {
             let share = whole.div_ceil(self.count.max(1));
-            Ok((slice, len.max(share)))
+            Ok((slice, charge(len.max(share))))
         } else {
-            Ok((Bytes::copy_from_slice(&slice), len))
+            Ok((Bytes::copy_from_slice(&slice), charge(len)))
         }
     }
 
-    fn message(&mut self) -> Result<Message, MessageError> {
+    /// The name of `len` octets at the cursor: a slice of the frame when the frame is small, a
+    /// copy of its own otherwise, so a name held for a bind never keeps a large frame alive.
+    fn take_name(&mut self, len: usize) -> Result<Bytes, MessageError> {
+        let whole = self.data.len();
+        let slice = self.take(len, "name")?;
+        if whole <= SHARE_FRAME_MAX {
+            Ok(slice)
+        } else {
+            Ok(Bytes::copy_from_slice(&slice))
+        }
+    }
+
+    /// The next message; a name it carries is pushed to `names`.
+    fn message(&mut self, names: &mut Vec<Bytes>) -> Result<Message, MessageError> {
         let flags = *self
             .data
             .get(self.pos)
@@ -456,35 +553,36 @@ impl Messages {
             return Err(MessageError::Flags { flags });
         }
         self.pos += 1;
-        let origin = if flags & STANDING != 0 {
-            Some(Origin::Standing(self.sequence()?))
-        } else if flags & REPLAYED != 0 {
-            Some(Origin::Replayed(self.sequence()?))
+        let original = if flags & (STANDING | REPLAYED) != 0 {
+            let original = self.sequence()?;
+            if original >= self.seq {
+                return Err(MessageError::OriginalSequence {
+                    original,
+                    seq: self.seq,
+                });
+            }
+            original
         } else {
-            None
+            0
         };
-        if let Some(origin) = origin
-            && origin.sequence() >= self.seq
-        {
-            return Err(MessageError::OriginalSequence {
-                original: origin.sequence(),
-                seq: self.seq,
-            });
-        }
         let name_id = self.varint("name id")?;
         if !(1..=NAMES_PER_CHANNEL).contains(&name_id) {
             return Err(MessageError::NameId { id: name_id });
         }
-        let name = if flags & NAMED != 0 {
+        let name_ix = if flags & NAMED != 0 {
             let len = self.varint("name length")?;
             if len > NAME_MAX as u64 {
                 return Err(MessageError::NameTooLong { len: len as usize });
             }
-            Some(self.take(len as usize, "name")?)
+            let name = self.take_name(len as usize)?;
+            // A frame counts at most 255 messages, so this is at most 254.
+            let at = names.len() as u8;
+            names.push(name);
+            at
         } else {
-            None
+            0
         };
-        let stand_secs = if flags & STAND != 0 {
+        let stand = if flags & STAND != 0 {
             let secs = self.varint("stand seconds")?;
             if secs > STAND_SECS_MAX {
                 return Err(MessageError::StandSeconds {
@@ -492,9 +590,9 @@ impl Messages {
                     max: STAND_SECS_MAX,
                 });
             }
-            Some(secs)
+            secs as u32
         } else {
-            None
+            0
         };
         let len = self.varint("payload length")?;
         if len > self.max_message as u64 {
@@ -505,13 +603,14 @@ impl Messages {
         }
         let (payload, pinned) = self.take_payload(len as usize)?;
         Ok(Message {
-            seq: self.seq,
-            name_id,
-            name,
-            stand_secs,
-            origin,
             payload,
+            seq: self.seq,
+            original,
             pinned,
+            stand,
+            name_id: name_id as u16,
+            flags: flags & (NAMED | STAND | STANDING | REPLAYED),
+            name_ix,
         })
     }
 
@@ -520,24 +619,36 @@ impl Messages {
     }
 
     /// Parse every message of the frame into the end of `out`, written where it stays (no
-    /// message is returned through the iterator and moved again). On an error `out` holds the
-    /// messages before it and the frame is refused as a whole by the caller. The same checks as
-    /// the iterator: each message, then only padding after the last.
+    /// message is returned and moved again), and the names the frame carries into the end of
+    /// `names` (a message says which by its index, [`Message::name_index`], counted from the
+    /// frame's first: pass `names` empty). On an error `out` holds the messages before it and
+    /// the frame is refused as a whole by the caller. Each message is checked, then only padding
+    /// may follow the last.
     #[inline]
-    pub(crate) fn parse_into(&mut self, out: &mut Vec<Message>) -> Result<(), MessageError> {
+    pub(crate) fn parse_into(
+        &mut self,
+        out: &mut Vec<Message>,
+        names: &mut Vec<Bytes>,
+    ) -> Result<(), MessageError> {
         while self.seen < self.count {
-            let message = self.message()?;
+            let message = self.message(names)?;
             out.push(message);
             self.seen += 1;
             self.seq += 1;
         }
-        self.done = true;
         check_padding(&self.data[self.pos..])
     }
 }
 
+/// The octets a message is charged, as the 32 bits a [`Message`] keeps them in (the plaintext of
+/// a frame is at most `STREAM_FRAME_MAX`).
+fn charge(octets: usize) -> u32 {
+    u32::try_from(octets).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
 impl Iterator for Messages {
-    type Item = Result<Message, MessageError>;
+    type Item = Result<ReadMessage, MessageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -547,11 +658,12 @@ impl Iterator for Messages {
             self.done = true;
             return check_padding(&self.data[self.pos..]).err().map(Err);
         }
-        match self.message() {
+        let mut names = Vec::new();
+        match self.message(&mut names) {
             Ok(m) => {
                 self.seen += 1;
                 self.seq += 1;
-                Some(Ok(m))
+                Some(Ok(ReadMessage::of(&m, &names)))
             }
             Err(e) => {
                 self.done = true;
@@ -574,6 +686,10 @@ pub(crate) fn check_padding(rest: &[u8]) -> Result<(), MessageError> {
         Some(_) => Err(MessageError::Trailing { octets: rest.len() }),
     }
 }
+
+#[cfg(test)]
+#[path = "message_equivalence_tests.rs"]
+mod equivalence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -601,7 +717,7 @@ mod tests {
         buf
     }
 
-    fn read_all(plain: Vec<u8>, seq0: u64, count: usize) -> Result<Vec<Message>, MessageError> {
+    fn read_all(plain: Vec<u8>, seq0: u64, count: usize) -> Result<Vec<ReadMessage>, MessageError> {
         Messages::new(Bytes::from(plain), seq0, count, MESSAGE_DEFAULT).collect()
     }
 
@@ -619,7 +735,7 @@ mod tests {
         let msgs: Vec<OutMessage<'_>> = (0..14).map(|_| OutMessage::new(1, &small)).collect();
         let plain = Bytes::from(plaintext_of(&msgs));
         assert!(plain.len() <= SHARE_FRAME_MAX);
-        let got: Vec<Message> = Messages::new(plain.clone(), 0, 14, MESSAGE_DEFAULT)
+        let got: Vec<ReadMessage> = Messages::new(plain.clone(), 0, 14, MESSAGE_DEFAULT)
             .collect::<Result<_, _>>()
             .unwrap();
         assert!(got.iter().all(|m| shares_the_frame(&plain, &m.payload)));
@@ -635,7 +751,7 @@ mod tests {
         let msgs: Vec<OutMessage<'_>> = (0..120).map(|_| OutMessage::new(1, &hundred)).collect();
         let plain = Bytes::from(plaintext_of(&msgs));
         assert!(plain.len() > SHARE_FRAME_MAX);
-        let got: Vec<Message> = Messages::new(plain.clone(), 0, 120, MESSAGE_DEFAULT)
+        let got: Vec<ReadMessage> = Messages::new(plain.clone(), 0, 120, MESSAGE_DEFAULT)
             .collect::<Result<_, _>>()
             .unwrap();
         assert!(got.iter().all(|m| !shares_the_frame(&plain, &m.payload)));
@@ -648,7 +764,7 @@ mod tests {
         let big = vec![0x33u8; 20_000];
         let msgs = [OutMessage::new(1, &big), OutMessage::new(2, &small)];
         let plain = Bytes::from(plaintext_of(&msgs));
-        let got: Vec<Message> = Messages::new(plain.clone(), 0, 2, MESSAGE_DEFAULT)
+        let got: Vec<ReadMessage> = Messages::new(plain.clone(), 0, 2, MESSAGE_DEFAULT)
             .collect::<Result<_, _>>()
             .unwrap();
         assert!(shares_the_frame(&plain, &got[0].payload));
@@ -660,7 +776,7 @@ mod tests {
         padded.push(PAD);
         padded.resize(1 << 20, 0);
         let plain = Bytes::from(padded);
-        let got: Vec<Message> = Messages::new(plain.clone(), 0, 1, MESSAGE_DEFAULT)
+        let got: Vec<ReadMessage> = Messages::new(plain.clone(), 0, 1, MESSAGE_DEFAULT)
             .collect::<Result<_, _>>()
             .unwrap();
         assert!(!shares_the_frame(&plain, &got[0].payload));
@@ -762,7 +878,7 @@ mod tests {
             let frame = w.seal(&cipher).unwrap();
             let opened = crate::chan::frame::open(&cipher, frame, 9_000).unwrap();
             prop_assert_eq!(opened.header().count as usize, payloads.len());
-            let got: Vec<Message> = opened.messages(MESSAGE_DEFAULT).unwrap().collect::<Result<_, _>>().unwrap();
+            let got: Vec<ReadMessage> = opened.messages(MESSAGE_DEFAULT).unwrap().collect::<Result<_, _>>().unwrap();
             prop_assert_eq!(got.len(), payloads.len());
             for (i, (m, p)) in got.iter().zip(&payloads).enumerate() {
                 prop_assert_eq!(m.seq, seq0 + i as u64);
@@ -785,9 +901,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_malformed_plaintext_is_refused_and_says_why() {
-        let table: &[(&[u8], usize, MessageError)] = &[
+    /// The plaintexts a reader refuses, with the count the frame header says and the refusal each
+    /// has (the reader's limit is 64): the table the equivalence cases also run.
+    pub(super) fn malformed_vectors() -> &'static [(&'static [u8], usize, MessageError)] {
+        &[
             (&[], 1, MessageError::Truncated { what: "flags" }),
             (&[0x00], 1, MessageError::Truncated { what: "name id" }),
             (
@@ -869,14 +986,18 @@ mod tests {
                 1,
                 MessageError::Padding { at: 2 },
             ),
-        ];
-        for (plain, count, want) in table {
+        ]
+    }
+
+    #[test]
+    fn a_malformed_plaintext_is_refused_and_says_why() {
+        for (plain, count, want) in malformed_vectors() {
             let got: Result<Vec<_>, _> =
                 Messages::new(Bytes::copy_from_slice(plain), 0, *count, 64).collect();
             assert_eq!(got.as_ref().err(), Some(want), "{plain:02x?}");
-            let mut into = Vec::new();
-            let parsed =
-                Messages::new(Bytes::copy_from_slice(plain), 0, *count, 64).parse_into(&mut into);
+            let (mut into, mut names) = (Vec::new(), Vec::new());
+            let parsed = Messages::new(Bytes::copy_from_slice(plain), 0, *count, 64)
+                .parse_into(&mut into, &mut names);
             assert_eq!(parsed.as_ref().err(), Some(want), "parse_into {plain:02x?}");
         }
     }
@@ -893,14 +1014,16 @@ mod tests {
         ];
         for count in [1usize, 2, 3] {
             let plain = Bytes::from(plaintext_of(&msgs[..count]));
-            let by_iter: Vec<Message> = Messages::new(plain.clone(), 40, count, MESSAGE_DEFAULT)
-                .collect::<Result<_, _>>()
-                .unwrap();
-            let mut into = vec![];
+            let by_iter: Vec<ReadMessage> =
+                Messages::new(plain.clone(), 40, count, MESSAGE_DEFAULT)
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+            let (mut into, mut names) = (vec![], vec![]);
             Messages::new(plain, 40, count, MESSAGE_DEFAULT)
-                .parse_into(&mut into)
+                .parse_into(&mut into, &mut names)
                 .unwrap();
-            assert_eq!(into, by_iter, "{count} messages");
+            let read: Vec<ReadMessage> = into.iter().map(|m| ReadMessage::of(m, &names)).collect();
+            assert_eq!(read, by_iter, "{count} messages");
             assert_eq!(into.last().map(|m| m.seq), Some(40 + count as u64 - 1));
         }
     }

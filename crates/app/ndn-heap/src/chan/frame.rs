@@ -423,7 +423,7 @@ mod tests {
     use crate::chan::aead::Aead;
     use crate::chan::key::{ChannelKey, FrameKey};
     use crate::chan::limits::MESSAGE_DEFAULT;
-    use crate::chan::message::{Message, MessageWriter, OutMessage};
+    use crate::chan::message::{MessageWriter, OutMessage, ReadMessage};
     use proptest::prelude::*;
 
     const BOTH: [Aead; 2] = [Aead::Aes256Gcm, Aead::ChaCha20Poly1305];
@@ -562,7 +562,7 @@ mod tests {
                 hex(opened.plaintext()),
                 "00010568656c6c6f01020308016106776f726c6421"
             );
-            let got: Vec<Message> = opened
+            let got: Vec<ReadMessage> = opened
                 .messages(MESSAGE_DEFAULT)
                 .unwrap()
                 .collect::<Result<_, _>>()

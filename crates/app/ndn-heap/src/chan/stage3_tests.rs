@@ -13,7 +13,7 @@ use super::carrier_kit::{Link, LinkConfig};
 use super::control::Control;
 use super::frame::open;
 use super::limits::{MESSAGE_MAX, STREAM_FRAME_MAX};
-use super::message::{Message, Origin};
+use super::message::{Origin, ReadMessage};
 use super::rx_tests::{Rig, eventually, rig_of, shared};
 use super::tx::FRAME_CAP;
 use super::verbs::{Congestion, EmitError, EmitOptions, Mode, Window};
@@ -58,7 +58,7 @@ fn cipher(rig: &Rig, mode: ChannelMode) -> FrameCipher {
 #[derive(Debug)]
 enum Seen {
     Control(Control),
-    Data(Vec<Message>),
+    Data(Vec<ReadMessage>),
 }
 
 /// Everything on the stream until it is quiet.
@@ -108,7 +108,7 @@ fn controls(seen: &[Seen]) -> Vec<&Control> {
         .collect()
 }
 
-fn messages(seen: &[Seen]) -> Vec<&Message> {
+fn messages(seen: &[Seen]) -> Vec<&ReadMessage> {
     seen.iter()
         .flat_map(|s| match s {
             Seen::Data(m) => m.iter().collect::<Vec<_>>(),

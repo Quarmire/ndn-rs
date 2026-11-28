@@ -22,7 +22,7 @@ use super::control::Control;
 use super::frame;
 use super::key::ChannelKey;
 use super::limits::{MESSAGE_DEFAULT, MESSAGE_MAX, STREAM_FRAME_MAX};
-use super::message::{Message, Origin};
+use super::message::{Origin, ReadMessage};
 use super::table::name_octets;
 use super::tx::{
     BURST_GAP, KeySource, QUEUE_BYTES, Refused, SEQ_END, SINCE_REPLAY_EVERY, TxChannel, TxStats,
@@ -69,7 +69,7 @@ enum Seen {
         class: SideClass,
 
         count: u8,
-        messages: Vec<Message>,
+        messages: Vec<ReadMessage>,
     },
     Control {
         seq: u64,
@@ -84,7 +84,7 @@ impl Decoder {
         let header = *opened.header();
         match header.kind {
             SideKind::Data => {
-                let messages: Vec<Message> = opened
+                let messages: Vec<ReadMessage> = opened
                     .messages(MESSAGE_MAX)
                     .expect("data")
                     .collect::<Result<_, _>>()
@@ -231,7 +231,7 @@ fn data_counts(seen: &[Seen]) -> Vec<u8> {
         .collect()
 }
 
-fn messages(seen: &[Seen]) -> Vec<&Message> {
+fn messages(seen: &[Seen]) -> Vec<&ReadMessage> {
     seen.iter()
         .flat_map(|s| match s {
             Seen::Data { messages, .. } => messages.iter().collect::<Vec<_>>(),
@@ -558,7 +558,7 @@ async fn an_oversize_latest_message_goes_on_the_stream_and_still_replaces_an_uns
     let dgram_payloads: Vec<&[u8]> = messages(&dgrams).iter().map(|m| &m.payload[..]).collect();
     assert_eq!(dgram_payloads, [&b"other"[..]], "the small A never left");
     let streamed = stream(&mut rig);
-    let on_stream: Vec<&Message> = messages(&streamed);
+    let on_stream: Vec<&ReadMessage> = messages(&streamed);
     assert_eq!(on_stream.len(), 1);
     assert_eq!(on_stream[0].payload.len(), 3_000);
     assert!(matches!(
@@ -844,7 +844,7 @@ async fn window_keeps_at_most_its_limits_and_replays_them_to_a_joiner() {
     assert_eq!(terms.window.unwrap().messages, 256);
     settle(&rig.tx).await;
     let seen = stream(&mut rig);
-    let replayed: Vec<&Message> = messages(&seen);
+    let replayed: Vec<&ReadMessage> = messages(&seen);
     assert_eq!(replayed.len(), 256);
     let originals: Vec<u64> = replayed
         .iter()

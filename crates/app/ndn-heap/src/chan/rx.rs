@@ -362,10 +362,19 @@ struct Lanes {
     verified: Arc<[Arc<Sink>]>,
 }
 
+/// The messages of a parsed `DATA` frame, and the names they carry (a message says which name by
+/// its index, [`Message::name_index`]): a buffer kept between frames, so a frame costs no
+/// allocation for them.
+#[derive(Clone, Default)]
+struct Parsed {
+    messages: Vec<Message>,
+    names: Vec<Bytes>,
+}
+
 /// What a frame is, parsed: the messages of a `DATA` frame or the record of a `CONTROL` frame.
 #[derive(Clone)]
 enum Body {
-    Data(Vec<Message>),
+    Data(Parsed),
     Control(Control),
 }
 
@@ -445,7 +454,7 @@ struct RxState {
     /// Prepared ciphers by frame key: the key held and the one before it.
     ciphers: Vec<(FrameKey, FrameCipher)>,
     /// The messages of the frame being taken (a buffer kept between frames).
-    parsed: Vec<Message>,
+    parsed: Parsed,
     /// The face the last accepted frame came over.
     last_ingress: u64,
     ended: bool,
@@ -558,7 +567,7 @@ impl ChannelRx {
                 verified: None,
                 hello: None,
                 ciphers: Vec::with_capacity(2),
-                parsed: Vec::new(),
+                parsed: Parsed::default(),
                 last_ingress: 0,
                 ended: false,
                 verify: period
@@ -1045,9 +1054,14 @@ impl ChannelRx {
                         return Delivery::Dropped(Dropped::Malformed);
                     }
                 };
-                st.parsed.clear();
-                if messages.parse_into(&mut st.parsed).is_err() {
-                    st.parsed.clear();
+                st.parsed.messages.clear();
+                st.parsed.names.clear();
+                if messages
+                    .parse_into(&mut st.parsed.messages, &mut st.parsed.names)
+                    .is_err()
+                {
+                    st.parsed.messages.clear();
+                    st.parsed.names.clear();
                     stats.malformed.bump();
                     return Delivery::Dropped(Dropped::Malformed);
                 }
@@ -1138,7 +1152,7 @@ impl ChannelRx {
             self.refuse_verified(st, lanes);
         }
         let rebinds = match &body {
-            Body::Data(messages) => messages.iter().any(|m| m.name.is_some()),
+            Body::Data(parsed) => !parsed.names.is_empty(),
             Body::Control(control) => {
                 matches!(control, Control::Bind { .. } | Control::Unbind { .. })
             }
@@ -1206,7 +1220,8 @@ impl ChannelRx {
             delivery = Delivery::Deferred;
         }
         // The buffer the messages were parsed into is kept for the next frame.
-        if let Body::Data(buffer) = body {
+        if let Body::Data(mut buffer) = body {
+            buffer.names.clear();
             st.parsed = buffer;
         }
         if let Some(held_body) = held_body {
@@ -1845,12 +1860,12 @@ impl ChannelRx {
             },
         };
         match body {
-            Body::Data(messages) => {
+            Body::Data(parsed) => {
                 self.sequence(pipe, node, sinks, header, false);
-                let count = messages.len();
+                let count = parsed.messages.len();
                 node.chan.stats.rx.messages.add(count as u64);
-                for message in messages.drain(..) {
-                    self.accept(pipe, node, message, now);
+                for message in parsed.messages.drain(..) {
+                    self.accept(pipe, node, &parsed.names, message, now);
                 }
                 self.flush(pipe, node, sinks);
                 Delivery::Delivered { messages: count }
@@ -1902,12 +1917,19 @@ impl ChannelRx {
 
     /// Take one message: bind its name if it carries one, hold it if its bare id is unknown, and
     /// otherwise queue it for the sinks.
-    fn accept(&self, pipe: &mut Pipe, node: &NodeInner, message: Message, now: Instant) {
+    fn accept(
+        &self,
+        pipe: &mut Pipe,
+        node: &NodeInner,
+        names: &[Bytes],
+        message: Message,
+        now: Instant,
+    ) {
         let stats = &node.chan.stats.rx;
-        let named = message.name.is_some();
-        let id = message.name_id;
-        let resolved = match &message.name {
-            Some(octets) => match pipe.names.bind(id, octets) {
+        let named = message.name_index();
+        let id = message.name_id();
+        let resolved = match named {
+            Some(at) => match pipe.names.bind(id, &names[at]) {
                 Ok(binding) => Some((binding.name.clone(), binding.bound)),
                 Err(_) => {
                     stats.bad_bind.bump();
@@ -1922,7 +1944,7 @@ impl ChannelRx {
         match resolved {
             Some((name, bound)) => {
                 self.resolve(pipe, node, message, name, bound);
-                if named {
+                if named.is_some() {
                     self.release_id(pipe, node, id, now);
                 }
             }
@@ -1969,7 +1991,7 @@ impl ChannelRx {
     /// A message with its name: apply its origin and queue it.
     fn resolve(&self, pipe: &mut Pipe, node: &NodeInner, message: Message, name: Name, bound: u32) {
         let stats = &node.chan.stats.rx;
-        let seq = match message.origin {
+        let seq = match message.origin() {
             Some(Origin::Standing(original)) => {
                 if !pipe.standing_open {
                     stats.standing_stray.bump();
@@ -1992,11 +2014,12 @@ impl ChannelRx {
                 message.seq
             }
         };
-        let weight = message.pinned;
+        let weight = message.pinned();
+        let stands = message.stand_secs().map(Duration::from_secs);
         pipe.out.push(Out {
             pair: Pair {
                 channel: self.channel,
-                id: message.name_id as u32,
+                id: message.name_id() as u32,
                 bound,
             },
             seq,
@@ -2007,7 +2030,7 @@ impl ChannelRx {
                 author: Arc::clone(&self.author),
                 kind: Kind::Emitted(Emitted {
                     seq,
-                    stands: message.stand_secs.map(Duration::from_secs),
+                    stands,
                     verified: pipe.verified,
                 }),
             }),
