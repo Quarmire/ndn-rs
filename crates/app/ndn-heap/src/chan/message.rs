@@ -390,7 +390,12 @@ pub(crate) struct Message {
     name_ix: u8,
 }
 
+// 64 octets on a 64-bit target (`Bytes` is four words: 32 octets). A 32-bit target (wasm32) has
+// a 16-octet `Bytes`, so the message is smaller there, 48 octets, and may not be larger.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Message>() == 64);
+#[cfg(not(target_pointer_width = "64"))]
+const _: () = assert!(std::mem::size_of::<Message>() <= 64);
 // A charge and a stand time fit the octets a message keeps them in.
 const _: () = assert!((super::limits::STREAM_FRAME_MAX as u64) < u32::MAX as u64);
 const _: () = assert!(STAND_SECS_MAX <= u32::MAX as u64);
