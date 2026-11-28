@@ -33,7 +33,7 @@ use super::channels::LIFETIME_DEFAULT;
 use super::error::ChanError;
 use super::key::ChannelKey;
 use super::pair::{AskPair, pair_context};
-use super::sessions::{Asking, NotInstalled, RecvSession};
+use super::sessions::{Asking, NotInstalled, RecvSession, Signing};
 use super::standing::{Who, gate, standing};
 use super::wire::{Answer, ChanAsk, ChannelMode, SessionRecord, carrier};
 use crate::error::HeapError;
@@ -412,23 +412,27 @@ impl NodeInner {
                     && s.sender() == sender
                     && s.mode() == mode
             });
+            let signing = Signing {
+                key,
+                public: signer_public,
+            };
             let (session, replay) = match existing {
                 Some(session) => {
-                    session.renewed(&record, channel_key, key, judged_at, now);
-                    session.set_signer_public(signer_public);
+                    // One step: the sender's key and its checkpoint key change with the renewal,
+                    // so a checkpoint that arrives meanwhile is judged under a consistent session.
+                    session.renewed(&record, channel_key, signing, judged_at, now);
                     (session, None)
                 }
                 None => {
                     let session = Arc::new(RecvSession::new(
                         &record,
                         channel_key,
-                        key,
+                        signing,
                         Arc::clone(&self.judge),
                         log.fold.version(),
                         judged_at,
                         now,
                     ));
-                    session.set_signer_public(signer_public);
                     // Frames of this channel that reached this device before its session did are
                     // held; from here they are taken in first, in the order they arrived, and a frame
                     // that arrives meanwhile queues behind them.

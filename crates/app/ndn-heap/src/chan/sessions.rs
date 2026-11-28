@@ -169,6 +169,30 @@ impl SignerKey {
     }
 }
 
+/// The key that signed a sender's session answer, and what this device knows of it: the sender's
+/// device key as it found it when the answer was taken, and the key's Ed25519 public key as a
+/// certificate it vouches for carries it (an answer's own key is the one that signed it: the
+/// digest the validator resolved to a certificate names exactly this key), `None` when no such
+/// certificate was found. It is given whole to [`RecvSession::new`] and [`RecvSession::renewed`],
+/// so the two are never set apart.
+pub(crate) struct Signing {
+    pub(crate) key: Name,
+    pub(crate) public: Option<[u8; 32]>,
+}
+
+/// The decoded key for `public`: the one `held` when it has the same octets (a renewal that finds
+/// the same key decodes nothing again), a newly decoded one otherwise, none for none.
+fn signer_key_of(
+    held: Option<&Arc<SignerKey>>,
+    public: Option<[u8; 32]>,
+) -> Option<Arc<SignerKey>> {
+    match (held, public) {
+        (Some(held), Some(octets)) if held.octets == octets => Some(Arc::clone(held)),
+        (_, Some(octets)) => Some(Arc::new(SignerKey::new(octets))),
+        (_, None) => None,
+    }
+}
+
 struct State {
     current: Held,
     previous: Option<(Held, Instant)>,
@@ -251,12 +275,12 @@ fn newer(epoch: u32, than: u32) -> bool {
 
 impl RecvSession {
     /// A session installed at `now` from the sender's answer `record`, whose key (already
-    /// unwrapped) is `key`, judged by `judge` and the fold whose version is `live_fold` when
-    /// `judged_at` was read.
+    /// unwrapped) is `key`, signed by `signing`, judged by `judge` and the fold whose version is
+    /// `live_fold` when `judged_at` was read.
     pub(crate) fn new(
         record: &SessionRecord,
         key: ChannelKey,
-        sender_key: Name,
+        signing: Signing,
         judge: Arc<Judge>,
         live_fold: Arc<AtomicU64>,
         judged_at: (u64, u64),
@@ -278,8 +302,8 @@ impl RecvSession {
                 installed: now,
                 lifetime: Duration::from_secs(record.lifetime),
                 terms: Terms::of(record),
-                sender_key,
-                signer_public: None,
+                sender_key: signing.key,
+                signer_public: signer_key_of(None, signing.public),
                 retry_at: None,
                 ended: None,
             }),
@@ -371,20 +395,6 @@ impl RecvSession {
     #[cfg(test)]
     pub(crate) fn signer_public(&self) -> Option<[u8; 32]> {
         self.state.lock().signer_public.as_ref().map(|k| k.octets)
-    }
-
-    /// The sender's key, as this device found it in a certificate it vouches for when the answer
-    /// was taken (an answer's own key is the one that signed it: the digest the validator
-    /// resolved to a certificate names exactly this key). Set at each install and renewal; the
-    /// key is decoded here, once, and a renewal that finds the same octets keeps the decoded key.
-    pub(crate) fn set_signer_public(&self, public: Option<[u8; 32]>) {
-        let mut state = self.state.lock();
-        let kept = match (&state.signer_public, public) {
-            (Some(held), Some(octets)) if held.octets == octets => return,
-            (_, None) => None,
-            (_, Some(octets)) => Some(Arc::new(SignerKey::new(octets))),
-        };
-        state.signer_public = kept;
     }
 
     /// The key epoch of the key held now.
@@ -479,12 +489,15 @@ impl RecvSession {
 
     /// The session took a new answer of the same channel at `now`: a renewal, or a key pulled
     /// after a re-key. A key epoch not newer than the one held changes only the lifetime. The key
-    /// before stays acceptable until [`REKEY_GRACE`] after this answer.
+    /// before stays acceptable until [`REKEY_GRACE`] after this answer. The answer's sender key
+    /// and its checkpoint key (`signing`) are taken **in the same step** as the rest, under the
+    /// one lock: a frame never meets the renewal's epoch with the key before it, so a checkpoint
+    /// of a sender that rotated its key is never verified under the old one.
     pub(crate) fn renewed(
         &self,
         record: &SessionRecord,
         key: ChannelKey,
-        sender_key: Name,
+        signing: Signing,
         judged_at: (u64, u64),
         now: Instant,
     ) {
@@ -506,7 +519,8 @@ impl RecvSession {
         state.installed = now;
         state.lifetime = Duration::from_secs(record.lifetime);
         state.terms = Terms::of(record);
-        state.sender_key = sender_key;
+        state.sender_key = signing.key;
+        state.signer_public = signer_key_of(state.signer_public.as_ref(), signing.public);
         state.retry_at = None;
         self.generation.store(judged_at.0, Ordering::SeqCst);
         self.fold_version.store(judged_at.1, Ordering::SeqCst);

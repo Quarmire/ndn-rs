@@ -1389,7 +1389,10 @@ async fn a_session_of_lifetime_2_pow_63_does_not_panic_chan_tick() {
     let session = Arc::new(super::sessions::RecvSession::new(
         &record,
         ChannelKey::random(),
-        alice.writer().clone(),
+        super::sessions::Signing {
+            key: alice.writer().clone(),
+            public: None,
+        },
         Arc::clone(&bob.inner.judge),
         fold,
         judged,

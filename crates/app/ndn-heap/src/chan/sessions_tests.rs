@@ -17,6 +17,22 @@ fn n(s: &str) -> Name {
     s.parse().unwrap()
 }
 
+/// The signer of an answer, with no certificate's key found for it.
+fn signing(key: &str) -> Signing {
+    Signing {
+        key: n(key),
+        public: None,
+    }
+}
+
+/// The signer `key` with its public key `public`.
+fn signing_with(key: &str, public: Option<[u8; 32]>) -> Signing {
+    Signing {
+        key: n(key),
+        public,
+    }
+}
+
 fn record(id: u64, key_epoch: u32, lifetime: u64) -> SessionRecord {
     SessionRecord {
         id,
@@ -60,7 +76,7 @@ impl Fixture {
         let session = Arc::new(RecvSession::new(
             record,
             ChannelKey::from_bytes(key),
-            n("/bob/phone/KEY/1"),
+            signing("/bob/phone/KEY/1"),
             Arc::clone(&self.judge),
             Arc::clone(&self.fold),
             (self.judge.generation(), self.fold.load(Ordering::SeqCst)),
@@ -122,7 +138,7 @@ async fn renewal_is_due_at_75_percent_and_a_failed_one_is_tried_again_after_ten_
     s.renewed(
         &record(7, 1, 100),
         ChannelKey::from_bytes([2; 32]),
-        n("/bob/phone/KEY/1"),
+        signing("/bob/phone/KEY/1"),
         (0, 0),
         t0 + Duration::from_secs(85),
     );
@@ -152,7 +168,7 @@ async fn a_junk_frame_under_a_future_epoch_does_not_shorten_the_old_keys_grace()
     s.renewed(
         &record(7, 1, 3600),
         ChannelKey::from_bytes([2; 32]),
-        n("/bob/phone/KEY/1"),
+        signing("/bob/phone/KEY/1"),
         (0, 0),
         t2,
     );
@@ -186,7 +202,7 @@ async fn a_session_of_lifetime_2_pow_63_does_not_panic_the_store() {
         s.renewed(
             &record(7, 1, lifetime),
             ChannelKey::from_bytes([2; 32]),
-            n("/bob/phone/KEY/1"),
+            signing("/bob/phone/KEY/1"),
             (0, 0),
             later,
         );
@@ -203,7 +219,7 @@ async fn a_renewal_with_no_frame_seen_first_counts_the_grace_from_the_answer() {
     s.renewed(
         &record(7, 1, 100),
         ChannelKey::from_bytes([2; 32]),
-        n("/bob/phone/KEY/1"),
+        signing("/bob/phone/KEY/1"),
         (0, 0),
         t1,
     );
@@ -213,7 +229,7 @@ async fn a_renewal_with_no_frame_seen_first_counts_the_grace_from_the_answer() {
     s.renewed(
         &record(7, 1, 100),
         ChannelKey::from_bytes([9; 32]),
-        n("/bob/phone/KEY/1"),
+        signing("/bob/phone/KEY/1"),
         (0, 0),
         t1 + Duration::from_secs(1),
     );
@@ -288,7 +304,7 @@ async fn a_session_never_overwrites_the_id_another_channel_holds() {
         Arc::new(RecvSession::new(
             record,
             ChannelKey::from_bytes([9; 32]),
-            n("/carol/tablet/KEY/1"),
+            signing("/carol/tablet/KEY/1"),
             Arc::clone(&f.judge),
             Arc::clone(&f.fold),
             (f.judge.generation(), f.fold.load(Ordering::SeqCst)),
@@ -357,23 +373,33 @@ async fn is_current_moves_with_the_fold_version_and_not_with_time() {
 #[tokio::test]
 async fn the_senders_checkpoint_key_is_decoded_once_and_kept_across_a_renewal() {
     let f = fixture().await;
-    let s = f.session(&record(7, 0, 3600), [1; 32], Instant::now());
+    let t0 = Instant::now();
+    let s = f.session(&record(7, 0, 3600), [1; 32], t0);
     assert!(s.signer_key().is_none());
-    let alice = ndn_security::Ed25519Signer::from_seed(&[1; 32], n("/bob/phone/KEY/1"));
-    let public =
-        <[u8; 32]>::try_from(&ndn_security::Signer::public_key(&alice).unwrap()[..]).unwrap();
-    s.set_signer_public(Some(public));
+    let renew = |public: Option<[u8; 32]>| {
+        s.renewed(
+            &record(7, 0, 3600),
+            ChannelKey::from_bytes([1; 32]),
+            signing_with("/bob/phone/KEY/1", public),
+            (0, 0),
+            t0,
+        )
+    };
+    let public_of = |seed: u8| {
+        let signer = ndn_security::Ed25519Signer::from_seed(&[seed; 32], n("/bob/phone/KEY/1"));
+        <[u8; 32]>::try_from(&ndn_security::Signer::public_key(&signer).unwrap()[..]).unwrap()
+    };
+    let public = public_of(1);
+    renew(Some(public));
     let first = s.signer_key().expect("a key");
     assert!(first.key().is_some(), "a real key decodes");
-    s.set_signer_public(Some(public));
+    renew(Some(public));
     assert!(
         Arc::ptr_eq(&first, &s.signer_key().unwrap()),
         "the same octets at a renewal: the decoded key is kept"
     );
-    let other = ndn_security::Ed25519Signer::from_seed(&[2; 32], n("/bob/phone/KEY/1"));
-    let other =
-        <[u8; 32]>::try_from(&ndn_security::Signer::public_key(&other).unwrap()[..]).unwrap();
-    s.set_signer_public(Some(other));
+    let other = public_of(2);
+    renew(Some(other));
     assert!(!Arc::ptr_eq(&first, &s.signer_key().unwrap()));
     assert_eq!(s.signer_public(), Some(other));
     // Octets that are not a point: found by sweep, held, decoding to nothing.
@@ -381,9 +407,94 @@ async fn the_senders_checkpoint_key_is_decoded_once_and_kept_across_a_renewal() 
         .map(|n| [n; 32])
         .find(|octets| ndn_security::Ed25519PublicKey::from_bytes(octets).is_none())
         .expect("a 32-octet string that is not a point");
-    s.set_signer_public(Some(not_a_point));
+    renew(Some(not_a_point));
     assert!(s.signer_key().expect("held").key().is_none());
     assert_eq!(s.signer_public(), Some(not_a_point));
-    s.set_signer_public(None);
+    renew(None);
     assert!(s.signer_key().is_none());
+}
+
+/// A session taken with a checkpoint key holds it from the first instant (the constructor takes
+/// the signer whole, so a new session is never shared without it).
+#[tokio::test]
+async fn a_new_session_holds_the_checkpoint_key_it_was_taken_with() {
+    let f = fixture().await;
+    let signer = ndn_security::Ed25519Signer::from_seed(&[3; 32], n("/bob/phone/KEY/1"));
+    let public =
+        <[u8; 32]>::try_from(&ndn_security::Signer::public_key(&signer).unwrap()[..]).unwrap();
+    let s = RecvSession::new(
+        &record(7, 0, 3600),
+        ChannelKey::from_bytes([1; 32]),
+        signing_with("/bob/phone/KEY/1", Some(public)),
+        Arc::clone(&f.judge),
+        Arc::clone(&f.fold),
+        (0, 0),
+        Instant::now(),
+    );
+    assert_eq!(s.signer_public(), Some(public));
+    assert_eq!(s.sender_key(), n("/bob/phone/KEY/1"));
+}
+
+/// A renewal that moves the sender to another checkpoint key takes that key in the same step as
+/// the renewal: there is no instant at which the session holds the renewal's epoch and terms and
+/// the old key (a checkpoint verified in between would fail under it, ending the session of an
+/// honest sender, barring its face and raising a forgery alert). The renewal is one call that
+/// takes the sender's key, the checkpoint key and the rest under one lock; nothing sets the
+/// checkpoint key apart from it.
+#[tokio::test]
+async fn a_renewal_installs_the_rotated_checkpoint_key_with_the_renewal_and_not_after() {
+    use ndn_security::{Ed25519Signer, Signer, VerifyOutcome};
+    let f = fixture().await;
+    let t0 = Instant::now();
+    let signer_of = |seed: u8| Ed25519Signer::from_seed(&[seed; 32], n("/bob/phone/KEY/1"));
+    let public_of =
+        |signer: &Ed25519Signer| <[u8; 32]>::try_from(&signer.public_key().unwrap()[..]).unwrap();
+    let (old, rotated) = (signer_of(1), signer_of(2));
+    let s = f.session(&record(7, 0, 3600), [1; 32], t0);
+    s.renewed(
+        &record(7, 0, 3600),
+        ChannelKey::from_bytes([1; 32]),
+        signing_with("/bob/phone/KEY/1", Some(public_of(&old))),
+        (0, 0),
+        t0,
+    );
+    let region = b"a checkpoint's signed region";
+    let signature = rotated.sign_sync(region).unwrap();
+    assert_eq!(
+        s.signer_key()
+            .unwrap()
+            .key()
+            .unwrap()
+            .verify(region, &signature),
+        VerifyOutcome::Invalid,
+        "before the renewal the old key is held and refuses the rotated key's signature"
+    );
+
+    // The renewal, as the asker's install runs it: one call.
+    s.renewed(
+        &record(7, 1, 3600),
+        ChannelKey::from_bytes([2; 32]),
+        signing_with("/bob/phone/KEY/2", Some(public_of(&rotated))),
+        (0, 0),
+        t0 + Duration::from_secs(1),
+    );
+
+    // What a checkpoint verified at this instant sees: the new epoch, the rotated key and the
+    // key that signed the answer.
+    assert_eq!(s.key_epoch(), 1);
+    assert_eq!(s.sender_key(), n("/bob/phone/KEY/2"));
+    assert_eq!(
+        s.signer_public(),
+        Some(public_of(&rotated)),
+        "the renewal's epoch is held but the checkpoint key is still the old one"
+    );
+    assert_eq!(
+        s.signer_key()
+            .unwrap()
+            .key()
+            .unwrap()
+            .verify(region, &signature),
+        VerifyOutcome::Valid,
+        "a checkpoint signed by the rotated key verifies right after the renewal"
+    );
 }
