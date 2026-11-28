@@ -952,9 +952,19 @@ async fn targets_serving_uses_the_announce_hint_and_none_known_is_noserver() {
     };
     let before = signed();
     // `/carol/phone` serves it by its announce, but is no writer: not asked and counted nowhere.
-    hints.record(&space(), &n("/carol/phone"), &[n("/world")], Instant::now());
-    hints.record(&space(), &n("/bob/phone"), &[n("/world")], Instant::now());
-    hints.record(&space(), &n("/bob/tablet"), &[n("/other")], Instant::now());
+    let record = |device: &str, person: &str, serves: &str| {
+        hints.record(
+            &space(),
+            &n(device),
+            &n(person),
+            false,
+            &[n(serves)],
+            Instant::now(),
+        );
+    };
+    record("/carol/phone", "/carol", "/world");
+    record("/bob/phone", "/bob", "/world");
+    record("/bob/tablet", "/bob", "/other");
     let started = std::time::Instant::now();
     let told = read_all(items).await;
     assert!(
@@ -976,11 +986,14 @@ async fn targets_serving_uses_the_announce_hint_and_none_known_is_noserver() {
     );
     assert_eq!(signed(), before + 1);
 
-    // More than sixteen: the sixteen heard last are asked, the rest counted.
+    // More than sixteen (the record vouches for them): the sixteen heard last are asked, the
+    // rest counted.
     for i in 0..20 {
         hints.record(
             &space(),
             &n(&format!("/bob/d{i:02}")),
+            &n("/bob"),
+            true,
             &[n("/many")],
             Instant::now(),
         );
@@ -1096,8 +1109,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::rig;
+use super::types::{ProofError, ProvenAnswer};
 use super::types::{Query, Reply};
-use crate::wire::{AnswerBody, QueryAnswer, Status};
+use crate::wire::{AnswerBody, QueryAnswer, QueryAsk, QueryProof, Status};
+use ndn_packet::encode::DataBuilder;
 
 fn heap_of(node: &Node) -> Heap {
     node.space(&space()).expect("the space is open here")
@@ -1385,19 +1400,18 @@ async fn an_answer_over_answer_max_fails_answertoolarge() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn proof_keeps_the_signed_data_and_it_verifies_as_the_servers() {
-    let rig = rig::rig(&["/alice/laptop", "/bob/phone"]).await;
-    let alice_heap = rig::public(&rig, &["/bob"]).await;
-    let bob = heap_of(&rig.nodes[1]);
-    let runs = Arc::new(AtomicUsize::new(0));
-    let _serving = alice_heap.serve(n("/w"), echo("a:", &runs)).unwrap();
-    let mut ask = to(Ask::new(Bytes::from_static(b"x")), &["/alice/laptop"]);
+/// The proof of the answer `heap` is told by `device` to the query `query` of `path`: the proof,
+/// the query id and the answer octets.
+async fn proof_of(
+    heap: &Heap,
+    device: &str,
+    path: &str,
+    query: &'static [u8],
+) -> (Bytes, QueryId, Bytes) {
+    let mut ask = to(Ask::new(Bytes::from_static(query)), &[device]);
     ask.deadline = Duration::from_secs(5);
-    let without = asked(&bob, "/w/1", ask.clone()).await;
-    assert!(matches!(&without[0], Ok(Got { kind: Kind::Answered(a), .. }) if a.proof.is_none()));
     ask.proof = true;
-    let told = asked(&bob, "/w/1", ask).await;
+    let told = asked(heap, path, ask).await;
     let Ok(Got {
         kind: Kind::Answered(answered),
         bytes,
@@ -1406,21 +1420,264 @@ async fn proof_keeps_the_signed_data_and_it_verifies_as_the_servers() {
     else {
         panic!("{told:?}");
     };
-    let proof = answered.proof.clone().expect("the signed Data is kept");
-    let data = ndn_packet::Data::decode(proof).expect("a Data");
-    let (device, _) = crate::wire::parse_query_name(&data.name).expect("a query's name");
-    assert_eq!(device, n("/alice/laptop"));
-    assert!(
-        rig::signed_by(&rig.nodes[1], &rig.nodes[0], &data).await,
-        "it verifies as the server device's"
-    );
-    let answer = rig::answer_of(&data);
-    assert_eq!(answer.id, answered.query.0.to_be_bytes());
+    (
+        answered.proof.clone().expect("the proof is kept"),
+        answered.query,
+        bytes.clone(),
+    )
+}
+
+/// The two packets a proof holds.
+fn parts(proof: &Bytes) -> QueryProof {
+    QueryProof::decode(proof.clone()).expect("a proof is a QUERY_PROOF bundle")
+}
+
+fn bundle(interest: Bytes, answer: Bytes) -> Bytes {
+    QueryProof { interest, answer }
+        .encode()
+        .expect("a bundle of two packets")
+}
+
+/// Whether `hay` holds `needle`.
+fn holds(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The Data `signer` signs as the answer `Answered(text)` to the query `wire` (made for the
+/// device `to`), with `signer`'s certificates: what a device that was never asked, or is no
+/// writer, writes by hand.
+fn answered_by(
+    signer: &Node,
+    to: &Node,
+    wire: &Bytes,
+    ask: &QueryAsk,
+    text: &'static [u8],
+) -> Bytes {
+    let content = QueryAnswer {
+        id: ask.id,
+        body: AnswerBody::Plain(Status::Answered(Bytes::from_static(text))),
+        certs: signer.inner.signer_chain(),
+    }
+    .encode()
+    .unwrap();
+    let builder = DataBuilder::new(rig::name_of(to, wire), &content).freshness(Duration::ZERO);
+    crate::seal::sign(builder, &*signer.inner.signer).expect("the device signs")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_third_party_verifies_the_proof_from_the_record_alone_and_learns_what_and_when() {
+    let rig = rig::rig(&["/alice/laptop", "/bob/phone", "/carol/phone"]).await;
+    let alice_heap = rig::public(&rig, &["/bob", "/carol"]).await;
+    let (bob, carol) = (heap_of(&rig.nodes[1]), heap_of(&rig.nodes[2]));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let _serving = alice_heap.serve(n("/w"), echo("a:", &runs)).unwrap();
+    let mut plain = to(Ask::new(Bytes::from_static(b"x")), &["/alice/laptop"]);
+    plain.deadline = Duration::from_secs(5);
+    let without = asked(&bob, "/w/1", plain).await;
+    assert!(matches!(&without[0], Ok(Got { kind: Kind::Answered(a), .. }) if a.proof.is_none()));
+
+    let before = rig.nodes[1].inner.now();
+    let (proof, query, answer) = proof_of(&bob, "/alice/laptop", "/w/2", b"where is it").await;
+    let after = rig.nodes[1].inner.now();
+    assert_eq!(answer.as_ref(), b"a:where is it");
+
+    // Carol never took part in the exchange: she holds the record and the proof, nothing else.
+    let seen = carol
+        .verify_answer_proof(&proof)
+        .await
+        .expect("a member that never took part verifies the proof");
+    assert_eq!(seen.space, space());
+    assert_eq!(seen.query, query);
+    assert_eq!(seen.asker, n("/bob"));
+    assert_eq!(seen.asker_device, n("/bob/phone"));
+    assert_eq!(seen.server_person, n("/alice"));
+    assert_eq!(seen.server, n("/alice/laptop"));
+    assert_eq!(seen.path, Some(n("/w/2")), "what was asked");
     assert_eq!(
-        rig::status_of(&data),
-        Status::Answered(bytes.clone()),
-        "the Data carries the answer told"
+        seen.query_bytes.as_deref(),
+        Some(b"where is it".as_slice()),
+        "the octets asked"
     );
+    assert!(
+        (before..=after).contains(&seen.signed_at.0),
+        "when: the asker's SignatureTime {} lies in {before}..={after}",
+        seen.signed_at.0
+    );
+    assert_eq!(seen.answer, ProvenAnswer::Answered(answer));
+
+    // The bundle is the question and its answer: one Interest and the Data named as it.
+    let held = parts(&proof);
+    let interest = ndn_packet::Interest::decode(held.interest).expect("an Interest");
+    let data = ndn_packet::Data::decode(held.answer).expect("a Data");
+    assert_eq!(*data.name, *interest.name);
+    assert_eq!(rig::answer_of(&data).id, query.0.to_be_bytes());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_with_a_changed_answer_or_a_changed_question_is_refused() {
+    let rig = rig::rig(&["/alice/laptop", "/bob/phone", "/carol/phone"]).await;
+    let alice_heap = rig::public(&rig, &["/bob", "/carol"]).await;
+    let (bob, carol) = (heap_of(&rig.nodes[1]), heap_of(&rig.nodes[2]));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let _serving = alice_heap.serve(n("/w"), echo("a:", &runs)).unwrap();
+    let (proof, ..) = proof_of(&bob, "/alice/laptop", "/w/2", b"where is it").await;
+    assert!(carol.verify_answer_proof(&proof).await.is_ok(), "control");
+    let held = parts(&proof);
+
+    // The answer's octets changed, the length kept: the server's signature does not verify.
+    let mut raw = held.answer.to_vec();
+    let at = raw
+        .windows(3)
+        .position(|w| w == b"a:w")
+        .expect("the answer octets are in the Data");
+    raw[at + 2] = b'W';
+    let err = carol
+        .verify_answer_proof(&bundle(held.interest.clone(), Bytes::from(raw)))
+        .await
+        .expect_err("a changed answer is refused");
+    assert!(matches!(err, ProofError::Answer { .. }), "{err}");
+
+    // The query's octets changed: the Interest no longer hashes to the digest in its name.
+    let mut raw = held.interest.to_vec();
+    let at = raw
+        .windows(11)
+        .position(|w| w == b"where is it")
+        .expect("the query octets are in the Interest");
+    raw[at] = b'W';
+    let err = carol
+        .verify_answer_proof(&bundle(Bytes::from(raw), held.answer.clone()))
+        .await
+        .expect_err("a changed question is refused");
+    assert!(matches!(err, ProofError::Question { .. }), "{err}");
+
+    // Bytes that are no proof.
+    let err = carol
+        .verify_answer_proof(&held.answer)
+        .await
+        .expect_err("a bare Data is no proof");
+    assert!(matches!(err, ProofError::Malformed { .. }), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_whose_question_was_swapped_for_another_is_refused() {
+    let rig = rig::rig(&["/alice/laptop", "/bob/phone", "/carol/phone"]).await;
+    let alice_heap = rig::public(&rig, &["/bob", "/carol"]).await;
+    let (bob, carol) = (heap_of(&rig.nodes[1]), heap_of(&rig.nodes[2]));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let _serving = alice_heap.serve(n("/w"), echo("a:", &runs)).unwrap();
+    let (first, ..) = proof_of(&bob, "/alice/laptop", "/w/1", b"first").await;
+    let (second, ..) = proof_of(&bob, "/alice/laptop", "/w/2", b"second").await;
+    for proof in [&first, &second] {
+        assert!(carol.verify_answer_proof(proof).await.is_ok(), "control");
+    }
+    let (a, b) = (parts(&first), parts(&second));
+    // Each packet is genuine, signed by the right key: but the answer to one is no answer to the
+    // other (its name is the digest of the question it answers).
+    for swapped in [
+        bundle(b.interest.clone(), a.answer.clone()),
+        bundle(a.interest.clone(), b.answer.clone()),
+    ] {
+        let err = carol
+            .verify_answer_proof(&swapped)
+            .await
+            .expect_err("a swapped question is refused");
+        assert!(matches!(err, ProofError::Unrelated { .. }), "{err}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_signed_by_a_non_writer_or_asked_by_a_non_member_is_refused() {
+    let rig = rig::rig(&["/alice/laptop", "/bob/phone", "/carol/phone", "/dave/phone"]).await;
+    let alice_heap = rig::public(&rig, &["/bob", "/carol"]).await;
+    let (alice, bob, carol, dave) = (&rig.nodes[0], &rig.nodes[1], &rig.nodes[2], &rig.nodes[3]);
+
+    // Control: bob's query to carol's device (a writer's), answered and signed by carol.
+    let ask = rig::plain_ask(bob, "/w/1", b"x");
+    let wire = rig::signed_query(bob, carol, &ask);
+    let data = answered_by(carol, carol, &wire, &ask, b"yes");
+    let seen = alice_heap
+        .verify_answer_proof(&bundle(wire, data))
+        .await
+        .expect("a writer's answer to a member's query verifies");
+    assert_eq!(seen.server, n("/carol/phone"));
+    assert_eq!(
+        seen.answer,
+        ProvenAnswer::Answered(Bytes::from_static(b"yes"))
+    );
+
+    // Dave's device is no writer: what it signs is no word of the space's writers.
+    let wire = rig::signed_query(bob, dave, &ask);
+    let data = answered_by(dave, dave, &wire, &ask, b"yes");
+    let err = alice_heap
+        .verify_answer_proof(&bundle(wire, data))
+        .await
+        .expect_err("a non-writer's answer is refused");
+    assert!(matches!(err, ProofError::ServerNotWriter { .. }), "{err}");
+
+    // The right device name, another device's key: it does not verify as the server's.
+    let wire = rig::signed_query(bob, alice, &ask);
+    let data = answered_by(carol, alice, &wire, &ask, b"yes");
+    let err = alice_heap
+        .verify_answer_proof(&bundle(wire, data))
+        .await
+        .expect_err("another device's signature is refused");
+    assert!(matches!(err, ProofError::Answer { .. }), "{err}");
+
+    // A query of a person the record does not list: no member asked it.
+    let ask = rig::plain_ask(dave, "/w/1", b"x");
+    let wire = rig::signed_query(dave, carol, &ask);
+    let data = answered_by(carol, carol, &wire, &ask, b"yes");
+    let err = alice_heap
+        .verify_answer_proof(&bundle(wire, data))
+        .await
+        .expect_err("a stranger's query is refused");
+    assert!(matches!(err, ProofError::AskerNotListed { .. }), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_proof_of_a_sealed_answer_is_signed_ciphertext_and_the_verifier_says_so() {
+    let rig = rig::rig(&["/alice/laptop", "/bob/phone", "/carol/phone"]).await;
+    let alice_heap = rig::sealed(&rig, &["/alice"], &["/bob", "/carol"]).await;
+    let (bob, carol) = (heap_of(&rig.nodes[1]), heap_of(&rig.nodes[2]));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let _serving = alice_heap.serve(n("/w"), echo("s:", &runs)).unwrap();
+    let before = rig.nodes[1].inner.now();
+    let (proof, query, answer) =
+        proof_of(&bob, "/alice/laptop", "/w/hidden-path", b"secret query").await;
+    let after = rig.nodes[1].inner.now();
+    assert_eq!(answer.as_ref(), b"s:secret query");
+    for secret in [b"secret query".as_slice(), b"hidden-path", b"s:secret"] {
+        assert!(
+            !holds(&proof, secret),
+            "the proof of a sealed space shows {:?} in the clear",
+            String::from_utf8_lossy(secret)
+        );
+    }
+    let seen = carol
+        .verify_answer_proof(&proof)
+        .await
+        .expect("a reader that never took part verifies the signed ciphertext");
+    assert_eq!(seen.query, query);
+    assert_eq!(seen.server, n("/alice/laptop"));
+    assert_eq!(seen.asker_device, n("/bob/phone"));
+    assert_eq!(seen.path, None, "the path is ciphertext");
+    assert_eq!(seen.query_bytes, None, "the octets are ciphertext");
+    assert!((before..=after).contains(&seen.signed_at.0));
+    assert!(
+        matches!(&seen.answer, ProvenAnswer::Sealed { ciphertext } if !ciphertext.is_empty()),
+        "{:?}",
+        seen.answer
+    );
+    // Changed ciphertext does not verify.
+    let held = parts(&proof);
+    let mut raw = held.answer.to_vec();
+    let last = raw.len() - 100;
+    raw[last] ^= 1;
+    let err = carol
+        .verify_answer_proof(&bundle(held.interest, Bytes::from(raw)))
+        .await
+        .expect_err("a changed ciphertext is refused");
+    assert!(matches!(err, ProofError::Answer { .. }), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1529,6 +1786,25 @@ async fn a_sealed_space_query_end_to_end_one_agreement_for_two_queries() {
     );
 }
 
+/// A sealed space's announces name no prefix, so `Targets::Serving` has nothing to go by: it is
+/// refused at once with what to do, not left to wait out the deadline for a hint that cannot come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn targets_serving_in_a_sealed_space_is_refused_with_what_to_do() {
+    let rig = rig::rig(&["/alice/laptop", "/bob/phone"]).await;
+    let _alice_heap = rig::sealed(&rig, &["/alice"], &["/bob"]).await;
+    let bob = heap_of(&rig.nodes[1]);
+    let refused = bob.get(
+        Select::Path(n("/w/x")),
+        query_only(Ask::new(Bytes::from_static(b"q"))),
+    );
+    assert!(
+        matches!(&refused, Err(HeapError::BadRequest { why })
+            if why.contains("Targets::Devices") && why.contains("sealed")),
+        "{:?}",
+        refused.as_ref().map(|_| "an Items")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn targets_person_and_devices() {
     let rig = rig::rig(&[
@@ -1585,22 +1861,28 @@ async fn targets_person_and_devices() {
         "this device is never its own server"
     );
     // A device of a person the space does not list announces that it serves: it is no writer.
-    alice_node
-        .inner
-        .query
-        .hints
-        .record(&space(), &n("/dave/phone"), &[n("/z")], Instant::now());
+    alice_node.inner.query.hints.record(
+        &space(),
+        &n("/dave/phone"),
+        &n("/dave"),
+        false,
+        &[n("/z")],
+        Instant::now(),
+    );
     assert_eq!(
         targets(Targets::Person(n("/dave"))).await.0,
         Vec::<Name>::new(),
         "a person the space does not list has no writer device, announced or not"
     );
     // An announce of a device of the person that the record holds nothing of.
-    alice_node
-        .inner
-        .query
-        .hints
-        .record(&space(), &n("/carol/phone"), &[n("/z")], Instant::now());
+    alice_node.inner.query.hints.record(
+        &space(),
+        &n("/carol/phone"),
+        &n("/carol"),
+        false,
+        &[n("/z")],
+        Instant::now(),
+    );
     assert_eq!(
         targets(Targets::Person(n("/carol"))).await.0,
         vec![n("/carol/phone")]
@@ -1638,7 +1920,7 @@ async fn judged(
     let name = (*data.name).clone();
     asker
         .inner
-        .query_take_answer(&run, server.name(), &name, data, None)
+        .query_take_answer(&run, server.name(), &name, &Bytes::new(), data, None)
         .await
 }
 
@@ -1730,7 +2012,7 @@ async fn a_mismatched_query_id_is_badanswer() {
     let data = crafted(alice, &other_name, &ok);
     let r = bob
         .inner
-        .query_take_answer(&run, alice.name(), &name, data, None)
+        .query_take_answer(&run, alice.name(), &name, &Bytes::new(), data, None)
         .await;
     match failure(r) {
         QueryError::BadAnswer { why } => assert!(why.contains("is named"), "{why}"),

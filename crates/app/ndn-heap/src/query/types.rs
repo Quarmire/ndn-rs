@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_foundation_types::Name;
 
-use crate::error::NextStep;
+use crate::error::{NextStep, Timestamp};
 use crate::rt::Instant;
 
 /// The id an asker gives a query: eight random octets, echoed by the server in its answer, the
@@ -30,9 +30,11 @@ impl std::fmt::Display for QueryId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Via {
-    /// A signed Interest and a signed Data: the answer is the server device's own statement and
-    /// proves it to anyone, [`Answered::proof`] keeps it. In a sealed space the octets are
-    /// sealed to the pair of devices as well; the signature covers the sealed octets.
+    /// A signed Interest and a signed Data: the answer is the server device's own statement. With
+    /// [`Ask::proof`] the asker keeps the signed query with it ([`Answered::proof`]), and anyone
+    /// who holds the space's record can check what was asked and answered, and when by the
+    /// asker's clock. In a sealed space the octets are sealed to the pair of devices as well; the
+    /// signature covers the sealed octets, so a proof there shows the exchange and not its words.
     Signed,
 }
 
@@ -94,7 +96,9 @@ pub struct Ask {
     /// The largest answer told (default [`ANSWER_MAX_DEFAULT`]); a larger one is a
     /// [`QueryError::AnswerTooLarge`] failure.
     pub answer_max: usize,
-    /// Keep the signed Data of each answer ([`Answered::proof`]); default `false`.
+    /// Keep the proof of each answer ([`Answered::proof`]: the signed query and the signed
+    /// answer, which a third party verifies from the space's record with
+    /// [`Heap::verify_answer_proof`](crate::Heap::verify_answer_proof)); default `false`.
     pub proof: bool,
 }
 
@@ -250,9 +254,183 @@ pub struct Answered {
     /// The handler's own refusal; the item's bytes are then empty. Not a failure: the
     /// application's word, counted `refused`.
     pub refusal: Option<AppRefusal>,
-    /// The signed Data the server sent, when [`Ask::proof`] was set: the server device's
-    /// statement, which anyone who holds the space's record can check.
+    /// The proof of this answer, when [`Ask::proof`] was set: the asker's **signed query** (the
+    /// Interest, whose parameters carry the space, the path and the query octets in a public
+    /// space, and the `SignatureTime`) **and** the server's signed answer (the Data), as one
+    /// bundle. Check it, with the record of the space and nothing else, by
+    /// [`Heap::verify_answer_proof`](crate::Heap::verify_answer_proof); keep the octets whole.
+    ///
+    /// In a sealed space the question and the answer inside the bundle are ciphertext that only
+    /// the asker and the server open: the proof then shows that this server, a writer, signed
+    /// an answer sealed to this asker's signed query, at the asker's time, and
+    /// [`ProvenAnswer::Sealed`] says so. It does not show what was asked or answered.
     pub proof: Option<Bytes>,
+}
+
+/// What [`Heap::verify_answer_proof`](crate::Heap::verify_answer_proof) found in a proof that
+/// verified.
+///
+/// **The time** is [`VerifiedAnswer::signed_at`], the `SignatureTime` of the asker's query, on
+/// the asker's clock: the answer's Data carries no time of its own (it has a KeyLocator only).
+/// The answer was made after that moment (its name is the digest of the signed Interest) and no
+/// more is signed about when. **Standing** is judged by the record the verifier holds when it
+/// verifies: a person removed from the space, or a key revoked, after the exchange fails the
+/// proof closed; keep the verdict from the day the proof was received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VerifiedAnswer {
+    /// The space the query was asked in.
+    pub space: Name,
+    /// The query's id, echoed by the answer.
+    pub query: QueryId,
+    /// The asker's person.
+    pub asker: Name,
+    /// The asker's device, whose key signed the query.
+    pub asker_device: Name,
+    /// The server's person.
+    pub server_person: Name,
+    /// The server's device, a writer's, whose key signed the answer.
+    pub server: Name,
+    /// The asked path, relative to the space; `None` in a sealed space, where it is ciphertext.
+    pub path: Option<Name>,
+    /// The query octets; `None` in a sealed space, where they are ciphertext.
+    pub query_bytes: Option<Bytes>,
+    /// Milliseconds since the Unix epoch on the asker's clock when it signed the query.
+    pub signed_at: Timestamp,
+    /// What the server answered.
+    pub answer: ProvenAnswer,
+}
+
+/// What a verified proof shows the server answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProvenAnswer {
+    /// The handler answered with these octets.
+    Answered(Bytes),
+    /// The handler refused, in the application's words.
+    Refused(AppRefusal),
+    /// The server serves no prefix of the path.
+    NotServed,
+    /// The answer did not fit the server's limit of `max` octets.
+    TooLarge {
+        /// The limit.
+        max: u64,
+    },
+    /// The space is sealed: the server signed `ciphertext`, which only the asker and the server
+    /// can open. The proof shows the exchange took place and whose it was, not what was said.
+    Sealed {
+        /// The ciphertext of the status the server signed.
+        ciphertext: Bytes,
+    },
+}
+
+/// Why [`Heap::verify_answer_proof`](crate::Heap::verify_answer_proof) did not accept a proof.
+/// [`ProofError::next`] says what to do. The enum grows: match it with a wildcard arm.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProofError {
+    /// The octets are no proof: not the bundle [`Answered::proof`] holds, or changed.
+    #[error(
+        "these octets are no proof of a query's answer ({why}): give the octets \
+         Answered::proof held, whole and unchanged"
+    )]
+    Malformed {
+        /// Why.
+        why: String,
+    },
+    /// The proof is about another space than this one.
+    #[error(
+        "the proof is of a query in {proof}, and this is {held}: verify it with the Heap of {proof}"
+    )]
+    OtherSpace {
+        /// The space the proof names.
+        proof: Name,
+        /// The space of this Heap.
+        held: Name,
+    },
+    /// The record of the space is not held here, so nobody's standing can be judged.
+    #[error(
+        "the space's record is not held here yet, so no standing can be judged: follow the \
+         space (watch it) until its owner's entries arrive, then verify again"
+    )]
+    NoRecord,
+    /// The signed query does not verify as its asker's.
+    #[error(
+        "the query in the proof does not verify as its asker's ({why}): this is no proof of a \
+         query by a member of the space"
+    )]
+    Question {
+        /// Why.
+        why: String,
+    },
+    /// The asker is no listed member by the record held here.
+    #[error(
+        "the asker {asker} is neither a writer nor a reader of the space by the record held \
+         here ({why}): the proof is no proof of a member's query; ask the owner, or hold a \
+         newer record if the asker was listed when it asked"
+    )]
+    AskerNotListed {
+        /// The asker's device key.
+        asker: Name,
+        /// Why.
+        why: String,
+    },
+    /// The answer is not the answer to this query.
+    #[error(
+        "the answer in the proof is not the answer to the query in it ({why}): a proof is the \
+         query and its own answer, as Answered::proof keeps them"
+    )]
+    Unrelated {
+        /// Why.
+        why: String,
+    },
+    /// The answer does not verify as its server's.
+    #[error(
+        "the answer in the proof does not verify as the server's ({why}): it is not the \
+         statement of that device"
+    )]
+    Answer {
+        /// Why.
+        why: String,
+    },
+    /// The server's key is no writer's by the record held here.
+    #[error(
+        "the server {server} is no writer of the space by the record held here ({why}): its \
+         word is no word of the space's writers; ask the owner, or hold a newer record if it \
+         was a writer when it answered"
+    )]
+    ServerNotWriter {
+        /// The server's device key.
+        server: Name,
+        /// Why.
+        why: String,
+    },
+    /// A signature cannot be judged from what is held and carried.
+    #[error(
+        "the proof cannot be verified yet ({why}): nothing is fetched to verify a proof; hold \
+         the signers' certificates (open the space and let its members' contexts arrive) and \
+         verify again"
+    )]
+    NotJudged {
+        /// What waits.
+        why: String,
+    },
+}
+
+impl ProofError {
+    /// What to do about it, in the heap's vocabulary.
+    pub fn next(&self) -> NextStep {
+        match self {
+            ProofError::Malformed { .. }
+            | ProofError::OtherSpace { .. }
+            | ProofError::Unrelated { .. } => NextStep::FixRequest,
+            ProofError::NoRecord | ProofError::NotJudged { .. } => NextStep::RetryLater,
+            ProofError::AskerNotListed { .. } | ProofError::ServerNotWriter { .. } => {
+                NextStep::AskOwner
+            }
+            ProofError::Question { .. } | ProofError::Answer { .. } => NextStep::None,
+        }
+    }
 }
 
 /// Why a query to one server failed: told as [`GetNotice::QueryFailed`](crate::GetNotice) and

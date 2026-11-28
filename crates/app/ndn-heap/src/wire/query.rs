@@ -622,6 +622,92 @@ impl QueryAnswer {
     }
 }
 
+// -- The proof -------------------------------------------------------------------------------------
+
+/// `{ P_QUERY, P_ANSWER }`: a proof of a query's answer ([`QueryProof`]).
+pub(crate) const QUERY_PROOF: u64 = 0x06E1;
+/// The asker's signed query: the whole Interest `<server>/32=query/<digest>`.
+pub(crate) const P_QUERY: u64 = 0x06E3;
+/// The server's signed answer: the whole Data named as that Interest.
+pub(crate) const P_ANSWER: u64 = 0x06E5;
+
+/// The most octets of either packet of a proof: a query's parameters are at most
+/// [`QUERY_ASK_MAX`] and an answer's Content at most [`ANSWER_CONTENT_MAX`], and the name, the
+/// signature information and the signature are well under the rest.
+pub(crate) const PROOF_PACKET_MAX: usize = 16 * 1024;
+
+/// What an asker keeps of one answer to hold the server to it: the query it signed and the
+/// answer the server signed, each a whole packet, so that the bundle is verified by anyone who
+/// holds the space's record (`Heap::verify_answer_proof`) with no other knowledge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QueryProof {
+    /// The asker's signed query: the whole Interest.
+    pub interest: Bytes,
+    /// The server's signed answer: the whole Data.
+    pub answer: Bytes,
+}
+
+impl QueryProof {
+    /// The `QUERY_PROOF` TLV; refused if a packet is over [`PROOF_PACKET_MAX`] or empty.
+    pub(crate) fn encode(&self) -> Result<Bytes, WireError> {
+        for (what, part) in [
+            ("a proof's query", &self.interest),
+            ("a proof's answer", &self.answer),
+        ] {
+            if part.is_empty() {
+                return Err(WireError::Missing(what));
+            }
+            if part.len() > PROOF_PACKET_MAX {
+                return Err(WireError::TooLarge {
+                    what,
+                    size: part.len(),
+                    max: PROOF_PACKET_MAX,
+                });
+            }
+        }
+        let mut w = TlvWriter::new();
+        w.write_nested(QUERY_PROOF, |w| {
+            w.write_tlv(P_QUERY, &self.interest);
+            w.write_tlv(P_ANSWER, &self.answer);
+        });
+        Ok(w.finish())
+    }
+
+    /// Decode a `QUERY_PROOF` TLV of at most two packets of [`PROOF_PACKET_MAX`] octets.
+    pub(crate) fn decode(content: Bytes) -> Result<QueryProof, WireError> {
+        let most = 2 * (PROOF_PACKET_MAX + 8) + 16;
+        if content.len() > most {
+            return Err(WireError::TooLarge {
+                what: "a proof",
+                size: content.len(),
+                max: most,
+            });
+        }
+        let value = only(content, QUERY_PROOF, "a proof is one QUERY_PROOF TLV")?;
+        let (mut interest, mut answer) = (None, None);
+        each(value, |t, v| {
+            let (slot, what) = match t {
+                P_QUERY => (&mut interest, "a proof's query"),
+                P_ANSWER => (&mut answer, "a proof's answer"),
+                _ => return Ok(false),
+            };
+            if v.len() > PROOF_PACKET_MAX {
+                return Err(WireError::TooLarge {
+                    what,
+                    size: v.len(),
+                    max: PROOF_PACKET_MAX,
+                });
+            }
+            once(slot, v, what)?;
+            Ok(true)
+        })?;
+        Ok(QueryProof {
+            interest: need(interest, "a proof's query")?,
+            answer: need(answer, "a proof's answer")?,
+        })
+    }
+}
+
 #[cfg(test)]
 #[path = "query_tests.rs"]
 mod tests;

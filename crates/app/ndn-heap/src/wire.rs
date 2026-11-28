@@ -78,8 +78,8 @@ pub(crate) use prim::{
 )]
 pub(crate) use query::{
     A_SEALED, ANSWER_BYTES_MAX, ANSWER_CONTENT_MAX, ANSWER_SEALED_MAX, ANSWER_TEXT_MAX, AnswerBody,
-    AskSeal, DEADLINE_MAX_MS, QUERY_ASK_MAX, QUERY_BYTES_MAX, QUERY_PATH_MAX, QUERY_SEALED_MAX,
-    QueryAnswer, QueryAsk, Status, name_value_len,
+    AskSeal, DEADLINE_MAX_MS, PROOF_PACKET_MAX, QUERY_ASK_MAX, QUERY_BYTES_MAX, QUERY_PATH_MAX,
+    QUERY_SEALED_MAX, QueryAnswer, QueryAsk, QueryProof, Status, name_value_len,
 };
 pub(crate) use sign::{SignError, sign_entry};
 

@@ -905,3 +905,66 @@ fn the_sealed_part_of_a_query_is_a_path_and_octets_within_their_limits() {
         Err(WireError::Duplicate(_))
     ));
 }
+
+#[test]
+fn a_proof_is_two_packets_in_one_critical_record_with_golden_octets() {
+    let proof = QueryProof {
+        interest: Bytes::from_static(&[0x05, 0x01, 0xAA]),
+        answer: Bytes::from_static(&[0x06, 0x02, 0xBB, 0xCC]),
+    };
+    let wire = proof.encode().unwrap();
+    // QUERY_PROOF 0x06E1 { P_QUERY 0x06E3 (3 octets), P_ANSWER 0x06E5 (4 octets) }.
+    assert_eq!(hex(&wire), "fd06e10ffd06e3030501aafd06e5040602bbcc");
+    assert_eq!(QueryProof::decode(wire), Ok(proof));
+}
+
+#[test]
+fn a_proof_refuses_what_is_missing_doubled_over_the_limit_or_unknown_and_critical() {
+    let (q, a) = (tlv_of(P_QUERY, b"q"), tlv_of(P_ANSWER, b"a"));
+    let skip = tlv_of(0x06E0, b"future");
+    assert!(QueryProof::decode(record(QUERY_PROOF, &[q.clone(), a.clone(), skip])).is_ok());
+    assert!(matches!(
+        QueryProof::decode(record(QUERY_PROOF, std::slice::from_ref(&q))),
+        Err(WireError::Missing(_))
+    ));
+    assert!(matches!(
+        QueryProof::decode(record(QUERY_PROOF, std::slice::from_ref(&a))),
+        Err(WireError::Missing(_))
+    ));
+    assert!(matches!(
+        QueryProof::decode(record(QUERY_PROOF, &[q.clone(), q.clone(), a.clone()])),
+        Err(WireError::Duplicate(_))
+    ));
+    assert_eq!(
+        QueryProof::decode(record(
+            QUERY_PROOF,
+            &[q.clone(), a.clone(), tlv_of(0x06FF, b"x")]
+        )),
+        Err(WireError::UnknownCritical(0x06FF))
+    );
+    // Not a proof at all: another record, or a bare packet.
+    assert!(QueryProof::decode(record(QUERY_ANSWER, &[q.clone(), a.clone()])).is_err());
+    assert!(QueryProof::decode(Bytes::from_static(&[0x06, 0x01, 0x00])).is_err());
+    // A packet over the limit, on both ends of the wire.
+    let big = Bytes::from(vec![0u8; PROOF_PACKET_MAX + 1]);
+    assert!(matches!(
+        QueryProof {
+            interest: big.clone(),
+            answer: Bytes::from_static(b"a")
+        }
+        .encode(),
+        Err(WireError::TooLarge { .. })
+    ));
+    assert!(matches!(
+        QueryProof {
+            interest: Bytes::from_static(b"q"),
+            answer: Bytes::new()
+        }
+        .encode(),
+        Err(WireError::Missing(_))
+    ));
+    assert!(matches!(
+        QueryProof::decode(record(QUERY_PROOF, &[tlv_of(P_QUERY, &big), a])),
+        Err(WireError::TooLarge { .. })
+    ));
+}

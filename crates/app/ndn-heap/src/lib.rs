@@ -71,8 +71,9 @@ pub use crate::log::{Alert, Change, Frontier, Members};
 pub use crate::node::{Clock, Config, Node, Transport};
 pub use crate::query::{
     ANSWER_MAX_DEFAULT, Answered, AppRefusal, Ask, Asker, DEADLINE_MAX, Handler, HandlerFuture,
-    QUERY_MAX, Query, QueryError, QueryId, QueryPath, REFUSAL_TEXT_MAX, Reply, SERVE_PREFIX_MAX,
-    SERVE_PREFIXES_MAX, ServeError, Serving, TARGETS_MAX, Targets, Via,
+    ProofError, ProvenAnswer, QUERY_MAX, Query, QueryError, QueryId, QueryPath, REFUSAL_TEXT_MAX,
+    Reply, SERVE_PREFIX_MAX, SERVE_PREFIXES_MAX, ServeError, Serving, TARGETS_MAX, Targets,
+    VerifiedAnswer, Via,
 };
 pub use crate::register::{EntryId, Item};
 pub use crate::revocation::{CutBound, CutProposal};

@@ -33,26 +33,29 @@ use ndn_app::{AppError, Consumer};
 use ndn_foundation_types::Name;
 use ndn_packet::encode::InterestBuilder;
 use ndn_packet::{Data, Interest, NackReason};
+use ndn_security::cert_name::key_name_of;
 use ndn_security::{PairKeys, pair_keys_to};
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 
 use super::answers::AnswerSink;
 use super::types::{
-    ANSWER_MAX_DEFAULT, Answered, AppRefusal, Ask, DEADLINE_MAX, QUERY_MAX, QueryError, QueryId,
-    QueryPath, TARGETS_MAX, Targets, Via,
+    ANSWER_MAX_DEFAULT, Answered, AppRefusal, Ask, DEADLINE_MAX, ProofError, ProvenAnswer,
+    QUERY_MAX, QueryError, QueryId, QueryPath, TARGETS_MAX, Targets, VerifiedAnswer, Via,
 };
 use super::{answer_aad, open_answer, pair_context, query_aad, seal_query};
 use crate::chan::ask::is_reserved;
-use crate::chan::standing::{Who, gate, standing};
+use crate::chan::standing::{Unstanding, Who, gate, standing};
 use crate::chan::verbs::{GetNotice, Got, Kind, Select};
-use crate::error::HeapError;
+use crate::error::{HeapError, Timestamp};
 use crate::node::NodeInner;
 use crate::rt::Instant;
 use crate::space::SpaceInner;
-use crate::trust::Judged;
+use crate::trust::{InterestJudged, Judged};
 use crate::wire::{
-    AnswerBody, AskSeal, DEADLINE_MAX_MS, EpochId, QUERY_PATH_MAX, QueryAnswer, QueryAsk, Status,
-    is_device_name, parse_seal_key_name, query_prefix, seal_prefix,
+    AnswerBody, AskSeal, DEADLINE_MAX_MS, EpochId, PROOF_PACKET_MAX, QUERY_ASK_MAX, QUERY_PATH_MAX,
+    QueryAnswer, QueryAsk, QueryProof, Status, device_of, is_device_name, parse_query_name,
+    parse_seal_key_name, query_prefix, seal_prefix,
 };
 
 /// The most queries one node has outstanding, over all servers.
@@ -555,6 +558,15 @@ impl NodeInner {
                 }
             }
         }
+        if matches!(ask.targets, Targets::Serving) && held.log.lock().sealed() {
+            return Err(bad(
+                "Targets::Serving finds servers by the prefixes their announces list, and the \
+                 announces of a sealed space list none (the prefixes served stay secret: an \
+                 announce is in the clear): ask Targets::Devices (name the servers) or \
+                 Targets::Person"
+                    .into(),
+            ));
+        }
         {
             let log = held.log.lock();
             gate(&log, &self.judge, Who::Listed, "queries")?;
@@ -784,10 +796,10 @@ impl NodeInner {
             .map_err(|e| not_ready(format!("the signed query does not decode ({e})")))?;
         let name = (*interest.name).clone();
         let data = Consumer::new(Arc::clone(&self.conn))
-            .fetch_wire(wire, remaining)
+            .fetch_wire(wire.clone(), remaining)
             .await
             .map_err(fetch_stop)?;
-        self.query_take_answer(run, server, &name, data, seal.as_ref())
+        self.query_take_answer(run, server, &name, &wire, data, seal.as_ref())
             .await
     }
 
@@ -798,6 +810,7 @@ impl NodeInner {
         run: &Run,
         server: &Name,
         name: &Name,
+        query: &Bytes,
         data: Data,
         seal: Option<&SealUse>,
     ) -> Result<Outcome, Stop> {
@@ -880,7 +893,28 @@ impl NodeInner {
                 ));
             }
         };
-        let proof = run.ask.proof.then(|| data.raw().clone());
+        // The device served the path: a hint that named it is proven (docs/specs/query.md,
+        // Targeting).
+        if matches!(status, Status::Answered(_) | Status::Refused { .. }) {
+            self.query.hints.proven(space, server, Instant::now());
+        }
+        // The proof is the question and its answer: the signed Interest (its parameters carry
+        // the path and octets of a public query, and its SignatureTime) and the signed Data.
+        let proof = if run.ask.proof {
+            let bundle = QueryProof {
+                interest: query.clone(),
+                answer: data.raw().clone(),
+            };
+            Some(bundle.encode().map_err(|_| {
+                Stop::Failed(QueryError::TooLarge {
+                    what: "the proof to keep (the signed query and the signed answer, 16 KiB \
+                           each at most); ask without Ask::proof",
+                    max: PROOF_PACKET_MAX as u64,
+                })
+            })?)
+        } else {
+            None
+        };
         let got = |bytes: Bytes, refusal: Option<AppRefusal>| Got {
             path: run.path.clone(),
             bytes,
@@ -1030,6 +1064,264 @@ impl NodeInner {
         }
         self.signatures.fetch_add(1, Ordering::Relaxed);
         Ok(wire)
+    }
+}
+
+// -- Verifying a proof ----------------------------------------------------------------------------
+
+/// Why a key does not stand, in words for a [`ProofError`].
+fn unstood(why: &Unstanding) -> &'static str {
+    match why {
+        Unstanding::NotMember => {
+            "no person the record lists owns the key, or its role is no member's device"
+        }
+        Unstanding::Revoked => "the trust context governing the key revokes it",
+        Unstanding::Suspected => "this node marks the key suspected",
+        Unstanding::Unchained => {
+            "the context revokes keys and the certificates held do not show that none of them \
+             certified this key"
+        }
+    }
+}
+
+impl NodeInner {
+    /// Verify `proof`, the bundle [`Answered::proof`] keeps, for the space `held`, from the record
+    /// this node holds of it and the certificates the bundle carries, and nothing else: nothing
+    /// is fetched and nothing is sent. [`crate::Heap::verify_answer_proof`] says what it checks.
+    pub(crate) async fn query_verify_proof(
+        &self,
+        held: &SpaceInner,
+        proof: &[u8],
+    ) -> Result<VerifiedAnswer, ProofError> {
+        let malformed = |why: String| ProofError::Malformed { why };
+        let question = |why: String| ProofError::Question { why };
+        let bundle = QueryProof::decode(Bytes::copy_from_slice(proof))
+            .map_err(|e| malformed(e.to_string()))?;
+        let interest = Interest::decode(bundle.interest)
+            .map_err(|e| malformed(format!("its query is no Interest ({e})")))?;
+        let data = Data::decode(bundle.answer)
+            .map_err(|e| malformed(format!("its answer is no Data ({e})")))?;
+
+        // The question, as the server read it: `<device>/32=query/<digest>` whose parameters
+        // hash to the digest and are a QUERY_ASK, signed by a device key at a time.
+        let Some((server, digest)) = parse_query_name(&interest.name) else {
+            return Err(question(format!(
+                "it is named {}, not <device>/32=query/<digest>",
+                interest.name
+            )));
+        };
+        let params = interest
+            .app_parameters()
+            .cloned()
+            .ok_or_else(|| question("it carries no ApplicationParameters".into()))?;
+        if params.len() > QUERY_ASK_MAX {
+            return Err(question(format!(
+                "its parameters are {} octets, over the {QUERY_ASK_MAX} a query has",
+                params.len()
+            )));
+        }
+        let digest_holds = interest
+            .parameters_portion()
+            .is_some_and(|portion| Sha256::digest(&portion).as_slice() == digest);
+        if !digest_holds {
+            return Err(question(
+                "its parameters do not hash to the digest in its name: it was changed".into(),
+            ));
+        }
+        let ask = QueryAsk::decode(params)
+            .map_err(|e| question(format!("its parameters are no QUERY_ASK ({e})")))?;
+        if ask.space != held.name {
+            return Err(ProofError::OtherSpace {
+                proof: ask.space,
+                held: held.name.clone(),
+            });
+        }
+        let Some(sig_info) = interest.sig_info() else {
+            return Err(question("it is not signed".into()));
+        };
+        let (Some(locator), Some(_), Some(signed_at)) = (
+            sig_info.key_locator_name(),
+            sig_info.sig_nonce.as_ref(),
+            sig_info.sig_time,
+        ) else {
+            return Err(question(
+                "it names no signing key, or carries no SignatureNonce or SignatureTime".into(),
+            ));
+        };
+        let key = key_name_of(&locator);
+        if device_of(&key).is_none() {
+            return Err(question(format!("{key} is no device's key")));
+        }
+
+        // The answer is this question's: named as the Interest, which names the digest of its
+        // parameters, signature and time; the same query id; and the same plain-or-sealed shape.
+        if *data.name != *interest.name {
+            return Err(ProofError::Unrelated {
+                why: format!(
+                    "it is named {}, and the query in the proof is {}",
+                    data.name, interest.name
+                ),
+            });
+        }
+
+        // The record: without the creation nothing can stand.
+        if held.log.lock().fold.create().is_none() {
+            return Err(ProofError::NoRecord);
+        }
+
+        // The asker: the query verifies as its key's, by the chain the query carries and the
+        // certificates held, and the key stands as a listed person by the record.
+        match self
+            .judge
+            .validate_interest(&ask.space, &interest, &key, &ask.chain)
+            .await
+        {
+            InterestJudged::Valid => {}
+            InterestJudged::Pending(waiting) => {
+                return Err(ProofError::NotJudged {
+                    why: format!("the query's signature: {waiting}"),
+                });
+            }
+            InterestJudged::Refused(why) => {
+                return Err(question(format!(
+                    "its signature is refused ({why}): it is not {key}'s"
+                )));
+            }
+        }
+        let asker = {
+            let log = held.log.lock();
+            standing(&log, &self.judge, &key, Who::Listed)
+        }
+        .map_err(|why| ProofError::AskerNotListed {
+            asker: key.clone(),
+            why: unstood(&why).into(),
+        })?;
+
+        // The server: the answer verifies as its device's, by the certificates it carries and
+        // those held, and the key is a writer's by the record.
+        let content = data.content().cloned().ok_or_else(|| ProofError::Answer {
+            why: "it has no content".into(),
+        })?;
+        let answer = QueryAnswer::decode(content).map_err(|e| ProofError::Answer {
+            why: format!("its content is no QUERY_ANSWER ({e})"),
+        })?;
+        let server_key = match self
+            .judge
+            .validate_asker_packet(&data, &server, &ask.space, &answer.certs)
+            .await
+        {
+            Judged::Valid(v) => v.key,
+            Judged::Refused(why) => {
+                return Err(ProofError::Answer {
+                    why: format!("its signature is refused ({why}): it is not {server}'s"),
+                });
+            }
+            Judged::Pending(waiting) => {
+                return Err(ProofError::NotJudged {
+                    why: format!("the answer's signature: {waiting}"),
+                });
+            }
+        };
+        let server_person = {
+            let log = held.log.lock();
+            standing(&log, &self.judge, &server_key, Who::Writer)
+        }
+        .map_err(|why| ProofError::ServerNotWriter {
+            server: server_key.clone(),
+            why: unstood(&why).into(),
+        })?;
+
+        // The binding of the answer to the query.
+        if answer.id != ask.id {
+            return Err(ProofError::Unrelated {
+                why: "it answers another query (Q_ID differs)".into(),
+            });
+        }
+        let (path, query_bytes, shown) = match (&ask.seal, answer.body) {
+            (None, AnswerBody::Plain(status)) => (
+                ask.path.clone(),
+                Some(ask.bytes.clone()),
+                match status {
+                    Status::Answered(bytes) => ProvenAnswer::Answered(bytes),
+                    Status::Refused { code, text } => {
+                        ProvenAnswer::Refused(AppRefusal::new(code, text))
+                    }
+                    Status::NotServed => ProvenAnswer::NotServed,
+                    Status::TooLarge { max } => ProvenAnswer::TooLarge { max },
+                },
+            ),
+            (Some(seal), AnswerBody::Sealed { seq, cipher }) => {
+                if seq != seal.seq {
+                    return Err(ProofError::Unrelated {
+                        why: "its sealing counter is not the query's: it answers another exchange"
+                            .into(),
+                    });
+                }
+                (None, None, ProvenAnswer::Sealed { ciphertext: cipher })
+            }
+            (None, AnswerBody::Sealed { .. }) => {
+                return Err(ProofError::Unrelated {
+                    why: "the answer is sealed to a pair and the query is plain".into(),
+                });
+            }
+            (Some(_), AnswerBody::Plain(_)) => {
+                return Err(ProofError::Unrelated {
+                    why: "the answer is in the clear and the query is sealed".into(),
+                });
+            }
+        };
+        Ok(VerifiedAnswer {
+            space: ask.space,
+            query: QueryId(u64::from_be_bytes(ask.id)),
+            asker,
+            asker_device: device_of(&key).expect("checked above"),
+            server_person,
+            server,
+            path,
+            query_bytes,
+            signed_at: Timestamp(signed_at),
+            answer: shown,
+        })
+    }
+}
+
+impl crate::space::Heap {
+    /// Verify the proof of a query's answer ([`Answered::proof`], kept when [`Ask::proof`] was
+    /// set) from this space's record and nothing else: any member that holds the space can do it,
+    /// whether or not it took part. Nothing is fetched and nothing is sent.
+    ///
+    /// What it checks, and what an `Ok` says:
+    ///
+    /// * the proof is the asker's **signed query** (an Interest whose name is the digest of its
+    ///   parameters) and the **server's answer** (the Data named exactly as that Interest, so as
+    ///   the digest of the question, its signature and its time);
+    /// * the query's signature verifies as a device key of a person the record **lists**, by the
+    ///   chain the query carries and the certificates held, and the answer's signature as the
+    ///   named server device's, by the chain it carries and the certificates held;
+    /// * the server's key is a **writer's** by the record, the answer's query id is the query's
+    ///   and, in a sealed space, its sealing counter is the query's.
+    ///
+    /// [`VerifiedAnswer`] then gives the asker, the server, the path and query octets (a public
+    /// space), what the server answered and `signed_at`, **the time on the asker's clock when it
+    /// signed the query**: the answer's Data has a KeyLocator and no time, so that is the only
+    /// time a proof shows. The answer was made after it (the Data names the query's digest); how
+    /// long after is not signed. A server need not have answered within the deadline of the query.
+    ///
+    /// **A sealed space** seals the path, the query octets and the answer to the pair of
+    /// devices; the proof is then ciphertext that only the asker and the server open. The
+    /// verifier proves that this server, a writer, signed an answer sealed to this member's
+    /// signed query at `signed_at`, and says so ([`ProvenAnswer::Sealed`], `path` and
+    /// `query_bytes` `None`): it shows that the exchange took place and whose it was, not what was
+    /// said. This version has no way for the asker to disclose the plaintext to a verifier.
+    ///
+    /// **Standing is judged by the record this node holds when it verifies** (the live rule
+    /// for the query's signature: the asker's certificates must be valid now, the durable rule
+    /// for the answer's: the server's need not be): a person removed from the space, or a key
+    /// revoked, since the exchange fails the proof, closed, and so does an asker certificate
+    /// that has lapsed since. Verify a proof when it is received, with a current record, and
+    /// keep the verdict; a record that does not hold the creation is [`ProofError::NoRecord`].
+    pub async fn verify_answer_proof(&self, proof: &[u8]) -> Result<VerifiedAnswer, ProofError> {
+        self.node.query_verify_proof(&self.inner, proof).await
     }
 }
 

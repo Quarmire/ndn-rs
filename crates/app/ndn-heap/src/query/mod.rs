@@ -30,8 +30,9 @@ pub(crate) use serve::QueryOutcome;
 pub use serving::Serving;
 pub use types::{
     ANSWER_MAX_DEFAULT, Answered, AppRefusal, Ask, Asker, DEADLINE_MAX, Handler, HandlerFuture,
-    QUERY_MAX, Query, QueryError, QueryId, QueryPath, REFUSAL_TEXT_MAX, Reply, SERVE_PREFIX_MAX,
-    SERVE_PREFIXES_MAX, ServeError, TARGETS_MAX, Targets, Via,
+    ProofError, ProvenAnswer, QUERY_MAX, Query, QueryError, QueryId, QueryPath, REFUSAL_TEXT_MAX,
+    Reply, SERVE_PREFIX_MAX, SERVE_PREFIXES_MAX, ServeError, TARGETS_MAX, Targets, VerifiedAnswer,
+    Via,
 };
 
 /// What a node keeps of queries: the prefixes it serves, the announce hints it has heard, and
