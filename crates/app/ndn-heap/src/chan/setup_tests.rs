@@ -898,7 +898,7 @@ async fn a_revoked_senders_session_is_dropped_when_the_trust_generation_moves() 
 }
 
 /// `node`'s keyring adopts version 2 of `person`'s trust context, which revokes `key`.
-fn revoke_at(node: &Node, person: &Name, key: &Name) {
+pub(super) fn revoke_at(node: &Node, person: &Name, key: &Name) {
     let validator = &node.inner.judge.validator;
     let held = validator
         .keyring()

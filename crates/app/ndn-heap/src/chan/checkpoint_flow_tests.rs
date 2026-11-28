@@ -2193,3 +2193,96 @@ async fn a_checkpoint_hashed_when_the_ring_is_drained_is_the_record_an_eager_has
         "and it verifies under the sender's key"
     );
 }
+
+/// The sender's device key is revoked at this node while its session lives (the node adopts a
+/// version of the sender's trust context that revokes the key). The decoded checkpoint key the
+/// session holds is the session's own, so what stops it is the standing judgement the frame layer
+/// makes before it takes any frame: the trust generation moved, the sender is judged again, and a
+/// key that no longer stands ends the session. The next frame (data or checkpoint, whichever
+/// comes first), genuine as it is, sealed under the key held and signed by the key now revoked, is
+/// not taken: nothing of it is delivered, no checkpoint is read or verified, the session is
+/// dropped and the `Items` are told `NotMember`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sender_key_revoked_mid_session_stops_its_next_frame_and_its_next_checkpoint() {
+    for first in ["a data frame", "a checkpoint"] {
+        let mut ck = ck(ChannelMode::Latest, latest(), LinkConfig::default()).await;
+        ck.pause_tick();
+        let s = ck.start();
+        let g0 = ck.data(s, 0, b"one");
+        ck.data_in(&g0, HONEST, 1).await;
+        let cp0 = ck.checkpoint(s + 1, s, s + 1, &[&g0]);
+        ck.checkpoint_in(&cp0, HONEST, 2).await;
+        assert_eq!(ck.got(), vec![(path(0), b"one".to_vec())]);
+        let verified = ck.stats().checkpoints_verified.get();
+        assert!(
+            verified >= 1,
+            "the checkpoint before the revocation verified"
+        );
+        // Built while bob's key stands: genuine, under the key held, signed by bob's key.
+        let g1 = ck.data(s + 2, 1, b"two");
+        let cp1 = ck.checkpoint(s + 3, s, s + 3, &[&g0, &g1]);
+
+        let session = ck
+            .carol()
+            .inner
+            .chan
+            .sessions
+            .get(ck.info.channel)
+            .expect("carol holds the session");
+        assert!(session.is_current());
+        super::setup_tests::revoke_at(ck.carol(), &n("/bob"), ck.bob().writer());
+        assert!(
+            !session.is_current(),
+            "the trust generation moved when the revocation was adopted"
+        );
+
+        let (refused, later) = if first == "a data frame" {
+            (&g1, &cp1)
+        } else {
+            (&cp1, &g1)
+        };
+        let got = ck.deliver(refused, HONEST, ck.at(30)).await;
+        assert!(
+            matches!(&got, Delivery::Ended(EndReason::NotMember { .. })),
+            "{first}, genuine, after the revocation: {got:?}"
+        );
+        assert_eq!(ck.stats().not_member.get(), 1, "{first}");
+        assert_eq!(
+            ck.stats().checkpoints_verified.get(),
+            verified,
+            "{first}: no checkpoint was verified after the revocation"
+        );
+        assert!(!ck.session_held(), "{first}: the session is dropped");
+        // The other one, genuine as well, finds no session: a frame of a channel this node holds
+        // no session for is dropped, or held (bounded, unread) for a session that is never
+        // installed again, since the ask that would install it judges the revoked sender and is
+        // refused. Neither delivers it, and neither verifies a checkpoint.
+        let after = ck.deliver(later, HONEST, ck.at(31)).await;
+        assert!(
+            matches!(after, Delivery::Dropped(_) | Delivery::Held),
+            "{first}: nothing more is taken: {after:?}"
+        );
+        assert_eq!(
+            ck.stats().checkpoints_verified.get(),
+            verified,
+            "{first}: still no checkpoint verified"
+        );
+        let events = ck.events();
+        assert!(
+            matches!(
+                events.last(),
+                Some(Err(GetNotice::LiveEnded(LiveEnd::Ended {
+                    reason: EndReason::NotMember { .. },
+                    ..
+                })))
+            ),
+            "{first}: the Items are told why: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Ok((_, p)) if p == b"two")),
+            "{first}: the frame after the revocation was delivered: {events:?}"
+        );
+    }
+}
