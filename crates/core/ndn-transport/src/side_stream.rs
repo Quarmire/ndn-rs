@@ -223,7 +223,7 @@ impl SideLane {
     }
 
     /// Whether `frame` may be queued at all: it starts with the marker and fits a record.
-    fn check(frame: &Bytes) -> Result<(), SideRefused> {
+    fn check(frame: &[u8]) -> Result<(), SideRefused> {
         if frame.first() != Some(&SIDE_MARKER) {
             return Err(SideRefused::Malformed);
         }
@@ -252,7 +252,7 @@ impl SideLane {
         if state.closed {
             return Err(SideRefused::Closed);
         }
-        if state.frames.len() >= LANE_FRAMES || state.octets + cost > LANE_OCTETS {
+        if !Self::fits(&state, cost) {
             return Err(SideRefused::Full);
         }
         state.octets += cost;
@@ -262,13 +262,31 @@ impl SideLane {
         Ok(())
     }
 
+    /// Whether a frame whose record costs `cost` octets (the frame and its header) is under
+    /// both bounds: the one test `try_push` and [`has_room_for`](Self::has_room_for) make.
+    fn fits(state: &LaneState, cost: usize) -> bool {
+        state.frames.len() < LANE_FRAMES && state.octets + cost <= LANE_OCTETS
+    }
+
     /// Whether [`try_push`](Self::try_push) may take a frame now and not refuse it
     /// [`Full`](SideRefused::Full): fewer frames and octets wait than the bounds, or the lane is
-    /// closed (which refuses another way). The read `try_push` makes first, without the frame;
-    /// room is not reserved.
+    /// closed (which refuses another way). The read `try_push` makes first, without the frame
+    /// (a frame of one octet: any frame needs at least that); room is not reserved.
     pub(crate) fn has_room(&self) -> bool {
         let state = self.lock();
-        state.closed || (state.frames.len() < LANE_FRAMES && state.octets < LANE_OCTETS)
+        state.closed || Self::fits(&state, RECORD_HEADER_LEN + 1)
+    }
+
+    /// [`has_room`](Self::has_room) for `frame`: what `try_push` would answer for it without
+    /// taking it. A frame the lane refuses another way (not a side frame, over a record, a lane
+    /// the peer has not opened or that is closed) is no frame to wait for room for, as waiting
+    /// would end in the same refusal, later.
+    pub(crate) fn has_room_for(&self, frame: &[u8]) -> bool {
+        if Self::check(frame).is_err() || !self.is_open() {
+            return true;
+        }
+        let state = self.lock();
+        state.closed || Self::fits(&state, frame.len() + RECORD_HEADER_LEN)
     }
 
     /// Queue `frame`, waiting for room.

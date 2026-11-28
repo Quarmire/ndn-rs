@@ -33,6 +33,12 @@ struct SideGauge {
 }
 
 impl SideGauge {
+    /// Whether `len` more octets are under the byte bound now: the test `admit` makes, read
+    /// without counting anything.
+    fn fits(&self, len: usize) -> bool {
+        self.queued.load(Ordering::Acquire).saturating_add(len) <= SIDE_INBOX_BYTES
+    }
+
     /// Count `len` octets as queued if the byte bound allows it; false (nothing counted) if not.
     fn admit(&self, len: usize) -> bool {
         let before = self.queued.fetch_add(len, Ordering::AcqRel);
@@ -255,6 +261,15 @@ impl Transport for InProcFace {
     /// bound, the two reads `forward_side_from` makes first. Room is not reserved.
     fn side_room(&self, _class: SideClass) -> bool {
         self.side_tx.capacity() > 0 && self.side.queued.load(Ordering::Acquire) < SIDE_INBOX_BYTES
+    }
+
+    /// [`side_room`](Self::side_room) for this frame: the inbox must hold the frame under its
+    /// byte bound too ([`SideGauge::fits`], the test `forward_side_from` makes), not merely be
+    /// under it. A mebibyte stream frame judged room at 7.9 of 8 MiB was refused `Full` by
+    /// `forward_side_from` and lost at the first hop, which a sender's hold-back claims to
+    /// prevent.
+    fn side_room_for(&self, frame: &[u8], _class: SideClass) -> bool {
+        self.side_tx.capacity() > 0 && self.side.fits(frame.len())
     }
 
     async fn send_bytes_with_source(&self, pkt: Bytes, source: FaceId) -> Result<(), FaceError> {
@@ -529,6 +544,48 @@ mod tests {
             face.forward_side_from(small, SideClass::Datagram, FaceId(1)),
             Err(SideRefused::Closed)
         );
+    }
+
+    /// Room for a frame is room for **that** frame: with 7.5 of the 8 MiB byte bound queued, an
+    /// inbox takes a small frame and refuses a mebibyte, and `side_room_for` says so before the
+    /// frame is sent. `side_room` alone (is the inbox under its bound) said room for the
+    /// mebibyte, and the engine's `forward_side_from` then refused it `Full`: a frame the
+    /// first hop held back for its sender, lost there.
+    #[tokio::test]
+    async fn side_room_for_a_frame_reads_the_bound_forward_side_from_checks() {
+        use ndn_transport::{SIDE_MARKER, SideClass, SideRefused};
+
+        let (face, handle) = InProcFace::new(FaceId(5), 4);
+        let mebibyte = Bytes::from(vec![SIDE_MARKER; 1024 * 1024]);
+        let small = Bytes::from(vec![SIDE_MARKER; 1024]);
+        for _ in 0..7 {
+            face.forward_side_from(mebibyte.clone(), SideClass::Stream, FaceId(1))
+                .unwrap();
+        }
+        face.forward_side_from(
+            Bytes::from(vec![SIDE_MARKER; 512 * 1024]),
+            SideClass::Stream,
+            FaceId(1),
+        )
+        .unwrap();
+        assert!(
+            face.side_room(SideClass::Stream),
+            "the inbox is under its bound"
+        );
+        assert!(face.side_room_for(&small, SideClass::Stream));
+        assert!(
+            !face.side_room_for(&mebibyte, SideClass::Stream),
+            "forward_side_from refuses a mebibyte here, and the read said room"
+        );
+        assert_eq!(
+            face.forward_side_from(mebibyte.clone(), SideClass::Stream, FaceId(1)),
+            Err(SideRefused::Full)
+        );
+        face.forward_side_from(small.clone(), SideClass::Stream, FaceId(1))
+            .unwrap();
+        // Draining one frame makes room for it again.
+        assert!(handle.recv_side().await.is_some());
+        assert!(face.side_room_for(&mebibyte, SideClass::Stream));
     }
 
     /// An app's send is `try_send` when it must not wait: `Full` when the face's queue has no

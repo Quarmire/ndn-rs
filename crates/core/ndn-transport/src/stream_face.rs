@@ -265,6 +265,15 @@ where
         self.lane.as_ref().is_none_or(|lane| lane.has_room())
     }
 
+    /// [`side_room`](Self::side_room) for this frame: the lane's queue must hold the frame and
+    /// its record header under both bounds, the test `forward_side` makes. A frame the lane
+    /// refuses another way has no room to wait for.
+    fn side_room_for(&self, frame: &[u8], _class: SideClass) -> bool {
+        self.lane
+            .as_ref()
+            .is_none_or(|lane| lane.has_room_for(frame))
+    }
+
     /// What the peer has said it reads: [`RECORD_MAX`] once it opened the lane (a forwarder's
     /// end read the client's hello; a client's end said hello), `0` before, and for a face with
     /// no lane.
@@ -508,6 +517,45 @@ mod tests {
             Transport::send_side(&face, side(1, 46), SideClass::Stream).await,
             Err(SideRefused::Closed)
         );
+    }
+
+    /// Room for a frame is room for **that** frame: a lane with a little under a mebibyte left
+    /// takes a small frame and refuses a big one, and `side_room_for` says so before the frame
+    /// is sent. The frame-less `side_room` only asks that the lane is under its bound, so a
+    /// mebibyte frame judged "room" at 3.9 of 4 MiB was refused `Full` by `forward_side` and
+    /// lost at the first hop, which a sender's hold-back claims to prevent.
+    #[tokio::test]
+    async fn side_room_for_a_frame_reads_the_octets_forward_side_checks() {
+        let (near, _far) = tokio::io::duplex(1024);
+        let (r, w) = tokio::io::split(near);
+        let (face, _pump) =
+            StreamFace::new(FaceId(1), FaceKind::Unix, None, None, r, w, SideTlvCodec)
+                .with_side_lane();
+        face.open_side();
+        let big = side(1, RECORD_MAX);
+        let small = side(2, 1_000);
+        for _ in 0..3 {
+            Transport::forward_side(&face, big.clone(), SideClass::Stream).unwrap();
+        }
+        assert!(
+            Transport::side_room(&face, SideClass::Stream),
+            "the lane is under its bound"
+        );
+        assert!(Transport::side_room_for(&face, &small, SideClass::Stream));
+        assert!(
+            !Transport::side_room_for(&face, &big, SideClass::Stream),
+            "forward_side refuses a mebibyte here, and the read said room"
+        );
+        assert_eq!(
+            Transport::forward_side(&face, big.clone(), SideClass::Stream),
+            Err(SideRefused::Full)
+        );
+        Transport::forward_side(&face, small.clone(), SideClass::Stream).unwrap();
+        // A frame the lane refuses another way is not waited for.
+        let over = side(3, RECORD_MAX + 1);
+        assert!(Transport::side_room_for(&face, &over, SideClass::Stream));
+        let ndn = Bytes::from_static(&[0x06, 0x00]);
+        assert!(Transport::side_room_for(&face, &ndn, SideClass::Stream));
     }
 
     /// Dropping the face ends its pump.
