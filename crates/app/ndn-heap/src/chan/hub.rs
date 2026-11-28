@@ -407,9 +407,21 @@ impl NodeInner {
     /// device, its channel modes and the prefixes it serves queries under (at most 16 names and
     /// 512 octets of name values, shortest first: the rest are left out). `None`: a device with
     /// no channel and no prefix has nothing to announce.
+    ///
+    /// In a **sealed** space the announce lists no prefix: it is an Interest in the clear on the
+    /// sync group, and the prefixes a device serves there are as secret as the paths of a query
+    /// (which is why a query there is sealed). Askers there name the servers
+    /// (`Targets::Devices`, `Targets::Person`), as `Targets::Serving` has no hint to go by.
     pub(crate) fn announce_record(&self, space: &Name) -> Option<(Name, bytes::Bytes)> {
         let modes = self.chan.channels.modes(space);
-        let serves = self.query_serves(space);
+        let sealed = self
+            .space_of(space)
+            .is_some_and(|held| held.log.lock().sealed());
+        let serves = if sealed {
+            Vec::new()
+        } else {
+            self.query_serves(space)
+        };
         let group = sync_group_of(space).filter(|_| !modes.is_empty() || !serves.is_empty())?;
         let record = Announce {
             sender: self.device.clone(),
@@ -429,6 +441,9 @@ impl NodeInner {
     /// it), only by the lapse. It is answered by nobody and cached nowhere.
     pub(crate) async fn chan_announce(&self, space: &Name) {
         let Some((group, record)) = self.announce_record(space) else {
+            // A sealed space that only serves announces nothing: its prefix is not due again
+            // until the next period.
+            self.query.server.announced(space, Instant::now());
             return;
         };
         let wire = InterestBuilder::new(chan_prefix(&group))
@@ -486,10 +501,15 @@ impl NodeInner {
             return;
         };
         let person = self.person_of(&sender);
-        let (writer, vouched) = self.space_of(&space).map_or((false, false), |held| {
-            let log = held.log.lock();
-            (log.fold.is_writer(&person), log.vouches(&sender))
-        });
+        let (writer, vouched, sealed) =
+            self.space_of(&space).map_or((false, false, false), |held| {
+                let log = held.log.lock();
+                (
+                    log.fold.is_writer(&person),
+                    log.vouches(&sender),
+                    log.sealed(),
+                )
+            });
         if !writer {
             stats.announce_strangers.bump();
             return;
@@ -505,10 +525,13 @@ impl NodeInner {
         // The prefixes it says it serves are a hint too, recorded whatever is decided about
         // asking it for a channel (a device that only serves has no mode to ask for). An
         // announce that lists none records nothing: it is unsigned, so one that removed a hint
-        // would let anyone remove the hint of a real server.
-        self.query
-            .hints
-            .record(&space, &sender, &person, vouched, &serves, Instant::now());
+        // would let anyone remove the hint of a real server. A sealed space's announce lists no
+        // prefix (the prefixes served stay secret), so one that does is no hint either.
+        if !sealed {
+            self.query
+                .hints
+                .record(&space, &sender, &person, vouched, &serves, Instant::now());
+        }
         let now = Instant::now();
         if !self.chan.is_listening(&space) {
             stats.announce_ignored.bump();

@@ -1244,6 +1244,36 @@ async fn spoofed_device_names_do_not_crowd_the_real_server_out_of_the_targets() 
     );
 }
 
+/// The announce is in the clear on the sync group. In a sealed space the prefixes a device
+/// serves are not: the announce lists none, and a hearer takes no hint of one that does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sealed_space_announce_names_no_served_prefix() {
+    let rig = rig(&["/alice/laptop", "/bob/phone", "/carol/tablet"]).await;
+    let heap = super::rig::sealed(&rig, &["/bob"], &["/carol"]).await;
+    let (alice, bob) = (&rig.nodes[0], &rig.nodes[1]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let _serving = heap.serve(n("/secret"), echo(&ran)).unwrap();
+    assert!(
+        !alice.inner.query_serves(&space()).is_empty(),
+        "alice serves /secret"
+    );
+    if let Some((_, params)) = alice.inner.announce_record(&space()) {
+        assert!(
+            !contains(&params, b"secret"),
+            "the announce of a sealed space shows the prefix served to the sync group"
+        );
+    }
+    // A hearer takes no hint of a prefix in a sealed space, whoever announced it.
+    hear(
+        bob,
+        announce_wire("/alice/laptop", &[ChannelMode::Latest], &["/secret"]),
+    );
+    assert!(
+        hinted(bob, "/secret/x").is_empty(),
+        "a sealed space's prefixes are no hint: ask Targets::Devices or Targets::Person"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_announce_is_sent_again_when_the_set_served_changes() {
     let rig = rig(&["/alice/laptop", "/bob/phone"]).await;
